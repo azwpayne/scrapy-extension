@@ -95,9 +95,28 @@ class ConnectionManager:
     """
     if self.backend_type == BackendType.REDIS:
       from scrapy_extension.backends.redis_backend import RedisBackend
+      from scrapy_extension.config.settings import RedisSettings
 
       config = RedisSettings(**self.settings)
       return RedisBackend(config)
+    elif self.backend_type == BackendType.MONGODB:
+      from scrapy_extension.backends.mongodb_backend import MongoDBBackend
+      from scrapy_extension.config.settings import MongoDBSettings
+
+      config = MongoDBSettings(**self.settings)
+      return MongoDBBackend(config)
+    elif self.backend_type == BackendType.KAFKA:
+      from scrapy_extension.backends.kafka_backend import KafkaBackend
+      from scrapy_extension.config.settings import KafkaSettings
+
+      config = KafkaSettings(**self.settings)
+      return KafkaBackend(config)
+    elif self.backend_type == BackendType.RABBITMQ:
+      from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
+      from scrapy_extension.config.settings import RabbitMQSettings
+
+      config = RabbitMQSettings(**self.settings)
+      return RabbitMQBackend(config)
     else:
       raise ValueError(f"Unsupported backend type: {self.backend_type}")
 
