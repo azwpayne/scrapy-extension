@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
@@ -155,22 +155,60 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     return BackendType.MONGODB
 
-  # QueueBackend methods (stubs for now)
+  # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
-    """Push an item to a queue."""
-    raise NotImplementedError("push not implemented yet")
+    """Push item to priority queue.
+
+    Args:
+        queue_name: Name of the queue.
+        item: Item to push (bytes).
+        priority: Priority value (higher = more urgent).
+    """
+    doc = {
+      "queue_name": queue_name,
+      "item": item,
+      "priority": -priority,  # Negated for DESC sort
+      "created_at": datetime.now(tz=timezone.utc),
+    }
+    self._queue_collection.insert_one(doc)
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-    """Pop an item from a queue."""
-    raise NotImplementedError("pop not implemented yet")
+    """Pop highest priority item from queue.
+
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (0 = non-blocking).
+
+    Returns:
+        The popped item, or None if queue is empty.
+    """
+    # MongoDB doesn't support blocking pop, so we ignore timeout
+    result = self._queue_collection.find_one_and_delete(
+      {"queue_name": queue_name},
+      sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
+    )
+    if result:
+      return result["item"]
+    return None
 
   def queue_len(self, queue_name: str) -> int:
-    """Get the number of items in a queue."""
-    raise NotImplementedError("queue_len not implemented yet")
+    """Get queue length.
+
+    Args:
+        queue_name: Name of the queue.
+
+    Returns:
+        Number of items in the queue.
+    """
+    return self._queue_collection.count_documents({"queue_name": queue_name})
 
   def clear_queue(self, queue_name: str) -> None:
-    """Clear all items from a queue."""
-    raise NotImplementedError("clear_queue not implemented yet")
+    """Clear all items from queue.
+
+    Args:
+        queue_name: Name of the queue.
+    """
+    self._queue_collection.delete_many({"queue_name": queue_name})
 
   # SetBackend methods (stubs for now)
   def add(self, set_name: str, item: bytes) -> bool:
