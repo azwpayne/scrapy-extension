@@ -95,3 +95,82 @@ def test_mongodb_backend_clear_queue():
 
         backend.clear_queue("test_queue")
         mock_collection.delete_many.assert_called_once_with({"queue_name": "test_queue"})
+
+
+def test_mongodb_backend_set_operations():
+    """Test MongoDB backend set operations."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+
+    with patch("scrapy_extension.backends.mongodb_backend.MongoClient"):
+        backend.connect()
+        mock_collection = MagicMock()
+        backend._set_collection = mock_collection
+
+        # Test add
+        mock_collection.insert_one.return_value = MagicMock()
+        result = backend.add("test_set", b"test_item")
+        assert result is True
+        mock_collection.insert_one.assert_called_once()
+
+        # Test contains (item exists)
+        mock_collection.find_one.return_value = {"set_name": "test_set", "item_hash": "abc123"}
+        result = backend.contains("test_set", b"test_item")
+        assert result is True
+
+        # Test contains (item not exists)
+        mock_collection.find_one.return_value = None
+        result = backend.contains("test_set", b"other_item")
+        assert result is False
+
+
+def test_mongodb_backend_set_remove():
+    """Test MongoDB backend set remove."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+
+    with patch("scrapy_extension.backends.mongodb_backend.MongoClient"):
+        backend.connect()
+        mock_collection = MagicMock()
+        backend._set_collection = mock_collection
+
+        # Test remove success
+        mock_delete_result = MagicMock()
+        mock_delete_result.deleted_count = 1
+        mock_collection.delete_one.return_value = mock_delete_result
+        result = backend.remove("test_set", b"test_item")
+        assert result is True
+
+        # Test remove failure (not found)
+        mock_delete_result.deleted_count = 0
+        result = backend.remove("test_set", b"missing_item")
+        assert result is False
+
+
+def test_mongodb_backend_set_len():
+    """Test MongoDB backend set length."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+
+    with patch("scrapy_extension.backends.mongodb_backend.MongoClient"):
+        backend.connect()
+        mock_collection = MagicMock()
+        backend._set_collection = mock_collection
+        mock_collection.count_documents.return_value = 3
+
+        result = backend.set_len("test_set")
+        assert result == 3
+
+
+def test_mongodb_backend_clear_set():
+    """Test MongoDB backend clear set."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+
+    with patch("scrapy_extension.backends.mongodb_backend.MongoClient"):
+        backend.connect()
+        mock_collection = MagicMock()
+        backend._set_collection = mock_collection
+
+        backend.clear_set("test_set")
+        mock_collection.delete_many.assert_called_once_with({"set_name": "test_set"})

@@ -210,26 +210,90 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     self._queue_collection.delete_many({"queue_name": queue_name})
 
-  # SetBackend methods (stubs for now)
+  # SetBackend implementation
+  def _hash_item(self, item: bytes) -> str:
+    """Generate hash for item.
+
+    Args:
+        item: Item to hash.
+
+    Returns:
+        SHA256 hex digest of item.
+    """
+    return hashlib.sha256(item).hexdigest()
+
   def add(self, set_name: str, item: bytes) -> bool:
-    """Add an item to a set."""
-    raise NotImplementedError("add not implemented yet")
+    """Add item to set.
+
+    Args:
+        set_name: Name of the set.
+        item: Item to add (bytes).
+
+    Returns:
+        True if added, False if already existed.
+    """
+    doc = {
+      "set_name": set_name,
+      "item_hash": self._hash_item(item),
+      "item": item,
+      "created_at": datetime.now(tz=timezone.utc),
+    }
+    try:
+      self._set_collection.insert_one(doc)
+      return True
+    except DuplicateKeyError:
+      return False
 
   def remove(self, set_name: str, item: bytes) -> bool:
-    """Remove an item from a set."""
-    raise NotImplementedError("remove not implemented yet")
+    """Remove item from set.
+
+    Args:
+        set_name: Name of the set.
+        item: Item to remove.
+
+    Returns:
+        True if removed, False if didn't exist.
+    """
+    result = self._set_collection.delete_one({
+      "set_name": set_name,
+      "item_hash": self._hash_item(item),
+    })
+    return result.deleted_count > 0
 
   def contains(self, set_name: str, item: bytes) -> bool:
-    """Check if an item is in a set."""
-    raise NotImplementedError("contains not implemented yet")
+    """Check if item is in set.
+
+    Args:
+        set_name: Name of the set.
+        item: Item to check.
+
+    Returns:
+        True if item exists in the set.
+    """
+    result = self._set_collection.find_one({
+      "set_name": set_name,
+      "item_hash": self._hash_item(item),
+    })
+    return result is not None
 
   def set_len(self, set_name: str) -> int:
-    """Get the number of items in a set."""
-    raise NotImplementedError("set_len not implemented yet")
+    """Get set size.
+
+    Args:
+        set_name: Name of the set.
+
+    Returns:
+        Number of items in the set.
+    """
+    return self._set_collection.count_documents({"set_name": set_name})
 
   def clear_set(self, set_name: str) -> None:
-    """Clear all items from a set."""
-    raise NotImplementedError("clear_set not implemented yet")
+    """Clear all items from set.
+
+    Args:
+        set_name: Name of the set.
+    """
+    self._set_collection.delete_many({"set_name": set_name})
 
   # StorageBackend methods (stubs for now)
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
