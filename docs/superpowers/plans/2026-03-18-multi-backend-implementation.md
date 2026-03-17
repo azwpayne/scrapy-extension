@@ -4,7 +4,7 @@
 
 **Goal:** Implement MongoDB, Kafka, and RabbitMQ backends for the scrapy-extension distributed crawling package.
 
-**Architecture:** Three new backend classes implementing the protocol-based abstraction with registry-based ConnectionManager. MongoDB implements all protocols; Kafka and RabbitMQ implement QueueBackend only.
+**Architecture:** Three new backend classes implementing the protocol-based abstraction with elif-based ConnectionManager. MongoDB implements all protocols; Kafka and RabbitMQ implement QueueBackend only.
 
 **Tech Stack:** Python 3.10+, pymongo, kafka-python, pika, pydantic-settings, pytest
 
@@ -1865,37 +1865,6 @@ class RabbitMQBackend(Backend, QueueBackend):
             self._channel.queue_purge(queue=queue_name)
         except AMQPError as e:
             logger.warning("Failed to clear queue %s: %s", queue_name, e)
-
-    # SetBackend - Not Implemented
-    def add(self, set_name: str, item: bytes) -> bool:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def remove(self, set_name: str, item: bytes) -> bool:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def contains(self, set_name: str, item: bytes) -> bool:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def set_len(self, set_name: str) -> int:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def clear_set(self, set_name: str) -> None:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
 
     # Note: RabbitMQBackend only implements QueueBackend
     # SetBackend and StorageBackend methods are not included
