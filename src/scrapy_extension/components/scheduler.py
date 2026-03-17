@@ -16,193 +16,192 @@ from scrapy_extension.components.queue import BackendQueue
 from scrapy_extension.exceptions import QueueError
 
 if TYPE_CHECKING:
-    from scrapy import Spider
-    from scrapy.crawler import Crawler
-    from scrapy.statscollectors import StatsCollector
+  from scrapy import Spider
+  from scrapy.crawler import Crawler
+  from scrapy.statscollectors import StatsCollector
 
-    from scrapy_extension.connection.manager import ConnectionManager
+  from scrapy_extension.connection.manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
 
 class BackendScheduler:
-    """Scrapy scheduler implementation using backend interfaces.
+  """Scrapy scheduler implementation using backend interfaces.
 
-    This scheduler uses:
-    - QueueBackend for request queueing
-    - SetBackend for duplicate filtering
+  This scheduler uses:
+  - QueueBackend for request queueing
+  - SetBackend for duplicate filtering
 
-    Attributes:
-        connection_manager: The connection manager for backend access.
-        queue_key: The key for the request queue.
-        dupefilter_key: The key for the dupefilter set.
+  Attributes:
+      connection_manager: The connection manager for backend access.
+      queue_key: The key for the request queue.
+      dupefilter_key: The key for the dupefilter set.
+      stats: Optional stats collector for metrics.
+  """
+
+  def __init__(
+    self,
+    connection_manager: ConnectionManager,
+    queue_key: str = "scheduler:queue",
+    dupefilter_key: str = "scheduler:dupefilter",
+    stats: StatsCollector | None = None,
+  ) -> None:
+    """Initialize the scheduler.
+
+    Args:
+        connection_manager: Connection manager for backend access.
+        queue_key: Key for the request queue.
+        dupefilter_key: Key for the dupefilter set.
         stats: Optional stats collector for metrics.
     """
+    self.connection_manager = connection_manager
+    self.queue_key = queue_key
+    self.dupefilter_key = dupefilter_key
+    self.stats = stats
+    self._queue: BackendQueue | None = None
+    self._spider: Spider | None = None
 
-    def __init__(
-        self,
-        connection_manager: ConnectionManager,
-        queue_key: str = "scheduler:queue",
-        dupefilter_key: str = "scheduler:dupefilter",
-        stats: StatsCollector | None = None,
-    ) -> None:
-        """Initialize the scheduler.
+  @classmethod
+  def from_settings(cls, settings: Settings) -> BackendScheduler:
+    """Create scheduler from Scrapy settings.
 
-        Args:
-            connection_manager: Connection manager for backend access.
-            queue_key: Key for the request queue.
-            dupefilter_key: Key for the dupefilter set.
-            stats: Optional stats collector for metrics.
-        """
-        self.connection_manager = connection_manager
-        self.queue_key = queue_key
-        self.dupefilter_key = dupefilter_key
-        self.stats = stats
-        self._queue: BackendQueue | None = None
-        self._spider: Spider | None = None
+    Args:
+        settings: Scrapy settings object.
 
-    @classmethod
-    def from_settings(cls, settings: Settings) -> BackendScheduler:
-        """Create scheduler from Scrapy settings.
+    Returns:
+        A new BackendScheduler instance.
+    """
+    from scrapy_extension.connection.manager import ConnectionManager
+    from scrapy_extension.backends.base import BackendType
 
-        Args:
-            settings: Scrapy settings object.
+    backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
+    manager = ConnectionManager.get_manager(
+      backend_type=backend_type,
+      settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
+    )
+    return cls(
+      connection_manager=manager,
+      queue_key=settings.get("SCRAPY_QUEUE_KEY", "scheduler:queue"),
+      dupefilter_key=settings.get("SCRAPY_DUPEFILTER_KEY", "scheduler:dupefilter"),
+    )
 
-        Returns:
-            A new BackendScheduler instance.
-        """
-        from scrapy_extension.connection.manager import ConnectionManager
-        from scrapy_extension.backends.base import BackendType
+  @classmethod
+  def from_crawler(cls, crawler: Crawler) -> BackendScheduler:
+    """Create scheduler from crawler.
 
-        backend_type = BackendType(
-            settings.get("SCRAPY_BACKEND_TYPE", "redis")
-        )
-        manager = ConnectionManager.get_manager(
-            backend_type=backend_type,
-            settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
-        )
-        return cls(
-            connection_manager=manager,
-            queue_key=settings.get("SCRAPY_QUEUE_KEY", "scheduler:queue"),
-            dupefilter_key=settings.get("SCRAPY_DUPEFILTER_KEY", "scheduler:dupefilter"),
-        )
+    Args:
+        crawler: The Scrapy crawler instance.
 
-    @classmethod
-    def from_crawler(cls, crawler: Crawler) -> BackendScheduler:
-        """Create scheduler from crawler.
+    Returns:
+        A new BackendScheduler instance.
+    """
+    scheduler = cls.from_settings(crawler.settings)
+    scheduler.stats = crawler.stats
+    return scheduler
 
-        Args:
-            crawler: The Scrapy crawler instance.
+  def open(self, spider: Spider) -> None:
+    """Open the scheduler for a spider.
 
-        Returns:
-            A new BackendScheduler instance.
-        """
-        scheduler = cls.from_settings(crawler.settings)
-        scheduler.stats = crawler.stats
-        return scheduler
+    Args:
+        spider: The spider instance.
+    """
+    self._spider = spider
+    self._queue = BackendQueue(
+      connection_manager=self.connection_manager,
+      queue_name=f"{spider.name}:queue",
+    )
+    logger.info(f"Scheduler opened for spider {spider.name}")
 
-    def open(self, spider: Spider) -> None:
-        """Open the scheduler for a spider.
+  def close(self, reason: str) -> None:
+    """Close the scheduler.
 
-        Args:
-            spider: The spider instance.
-        """
-        self._spider = spider
-        self._queue = BackendQueue(
-            connection_manager=self.connection_manager,
-            queue_name=f"{spider.name}:queue",
-        )
-        logger.info(f"Scheduler opened for spider {spider.name}")
+    Args:
+        reason: The reason for closing.
+    """
+    logger.info(f"Scheduler closed: {reason}")
+    self._queue = None
+    self._spider = None
 
-    def close(self, reason: str) -> None:
-        """Close the scheduler.
+  def enqueue_request(self, request: Request) -> bool:
+    """Enqueue a request.
 
-        Args:
-            reason: The reason for closing.
-        """
-        logger.info(f"Scheduler closed: {reason}")
-        self._queue = None
-        self._spider = None
+    Args:
+        request: The request to enqueue.
 
-    def enqueue_request(self, request: Request) -> bool:
-        """Enqueue a request.
+    Returns:
+        True if the request was enqueued, False if it was a duplicate.
+    """
+    # Check for duplicates
+    fingerprint = self._request_fingerprint(request)
+    if self.connection_manager.get_set_backend().contains(
+      self.dupefilter_key, fingerprint.encode()
+    ):
+      if self.stats:
+        self.stats.inc_value("scheduler/dropped_duplicates")
+      return False
 
-        Args:
-            request: The request to enqueue.
+    # Add fingerprint
+    self.connection_manager.get_set_backend().add(
+      self.dupefilter_key, fingerprint.encode()
+    )
 
-        Returns:
-            True if the request was enqueued, False if it was a duplicate.
-        """
-        # Check for duplicates
-        fingerprint = self._request_fingerprint(request)
-        if self.connection_manager.get_set_backend().contains(
-            self.dupefilter_key, fingerprint.encode()
-        ):
-            if self.stats:
-                self.stats.inc_value("scheduler/dropped_duplicates")
-            return False
+    # Enqueue with priority (negate because Scrapy uses higher = more urgent)
+    priority = request.priority
+    try:
+      if self._queue is None:
+        raise RuntimeError("Scheduler not opened")
+      self._queue.push(request, priority=priority)
+      if self.stats:
+        self.stats.inc_value("scheduler/enqueued")
+      return True
+    except QueueError as e:
+      logger.error(f"Failed to enqueue request: {e}")
+      return False
 
-        # Add fingerprint
-        self.connection_manager.get_set_backend().add(
-            self.dupefilter_key, fingerprint.encode()
-        )
+  def next_request(self) -> Request | None:
+    """Get the next request from the queue.
 
-        # Enqueue with priority (negate because Scrapy uses higher = more urgent)
-        priority = request.priority
-        try:
-            if self._queue is None:
-                raise RuntimeError("Scheduler not opened")
-            self._queue.push(request, priority=priority)
-            if self.stats:
-                self.stats.inc_value("scheduler/enqueued")
-            return True
-        except QueueError as e:
-            logger.error(f"Failed to enqueue request: {e}")
-            return False
+    Returns:
+        The next request, or None if the queue is empty.
+    """
+    try:
+      if self._queue is None:
+        raise RuntimeError("Scheduler not opened")
+      request = self._queue.pop(timeout=0)
+      if request and self.stats:
+        self.stats.inc_value("scheduler/dequeued")
+      return request
+    except QueueError as e:
+      logger.error(f"Failed to get next request: {e}")
+      return None
 
-    def next_request(self) -> Request | None:
-        """Get the next request from the queue.
+  def has_pending_requests(self) -> bool:
+    """Check if there are pending requests.
 
-        Returns:
-            The next request, or None if the queue is empty.
-        """
-        try:
-            if self._queue is None:
-                raise RuntimeError("Scheduler not opened")
-            request = self._queue.pop(timeout=0)
-            if request and self.stats:
-                self.stats.inc_value("scheduler/dequeued")
-            return request
-        except QueueError as e:
-            logger.error(f"Failed to get next request: {e}")
-            return None
+    Returns:
+        True if there are pending requests.
+    """
+    return len(self) > 0
 
-    def has_pending_requests(self) -> bool:
-        """Check if there are pending requests.
+  def __len__(self) -> int:
+    """Get the number of pending requests.
 
-        Returns:
-            True if there are pending requests.
-        """
-        return len(self) > 0
+    Returns:
+        Number of pending requests.
+    """
+    if self._queue is None:
+      return 0
+    return len(self._queue)
 
-    def __len__(self) -> int:
-        """Get the number of pending requests.
+  def _request_fingerprint(self, request: Request) -> str:
+    """Generate a fingerprint for a request.
 
-        Returns:
-            Number of pending requests.
-        """
-        if self._queue is None:
-            return 0
-        return len(self._queue)
+    Args:
+        request: The request to fingerprint.
 
-    def _request_fingerprint(self, request: Request) -> str:
-        """Generate a fingerprint for a request.
+    Returns:
+        A unique fingerprint string.
+    """
+    from scrapy.utils.request import fingerprint
 
-        Args:
-            request: The request to fingerprint.
-
-        Returns:
-            A unique fingerprint string.
-        """
-        from scrapy.utils.request import fingerprint
-        return fingerprint(request).hex()
+    return fingerprint(request).hex()

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Scrapy extension package (`scrapy-extension`) that provides utilities for Scrapy web crawling projects. It's designed to work with Redis for distributed crawling and uses Pydantic Settings for configuration management.
+This is `scrapy-extension`, a Scrapy extension package providing distributed crawling capabilities with support for multiple backends: Redis (implemented), MongoDB, Kafka, and RabbitMQ (planned).
 
 ## Build System & Package Management
 
@@ -21,93 +21,101 @@ This project uses **uv** for Python package management and building:
 # Install dependencies (including dev)
 uv sync
 
-# Run a single test file
-uv run pytest tests/test_file.py
-
 # Run all tests
 uv run pytest
 
+# Run a single test file
+uv run pytest tests/test_backends.py
+
+# Run a specific test
+uv run pytest tests/test_backends.py::TestRedisBackend::test_connect_success -v
+
 # Run tests with verbose output
 uv run pytest -v
-
-# Install the package in editable mode
-uv pip install -e .
 ```
-
-## Task Runner
-
-This project uses **poethepoet** (configured in `pyproject.toml` under `[tool.poe.tasks]`). Check `pyproject.toml` for available tasks:
-
-```bash
-# List available tasks
-poe --help
-
-# Run a specific task
-poe <task-name>
-```
-
-## Dependencies
-
-### Runtime Dependencies
-- `scrapy>=2.14.2` - Web crawling framework
-- `redis>=7.3.0` - Redis client for distributed crawling
-- `pydantic-settings>=2.13.1` - Configuration management
-
-### Development Dependencies
-- `pytest>=9.0.2` - Testing framework
-- `poethepoet>=0.42.1` - Task runner
 
 ## Architecture
 
-### Project Structure
+### Backend Abstraction
 
-```
-src/scrapy_extension/    # Main package source
-├── __init__.py          # Package entry point
-└── py.typed             # PEP 561 type marker
+The project uses a protocol-based backend abstraction defined in `src/scrapy_extension/backends/base.py`:
 
-tests/                   # Test files (empty - needs tests)
-examples/                # Example usage (empty)
-docs/                    # Documentation (empty)
-```
+- **`Backend`**: Base protocol for all backends (connect, disconnect, ping)
+- **`QueueBackend`**: Priority queue operations (push, pop, len, clear)
+- **`SetBackend`**: Set operations for duplicate filtering (add, contains, remove, len)
+- **`StorageBackend`**: Key-value storage with TTL support (store, retrieve, delete, exists)
 
-### Package Design Patterns
+All backends implement these protocols. Currently only **Redis** is implemented via `RedisBackend` class using:
+- Sorted Sets for queues (priority ordering)
+- Sets for duplicate filtering
+- Strings with TTL for storage
 
-This is a **Scrapy extension package**, so it should follow Scrapy's extension patterns:
+### Scrapy Components
 
-1. **Extensions**: Subclass `scrapy.extensions.Extension` for extending Scrapy functionality
-2. **Middlewares**: Implement downloader or spider middlewares
-3. **Pipelines**: Implement item pipelines for data processing
-4. **Settings**: Use Pydantic Settings for type-safe configuration with environment variable support
+Components in `src/scrapy_extension/components/` wrap backend interfaces for Scrapy integration:
 
-### Key Integration Points
+- **`BackendQueue`**: Request serialization/deserialization, uses `QueueBackend`
+- **`BackendScheduler`**: Scrapy scheduler using `BackendQueue` + `SetBackend` for deduplication
+- **`BackendDupeFilter`**: Distributed duplicate filter using `SetBackend`
+- **`BackendPipeline`**: Item storage pipeline using `StorageBackend`
+- **`BackendSpiderMixin`**: Mixin for spiders to easily access backend components
 
-- **Redis Integration**: The `redis` dependency suggests this extension provides Redis-based components (likely for distributed crawling, duplicate filtering, or scheduling)
-- **Settings**: Use `pydantic-settings` to define configuration classes that can be populated from environment variables or settings files
-- **Scrapy Integration**: Components should be registered via Scrapy's settings system (e.g., `EXTENSIONS`, `DOWNLOADER_MIDDLEWARES`, `ITEM_PIPELINES`)
+### Configuration
+
+Uses **pydantic-settings** with environment variable support:
+
+- **`Settings`**: Global settings (backend type, retry config)
+- **`RedisSettings`**: Redis-specific settings (`SCRAPY_REDIS_HOST`, `SCRAPY_REDIS_PORT`, etc.)
+
+### Connection Management
+
+**`ConnectionManager`** (`src/scrapy_extension/connection/manager.py`): Lazy singleton pattern with retry logic. Manages backend lifecycle and provides access to typed backend interfaces.
+
+### Request Serialization
+
+`BackendQueue` implements custom `_request_to_dict()` method (not using Scrapy's `request_to_dict`) to serialize:
+- URL, method, headers, body, cookies
+- Callback/errback function names
+- Meta, encoding, priority, flags, dont_filter
+
+Uses `JSONSerializer` for encoding/decoding.
+
+## Key Integration Points
+
+- Register components in Scrapy settings:
+  - `SCHEDULER = "scrapy_extension.components.scheduler.BackendScheduler"`
+  - `DUPEFILTER_CLASS = "scrapy_extension.components.dupefilter.BackendDupeFilter"`
+  - `ITEM_PIPELINES = {"scrapy_extension.components.pipeline.BackendPipeline": 300}`
+
+- Use `BackendSpiderMixin` and call `setup_backend()` in spider `__init__`
+- Backend type selection via `Settings.backend_type` or `SCRAPY_BACKEND_TYPE` env var
 
 ## Testing
 
-Tests are located in `tests/` directory (currently empty). The project uses **pytest**:
+Tests use pytest with mocked backends (no real Redis/MongoDB/Kafka/RabbitMQ required):
 
 ```bash
-# Run tests
+# Run all tests
 uv run pytest
 
-# Run with coverage (if configured)
-uv run pytest --cov=scrapy_extension
-
-# Run specific test
-uv run pytest tests/test_specific.py::test_function -v
+# Run with verbose output
+uv run pytest -v
 ```
 
 ## Type Hints
 
-This project includes a `py.typed` marker file, indicating it provides type information. All new code should include type annotations.
+Full type annotations required. Project includes `py.typed` marker file.
 
-## Development Workflow
+## Dependencies
 
-1. Make changes to source code in `src/scrapy_extension/`
-2. Run tests: `uv run pytest`
-3. Sync dependencies if needed: `uv sync`
-4. The `uv.lock` file should be committed when dependencies change
+### Runtime
+- `scrapy>=2.14.2` - Web crawling framework
+- `redis>=7.3.0` - Redis client (current MVP backend)
+- `pymongo>=4.5.0` - MongoDB client (planned)
+- `kafka-python>=2.0.2` - Kafka client (planned)
+- `pika>=1.3.2` - RabbitMQ client (planned)
+- `pydantic-settings>=2.13.1` - Configuration management
+
+### Development
+- `pytest>=9.0.2` - Testing framework
+- `ruff>=0.15.6` - Linting/formatting

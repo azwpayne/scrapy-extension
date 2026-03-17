@@ -13,356 +13,378 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 from scrapy_extension.backends.base import (
-    Backend,
-    BackendType,
-    QueueBackend,
-    SetBackend,
-    StorageBackend,
+  Backend,
+  BackendType,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
 )
-from scrapy_extension.exceptions import ConnectionError, QueueError
+from scrapy_extension.exceptions import BackendConnectionError, QueueError
 
 if TYPE_CHECKING:
-    from scrapy_extension.config.settings import RedisSettings
+  from scrapy_extension.config.settings import RedisSettings
 
 logger = logging.getLogger(__name__)
 
 
 class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
-    """Redis backend implementation.
+  """Redis backend implementation.
 
-    Implements all backend interfaces using Redis data structures:
-    - Queue: Redis Sorted Sets (ZADD/ZRANGEBYSCORE/ZREM)
-    - Set: Redis Sets (SADD/SREM/SISMEMBER/SCARD/DEL)
-    - Storage: Redis Strings with TTL (SET/GET/DEL/EXISTS/TTL)
+  Implements all backend interfaces using Redis data structures:
+  - Queue: Redis Sorted Sets (ZADD/ZRANGEBYSCORE/ZREM)
+  - Set: Redis Sets (SADD/SREM/SISMEMBER/SCARD/DEL)
+  - Storage: Redis Strings with TTL (SET/GET/DEL/EXISTS/TTL)
 
-    Supports standalone, sentinel, and cluster deployment modes.
+  Supports standalone, sentinel, and cluster deployment modes.
 
-    Attributes:
-        config: RedisSettings instance with connection parameters.
-        _client: The Redis client instance (None until connected).
+  Attributes:
+      config: RedisSettings instance with connection parameters.
+      _client: The Redis client instance (None until connected).
+  """
+
+  def __init__(self, config: RedisSettings) -> None:
+    """Initialize Redis backend.
+
+    Args:
+        config: Configuration for Redis connection.
     """
+    self.config = config
+    self._client: Redis | None = None
 
-    def __init__(self, config: RedisSettings) -> None:
-        """Initialize Redis backend.
+  def connect(self) -> None:
+    """Establish connection to Redis.
 
-        Args:
-            config: Configuration for Redis connection.
-        """
-        self.config = config
-        self._client: Redis | None = None
+    Creates a Redis client based on the configuration settings.
+    Does not verify the connection until first use.
 
-    def connect(self) -> None:
-        """Establish connection to Redis.
+    Raises:
+        ConnectionError: If the connection cannot be established.
+    """
+    try:
+      self._client = Redis(
+        host=self.config.host,
+        port=self.config.port,
+        db=self.config.db,
+        password=self.config.password,
+        decode_responses=False,  # Keep as bytes for consistency
+      )
+      # Verify connection
+      self._client.ping()
+    except RedisError as e:
+      msg = f"Failed to connect to Redis: {e}"
+      raise BackendConnectionError(
+        msg,
+        backend_type="redis",
+      ) from e
 
-        Creates a Redis client based on the configuration settings.
-        Does not verify the connection until first use.
+  def disconnect(self) -> None:
+    """Close Redis connection.
 
-        Raises:
-            ConnectionError: If the connection cannot be established.
-        """
-        try:
-            self._client = Redis(
-                host=self.config.host,
-                port=self.config.port,
-                db=self.config.db,
-                password=self.config.password,
-                decode_responses=False,  # Keep as bytes for consistency
-            )
-            # Verify connection
-            self._client.ping()
-        except RedisError as e:
-            raise ConnectionError(
-                f"Failed to connect to Redis: {e}",
-                backend_type="redis",
-            ) from e
+    Closes the connection pool and releases resources.
+    """
+    if self._client:
+      self._client.close()
+      self._client = None
 
-    def disconnect(self) -> None:
-        """Close Redis connection.
+  def is_connected(self) -> bool:
+    """Check if Redis is connected.
 
-        Closes the connection pool and releases resources.
-        """
-        if self._client:
-            self._client.close()
-            self._client = None
+    Returns:
+        True if connected and responding to ping, False otherwise.
+    """
+    try:
+      result = self._client.ping()
+      return bool(result) if result is not None else False
+    except RedisError:
+      return False
 
-    def is_connected(self) -> bool:
-        """Check if Redis is connected.
+  def ping(self) -> bool:
+    """Check Redis health.
 
-        Returns:
-            True if connected and responding to ping, False otherwise.
-        """
-        try:
-            result = self._client.ping()
-            return bool(result) if result is not None else False
-        except RedisError:
-            return False
+    Returns:
+        True if Redis responds to ping.
+    """
+    try:
+      result = self._client.ping() if self._client else False
+      return bool(result) if result is not None else False
+    except RedisError:
+      return False
 
-    def ping(self) -> bool:
-        """Check Redis health.
+  @property
+  def backend_type(self) -> BackendType:
+    """Return backend type.
 
-        Returns:
-            True if Redis responds to ping.
-        """
-        try:
-            result = self._client.ping() if self._client else False
-            return bool(result) if result is not None else False
-        except RedisError:
-            return False
+    Returns:
+        BackendType.REDIS
+    """
+    return BackendType.REDIS
 
-    @property
-    def backend_type(self) -> BackendType:
-        """Return backend type.
+  @property
+  def client(self) -> Redis:
+    """Get Redis client, connecting if necessary.
 
-        Returns:
-            BackendType.REDIS
-        """
-        return BackendType.REDIS
+    Returns:
+        The Redis client instance.
 
-    @property
-    def client(self) -> Redis:
-        """Get Redis client, connecting if necessary.
+    Raises:
+        ConnectionError: If not connected and connection fails.
+    """
+    if self._client is None:
+      self.connect()
+    return self._client  # type: ignore[return-value]
 
-        Returns:
-            The Redis client instance.
+  # QueueBackend implementation using Sorted Sets
+  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    """Push item to priority queue.
 
-        Raises:
-            ConnectionError: If not connected and connection fails.
-        """
-        if self._client is None:
-            self.connect()
-        return self._client  # type: ignore[return-value]
+    Uses Redis Sorted Set with priority as score.
+    Lower priority values = higher priority (processed first).
 
-    # QueueBackend implementation using Sorted Sets
-    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
-        """Push item to priority queue.
+    Args:
+        queue_name: Name of the queue.
+        item: Item to push (bytes).
+        priority: Priority value (lower = more urgent).
 
-        Uses Redis Sorted Set with priority as score.
-        Lower priority values = higher priority (processed first).
+    Raises:
+        QueueError: If the push operation fails.
+    """
+    try:
+      # Use negative priority so lower values (higher priority) have higher scores
+      # This makes zpopmax return highest priority items first
+      self.client.zadd(queue_name, {item: -priority})
+    except RedisError as e:
+      msg = f"Failed to push to queue {queue_name}: {e}"
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="push",
+      ) from e
 
-        Args:
-            queue_name: Name of the queue.
-            item: Item to push (bytes).
-            priority: Priority value (lower = more urgent).
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    """Pop highest priority item from queue.
 
-        Raises:
-            QueueError: If the push operation fails.
-        """
-        try:
-            # Use negative priority so lower values (higher priority) have higher scores
-            # This makes zpopmax return highest priority items first
-            self.client.zadd(queue_name, {item: -priority})
-        except RedisError as e:
-            raise QueueError(
-                f"Failed to push to queue {queue_name}: {e}",
-                queue_name=queue_name,
-                operation="push",
-            ) from e
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (0 = non-blocking).
 
-    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-        """Pop highest priority item from queue.
+    Returns:
+        The popped item, or None if queue is empty.
 
-        Args:
-            queue_name: Name of the queue.
-            timeout: Seconds to wait (0 = non-blocking).
+    Raises:
+        QueueError: If the pop operation fails.
+    """
+    try:
+      if timeout > 0:
+        # Use BZPOPMAX for blocking pop
+        result = self.client.bzpopmax(queue_name, timeout=timeout)
+        if result:
+          # result is (queue_name, item, score)
+          return result[1]  # type: ignore[index, return-value]
+        return None
+      else:
+        # Non-blocking pop - returns list of (item, score) tuples
+        result = self.client.zpopmax(queue_name)  # type: ignore[assignment]
+        if result and len(result) > 0:  # type: ignore[arg-type]
+          return result[0][0]  # type: ignore[index, return-value]
+        return None
+    except RedisError as e:
+      msg = f"Failed to pop from queue {queue_name}: {e}"
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="pop",
+      ) from e
 
-        Returns:
-            The popped item, or None if queue is empty.
+  def queue_len(self, queue_name: str) -> int:
+    """Get queue length.
 
-        Raises:
-            QueueError: If the pop operation fails.
-        """
-        try:
-            if timeout > 0:
-                # Use BZPOPMAX for blocking pop
-                result = self.client.bzpopmax(queue_name, timeout=timeout)
-                if result:
-                    # result is (queue_name, item, score)
-                    return result[1]  # type: ignore[index, return-value]
-                return None
-            else:
-                # Non-blocking pop - returns list of (item, score) tuples
-                result = self.client.zpopmax(queue_name)  # type: ignore[assignment]
-                if result and len(result) > 0:  # type: ignore[arg-type]
-                    return result[0][0]  # type: ignore[index, return-value]
-                return None
-        except RedisError as e:
-            raise QueueError(
-                f"Failed to pop from queue {queue_name}: {e}",
-                queue_name=queue_name,
-                operation="pop",
-            ) from e
+    Args:
+        queue_name: Name of the queue.
 
-    def len(self, queue_name: str) -> int:
-        """Get queue length.
+    Returns:
+        Number of items in the queue.
+    """
+    try:
+      return int(self.client.zcard(queue_name))  # type: ignore[arg-type, return-value]
+    except RedisError:
+      return 0
 
-        Args:
-            queue_name: Name of the queue.
+  def clear_queue(self, queue_name: str) -> None:
+    """Clear all items from queue.
 
-        Returns:
-            Number of items in the queue.
-        """
-        try:
-            return int(self.client.zcard(queue_name))  # type: ignore[arg-type, return-value]
-        except RedisError:
-            return 0
+    Args:
+        queue_name: Name of the queue.
+    """
+    try:
+      self.client.delete(queue_name)
+    except RedisError as e:
+      logger.warning("Failed to clear queue %s: %s", queue_name, e)
 
-    def clear(self, queue_name: str) -> None:
-        """Clear all items from queue.
+  # SetBackend implementation using Redis Sets
+  def add(self, set_name: str, item: bytes) -> bool:
+    """Add item to set.
 
-        Args:
-            queue_name: Name of the queue.
-        """
-        try:
-            self.client.delete(queue_name)
-        except RedisError as e:
-            logger.warning(f"Failed to clear queue {queue_name}: {e}")
+    Args:
+        set_name: Name of the set.
+        item: Item to add (bytes).
 
-    # SetBackend implementation using Redis Sets
-    def add(self, set_name: str, item: bytes) -> bool:
-        """Add item to set.
+    Returns:
+        True if added, False if already existed.
+    """
+    try:
+      return self.client.sadd(set_name, item) == 1
+    except RedisError:
+      return False
 
-        Args:
-            set_name: Name of the set.
-            item: Item to add (bytes).
+  def remove(self, set_name: str, item: bytes) -> bool:
+    """Remove item from set.
 
-        Returns:
-            True if added, False if already existed.
-        """
-        try:
-            return self.client.sadd(set_name, item) == 1
-        except RedisError:
-            return False
+    Args:
+        set_name: Name of the set.
+        item: Item to remove.
 
-    def remove(self, set_name: str, item: bytes) -> bool:
-        """Remove item from set.
+    Returns:
+        True if removed, False if didn't exist.
+    """
+    try:
+      return self.client.srem(set_name, item) == 1
+    except RedisError:
+      return False
 
-        Args:
-            set_name: Name of the set.
-            item: Item to remove.
+  def contains(self, set_name: str, item: bytes) -> bool:
+    """Check if item is in set.
 
-        Returns:
-            True if removed, False if didn't exist.
-        """
-        try:
-            return self.client.srem(set_name, item) == 1
-        except RedisError:
-            return False
+    Args:
+        set_name: Name of the set.
+        item: Item to check.
 
-    def contains(self, set_name: str, item: bytes) -> bool:
-        """Check if item is in set.
+    Returns:
+        True if item exists in the set.
+    """
+    try:
+      result = self.client.sismember(set_name, item)  # type: ignore[arg-type]
+      return bool(result)  # type: ignore[arg-type]
+    except RedisError:
+      return False
 
-        Args:
-            set_name: Name of the set.
-            item: Item to check.
+  def set_len(self, set_name: str) -> int:
+    """Get set size.
 
-        Returns:
-            True if item exists in the set.
-        """
-        try:
-            result = self.client.sismember(set_name, item)  # type: ignore[arg-type]
-            return bool(result)  # type: ignore[arg-type]
-        except RedisError:
-            return False
+    Args:
+        set_name: Name of the set.
 
-    def set_len(self, set_name: str) -> int:
-        """Get set size.
+    Returns:
+        Number of items in the set.
+    """
+    try:
+      return int(self.client.scard(set_name))  # type: ignore[arg-type, return-value]
+    except RedisError:
+      return 0
 
-        Args:
-            set_name: Name of the set.
+  def clear_set(self, set_name: str) -> None:
+    """Clear all items from set.
 
-        Returns:
-            Number of items in the set.
-        """
-        try:
-            return int(self.client.scard(set_name))  # type: ignore[arg-type, return-value]
-        except RedisError:
-            return 0
+    Args:
+        set_name: Name of the set.
+    """
+    try:
+      self.client.delete(set_name)
+    except RedisError as e:
+      logger.warning("Failed to clear set %s: %s", set_name, e)
 
-    def clear_set(self, set_name: str) -> None:
-        """Clear all items from set.
+  # StorageBackend implementation using Redis Strings
+  def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
+    """Store data with key.
 
-        Args:
-            set_name: Name of the set.
-        """
-        try:
-            self.client.delete(set_name)
-        except RedisError as e:
-            logger.warning(f"Failed to clear set {set_name}: {e}")
+    Args:
+        key: Storage key.
+        data: Data to store (bytes).
+        ttl: Optional time-to-live in seconds.
+    """
+    try:
+      if ttl:
+        self.client.setex(key, ttl, data)
+      else:
+        self.client.set(key, data)
+    except RedisError as e:
+      logger.warning("Failed to store key %s: %s", key, e)
 
-    # StorageBackend implementation using Redis Strings
-    def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-        """Store data with key.
+  def retrieve(self, key: str) -> bytes | None:
+    """Retrieve data by key.
 
-        Args:
-            key: Storage key.
-            data: Data to store (bytes).
-            ttl: Optional time-to-live in seconds.
-        """
-        try:
-            if ttl:
-                self.client.setex(key, ttl, data)
-            else:
-                self.client.set(key, data)
-        except RedisError as e:
-            logger.warning(f"Failed to store key {key}: {e}")
+    Args:
+        key: Storage key.
 
-    def retrieve(self, key: str) -> bytes | None:
-        """Retrieve data by key.
+    Returns:
+        Stored data, or None if not found.
+    """
+    try:
+      return self.client.get(key)
+    except RedisError:
+      return None
 
-        Args:
-            key: Storage key.
+  def delete(self, key: str) -> bool:
+    """Delete data by key.
 
-        Returns:
-            Stored data, or None if not found.
-        """
-        try:
-            return self.client.get(key)
-        except RedisError:
-            return None
+    Args:
+        key: Storage key.
 
-    def delete(self, key: str) -> bool:
-        """Delete data by key.
+    Returns:
+        True if deleted, False if didn't exist.
+    """
+    try:
+      return self.client.delete(key) == 1
+    except RedisError:
+      return False
 
-        Args:
-            key: Storage key.
+  def exists(self, key: str) -> bool:
+    """Check if key exists.
 
-        Returns:
-            True if deleted, False if didn't exist.
-        """
-        try:
-            return self.client.delete(key) == 1
-        except RedisError:
-            return False
+    Args:
+        key: Storage key.
 
-    def exists(self, key: str) -> bool:
-        """Check if key exists.
+    Returns:
+        True if key exists.
+    """
+    try:
+      return self.client.exists(key) == 1
+    except RedisError:
+      return False
 
-        Args:
-            key: Storage key.
+  def ttl(self, key: str) -> int | None:
+    """Get remaining time-to-live.
 
-        Returns:
-            True if key exists.
-        """
-        try:
-            return self.client.exists(key) == 1
-        except RedisError:
-            return False
+    Args:
+        key: Storage key.
 
-    def ttl(self, key: str) -> int | None:
-        """Get remaining time-to-live.
+    Returns:
+        Seconds remaining, None if no TTL, -1 if expired.
+    """
+    try:
+      result = self.client.ttl(key)
+      if result == -1:
+        return None  # No TTL set
+      if result == -2:
+        return -1  # Key doesn't exist/expired
+      return result
+    except RedisError:
+      return None
 
-        Args:
-            key: Storage key.
+  def clear_storage(self, prefix: str | None = None) -> None:
+    """Clear all stored data, optionally filtered by prefix.
 
-        Returns:
-            Seconds remaining, None if no TTL, -1 if expired.
-        """
-        try:
-            result = self.client.ttl(key)
-            if result == -1:
-                return None  # No TTL set
-            if result == -2:
-                return -1  # Key doesn't exist/expired
-            return result
-        except RedisError:
-            return None
+    Args:
+        prefix: If provided, only clear keys starting with this prefix.
+               If None, clear all storage data.
+    """
+    try:
+      if prefix:
+        # Use scan + delete for prefixed keys
+        pattern = f"{prefix}*"
+        for key in self.client.scan_iter(match=pattern):
+          self.client.delete(key)
+      else:
+        # Clear all keys in the current database
+        self.client.flushdb()
+    except RedisError as e:
+      logger.warning("Failed to clear storage: %s", e)

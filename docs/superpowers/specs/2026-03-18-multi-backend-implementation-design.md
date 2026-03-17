@@ -20,14 +20,26 @@ This document specifies the implementation of MongoDB, Kafka, and RabbitMQ backe
 
 ## Architecture
 
+### Protocol Method Naming
+
+To avoid method name collisions when a class implements multiple protocols, all protocol methods use prefixed names:
+
+| Protocol | Methods |
+|----------|---------|
+| `QueueBackend` | `push()`, `pop()`, `queue_len()`, `clear_queue()` |
+| `SetBackend` | `add()`, `remove()`, `contains()`, `set_len()`, `clear_set()` |
+| `StorageBackend` | `store()`, `retrieve()`, `delete()`, `exists()`, `ttl()`, `clear_storage()` |
+
 ### Protocol Compliance Matrix
 
 | Backend | Backend | QueueBackend | SetBackend | StorageBackend |
 |---------|---------|--------------|------------|----------------|
 | Redis | ✅ | ✅ | ✅ | ✅ |
 | MongoDB | ✅ | ✅ | ✅ | ✅ |
-| Kafka | ✅ | ✅ | ❌ | ❌ |
-| RabbitMQ | ✅ | ✅ | ❌ | ❌ |
+| Kafka | ✅ | ✅ | ❌ N/A | ❌ N/A |
+| RabbitMQ | ✅ | ✅ | ❌ N/A | ❌ N/A |
+
+**Note:** Kafka and RabbitMQ only implement QueueBackend. SetBackend and StorageBackend operations raise `NotImplementedError` as message queues are architecturally unsuitable for these use cases.
 
 ### 1. MongoDB Backend
 
@@ -79,10 +91,10 @@ This document specifies the implementation of MongoDB, Kafka, and RabbitMQ backe
 - Atomic operation ensures no race conditions
 - Blocking implementation using cursor with timeout
 
-**QueueBackend.len()**
+**QueueBackend.queue_len()**
 - `count_documents({queue_name: name})`
 
-**QueueBackend.clear()**
+**QueueBackend.clear_queue()**
 - `delete_many({queue_name: name})`
 
 **SetBackend.add()**
@@ -93,8 +105,11 @@ This document specifies the implementation of MongoDB, Kafka, and RabbitMQ backe
 **SetBackend.contains()**
 - `find_one({set_name, item_hash})` is not None
 
-**SetBackend.len()**
+**SetBackend.set_len()**
 - `count_documents({set_name: name})`
+
+**SetBackend.clear_set()**
+- `delete_many({set_name: name})`
 
 **StorageBackend.store()**
 - `replace_one({key}, doc, upsert=True)`
@@ -103,9 +118,21 @@ This document specifies the implementation of MongoDB, Kafka, and RabbitMQ backe
 **StorageBackend.retrieve()**
 - `find_one({key})` return data field
 
+**StorageBackend.delete()**
+- `delete_one({key})`
+- Return True if deleted_count > 0
+
+**StorageBackend.exists()**
+- `find_one({key}, {key: 1})` is not None
+
 **StorageBackend.ttl()**
 - `find_one({key}, {expireAt: 1})`
 - Calculate remaining seconds
+- **Note:** MongoDB TTL has ~60 second granularity
+
+**StorageBackend.clear_storage()**
+- `delete_many({})` if no prefix
+- `delete_many({key: {"$regex": f"^{prefix}"}})` if prefix provided
 
 #### Configuration
 
@@ -144,6 +171,7 @@ Kafka is a distributed event streaming platform. It excels at queue semantics bu
 - Use multiple partitions: priority 0 → partition 0, priority 1 → partition 1, etc.
 - Consumers prioritize lower partition numbers
 - Configurable max partitions (default: 10)
+- **Limitation:** Priority range limited to 0-(max_partitions-1), max 255 per protocol
 
 #### Implementation Details
 
@@ -161,17 +189,18 @@ self._producer.send(
 - Non-blocking: poll all partitions, prioritize lower partition numbers
 - Blocking: use consumer with timeout, round-robin through partitions
 
-**QueueBackend.len()**
+**QueueBackend.queue_len()**
 - Sum end offsets across all partitions minus current position
-- Note: Eventually consistent
+- **Note:** Eventually consistent, use for monitoring only
 
-**QueueBackend.clear()**
+**QueueBackend.clear_queue()**
 - Delete and recreate topic (requires admin client)
 - Or use compacted topic and tombstone records
 
 **SetBackend & StorageBackend**
-- Raise `NotImplementedError` with clear message
-- Document that Kafka is queue-only backend
+- Raise `NotImplementedError` with clear message:
+  - `"Kafka backend does not support set operations. Use MongoDB or Redis for SetBackend."`
+  - `"Kafka backend does not support storage operations. Use MongoDB or Redis for StorageBackend."`
 
 #### Configuration
 
@@ -180,7 +209,7 @@ class KafkaSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SCRAPY_KAFKA_")
 
     bootstrap_servers: str = "localhost:9092"
-    max_priority_partitions: int = 10
+    max_priority_partitions: int = Field(default=10, ge=1, le=255)
 
     # Producer settings
     acks: str | int = "all"  # 0, 1, "all"
@@ -212,6 +241,7 @@ RabbitMQ is an AMQP message broker with native priority queue support.
 **Queue Declaration**
 - Use `x-max-priority` argument (max 255 per AMQP spec)
 - Priority 0-255, higher = more urgent
+- **Performance Note:** Priorities > 5 can impact performance
 
 #### Implementation Details
 
@@ -238,15 +268,16 @@ if method:
 return None
 ```
 
-**QueueBackend.len()**
+**QueueBackend.queue_len()**
 - `queue_declare(passive=True)` returns message_count
 
-**QueueBackend.clear()**
+**QueueBackend.clear_queue()**
 - `queue_purge()` removes all messages
 
 **SetBackend & StorageBackend**
-- Raise `NotImplementedError`
-- Document that RabbitMQ is queue-only backend
+- Raise `NotImplementedError` with clear message:
+  - `"RabbitMQ backend does not support set operations. Use MongoDB or Redis for SetBackend."`
+  - `"RabbitMQ backend does not support storage operations. Use MongoDB or Redis for StorageBackend."`
 
 #### Configuration
 
@@ -261,7 +292,7 @@ class RabbitMQSettings(BaseSettings):
     virtual_host: str = "/"
 
     # Connection settings
-    max_priority: int = 255
+    max_priority: int = Field(default=255, ge=1, le=255)
     heartbeat: int = 600
     blocked_connection_timeout: int = 300
 
@@ -289,9 +320,51 @@ _SETTINGS: dict[BackendType, type[BaseSettings]] = {
     BackendType.KAFKA: KafkaSettings,
     BackendType.RABBITMQ: RabbitMQSettings,
 }
+
+class ConnectionManager:
+    """Manages backend connections with lazy initialization."""
+
+    def __init__(self) -> None:
+        self._backend: Backend | None = None
+        self._settings: Settings = Settings()
+
+    def _create_backend(self) -> Backend:
+        """Create backend instance based on settings."""
+        backend_type = self._settings.backend_type
+        backend_class = _BACKENDS[backend_type]
+        settings_class = _SETTINGS[backend_type]
+        config = settings_class()
+        return backend_class(config)
+
+    def get_backend(self) -> Backend:
+        """Get or create backend instance."""
+        if self._backend is None:
+            self._backend = self._create_backend()
+            self._backend.connect()
+        return self._backend
 ```
 
-### 5. Error Handling
+### 5. Dependency Management
+
+Add optional dependencies to `pyproject.toml`:
+
+```toml
+[project.optional-dependencies]
+mongodb = ["pymongo>=4.5.0"]
+kafka = ["kafka-python>=2.0.2"]
+rabbitmq = ["pika>=1.3.2"]
+all = ["pymongo>=4.5.0", "kafka-python>=2.0.2", "pika>=1.3.2"]
+```
+
+Install with specific backend:
+```bash
+pip install scrapy-extension[mongodb]
+pip install scrapy-extension[kafka]
+pip install scrapy-extension[rabbitmq]
+pip install scrapy-extension[all]  # All backends
+```
+
+### 6. Error Handling
 
 Each backend should wrap client exceptions into `scrapy-extension` exceptions:
 
@@ -302,18 +375,44 @@ Each backend should wrap client exceptions into `scrapy-extension` exceptions:
 | `kafka.errors.KafkaError` | `BackendConnectionError` / `QueueError` |
 | `pika.exceptions.AMQPError` | `BackendConnectionError` / `QueueError` |
 
-### 6. Testing Strategy
+### 7. Testing Strategy
 
 Each backend requires:
 
 1. **Unit tests** with mocked clients (no real services)
 2. **Integration tests** marked with `pytest.mark.integration` (require real services)
 
-Test coverage requirements:
-- All protocol methods
+**Mocking Strategy:**
+
+| Backend | Mocking Approach |
+|---------|-----------------|
+| MongoDB | `mongomock` library or `unittest.mock.MagicMock` |
+| Kafka | Custom mock classes (Producer/Consumer/AdminClient) |
+| RabbitMQ | `unittest.mock.MagicMock` with pika structures |
+
+**Test Coverage Requirements:**
+- All protocol methods (both success and failure paths)
 - Connection/disconnection scenarios
-- Error conditions
+- Error conditions and exception mapping
 - Configuration validation
+- Edge cases (empty queues, non-existent keys, etc.)
+
+**Example Test Pattern:**
+```python
+def test_mongodb_backend_push_pop():
+    mock_collection = MagicMock()
+    backend = MongoDBBackend(mock_config)
+    backend._queue_collection = mock_collection
+
+    # Test push
+    backend.push("test_queue", b"item", priority=1.0)
+    mock_collection.insert_one.assert_called_once()
+
+    # Test pop
+    mock_collection.find_one_and_delete.return_value = {"item": b"item"}
+    result = backend.pop("test_queue")
+    assert result == b"item"
+```
 
 ## Implementation Order
 
@@ -321,14 +420,15 @@ Test coverage requirements:
 2. **Kafka Backend** - Queue-only, complex configuration
 3. **RabbitMQ Backend** - Queue-only, simpler configuration
 
-## Risks and Mitigations
+## Known Limitations
 
-| Risk | Mitigation |
-|------|------------|
-| MongoDB atomic pop race condition | Use `find_one_and_delete` which is atomic |
-| Kafka eventual consistency for len() | Document behavior, use for monitoring only |
-| RabbitMQ priority queue performance | Document that priorities > 5 impact performance |
-| Configuration drift between backends | Shared base settings, clear env var prefixes |
+| Backend | Limitation | Mitigation |
+|---------|------------|------------|
+| MongoDB | TTL granularity ~60 seconds | Document limitation, design for coarse expiration |
+| Kafka | Priority limited to max_partitions | Configurable, document trade-off |
+| Kafka | queue_len() eventually consistent | Use for monitoring only |
+| RabbitMQ | Priorities > 5 impact performance | Document recommendation to use 0-5 |
+| Kafka/RabbitMQ | No Set/Storage support | Use MongoDB or Redis for these needs |
 
 ## Migration Path
 
@@ -338,10 +438,13 @@ Existing Redis users are unaffected. To use new backends:
 2. Set `SCRAPY_BACKEND_TYPE=mongodb`
 3. Configure backend-specific settings via env vars
 
-## Open Questions
+## Future Considerations (Out of Scope)
 
-1. Should we provide a `HybridBackend` that uses different backends for different components (e.g., Kafka for queue, MongoDB for set/storage)?
-2. Should Kafka/RabbitMQ backends delegate Set/Storage to a secondary backend (e.g., Redis) rather than raising NotImplementedError?
+The following are explicitly deferred to future phases:
+
+1. **HybridBackend**: Using different backends for different components (e.g., Kafka for queue, MongoDB for set/storage)
+2. **Delegation Pattern**: Having Kafka/RabbitMQ delegate Set/Storage to a secondary backend
+3. **Backend Migration Tools**: Moving data between backends
 
 ## Success Criteria
 
@@ -350,4 +453,5 @@ Existing Redis users are unaffected. To use new backends:
 - [ ] 100% protocol method coverage for all backends
 - [ ] Configuration classes with environment variable support
 - [ ] Documentation with usage examples
-- [ ] Performance benchmarks (optional but recommended)
+- [ ] Optional dependencies properly declared in pyproject.toml
+- [ ] All protocol method names use prefixed naming convention
