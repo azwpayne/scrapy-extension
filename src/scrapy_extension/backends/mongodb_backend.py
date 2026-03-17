@@ -295,27 +295,95 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     self._set_collection.delete_many({"set_name": set_name})
 
-  # StorageBackend methods (stubs for now)
+  # StorageBackend implementation
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-    """Store data with a key."""
-    raise NotImplementedError("store not implemented yet")
+    """Store data with key.
+
+    Args:
+        key: Storage key.
+        data: Data to store (bytes).
+        ttl: Optional time-to-live in seconds.
+    """
+    doc = {
+      "key": key,
+      "data": data,
+    }
+    if ttl is not None:
+      doc["expireAt"] = datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
+
+    self._storage_collection.replace_one(
+      {"key": key},
+      doc,
+      upsert=True,
+    )
 
   def retrieve(self, key: str) -> bytes | None:
-    """Retrieve data by key."""
-    raise NotImplementedError("retrieve not implemented yet")
+    """Retrieve data by key.
+
+    Args:
+        key: Storage key.
+
+    Returns:
+        Stored data, or None if not found.
+    """
+    result = self._storage_collection.find_one({"key": key})
+    if result:
+      return result.get("data")
+    return None
 
   def delete(self, key: str) -> bool:
-    """Delete data by key."""
-    raise NotImplementedError("delete not implemented yet")
+    """Delete data by key.
+
+    Args:
+        key: Storage key.
+
+    Returns:
+        True if deleted, False if didn't exist.
+    """
+    result = self._storage_collection.delete_one({"key": key})
+    return result.deleted_count > 0
 
   def exists(self, key: str) -> bool:
-    """Check if a key exists."""
-    raise NotImplementedError("exists not implemented yet")
+    """Check if key exists.
+
+    Args:
+        key: Storage key.
+
+    Returns:
+        True if key exists.
+    """
+    result = self._storage_collection.find_one({"key": key}, {"_id": 1})
+    return result is not None
 
   def ttl(self, key: str) -> int | None:
-    """Get the remaining time-to-live for a key."""
-    raise NotImplementedError("ttl not implemented yet")
+    """Get remaining time-to-live.
+
+    Args:
+        key: Storage key.
+
+    Returns:
+        Seconds remaining, None if no TTL, -1 if expired.
+    """
+    result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
+    if result is None:
+      return -1
+    if "expireAt" not in result:
+      return None
+
+    expire_at = result["expireAt"]
+    remaining = (expire_at - datetime.now(tz=timezone.utc)).total_seconds()
+    return max(0, int(remaining))
 
   def clear_storage(self, prefix: str | None = None) -> None:
-    """Clear all stored data, optionally filtered by prefix."""
-    raise NotImplementedError("clear_storage not implemented yet")
+    """Clear all stored data, optionally filtered by prefix.
+
+    Args:
+        prefix: If provided, only clear keys starting with this prefix.
+               If None, clear all storage data.
+    """
+    if prefix:
+      import re
+      pattern = re.escape(prefix)
+      self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
+    else:
+      self._storage_collection.delete_many({})

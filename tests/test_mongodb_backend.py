@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from scrapy_extension.backends.mongodb_backend import MongoDBBackend
 from scrapy_extension.config.settings import MongoDBSettings
@@ -174,3 +175,65 @@ def test_mongodb_backend_clear_set():
 
         backend.clear_set("test_set")
         mock_collection.delete_many.assert_called_once_with({"set_name": "test_set"})
+
+
+def test_mongodb_backend_storage_operations():
+    """Test MongoDB backend storage operations."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+
+    with patch("scrapy_extension.backends.mongodb_backend.MongoClient"):
+        backend.connect()
+        mock_collection = MagicMock()
+        backend._storage_collection = mock_collection
+
+        # Test store
+        backend.store("test_key", b"test_data")
+        mock_collection.replace_one.assert_called_once()
+
+        # Test retrieve
+        mock_collection.find_one.return_value = {"key": "test_key", "data": b"test_data"}
+        result = backend.retrieve("test_key")
+        assert result == b"test_data"
+
+        # Test exists
+        result = backend.exists("test_key")
+        assert result is True
+
+        # Test delete
+        mock_delete_result = MagicMock()
+        mock_delete_result.deleted_count = 1
+        mock_collection.delete_one.return_value = mock_delete_result
+        result = backend.delete("test_key")
+        assert result is True
+
+
+def test_mongodb_backend_storage_ttl():
+    """Test MongoDB backend storage TTL."""
+    from datetime import datetime, timedelta, timezone
+
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+
+    with patch("scrapy_extension.backends.mongodb_backend.MongoClient"):
+        backend.connect()
+        mock_collection = MagicMock()
+        backend._storage_collection = mock_collection
+
+        # Test with TTL
+        future_time = datetime.now(tz=timezone.utc) + timedelta(seconds=3600)
+        mock_collection.find_one.return_value = {"key": "test_key", "expireAt": future_time}
+
+        result = backend.ttl("test_key")
+        assert result is not None
+        assert 3590 <= result <= 3600  # Allow for execution time
+
+        # Test without TTL
+        mock_collection.find_one.return_value = {"key": "test_key"}
+        result = backend.ttl("test_key")
+        assert result is None
+
+        # Test non-existent key
+        mock_collection.find_one.return_value = None
+        result = backend.ttl("missing_key")
+        assert result == -1
