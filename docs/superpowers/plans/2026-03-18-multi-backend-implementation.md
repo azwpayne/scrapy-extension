@@ -1391,74 +1391,9 @@ class KafkaBackend(Backend, QueueBackend):
         except KafkaError as e:
             logger.warning("Failed to clear queue %s: %s", queue_name, e)
 
-    # SetBackend - Not Implemented
-    def add(self, set_name: str, item: bytes) -> bool:
-        raise NotImplementedError(
-            "Kafka backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def remove(self, set_name: str, item: bytes) -> bool:
-        raise NotImplementedError(
-            "Kafka backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def contains(self, set_name: str, item: bytes) -> bool:
-        raise NotImplementedError(
-            "Kafka backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def set_len(self, set_name: str) -> int:
-        raise NotImplementedError(
-            "Kafka backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    def clear_set(self, set_name: str) -> None:
-        raise NotImplementedError(
-            "Kafka backend does not support set operations. "
-            "Use MongoDB or Redis for SetBackend."
-        )
-
-    # StorageBackend - Not Implemented
-    def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-        raise NotImplementedError(
-            "Kafka backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def retrieve(self, key: str) -> bytes | None:
-        raise NotImplementedError(
-            "Kafka backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def delete(self, key: str) -> bool:
-        raise NotImplementedError(
-            "Kafka backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def exists(self, key: str) -> bool:
-        raise NotImplementedError(
-            "Kafka backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def ttl(self, key: str) -> int | None:
-        raise NotImplementedError(
-            "Kafka backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def clear_storage(self, prefix: str | None = None) -> None:
-        raise NotImplementedError(
-            "Kafka backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-```
+    # Note: KafkaBackend only implements QueueBackend
+    # SetBackend and StorageBackend methods are not included
+    # because Kafka only supports queue operations
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1490,16 +1425,16 @@ def test_kafka_backend_push():
         assert call_kwargs["partition"] == 1
 
 
-def test_kafka_backend_not_implemented_methods():
-    """Test that Set/Storage methods raise NotImplementedError."""
+def test_kafka_backend_only_implements_queuebackend():
+    """Test that KafkaBackend only implements QueueBackend protocol."""
+    from scrapy_extension.backends.base import QueueBackend, Backend
+
     config = KafkaSettings()
     backend = KafkaBackend(config)
 
-    with pytest.raises(NotImplementedError, match="Kafka backend does not support"):
-        backend.add("test_set", b"item")
-
-    with pytest.raises(NotImplementedError, match="Kafka backend does not support"):
-        backend.store("key", b"data")
+    # Should implement Backend and QueueBackend
+    assert isinstance(backend, Backend)
+    assert isinstance(backend, QueueBackend)
 ```
 
 - [ ] **Step 6: Run tests**
@@ -1962,42 +1897,9 @@ class RabbitMQBackend(Backend, QueueBackend):
             "Use MongoDB or Redis for SetBackend."
         )
 
-    # StorageBackend - Not Implemented
-    def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def retrieve(self, key: str) -> bytes | None:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def delete(self, key: str) -> bool:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def exists(self, key: str) -> bool:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def ttl(self, key: str) -> int | None:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
-
-    def clear_storage(self, prefix: str | None = None) -> None:
-        raise NotImplementedError(
-            "RabbitMQ backend does not support storage operations. "
-            "Use MongoDB or Redis for StorageBackend."
-        )
+    # Note: RabbitMQBackend only implements QueueBackend
+    # SetBackend and StorageBackend methods are not included
+    # because RabbitMQ only supports queue operations
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -2027,18 +1929,6 @@ def test_rabbitmq_backend_push():
         call_kwargs = mock_channel.basic_publish.call_args[1]
         assert call_kwargs["routing_key"] == "test_queue"
         assert call_kwargs["body"] == b"test_item"
-
-
-def test_rabbitmq_backend_not_implemented_methods():
-    """Test that Set/Storage methods raise NotImplementedError."""
-    config = RabbitMQSettings()
-    backend = RabbitMQBackend(config)
-
-    with pytest.raises(NotImplementedError, match="RabbitMQ backend does not support"):
-        backend.add("test_set", b"item")
-
-    with pytest.raises(NotImplementedError, match="RabbitMQ backend does not support"):
-        backend.store("key", b"data")
 ```
 
 - [ ] **Step 6: Run tests**
@@ -2059,7 +1949,36 @@ git commit -m "feat: add RabbitMQBackend implementation"
 
 **Files:**
 - Modify: `src/scrapy_extension/connection/manager.py`
-- Test: `tests/test_connection_manager.py`
+- Create: `tests/test_connection_manager.py`
+
+- [ ] **Step 0: Create test file**
+
+Create `tests/test_connection_manager.py`:
+
+```python
+"""Tests for connection manager."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from scrapy_extension.backends.base import BackendType
+from scrapy_extension.connection.manager import ConnectionManager
+
+
+def test_connection_manager_get_manager_singleton():
+    """Test that get_manager returns singleton for same params."""
+    manager1 = ConnectionManager.get_manager(BackendType.REDIS)
+    manager2 = ConnectionManager.get_manager(BackendType.REDIS)
+    assert manager1 is manager2
+
+
+def test_connection_manager_different_params():
+    """Test that different params return different managers."""
+    manager1 = ConnectionManager.get_manager(BackendType.REDIS, {"host": "localhost"})
+    manager2 = ConnectionManager.get_manager(BackendType.REDIS, {"host": "other"})
+    assert manager1 is not manager2
+```
 
 - [ ] **Step 1: Write failing test for multi-backend support**
 
@@ -2085,69 +2004,9 @@ def test_connection_manager_create_mongodb_backend():
 Run: `pytest tests/test_connection_manager.py::test_connection_manager_create_mongodb_backend -v`
 Expected: FAIL
 
-- [ ] **Step 3: Update ConnectionManager with registry pattern**
+- [ ] **Step 3: Update ConnectionManager _create_backend method**
 
-Modify `src/scrapy_extension/connection/manager.py`:
-
-```python
-# Add at top with imports
-from scrapy_extension.config.settings import (
-    KafkaSettings,
-    MongoDBSettings,
-    RabbitMQSettings,
-    RedisSettings,
-)
-
-# Add after imports
-_BACKENDS: dict[BackendType, type] = {}
-_SETTINGS: dict[BackendType, type] = {}
-
-def _register_backend(backend_type: BackendType, backend_class, settings_class):
-    """Register a backend type."""
-    _BACKENDS[backend_type] = backend_class
-    _SETTINGS[backend_type] = settings_class
-
-
-# Register built-in backends
-def _register_builtin_backends():
-    from scrapy_extension.backends.redis_backend import RedisBackend
-
-    _register_backend(BackendType.REDIS, RedisBackend, RedisSettings)
-
-def _create_backend(backend_type: BackendType, settings: dict) -> Backend:
-    """Create a backend instance based on type.
-
-    Args:
-        backend_type: The type of backend to create.
-        settings: Backend-specific settings dictionary.
-
-    Returns:
-        A new backend instance.
-
-    Raises:
-        ValueError: If the backend type is not supported.
-    """
-    if backend_type not in _BACKENDS:
-        # Lazy import for optional dependencies
-        if backend_type == BackendType.MONGODB:
-            from scrapy_extension.backends.mongodb_backend import MongoDBBackend
-            _register_backend(BackendType.MONGODB, MongoDBBackend, MongoDBSettings)
-        elif backend_type == BackendType.KAFKA:
-            from scrapy_extension.backends.kafka_backend import KafkaBackend
-            _register_backend(BackendType.KAFKA, KafkaBackend, KafkaSettings)
-        elif backend_type == BackendType.RABBITMQ:
-            from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
-            _register_backend(BackendType.RABBITMQ, RabbitMQBackend, RabbitMQSettings)
-        else:
-            raise ValueError(f"Unsupported backend type: {backend_type}")
-
-    backend_class = _BACKENDS[backend_type]
-    settings_class = _SETTINGS[backend_type]
-    config = settings_class(**settings)
-    return backend_class(config)
-```
-
-Then update the `_create_backend` method in `ConnectionManager` class:
+Modify the `_create_backend` method in `src/scrapy_extension/connection/manager.py`:
 
 ```python
     def _create_backend(self) -> Backend:
@@ -2159,10 +2018,33 @@ Then update the `_create_backend` method in `ConnectionManager` class:
         Raises:
             ValueError: If the backend type is not supported.
         """
-        return _create_backend(self.backend_type, self.settings)
-```
+        if self.backend_type == BackendType.REDIS:
+            from scrapy_extension.backends.redis_backend import RedisBackend
+            from scrapy_extension.config.settings import RedisSettings
 
-Also update the top-level imports to use lazy imports.
+            config = RedisSettings(**self.settings)
+            return RedisBackend(config)
+        elif self.backend_type == BackendType.MONGODB:
+            from scrapy_extension.backends.mongodb_backend import MongoDBBackend
+            from scrapy_extension.config.settings import MongoDBSettings
+
+            config = MongoDBSettings(**self.settings)
+            return MongoDBBackend(config)
+        elif self.backend_type == BackendType.KAFKA:
+            from scrapy_extension.backends.kafka_backend import KafkaBackend
+            from scrapy_extension.config.settings import KafkaSettings
+
+            config = KafkaSettings(**self.settings)
+            return KafkaBackend(config)
+        elif self.backend_type == BackendType.RABBITMQ:
+            from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
+            from scrapy_extension.config.settings import RabbitMQSettings
+
+            config = RabbitMQSettings(**self.settings)
+            return RabbitMQBackend(config)
+        else:
+            raise ValueError(f"Unsupported backend type: {self.backend_type}")
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
