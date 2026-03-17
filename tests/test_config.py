@@ -136,3 +136,13 @@ def test_kafka_settings_from_env(monkeypatch):
     settings = KafkaSettings()
     assert settings.bootstrap_servers == "kafka.example.com:9092"
     assert settings.group_id == "my-group"
+
+
+def test_rabbitmq_settings_defaults():
+    from scrapy_extension.config.settings import RabbitMQSettings
+    settings = RabbitMQSettings()
+    assert settings.host == "localhost"
+    assert settings.port == 5672
+    assert settings.username == "guest"
+    assert settings.password == "guest"
+    assert settings.max_priority == 255

@@ -275,3 +275,74 @@ class KafkaSettings(BaseSettings):
     ge=0,
     description="Retention time in ms (7 days)",
   )
+
+
+class RabbitMQSettings(BaseSettings):
+  """RabbitMQ-specific settings.
+
+  These settings configure the RabbitMQ connection and can be set
+  via environment variables with the SCRAPY_RABBITMQ_ prefix.
+  """
+
+  model_config = SettingsConfigDict(
+    env_prefix="SCRAPY_RABBITMQ_",
+    case_sensitive=False,
+    extra="ignore",
+  )
+
+  host: str = Field(
+    default="localhost",
+    description="RabbitMQ server hostname",
+  )
+  port: int = Field(
+    default=5672,
+    ge=1,
+    le=65535,
+    description="RabbitMQ server port",
+  )
+  username: str = Field(
+    default="guest",
+    description="RabbitMQ username",
+  )
+  password: str = Field(
+    default="guest",
+    description="RabbitMQ password",
+  )
+  virtual_host: str = Field(
+    default="/",
+    description="RabbitMQ virtual host",
+  )
+
+  # Connection settings
+  max_priority: int = Field(
+    default=255,
+    ge=1,
+    le=255,
+    description="Maximum priority level (1-255)",
+  )
+  heartbeat: int = Field(
+    default=600,
+    ge=0,
+    description="Heartbeat interval in seconds",
+  )
+  blocked_connection_timeout: int = Field(
+    default=300,
+    ge=0,
+    description="Blocked connection timeout in seconds",
+  )
+
+  # Queue settings
+  durable: bool = Field(
+    default=True,
+    description="Create durable queues",
+  )
+  auto_delete: bool = Field(
+    default=False,
+    description="Auto-delete queues when last consumer unsubscribes",
+  )
+  delivery_mode: int = Field(
+    default=2,
+    ge=1,
+    le=2,
+    description="Message delivery mode (1=transient, 2=persistent)",
+  )
