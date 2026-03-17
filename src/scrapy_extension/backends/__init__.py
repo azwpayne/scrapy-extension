@@ -14,6 +14,7 @@ from scrapy_extension.backends.base import (
   JSONSerializer,
 )
 from scrapy_extension.backends.redis_backend import RedisBackend
+from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
 
 __all__ = [
   "Backend",
@@ -24,4 +25,5 @@ __all__ = [
   "Serializer",
   "JSONSerializer",
   "RedisBackend",
+  "RabbitMQBackend",
 ]
