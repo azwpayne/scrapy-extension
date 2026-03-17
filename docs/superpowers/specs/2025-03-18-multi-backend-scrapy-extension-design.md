@@ -27,12 +27,15 @@ to work with any supported backend.
 ### 1.3 MVP Scope
 
 **Day 1 Requirements:**
+
 - All 4 backends (Redis, MongoDB, Kafka, RabbitMQ) with full implementations
-- All 5 components (Scheduler, DupeFilter, Pipeline, Queue, SpiderMixin) working with all backends
+- All 5 components (Scheduler, DupeFilter, Pipeline, Queue, SpiderMixin) working with
+  all backends
 - Configuration via environment variables or direct Python instantiation
 - Basic error handling with connection retry
 
 **Out of Scope for MVP:**
+
 - Async backend implementations
 - Health check endpoints
 - Metrics integration
@@ -45,7 +48,7 @@ to work with any supported backend.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Scrapy Components                     │
+│                    Scrapy Components                    │
 ├─────────────┬──────────────┬─────────────┬──────────────┤
 │  Scheduler  │ Dup Filter   │   Pipeline  │Spider Mixin  │
 └──────┬──────┴──────┬───────┴──────┬──────┴──────┬───────┘
@@ -486,6 +489,7 @@ class BackendSpiderMixin:
 Supports: standalone, sentinel, cluster
 
 **Implementation Requirements:**
+
 - Queue: Use Redis Sorted Sets (ZADD/ZRANGEBYSCORE) for priority queue
 - DupeFilter: Use Redis Sets (SADD) - SADD returns 0 if member exists
 - Pipeline: Use Redis Lists (LPUSH) or Hashes for item storage
@@ -525,7 +529,8 @@ class RedisBackend(BackendInterface):
         elif self.config.mode == "cluster":
             from redis.cluster import RedisCluster
             self._client = RedisCluster(
-                startup_nodes=[{"host": n.host, "port": n.port} for n in self.config.startup_nodes],
+                startup_nodes=[{"host": n.host, "port": n.port} for n in
+                               self.config.startup_nodes],
                 password=self.config.password,
                 skip_full_coverage_check=self.config.skip_full_coverage_check,
             )
@@ -613,10 +618,13 @@ class RedisBackend(BackendInterface):
 Supports: standalone, replica set, sharded
 
 **Implementation Requirements:**
-- Queue: Use capped collection with natural ordering, or standard collection with sort by priority
+
+- Queue: Use capped collection with natural ordering, or standard collection with sort
+  by priority
 - DupeFilter: Use unique index on (key, fingerprint) compound field
 - Pipeline: Use standard collection for items
-- Pub/Sub: Use tailable cursor on capped collection (MongoDB change streams not available on all deployments)
+- Pub/Sub: Use tailable cursor on capped collection (MongoDB change streams not
+  available on all deployments)
 
 ```python
 from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -724,7 +732,8 @@ class MongoBackend(BackendInterface):
 
         while True:
             query = {'_id': {'$gt': last_id}} if last_id else {}
-            cursor = collection.find(query, cursor_type=pymongo.CursorType.TAILABLE_AWAIT)
+            cursor = collection.find(query,
+                                     cursor_type=pymongo.CursorType.TAILABLE_AWAIT)
 
             try:
                 for doc in cursor:
@@ -746,8 +755,10 @@ class MongoBackend(BackendInterface):
 ### 4.3 Kafka Backend
 
 **Implementation Requirements:**
+
 - Queue: Use Kafka topics with priority-based partitioning
-- DupeFilter: Use compacted topic or external dedup store (Kafka doesn't have native sets)
+- DupeFilter: Use compacted topic or external dedup store (Kafka doesn't have native
+  sets)
 - Pipeline: Use Kafka topics for item streaming
 - Pub/Sub: Native Kafka consumer groups
 
@@ -906,6 +917,7 @@ class KafkaBackend(BackendInterface):
 ### 4.4 RabbitMQ Backend
 
 **Implementation Requirements:**
+
 - Queue: Use RabbitMQ priority queues (max-priority header)
 - DupeFilter: Use in-memory dedup or external cache (RabbitMQ doesn't have native dedup)
 - Pipeline: Use standard queues for item storage
@@ -961,10 +973,10 @@ class RabbitMQBackend(BackendInterface):
     @property
     def is_connected(self) -> bool:
         return (
-            self._connection is not None
-            and self._connection.is_open
-            and self._channel is not None
-            and self._channel.is_open
+                self._connection is not None
+                and self._connection.is_open
+                and self._channel is not None
+                and self._channel.is_open
         )
 
     # Queue operations using RabbitMQ priority queues
@@ -994,19 +1006,22 @@ class RabbitMQBackend(BackendInterface):
 
         if timeout > 0:
             # Use blocking consume with timeout
-            method_frame, _, body = self.channel.basic_get(queue=queue_name, auto_ack=True)
+            method_frame, _, body = self.channel.basic_get(queue=queue_name,
+                                                           auto_ack=True)
             if method_frame:
                 return body
             # Wait for message
             start_time = time.time()
             while time.time() - start_time < timeout:
-                method_frame, _, body = self.channel.basic_get(queue=queue_name, auto_ack=True)
+                method_frame, _, body = self.channel.basic_get(queue=queue_name,
+                                                               auto_ack=True)
                 if method_frame:
                     return body
                 time.sleep(0.1)
             return None
         else:
-            method_frame, _, body = self.channel.basic_get(queue=queue_name, auto_ack=True)
+            method_frame, _, body = self.channel.basic_get(queue=queue_name,
+                                                           auto_ack=True)
             return body if method_frame else None
 
     def queue_len(self, queue_name: str) -> int:
@@ -1242,9 +1257,11 @@ class ScrapyExtensionSettings(BaseSettings):
 
 ### 5.7 Configuration Loading
 
-**Important:** Scrapy's settings system requires serializable values. Pydantic models cannot be directly assigned to Scrapy settings.
+**Important:** Scrapy's settings system requires serializable values. Pydantic models
+cannot be directly assigned to Scrapy settings.
 
 **Approach 1: Environment Variables (Recommended)**
+
 ```python
 # settings.py - Standard Scrapy settings file
 import os
@@ -1255,6 +1272,7 @@ os.environ["SCRAPY_EXT_BACKEND__HOST"] = "localhost"
 ```
 
 **Approach 2: Python Instantiation in Extension Setup**
+
 ```python
 # extensions.py or spider code
 from scrapy_extension import BackendFactory, RedisConfig
@@ -1265,6 +1283,7 @@ backend = BackendFactory.get_backend(config)
 ```
 
 **Approach 3: Custom Settings Middleware**
+
 ```python
 # Middleware that converts Scrapy dict settings to Pydantic models
 class ExtensionSettingsMiddleware:
@@ -1275,6 +1294,7 @@ class ExtensionSettingsMiddleware:
 ```
 
 **Configuration Flow:**
+
 1. User provides config via env vars or direct Python
 2. `ScrapyExtensionSettings` parses and validates via pydantic-settings
 3. `BackendFactory.get_backend()` creates singleton instance
@@ -1324,6 +1344,7 @@ src/scrapy_extension/
 ### 7.1 Basic Usage (Redis)
 
 **Configuration via Environment Variables:**
+
 ```bash
 export SCRAPY_EXT_BACKEND__BACKEND_TYPE="redis"
 export SCRAPY_EXT_BACKEND__MODE="cluster"
@@ -1332,6 +1353,7 @@ export SCRAPY_EXT_BACKEND__PASSWORD="secret"
 ```
 
 **Scrapy Settings:**
+
 ```python
 # settings.py
 EXTENSIONS = {
@@ -1449,6 +1471,7 @@ dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy"]
 ```
 
 **Installation Examples:**
+
 ```bash
 # Install with specific backend
 pip install scrapy-extension[redis]
