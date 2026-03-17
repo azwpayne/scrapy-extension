@@ -88,3 +88,33 @@ class TestRedisSettings:
     settings = RedisSettings()
     assert settings.host == "redis.example.com"
     assert settings.port == 6380
+
+
+class TestMongoDBSettings:
+  """Test MongoDBSettings."""
+
+  def test_default_values(self):
+    """Test all default values."""
+    from scrapy_extension.config.settings import MongoDBSettings
+    settings = MongoDBSettings()
+    assert settings.uri == "mongodb://localhost:27017"
+    assert settings.database == "scrapy_extension"
+    assert settings.queue_collection == "queues"
+    assert settings.set_collection == "sets"
+    assert settings.storage_collection == "storage"
+    assert settings.min_pool_size == 1
+    assert settings.max_pool_size == 10
+    assert settings.max_idle_time_ms == 60000
+    assert settings.wait_queue_timeout_ms == 5000
+    assert settings.w == 1
+    assert settings.journal is True
+    assert settings.read_preference == "primary"
+
+  def test_from_env_vars(self, monkeypatch):
+    """Test loading from environment variables."""
+    from scrapy_extension.config.settings import MongoDBSettings
+    monkeypatch.setenv("SCRAPY_MONGO_URI", "mongodb://custom:27017")
+    monkeypatch.setenv("SCRAPY_MONGO_DATABASE", "custom_db")
+    settings = MongoDBSettings()
+    assert settings.uri == "mongodb://custom:27017"
+    assert settings.database == "custom_db"

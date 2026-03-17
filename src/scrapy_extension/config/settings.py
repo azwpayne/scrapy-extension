@@ -108,3 +108,74 @@ class RedisSettings(BaseSettings):
     default=True,
     description="Whether to retry on timeout",
   )
+
+
+class MongoDBSettings(BaseSettings):
+  """MongoDB-specific settings.
+
+  These settings configure the MongoDB connection and can be set
+  via environment variables with the SCRAPY_MONGO_ prefix.
+  """
+
+  model_config = SettingsConfigDict(
+    env_prefix="SCRAPY_MONGO_",
+    case_sensitive=False,
+    extra="ignore",
+  )
+
+  uri: str = Field(
+    default="mongodb://localhost:27017",
+    description="MongoDB connection URI",
+  )
+  database: str = Field(
+    default="scrapy_extension",
+    description="MongoDB database name",
+  )
+  queue_collection: str = Field(
+    default="queues",
+    description="Collection name for queue storage",
+  )
+  set_collection: str = Field(
+    default="sets",
+    description="Collection name for set storage",
+  )
+  storage_collection: str = Field(
+    default="storage",
+    description="Collection name for key-value storage",
+  )
+
+  # Connection pool settings
+  min_pool_size: int = Field(
+    default=1,
+    ge=0,
+    description="Minimum connection pool size",
+  )
+  max_pool_size: int = Field(
+    default=10,
+    ge=1,
+    description="Maximum connection pool size",
+  )
+  max_idle_time_ms: int = Field(
+    default=60000,
+    ge=0,
+    description="Maximum connection idle time in milliseconds",
+  )
+  wait_queue_timeout_ms: int = Field(
+    default=5000,
+    ge=0,
+    description="Maximum wait time for connection from pool",
+  )
+
+  # Write concern
+  w: int | str = Field(
+    default=1,
+    description="Write concern (1, 'majority', or integer)",
+  )
+  journal: bool = Field(
+    default=True,
+    description="Wait for journal commit",
+  )
+  read_preference: str = Field(
+    default="primary",
+    description="Read preference (primary, secondary, nearest)",
+  )
