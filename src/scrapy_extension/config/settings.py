@@ -179,3 +179,99 @@ class MongoDBSettings(BaseSettings):
     default="primary",
     description="Read preference (primary, secondary, nearest)",
   )
+
+
+class KafkaSettings(BaseSettings):
+  """Kafka-specific settings.
+
+  These settings configure the Kafka connection and can be set
+  via environment variables with the SCRAPY_KAFKA_ prefix.
+  """
+
+  model_config = SettingsConfigDict(
+    env_prefix="SCRAPY_KAFKA_",
+    case_sensitive=False,
+    extra="ignore",
+  )
+
+  bootstrap_servers: str = Field(
+    default="localhost:9092",
+    description="Kafka bootstrap servers",
+  )
+  max_priority_partitions: int = Field(
+    default=10,
+    ge=1,
+    le=255,
+    description="Number of partitions for priority support",
+  )
+
+  # Producer settings
+  acks: str | int = Field(
+    default="all",
+    description="Producer acks (0, 1, or 'all')",
+  )
+  retries: int = Field(
+    default=3,
+    ge=0,
+    description="Number of send retries",
+  )
+  batch_size: int = Field(
+    default=16384,
+    ge=0,
+    description="Batch size in bytes",
+  )
+  linger_ms: int = Field(
+    default=5,
+    ge=0,
+    description="Time to wait for batching",
+  )
+  compression_type: str | None = Field(
+    default=None,
+    description="Compression type (gzip, snappy, lz4, zstd)",
+  )
+
+  # Consumer settings
+  group_id: str = Field(
+    default="scrapy-extension",
+    description="Consumer group ID",
+  )
+  auto_offset_reset: str = Field(
+    default="earliest",
+    description="Auto offset reset (earliest, latest)",
+  )
+  enable_auto_commit: bool = Field(
+    default=True,
+    description="Enable auto commit",
+  )
+  auto_commit_interval_ms: int = Field(
+    default=5000,
+    ge=0,
+    description="Auto commit interval in ms",
+  )
+  max_poll_records: int = Field(
+    default=500,
+    ge=1,
+    description="Max records per poll",
+  )
+  session_timeout_ms: int = Field(
+    default=10000,
+    ge=0,
+    description="Session timeout in ms",
+  )
+
+  # Topic settings
+  replication_factor: int = Field(
+    default=1,
+    ge=1,
+    description="Topic replication factor",
+  )
+  num_partitions: int = Field(
+    default=10,
+    ge=1,
+    description="Number of topic partitions",
+  )
+  retention_ms: int = Field(
+    default=604800000,
+    ge=0,
+    description="Retention time in ms (7 days)",
+  )

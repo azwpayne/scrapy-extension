@@ -118,3 +118,21 @@ class TestMongoDBSettings:
     settings = MongoDBSettings()
     assert settings.uri == "mongodb://custom:27017"
     assert settings.database == "custom_db"
+
+
+def test_kafka_settings_defaults():
+    from scrapy_extension.config.settings import KafkaSettings
+    settings = KafkaSettings()
+    assert settings.bootstrap_servers == "localhost:9092"
+    assert settings.max_priority_partitions == 10
+    assert settings.acks == "all"
+    assert settings.group_id == "scrapy-extension"
+
+
+def test_kafka_settings_from_env(monkeypatch):
+    from scrapy_extension.config.settings import KafkaSettings
+    monkeypatch.setenv("SCRAPY_KAFKA_BOOTSTRAP_SERVERS", "kafka.example.com:9092")
+    monkeypatch.setenv("SCRAPY_KAFKA_GROUP_ID", "my-group")
+    settings = KafkaSettings()
+    assert settings.bootstrap_servers == "kafka.example.com:9092"
+    assert settings.group_id == "my-group"
