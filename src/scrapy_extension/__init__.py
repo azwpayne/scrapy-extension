@@ -13,12 +13,21 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
+from scrapy_extension.backends.kafka_backend import KafkaBackend
+from scrapy_extension.backends.mongodb_backend import MongoDBBackend
+from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
 from scrapy_extension.backends.redis_backend import RedisBackend
 from scrapy_extension.components.dupefilter import BackendDupeFilter
 from scrapy_extension.components.pipeline import BackendPipeline
 from scrapy_extension.components.queue import BackendQueue
 from scrapy_extension.components.scheduler import BackendScheduler
-from scrapy_extension.config.settings import RedisSettings, Settings
+from scrapy_extension.config.settings import (
+  KafkaSettings,
+  MongoDBSettings,
+  RabbitMQSettings,
+  RedisSettings,
+  Settings,
+)
 from scrapy_extension.connection.manager import ConnectionManager
 from scrapy_extension.exceptions import (
   BackendConnectionError,
@@ -38,12 +47,18 @@ __all__ = [
   "SetBackend",
   "StorageBackend",
   "RedisBackend",
+  "MongoDBBackend",
+  "KafkaBackend",
+  "RabbitMQBackend",
   # Serialization
   "Serializer",
   "JSONSerializer",
   # Configuration
   "Settings",
   "RedisSettings",
+  "MongoDBSettings",
+  "KafkaSettings",
+  "RabbitMQSettings",
   # Connection
   "ConnectionManager",
   # Components
@@ -55,7 +70,7 @@ __all__ = [
   "BackendSpiderMixin",
   # Exceptions
   "BackendError",
-    "BackendConnectionError",
+  "BackendConnectionError",
   "QueueError",
   "SerializationError",
   "ConfigurationError",
