@@ -7,16 +7,15 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
-from typing import TYPE_CHECKING, Any
-
-from scrapy.settings import Settings
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import JSONSerializer
 
 if TYPE_CHECKING:
   from scrapy import Item, Spider
   from scrapy.crawler import Crawler
+  from scrapy.settings import Settings
 
   from scrapy_extension.connection.manager import ConnectionManager
 
@@ -63,8 +62,8 @@ class BackendPipeline:
     Returns:
         A new BackendPipeline instance.
     """
-    from scrapy_extension.connection.manager import ConnectionManager
     from scrapy_extension.backends.base import BackendType
+    from scrapy_extension.connection.manager import ConnectionManager
 
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(
@@ -116,7 +115,7 @@ class BackendPipeline:
         The processed item.
     """
     # Generate unique key
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     unique_id = uuid.uuid4().hex[:8]
     key = f"{self.key_prefix}:{spider.name}:{timestamp}:{unique_id}"
 
