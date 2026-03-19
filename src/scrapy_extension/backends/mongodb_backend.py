@@ -207,7 +207,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def _initialize_collections(self) -> None:
     """Initialize database and create indexes."""
-    assert self._client is not None
+    if self._client is None:
+      msg = "MongoDB client not initialized"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     # Initialize database and collections
     self._db = self._client[self.config.database]
     self._queue_collection = self._db[self.config.queue_collection]
@@ -282,10 +284,18 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self._initialize_collections()
 
   def _create_indexes(self) -> None:
-    """Create necessary indexes for collections."""
-    assert self._queue_collection is not None
-    assert self._set_collection is not None
-    assert self._storage_collection is not None
+    """Create necessary indexes for collections.
+
+    Raises:
+        BackendConnectionError: If collections are not initialized.
+    """
+    if (
+      self._queue_collection is None
+      or self._set_collection is None
+      or self._storage_collection is None
+    ):
+      msg = "Collections not initialized: call _initialize_collections() first"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     # Queue indexes
     self._queue_collection.create_index(
       [("queue_name", ASCENDING), ("priority", ASCENDING), ("created_at", ASCENDING)]
@@ -347,10 +357,18 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     return BackendType.MONGODB
 
   def _assert_connected(self) -> None:
-    """Assert that all collections are initialized."""
-    assert self._queue_collection is not None, "Not connected: call connect() first"
-    assert self._set_collection is not None, "Not connected: call connect() first"
-    assert self._storage_collection is not None, "Not connected: call connect() first"
+    """Verify all collections are initialized.
+
+    Raises:
+        BackendConnectionError: If not connected.
+    """
+    if (
+      self._queue_collection is None
+      or self._set_collection is None
+      or self._storage_collection is None
+    ):
+      msg = "Not connected: call connect() first"
+      raise BackendConnectionError(msg, backend_type="mongodb")
 
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
@@ -361,7 +379,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         item: Item to push (bytes).
         priority: Priority value (higher = more urgent).
     """
-    assert self._queue_collection is not None
+    self._assert_connected()
     doc = {
       "queue_name": queue_name,
       "item": item,
@@ -380,7 +398,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         The popped item, or None if queue is empty.
     """
-    assert self._queue_collection is not None
+    self._assert_connected()
     # MongoDB doesn't support blocking pop, so we ignore timeout
     result = self._queue_collection.find_one_and_delete(
       {"queue_name": queue_name},
@@ -399,7 +417,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Number of items in the queue.
     """
-    assert self._queue_collection is not None
+    self._assert_connected()
     return self._queue_collection.count_documents({"queue_name": queue_name})
 
   def clear_queue(self, queue_name: str) -> None:
@@ -408,7 +426,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         queue_name: Name of the queue.
     """
-    assert self._queue_collection is not None
+    self._assert_connected()
     self._queue_collection.delete_many({"queue_name": queue_name})
 
   # SetBackend implementation
@@ -433,7 +451,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         True if added, False if already existed.
     """
-    assert self._set_collection is not None
+    self._assert_connected()
     doc = {
       "set_name": set_name,
       "item_hash": self._hash_item(item),
@@ -457,7 +475,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         True if removed, False if didn't exist.
     """
-    assert self._set_collection is not None
+    self._assert_connected()
     result = self._set_collection.delete_one(
       {
         "set_name": set_name,
@@ -476,7 +494,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         True if item exists in the set.
     """
-    assert self._set_collection is not None
+    self._assert_connected()
     result = self._set_collection.find_one(
       {
         "set_name": set_name,
@@ -494,7 +512,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Number of items in the set.
     """
-    assert self._set_collection is not None
+    self._assert_connected()
     return self._set_collection.count_documents({"set_name": set_name})
 
   def clear_set(self, set_name: str) -> None:
@@ -503,7 +521,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         set_name: Name of the set.
     """
-    assert self._set_collection is not None
+    self._assert_connected()
     self._set_collection.delete_many({"set_name": set_name})
 
   # StorageBackend implementation
@@ -515,7 +533,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         data: Data to store (bytes).
         ttl: Optional time-to-live in seconds.
     """
-    assert self._storage_collection is not None
+    self._assert_connected()
     doc: dict[str, Any] = {
       "key": key,
       "data": data,
@@ -538,7 +556,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Stored data, or None if not found.
     """
-    assert self._storage_collection is not None
+    self._assert_connected()
     result = self._storage_collection.find_one({"key": key})
     if result:
       return result.get("data")
@@ -553,7 +571,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         True if deleted, False if didn't exist.
     """
-    assert self._storage_collection is not None
+    self._assert_connected()
     result = self._storage_collection.delete_one({"key": key})
     return result.deleted_count > 0
 
@@ -566,7 +584,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         True if key exists.
     """
-    assert self._storage_collection is not None
+    self._assert_connected()
     result = self._storage_collection.find_one({"key": key}, {"_id": 1})
     return result is not None
 
@@ -579,7 +597,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Seconds remaining, None if no TTL, -1 if expired.
     """
-    assert self._storage_collection is not None
+    self._assert_connected()
     result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
     if result is None:
       return -1
@@ -597,7 +615,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         prefix: If provided, only clear keys starting with this prefix.
                If None, clear all storage data.
     """
-    assert self._storage_collection is not None
+    self._assert_connected()
     if prefix:
       pattern = re.escape(prefix)
       self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})

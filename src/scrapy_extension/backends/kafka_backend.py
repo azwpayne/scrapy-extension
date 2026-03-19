@@ -262,9 +262,8 @@ class KafkaBackend(Backend, QueueBackend):
       if self._admin_client:
         self._admin_client.list_topics()
         return True
-    except KafkaError:
       return False
-    else:
+    except KafkaError:
       return False
 
   @property

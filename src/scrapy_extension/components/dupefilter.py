@@ -123,10 +123,7 @@ class BackendDupeFilter:
     fingerprint = self.request_fingerprint(request)
     set_backend = self.connection_manager.get_set_backend()
 
-    # Prefer atomic add if supported; fallback to contains-check semantics.
-    if set_backend.contains(self.key, fingerprint.encode()):
-      return True
-
+    # Use atomic add — return True (duplicate) if item already existed
     added = set_backend.add(self.key, fingerprint.encode())
     return not added
 

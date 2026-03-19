@@ -132,11 +132,15 @@ class BackendQueue:
   def peek(self) -> Request | None:
     """Peek at the next request without removing it.
 
+    Warning:
+        This operation is NOT atomic. Between pop and push, another
+        consumer may take the item. Use only for monitoring/debugging,
+        never for request processing in concurrent environments.
+
     Returns:
         The next request, or None if the queue is empty.
     """
-    # For Redis sorted sets, we can't truly peek without popping
-    # So we pop and push back (not atomic, but best effort)
+    # Non-atomic: pop then push back. NOT safe for concurrent consumers.
     request = self.pop(timeout=0)
     if request:
       # Push back with same priority to preserve ordering.

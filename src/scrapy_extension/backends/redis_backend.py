@@ -91,12 +91,6 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       #   msg = f"Unsupported Redis mode: {self.config.mode}"
       #   raise ConfigurationError(msg,setting_name="mode",setting_value=self.config.mode)
       logger.debug("Connected to Redis in %s mode", self.config.mode.value)
-    except RedisError as e:
-      msg = f"Failed to connect to Redis ({self.config.mode.value}): {e}"
-      raise BackendConnectionError(
-        msg,
-        backend_type="redis",
-      ) from e
     except Exception as e:
       msg = f"Failed to connect to Redis ({self.config.mode.value}): {e}"
       raise BackendConnectionError(

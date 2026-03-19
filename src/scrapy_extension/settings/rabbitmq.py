@@ -63,11 +63,11 @@ class RabbitMQSettings(BaseSettings):
   )
   username: str = Field(
     default="guest",
-    description="RabbitMQ username",
+    description="RabbitMQ username. MUST override in production via SCRAPY_RABBITMQ_USERNAME.",
   )
   password: str = Field(
     default="guest",
-    description="RabbitMQ password",
+    description="RabbitMQ password. MUST override in production via SCRAPY_RABBITMQ_PASSWORD.",
   )
   virtual_host: str = Field(
     default="/",
