@@ -1,8 +1,7 @@
 """Tests for Scrapy components."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-import pytest
 from scrapy.http import Request
 
 from scrapy_extension.components.dupefilter import BackendDupeFilter
@@ -52,12 +51,32 @@ class TestBackendQueue:
 
   def test_len(self, mock_connection_manager):
     """Test queue length."""
-    mock_connection_manager.get_queue_backend().len.return_value = 5
+    mock_connection_manager.get_queue_backend().queue_len.return_value = 5
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
       queue_name="test_queue",
     )
     assert len(queue) == 5
+
+  def test_peek_preserves_priority(self, mock_connection_manager):
+    """Test that peek pushes back with the same priority."""
+    # Return a request dict with explicit priority to preserve through push.
+    mock_connection_manager.get_queue_backend().pop.return_value = b'{"url":"https://example.com","callback":null,"errback":null,"method":"GET","headers":{},"body":null,"cookies":{},"meta":{},"encoding":"utf-8","priority":42,"dont_filter":false,"flags":[]}'
+
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+
+    result = queue.peek()
+
+    assert result is not None
+    assert result.priority == 42
+
+    call_args = mock_connection_manager.get_queue_backend().push.call_args
+    assert call_args is not None
+    assert call_args[0][0] == "test_queue"
+    assert call_args[0][2] == 42
 
 
 class TestBackendScheduler:
@@ -94,12 +113,13 @@ class TestBackendScheduler:
     )
 
     mock_set_backend = mock_connection_manager.get_set_backend()
-    mock_set_backend.contains.return_value = True
+    mock_set_backend.add.return_value = False
 
     request = Request(url="https://example.com")
     result = scheduler.enqueue_request(request)
 
     assert result is False
+    mock_set_backend.add.assert_called_once()
 
   def test_next_request(self, mock_connection_manager):
     """Test getting next request."""
@@ -123,6 +143,25 @@ class TestBackendScheduler:
 
     assert result is not None
     assert isinstance(result, Request)
+
+  def test_enqueue_duplicate_uses_set_add(self, mock_connection_manager):
+    """Test enqueue_request deduplication uses set.add result for atomicity."""
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+      dupefilter_key="test:dupefilter",
+    )
+
+    # Configure set.add to indicate duplicate (already exists)
+    set_backend = mock_connection_manager.get_set_backend()
+    set_backend.add.return_value = False
+
+    request = Request(url="https://example.com")
+    result = scheduler.enqueue_request(request)
+
+    assert result is False
+    set_backend.add.assert_called_once()
+    set_backend.contains.assert_not_called()
 
 
 class TestBackendDupeFilter:
@@ -153,6 +192,7 @@ class TestBackendDupeFilter:
 
     mock_set_backend = mock_connection_manager.get_set_backend()
     mock_set_backend.contains.return_value = True
+    mock_set_backend.add.return_value = False
 
     request = Request(url="https://example.com")
     result = dupefilter.request_seen(request)

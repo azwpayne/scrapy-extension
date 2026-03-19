@@ -1,5 +1,5 @@
 """Spider mixin for backend integration.
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This module provides the BackendSpiderMixin class that adds backend functionality
 to Scrapy spiders, enabling distributed crawling capabilities.
 """
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 
 class BackendSpiderMixin:
+  name: str  # provided by Spider when used as mixin
   """Mixin class for spiders to integrate with backend components.
 
   This mixin provides convenient access to backend functionality including
@@ -118,6 +119,19 @@ class BackendSpiderMixin:
 
     return self._connection_manager
 
+  def _build_redis_settings(self) -> dict[str, Any]:
+    """Build Redis-specific shortcut settings."""
+    shortcuts: dict[str, Any] = {}
+    if self.redis_host is not None:
+      shortcuts["host"] = self.redis_host
+    if self.redis_port is not None:
+      shortcuts["port"] = self.redis_port
+    if self.redis_db is not None:
+      shortcuts["db"] = self.redis_db
+    if self.redis_password is not None:
+      shortcuts["password"] = self.redis_password
+    return shortcuts
+
   def _build_backend_settings(self) -> dict[str, Any]:
     """Build backend settings from shortcut attributes.
 
@@ -131,29 +145,19 @@ class BackendSpiderMixin:
       settings.update(self.backend_settings)
 
     # Add shortcut settings based on backend type
-    if self.backend_type and self.backend_type.value == "redis":
-      if self.redis_host is not None:
-        settings["host"] = self.redis_host
-      if self.redis_port is not None:
-        settings["port"] = self.redis_port
-      if self.redis_db is not None:
-        settings["db"] = self.redis_db
-      if self.redis_password is not None:
-        settings["password"] = self.redis_password
-
-    elif self.backend_type and self.backend_type.value == "mongodb":
+    backend_value = self.backend_type.value if self.backend_type else None
+    if backend_value == "redis":
+      settings.update(self._build_redis_settings())
+    elif backend_value == "mongodb":
       if self.mongodb_uri is not None:
         settings["uri"] = self.mongodb_uri
       if self.mongodb_db is not None:
         settings["database"] = self.mongodb_db
-
-    elif self.backend_type and self.backend_type.value == "kafka":
+    elif backend_value == "kafka":
       if self.kafka_bootstrap_servers is not None:
         settings["bootstrap_servers"] = self.kafka_bootstrap_servers
-
-    elif self.backend_type and self.backend_type.value == "rabbitmq":
-      if self.rabbitmq_url is not None:
-        settings["url"] = self.rabbitmq_url
+    elif backend_value == "rabbitmq" and self.rabbitmq_url is not None:
+      settings["url"] = self.rabbitmq_url
 
     return settings
 
@@ -176,12 +180,12 @@ class BackendSpiderMixin:
     if spider is self and self._connection_manager is not None:
       self._connection_manager.connect()
 
-  def _on_spider_closed(self, spider: Spider, reason: str) -> None:
+  def _on_spider_closed(self, spider: Spider, reason: str = "") -> None:  # noqa: ARG002
     """Handle spider_closed signal.
 
     Args:
         spider: The spider instance that was closed.
-        reason: The reason for closing the spider.
+        reason: The reason for closing the spider (unused, provided by Scrapy).
     """
     if spider is self:
       self.close_backend()

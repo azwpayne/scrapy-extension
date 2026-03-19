@@ -7,5 +7,11 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv*/
 .claude/
+.gstack
+docs/superpowers/
+aaa
+.coverage
+.pytest_cache/
+.tox/

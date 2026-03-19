@@ -10,8 +10,8 @@ from scrapy_extension.components.queue import BackendQueue
 from scrapy_extension.components.scheduler import BackendScheduler
 
 __all__ = [
-  "BackendQueue",
-  "BackendScheduler",
   "BackendDupeFilter",
   "BackendPipeline",
+  "BackendQueue",
+  "BackendScheduler",
 ]

@@ -105,7 +105,6 @@ class Backend(ABC):
     Raises:
         ConnectionError: If the connection cannot be established.
     """
-    pass
 
   @abstractmethod
   def disconnect(self) -> None:
@@ -114,7 +113,6 @@ class Backend(ABC):
     This method should cleanly close all connections and
     release any resources.
     """
-    pass
 
   @abstractmethod
   def is_connected(self) -> bool:
@@ -123,7 +121,6 @@ class Backend(ABC):
     Returns:
         True if connected, False otherwise.
     """
-    pass
 
   @abstractmethod
   def ping(self) -> bool:
@@ -132,7 +129,6 @@ class Backend(ABC):
     Returns:
         True if the backend is healthy and responsive.
     """
-    pass
 
   @property
   @abstractmethod
@@ -142,7 +138,6 @@ class Backend(ABC):
     Returns:
         The BackendType enum value for this backend.
     """
-    pass
 
 
 class QueueBackend(ABC):
@@ -163,7 +158,6 @@ class QueueBackend(ABC):
     Raises:
         QueueError: If the push operation fails.
     """
-    pass
 
   @abstractmethod
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
@@ -179,7 +173,6 @@ class QueueBackend(ABC):
     Raises:
         QueueError: If the pop operation fails.
     """
-    pass
 
   @abstractmethod
   def queue_len(self, queue_name: str) -> int:
@@ -191,7 +184,6 @@ class QueueBackend(ABC):
     Returns:
         The number of items in the queue.
     """
-    pass
 
   @abstractmethod
   def clear_queue(self, queue_name: str) -> None:
@@ -200,7 +192,6 @@ class QueueBackend(ABC):
     Args:
         queue_name: The name of the queue.
     """
-    pass
 
 
 class SetBackend(ABC):
@@ -220,7 +211,6 @@ class SetBackend(ABC):
     Returns:
         True if the item was added, False if it already existed.
     """
-    pass
 
   @abstractmethod
   def remove(self, set_name: str, item: bytes) -> bool:
@@ -233,7 +223,6 @@ class SetBackend(ABC):
     Returns:
         True if the item was removed, False if it didn't exist.
     """
-    pass
 
   @abstractmethod
   def contains(self, set_name: str, item: bytes) -> bool:
@@ -246,7 +235,6 @@ class SetBackend(ABC):
     Returns:
         True if the item exists in the set.
     """
-    pass
 
   @abstractmethod
   def set_len(self, set_name: str) -> int:
@@ -258,7 +246,6 @@ class SetBackend(ABC):
     Returns:
         The number of items in the set.
     """
-    pass
 
   @abstractmethod
   def clear_set(self, set_name: str) -> None:
@@ -267,7 +254,6 @@ class SetBackend(ABC):
     Args:
         set_name: The name of the set.
     """
-    pass
 
 
 class StorageBackend(ABC):
@@ -285,7 +271,6 @@ class StorageBackend(ABC):
         data: The data to store (bytes).
         ttl: Optional time-to-live in seconds.
     """
-    pass
 
   @abstractmethod
   def retrieve(self, key: str) -> bytes | None:
@@ -297,7 +282,6 @@ class StorageBackend(ABC):
     Returns:
         The stored data, or None if not found.
     """
-    pass
 
   @abstractmethod
   def delete(self, key: str) -> bool:
@@ -309,7 +293,6 @@ class StorageBackend(ABC):
     Returns:
         True if the key was deleted, False if it didn't exist.
     """
-    pass
 
   @abstractmethod
   def exists(self, key: str) -> bool:
@@ -321,7 +304,6 @@ class StorageBackend(ABC):
     Returns:
         True if the key exists.
     """
-    pass
 
   @abstractmethod
   def ttl(self, key: str) -> int | None:
@@ -333,7 +315,6 @@ class StorageBackend(ABC):
     Returns:
         Seconds remaining, None if no TTL, or -1 if expired.
     """
-    pass
 
   @abstractmethod
   def clear_storage(self, prefix: str | None = None) -> None:
@@ -343,4 +324,3 @@ class StorageBackend(ABC):
         prefix: If provided, only clear keys starting with this prefix.
                If None, clear all storage data.
     """
-    pass

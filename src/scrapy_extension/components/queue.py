@@ -8,13 +8,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from scrapy.http import Request
 from scrapy.utils.request import request_from_dict
 
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import SerializationError
 
 if TYPE_CHECKING:
+  from scrapy.http import Request
+
   from scrapy_extension.connection.manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
@@ -56,13 +57,21 @@ class BackendQueue:
     Returns:
         Dictionary representation of the request.
     """
+    body_value = None
+    if request.body:
+      try:
+        body_value = request.body.decode("utf-8")
+      except Exception:
+        # Fallback: use latin-1 to preserve arbitrary bytes through JSON
+        body_value = request.body.decode("latin-1")
+
     return {
       "url": request.url,
       "callback": request.callback.__name__ if request.callback else None,
       "errback": request.errback.__name__ if request.errback else None,
       "method": request.method,
       "headers": dict(request.headers.to_unicode_dict()),
-      "body": request.body.decode("utf-8") if request.body else None,
+      "body": body_value,
       "cookies": request.cookies,
       "meta": request.meta,
       "encoding": request.encoding,
@@ -86,8 +95,9 @@ class BackendQueue:
       data = self._serializer.serialize(request_dict)
       self.connection_manager.get_queue_backend().push(self.queue_name, data, priority)
     except Exception as e:
+      msg = f"Failed to serialize request: {e}"
       raise SerializationError(
-        f"Failed to serialize request: {e}",
+        msg,
         data=request,
         serializer="json",
       ) from e
@@ -112,8 +122,9 @@ class BackendQueue:
       request_dict = self._serializer.deserialize(data)
       return request_from_dict(request_dict)
     except Exception as e:
+      msg = f"Failed to deserialize request: {e}"
       raise SerializationError(
-        f"Failed to deserialize request: {e}",
+        msg,
         data=data,
         serializer="json",
       ) from e
@@ -128,8 +139,8 @@ class BackendQueue:
     # So we pop and push back (not atomic, but best effort)
     request = self.pop(timeout=0)
     if request:
-      # Push back with same priority (we lose the exact priority)
-      self.push(request, priority=0)
+      # Push back with same priority to preserve ordering.
+      self.push(request, priority=request.priority)
     return request
 
   def __len__(self) -> int:
@@ -138,8 +149,8 @@ class BackendQueue:
     Returns:
         Number of requests.
     """
-    return self.connection_manager.get_queue_backend().len(self.queue_name)
+    return self.connection_manager.get_queue_backend().queue_len(self.queue_name)
 
   def clear(self) -> None:
     """Clear all requests from the queue."""
-    self.connection_manager.get_queue_backend().clear(self.queue_name)
+    self.connection_manager.get_queue_backend().clear_queue(self.queue_name)

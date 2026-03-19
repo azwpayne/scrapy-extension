@@ -1,4 +1,4 @@
-"""Redis backend implementation with multi-mode support.
+"""Redis backend implementation with multimode support.
 
 This module provides a Redis-based implementation of the backend interfaces
 for distributed crawling, supporting multiple deployment modes:
@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from redis import Redis
 from redis.cluster import RedisCluster
 from redis.exceptions import RedisError
-from redis.sentinel import Sentinel  # type: ignore[attr-defined]
+from redis.sentinel import Sentinel
 
 from scrapy_extension.backends.base import (
   Backend,
@@ -26,21 +26,22 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.config.settings import RedisMode
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.settings import RedisMode
 
 if TYPE_CHECKING:
-  from scrapy_extension.config.settings import RedisSettings
+  from scrapy_extension.settings import RedisSettings
 
 logger = logging.getLogger(__name__)
 
 
+# TODO: Add support for Redis client pool
 class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
-  """Redis backend implementation with multi-mode support.
+  """Redis backend implementation with multimode support.
 
   Implements all backend interfaces using Redis data structures:
   - Queue: Redis Sorted Sets (ZADD/ZRANGEBYSCORE/ZREM)
@@ -86,14 +87,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._connect_sentinel()
       elif self.config.mode == RedisMode.CLUSTER:
         self._connect_cluster()
-      else:
-        msg = f"Unsupported Redis mode: {self.config.mode}"
-        raise ConfigurationError(
-          msg,
-          setting_name="mode",
-          setting_value=self.config.mode,
-        )
-      logger.debug(f"Connected to Redis in {self.config.mode.value} mode")
+      # else:
+      #   msg = f"Unsupported Redis mode: {self.config.mode}"
+      #   raise ConfigurationError(msg,setting_name="mode",setting_value=self.config.mode)
+      logger.debug("Connected to Redis in %s mode", self.config.mode.value)
     except RedisError as e:
       msg = f"Failed to connect to Redis ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
@@ -150,7 +147,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     # Store replica info for potential read scaling (not yet implemented)
     if self.config.replicas:
-      logger.debug(f"Configured {len(self.config.replicas)} replicas for read scaling")
+      logger.debug("Configured %d replicas for read scaling", len(self.config.replicas))
 
   def _connect_sentinel(self) -> None:
     """Connect via Redis Sentinel for high availability.
@@ -207,7 +204,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self._client = self._master_client
 
     logger.debug(
-      f"Connected to master '{self.config.sentinel_master_name}' via Sentinel"
+      "Connected to master '%s' via Sentinel", self.config.sentinel_master_name
     )
 
   def _connect_cluster(self) -> None:
@@ -245,7 +242,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     # Verify connection
     self._client.ping()
-    logger.debug(f"Connected to Redis Cluster with {len(nodes)} startup nodes")
+    logger.debug("Connected to Redis Cluster with %d startup nodes", len(nodes))
 
   def disconnect(self) -> None:
     """Close Redis connection.
@@ -365,7 +362,6 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       result = self.client.zpopmax(queue_name)  # type: ignore[assignment]
       if result and len(result) > 0:  # type: ignore[arg-type]
         return result[0][0]  # type: ignore[index, return-value]
-      return None
     except RedisError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(
@@ -373,6 +369,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
+    else:
+      return None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -548,9 +546,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         return None  # No TTL set
       if result == -2:
         return -1  # Key doesn't exist/expired
-      return result
     except RedisError:
       return None
+    else:
+      return result
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.

@@ -9,15 +9,15 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from scrapy.http import Request
-from scrapy.settings import Settings
-
 from scrapy_extension.components.queue import BackendQueue
 from scrapy_extension.exceptions import QueueError
+from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:
   from scrapy import Spider
   from scrapy.crawler import Crawler
+  from scrapy.http import Request
+  from scrapy.settings import Settings
   from scrapy.statscollectors import StatsCollector
 
   from scrapy_extension.connection.manager import ConnectionManager
@@ -71,8 +71,8 @@ class BackendScheduler:
     Returns:
         A new BackendScheduler instance.
     """
-    from scrapy_extension.connection.manager import ConnectionManager
     from scrapy_extension.backends.base import BackendType
+    from scrapy_extension.connection.manager import ConnectionManager
 
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(
@@ -110,7 +110,7 @@ class BackendScheduler:
       connection_manager=self.connection_manager,
       queue_name=f"{spider.name}:queue",
     )
-    logger.info(f"Scheduler opened for spider {spider.name}")
+    logger.info("Scheduler opened for spider %s", spider.name)
 
   def close(self, reason: str) -> None:
     """Close the scheduler.
@@ -118,7 +118,7 @@ class BackendScheduler:
     Args:
         reason: The reason for closing.
     """
-    logger.info(f"Scheduler closed: {reason}")
+    logger.info("Scheduler closed: %s", reason)
     self._queue = None
     self._spider = None
 
@@ -131,32 +131,30 @@ class BackendScheduler:
     Returns:
         True if the request was enqueued, False if it was a duplicate.
     """
-    # Check for duplicates
+    # Add fingerprint and detect duplicates atomically when supported.
     fingerprint = self._request_fingerprint(request)
-    if self.connection_manager.get_set_backend().contains(
+    added = self.connection_manager.get_set_backend().add(
       self.dupefilter_key, fingerprint.encode()
-    ):
+    )
+    if not added:
       if self.stats:
         self.stats.inc_value("scheduler/dropped_duplicates")
       return False
-
-    # Add fingerprint
-    self.connection_manager.get_set_backend().add(
-      self.dupefilter_key, fingerprint.encode()
-    )
 
     # Enqueue with priority (negate because Scrapy uses higher = more urgent)
     priority = request.priority
     try:
       if self._queue is None:
-        raise RuntimeError("Scheduler not opened")
+        msg = "Scheduler not opened"
+        raise RuntimeError(msg)
       self._queue.push(request, priority=priority)
       if self.stats:
         self.stats.inc_value("scheduler/enqueued")
-      return True
-    except QueueError as e:
-      logger.error(f"Failed to enqueue request: {e}")
+    except QueueError:
+      logger.exception("Failed to enqueue request")
       return False
+    else:
+      return True
 
   def next_request(self) -> Request | None:
     """Get the next request from the queue.
@@ -166,14 +164,16 @@ class BackendScheduler:
     """
     try:
       if self._queue is None:
-        raise RuntimeError("Scheduler not opened")
+        msg = "Scheduler not opened"
+        raise RuntimeError(msg)
       request = self._queue.pop(timeout=0)
       if request and self.stats:
         self.stats.inc_value("scheduler/dequeued")
-      return request
-    except QueueError as e:
-      logger.error(f"Failed to get next request: {e}")
+    except QueueError:
+      logger.exception("Failed to get next request")
       return None
+    else:
+      return request
 
   def has_pending_requests(self) -> bool:
     """Check if there are pending requests.
@@ -202,6 +202,4 @@ class BackendScheduler:
     Returns:
         A unique fingerprint string.
     """
-    from scrapy.utils.request import fingerprint
-
-    return fingerprint(request).hex()
+    return request_fingerprint(request)

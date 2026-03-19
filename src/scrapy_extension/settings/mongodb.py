@@ -1,0 +1,193 @@
+# @author  : azwpayne(https://github.com/azwpayne)
+# @name    : mongodb.py
+# @time    : 2026/3/18 20:39 Wed
+# @blog    : https://paynewu.com/
+# @mail    : paynewu0719@gmail.com
+# @desc    :
+
+from __future__ import annotations
+
+from enum import Enum
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class MongoDBMode(str, Enum):
+  """MongoDB deployment modes.
+
+  Attributes:
+      STANDALONE: Single MongoDB instance (default).
+      REPLICA_SET: Replica set for high availability.
+      SHARDED_CLUSTER: Sharded cluster for horizontal scaling.
+      ATLAS: MongoDB Atlas cloud service.
+  """
+
+  STANDALONE = "standalone"
+  REPLICA_SET = "replica_set"
+  SHARDED_CLUSTER = "sharded_cluster"
+  ATLAS = "atlas"
+
+
+class MongoDBSettings(BaseSettings):
+  """MongoDB-specific settings for all deployment modes.
+
+  These settings configure the MongoDB connection and can be set
+  via environment variables with the SCRAPY_MONGO_ prefix.
+
+  Supports four deployment modes:
+  - standalone: Single MongoDB instance (default)
+  - replica_set: Replica set for high availability
+  - sharded_cluster: Sharded cluster for horizontal scaling
+  - atlas: MongoDB Atlas cloud service
+  """
+
+  model_config = SettingsConfigDict(
+    env_prefix="SCRAPY_MONGO_",
+    case_sensitive=False,
+    extra="ignore",
+  )
+
+  # === Mode Selection ===
+  mode: MongoDBMode = Field(
+    default=MongoDBMode.STANDALONE,
+    description="MongoDB deployment mode (standalone, replica_set, sharded_cluster, atlas)",
+  )
+
+  # === Connection Settings ===
+  uri: str = Field(
+    default="mongodb://localhost:27017",
+    description="MongoDB connection URI (used for all modes)",
+  )
+  database: str = Field(
+    default="scrapy_extension",
+    description="MongoDB database name",
+  )
+
+  # === Collection Names ===
+  queue_collection: str = Field(
+    default="queues",
+    description="Collection name for queue storage",
+  )
+  set_collection: str = Field(
+    default="sets",
+    description="Collection name for set storage",
+  )
+  storage_collection: str = Field(
+    default="storage",
+    description="Collection name for key-value storage",
+  )
+
+  # === Replica Set Settings ===
+  replica_set_name: str | None = Field(
+    default=None,
+    description="Replica set name (for replica_set mode)",
+  )
+  replica_set_members: list[str] = Field(
+    default_factory=list,
+    description="List of replica set member host:port",
+  )
+  read_preference: str = Field(
+    default="primary",
+    description="Read preference (primary, secondary, nearest, primaryPreferred, secondaryPreferred)",
+  )
+
+  # === Sharded Cluster Settings ===
+  mongos_routers: list[str] = Field(
+    default_factory=list,
+    description="List of mongos router host:port (for sharded_cluster mode)",
+  )
+
+  # === Atlas Settings ===
+  atlas_cluster_name: str | None = Field(
+    default=None,
+    description="Atlas cluster name (for atlas mode)",
+  )
+
+  # === Connection Pool Settings ===
+  min_pool_size: int = Field(
+    default=1,
+    ge=0,
+    description="Minimum connection pool size",
+  )
+  max_pool_size: int = Field(
+    default=10,
+    ge=1,
+    description="Maximum connection pool size",
+  )
+  max_idle_time_ms: int = Field(
+    default=60000,
+    ge=0,
+    description="Maximum connection idle time in milliseconds",
+  )
+  wait_queue_timeout_ms: int = Field(
+    default=5000,
+    ge=0,
+    description="Maximum wait time for connection from pool",
+  )
+
+  # === Authentication Settings ===
+  username: str | None = Field(
+    default=None,
+    description="MongoDB username",
+  )
+  password: str | None = Field(
+    default=None,
+    description="MongoDB password",
+  )
+  auth_source: str = Field(
+    default="admin",
+    description="Authentication database",
+  )
+  auth_mechanism: str | None = Field(
+    default=None,
+    description="Authentication mechanism (SCRAM-SHA-1, SCRAM-SHA-256, etc.)",
+  )
+
+  # === TLS/SSL Settings ===
+  tls_enabled: bool = Field(
+    default=False,
+    description="Enable TLS/SSL connection",
+  )
+  tls_ca_file: str | None = Field(
+    default=None,
+    description="Path to CA certificate file",
+  )
+  tls_cert_file: str | None = Field(
+    default=None,
+    description="Path to client certificate file",
+  )
+  tls_key_file: str | None = Field(
+    default=None,
+    description="Path to client private key file",
+  )
+  tls_allow_invalid_certificates: bool = Field(
+    default=False,
+    description="Allow invalid certificates (not recommended for production)",
+  )
+
+  # === Write Concern ===
+  w: int | str = Field(
+    default=1,
+    description="Write concern (1, 'majority', or integer)",
+  )
+  journal: bool = Field(
+    default=True,
+    description="Wait for journal commit",
+  )
+  w_timeout_ms: int | None = Field(
+    default=None,
+    description="Write concern timeout in milliseconds",
+  )
+
+  # === Server Selection ===
+  server_selection_timeout_ms: int = Field(
+    default=30000,
+    ge=0,
+    description="Server selection timeout in milliseconds",
+  )
+  heartbeat_frequency_ms: int = Field(
+    default=10000,
+    ge=0,
+    description="Heartbeat frequency in milliseconds",
+  )

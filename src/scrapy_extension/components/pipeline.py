@@ -94,7 +94,7 @@ class BackendPipeline:
     Args:
         spider: The spider instance.
     """
-    logger.info(f"Pipeline opened for spider {spider.name}")
+    logger.info("Pipeline opened for spider %s", spider.name)
 
   def close_spider(self, spider: Spider) -> None:
     """Called when spider closes.
@@ -102,7 +102,7 @@ class BackendPipeline:
     Args:
         spider: The spider instance.
     """
-    logger.info(f"Pipeline closed for spider {spider.name}")
+    logger.info("Pipeline closed for spider %s", spider.name)
 
   def process_item(self, item: Item, spider: Spider) -> Item:
     """Process and store an item.
@@ -126,5 +126,5 @@ class BackendPipeline:
     # Store in backend
     self.connection_manager.get_storage_backend().store(key, data, ttl=self.ttl)
 
-    logger.debug(f"Stored item: {key}")
+    logger.debug("Stored item: %s", key)
     return item

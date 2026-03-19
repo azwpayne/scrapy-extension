@@ -6,13 +6,18 @@ for all backend types.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from scrapy_extension.backends.base import BackendType
-from scrapy_extension.config.settings import RedisSettings
+from scrapy_extension.backends.base import (
+  BackendType,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
+)
 from scrapy_extension.exceptions import BackendConnectionError
 
 if TYPE_CHECKING:
@@ -43,7 +48,7 @@ class ConnectionManager:
   """
 
   # Class-level registry of managers
-  _managers: dict[str, "ConnectionManager"] = {}
+  _managers: dict[str, ConnectionManager] = {}
   _registry_lock = threading.Lock()
 
   def __init__(
@@ -77,11 +82,22 @@ class ConnectionManager:
     Returns:
         A ConnectionManager instance for the given backend.
     """
-    key = f"{backend_type.value}:{hash(str(settings))}"
+    normalized_settings = settings or {}
+    try:
+      settings_key = json.dumps(
+        normalized_settings,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+      )
+    except (TypeError, ValueError):
+      settings_key = str(sorted(normalized_settings.items()))
+
+    key = f"{backend_type.value}:{settings_key}"
 
     with cls._registry_lock:
       if key not in cls._managers:
-        cls._managers[key] = cls(backend_type, settings)
+        cls._managers[key] = cls(backend_type, normalized_settings)
       return cls._managers[key]
 
   def _create_backend(self) -> Backend:
@@ -95,30 +111,30 @@ class ConnectionManager:
     """
     if self.backend_type == BackendType.REDIS:
       from scrapy_extension.backends.redis_backend import RedisBackend
-      from scrapy_extension.config.settings import RedisSettings
+      from scrapy_extension.settings import RedisSettings
 
       config = RedisSettings(**self.settings)
       return RedisBackend(config)
-    elif self.backend_type == BackendType.MONGODB:
+    if self.backend_type == BackendType.MONGODB:
       from scrapy_extension.backends.mongodb_backend import MongoDBBackend
-      from scrapy_extension.config.settings import MongoDBSettings
+      from scrapy_extension.settings import MongoDBSettings
 
       config = MongoDBSettings(**self.settings)
       return MongoDBBackend(config)
-    elif self.backend_type == BackendType.KAFKA:
+    if self.backend_type == BackendType.KAFKA:
       from scrapy_extension.backends.kafka_backend import KafkaBackend
-      from scrapy_extension.config.settings import KafkaSettings
+      from scrapy_extension.settings import KafkaSettings
 
       config = KafkaSettings(**self.settings)
       return KafkaBackend(config)
-    elif self.backend_type == BackendType.RABBITMQ:
+    if self.backend_type == BackendType.RABBITMQ:
       from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
-      from scrapy_extension.config.settings import RabbitMQSettings
+      from scrapy_extension.settings import RabbitMQSettings
 
       config = RabbitMQSettings(**self.settings)
       return RabbitMQBackend(config)
-    else:
-      raise ValueError(f"Unsupported backend type: {self.backend_type}")
+    msg = f"Unsupported backend type: {self.backend_type}"
+    raise ValueError(msg)
 
   def connect(self) -> None:
     """Establish connection with retry logic.
@@ -132,21 +148,38 @@ class ConnectionManager:
     retry_attempts = self.settings.get("retry_attempts", 3)
     retry_delay = self.settings.get("retry_delay", 1.0)
 
+    last_exception: Exception | None = None
     for attempt in range(retry_attempts):
       try:
-        self._backend = self._create_backend()
-        self._backend.connect()
-        logger.debug(f"Connected to {self.backend_type.value}")
+        self._attempt_connection()
+        logger.debug("Connected to %s", self.backend_type.value)
         return
       except Exception as e:
-        logger.warning(f"Connection attempt {attempt + 1}/{retry_attempts} failed: {e}")
+        # Retry on all exceptions except on KeyboardInterrupt/SystemExit
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+          raise
+        last_exception = e
+        logger.warning(
+          "Connection attempt %d/%d failed: %s", attempt + 1, retry_attempts, e
+        )
         if attempt < retry_attempts - 1:
           time.sleep(retry_delay * (2**attempt))
-        else:
-          raise BackendConnectionError(
-            f"Failed to connect after {retry_attempts} attempts: {e}",
-            backend_type=self.backend_type.value,
-          ) from e
+
+    if last_exception is not None:
+      msg = f"Failed to connect after {retry_attempts} attempts: {last_exception}"
+      raise BackendConnectionError(
+        msg,
+        backend_type=self.backend_type.value,
+      ) from last_exception
+
+  def _attempt_connection(self) -> None:
+    """Attempt a single connection.
+
+    Raises:
+        Exception: If the connection attempt fails.
+    """
+    self._backend = self._create_backend()
+    self._backend.connect()
 
   def close(self) -> None:
     """Close the backend connection.
@@ -157,9 +190,9 @@ class ConnectionManager:
       if self._backend:
         try:
           self._backend.disconnect()
-          logger.debug(f"Disconnected from {self.backend_type.value}")
-        except Exception as e:
-          logger.warning(f"Error during disconnect: {e}")
+          logger.debug("Disconnected from %s", self.backend_type.value)
+        except (RuntimeError, ValueError, AttributeError) as e:
+          logger.warning("Error during disconnect: %s", e)
         finally:
           self._backend = None
 
@@ -177,6 +210,7 @@ class ConnectionManager:
       with self._lock:
         if self._backend is None:
           self.connect()
+    assert self._backend is not None
     return self._backend
 
   def is_connected(self) -> bool:
@@ -195,7 +229,12 @@ class ConnectionManager:
     Returns:
         The QueueBackend interface of the backend.
     """
-    return self.backend  # type: ignore[return-value]
+    backend = self.backend
+    if not isinstance(backend, QueueBackend):
+      raise NotImplementedError(
+        f"Backend {backend.__class__.__name__} does not support queue operations"
+      )
+    return backend
 
   def get_set_backend(self) -> SetBackend:
     """Get the set backend interface.
@@ -203,7 +242,12 @@ class ConnectionManager:
     Returns:
         The SetBackend interface of the backend.
     """
-    return self.backend  # type: ignore[return-value]
+    backend = self.backend
+    if not isinstance(backend, SetBackend):
+      raise NotImplementedError(
+        f"Backend {backend.__class__.__name__} does not support set operations"
+      )
+    return backend
 
   def get_storage_backend(self) -> StorageBackend:
     """Get the storage backend interface.
@@ -211,4 +255,9 @@ class ConnectionManager:
     Returns:
         The StorageBackend interface of the backend.
     """
-    return self.backend  # type: ignore[return-value]
+    backend = self.backend
+    if not isinstance(backend, StorageBackend):
+      raise NotImplementedError(
+        f"Backend {backend.__class__.__name__} does not support storage operations"
+      )
+    return backend

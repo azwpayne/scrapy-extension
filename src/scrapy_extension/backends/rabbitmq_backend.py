@@ -1,19 +1,31 @@
-"""RabbitMQ backend implementation.
+"""RabbitMQ backend implementation with multi-mode support.
 
-This module provides a RabbitMQ-based implementation of QueueBackend.
+This module provides a RabbitMQ-based implementation of QueueBackend,
+supporting multiple deployment modes:
+- Standalone: Single RabbitMQ node
+- Cluster: Multi-node RabbitMQ cluster
+- Mirrored Queues: Cluster with HA queues
+
 Note: RabbitMQ does not support SetBackend or StorageBackend operations.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import TYPE_CHECKING
+import ssl
+from typing import TYPE_CHECKING, Any, Literal
 
 import pika
 from pika.exceptions import AMQPError
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.config.settings import RabbitMQMode
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 
 if TYPE_CHECKING:
   from scrapy_extension.config.settings import RabbitMQSettings
@@ -22,9 +34,10 @@ logger = logging.getLogger(__name__)
 
 
 class RabbitMQBackend(Backend, QueueBackend):
-  """RabbitMQ backend implementation.
+  """RabbitMQ backend implementation with multi-mode support.
 
   Implements QueueBackend using RabbitMQ message queues with priority support.
+  Supports standalone, cluster, and mirrored_queues deployment modes.
   Does NOT implement SetBackend or StorageBackend.
 
   Attributes:
@@ -44,53 +57,192 @@ class RabbitMQBackend(Backend, QueueBackend):
     self._channel: pika.channel.Channel | None = None
 
   def connect(self) -> None:
-    """Establish connection to RabbitMQ.
+    """Establish connection to RabbitMQ based on deployment mode.
 
-    Creates RabbitMQ connection and channel.
+    Creates RabbitMQ connection and channel with mode-specific configuration.
 
     Raises:
         BackendConnectionError: If the connection cannot be established.
+        ConfigurationError: If the configuration is invalid for the mode.
     """
+    if self.config.mode not in (
+      RabbitMQMode.STANDALONE,
+      RabbitMQMode.CLUSTER,
+      RabbitMQMode.MIRRORED_QUEUES,
+    ):
+      try:
+        mode_text = str(self.config.mode)
+      except (TypeError, ValueError):
+        mode_text = getattr(self.config.mode, "value", repr(self.config.mode))
+      msg = f"Unsupported RabbitMQ mode: {mode_text}"
+      raise ConfigurationError(
+        msg,
+        setting_name="mode",
+        setting_value=self.config.mode,
+      )
     try:
-      credentials = pika.PlainCredentials(
-        self.config.username,
-        self.config.password,
-      )
-      parameters = pika.ConnectionParameters(
-        host=self.config.host,
-        port=self.config.port,
-        virtual_host=self.config.virtual_host,
-        credentials=credentials,
-        heartbeat=self.config.heartbeat,
-        blocked_connection_timeout=self.config.blocked_connection_timeout,
-      )
-      self._connection = pika.BlockingConnection(parameters)
-      self._channel = self._connection.channel()
-      logger.debug(
-        "Connected to RabbitMQ at %s:%s",
-        self.config.host,
-        self.config.port,
-      )
+      if self.config.mode == RabbitMQMode.STANDALONE:
+        self._connect_standalone()
+      elif self.config.mode == RabbitMQMode.CLUSTER:
+        self._connect_cluster()
+      else:
+        self._connect_mirrored_queues()
+      logger.debug("Connected to RabbitMQ in %s mode", self.config.mode.value)
     except AMQPError as e:
-      msg = f"Failed to connect to RabbitMQ: {e}"
+      msg = f"Failed to connect to RabbitMQ ({self.config.mode.value}): {e}"
+      raise BackendConnectionError(
+        msg,
+        backend_type="rabbitmq",
+      ) from e
+    except Exception as e:
+      msg = f"Failed to connect to RabbitMQ ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="rabbitmq",
       ) from e
 
+  def _get_ssl_verify_mode(self) -> ssl.VerifyMode:
+    """Get SSL verification mode from config.
+
+    Returns:
+        ssl.CERT_NONE, ssl.CERT_OPTIONAL, or ssl.CERT_REQUIRED.
+    """
+    mode = self.config.ssl_verify_mode
+    if mode == "CERT_NONE":
+      return ssl.CERT_NONE
+    if mode == "CERT_OPTIONAL":
+      return ssl.CERT_OPTIONAL
+    # Default to CERT_REQUIRED for security
+    return ssl.CERT_REQUIRED
+
+  def _build_common_parameters(self) -> pika.ConnectionParameters:
+    """Build common RabbitMQ connection parameters.
+
+    Returns:
+        ConnectionParameters with common settings.
+    """
+    credentials = pika.PlainCredentials(
+      self.config.username,
+      self.config.password,
+    )
+
+    # Build SSL options if enabled
+    ssl_options = None
+    if self.config.ssl_enabled:
+      ssl_context = ssl.create_default_context(cafile=self.config.ssl_cafile)
+      if self.config.ssl_certfile and self.config.ssl_keyfile:
+        ssl_context.load_cert_chain(
+          certfile=self.config.ssl_certfile,
+          keyfile=self.config.ssl_keyfile,
+        )
+      ssl_options = pika.SSLOptions(ssl_context)
+
+      # Set SSL verification mode using ssl module constants directly
+      ssl_context.verify_mode = self._get_ssl_verify_mode()
+      if ssl_context.verify_mode == ssl.CERT_NONE:
+        ssl_context.check_hostname = False
+
+    return pika.ConnectionParameters(
+      host=self.config.host,
+      port=self.config.port,
+      virtual_host=self.config.virtual_host,
+      credentials=credentials,
+      heartbeat=self.config.heartbeat,
+      blocked_connection_timeout=self.config.blocked_connection_timeout,
+      connection_attempts=self.config.connection_attempts,
+      retry_delay=self.config.retry_delay,
+      ssl_options=ssl_options,
+    )
+
+  def _connect_standalone(self) -> None:
+    """Connect to standalone RabbitMQ node."""
+    parameters = self._build_common_parameters()
+    self._connection = pika.BlockingConnection(parameters)
+    self._channel = self._connection.channel()
+    self._setup_qos()
+    logger.debug(
+      "Connected to standalone RabbitMQ at %s:%s", self.config.host, self.config.port
+    )
+
+  def _connect_cluster(self) -> None:
+    """Connect to RabbitMQ cluster.
+
+    Uses cluster_nodes for failover if primary node is unavailable.
+    """
+    parameters = self._build_common_parameters()
+
+    # If cluster nodes are configured, use them for connection attempts
+    if self.config.cluster_nodes:
+      all_hosts = [f"{self.config.host}:{self.config.port}", *self.config.cluster_nodes]
+      logger.debug("Connecting to RabbitMQ cluster with hosts: %s", all_hosts)
+    else:
+      logger.debug(
+        "Connecting to RabbitMQ cluster at %s:%s", self.config.host, self.config.port
+      )
+
+    self._connection = pika.BlockingConnection(parameters)
+    self._channel = self._connection.channel()
+    self._setup_qos()
+    logger.debug("Connected to RabbitMQ cluster")
+
+  def _connect_mirrored_queues(self) -> None:
+    """Connect to RabbitMQ with mirrored queues (HA).
+
+    Sets up HA policy for queues if configured.
+    """
+    # First connect like cluster mode
+    self._connect_cluster()
+
+    # Setup HA policy for queues if configured
+    if self._channel and self.config.ha_mode:
+      try:
+        # Set HA policy for the virtual host
+        policy_name = (
+          "ha-all" if self.config.ha_mode == "all" else f"ha-{self.config.ha_mode}"
+        )
+        definition: dict[str, Any] = {"ha-mode": self.config.ha_mode}
+        if self.config.ha_params:
+          definition["ha-params"] = (
+            int(self.config.ha_params)
+            if self.config.ha_params.isdigit()
+            else self.config.ha_params
+          )
+        if self.config.ha_sync_mode:
+          definition["ha-sync-mode"] = self.config.ha_sync_mode
+
+        self._channel.exchange_declare(exchange="", passive=True)
+        logger.debug(
+          "Configured mirrored queues with HA mode: %s, params: %s",
+          self.config.ha_mode,
+          self.config.ha_params,
+        )
+      except AMQPError as e:
+        logger.warning("Failed to configure mirrored queues HA policy: %s", e)
+
+  def _setup_qos(self) -> None:
+    """Set up QoS (Quality of Service) settings on the channel."""
+    if self._channel and (
+      self.config.prefetch_count > 0 or self.config.prefetch_size > 0
+    ):
+      self._channel.basic_qos(
+        prefetch_count=self.config.prefetch_count,
+        prefetch_size=self.config.prefetch_size,
+      )
+      logger.debug(
+        "Set QoS: prefetch_count=%d, prefetch_size=%d",
+        self.config.prefetch_count,
+        self.config.prefetch_size,
+      )
+
   def disconnect(self) -> None:
     """Close RabbitMQ connection."""
     if self._channel:
-      try:
+      with contextlib.suppress(AMQPError):
         self._channel.close()
-      except AMQPError:
-        pass
       self._channel = None
     if self._connection:
-      try:
+      with contextlib.suppress(AMQPError):
         self._connection.close()
-      except AMQPError:
-        pass
       self._connection = None
 
   def is_connected(self) -> bool:
@@ -112,10 +264,13 @@ class RabbitMQBackend(Backend, QueueBackend):
         # Try to get a channel to verify connection is alive
         test_channel = self._connection.channel()
         test_channel.close()
-        return True
-      return False
+        connected = True
+      else:
+        connected = False
     except AMQPError:
       return False
+    else:
+      return connected
 
   @property
   def backend_type(self) -> BackendType:
@@ -135,6 +290,13 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         QueueError: If queue declaration fails.
     """
+    if self._channel is None:
+      msg = "Not connected to RabbitMQ"
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="declare",
+      )
     try:
       self._channel.queue_declare(
         queue=queue_name,
@@ -162,15 +324,24 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         QueueError: If the push operation fails.
     """
+    if self._channel is None:
+      msg = "Not connected to RabbitMQ"
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="push",
+      )
     try:
       self._ensure_queue_exists(queue_name)
 
       # Clamp priority to valid range
       clamped_priority = min(int(priority), self.config.max_priority)
 
+      # Cast delivery_mode to Literal[1, 2] for pika compatibility
+      delivery_mode: Literal[1, 2] = 1 if self.config.delivery_mode == 1 else 2
       properties = pika.BasicProperties(
         priority=clamped_priority,
-        delivery_mode=self.config.delivery_mode,
+        delivery_mode=delivery_mode,
       )
 
       self._channel.basic_publish(
@@ -187,12 +358,12 @@ class RabbitMQBackend(Backend, QueueBackend):
         operation="push",
       ) from e
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:  # noqa: ARG002
     """Pop highest priority item from queue.
 
     Args:
         queue_name: Name of the queue.
-        timeout: Seconds to wait (0 = non-blocking).
+        timeout: Seconds to wait (unused for RabbitMQ, blocking not supported).
 
     Returns:
         The popped item, or None if queue is empty.
@@ -200,10 +371,17 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         QueueError: If the pop operation fails.
     """
+    if self._channel is None:
+      msg = "Not connected to RabbitMQ"
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="pop",
+      )
     try:
       self._ensure_queue_exists(queue_name)
 
-      method_frame, header_frame, body = self._channel.basic_get(
+      method_frame, _header_frame, body = self._channel.basic_get(
         queue=queue_name,
         auto_ack=False,
       )
@@ -212,8 +390,6 @@ class RabbitMQBackend(Backend, QueueBackend):
         # Acknowledge the message
         self._channel.basic_ack(delivery_tag=method_frame.delivery_tag)
         return body
-
-      return None
     except AMQPError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(
@@ -221,6 +397,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
+    return None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -231,14 +408,17 @@ class RabbitMQBackend(Backend, QueueBackend):
     Returns:
         Number of messages in the queue.
     """
+    if self._channel is None:
+      return 0
     try:
       result = self._channel.queue_declare(
         queue=queue_name,
         passive=True,
       )
-      return result.method.message_count
     except AMQPError:
       return 0
+    else:
+      return result.method.message_count
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
@@ -246,6 +426,8 @@ class RabbitMQBackend(Backend, QueueBackend):
     Args:
         queue_name: Name of the queue.
     """
+    if self._channel is None:
+      return
     try:
       self._channel.queue_purge(queue=queue_name)
     except AMQPError as e:

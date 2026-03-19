@@ -3,11 +3,36 @@
 from unittest.mock import Mock, patch
 
 import pytest
+
 from scrapy_extension.backends.base import (
   BackendType,
   JSONSerializer,
 )
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import BackendConnectionError
+
+
+class TestRedisMode:
+  """Test RedisMode enum."""
+
+  def test_standalone_value(self):
+    from scrapy_extension.config.settings import RedisMode
+
+    assert RedisMode.STANDALONE.value == "standalone"
+
+  def test_master_slave_value(self):
+    from scrapy_extension.config.settings import RedisMode
+
+    assert RedisMode.MASTER_SLAVE.value == "master_slave"
+
+  def test_sentinel_value(self):
+    from scrapy_extension.config.settings import RedisMode
+
+    assert RedisMode.SENTINEL.value == "sentinel"
+
+  def test_cluster_value(self):
+    from scrapy_extension.config.settings import RedisMode
+
+    assert RedisMode.CLUSTER.value == "cluster"
 
 
 class TestBackendType:
@@ -93,6 +118,7 @@ class TestRedisBackend:
   def test_connect_failure(self, redis_settings):
     """Test connection failure raises ConnectionError."""
     from redis.exceptions import RedisError
+
     from scrapy_extension.backends.redis_backend import RedisBackend
 
     with patch("scrapy_extension.backends.redis_backend.Redis") as mock:
@@ -182,3 +208,150 @@ class TestRedisBackend:
       backend = RedisBackend(redis_settings)
       result = backend.retrieve("test_key")
       assert result == b"test_data"
+
+
+class TestRedisBackendModes:
+  """Test RedisBackend with different deployment modes."""
+
+  @pytest.fixture
+  def mock_redis(self):
+    """Create mock Redis client."""
+    return Mock()
+
+  def test_standalone_mode_default(self, mock_redis):
+    """Test standalone mode is default."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(host="localhost", port=6379)
+    assert settings.mode == RedisMode.STANDALONE
+
+    with patch(
+      "scrapy_extension.backends.redis_backend.Redis", return_value=mock_redis
+    ):
+      backend = RedisBackend(settings)
+      backend.connect()
+      assert backend.is_connected()
+
+  def test_sentinel_mode_success(self, mock_redis):
+    """Test sentinel mode connection."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel1:26379", "sentinel2:26379"],
+      sentinel_master_name="mymaster",
+      password="secret",
+    )
+
+    mock_sentinel = Mock()
+    mock_sentinel.master_for.return_value = mock_redis
+
+    with patch(
+      "scrapy_extension.backends.redis_backend.Sentinel", return_value=mock_sentinel
+    ):
+      backend = RedisBackend(settings)
+      backend.connect()
+      assert backend.is_connected()
+      mock_sentinel.master_for.assert_called_once()
+
+  def test_sentinel_mode_missing_sentinels(self):
+    """Test sentinel mode requires sentinels configuration."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+    from scrapy_extension.exceptions import BackendConnectionError
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinel_master_name="mymaster",
+    )
+
+    backend = RedisBackend(settings)
+    with pytest.raises(BackendConnectionError) as exc_info:
+      backend.connect()
+    assert "sentinels" in str(exc_info.value).lower()
+
+  def test_cluster_mode_success(self, mock_redis):
+    """Test cluster mode connection."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER,
+      cluster_startup_nodes=["node1:7000", "node2:7000", "node3:7000"],
+      password="secret",
+    )
+
+    with patch(
+      "scrapy_extension.backends.redis_backend.RedisCluster", return_value=mock_redis
+    ):
+      backend = RedisBackend(settings)
+      backend.connect()
+      assert backend.is_connected()
+
+  def test_master_slave_mode_success(self, mock_redis):
+    """Test master-slave mode connection."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.MASTER_SLAVE,
+      host="master.redis.com",
+      port=6379,
+      replicas=["replica1.redis.com:6379", "replica2.redis.com:6379"],
+    )
+
+    with patch(
+      "scrapy_extension.backends.redis_backend.Redis", return_value=mock_redis
+    ):
+      backend = RedisBackend(settings)
+      backend.connect()
+      assert backend.is_connected()
+
+  def test_cluster_mode_uses_startup_nodes(self, mock_redis):
+    """Test cluster mode uses startup nodes configuration."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER,
+      cluster_startup_nodes=["node1:7000", "node2:7000"],
+    )
+
+    with patch(
+      "scrapy_extension.backends.redis_backend.RedisCluster", return_value=mock_redis
+    ) as mock_cluster_class:
+      backend = RedisBackend(settings)
+      backend.connect()
+      mock_cluster_class.assert_called_once()
+      call_kwargs = mock_cluster_class.call_args.kwargs
+      assert "startup_nodes" in call_kwargs
+      assert len(call_kwargs["startup_nodes"]) == 2
+
+  def test_sentinel_mode_configuration(self, mock_redis):
+    """Test sentinel mode configuration options."""
+    from scrapy_extension.backends.redis_backend import RedisBackend
+    from scrapy_extension.config.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"],
+      sentinel_master_name="myredis",
+      sentinel_password="sentinel_pass",
+      password="redis_pass",
+      db=0,
+    )
+
+    mock_sentinel = Mock()
+    mock_sentinel.master_for.return_value = mock_redis
+
+    with patch(
+      "scrapy_extension.backends.redis_backend.Sentinel", return_value=mock_sentinel
+    ) as mock_sentinel_class:
+      backend = RedisBackend(settings)
+      backend.connect()
+      mock_sentinel_class.assert_called_once()
+      # Verify sentinels were passed correctly
+      call_args = mock_sentinel_class.call_args
+      assert len(call_args.args[0]) == 3  # Three sentinel tuples

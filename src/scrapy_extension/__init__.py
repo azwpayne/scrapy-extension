@@ -21,13 +21,6 @@ from scrapy_extension.components.dupefilter import BackendDupeFilter
 from scrapy_extension.components.pipeline import BackendPipeline
 from scrapy_extension.components.queue import BackendQueue
 from scrapy_extension.components.scheduler import BackendScheduler
-from scrapy_extension.config.settings import (
-  KafkaSettings,
-  MongoDBSettings,
-  RabbitMQSettings,
-  RedisSettings,
-  Settings,
-)
 from scrapy_extension.connection.manager import ConnectionManager
 from scrapy_extension.exceptions import (
   BackendConnectionError,
@@ -36,47 +29,58 @@ from scrapy_extension.exceptions import (
   QueueError,
   SerializationError,
 )
+from scrapy_extension.settings import (
+  KafkaMode,
+  KafkaSettings,
+  MongoDBMode,
+  MongoDBSettings,
+  RabbitMQMode,
+  RabbitMQSettings,
+  RedisMode,
+  RedisSettings,
+  Settings,
+)
 from scrapy_extension.spider_mixin import BackendSpiderMixin
 
 __version__ = "0.1.0"
+
 __all__ = [
   # Backends
   "Backend",
-  "BackendType",
-  "QueueBackend",
-  "SetBackend",
-  "StorageBackend",
-  "RedisBackend",
-  "MongoDBBackend",
-  "KafkaBackend",
-  "RabbitMQBackend",
-  # Serialization
-  "Serializer",
-  "JSONSerializer",
-  # Configuration
-  "Settings",
-  "RedisSettings",
-  "MongoDBSettings",
-  "KafkaSettings",
-  "RabbitMQSettings",
-  # Connection
-  "ConnectionManager",
+  "BackendConnectionError",
+  "BackendDupeFilter",
+  # Exceptions
+  "BackendError",
+  "BackendPipeline",
   # Components
   "BackendQueue",
   "BackendScheduler",
-  "BackendDupeFilter",
-  "BackendPipeline",
   # Spider
   "BackendSpiderMixin",
-  # Exceptions
-  "BackendError",
-  "BackendConnectionError",
-  "QueueError",
-  "SerializationError",
+  "BackendType",
   "ConfigurationError",
+  # Connection
+  "ConnectionManager",
+  "JSONSerializer",
+  "KafkaBackend",
+  "KafkaMode",
+  "KafkaSettings",
+  "MongoDBBackend",
+  "MongoDBMode",
+  "MongoDBSettings",
+  "QueueBackend",
+  "QueueError",
+  "RabbitMQBackend",
+  "RabbitMQMode",
+  "RabbitMQSettings",
+  "RedisBackend",
+  "RedisMode",
+  "RedisSettings",
+  "SerializationError",
+  # Serialization
+  "Serializer",
+  "SetBackend",
+  # Configuration
+  "Settings",
+  "StorageBackend",
 ]
-
-
-def hello() -> str:
-  """Return a greeting message."""
-  return "Hello from scrapy-extension!"

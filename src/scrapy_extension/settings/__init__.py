@@ -1,10 +1,9 @@
-"""Compatibility shim for scrapy_extension.config.settings.
+"""Configuration module for scrapy-extension.
 
-This module re-exports settings classes from scrapy_extension.settings
-for backward compatibility with code importing from the old location.
+This module provides pydantic-settings based configuration classes
+for all backend types.
 """
 
-# Re-export all settings classes from the new location
 from scrapy_extension.settings.base import Settings
 from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
 from scrapy_extension.settings.mongodb import MongoDBMode, MongoDBSettings

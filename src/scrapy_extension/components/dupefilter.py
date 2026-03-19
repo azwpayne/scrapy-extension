@@ -8,12 +8,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from scrapy.http import Request
-from scrapy.settings import Settings
+from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:
   from scrapy import Spider
   from scrapy.crawler import Crawler
+  from scrapy.http import Request
+  from scrapy.settings import Settings
 
   from scrapy_extension.connection.manager import ConnectionManager
 
@@ -36,6 +37,7 @@ class BackendDupeFilter:
     self,
     connection_manager: ConnectionManager,
     key: str = "dupefilter",
+    *,
     debug: bool = False,
   ) -> None:
     """Initialize the dupefilter.
@@ -59,8 +61,8 @@ class BackendDupeFilter:
     Returns:
         A new BackendDupeFilter instance.
     """
-    from scrapy_extension.connection.manager import ConnectionManager
     from scrapy_extension.backends.base import BackendType
+    from scrapy_extension.connection.manager import ConnectionManager
 
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(
@@ -70,7 +72,7 @@ class BackendDupeFilter:
     return cls(
       connection_manager=manager,
       key=settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter"),
-      debug=settings.getbool("DUPEFILTER_DEBUG", False),
+      debug=settings.getbool("DUPEFILTER_DEBUG", default=False),
     )
 
   @classmethod
@@ -87,7 +89,6 @@ class BackendDupeFilter:
 
   def open(self) -> None:
     """Open the dupefilter (no-op for backend-based)."""
-    pass
 
   def close(self, reason: str) -> None:
     """Close the dupefilter (no-op for backend-based).
@@ -95,7 +96,6 @@ class BackendDupeFilter:
     Args:
         reason: The reason for closing.
     """
-    pass
 
   def log(self, request: Request, spider: Spider) -> None:
     """Log a filtered request.
@@ -106,7 +106,8 @@ class BackendDupeFilter:
     """
     if self.debug:
       logger.debug(
-        f"Filtered duplicate request: {request.url}",
+        "Filtered duplicate request: %s",
+        request.url,
         extra={"spider": spider},
       )
 
@@ -120,12 +121,14 @@ class BackendDupeFilter:
         True if the request is a duplicate, False otherwise.
     """
     fingerprint = self.request_fingerprint(request)
-    exists = self.connection_manager.get_set_backend().contains(
-      self.key, fingerprint.encode()
-    )
-    if not exists:
-      self.connection_manager.get_set_backend().add(self.key, fingerprint.encode())
-    return exists
+    set_backend = self.connection_manager.get_set_backend()
+
+    # Prefer atomic add if supported; fallback to contains-check semantics.
+    if set_backend.contains(self.key, fingerprint.encode()):
+      return True
+
+    added = set_backend.add(self.key, fingerprint.encode())
+    return not added
 
   def request_fingerprint(self, request: Request) -> str:
     """Generate a fingerprint for a request.
@@ -136,6 +139,4 @@ class BackendDupeFilter:
     Returns:
         A unique fingerprint string.
     """
-    from scrapy.utils.request import fingerprint
-
-    return fingerprint(request).hex()
+    return request_fingerprint(request)

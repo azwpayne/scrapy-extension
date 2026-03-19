@@ -78,7 +78,7 @@ class TestRedisSettings:
     assert settings.password is None
 
     settings = RedisSettings(password="secret")
-    assert settings.password == "secret"
+    assert settings.password == "secret"  # noqa: S105
 
   def test_from_env_vars(self, monkeypatch):
     """Test loading from environment variables."""
@@ -96,6 +96,7 @@ class TestMongoDBSettings:
   def test_default_values(self):
     """Test all default values."""
     from scrapy_extension.config.settings import MongoDBSettings
+
     settings = MongoDBSettings()
     assert settings.uri == "mongodb://localhost:27017"
     assert settings.database == "scrapy_extension"
@@ -113,6 +114,7 @@ class TestMongoDBSettings:
   def test_from_env_vars(self, monkeypatch):
     """Test loading from environment variables."""
     from scrapy_extension.config.settings import MongoDBSettings
+
     monkeypatch.setenv("SCRAPY_MONGO_URI", "mongodb://custom:27017")
     monkeypatch.setenv("SCRAPY_MONGO_DATABASE", "custom_db")
     settings = MongoDBSettings()
@@ -121,28 +123,31 @@ class TestMongoDBSettings:
 
 
 def test_kafka_settings_defaults():
-    from scrapy_extension.config.settings import KafkaSettings
-    settings = KafkaSettings()
-    assert settings.bootstrap_servers == "localhost:9092"
-    assert settings.max_priority_partitions == 10
-    assert settings.acks == "all"
-    assert settings.group_id == "scrapy-extension"
+  from scrapy_extension.config.settings import KafkaSettings
+
+  settings = KafkaSettings()
+  assert settings.bootstrap_servers == "localhost:9092"
+  assert settings.max_priority_partitions == 10
+  assert settings.acks == "all"
+  assert settings.group_id == "scrapy-extension"
 
 
 def test_kafka_settings_from_env(monkeypatch):
-    from scrapy_extension.config.settings import KafkaSettings
-    monkeypatch.setenv("SCRAPY_KAFKA_BOOTSTRAP_SERVERS", "kafka.example.com:9092")
-    monkeypatch.setenv("SCRAPY_KAFKA_GROUP_ID", "my-group")
-    settings = KafkaSettings()
-    assert settings.bootstrap_servers == "kafka.example.com:9092"
-    assert settings.group_id == "my-group"
+  from scrapy_extension.config.settings import KafkaSettings
+
+  monkeypatch.setenv("SCRAPY_KAFKA_BOOTSTRAP_SERVERS", "kafka.example.com:9092")
+  monkeypatch.setenv("SCRAPY_KAFKA_GROUP_ID", "my-group")
+  settings = KafkaSettings()
+  assert settings.bootstrap_servers == "kafka.example.com:9092"
+  assert settings.group_id == "my-group"
 
 
 def test_rabbitmq_settings_defaults():
-    from scrapy_extension.config.settings import RabbitMQSettings
-    settings = RabbitMQSettings()
-    assert settings.host == "localhost"
-    assert settings.port == 5672
-    assert settings.username == "guest"
-    assert settings.password == "guest"
-    assert settings.max_priority == 255
+  from scrapy_extension.config.settings import RabbitMQSettings
+
+  settings = RabbitMQSettings()
+  assert settings.host == "localhost"
+  assert settings.port == 5672
+  assert settings.username == "guest"
+  assert settings.password == "guest"  # noqa: S105
+  assert settings.max_priority == 255
