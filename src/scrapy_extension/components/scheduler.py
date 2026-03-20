@@ -131,15 +131,18 @@ class BackendScheduler:
     Returns:
         True if the request was enqueued, False if it was a duplicate.
     """
-    # Add fingerprint and detect duplicates atomically when supported.
+    # Skip dedup for backends that only support queue operations (e.g. Kafka, RabbitMQ).
     fingerprint = self._request_fingerprint(request)
-    added = self.connection_manager.get_set_backend().add(
-      self.dupefilter_key, fingerprint.encode()
-    )
-    if not added:
-      if self.stats:
-        self.stats.inc_value("scheduler/dropped_duplicates")
-      return False
+    try:
+      set_backend = self.connection_manager.get_set_backend()
+    except NotImplementedError:
+      logger.debug("Backend does not support set operations; skipping dedup")
+    else:
+      added = set_backend.add(self.dupefilter_key, fingerprint.encode())
+      if not added:
+        if self.stats:
+          self.stats.inc_value("scheduler/dropped_duplicates")
+        return False
 
     # Enqueue with priority (negate because Scrapy uses higher = more urgent)
     priority = request.priority

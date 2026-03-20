@@ -7,12 +7,14 @@ class QuotesCrawlSpider(CrawlSpider):
   allowed_domains = ["quotes.toscrape.com"]
   start_urls = ["https://quotes.toscrape.com"]
 
-  rules = (Rule(LinkExtractor(allow=r"Items/"), callback="parse_item", follow=True),)
+  rules = (Rule(LinkExtractor(allow=r"/page/\d+"), callback="parse_item", follow=True),)
 
-  @staticmethod
-  def parse_item(response):
-    return {
-      "domain_id": response.xpath('//input[@id="sid"]/@value').get(),
-      "name": response.xpath('//div[@id="name"]').get(),
-      "description": response.xpath('//div[@id="description"]').get(),
-    }
+  def parse_item(self, response):
+    self.logger.info("Parsing %s", response.url)
+
+    for quote in response.css("div.quote"):
+      yield {
+        "text": quote.css("span.text::text").get(),
+        "author": quote.css("small.author::text").get(),
+        "tags": quote.css("div.tags a.tag::text").getall(),
+      }

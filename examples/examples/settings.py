@@ -1,7 +1,8 @@
 # Scrapy settings for examples project
 #
-# For simplicity, this file contains only settings considered important or
-# commonly used. You can find more settings consulting the documentation:
+# This configuration demonstrates scrapy-extension with Redis as the default
+# backend. Uncomment alternative backend blocks to switch to MongoDB, Kafka,
+# or RabbitMQ.
 #
 #     https://docs.scrapy.org/en/latest/topics/settings.html
 #     https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
@@ -14,7 +15,6 @@ NEWSPIDER_MODULE = "examples.spiders"
 
 ADDONS = {}
 
-
 # Crawl responsibly by identifying yourself (and your website) on the user-agent
 # USER_AGENT = "examples (+http://www.yourdomain.com)"
 
@@ -22,7 +22,6 @@ ADDONS = {}
 ROBOTSTXT_OBEY = True
 
 # Concurrency and throttling settings
-# CONCURRENT_REQUESTS = 16
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
 DOWNLOAD_DELAY = 1
 
@@ -32,56 +31,122 @@ DOWNLOAD_DELAY = 1
 # Disable Telnet Console (enabled by default)
 # TELNETCONSOLE_ENABLED = False
 
-# Override the default request headers:
-# DEFAULT_REQUEST_HEADERS = {
-#    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-#    "Accept-Language": "en",
-# }
-
-# Enable or disable spider middlewares
-# See https://docs.scrapy.org/en/latest/topics/spider-middleware.html
-# SPIDER_MIDDLEWARES = {
-#    "examples.middlewares.ExamplesSpiderMiddleware": 543,
-# }
-
-# Enable or disable downloader middlewares
-# See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
-# DOWNLOADER_MIDDLEWARES = {
-#    "examples.middlewares.ExamplesDownloaderMiddleware": 543,
-# }
-
-# Enable or disable extensions
-# See https://docs.scrapy.org/en/latest/topics/extensions.html
-# EXTENSIONS = {
-#    "scrapy.extensions.telnet.TelnetConsole": None,
-# }
-
-# Configure item pipelines
-# See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-# ITEM_PIPELINES = {
-#    "examples.pipelines.ExamplesPipeline": 300,
-# }
-
-# Enable and configure the AutoThrottle extension (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/autothrottle.html
-# AUTOTHROTTLE_ENABLED = True
-# The initial download delay
-# AUTOTHROTTLE_START_DELAY = 5
-# The maximum download delay to be set in case of high latencies
-# AUTOTHROTTLE_MAX_DELAY = 60
-# The average number of requests Scrapy should be sending in parallel to
-# each remote server
-# AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
-# Enable showing throttling stats for every response received:
-# AUTOTHROTTLE_DEBUG = False
-
-# Enable and configure HTTP caching (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html#httpcache-middleware-settings
-# HTTPCACHE_ENABLED = True
-# HTTPCACHE_EXPIRATION_SECS = 0
-# HTTPCACHE_DIR = "httpcache"
-# HTTPCACHE_IGNORE_HTTP_CODES = []
-# HTTPCACHE_STORAGE = "scrapy.extensions.httpcache.FilesystemCacheStorage"
-
 # Set settings whose default value is deprecated to a future-proof value
 FEED_EXPORT_ENCODING = "utf-8"
+
+# =============================================================================
+# scrapy-extension: Backend Configuration
+# =============================================================================
+
+# --- Scheduler & DupeFilter (required for distributed crawling) ---
+SCHEDULER = "scrapy_extension.components.scheduler.BackendScheduler"
+DUPEFILTER_CLASS = "scrapy_extension.components.dupefilter.BackendDupeFilter"
+
+# --- Item Pipeline (stores items in backend storage) ---
+ITEM_PIPELINES = {
+  "scrapy_extension.components.pipeline.BackendPipeline": 300,
+}
+
+# --- Pipeline options ---
+SCRAPY_PIPELINE_KEY_PREFIX = "items"
+# SCRAPY_PIPELINE_TTL = 3600  # Optional: items expire after 1 hour (seconds)
+
+# =============================================================================
+# Backend Selection (redis | mongodb | kafka | rabbitmq)
+# =============================================================================
+
+SCRAPY_BACKEND_TYPE = "redis"
+
+# =============================================================================
+# Redis Configuration (Default)
+# =============================================================================
+# Supports modes: standalone (default), master_slave, sentinel, cluster
+
+SCRAPY_REDIS_HOST = "localhost"
+SCRAPY_REDIS_PORT = 6379
+SCRAPY_REDIS_DB = 0
+# SCRAPY_REDIS_PASSWORD = "secret"  # Optional
+
+# --- Redis Master-Slave Mode ---
+# SCRAPY_REDIS_MODE = "master_slave"
+# SCRAPY_REDIS_REPLICAS = ["replica1.redis.com:6379", "replica2.redis.com:6379"]
+# SCRAPY_REDIS_READ_FROM_REPLICAS = True
+
+# --- Redis Sentinel Mode (High Availability) ---
+# SCRAPY_REDIS_MODE = "sentinel"
+# SCRAPY_REDIS_SENTINELS = ["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"]
+# SCRAPY_REDIS_SENTINEL_MASTER_NAME = "mymaster"
+# SCRAPY_REDIS_SENTINEL_PASSWORD = "sentinel_secret"
+# SCRAPY_REDIS_PASSWORD = "redis_secret"
+
+# --- Redis Cluster Mode ---
+# SCRAPY_REDIS_MODE = "cluster"
+# SCRAPY_REDIS_CLUSTER_STARTUP_NODES = ["node1:7000", "node2:7000", "node3:7000"]
+# SCRAPY_REDIS_CLUSTER_MAX_REDIRECTS = 5
+
+# =============================================================================
+# MongoDB Configuration (Uncomment to use)
+# =============================================================================
+# Supports modes: standalone (default), replica_set, sharded_cluster, atlas
+
+# SCRAPY_BACKEND_TYPE = "mongodb"
+# SCRAPY_MONGO_URI = "mongodb://localhost:27017"
+# SCRAPY_MONGO_DATABASE = "scrapy"
+
+# --- MongoDB Replica Set ---
+# SCRAPY_MONGO_MODE = "replica_set"
+# SCRAPY_MONGO_REPLICA_SET_NAME = "myReplicaSet"
+# SCRAPY_MONGO_REPLICA_SET_MEMBERS = ["host1:27017", "host2:27017", "host3:27017"]
+# SCRAPY_MONGO_TLS_ENABLED = True
+
+# --- MongoDB Atlas (Cloud) ---
+# SCRAPY_MONGO_MODE = "atlas"
+# SCRAPY_MONGO_URI = "mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/scrapy?retryWrites=true&w=majority"
+
+# =============================================================================
+# Kafka Configuration (Uncomment to use)
+# =============================================================================
+# Note: Kafka only supports Queue operations (no Set/Storage for dedup/storage)
+
+# SCRAPY_BACKEND_TYPE = "kafka"
+# SCRAPY_KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+# SCRAPY_KAFKA_GROUP_ID = "scrapy-spiders"
+
+# --- Kafka Cluster ---
+# SCRAPY_KAFKA_MODE = "cluster"
+# SCRAPY_KAFKA_CLUSTER_BROKERS = ["broker1:9092", "broker2:9092", "broker3:9092"]
+# SCRAPY_KAFKA_REPLICATION_FACTOR = 3
+
+# --- Confluent Cloud ---
+# SCRAPY_KAFKA_MODE = "confluent"
+# SCRAPY_KAFKA_CONFLUENT_BOOTSTRAP_SERVERS = "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+# SCRAPY_KAFKA_CONFLUENT_API_KEY = "API_KEY"
+# SCRAPY_KAFKA_CONFLUENT_API_SECRET = "API_SECRET"
+
+# =============================================================================
+# RabbitMQ Configuration (Uncomment to use)
+# =============================================================================
+# Note: RabbitMQ only supports Queue operations (no Set/Storage for dedup/storage)
+
+# SCRAPY_BACKEND_TYPE = "rabbitmq"
+# SCRAPY_RABBITMQ_HOST = "localhost"
+# SCRAPY_RABBITMQ_PORT = 5672
+# SCRAPY_RABBITMQ_USERNAME = "guest"
+# SCRAPY_RABBITMQ_PASSWORD = "guest"
+# SCRAPY_RABBITMQ_VIRTUAL_HOST = "/"
+
+# --- RabbitMQ Cluster ---
+# SCRAPY_RABBITMQ_MODE = "cluster"
+# SCRAPY_RABBITMQ_CLUSTER_NODES = ["node2:5672", "node3:5672"]
+
+# --- RabbitMQ Mirrored Queues (HA) ---
+# SCRAPY_RABBITMQ_MODE = "mirrored_queues"
+# SCRAPY_RABBITMQ_HA_MODE = "exactly"
+# SCRAPY_RABBITMQ_HA_PARAMS = "2"
+# SCRAPY_RABBITMQ_HA_SYNC_MODE = "automatic"
+
+# --- RabbitMQ SSL/TLS ---
+# SCRAPY_RABBITMQ_SSL_ENABLED = True
+# SCRAPY_RABBITMQ_SSL_CAFILE = "/path/to/ca.pem"
+# SCRAPY_RABBITMQ_SSL_CERTFILE = "/path/to/cert.pem"
+# SCRAPY_RABBITMQ_SSL_KEYFILE = "/path/to/key.pem"

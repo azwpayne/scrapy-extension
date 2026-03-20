@@ -121,7 +121,12 @@ class BackendDupeFilter:
         True if the request is a duplicate, False otherwise.
     """
     fingerprint = self.request_fingerprint(request)
-    set_backend = self.connection_manager.get_set_backend()
+
+    try:
+      set_backend = self.connection_manager.get_set_backend()
+    except NotImplementedError:
+      logger.debug("Backend does not support set operations; skipping dedup")
+      return False
 
     # Use atomic add — return True (duplicate) if item already existed
     added = set_backend.add(self.key, fingerprint.encode())
