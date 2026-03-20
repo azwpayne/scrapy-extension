@@ -21,12 +21,7 @@ from scrapy_extension.backends.base import (
 from scrapy_extension.exceptions import BackendConnectionError
 
 if TYPE_CHECKING:
-  from scrapy_extension.backends.base import (
-    Backend,
-    QueueBackend,
-    SetBackend,
-    StorageBackend,
-  )
+  from scrapy_extension.backends.base import Backend
 
 logger = logging.getLogger(__name__)
 
@@ -152,10 +147,7 @@ class ConnectionManager:
     for attempt in range(retry_attempts):
       try:
         self._attempt_connection()
-        logger.debug("Connected to %s", self.backend_type.value)
-        return
-      except Exception as e:
-        # Retry on all exceptions except on KeyboardInterrupt/SystemExit
+      except Exception as e:  # noqa: PERF203
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
           raise
         last_exception = e
@@ -164,6 +156,9 @@ class ConnectionManager:
         )
         if attempt < retry_attempts - 1:
           time.sleep(retry_delay * (2**attempt))
+      else:
+        logger.debug("Connected to %s", self.backend_type.value)
+        return
 
     if last_exception is not None:
       msg = f"Failed to connect after {retry_attempts} attempts: {last_exception}"
@@ -231,9 +226,8 @@ class ConnectionManager:
     """
     backend = self.backend
     if not isinstance(backend, QueueBackend):
-      raise NotImplementedError(
-        f"Backend {backend.__class__.__name__} does not support queue operations"
-      )
+      msg = f"Backend {backend.__class__.__name__} does not support queue operations"
+      raise NotImplementedError(msg)
     return backend
 
   def get_set_backend(self) -> SetBackend:
@@ -244,9 +238,8 @@ class ConnectionManager:
     """
     backend = self.backend
     if not isinstance(backend, SetBackend):
-      raise NotImplementedError(
-        f"Backend {backend.__class__.__name__} does not support set operations"
-      )
+      msg = f"Backend {backend.__class__.__name__} does not support set operations"
+      raise NotImplementedError(msg)
     return backend
 
   def get_storage_backend(self) -> StorageBackend:
@@ -257,7 +250,6 @@ class ConnectionManager:
     """
     backend = self.backend
     if not isinstance(backend, StorageBackend):
-      raise NotImplementedError(
-        f"Backend {backend.__class__.__name__} does not support storage operations"
-      )
+      msg = f"Backend {backend.__class__.__name__} does not support storage operations"
+      raise NotImplementedError(msg)
     return backend

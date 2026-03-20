@@ -261,10 +261,11 @@ class KafkaBackend(Backend, QueueBackend):
     try:
       if self._admin_client:
         self._admin_client.list_topics()
-        return True
-      return False
     except KafkaError:
       return False
+    else:
+      return self._admin_client is not None
+    return False
 
   @property
   def backend_type(self) -> BackendType:

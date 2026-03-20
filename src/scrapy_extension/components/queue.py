@@ -61,8 +61,7 @@ class BackendQueue:
     if request.body:
       try:
         body_value = request.body.decode("utf-8")
-      except Exception:
-        # Fallback: use latin-1 to preserve arbitrary bytes through JSON
+      except (UnicodeDecodeError, ValueError):
         body_value = request.body.decode("latin-1")
 
     return {

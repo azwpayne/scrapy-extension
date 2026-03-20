@@ -77,7 +77,7 @@ def test_connection_manager_get_manager_same_settings_order():
 def test_connection_manager_get_set_backend_not_supported():
   """get_set_backend should raise NotImplementedError for unsupported backend."""
   manager = ConnectionManager(BackendType.KAFKA)
-  manager._backend = object()
+  manager._backend = object()  # noqa: SLF001
 
   with pytest.raises(NotImplementedError):
     manager.get_set_backend()
