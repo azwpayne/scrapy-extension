@@ -12,22 +12,6 @@ from enum import Enum
 from typing import Any, Protocol
 
 
-class BackendType(str, Enum):
-  """Supported backend types for distributed crawling.
-
-  Attributes:
-      REDIS: Redis backend for distributed crawling.
-      MONGODB: MongoDB backend for distributed crawling.
-      KAFKA: Kafka backend for distributed crawling.
-      RABBITMQ: RabbitMQ backend for distributed crawling.
-  """
-
-  REDIS = "redis"
-  MONGODB = "mongodb"
-  KAFKA = "kafka"
-  RABBITMQ = "rabbitmq"
-
-
 class Serializer(Protocol):
   """Protocol for serializers.
 
@@ -86,6 +70,26 @@ class JSONSerializer:
         The deserialized object.
     """
     return json.loads(data.decode("utf-8"))
+
+
+class BackendType(str, Enum):
+  """Supported backend types for distributed crawling.
+
+  Attributes:
+      REDIS: Redis backend for distributed crawling.
+      MONGODB: MongoDB backend for distributed crawling.
+      KAFKA: Kafka backend for distributed crawling.
+      RABBITMQ: RabbitMQ backend for distributed crawling.
+      ELASTICSEARCH: ElasticSearch backend for distributed crawling.
+      ROCKETMQ: RocketMQ backend for distributed crawling.
+  """
+
+  REDIS = "redis"
+  MONGODB = "mongodb"
+  KAFKA = "kafka"
+  RABBITMQ = "rabbitmq"
+  ELASTICSEARCH = "elasticsearch"
+  ROCKETMQ = "rocketmq"
 
 
 class Backend(ABC):
@@ -321,6 +325,7 @@ class StorageBackend(ABC):
     """Clear all stored data, optionally filtered by prefix.
 
     Args:
-        prefix: If provided, only clear keys starting with this prefix.
-               If None, clear all storage data.
+        prefix:
+        - If provided, only clear keys starting with this prefix.
+        - If None, clear all storage data.
     """
