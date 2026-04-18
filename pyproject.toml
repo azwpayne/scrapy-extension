@@ -9,39 +9,81 @@ description = "multi backend components for Scrapy."
 readme = "README.md"
 authors = [{ name = "azwpayne", email = "paynewu0719@gmail.com" }]
 requires-python = ">=3.10"
-dependencies = ["pydantic-settings>=2.13.1", "redis>=7.3.0", "scrapy>=2.14.2"]
-
-[project.optional-dependencies]
-mongodb = ["pymongo>=4.5.0"]
-kafka = ["kafka-python>=2.0.2"]
-rabbitmq = ["pika>=1.3.2"]
-all = ["pymongo>=4.5.0", "kafka-python>=2.0.2", "pika>=1.3.2"]
+dependencies = ["pydantic-settings>=2.13.1", "redis>=7.3.0", "scrapy>=2.14.2", "rocketmq-client-python>=2.0.0"]
 
 [dependency-groups]
-dev = ["poethepoet>=0.42.1", "ruff>=0.15.6", "ty>=0.0.23"]
-test = [
-  "pytest",
-  "pytest-asyncio",
-  "pytest-cov",
-  "pytest-xdist",
-  "pytest-mock",
-  "pytest-benchmark",
-  "pytest-timeout",
-  "pytest-sugar",
-  "pytest-factoryboy",
+dev = [
+    "poethepoet",
+    "ruff",
 ]
-
+test = [
+    "pytest",
+    "pytest-xdist[psutil]",
+    "pytest-parallel",
+    "pytest-randomly",
+    "pytest-order",
+    "pytest-repeat",
+    "pytest-rerunfailures",
+    "pytest-timeout",
+    # Mocking & 仿真
+    "pytest-mock",
+    "responses",
+    "moto[all]",
+    "vcrpy",
+    "time-machine",
+    "pytest-socket",
+    "testcontainers",
+    # 数据生成
+    "hypothesis",
+    "faker",
+    "factory-boy",
+    "pytest-factoryboy",
+    "polyfactory",
+    # 覆盖率与变异测试
+    "pytest-cov",
+    "coverage[toml]",
+    "diff-cover",
+    "mutmut",
+    "cosmic-ray",
+    "pytest-deadfixtures",
+    # 可视化与报告
+    "syrupy",
+    "pytest-html",
+    "allure-pytest",
+    "pytest-sugar",
+    "pytest-instafail",
+    "pytest-pretty",
+    "pytest-watcher",
+    # 性能与资源
+    # "pytest-benchmark",
+    "pytest-memray",
+    "pytest-leaks",
+    "pytest-profiling",
+    # 异步
+    "pytest-asyncio",
+    "pytest-anyio",
+    # 安全与质量
+    "pytest-bandit",
+    "safety",
+    "pytest-mypy",
+    "pytest-ruff",
+    # 高级断言
+    "pytest-check",
+    "pytest-subtests",
+    "pytest-describe",
+]
 
 [tool.poe]
 executor.type = "uv"
 tasks.full = ["clean", "format"]
 tasks.test = [
-  "clean",
-  "test-py310",
-  "test-py311",
-  "test-py312",
-  "test-py313",
-  "test-py314",
+    "clean",
+    "test-py310",
+    "test-py311",
+    "test-py312",
+    "test-py313",
+    "test-py314",
+    "test-py314t"
 ]
 
 tasks.format = "ruff format"
@@ -52,36 +94,144 @@ tasks.test-py311 = { shell = "uv run --python 3.11 --group test pytest" }
 tasks.test-py312 = { shell = "uv run --python 3.12 --group test pytest" }
 tasks.test-py313 = { shell = "uv run --python 3.13 --group test pytest" }
 tasks.test-py314 = { shell = "uv run --python 3.14 --group test pytest" }
-
+tasks.test-py314t = { shell = "uv run --python 3.14t --group test pytest" }
 
 tasks.clean = { shell = """
-	rm -rf *.py
-	rm -rf .pytest_cache htmlcov .coverage coverage.xml .ruff_cache .benchmarks
+	rm -rf .pytest_cache htmlcov .coverage coverage.xml .ruff_cache .benchmarks reports
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 """ }
 
-
 [tool.pytest.ini_options]
+minversion = "8.0"
+python_files = ["test_*.py", "*_test.py", "testing.py"]
+python_classes = ["Test*", "*Test"]
+python_functions = ["test_*", "it_*", "its_*", "check_*"]
 pythonpath = ["src", "."]
-testpaths = ["tests"]
+testpaths = ["tests", "src"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 timeout = 30
-addopts = """
-    -v
-    -n auto
-    --tb=short
-    --cov-branch
-    --strict-markers
-    --cov-report=xml
-    --cov-report=html
-    --cov=src/scrapy_extension
-    --cov-report=term-missing
-"""
+addopts = [
+    # 并行与随机
+    "-n=8",
+    "--randomly-seed=last",
+    "--dist=loadscope",
+    # 覆盖率
+    "--cov=src",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=html:reports/coverage",
+    "--cov-report=xml:reports/coverage.xml",
+    "--cov-report=json:reports/coverage.json",
+    "--cov-fail-under=90",
+    "--no-cov-on-fail",
+    # 性能与超时
+    "--timeout=60",
+    "--timeout-method=thread",
+    # "--benchmark-only",
+    # "--benchmark-max-time=1.0",
+    # 视觉与体验
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--strict-config",
+    "--html=reports/test_report.html",
+    "--self-contained-html",
+    # "--sugar",
+    "--instafail",
+    # 安全与质量
+    "--bandit",
+    "--mypy",
+    "--ruff",
+]
+filterwarnings = [
+    #    "ignore::pytest_benchmark.logger.PytestBenchmarkWarning",
+    "error::UserWarning", # 将警告视为错误
+    "ignore::DeprecationWarning:pkg_resources.*",
+]
+markers = [
+    "unit: 纯单元测试（无IO，<10ms）",
+    "integration: 集成测试（含数据库/HTTP）",
+    "e2e: 端到端测试（完整用户流程）",
+    "slow: 执行时间>1s的测试",
+    "flaky: 已知不稳定的测试（需重试）",
+    "security: 安全相关测试",
+    "mutation: 变异测试筛选",
+    "benchmark: 性能基准测试",
+    "snapshot: 快照测试",
+    "property: Hypothesis属性测试",
+]
+[tool.pyrefly]
+strict = true
+
+# 针对测试目录的特殊配置
+[[tool.pyrefly.overrides]]
+pattern = "tests/**/*.py"
+strict = false
+ignore_errors = ["bad-argument-type"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/conftest.py",
+    "*/migrations/*",
+    "*/venv/*",
+]
+branch = true
+parallel = true
+concurrency = ["thread", "multiprocessing"]
+
+[tool.coverage.report]
+precision = 2
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "reports/coverage"
+title = "Coverage Report"
+
+[tool.mutmut]
+paths_to_mutate = "src/"
+backup = false
+runner = "python -m pytest -x --timeout=60"
+tests_dir = "tests/"
+show_mutations = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B101"]  # 跳过assert检查（pytest使用大量assert）
 
 [tool.mypy]
-python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_no_return = true
+follow_imports = "normal"
 ignore_missing_imports = true
+show_error_codes = true
+pretty = true
+
+[tool.pytest-watcher]
+now = true
+patterns = ["*.py", "*.toml"]
+ignore_patterns = ["*.pyc", "__pycache__/*", "reports/*"]
+
 
 [tool.pytest_benchmark]
 min_rounds = 5
