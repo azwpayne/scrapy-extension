@@ -5,12 +5,19 @@ for all backend types.
 """
 
 from scrapy_extension.settings.base import Settings
+from scrapy_extension.settings.elasticsearch import (
+  ElasticSearchMode,
+  ElasticSearchSettings,
+)
 from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
 from scrapy_extension.settings.mongodb import MongoDBMode, MongoDBSettings
 from scrapy_extension.settings.rabbitmq import RabbitMQMode, RabbitMQSettings
 from scrapy_extension.settings.redis import RedisMode, RedisSettings
+from scrapy_extension.settings.rocketmq import RocketMQMode, RocketMQSettings
 
 __all__ = [
+  "ElasticSearchMode",
+  "ElasticSearchSettings",
   "KafkaMode",
   "KafkaSettings",
   "MongoDBMode",
@@ -19,5 +26,7 @@ __all__ = [
   "RabbitMQSettings",
   "RedisMode",
   "RedisSettings",
+  "RocketMQMode",
+  "RocketMQSettings",
   "Settings",
 ]
