@@ -16,7 +16,7 @@ from scrapy_extension.exceptions import SerializationError
 if TYPE_CHECKING:
   from scrapy.http import Request
 
-  from scrapy_extension.connection.manager import ConnectionManager
+  from scrapy_extension.backends.connectors import ConnectionManager
 
 logger = logging.getLogger(__name__)
 

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
   from scrapy.settings import Settings
   from scrapy.statscollectors import StatsCollector
 
-  from scrapy_extension.connection.manager import ConnectionManager
+  from scrapy_extension.backends.connectors import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ class BackendScheduler:
         A new BackendScheduler instance.
     """
     from scrapy_extension.backends.base import BackendType
-    from scrapy_extension.connection.manager import ConnectionManager
+    from scrapy_extension.backends.connectors import ConnectionManager
 
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(

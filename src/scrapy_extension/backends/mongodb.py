@@ -26,14 +26,14 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.config.settings import MongoDBMode
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.settings import MongoDBMode
 
 if TYPE_CHECKING:
   from pymongo.collection import Collection
   from pymongo.database import Database
 
-  from scrapy_extension.config.settings import MongoDBSettings
+  from scrapy_extension.settings import MongoDBSettings
 
 logger = logging.getLogger(__name__)
 

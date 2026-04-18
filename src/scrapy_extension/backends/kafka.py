@@ -14,20 +14,20 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from kafka import KafkaConsumer, KafkaProducer
+from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
-from scrapy_extension.config.settings import KafkaMode
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.settings import KafkaMode
 
 if TYPE_CHECKING:
-  from scrapy_extension.config.settings import KafkaSettings
+  from scrapy_extension.settings import KafkaSettings
 
 logger = logging.getLogger(__name__)
 
@@ -261,11 +261,11 @@ class KafkaBackend(Backend, QueueBackend):
     try:
       if self._admin_client:
         self._admin_client.list_topics()
+        return True
     except KafkaError:
       return False
     else:
-      return self._admin_client is not None
-    return False
+      return False
 
   @property
   def backend_type(self) -> BackendType:
@@ -400,16 +400,21 @@ class KafkaBackend(Backend, QueueBackend):
     try:
       topic_name = f"scrapy-{queue_name}"
       assert self._admin_client is not None
-      partitions = self._admin_client.describe_topics([topic_name])
+      topic_meta = self._admin_client.describe_topics([topic_name])
+      partition_ids = [p["partition"] for p in topic_meta[0]["partitions"]]
+      tps = [TopicPartition(topic_name, pid) for pid in partition_ids]
 
-      total = 0
-      for partition in partitions[0]["partitions"]:
-        partition_id = partition["partition"]
-        end_offset = self._admin_client.list_offsets(topic_name, partition_id, "latest")
-        begin_offset = self._admin_client.list_offsets(
-          topic_name, partition_id, "earliest"
-        )
-        total += end_offset - begin_offset
+      # Use a temporary consumer to query offsets
+      temp_consumer = KafkaConsumer(
+        bootstrap_servers=self.config.bootstrap_servers,
+        group_id=None,
+      )
+      try:
+        begin_offsets = temp_consumer.beginning_offsets(tps)
+        end_offsets = temp_consumer.end_offsets(tps)
+        total = sum(end_offsets[tp] - begin_offsets[tp] for tp in tps)
+      finally:
+        temp_consumer.close()
     except KafkaError:
       return 0
     else:

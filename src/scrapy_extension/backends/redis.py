@@ -262,9 +262,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if connected and responding to ping, False otherwise.
     """
     try:
-      if self._client is None:
+      if (client := self._client) is None:
         return False
-      result = self._client.ping()
+      result = client.ping()
       return bool(result) if result is not None else False
     except RedisError:
       return False
@@ -276,7 +276,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if Redis responds to ping.
     """
     try:
-      result = self._client.ping() if self._client else False
+      if (client := self._client) is None:
+        return False
+      result = client.ping()
       return bool(result) if result is not None else False
     except RedisError:
       return False
@@ -347,14 +349,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     try:
       if timeout > 0:
         # Use BZPOPMAX for blocking pop
-        result = self.client.bzpopmax(queue_name, timeout=timeout)
-        if result:
+        if result := self.client.bzpopmax(queue_name, timeout=timeout):
           # result is (queue_name, item, score)
           return result[1]  # type: ignore[index, return-value]
         return None
       # Non-blocking pop - returns list of (item, score) tuples
-      result = self.client.zpopmax(queue_name)  # type: ignore[assignment]
-      if result and len(result) > 0:  # type: ignore[arg-type]
+      if (result := self.client.zpopmax(queue_name)) and len(result) > 0:  # type: ignore[assignment, arg-type]
         return result[0][0]  # type: ignore[index, return-value]
     except RedisError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"

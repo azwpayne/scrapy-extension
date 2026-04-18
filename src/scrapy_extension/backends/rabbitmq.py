@@ -20,15 +20,15 @@ import pika
 from pika.exceptions import AMQPError
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
-from scrapy_extension.config.settings import RabbitMQMode
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.settings import RabbitMQMode
 
 if TYPE_CHECKING:
-  from scrapy_extension.config.settings import RabbitMQSettings
+  from scrapy_extension.settings import RabbitMQSettings
 
 logger = logging.getLogger(__name__)
 

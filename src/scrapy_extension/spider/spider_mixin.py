@@ -12,10 +12,10 @@ from scrapy import Spider, signals
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import BackendType
+  from scrapy_extension.backends.connectors import ConnectionManager
   from scrapy_extension.components.dupefilter import BackendDupeFilter
   from scrapy_extension.components.queue import BackendQueue
   from scrapy_extension.components.scheduler import BackendScheduler
-  from scrapy_extension.connection.manager import ConnectionManager
 
 
 class BackendSpiderMixin:
@@ -107,7 +107,7 @@ class BackendSpiderMixin:
     settings = self._build_backend_settings()
 
     # Import here to avoid circular imports
-    from scrapy_extension.connection.manager import ConnectionManager
+    from scrapy_extension.backends.connectors import ConnectionManager
 
     self._connection_manager = ConnectionManager(
       backend_type=self.backend_type,

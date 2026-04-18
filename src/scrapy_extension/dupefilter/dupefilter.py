@@ -16,7 +16,7 @@ if TYPE_CHECKING:
   from scrapy.http import Request
   from scrapy.settings import Settings
 
-  from scrapy_extension.connection.manager import ConnectionManager
+  from scrapy_extension.backends.connectors import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class BackendDupeFilter:
         A new BackendDupeFilter instance.
     """
     from scrapy_extension.backends.base import BackendType
-    from scrapy_extension.connection.manager import ConnectionManager
+    from scrapy_extension.backends.connectors import ConnectionManager
 
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(
