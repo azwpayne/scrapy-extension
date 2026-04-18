@@ -12,6 +12,7 @@ Note: Kafka does not support SetBackend or StorageBackend operations.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
@@ -20,11 +21,32 @@ from kafka.errors import KafkaError, TopicAlreadyExistsError
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
 from scrapy_extension.exceptions import (
-  BackendConnectionError,
-  ConfigurationError,
-  QueueError,
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
 )
 from scrapy_extension.settings import KafkaMode
+
+# Topic name validation pattern - only allow alphanumeric, dots, underscores, hyphens
+# Uses \Z instead of $ to match only at absolute end of string (not before trailing newline)
+TOPIC_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+\Z")
+
+
+def _validate_topic_name(name: str) -> None:
+    """Validate topic/queue name to prevent injection.
+
+    Args:
+        name: The name to validate.
+
+    Raises:
+        ValueError: If name contains invalid characters.
+    """
+    if not name or not TOPIC_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid topic/queue name: {name!r}. "
+            "Only alphanumeric, dots, underscores, and hyphens allowed."
+        )
+
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import KafkaSettings
@@ -99,6 +121,7 @@ class KafkaBackend(Backend, QueueBackend):
         backend_type="kafka",
       ) from e
     except Exception as e:
+      # Unexpected errors (e.g., RuntimeError from mocking in tests)
       msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
@@ -285,7 +308,11 @@ class KafkaBackend(Backend, QueueBackend):
 
     Args:
         queue_name: Name of the queue/topic.
+
+    Raises:
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_topic_name(queue_name)
     topic_name = f"scrapy-{queue_name}"
 
     # Skip if topic is already known to exist
@@ -350,7 +377,9 @@ class KafkaBackend(Backend, QueueBackend):
 
     Raises:
         QueueError: If the pop operation fails.
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_topic_name(queue_name)
     try:
       topic_name = f"scrapy-{queue_name}"
 
@@ -394,9 +423,13 @@ class KafkaBackend(Backend, QueueBackend):
     Returns:
         Approximate number of items in the queue.
 
+    Raises:
+        ValueError: If queue_name contains invalid characters.
+
     Note:
         This is eventually consistent and should be used for monitoring only.
     """
+    _validate_topic_name(queue_name)
     try:
       topic_name = f"scrapy-{queue_name}"
       assert self._admin_client is not None
@@ -425,7 +458,11 @@ class KafkaBackend(Backend, QueueBackend):
 
     Args:
         queue_name: Name of the queue.
+
+    Raises:
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_topic_name(queue_name)
     try:
       topic_name = f"scrapy-{queue_name}"
       assert self._admin_client is not None

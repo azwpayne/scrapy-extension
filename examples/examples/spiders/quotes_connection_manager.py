@@ -2,9 +2,9 @@ import hashlib
 
 import scrapy
 from scrapy import signals
+from scrapy_extension import BackendType, ConnectionManager
 
 from examples.items import QuoteItem
-from scrapy_extension import BackendType, ConnectionManager
 
 
 class QuotesConnectionManagerSpider(scrapy.Spider):

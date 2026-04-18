@@ -2,9 +2,8 @@
 
 import pytest
 from pydantic import ValidationError
-
 from scrapy_extension.backends.base import BackendType
-from scrapy_extension.config.settings import RedisSettings, Settings
+from scrapy_extension.settings import RedisSettings, Settings
 
 
 class TestSettings:
@@ -32,7 +31,7 @@ class TestSettings:
 
   def test_backend_type_from_str(self):
     """Test backend type from string."""
-    settings = Settings(backend_type="mongodb")
+    settings = Settings(backend_type=BackendType.MONGODB)
     assert settings.backend_type == BackendType.MONGODB
 
 
@@ -95,7 +94,7 @@ class TestMongoDBSettings:
 
   def test_default_values(self):
     """Test all default values."""
-    from scrapy_extension.config.settings import MongoDBSettings
+    from scrapy_extension.settings import MongoDBSettings
 
     settings = MongoDBSettings()
     assert settings.uri == "mongodb://localhost:27017"
@@ -113,7 +112,7 @@ class TestMongoDBSettings:
 
   def test_from_env_vars(self, monkeypatch):
     """Test loading from environment variables."""
-    from scrapy_extension.config.settings import MongoDBSettings
+    from scrapy_extension.settings import MongoDBSettings
 
     monkeypatch.setenv("SCRAPY_MONGO_URI", "mongodb://custom:27017")
     monkeypatch.setenv("SCRAPY_MONGO_DATABASE", "custom_db")
@@ -123,7 +122,7 @@ class TestMongoDBSettings:
 
 
 def test_kafka_settings_defaults():
-  from scrapy_extension.config.settings import KafkaSettings
+  from scrapy_extension.settings import KafkaSettings
 
   settings = KafkaSettings()
   assert settings.bootstrap_servers == "localhost:9092"
@@ -133,7 +132,7 @@ def test_kafka_settings_defaults():
 
 
 def test_kafka_settings_from_env(monkeypatch):
-  from scrapy_extension.config.settings import KafkaSettings
+  from scrapy_extension.settings import KafkaSettings
 
   monkeypatch.setenv("SCRAPY_KAFKA_BOOTSTRAP_SERVERS", "kafka.example.com:9092")
   monkeypatch.setenv("SCRAPY_KAFKA_GROUP_ID", "my-group")
@@ -143,7 +142,7 @@ def test_kafka_settings_from_env(monkeypatch):
 
 
 def test_rabbitmq_settings_defaults():
-  from scrapy_extension.config.settings import RabbitMQSettings
+  from scrapy_extension.settings import RabbitMQSettings
 
   settings = RabbitMQSettings()
   assert settings.host == "localhost"

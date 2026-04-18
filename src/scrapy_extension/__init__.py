@@ -1,7 +1,7 @@
 """Scrapy extension for distributed crawling with multiple backend support.
 
 This package provides distributed crawling capabilities for Scrapy with support
-for multiple backends: Redis, MongoDB, Kafka, and RabbitMQ.
+for multiple backends: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, and RocketMQ.
 """
 
 from scrapy_extension.backends.base import (
@@ -13,15 +13,14 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.backends.kafka_backend import KafkaBackend
-from scrapy_extension.backends.mongodb_backend import MongoDBBackend
-from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
-from scrapy_extension.backends.redis_backend import RedisBackend
-from scrapy_extension.components.dupefilter import BackendDupeFilter
-from scrapy_extension.components.pipeline import BackendPipeline
-from scrapy_extension.components.queue import BackendQueue
-from scrapy_extension.components.scheduler import BackendScheduler
-from scrapy_extension.connection.manager import ConnectionManager
+from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+from scrapy_extension.backends.kafka import KafkaBackend
+from scrapy_extension.backends.mongodb import MongoDBBackend
+from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+from scrapy_extension.backends.redis import RedisBackend
+from scrapy_extension.backends.rocketmq import RocketMQBackend
+from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   BackendError,
@@ -29,7 +28,12 @@ from scrapy_extension.exceptions import (
   QueueError,
   SerializationError,
 )
+from scrapy_extension.pipeline.pipeline import BackendPipeline
+from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import (
+  ElasticSearchMode,
+  ElasticSearchSettings,
   KafkaMode,
   KafkaSettings,
   MongoDBMode,
@@ -38,9 +42,11 @@ from scrapy_extension.settings import (
   RabbitMQSettings,
   RedisMode,
   RedisSettings,
+  RocketMQMode,
+  RocketMQSettings,
   Settings,
 )
-from scrapy_extension.spider_mixin import BackendSpiderMixin
+from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 
 __version__ = "0.1.0"
 
@@ -61,6 +67,9 @@ __all__ = [
   "ConfigurationError",
   # Connection
   "ConnectionManager",
+  "ElasticSearchBackend",
+  "ElasticSearchMode",
+  "ElasticSearchSettings",
   "JSONSerializer",
   "KafkaBackend",
   "KafkaMode",
@@ -76,6 +85,9 @@ __all__ = [
   "RedisBackend",
   "RedisMode",
   "RedisSettings",
+  "RocketMQBackend",
+  "RocketMQMode",
+  "RocketMQSettings",
   "SerializationError",
   # Serialization
   "Serializer",

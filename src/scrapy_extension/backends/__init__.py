@@ -13,16 +13,20 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
-from scrapy_extension.backends.redis_backend import RedisBackend
+from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+from scrapy_extension.backends.redis import RedisBackend
+from scrapy_extension.backends.rocketmq import RocketMQBackend
 
 __all__ = [
   "Backend",
   "BackendType",
+  "ConnectionManager",
   "JSONSerializer",
   "QueueBackend",
   "RabbitMQBackend",
   "RedisBackend",
+  "RocketMQBackend",
   "Serializer",
   "SetBackend",
   "StorageBackend",

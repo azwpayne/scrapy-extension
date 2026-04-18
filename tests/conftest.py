@@ -1,23 +1,21 @@
 """Pytest fixtures for scrapy-extension tests."""
 
-from unittest.mock import MagicMock, Mock
-
 import pytest
 
 
 @pytest.fixture
-def mock_redis_client():
+def mock_redis_client(mocker):
   """Create a mock Redis client."""
-  return Mock()
+  return mocker.Mock()
 
 
 @pytest.fixture
-def mock_connection_manager():
+def mock_connection_manager(mocker):
   """Create a mock connection manager."""
-  manager = MagicMock()
-  manager.get_queue_backend.return_value = Mock()
-  manager.get_set_backend.return_value = Mock()
-  manager.get_storage_backend.return_value = Mock()
+  manager = mocker.MagicMock()
+  manager.get_queue_backend.return_value = mocker.Mock()
+  manager.get_set_backend.return_value = mocker.Mock()
+  manager.get_storage_backend.return_value = mocker.Mock()
   return manager
 
 

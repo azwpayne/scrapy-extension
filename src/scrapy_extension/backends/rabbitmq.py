@@ -95,6 +95,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         backend_type="rabbitmq",
       ) from e
     except Exception as e:
+      # ConnectionFailed or other unexpected errors from pika connection layer
       msg = f"Failed to connect to RabbitMQ ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
@@ -120,7 +121,25 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Returns:
         ConnectionParameters with common settings.
+
+    Raises:
+        ConfigurationError: If using default guest credentials in non-standalone mode.
     """
+    # Warn/fail if using default guest credentials in non-standalone mode
+    if (
+      self.config.mode != RabbitMQMode.STANDALONE
+      and self.config.username == "guest"
+      and self.config.password == "guest"  # noqa: S105
+    ):
+      msg = (
+        "Default 'guest/guest' credentials are insecure for non-standalone modes. "
+        "Set SCRAPY_RABBITMQ_USERNAME and SCRAPY_RABBITMQ_PASSWORD explicitly."
+      )
+      raise ConfigurationError(
+        msg,
+        setting_name="username/password",
+        setting_value="guest/guest",
+      )
     credentials = pika.PlainCredentials(
       self.config.username,
       self.config.password,
@@ -210,7 +229,6 @@ class RabbitMQBackend(Backend, QueueBackend):
         if self.config.ha_sync_mode:
           definition["ha-sync-mode"] = self.config.ha_sync_mode
 
-        self._channel.exchange_declare(exchange="", passive=True)
         logger.debug(
           "Configured mirrored queues with HA mode: %s, params: %s",
           self.config.ha_mode,
@@ -256,21 +274,11 @@ class RabbitMQBackend(Backend, QueueBackend):
   def ping(self) -> bool:
     """Check RabbitMQ health.
 
-    Returns:
-        True if RabbitMQ is reachable.
+    Uses connection-level is_open check (heartbeat is already configured
+    in ConnectionParameters). No channel creation needed, avoiding
+    resource leaks from repeated channel allocation.
     """
-    try:
-      if self._connection and self._connection.is_open:
-        # Try to get a channel to verify connection is alive
-        test_channel = self._connection.channel()
-        test_channel.close()
-        connected = True
-      else:
-        connected = False
-    except AMQPError:
-      return False
-    else:
-      return connected
+    return self._connection is not None and self._connection.is_open
 
   @property
   def backend_type(self) -> BackendType:

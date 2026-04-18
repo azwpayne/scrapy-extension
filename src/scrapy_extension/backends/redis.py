@@ -12,10 +12,31 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Any
+import re
+from typing import TYPE_CHECKING, Any, cast
+
+# Key name validation pattern - only allow alphanumeric, dots, underscores, hyphens, colons
+KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
+
+
+def _validate_key_name(name: str, field_name: str = "name") -> None:
+    """Validate key/queue/set name to prevent injection.
+
+    Args:
+        name: The name to validate.
+        field_name: Field name for error messages.
+
+    Raises:
+        ValueError: If name contains invalid characters.
+    """
+    if not name or not KEY_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid {field_name}: {name!r}. "
+            f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
+        )
 
 from redis import Redis
-from redis.cluster import RedisCluster
+from redis.cluster import ClusterNode, RedisCluster
 from redis.exceptions import RedisError
 from redis.sentinel import Sentinel
 
@@ -39,7 +60,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# TODO: Add support for Redis client pool
 class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   """Redis backend implementation with multimode support.
 
@@ -91,16 +111,20 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       #   msg = f"Unsupported Redis mode: {self.config.mode}"
       #   raise ConfigurationError(msg,setting_name="mode",setting_value=self.config.mode)
       logger.debug("Connected to Redis in %s mode", self.config.mode.value)
-    except Exception as e:
+    except RedisError as e:
       msg = f"Failed to connect to Redis ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="redis",
       ) from e
 
-  def _connect_standalone(self) -> None:
-    """Connect to standalone Redis instance."""
-    self._client = Redis(
+  def _create_redis_client(self) -> Redis:
+    """Create a Redis client with shared configuration.
+
+    Returns:
+        Configured Redis client instance.
+    """
+    return Redis(
       host=self.config.host,
       port=self.config.port,
       db=self.config.db,
@@ -111,7 +135,16 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       retry_on_timeout=self.config.retry_on_timeout,
       max_connections=self.config.max_connections,
       decode_responses=self.config.decode_responses,
+      ssl=self.config.ssl_enabled,
+      ssl_ca_certs=self.config.ssl_cafile,
+      ssl_certfile=self.config.ssl_certfile,
+      ssl_keyfile=self.config.ssl_keyfile,
+      ssl_check_hostname=self.config.ssl_check_hostname,
     )
+
+  def _connect_standalone(self) -> None:
+    """Connect to standalone Redis instance."""
+    self._client = self._create_redis_client()
     self._client.ping()
 
   def _connect_master_slave(self) -> None:
@@ -123,19 +156,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Raises:
         ConfigurationError: If replicas are not configured.
     """
-    # Connect to master
-    self._master_client = Redis(
-      host=self.config.host,
-      port=self.config.port,
-      db=self.config.db,
-      password=self.config.password,
-      username=self.config.username,
-      socket_timeout=self.config.socket_timeout,
-      socket_connect_timeout=self.config.socket_connect_timeout,
-      retry_on_timeout=self.config.retry_on_timeout,
-      max_connections=self.config.max_connections,
-      decode_responses=self.config.decode_responses,
-    )
+    self._master_client = self._create_redis_client()
     self._master_client.ping()
     self._client = self._master_client
 
@@ -191,6 +212,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       socket_connect_timeout=self.config.socket_connect_timeout,
       retry_on_timeout=self.config.retry_on_timeout,
       decode_responses=self.config.decode_responses,
+      ssl=self.config.ssl_enabled,
+      ssl_ca_certs=self.config.ssl_cafile,
+      ssl_certfile=self.config.ssl_certfile,
+      ssl_keyfile=self.config.ssl_keyfile,
+      ssl_check_hostname=self.config.ssl_check_hostname,
     )
 
     # Verify connection
@@ -216,10 +242,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       startup_nodes = [f"{self.config.host}:{self.config.port}"]
 
     # Parse startup nodes
-    nodes = []
+    nodes: list[ClusterNode] = []
     for node_str in startup_nodes:
       host, port_str = node_str.rsplit(":", 1)
-      nodes.append({"host": host, "port": int(port_str)})
+      nodes.append(ClusterNode(host=host, port=int(port_str)))
 
     self._client = RedisCluster(
       startup_nodes=nodes,
@@ -232,6 +258,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       decode_responses=self.config.decode_responses,
       skip_full_coverage_check=self.config.cluster_skip_full_coverage_check,
       max_redirects=self.config.cluster_max_redirects,
+      ssl=self.config.ssl_enabled,
+      ssl_ca_certs=self.config.ssl_cafile,
+      ssl_certfile=self.config.ssl_certfile,
+      ssl_keyfile=self.config.ssl_keyfile,
+      ssl_check_hostname=self.config.ssl_check_hostname,
     )
 
     # Verify connection
@@ -304,7 +335,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     if self._client is None:
       self.connect()
-    return self._client  # type: ignore[return-value]
+    return cast("Redis | RedisCluster", self._client)
 
   # QueueBackend implementation using Sorted Sets
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
@@ -320,7 +351,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         QueueError: If the push operation fails.
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     try:
       # Use negative priority so lower values (higher priority) have higher scores
       # This makes zpopmax return highest priority items first
@@ -345,17 +378,23 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         QueueError: If the pop operation fails.
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     try:
       if timeout > 0:
         # Use BZPOPMAX for blocking pop
-        if result := self.client.bzpopmax(queue_name, timeout=timeout):
-          # result is (queue_name, item, score)
-          return result[1]  # type: ignore[index, return-value]
+        bz_result = cast("tuple[str, bytes, float] | None", self.client.bzpopmax(queue_name, timeout=timeout))
+        if bz_result is not None:
+          item_bytes = bz_result[1]
+          return item_bytes if isinstance(item_bytes, bytes) else None
         return None
       # Non-blocking pop - returns list of (item, score) tuples
-      if (result := self.client.zpopmax(queue_name)) and len(result) > 0:  # type: ignore[assignment, arg-type]
-        return result[0][0]  # type: ignore[index, return-value]
+      z_result = cast("list[tuple[bytes, float]]", self.client.zpopmax(queue_name))
+      if z_result and len(z_result) > 0:
+        item_bytes = z_result[0][0]
+        return item_bytes if isinstance(item_bytes, bytes) else None
+      return None  # noqa: TRY300
     except RedisError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(
@@ -363,8 +402,6 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
-    else:
-      return None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -374,9 +411,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Number of items in the queue.
+
+    Raises:
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     try:
-      return int(self.client.zcard(queue_name))  # type: ignore[arg-type, return-value]
+      return cast("int", self.client.zcard(queue_name))
     except RedisError:
       return 0
 
@@ -385,7 +426,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Args:
         queue_name: Name of the queue.
+
+    Raises:
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     try:
       self.client.delete(queue_name)
     except RedisError as e:
@@ -401,7 +446,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if added, False if already existed.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     try:
       return self.client.sadd(set_name, item) == 1
     except RedisError:
@@ -416,7 +465,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if removed, False if didn't exist.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     try:
       return self.client.srem(set_name, item) == 1
     except RedisError:
@@ -431,10 +484,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if item exists in the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     try:
-      result = self.client.sismember(set_name, item)  # type: ignore[arg-type]
-      return bool(result)  # type: ignore[arg-type]
+      result = cast("int", self.client.sismember(set_name, item.decode("utf-8")))
+      return bool(result)
     except RedisError:
       return False
 
@@ -446,9 +503,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Number of items in the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     try:
-      return int(self.client.scard(set_name))  # type: ignore[arg-type, return-value]
+      return cast("int", self.client.scard(set_name))
     except RedisError:
       return 0
 
@@ -457,7 +518,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Args:
         set_name: Name of the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     try:
       self.client.delete(set_name)
     except RedisError as e:
@@ -471,9 +536,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
         data: Data to store (bytes).
         ttl: Optional time-to-live in seconds.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
-      if ttl:
+      if ttl is not None:
         self.client.setex(key, ttl, data)
       else:
         self.client.set(key, data)
@@ -488,12 +557,19 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Stored data, or None if not found.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
       result = self.client.get(key)
-      return (
-        result if result is None or isinstance(result, bytes) else str(result).encode()
-      )  # type: ignore[return-value]
+      if result is None:
+        return None
+      if isinstance(result, bytes):
+        return result
+      # redis-py may return str for string values in some modes
+      return str(result).encode()
     except RedisError:
       return None
 
@@ -505,7 +581,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if deleted, False if didn't exist.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
       return self.client.delete(key) == 1
     except RedisError:
@@ -519,7 +599,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if key exists.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
       return self.client.exists(key) == 1
     except RedisError:
@@ -533,17 +617,21 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Seconds remaining, None if no TTL, -1 if expired.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
-      result: int = self.client.ttl(key)  # type: ignore[assignment]
+      result = cast("int", self.client.ttl(key))
+      # redis-py ttl() returns int: -2 = no key, -1 = no TTL, >= 0 = TTL seconds
+      if result == -2:
+        return -1  # Key doesn't exist (distinguish from no TTL)
       if result == -1:
         return None  # No TTL set
-      if result == -2:
-        return -1  # Key doesn't exist/expired
+      return result  # noqa: TRY300
     except RedisError:
       return None
-    else:
-      return result
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
@@ -553,7 +641,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         prefix: If provided, only clear keys starting with this prefix.
                If None, clear all storage data.
+
+    Raises:
+        ValueError: If prefix contains invalid characters.
     """
+    if prefix:
+        _validate_key_name(prefix, "prefix")
     try:
       if prefix:
         # Use scan + delete for prefixed keys

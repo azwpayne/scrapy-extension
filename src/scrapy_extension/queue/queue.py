@@ -6,6 +6,7 @@ This module provides a Scrapy queue component that uses backend queue interfaces
 from __future__ import annotations
 
 import logging
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 from scrapy.utils.request import request_from_dict
@@ -46,7 +47,11 @@ class BackendQueue:
     """
     self.connection_manager = connection_manager
     self.queue_name = queue_name
-    self._serializer = JSONSerializer()
+
+  @cached_property
+  def _serializer(self) -> JSONSerializer:
+    """Lazy-initialized JSON serializer."""
+    return JSONSerializer()
 
   def _request_to_dict(self, request: Request) -> dict:
     """Convert a Request to a dictionary.

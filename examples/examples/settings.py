@@ -52,7 +52,7 @@ SCRAPY_PIPELINE_KEY_PREFIX = "items"
 # SCRAPY_PIPELINE_TTL = 3600  # Optional: items expire after 1 hour (seconds)
 
 # =============================================================================
-# Backend Selection (redis | mongodb | kafka | rabbitmq)
+# Backend Selection (redis | mongodb | kafka | rabbitmq | elasticsearch | rocketmq)
 # =============================================================================
 
 SCRAPY_BACKEND_TYPE = "redis"
@@ -150,3 +150,51 @@ SCRAPY_REDIS_DB = 0
 # SCRAPY_RABBITMQ_SSL_CAFILE = "/path/to/ca.pem"
 # SCRAPY_RABBITMQ_SSL_CERTFILE = "/path/to/cert.pem"
 # SCRAPY_RABBITMQ_SSL_KEYFILE = "/path/to/key.pem"
+
+# =============================================================================
+# ElasticSearch Configuration (Uncomment to use)
+# =============================================================================
+# Supports modes: standalone (default), cloud
+
+# SCRAPY_BACKEND_TYPE = "elasticsearch"
+# SCRAPY_ELASTICSEARCH_HOSTS = ["http://localhost:9200"]
+
+# --- ElasticSearch with Auth ---
+# SCRAPY_ELASTICSEARCH_USERNAME = "elastic"
+# SCRAPY_ELASTICSEARCH_PASSWORD = "changeme"
+
+# --- ElasticSearch with API Key ---
+# SCRAPY_ELASTICSEARCH_API_KEY = "your-api-key"
+
+# --- Elastic Cloud ---
+# SCRAPY_ELASTICSEARCH_MODE = "cloud"
+# SCRAPY_ELASTICSEARCH_CLOUD_ID = "your-cloud-id"
+# SCRAPY_ELASTICSEARCH_API_KEY = "your-api-key"
+
+# --- Custom Index Names ---
+# SCRAPY_ELASTICSEARCH_QUEUE_INDEX = "scrapy_queue"
+# SCRAPY_ELASTICSEARCH_SET_INDEX = "scrapy_set"
+# SCRAPY_ELASTICSEARCH_STORAGE_INDEX = "scrapy_storage"
+
+# =============================================================================
+# RocketMQ Configuration (Uncomment to use)
+# =============================================================================
+# Note: RocketMQ only supports Queue operations (no Set/Storage for dedup/storage)
+
+# SCRAPY_BACKEND_TYPE = "rocketmq"
+# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
+
+# --- RocketMQ Cluster ---
+# SCRAPY_ROCKETMQ_MODE = "cluster"
+# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "namesrv1:9876,namesrv2:9876"
+
+# --- Alibaba Cloud RocketMQ ---
+# SCRAPY_ROCKETMQ_MODE = "cloud"
+# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "your-namesrv.addr.aliyun.com:8080"
+# SCRAPY_ROCKETMQ_ACCESS_KEY = "your_access_key"
+# SCRAPY_ROCKETMQ_SECRET_KEY = "your_secret_key"
+
+# --- RocketMQ Consumer/Producer Settings ---
+# SCRAPY_ROCKETMQ_CONSUMER_GROUP = "scrapy-extension-consumer"
+# SCRAPY_ROCKETMQ_PRODUCER_GROUP = "scrapy-extension-producer"
+# SCRAPY_ROCKETMQ_SEND_TIMEOUT = 3000

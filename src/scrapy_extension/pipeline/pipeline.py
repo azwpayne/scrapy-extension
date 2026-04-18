@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import JSONSerializer
@@ -50,7 +51,11 @@ class BackendPipeline:
     self.connection_manager = connection_manager
     self.key_prefix = key_prefix
     self.ttl = ttl
-    self._serializer = JSONSerializer()
+
+  @cached_property
+  def _serializer(self) -> JSONSerializer:
+    """Lazy-initialized JSON serializer."""
+    return JSONSerializer()
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendPipeline:
@@ -89,7 +94,7 @@ class BackendPipeline:
     return cls.from_settings(crawler.settings)
 
   def open_spider(self, spider: Spider) -> None:
-    """Called when spider opens.
+    """Called when a spider opens.
 
     Args:
         spider: The spider instance.
@@ -97,7 +102,7 @@ class BackendPipeline:
     logger.info("Pipeline opened for spider %s", spider.name)
 
   def close_spider(self, spider: Spider) -> None:
-    """Called when spider closes.
+    """Called when a spider closes.
 
     Args:
         spider: The spider instance.
@@ -114,17 +119,42 @@ class BackendPipeline:
     Returns:
         The processed item.
     """
-    # Generate unique key
-    timestamp = datetime.now(timezone.utc).isoformat()
-    unique_id = uuid.uuid4().hex[:8]
-    key = f"{self.key_prefix}:{spider.name}:{timestamp}:{unique_id}"
-
-    # Serialize item
-    item_dict = dict(item) if hasattr(item, "__iter__") else {"data": str(item)}
-    data = self._serializer.serialize(item_dict)
-
-    # Store in backend
-    self.connection_manager.get_storage_backend().store(key, data, ttl=self.ttl)
-
+    key = self._generate_item_key(spider)
+    data = self._serialize_item(item)
+    self._store_item(key, data)
     logger.debug("Stored item: %s", key)
     return item
+
+  def _generate_item_key(self, spider: Spider) -> str:
+    """Generate a unique key for the item.
+
+    Args:
+        spider: The spider instance.
+
+    Returns:
+        A unique storage key.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    unique_id = uuid.uuid4().hex[:8]
+    return f"{self.key_prefix}:{spider.name}:{timestamp}:{unique_id}"
+
+  def _serialize_item(self, item: Item) -> bytes:
+    """Serialize an item.
+
+    Args:
+        item: The item to serialize.
+
+    Returns:
+        Serialized item bytes.
+    """
+    item_dict = dict(item) if hasattr(item, "__iter__") else {"data": str(item)}
+    return self._serializer.serialize(item_dict)
+
+  def _store_item(self, key: str, data: bytes) -> None:
+    """Store serialized item.
+
+    Args:
+        key: Storage key.
+        data: Serialized item data.
+    """
+    self.connection_manager.get_storage_backend().store(key, data, ttl=self.ttl)

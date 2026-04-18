@@ -13,9 +13,9 @@ from scrapy import Spider, signals
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import BackendType
   from scrapy_extension.backends.connectors import ConnectionManager
-  from scrapy_extension.components.dupefilter import BackendDupeFilter
-  from scrapy_extension.components.queue import BackendQueue
-  from scrapy_extension.components.scheduler import BackendScheduler
+  from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+  from scrapy_extension.queue.queue import BackendQueue
+  from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
 class BackendSpiderMixin:
@@ -211,7 +211,7 @@ class BackendSpiderMixin:
       raise RuntimeError(msg)
 
     if self._queue is None:
-      from scrapy_extension.components.queue import BackendQueue
+      from scrapy_extension.queue.queue import BackendQueue
 
       name = queue_name or f"{self.name}:queue"
       self._queue = BackendQueue(
@@ -238,7 +238,7 @@ class BackendSpiderMixin:
       raise RuntimeError(msg)
 
     if self._dupefilter is None:
-      from scrapy_extension.components.dupefilter import BackendDupeFilter
+      from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 
       self._dupefilter = BackendDupeFilter(
         connection_manager=self._connection_manager,
@@ -264,7 +264,7 @@ class BackendSpiderMixin:
       raise RuntimeError(msg)
 
     if self._scheduler is None:
-      from scrapy_extension.components.scheduler import BackendScheduler
+      from scrapy_extension.schedule.scheduler import BackendScheduler
 
       self._scheduler = BackendScheduler(
         connection_manager=self._connection_manager,

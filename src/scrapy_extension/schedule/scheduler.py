@@ -9,8 +9,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from scrapy_extension.components.queue import BackendQueue
 from scrapy_extension.exceptions import QueueError
+from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:

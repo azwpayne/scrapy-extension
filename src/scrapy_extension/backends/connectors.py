@@ -104,32 +104,36 @@ class ConnectionManager:
     Raises:
         ValueError: If the backend type is not supported.
     """
-    if self.backend_type == BackendType.REDIS:
-      from scrapy_extension.backends.redis_backend import RedisBackend
-      from scrapy_extension.settings import RedisSettings
+    match self.backend_type:
+      case BackendType.REDIS:
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisSettings
 
-      config = RedisSettings(**self.settings)
-      return RedisBackend(config)
-    if self.backend_type == BackendType.MONGODB:
-      from scrapy_extension.backends.mongodb_backend import MongoDBBackend
-      from scrapy_extension.settings import MongoDBSettings
+        config = RedisSettings(**self.settings)
+        return RedisBackend(config)
+      case BackendType.MONGODB:
+        from scrapy_extension.backends.mongodb import MongoDBBackend
+        from scrapy_extension.settings import MongoDBSettings
 
-      config = MongoDBSettings(**self.settings)
-      return MongoDBBackend(config)
-    if self.backend_type == BackendType.KAFKA:
-      from scrapy_extension.backends.kafka_backend import KafkaBackend
-      from scrapy_extension.settings import KafkaSettings
+        return MongoDBBackend(MongoDBSettings(**self.settings))
+      case BackendType.KAFKA:
+        from scrapy_extension.backends.kafka import KafkaBackend
+        from scrapy_extension.settings import KafkaSettings
 
-      config = KafkaSettings(**self.settings)
-      return KafkaBackend(config)
-    if self.backend_type == BackendType.RABBITMQ:
-      from scrapy_extension.backends.rabbitmq_backend import RabbitMQBackend
-      from scrapy_extension.settings import RabbitMQSettings
+        return KafkaBackend(KafkaSettings(**self.settings))
+      case BackendType.RABBITMQ:
+        from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+        from scrapy_extension.settings import RabbitMQSettings
 
-      config = RabbitMQSettings(**self.settings)
-      return RabbitMQBackend(config)
-    msg = f"Unsupported backend type: {self.backend_type}"
-    raise ValueError(msg)
+        return RabbitMQBackend(RabbitMQSettings(**self.settings))
+      case BackendType.ELASTICSEARCH:
+        from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+        from scrapy_extension.settings import ElasticSearchSettings
+
+        return ElasticSearchBackend(ElasticSearchSettings(**self.settings))
+      case _:
+        msg = f"Unsupported backend type: {self.backend_type}"
+        raise ValueError(msg)
 
   def connect(self) -> None:
     """Establish connection with retry logic.
@@ -148,6 +152,9 @@ class ConnectionManager:
       try:
         self._attempt_connection()
       except Exception as e:  # noqa: PERF203
+        # Intentional broad catch: any backend connection error should trigger retry.
+        # Backend-specific exceptions (RedisError, PyMongoError, KafkaError, AMQPError)
+        # all inherit from Exception. Explicitly re-raise KeyboardInterrupt/SystemExit.
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
           raise
         last_exception = e

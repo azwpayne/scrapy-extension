@@ -92,10 +92,11 @@ def test_rocketmq_backend_pop_not_connected():
 
 
 def test_rocketmq_backend_queue_len_not_connected():
-    """Test queue_len returns 0 when not connected."""
+    """Test queue_len raises NotImplementedError when not connected."""
     config = RocketMQSettings()
     backend = RocketMQBackend(config)
-    assert backend.queue_len("test_queue") == 0
+    with pytest.raises(NotImplementedError):
+        backend.queue_len("test_queue")
 
 
 def test_rocketmq_backend_clear_queue_not_connected():

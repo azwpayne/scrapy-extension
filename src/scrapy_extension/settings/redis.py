@@ -172,3 +172,25 @@ class RedisSettings(BaseSettings):
     ge=0,
     description="Maximum MOVED/ASK redirects to follow",
   )
+
+  # === SSL/TLS Settings ===
+  ssl_enabled: bool = Field(
+    default=False,
+    description="Enable SSL/TLS connection",
+  )
+  ssl_cafile: str | None = Field(
+    default=None,
+    description="Path to CA certificate file for SSL",
+  )
+  ssl_certfile: str | None = Field(
+    default=None,
+    description="Path to client certificate file for SSL",
+  )
+  ssl_keyfile: str | None = Field(
+    default=None,
+    description="Path to client private key file for SSL",
+  )
+  ssl_check_hostname: bool = Field(
+    default=False,
+    description="Verify hostname matches certificate",
+  )

@@ -123,6 +123,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         backend_type="mongodb",
       ) from e
     except Exception as e:
+      # Unexpected errors (e.g., RuntimeError from mocking in tests)
       msg = f"Failed to connect to MongoDB ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
@@ -380,6 +381,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         priority: Priority value (higher = more urgent).
     """
     self._assert_connected()
+    assert self._queue_collection is not None
     doc = {
       "queue_name": queue_name,
       "item": item,
@@ -399,6 +401,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         The popped item, or None if queue is empty.
     """
     self._assert_connected()
+    assert self._queue_collection is not None
     # MongoDB doesn't support blocking pop, so we ignore timeout
     result = self._queue_collection.find_one_and_delete(
       {"queue_name": queue_name},
@@ -411,14 +414,21 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
 
+    Uses count_documents with limit to avoid O(n) full collection scans.
+    The limit (100000) provides an upper bound; for queues exceeding this
+    threshold, the returned value indicates "at least N" rather than exact count.
+
     Args:
         queue_name: Name of the queue.
 
     Returns:
-        Number of items in the queue.
+        Number of items in the queue (capped at 100000).
     """
     self._assert_connected()
-    return self._queue_collection.count_documents({"queue_name": queue_name})
+    assert self._queue_collection is not None
+    return self._queue_collection.count_documents(
+      {"queue_name": queue_name}, limit=100000
+    )
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
@@ -427,6 +437,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         queue_name: Name of the queue.
     """
     self._assert_connected()
+    assert self._queue_collection is not None
     self._queue_collection.delete_many({"queue_name": queue_name})
 
   # SetBackend implementation
@@ -452,6 +463,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if added, False if already existed.
     """
     self._assert_connected()
+    assert self._set_collection is not None
     doc = {
       "set_name": set_name,
       "item_hash": self._hash_item(item),
@@ -476,6 +488,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if removed, False if didn't exist.
     """
     self._assert_connected()
+    assert self._set_collection is not None
     result = self._set_collection.delete_one(
       {
         "set_name": set_name,
@@ -495,6 +508,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if item exists in the set.
     """
     self._assert_connected()
+    assert self._set_collection is not None
     result = self._set_collection.find_one(
       {
         "set_name": set_name,
@@ -506,14 +520,21 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def set_len(self, set_name: str) -> int:
     """Get set size.
 
+    Uses count_documents with limit to avoid O(n) full collection scans.
+    The limit (100000) provides an upper bound; for sets exceeding this
+    threshold, the returned value indicates "at least N" rather than exact count.
+
     Args:
         set_name: Name of the set.
 
     Returns:
-        Number of items in the set.
+        Number of items in the set (capped at 100000).
     """
     self._assert_connected()
-    return self._set_collection.count_documents({"set_name": set_name})
+    assert self._set_collection is not None
+    return self._set_collection.count_documents(
+      {"set_name": set_name}, limit=100000
+    )
 
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
@@ -522,6 +543,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         set_name: Name of the set.
     """
     self._assert_connected()
+    assert self._set_collection is not None
     self._set_collection.delete_many({"set_name": set_name})
 
   # StorageBackend implementation
@@ -534,6 +556,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ttl: Optional time-to-live in seconds.
     """
     self._assert_connected()
+    assert self._storage_collection is not None
     doc: dict[str, Any] = {
       "key": key,
       "data": data,
@@ -557,6 +580,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Stored data, or None if not found.
     """
     self._assert_connected()
+    assert self._storage_collection is not None
     result = self._storage_collection.find_one({"key": key})
     if result:
       return result.get("data")
@@ -572,6 +596,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if deleted, False if didn't exist.
     """
     self._assert_connected()
+    assert self._storage_collection is not None
     result = self._storage_collection.delete_one({"key": key})
     return result.deleted_count > 0
 
@@ -585,6 +610,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if key exists.
     """
     self._assert_connected()
+    assert self._storage_collection is not None
     result = self._storage_collection.find_one({"key": key}, {"_id": 1})
     return result is not None
 
@@ -598,6 +624,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Seconds remaining, None if no TTL, -1 if expired.
     """
     self._assert_connected()
+    assert self._storage_collection is not None
     result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
     if result is None:
       return -1
@@ -616,7 +643,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                If None, clear all storage data.
     """
     self._assert_connected()
+    assert self._storage_collection is not None
     if prefix:
+      # Limit prefix length to prevent regex DoS attacks (ReDoS)
+      prefix = prefix[:128]
       pattern = re.escape(prefix)
       self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
     else:

@@ -1,11 +1,8 @@
 """Tests for connection manager."""
 
-from unittest.mock import MagicMock, patch
-
 import pytest
-
 from scrapy_extension.backends.base import BackendType
-from scrapy_extension.connection.manager import ConnectionManager
+from scrapy_extension.backends.connectors import ConnectionManager
 
 
 def test_connection_manager_get_manager_singleton():
@@ -22,45 +19,41 @@ def test_connection_manager_different_params():
   assert manager1 is not manager2
 
 
-def test_connection_manager_create_mongodb_backend():
+def test_connection_manager_create_mongodb_backend(mocker):
   """Test ConnectionManager creates MongoDB backend."""
-  with patch(
-    "scrapy_extension.backends.mongodb_backend.MongoDBBackend"
-  ) as mock_backend:
-    mock_instance = MagicMock()
-    mock_backend.return_value = mock_instance
+  mock_backend = mocker.patch("scrapy_extension.backends.mongodb.MongoDBBackend")
+  mock_instance = mocker.MagicMock()
+  mock_backend.return_value = mock_instance
 
-    manager = ConnectionManager(BackendType.MONGODB)
-    backend = manager._create_backend()  # noqa: SLF001
+  manager = ConnectionManager(BackendType.MONGODB)
+  backend = manager._create_backend()  # noqa: SLF001
 
-    mock_backend.assert_called_once()
-    assert backend == mock_instance
+  mock_backend.assert_called_once()
+  assert backend == mock_instance
 
 
-def test_connection_manager_create_kafka_backend():
+def test_connection_manager_create_kafka_backend(mocker):
   """Test ConnectionManager creates Kafka backend."""
-  with patch("scrapy_extension.backends.kafka_backend.KafkaBackend") as mock_backend:
-    mock_instance = MagicMock()
-    mock_backend.return_value = mock_instance
+  mock_backend = mocker.patch("scrapy_extension.backends.kafka.KafkaBackend")
+  mock_instance = mocker.MagicMock()
+  mock_backend.return_value = mock_instance
 
-    manager = ConnectionManager(BackendType.KAFKA)
-    backend = manager._create_backend()  # noqa: SLF001
+  manager = ConnectionManager(BackendType.KAFKA)
+  backend = manager._create_backend()  # noqa: SLF001
 
-    mock_backend.assert_called_once()
+  mock_backend.assert_called_once()
 
 
-def test_connection_manager_create_rabbitmq_backend():
+def test_connection_manager_create_rabbitmq_backend(mocker):
   """Test ConnectionManager creates RabbitMQ backend."""
-  with patch(
-    "scrapy_extension.backends.rabbitmq_backend.RabbitMQBackend"
-  ) as mock_backend:
-    mock_instance = MagicMock()
-    mock_backend.return_value = mock_instance
+  mock_backend = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
+  mock_instance = mocker.MagicMock()
+  mock_backend.return_value = mock_instance
 
-    manager = ConnectionManager(BackendType.RABBITMQ)
-    backend = manager._create_backend()  # noqa: SLF001
+  manager = ConnectionManager(BackendType.RABBITMQ)
+  backend = manager._create_backend()  # noqa: SLF001
 
-    mock_backend.assert_called_once()
+  mock_backend.assert_called_once()
 
 
 def test_connection_manager_get_manager_same_settings_order():
@@ -74,10 +67,13 @@ def test_connection_manager_get_manager_same_settings_order():
   assert manager1 is manager2
 
 
-def test_connection_manager_get_set_backend_not_supported():
+def test_connection_manager_get_set_backend_not_supported(mocker):
   """get_set_backend should raise NotImplementedError for unsupported backend."""
   manager = ConnectionManager(BackendType.KAFKA)
-  manager._backend = object()  # noqa: SLF001
+  # We need to set _backend to something that is not a SetBackend but is a Backend subclass
+  mock_backend = mocker.MagicMock()
+  mock_backend.is_connected.return_value = True
+  manager._backend = mock_backend
 
   with pytest.raises(NotImplementedError):
     manager.get_set_backend()
