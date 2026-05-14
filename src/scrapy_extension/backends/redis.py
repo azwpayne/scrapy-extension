@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 try:
     from redis import Redis
@@ -321,7 +321,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     if self._client is None:
       self.connect()
-    return cast("Redis | RedisCluster", self._client)
+    return self._client
 
   # QueueBackend implementation using Sorted Sets
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
@@ -370,13 +370,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     try:
       if timeout > 0:
         # Use BZPOPMAX for blocking pop
-        bz_result = cast("tuple[str, bytes, float] | None", self.client.bzpopmax(queue_name, timeout=timeout))
+        bz_result = self.client.bzpopmax(queue_name, timeout=timeout)
         if bz_result is not None:
           item_bytes = bz_result[1]
           return item_bytes if isinstance(item_bytes, bytes) else None
         return None
       # Non-blocking pop - returns list of (item, score) tuples
-      z_result = cast("list[tuple[bytes, float]]", self.client.zpopmax(queue_name))
+      z_result = self.client.zpopmax(queue_name)
       if z_result and len(z_result) > 0:
         item_bytes = z_result[0][0]
         return item_bytes if isinstance(item_bytes, bytes) else None
@@ -403,7 +403,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     try:
-      return cast("int", self.client.zcard(queue_name))
+      return self.client.zcard(queue_name)
     except RedisError:
       return 0
 
@@ -476,7 +476,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      result = cast("int", self.client.sismember(set_name, item))
+      result = self.client.sismember(set_name, item)
       return bool(result)
     except RedisError:
       return False
@@ -495,7 +495,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return cast("int", self.client.scard(set_name))
+      return self.client.scard(set_name)
     except RedisError:
       return 0
 
@@ -609,7 +609,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      result = cast("int", self.client.ttl(key))
+      result = self.client.ttl(key)
       # redis-py ttl() returns int: -2 = no key, -1 = no TTL, >= 0 = TTL seconds
       if result == -2:
         return -1  # Key doesn't exist (distinguish from no TTL)

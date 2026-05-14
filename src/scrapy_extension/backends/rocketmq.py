@@ -134,6 +134,11 @@ class RocketMQBackend(Backend, QueueBackend):
 
   @property
   def backend_type(self) -> BackendType:
+    """Return backend type.
+
+    Returns:
+        BackendType.ROCKETMQ
+    """
     return BackendType.ROCKETMQ
 
   def _get_topic_name(self, queue_name: str) -> str:
