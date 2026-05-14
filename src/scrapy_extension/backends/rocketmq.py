@@ -30,6 +30,11 @@ class RocketMQBackend(Backend, QueueBackend):
   """
 
   def __init__(self, config: RocketMQSettings) -> None:
+    """Initialize RocketMQ backend.
+
+    Args:
+        config: Configuration for RocketMQ connection.
+    """
     self.config = config
     self._producer = None
     self._consumer = None
@@ -156,12 +161,12 @@ class RocketMQBackend(Backend, QueueBackend):
     """Push item to queue.
 
     Args:
-      queue_name: Name of the queue.
-      item: Item to push (bytes).
-      priority: Priority value (higher = more urgent).
+        queue_name: Name of the queue.
+        item: Item to push (bytes).
+        priority: Priority value (higher = more urgent).
 
     Raises:
-      QueueError: If push fails.
+        QueueError: If push fails.
     """
     from scrapy_extension.exceptions import QueueError
 
@@ -190,11 +195,11 @@ class RocketMQBackend(Backend, QueueBackend):
     """Pop item from queue.
 
     Args:
-      queue_name: Name of the queue.
-      timeout: Seconds to wait (0 = non-blocking).
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (0 = non-blocking).
 
     Returns:
-      Popped item, or None if queue is empty.
+        Popped item, or None if queue is empty.
     """
     from scrapy_extension.exceptions import QueueError
 
@@ -224,13 +229,13 @@ class RocketMQBackend(Backend, QueueBackend):
     """Get queue length.
 
     Args:
-      queue_name: Name of the queue.
+        queue_name: Name of the queue.
 
     Returns:
-      Number of items in queue.
+        Number of items in queue.
 
     Raises:
-      NotImplementedError: RocketMQ does not support queue length queries.
+        NotImplementedError: RocketMQ does not support queue length queries.
     """
     msg = "RocketMQ does not support queue_len(). Use pop() to consume messages."
     raise NotImplementedError(msg)
@@ -239,7 +244,7 @@ class RocketMQBackend(Backend, QueueBackend):
     """Clear all items from queue.
 
     Args:
-      queue_name: Name of the queue.
+        queue_name: Name of the queue.
     """
     from scrapy_extension.exceptions import QueueError
 
@@ -264,15 +269,15 @@ class RocketMQBackend(Backend, QueueBackend):
     """Add item to set.
 
     Args:
-      set_name: Name of the set.
-      item: Item to add (bytes).
+        set_name: Name of the set.
+        item: Item to add (bytes).
 
     Returns:
-      True if added.
+        True if added.
 
     Raises:
-      NotImplementedError: RocketMQ does not support atomic add-or-skip set operations.
-      QueueError: If not connected.
+        NotImplementedError: RocketMQ does not support atomic add-or-skip set operations.
+        QueueError: If not connected.
     """
     from scrapy_extension.exceptions import QueueError
 
@@ -289,8 +294,12 @@ class RocketMQBackend(Backend, QueueBackend):
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.
 
+    Args:
+        set_name: Name of the set.
+        item: Item to remove.
+
     Raises:
-      NotImplementedError: RocketMQ does not support atomic remove from sets.
+        NotImplementedError: RocketMQ does not support atomic remove from sets.
     """
     msg = "RocketMQ does not support atomic remove from sets. Use push() without dedup instead."
     raise NotImplementedError(msg)
@@ -299,14 +308,14 @@ class RocketMQBackend(Backend, QueueBackend):
     """Check if item is in set.
 
     Args:
-      set_name: Name of the set.
-      item: Item to check.
+        set_name: Name of the set.
+        item: Item to check.
 
     Returns:
-      True if item exists.
+        True if item exists.
 
     Raises:
-      NotImplementedError: RocketMQ does not support set membership queries.
+        NotImplementedError: RocketMQ does not support set membership queries.
     """
     msg = "RocketMQ does not support contains(). Use push() with a dedup mechanism instead."
     raise NotImplementedError(msg)
@@ -315,13 +324,13 @@ class RocketMQBackend(Backend, QueueBackend):
     """Get set size.
 
     Args:
-      set_name: Name of the set.
+        set_name: Name of the set.
 
     Returns:
-      Number of items in set.
+        Number of items in set.
 
     Raises:
-      NotImplementedError: RocketMQ does not support set size queries.
+        NotImplementedError: RocketMQ does not support set size queries.
     """
     msg = "RocketMQ does not support set_len(). Use pop() to drain and count items."
     raise NotImplementedError(msg)
@@ -330,7 +339,7 @@ class RocketMQBackend(Backend, QueueBackend):
     """Clear all items from set.
 
     Args:
-      set_name: Name of the set.
+        set_name: Name of the set.
     """
     if not self.is_connected():
       return
@@ -348,9 +357,9 @@ class RocketMQBackend(Backend, QueueBackend):
     """Store data with key.
 
     Args:
-      key: Storage key.
-      data: Data to store (bytes).
-      ttl: Optional time-to-live in seconds.
+        key: Storage key.
+        data: Data to store (bytes).
+        ttl: Optional time-to-live in seconds.
     """
     from scrapy_extension.exceptions import QueueError
 
@@ -382,13 +391,13 @@ class RocketMQBackend(Backend, QueueBackend):
     """Retrieve data by key.
 
     Args:
-      key: Storage key.
+        key: Storage key.
 
     Returns:
-      Stored data, or None if not found.
+        Stored data, or None if not found.
 
     Raises:
-      NotImplementedError: RocketMQ does not support point-in-time key retrieval.
+        NotImplementedError: RocketMQ does not support point-in-time key retrieval.
     """
     msg = "RocketMQ does not support retrieve(). Use a dedicated database for key-value storage."
     raise NotImplementedError(msg)
@@ -396,8 +405,11 @@ class RocketMQBackend(Backend, QueueBackend):
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
+    Args:
+        key: Storage key.
+
     Raises:
-      NotImplementedError: RocketMQ does not support key-based deletion.
+        NotImplementedError: RocketMQ does not support key-based deletion.
     """
     msg = "RocketMQ does not support key-based deletion. Use a different backend for storage."
     raise NotImplementedError(msg)
@@ -405,8 +417,11 @@ class RocketMQBackend(Backend, QueueBackend):
   def exists(self, key: str) -> bool:
     """Check if key exists.
 
+    Args:
+        key: Storage key.
+
     Raises:
-      NotImplementedError: RocketMQ does not support key-based existence checks.
+        NotImplementedError: RocketMQ does not support key-based existence checks.
     """
     msg = "RocketMQ does not support exists(). Use a different backend for storage."
     raise NotImplementedError(msg)
@@ -414,8 +429,11 @@ class RocketMQBackend(Backend, QueueBackend):
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
 
+    Args:
+        key: Storage key.
+
     Raises:
-      NotImplementedError: RocketMQ does not support TTL queries.
+        NotImplementedError: RocketMQ does not support TTL queries.
     """
     msg = "RocketMQ does not support ttl(). Use a different backend for storage."
     raise NotImplementedError(msg)
@@ -423,8 +441,11 @@ class RocketMQBackend(Backend, QueueBackend):
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data.
 
+    Args:
+        prefix: If provided, only clear keys starting with this prefix.
+
     Raises:
-      NotImplementedError: RocketMQ does not support storage clearing.
+        NotImplementedError: RocketMQ does not support storage clearing.
     """
     msg = "RocketMQ does not support clear_storage(). Use a different backend for storage."
     raise NotImplementedError(msg)
