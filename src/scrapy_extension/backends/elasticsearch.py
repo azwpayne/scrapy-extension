@@ -5,10 +5,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
 
-from elasticsearch import Elasticsearch, NotFoundError, RequestError, TransportError
+try:
+    from elasticsearch import Elasticsearch, NotFoundError, RequestError, TransportError
+except ImportError as e:
+    raise ImportError(
+        "ElasticSearch backend requires 'elasticsearch'. Install with: pip install scrapy-extension[elasticsearch]"
+    ) from e
 
 from scrapy_extension.backends.base import (
   Backend,
@@ -24,6 +30,26 @@ if TYPE_CHECKING:
   from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 logger = logging.getLogger(__name__)
+
+# Key name validation pattern
+_KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
+
+
+def _validate_key_name(name: str, field_name: str = "name") -> None:
+    """Validate key/queue/index name to prevent injection.
+
+    Args:
+        name: The name to validate.
+        field_name: Field name for error messages.
+
+    Raises:
+        ValueError: If name contains invalid characters.
+    """
+    if not name or not _KEY_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid {field_name}: {name!r}. "
+            f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
+        )
 
 
 def _b64encode(data: bytes) -> str:
@@ -111,6 +137,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   # ---- Queue ----
 
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    _validate_key_name(queue_name, "queue_name")
     doc = {
       "queue_name": queue_name,
       "item": _b64encode(item),
@@ -123,6 +150,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:  # noqa: ARG002
+    _validate_key_name(queue_name, "queue_name")
     try:
       resp = self.client.search(
         index=self.config.queue_index,
@@ -143,7 +171,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return _b64decode(doc["_source"]["item"])
 
   def queue_len(self, queue_name: str) -> int:
-    return self._count(self.config.queue_index, "queue_name", queue_name)
+    _validate_key_name(queue_name, "queue_name")
+    try:
+      return self._count(self.config.queue_index, "queue_name", queue_name)
+    except TransportError as e:
+      raise QueueError(str(e), queue_name=queue_name, operation="queue_len") from e
 
   def clear_queue(self, queue_name: str) -> None:
     self._delete_by_term(self.config.queue_index, "queue_name", queue_name)
@@ -154,6 +186,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     return f"{set_name}:{hashlib.sha256(item).hexdigest()}"
 
   def add(self, set_name: str, item: bytes) -> bool:
+    _validate_key_name(set_name, "set_name")
     doc_id = self._set_doc_id(set_name, item)
     doc = {
       "set_name": set_name,
@@ -195,6 +228,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   # ---- Storage ----
 
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
+    _validate_key_name(key, "key")
     doc: dict[str, Any] = {"key": key, "data": _b64encode(data)}
     if ttl is not None:
       doc["expireAt"] = (
@@ -213,9 +247,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return _b64decode(resp["_source"]["data"])
 
   def delete(self, key: str) -> bool:
+    _validate_key_name(key, "key")
     return self._delete_by_id(self.config.storage_index, key)
 
   def exists(self, key: str) -> bool:
+    _validate_key_name(key, "key")
     try:
       response = self.client.exists(index=self.config.storage_index, id=key)
       return bool(response)

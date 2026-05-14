@@ -10,14 +10,18 @@ for distributed crawling, supporting multiple deployment modes:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from pymongo import ASCENDING, MongoClient
-from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
+try:
+    from pymongo import ASCENDING, MongoClient
+    from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
+except ImportError as e:
+    raise ImportError(
+        "MongoDB backend requires 'pymongo'. Install with: pip install scrapy-extension[mongodb]"
+    ) from e
 
 from scrapy_extension.backends.base import (
   Backend,
@@ -25,8 +29,10 @@ from scrapy_extension.backends.base import (
   QueueBackend,
   SetBackend,
   StorageBackend,
+  _hash_item,
+  _validate_key_name,
 )
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError, QueueError
 from scrapy_extension.settings import MongoDBMode
 
 if TYPE_CHECKING:
@@ -379,7 +385,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         queue_name: Name of the queue.
         item: Item to push (bytes).
         priority: Priority value (higher = more urgent).
+
+    Raises:
+        QueueError: If the push operation fails.
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
     assert self._queue_collection is not None
     doc = {
@@ -388,7 +399,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "priority": -priority,  # Negated for DESC sort
       "created_at": datetime.now(tz=timezone.utc),
     }
-    self._queue_collection.insert_one(doc)
+    try:
+      self._queue_collection.insert_one(doc)
+    except PyMongoError as e:
+      msg = f"Failed to push to queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="push") from e
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:  # noqa: ARG002
     """Pop highest priority item from queue.
@@ -399,14 +414,21 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         The popped item, or None if queue is empty.
+
+    Raises:
+        QueueError: If the pop operation fails.
     """
     self._assert_connected()
     assert self._queue_collection is not None
-    # MongoDB doesn't support blocking pop, so we ignore timeout
-    result = self._queue_collection.find_one_and_delete(
-      {"queue_name": queue_name},
-      sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
-    )
+    try:
+      # MongoDB doesn't support blocking pop, so we ignore timeout
+      result = self._queue_collection.find_one_and_delete(
+        {"queue_name": queue_name},
+        sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
+      )
+    except PyMongoError as e:
+      msg = f"Failed to pop from queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="pop") from e
     if result:
       return result["item"]
     return None
@@ -441,17 +463,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self._queue_collection.delete_many({"queue_name": queue_name})
 
   # SetBackend implementation
-  def _hash_item(self, item: bytes) -> str:
-    """Generate hash for item.
-
-    Args:
-        item: Item to hash.
-
-    Returns:
-        SHA256 hex digest of item.
-    """
-    return hashlib.sha256(item).hexdigest()
-
   def add(self, set_name: str, item: bytes) -> bool:
     """Add item to set.
 
@@ -466,7 +477,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     assert self._set_collection is not None
     doc = {
       "set_name": set_name,
-      "item_hash": self._hash_item(item),
+      "item_hash": _hash_item(item),
       "item": item,
       "created_at": datetime.now(tz=timezone.utc),
     }
@@ -492,7 +503,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     result = self._set_collection.delete_one(
       {
         "set_name": set_name,
-        "item_hash": self._hash_item(item),
+        "item_hash": _hash_item(item),
       }
     )
     return result.deleted_count > 0
@@ -512,7 +523,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     result = self._set_collection.find_one(
       {
         "set_name": set_name,
-        "item_hash": self._hash_item(item),
+        "item_hash": _hash_item(item),
       }
     )
     return result is not None

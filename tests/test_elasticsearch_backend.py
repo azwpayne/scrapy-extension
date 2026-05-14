@@ -270,6 +270,105 @@ class TestStorage:
     }
 
 
+class TestValidation:
+  def test_validate_key_name_empty_string(self):
+    from scrapy_extension.backends.elasticsearch import _validate_key_name
+
+    with pytest.raises(ValueError, match="Invalid name"):
+      _validate_key_name("", "name")
+
+
+class TestSet:
+  def test_add_request_error_without_version_conflict(self, mocker):
+    b = _mock_backend(mocker)
+    err = RequestError("400", mocker.MagicMock(), {"error": "mapper_parsing_exception"})
+    b._client.index.side_effect = err
+    with pytest.raises(RequestError):
+      b.add("s", b"item")
+
+  def test_add_new(self, mocker):
+    b = _mock_backend(mocker)
+    assert b.add("s", b"item") is True
+    assert b._client.index.call_args.kwargs["op_type"] == "create"
+
+  def test_add_duplicate(self, mocker):
+    b = _mock_backend(mocker)
+    err = RequestError(
+      "409", mocker.MagicMock(), {"error": "version_conflict_engine_exception"}
+    )
+    b._client.index.side_effect = err
+    assert b.add("s", b"item") is False
+
+  def test_remove(self, mocker):
+    b = _mock_backend(mocker)
+    assert b.remove("s", b"item") is True
+    b._client.delete.assert_called_once()
+
+  def test_remove_not_found(self, mocker):
+    b = _mock_backend(mocker)
+    b._client.delete.side_effect = _make_not_found_error()
+    assert b.remove("s", b"item") is False
+
+  def test_contains(self, mocker):
+    b = _mock_backend(mocker)
+    b._client.exists.return_value = True
+    assert b.contains("s", b"item") is True
+
+  def test_set_len(self, mocker):
+    b = _mock_backend(mocker)
+    b._client.count.return_value = {"count": 3}
+    assert b.set_len("s") == 3
+
+  def test_clear_set(self, mocker):
+    b = _mock_backend(mocker)
+    b.clear_set("s")
+    b._client.delete_by_query.assert_called_once()
+
+
+class TestPing:
+  def test_ping_connected(self, mocker):
+    b = _mock_backend(mocker)
+    b._client.ping.return_value = True
+    assert b.ping() is True
+
+  def test_ping_disconnected(self):
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    assert backend.ping() is False
+
+
+class TestClientProperty:
+  def test_client_auto_connect(self, mocker):
+    mock_client = mocker.MagicMock(
+      ping=mocker.MagicMock(return_value=True),
+      indices=mocker.MagicMock(exists=mocker.MagicMock(return_value=False)),
+    )
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+    )
+
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    _ = backend.client
+    assert backend.is_connected()
+
+
+class TestEnsureIndices:
+  def test_ensure_indices_creates_missing_index(self, mocker):
+    mock_client = mocker.MagicMock(
+      ping=mocker.MagicMock(return_value=True),
+      indices=mocker.MagicMock(
+        exists=mocker.MagicMock(side_effect=[False, False, False]),
+        create=mocker.MagicMock(),
+      ),
+    )
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+    )
+
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    backend.connect()
+    assert mock_client.indices.create.call_count == 3
+
+
 class TestConnectionManager:
   def test_get_manager(self, mocker):
     from scrapy_extension.backends.connectors import ConnectionManager

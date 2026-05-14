@@ -6,7 +6,9 @@ backend implementations must follow.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Protocol
@@ -70,6 +72,55 @@ class JSONSerializer:
         The deserialized object.
     """
     return json.loads(data.decode("utf-8"))
+
+
+# Shared utilities for backends
+
+KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
+
+
+def _validate_key_name(name: str, field_name: str = "name") -> None:
+    """Validate key/queue/set/index name to prevent injection.
+
+    Args:
+        name: The name to validate.
+        field_name: Field name for error messages.
+
+    Raises:
+        ValueError: If name contains invalid characters.
+    """
+    if not name or not KEY_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid {field_name}: {name!r}. "
+            f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
+        )
+
+
+def _hash_item(item: bytes) -> str:
+    """Generate SHA256 hash for item.
+
+    Args:
+        item: Item to hash.
+
+    Returns:
+        SHA256 hex digest.
+    """
+    return hashlib.sha256(item).hexdigest()
+
+
+def _get_mode_text(mode: Any) -> str:
+    """Get a displayable string for a mode enum value.
+
+    Args:
+        mode: The mode enum value.
+
+    Returns:
+        A string representation of the mode.
+    """
+    try:
+        return str(mode)
+    except (TypeError, ValueError):
+        return getattr(mode, "value", repr(mode))
 
 
 class BackendType(str, Enum):

@@ -1043,3 +1043,224 @@ class TestRedisBackendConnectErrors:
     backend = RedisBackend(settings)
     with pytest.raises(BackendConnectionError):
       backend.connect()
+
+
+class TestRedisBackendCoverageGaps:
+  """Tests covering previously missing coverage lines in RedisBackend."""
+
+  @pytest.fixture
+  def redis_settings(self):
+    """Create Redis settings."""
+    from scrapy_extension.settings import RedisSettings
+
+    return RedisSettings(host="localhost", port=6379)
+
+  @pytest.fixture
+  def mock_redis(self, mocker):
+    """Create mock Redis client."""
+    return mocker.Mock()
+
+  def test_validate_key_name_empty(self):
+    """Test _validate_key_name raises ValueError for empty name (line 33)."""
+    from scrapy_extension.backends.redis import _validate_key_name
+
+    with pytest.raises(ValueError, match="Invalid name"):
+      _validate_key_name("")
+
+  def test_import_error_message(self):
+    """Test ImportError includes helpful install message (lines 43-44)."""
+    import subprocess
+    import sys
+
+    # Use subprocess to avoid corrupting the current process's module state
+    result = subprocess.run(
+      [
+        sys.executable,
+        "-c",
+        (
+          "import sys\n"
+          "# Block redis from being imported\n"
+          "import importlib.util\n"
+          "sys.modules['redis'] = None\n"
+          "sys.modules['redis.exceptions'] = None\n"
+          "sys.modules['redis.cluster'] = None\n"
+          "sys.modules['redis.sentinel'] = None\n"
+          "try:\n"
+          "    import scrapy_extension.backends.redis\n"
+          "    print('ERROR: No ImportError raised')\n"
+          "    sys.exit(1)\n"
+          "except ImportError as e:\n"
+          "    msg = str(e)\n"
+          '    if "pip install scrapy-extension[redis]" in msg:\n'
+          "        print('PASS')\n"
+          "    else:\n"
+          "        print(f'ERROR: Wrong message: {msg}')\n"
+          "        sys.exit(1)\n"
+        ),
+      ],
+      capture_output=True,
+      text=True,
+    )
+    assert result.returncode == 0, (
+      f"subprocess failed: {result.stderr}\n{result.stdout}"
+    )
+    assert "PASS" in result.stdout
+
+  def test_connect_cluster_branch(self, mock_redis, mocker):
+    """Test connect() CLUSTER branch and logger.debug (lines 113->118)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+    )
+    mocker.patch(
+      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_redis
+    )
+    backend = RedisBackend(settings)
+    backend.connect()
+    # The CLUSTER branch is exercised; verify it connected
+    assert backend.is_connected()
+
+  def test_connect_master_slave_no_replicas(self, mock_redis, mocker):
+    """Test _connect_master_slave with no replicas skips logging (line 169->exit)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.MASTER_SLAVE,
+      host="master.redis.com",
+      port=6379,
+      replicas=[],
+    )
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(settings)
+    backend.connect()
+    assert backend.is_connected()
+    # With replicas=None, the `if self.config.replicas:` branch is skipped
+
+  def test_disconnect_separate_master_client(self, redis_settings, mocker):
+    """Test disconnect closes separate _master_client (lines 283-285)."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_master = mocker.Mock()
+    mock_client = mocker.Mock()
+
+    backend = RedisBackend(redis_settings)
+    # Manually create a scenario where _master_client is separate from _client
+    backend._master_client = mock_master
+    backend._client = mock_client
+    backend._sentinel = mocker.Mock()
+
+    backend.disconnect()
+    # Both should be closed
+    mock_master.close.assert_called()
+    mock_client.close.assert_called()
+    assert backend._master_client is None
+    assert backend._client is None
+    assert backend._sentinel is None
+
+  def test_disconnect_master_client_redis_error_suppressed(
+    self, redis_settings, mocker
+  ):
+    """Test disconnect suppresses RedisError when closing _master_client (lines 283-285)."""
+    from redis.exceptions import RedisError
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_master = mocker.Mock()
+    mock_master.close.side_effect = RedisError("Already closed")
+    mock_client = mocker.Mock()
+
+    backend = RedisBackend(redis_settings)
+    backend._master_client = mock_master
+    backend._client = mock_client
+
+    # Should not raise
+    backend.disconnect()
+    assert backend._master_client is None
+    assert backend._client is None
+
+  def test_disconnect_clears_sentinel(self, redis_settings, mocker):
+    """Test disconnect sets _sentinel to None (lines 287->292)."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_client = mocker.Mock()
+    backend = RedisBackend(redis_settings)
+    backend._client = mock_client
+    backend._sentinel = mocker.Mock()
+
+    backend.disconnect()
+    assert backend._sentinel is None
+    assert backend._client is None
+
+  def test_retrieve_returns_none_for_missing_key(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """Test retrieve returns None when key doesn't exist (line 573)."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_redis.get.return_value = None
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    result = backend.retrieve("missing_key")
+    assert result is None
+
+  def test_clear_storage_cluster_with_prefix(self, mocker):
+    """Test clear_storage cluster scan_iter branch (lines 661-662)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+    )
+
+    mock_cluster = mocker.MagicMock()
+    mock_cluster.scan_iter.return_value = iter([b"prefix:key1", b"prefix:key2"])
+    mock_cluster.ping.return_value = True
+
+    mocker.patch(
+      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
+    )
+    # Patch isinstance so it returns True for the mock_cluster instance
+    original_isinstance = isinstance
+    mocker.patch(
+      "scrapy_extension.backends.redis.isinstance",
+      side_effect=lambda obj, cls: (
+        True if obj is mock_cluster else original_isinstance(obj, cls)
+      ),
+    )
+    backend = RedisBackend(settings)
+    backend.connect()
+    backend.clear_storage(prefix="prefix")
+
+    mock_cluster.scan_iter.assert_called_once_with(match="prefix*")
+    assert mock_cluster.delete.call_count == 2
+
+  def test_clear_storage_cluster_no_prefix(self, mocker):
+    """Test clear_storage cluster flushall branch (line 669)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+    )
+
+    mock_cluster = mocker.MagicMock()
+    mock_cluster.ping.return_value = True
+
+    mocker.patch(
+      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
+    )
+    # Patch isinstance so it returns True for the mock_cluster instance
+    original_isinstance = isinstance
+    mocker.patch(
+      "scrapy_extension.backends.redis.isinstance",
+      side_effect=lambda obj, cls: (
+        True if obj is mock_cluster else original_isinstance(obj, cls)
+      ),
+    )
+    backend = RedisBackend(settings)
+    backend.connect()
+    backend.clear_storage()
+
+    mock_cluster.flushall.assert_called_once()

@@ -15,30 +15,15 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any, cast
 
-# Key name validation pattern - only allow alphanumeric, dots, underscores, hyphens, colons
-KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
-
-
-def _validate_key_name(name: str, field_name: str = "name") -> None:
-    """Validate key/queue/set name to prevent injection.
-
-    Args:
-        name: The name to validate.
-        field_name: Field name for error messages.
-
-    Raises:
-        ValueError: If name contains invalid characters.
-    """
-    if not name or not KEY_NAME_PATTERN.match(name):
-        raise ValueError(
-            f"Invalid {field_name}: {name!r}. "
-            f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
-        )
-
-from redis import Redis
-from redis.cluster import ClusterNode, RedisCluster
-from redis.exceptions import RedisError
-from redis.sentinel import Sentinel
+try:
+    from redis import Redis
+    from redis.cluster import ClusterNode, RedisCluster
+    from redis.exceptions import RedisError
+    from redis.sentinel import Sentinel
+except ImportError as e:
+    raise ImportError(
+        "Redis backend requires 'redis'. Install with: pip install scrapy-extension[redis]"
+    ) from e
 
 from scrapy_extension.backends.base import (
   Backend,
@@ -46,6 +31,7 @@ from scrapy_extension.backends.base import (
   QueueBackend,
   SetBackend,
   StorageBackend,
+  _validate_key_name,
 )
 from scrapy_extension.exceptions import (
   BackendConnectionError,
@@ -490,7 +476,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      result = cast("int", self.client.sismember(set_name, item.decode("utf-8")))
+      result = cast("int", self.client.sismember(set_name, item))
       return bool(result)
     except RedisError:
       return False

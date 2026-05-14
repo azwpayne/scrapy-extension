@@ -15,11 +15,16 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from kafka import KafkaConsumer, KafkaProducer, TopicPartition
-from kafka.admin import KafkaAdminClient, NewTopic
-from kafka.errors import KafkaError, TopicAlreadyExistsError
+try:
+    from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+    from kafka.admin import KafkaAdminClient, NewTopic
+    from kafka.errors import KafkaError, TopicAlreadyExistsError
+except ImportError as e:
+    raise ImportError(
+        "Kafka backend requires 'kafka-python'. Install with: pip install scrapy-extension[kafka]"
+    ) from e
 
-from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
+from scrapy_extension.backends.base import Backend, BackendType, QueueBackend, _get_mode_text
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
@@ -96,11 +101,7 @@ class KafkaBackend(Backend, QueueBackend):
       KafkaMode.CLUSTER,
       KafkaMode.CONFLUENT,
     ):
-      try:
-        mode_text = str(self.config.mode)
-      except (TypeError, ValueError):
-        mode_text = getattr(self.config.mode, "value", repr(self.config.mode))
-      msg = f"Unsupported Kafka mode: {mode_text}"
+      msg = f"Unsupported Kafka mode: {_get_mode_text(self.config.mode)}"
       raise ConfigurationError(
         msg,
         setting_name="mode",

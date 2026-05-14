@@ -5,7 +5,7 @@
 # The recommended approach is to use BackendPipeline via settings.py:
 #
 #     ITEM_PIPELINES = {
-#         "scrapy_extension.components.pipeline.BackendPipeline": 300,
+#         "scrapy_extension.pipeline.pipeline.BackendPipeline": 300,
 #     }
 #
 # BackendPipeline automatically stores each item in the configured backend
@@ -26,5 +26,5 @@
 # Configure in settings.py:
 #     ITEM_PIPELINES = {
 #         "examples.pipelines.QuoteEnrichmentPipeline": 200,      # Run first
-#         "scrapy_extension.components.pipeline.BackendPipeline": 300,  # Then store
+#         "scrapy_extension.pipeline.pipeline.BackendPipeline": 300,  # Then store
 #     }

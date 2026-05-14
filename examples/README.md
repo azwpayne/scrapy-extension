@@ -45,7 +45,6 @@ examples/
 │       ├── quotes_kafka.py               # Kafka backend spider (queue only)
 │       ├── quotes_rabbitmq.py            # RabbitMQ backend spider (queue only)
 │       ├── quotes_elasticsearch.py       # ElasticSearch backend spider
-│       ├── quotes_rocketmq.py             # RocketMQ backend spider (queue only)
 │       ├── quotes_programmatic.py        # Programmatic settings configuration
 │       ├── quotes_multi_mode.py          # Redis Sentinel/Cluster modes
 │       ├── quotes_connection_manager.py  # Low-level ConnectionManager API
@@ -63,9 +62,14 @@ examples/
 | Kafka         | Yes   | No          | No      | standalone, cluster, confluent                  |
 | RabbitMQ      | Yes   | No          | No      | standalone, cluster, mirrored_queues           |
 | ElasticSearch | Yes   | Yes         | Yes     | standalone, cloud                               |
-| RocketMQ      | Yes   | No          | No      | standalone, cluster, cloud                       |
+| RocketMQ      | Yes   | Stub        | Stub    | standalone, cluster, cloud                      |
 
-**Note:** Kafka, RabbitMQ, and RocketMQ only implement QueueBackend. For deduplication and storage, use Redis, MongoDB, or ElasticSearch.
+- **Yes** — fully implemented
+- **No** — not available (raises `NotImplementedError`)
+- **Stub** — method signatures exist but raise `NotImplementedError` at runtime
+
+**Kafka, RabbitMQ**: Queue-only. For dedup/storage, use Redis, MongoDB, or ElasticSearch.
+**RocketMQ**: Queue functional. Set/Storage are stubs — pair with a full-featured backend.
 
 ---
 
@@ -327,9 +331,16 @@ docker logs rabbitmq
 
 ---
 
-## 5. RocketMQ Backend (`quotes_rocketmq`)
+## 5. RocketMQ Backend
 
-Uses RocketMQ for distributed request queuing. **Queue-only** — no Set or Storage support.
+> **Note:** No example spider provided. Configure RocketMQ directly in your project's `settings.py`:
+
+```python
+SCRAPY_BACKEND_TYPE = "rocketmq"
+SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
+```
+
+**Queue-only** — no Set or Storage support.
 
 ```bash
 # Start RocketMQ nameserver
@@ -340,8 +351,6 @@ docker run -d --name rocketmq-broker -p 10911:10911 -p 10909:10909 \
   --link rocketmq-namesrv \
   -e NAMESRV_ADDR=rocketmq-namesrv:9876 \
   apache/rocketmq:5.0 broker
-
-scrapy crawl quotes_rocketmq
 ```
 
 ### Configuration Options
@@ -375,13 +384,14 @@ SCRAPY_ROCKETMQ_SECRET_KEY = "your_secret_key"
 
 ### Important Limitations
 
-RocketMQ only implements `QueueBackend`. The following operations raise `NotImplementedError`:
+RocketMQ implements `QueueBackend` fully. `SetBackend` and `StorageBackend` method **signatures exist but raise `NotImplementedError`** at runtime:
 - `SetBackend.add()` — RocketMQ does not support atomic add-or-skip set operations
 - `SetBackend.contains()` — RocketMQ does not support set membership queries
 - `SetBackend.set_len()` — RocketMQ does not support set size queries
 - `StorageBackend.retrieve()` — RocketMQ does not support point-in-time key retrieval
+- `StorageBackend.delete()` / `exists()` / `ttl()` / `clear_storage()` — same limitation
 
-For deduplication, pair with Redis or MongoDB.
+For deduplication and storage, pair with Redis, MongoDB, or ElasticSearch.
 
 ### Common Errors
 
@@ -617,7 +627,7 @@ set_backend = self._manager.get_set_backend()       # add, contains, remove
 storage_backend = self._manager.get_storage_backend() # store, retrieve, delete
 ```
 
-**NotImplementedError guard (Kafka/RabbitMQ don't support Set/Storage):**
+**NotImplementedError guard (Kafka/RabbitMQ don't support Set/Storage, RocketMQ raises NotImplementedError at runtime):**
 
 ```python
 try:

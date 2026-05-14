@@ -131,6 +131,11 @@ class ConnectionManager:
         from scrapy_extension.settings import ElasticSearchSettings
 
         return ElasticSearchBackend(ElasticSearchSettings(**self.settings))
+      case BackendType.ROCKETMQ:
+        from scrapy_extension.backends.rocketmq import RocketMQBackend
+        from scrapy_extension.settings import RocketMQSettings
+
+        return RocketMQBackend(RocketMQSettings(**self.settings))
       case _:
         msg = f"Unsupported backend type: {self.backend_type}"
         raise ValueError(msg)

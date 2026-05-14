@@ -510,3 +510,236 @@ def test_rabbitmq_backend_clear_queue_amqp_error(mocker):
   backend.clear_queue("test_queue")
   mock_log.assert_called_once()
   assert "Purge failed" in str(mock_log.call_args[0][2])
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage gap tests
+# ---------------------------------------------------------------------------
+
+
+def test_rabbitmq_backend_import_error():
+  """Test ImportError includes helpful install message (lines 23-24)."""
+  import subprocess
+  import sys
+
+  # Use subprocess to avoid corrupting the current process's module state
+  result = subprocess.run(
+    [
+      sys.executable,
+      "-c",
+      (
+        "import sys\n"
+        "# Block pika from being imported\n"
+        "sys.modules['pika'] = None\n"
+        "sys.modules['pika.exceptions'] = None\n"
+        "try:\n"
+        "    import scrapy_extension.backends.rabbitmq\n"
+        "    print('ERROR: No ImportError raised')\n"
+        "    sys.exit(1)\n"
+        "except ImportError as e:\n"
+        "    msg = str(e)\n"
+        '    if "pip install scrapy-extension[rabbitmq]" in msg:\n'
+        "        print('PASS')\n"
+        "    else:\n"
+        "        print(f'ERROR: Wrong message: {msg}')\n"
+        "        sys.exit(1)\n"
+      ),
+    ],
+    capture_output=True,
+    text=True,
+  )
+  assert result.returncode == 0, f"subprocess failed: {result.stderr}\n{result.stdout}"
+  assert "PASS" in result.stdout
+
+
+def test_rabbitmq_backend_validate_key_name_empty():
+  """Test _validate_key_name raises ValueError for empty name (line 56)."""
+  from scrapy_extension.backends.rabbitmq import _validate_key_name
+
+  with pytest.raises(ValueError, match="Invalid name"):
+    _validate_key_name("")
+
+
+def test_rabbitmq_backend_connect_unsupported_mode_repr(mocker):
+  """Test connect handles unsupported mode where str() fails (lines 99-104)."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  # Create a mode object that raises TypeError on str() and has no .value
+  class BadMode:
+    def __str__(self):
+      raise TypeError("cannot convert")
+
+  backend.config.mode = BadMode()
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+  assert "Unsupported RabbitMQ mode" in str(exc_info.value)
+
+
+def test_rabbitmq_backend_ssl_disabled(mocker):
+  """Test SSL is disabled when ssl_enabled=False (default)."""
+  config = RabbitMQSettings()
+  config.ssl_enabled = False
+  config.username = "user"  # noqa: S106
+  config.password = "pass"  # noqa: S105
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  assert backend.is_connected()
+  # SSL should not be configured
+  assert backend._connection is not None
+
+
+def test_rabbitmq_backend_get_ssl_verify_mode(mocker):
+  """Test _get_ssl_verify_mode returns correct ssl.VerifyMode values."""
+  from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+  from scrapy_extension.settings import RabbitMQSettings
+
+  config = RabbitMQSettings()
+  config.username = "user"  # noqa: S106
+  config.password = "pass"  # noqa: S105
+  backend = RabbitMQBackend(config)
+
+  # Test CERT_NONE
+  config.ssl_verify_mode = "CERT_NONE"
+  assert backend._get_ssl_verify_mode() == ssl.CERT_NONE
+
+  # Test CERT_OPTIONAL
+  config.ssl_verify_mode = "CERT_OPTIONAL"
+  assert backend._get_ssl_verify_mode() == ssl.CERT_OPTIONAL
+
+  # Test default (CERT_REQUIRED) for unknown values
+  config.ssl_verify_mode = "UNKNOWN"
+  assert backend._get_ssl_verify_mode() == ssl.CERT_REQUIRED
+
+
+def test_rabbitmq_backend_connect_cluster_with_nodes(mocker):
+  """Test _connect_cluster with cluster_nodes configured (lines 221-222)."""
+  config = RabbitMQSettings()
+  config.mode = RabbitMQMode.CLUSTER
+  config.cluster_nodes = ["node2:5672", "node3:5672"]
+  config.username = "user"  # noqa: S106
+  config.password = "pass"  # noqa: S105
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  assert backend.is_connected()
+
+
+def test_rabbitmq_backend_mirrored_queues_no_ha_mode(mocker):
+  """Test _connect_mirrored_queues skips HA setup when ha_mode is None (lines 242->exit)."""
+  config = RabbitMQSettings()
+  config.mode = RabbitMQMode.MIRRORED_QUEUES
+  config.ha_mode = None
+  config.username = "user"  # noqa: S106
+  config.password = "pass"  # noqa: S105
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  assert backend._channel is not None
+
+
+def test_rabbitmq_backend_mirrored_queues_ha_params_non_digit(mocker):
+  """Test _connect_mirrored_queues with non-digit ha_params (line 250)."""
+  config = RabbitMQSettings()
+  config.mode = RabbitMQMode.MIRRORED_QUEUES
+  config.ha_mode = "nodes"
+  config.ha_params = "node1,node2"
+  config.username = "user"  # noqa: S106
+  config.password = "pass"  # noqa: S105
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  assert backend._channel is not None
+
+
+def test_rabbitmq_backend_mirrored_queues_ha_params_digit(mocker):
+  """Test _connect_mirrored_queues with digit ha_params (line 250-251)."""
+  config = RabbitMQSettings()
+  config.mode = RabbitMQMode.MIRRORED_QUEUES
+  config.ha_mode = "exactly"
+  config.ha_params = "2"
+  config.ha_sync_mode = "automatic"
+  config.username = "user"  # noqa: S106
+  config.password = "pass"  # noqa: S105
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  assert backend._channel is not None
+
+
+def test_rabbitmq_backend_setup_qos_no_prefetch(mocker):
+  """Test _setup_qos skips basic_qos when prefetch settings are zero (line 316)."""
+  config = RabbitMQSettings()
+  config.prefetch_count = 0
+  config.prefetch_size = 0
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  # basic_qos should NOT be called when both prefetch values are 0
+  mock_channel.basic_qos.assert_not_called()
+
+
+def test_rabbitmq_backend_disconnect_only_channel(mocker):
+  """Test disconnect closes channel but not connection when connection is None (lines 283->287)."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_channel = mocker.MagicMock()
+  backend._channel = mock_channel
+  backend._connection = None
+
+  backend.disconnect()
+  mock_channel.close.assert_called_once()
+  assert backend._channel is None
+
+
+def test_rabbitmq_backend_disconnect_only_connection(mocker):
+  """Test disconnect closes connection when channel is None (lines 287->exit)."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  backend._channel = None
+  backend._connection = mock_instance
+
+  backend.disconnect()
+  mock_instance.close.assert_called_once()
+  assert backend._connection is None

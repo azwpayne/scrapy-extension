@@ -39,12 +39,12 @@ FEED_EXPORT_ENCODING = "utf-8"
 # =============================================================================
 
 # --- Scheduler & DupeFilter (required for distributed crawling) ---
-SCHEDULER = "scrapy_extension.components.scheduler.BackendScheduler"
-DUPEFILTER_CLASS = "scrapy_extension.components.dupefilter.BackendDupeFilter"
+SCHEDULER = "scrapy_extension.schedule.scheduler.BackendScheduler"
+DUPEFILTER_CLASS = "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter"
 
 # --- Item Pipeline (stores items in backend storage) ---
 ITEM_PIPELINES = {
-  "scrapy_extension.components.pipeline.BackendPipeline": 300,
+  "scrapy_extension.pipeline.pipeline.BackendPipeline": 300,
 }
 
 # --- Pipeline options ---

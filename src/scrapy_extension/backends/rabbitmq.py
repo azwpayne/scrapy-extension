@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import ssl
 from typing import TYPE_CHECKING, Any, Literal
 
-import pika
-from pika.exceptions import AMQPError
+try:
+    import pika
+    from pika.exceptions import AMQPError
+except ImportError as e:
+    raise ImportError(
+        "RabbitMQ backend requires 'pika'. Install with: pip install scrapy-extension[rabbitmq]"
+    ) from e
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
 from scrapy_extension.exceptions import (
@@ -31,6 +37,26 @@ if TYPE_CHECKING:
   from scrapy_extension.settings import RabbitMQSettings
 
 logger = logging.getLogger(__name__)
+
+# Key name validation pattern - only allow alphanumeric, dots, underscores, hyphens, colons, slashes
+_KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:/-]+$")
+
+
+def _validate_key_name(name: str, field_name: str = "name") -> None:
+    """Validate key/queue name to prevent injection.
+
+    Args:
+        name: The name to validate.
+        field_name: Field name for error messages.
+
+    Raises:
+        ValueError: If name contains invalid characters.
+    """
+    if not name or not _KEY_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid {field_name}: {name!r}. "
+            f"Only alphanumeric, dots, underscores, hyphens, colons, and slashes allowed."
+        )
 
 
 class RabbitMQBackend(Backend, QueueBackend):
@@ -331,7 +357,9 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Raises:
         QueueError: If the push operation fails.
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     if self._channel is None:
       msg = "Not connected to RabbitMQ"
       raise QueueError(
@@ -415,18 +443,22 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Returns:
         Number of messages in the queue.
+
+    Raises:
+        QueueError: If the queue_len operation fails.
     """
     if self._channel is None:
-      return 0
+      msg = "Not connected to RabbitMQ"
+      raise QueueError(msg, queue_name=queue_name, operation="queue_len")
     try:
       result = self._channel.queue_declare(
         queue=queue_name,
         passive=True,
       )
-    except AMQPError:
-      return 0
-    else:
-      return result.method.message_count
+    except AMQPError as e:
+      msg = f"Failed to get queue length for {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="queue_len") from e
+    return result.method.message_count
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.

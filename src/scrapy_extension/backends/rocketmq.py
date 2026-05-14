@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -10,8 +9,8 @@ from scrapy_extension.backends.base import (
   Backend,
   BackendType,
   QueueBackend,
-  SetBackend,
-  StorageBackend,
+  _hash_item,
+  _validate_key_name,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.settings import RocketMQMode
@@ -22,8 +21,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class RocketMQBackend(Backend, QueueBackend, SetBackend, StorageBackend):
-  """RocketMQ backend implementation."""
+class RocketMQBackend(Backend, QueueBackend):
+  """RocketMQ backend implementation.
+
+  Note: RocketMQ only supports QueueBackend operations.
+  SetBackend and StorageBackend are not supported by RocketMQ.
+  Attempting to use get_set_backend() or get_storage_backend() will raise NotImplementedError.
+  """
 
   def __init__(self, config: RocketMQSettings) -> None:
     self.config = config
@@ -125,8 +129,8 @@ class RocketMQBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     if not self.is_connected():
       return False
-    # Simple health check - verify consumer is active
-    return True
+    # Verify producer and consumer are still active
+    return self._producer is not None and self._consumer is not None
 
   @property
   def backend_type(self) -> BackendType:
@@ -251,17 +255,6 @@ class RocketMQBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     return f"{self.config.set_topic_prefix}_{set_name}"
 
-  def _hash_item(self, item: bytes) -> str:
-    """Generate hash for item.
-
-    Args:
-      item: Item to hash.
-
-    Returns:
-      SHA256 hex digest.
-    """
-    return hashlib.sha256(item).hexdigest()
-
   def add(self, set_name: str, item: bytes) -> bool:
     """Add item to set.
 
@@ -291,16 +284,11 @@ class RocketMQBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.
 
-    Args:
-      set_name: Name of the set.
-      item: Item to remove.
-
-    Returns:
-      True if removed, False if didn't exist.
+    Raises:
+      NotImplementedError: RocketMQ does not support atomic remove from sets.
     """
-    # RocketMQ doesn't support delete in flight, log warning
-    logger.warning("remove not supported in RocketMQ set operations")
-    return False
+    msg = "RocketMQ does not support atomic remove from sets. Use push() without dedup instead."
+    raise NotImplementedError(msg)
 
   def contains(self, set_name: str, item: bytes) -> bool:
     """Check if item is in set.
@@ -403,47 +391,35 @@ class RocketMQBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
-    Args:
-      key: Storage key.
-
-    Returns:
-      True if deleted, False if didn't exist.
+    Raises:
+      NotImplementedError: RocketMQ does not support key-based deletion.
     """
-    if not self.is_connected():
-      return False
-    logger.warning("delete not fully supported in RocketMQ storage")
-    return False
+    msg = "RocketMQ does not support key-based deletion. Use a different backend for storage."
+    raise NotImplementedError(msg)
 
   def exists(self, key: str) -> bool:
     """Check if key exists.
 
-    Args:
-      key: Storage key.
-
-    Returns:
-      True if key exists.
+    Raises:
+      NotImplementedError: RocketMQ does not support key-based existence checks.
     """
-    if not self.is_connected():
-      return False
-    return False
+    msg = "RocketMQ does not support exists(). Use a different backend for storage."
+    raise NotImplementedError(msg)
 
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
 
-    Args:
-      key: Storage key.
-
-    Returns:
-      Seconds remaining, None if no TTL, -1 if expired.
+    Raises:
+      NotImplementedError: RocketMQ does not support TTL queries.
     """
-    return None
+    msg = "RocketMQ does not support ttl(). Use a different backend for storage."
+    raise NotImplementedError(msg)
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data.
 
-    Args:
-      prefix: Ignored in RocketMQ.
+    Raises:
+      NotImplementedError: RocketMQ does not support storage clearing.
     """
-    if not self.is_connected():
-      return
-    logger.warning("clear_storage not fully supported in RocketMQ")
+    msg = "RocketMQ does not support clear_storage(). Use a different backend for storage."
+    raise NotImplementedError(msg)

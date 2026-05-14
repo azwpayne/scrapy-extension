@@ -40,6 +40,6 @@ class RocketMQSettings(BaseSettings):
     send_timeout: int = Field(default=3000, ge=0)  # ms
 
     # === Topic Settings ===
-    topic: str = Field(default="scrapy-queue")
-    set_topic_suffix: str = Field(default="scrapy-set")
-    storage_topic_suffix: str = Field(default="scrapy-storage")
+    topic_prefix: str = Field(default="scrapy-queue")
+    set_topic_prefix: str = Field(default="scrapy-set")
+    storage_topic_prefix: str = Field(default="scrapy-storage")
