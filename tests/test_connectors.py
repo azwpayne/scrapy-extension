@@ -91,6 +91,20 @@ class TestConnectionManagerCreateBackend:
     with pytest.raises(ValueError, match="Unsupported backend type"):
       manager._create_backend()
 
+  def test_create_backend_rocketmq(self, mocker):
+    """Test _create_backend creates RocketMQBackend correctly."""
+    mock_backend = mocker.MagicMock()
+    mock_rocketmq_backend = mocker.patch(
+      "scrapy_extension.backends.rocketmq.RocketMQBackend"
+    )
+    mock_rocketmq_backend.return_value = mock_backend
+
+    manager = ConnectionManager(BackendType.ROCKETMQ)
+    backend = manager._create_backend()
+
+    mock_rocketmq_backend.assert_called_once()
+    assert backend == mock_backend
+
 
 class TestConnectionManagerSettingsKey:
   """Tests for settings key generation in get_manager."""
