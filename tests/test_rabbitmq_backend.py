@@ -455,16 +455,17 @@ def test_rabbitmq_backend_pop_no_channel():
 
 
 def test_rabbitmq_backend_queue_len_no_channel():
-  """Test queue_len returns 0 when channel is None (line 429-430)."""
+  """Test queue_len raises QueueError when channel is None."""
   config = RabbitMQSettings()
   backend = RabbitMQBackend(config)
 
-  result = backend.queue_len("test_queue")
-  assert result == 0
+  with pytest.raises(QueueError) as exc_info:
+    backend.queue_len("test_queue")
+  assert "Not connected" in str(exc_info.value)
 
 
 def test_rabbitmq_backend_queue_len_amqp_error(mocker):
-  """Test queue_len returns 0 when AMQPError is raised (lines 436-437)."""
+  """Test queue_len raises QueueError when AMQPError is raised."""
   config = RabbitMQSettings()
   backend = RabbitMQBackend(config)
 
@@ -477,8 +478,9 @@ def test_rabbitmq_backend_queue_len_amqp_error(mocker):
   backend.connect()
   mock_channel.queue_declare.side_effect = pika.exceptions.AMQPError("Queue error")
 
-  result = backend.queue_len("test_queue")
-  assert result == 0
+  with pytest.raises(QueueError) as exc_info:
+    backend.queue_len("test_queue")
+  assert "Failed to get queue length" in str(exc_info.value)
 
 
 def test_rabbitmq_backend_clear_queue_no_channel():
