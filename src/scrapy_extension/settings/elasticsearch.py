@@ -4,9 +4,11 @@ This module provides pydantic-settings based configuration for
 ElasticSearch backend connections.
 """
 
+from __future__ import annotations
+
 from enum import Enum
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -123,3 +125,26 @@ class ElasticSearchSettings(BaseSettings):
     default="scrapy_storage",
     description="Index name for storage operations",
   )
+
+  @model_validator(mode="after")
+  def validate_mode_requirements(self) -> ElasticSearchSettings:
+    """Fail-fast: CLOUD mode requires ``cloud_id``.
+
+    Mirrors the Redis SENTINEL validator (R8). Without this, the error
+    surfaced at ``connect()`` time (BackendConnectionError) rather than at
+    construction — far from the misconfiguration. Verified against
+    ``connect()`` (which already rejects CLOUD-without-cloud_id), so this
+    only moves the failure earlier; no valid configuration is newly
+    rejected. ``api_key`` is intentionally NOT required — CLOUD can
+    authenticate via basic_auth too (per ``_build_kwargs``).
+
+    Raises:
+        ValueError: If CLOUD mode is selected without ``cloud_id``.
+    """
+    if self.mode == ElasticSearchMode.CLOUD and not self.cloud_id:
+      msg = (
+        "ElasticSearch CLOUD mode requires 'cloud_id' to be set. "
+        f"Got cloud_id={self.cloud_id!r}."
+      )
+      raise ValueError(msg)
+    return self

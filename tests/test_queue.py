@@ -374,6 +374,36 @@ class TestBackendQueuePush:
     call_args = mock_connection_manager.get_queue_backend().push.call_args
     assert call_args[0][2] == 0.0
 
+  def test_ack_delegates_to_queue_backend(self, mock_connection_manager, mock_spider):
+    """R11: ack() delegates to the backend's ack with the queue name."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+    queue.ack()
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with("test_queue")
+
+  def test_nack_delegates_to_queue_backend(self, mock_connection_manager, mock_spider):
+    """R11: nack() delegates to the backend's nack with the queue name."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+    queue.nack()
+    mock_connection_manager.get_queue_backend().nack.assert_called_once_with("test_queue")
+
+  def test_decode_body_raises_on_invalid_base64(self):
+    """R17: _decode_body raises SerializationError on non-base64 body.
+
+    Covers the corruption-detection path: a queued request whose body isn't
+    valid base64 (queue tampering, version skew) surfaces as a loud
+    SerializationError, not a silent wrong decode.
+    """
+    with pytest.raises(SerializationError, match="Invalid base64 body"):
+      BackendQueue._decode_body({"body": "!!!not-base64!!!"})
+
   def test_push_raises_serialization_error_on_exception(self, mock_connection_manager, mock_spider):
     """Test push raises SerializationError when request serialization fails."""
     queue = BackendQueue(

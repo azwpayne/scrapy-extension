@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast unit job — runs on every push/PR. No external services required.
+  # Integration tests (tests/integration/, marker `integration`) are
+  # deselected here; they need live backends and are run separately (see
+  # the integration-tests job below, disabled by default).
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: pip install uv
+      - name: Sync dependencies (test group)
+        run: uv sync --group test
+      - name: Ruff
+        run: uv run ruff check
+      - name: Unit tests (integration deselected)
+        run: uv run pytest -m "not integration" --tb=short -q
+
+  # Integration job — DISABLED by default (commented out). Wiring it fully is
+  # left to the operator because (a) it needs 5 service containers, (b) the
+  # SCRAPY_TEST_* env vars must point at them, and (c) RocketMQ additionally
+  # needs the native librocketmq library, which isn't in standard GitHub
+  # images. To enable: uncomment, add `services:` blocks for redis/mongodb/
+  # elasticsearch/rabbitmq/kafka (mirror the standard GitHub Actions service
+  # patterns), wire the env vars to `localhost:<port>`, and for RocketMQ use a
+  # custom image that ships librocketmq (or exclude it). See R58 in
+  # docs/code-review-2026-06-15.md.
+  #
+  # integration-tests:
+  #   runs-on: ubuntu-latest
+  #   services:
+  #     redis:
+  #       image: redis:7
+  #       ports: ["6379:6379"]
+  #     mongodb:
+  #       image: mongo:7
+  #       ports: ["27017:27017"]
+  #     elasticsearch:
+  #       image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+  #       env:
+  #         discovery.type: single-node
+  #         xpack.security.enabled: "false"
+  #       ports: ["9200:9200"]
+  #     rabbitmq:
+  #       image: rabbitmq:3
+  #       ports: ["5672:5672"]
+  #     kafka:
+  #       image: bitnami/kafka:3.7
+  #       ports: ["9092:9092"]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: "3.12"
+  #     - run: pip install uv
+  #     - run: uv sync --group test --all-extras
+  #     - name: Wait for services to be healthy
+  #       run: sleep 30
+  #     - env:
+  #         SCRAPY_TEST_REDIS_URL: redis://localhost:6379/0
+  #         SCRAPY_TEST_MONGODB_URI: mongodb://localhost:27017
+  #         SCRAPY_TEST_ES_HOSTS: http://localhost:9200
+  #         SCRAPY_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+  #         SCRAPY_TEST_KAFKA_BOOTSTRAP: localhost:9092
+  #       run: uv run pytest tests/integration -m integration --tb=short -q

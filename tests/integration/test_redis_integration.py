@@ -34,13 +34,16 @@ from urllib.parse import urlparse
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-  not os.environ.get("SCRAPY_TEST_REDIS_URL"),
-  reason=(
-    "Set SCRAPY_TEST_REDIS_URL (e.g. redis://localhost:6379/0) to run "
-    "Redis integration tests against a live instance."
+pytestmark = [
+  pytest.mark.integration,
+  pytest.mark.skipif(
+    not os.environ.get("SCRAPY_TEST_REDIS_URL"),
+    reason=(
+      "Set SCRAPY_TEST_REDIS_URL (e.g. redis://localhost:6379/0) to run "
+      "Redis integration tests against a live instance."
+    ),
   ),
-)
+]
 
 
 def _settings_from_url(url: str):  # type: ignore[no-untyped-def]
@@ -60,7 +63,10 @@ def _settings_from_url(url: str):  # type: ignore[no-untyped-def]
     host=parsed.hostname or "localhost",
     port=parsed.port or 6379,
     db=int(db_raw),
-    username=parsed.username,
+    # urlparse returns '' (not None) for a password-only URL like
+    # redis://:secret@host — coerce to None so redis-py doesn't AUTH with
+    # an empty username (treated differently from no-username).
+    username=parsed.username or None,
     password=SecretStr(parsed.password) if parsed.password else None,
     socket_timeout=5.0,
     socket_connect_timeout=5.0,

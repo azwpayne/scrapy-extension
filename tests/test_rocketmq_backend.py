@@ -1026,14 +1026,11 @@ def test_rocketmq_mode_enum_values():
     assert RocketMQMode.CLOUD.value == "cloud"
 
 
-def test_rocketmq_settings_env_prefix():
+def test_rocketmq_settings_env_prefix(monkeypatch):
     """Test RocketMQSettings respects env prefix."""
-    import os
-
-    os.environ["SCRAPY_ROCKETMQ_NAMESRV_ADDRESS"] = "env-rocketmq:9876"
+    monkeypatch.setenv("SCRAPY_ROCKETMQ_NAMESRV_ADDRESS", "env-rocketmq:9876")
     settings = RocketMQSettings()
     assert settings.namesrv_address == "env-rocketmq:9876"
-    os.environ.pop("SCRAPY_ROCKETMQ_NAMESRV_ADDRESS", None)
 
 
 def test_rocketmq_settings_cloud_mode():

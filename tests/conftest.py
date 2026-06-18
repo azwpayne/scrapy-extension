@@ -39,3 +39,20 @@ def sample_request():
 def sample_item():
   """Create a sample Scrapy item."""
   return {"name": "Test Item", "value": 123}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_connection_manager_registry():
+  """Auto-clear the ConnectionManager class-level registry before each test.
+
+  ``ConnectionManager._managers`` is a process-global dict; tests that reach
+  ``get_manager()`` (via the ``from_settings`` / ``from_crawler`` factories on
+  the scheduler / pipeline / dupefilter) populate it. Without clearing,
+  managers leak across tests — the cross-test pollution R1-P1-8/R8 warned
+  about. ``clear_registry()`` existed but was only invoked inside its own
+  self-test, so the isolation it was built for wasn't actually applied.
+  """
+  from scrapy_extension.backends.connectors import ConnectionManager
+
+  ConnectionManager.clear_registry()
+  yield

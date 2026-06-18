@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.10.4,<0.11.0"]
+requires = ["uv_build>=0.10.4,<0.12"]
 build-backend = "uv_build"
 
 [project]
@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Distributed crawling for Scrapy with pluggable backends — Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "azwpayne", email = "paynewu0719@gmail.com" }]
 requires-python = ">=3.10"
 keywords = ["scrapy", "crawler", "distributed", "redis", "mongodb", "kafka", "rabbitmq", "elasticsearch", "rocketmq"]
@@ -15,7 +16,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Scrapy",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -106,6 +106,10 @@ tasks.test-py311 = { shell = "uv run --python 3.11 --group test pytest" }
 tasks.test-py312 = { shell = "uv run --python 3.12 --group test pytest" }
 tasks.test-py313 = { shell = "uv run --python 3.13 --group test pytest" }
 tasks.test-py314 = { shell = "uv run --python 3.14 --group test pytest" }
+# Free-threaded build. NOTE: lxml (pulled transitively by scrapy via parsel)
+# re-enables the GIL on import, so this verifies 3.14t interpreter-compat —
+# NOT GIL-free concurrency. True free-threading can't be exercised while
+# scrapy depends on lxml (R81).
 tasks.test-py314t = { shell = "uv run --python 3.14t --group test pytest" }
 
 tasks.clean = { shell = """
@@ -170,15 +174,6 @@ markers = [
     "snapshot: 快照测试",
     "property: Hypothesis属性测试",
 ]
-[tool.pyrefly]
-strict = true
-
-# 针对测试目录的特殊配置
-[[tool.pyrefly.overrides]]
-pattern = "tests/**/*.py"
-strict = false
-ignore_errors = ["bad-argument-type"]
-
 [tool.coverage.run]
 source = ["src"]
 omit = [
@@ -208,13 +203,6 @@ exclude_lines = [
 [tool.coverage.html]
 directory = "reports/coverage"
 title = "Coverage Report"
-
-[tool.mutmut]
-paths_to_mutate = "src/"
-backup = false
-runner = "python -m pytest -x --timeout=60"
-tests_dir = "tests/"
-show_mutations = true
 
 [tool.bandit]
 exclude_dirs = ["tests"]

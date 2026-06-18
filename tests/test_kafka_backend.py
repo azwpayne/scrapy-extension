@@ -535,6 +535,81 @@ class TestKafkaBackendPop:
 
     assert result is None
 
+  def test_pop_subscribes_once_per_topic_not_every_call(self, mocker):
+    """R57: pop() re-subscribes only when the topic changes, not every call.
+
+    Mirrors RocketMQ's ``_ensure_subscribed`` (R7). Pre-R57, pop() called
+    ``subscribe([topic])`` unconditionally on every pop — wasteful on
+    Scrapy's hot path (``next_request`` pops the same queue every tick).
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.poll.return_value = {}  # empty → pop returns None cleanly
+    backend._consumer = mock_consumer
+
+    backend.pop("queue_a", timeout=0.0)
+    backend.pop("queue_a", timeout=0.0)  # same topic → no re-subscribe
+    backend.pop("queue_b", timeout=0.0)  # different topic → re-subscribe
+
+    # subscribe called exactly twice (once per distinct topic), not 3 times.
+    assert mock_consumer.subscribe.call_count == 2
+    mock_consumer.subscribe.assert_any_call(["scrapy-queue_a"])
+    mock_consumer.subscribe.assert_any_call(["scrapy-queue_b"])
+
+  def test_pop_warns_when_previous_unacked(self, mocker, caplog):
+    """R18: pop() while a previous record is unacked warns about CONCURRENT_REQUESTS>1.
+
+    Pins Kafka's concurrent-pop detection — surfaces the misconfiguration that
+    breaks ack tracking under CONCURRENT_REQUESTS>1 (mirrors the RabbitMQ
+    equivalent, R66).
+    """
+    import logging
+
+    from kafka import TopicPartition
+
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+
+    mock_consumer = mocker.MagicMock()
+    mock_record = mocker.MagicMock()
+    mock_record.value = b"data"
+    # Two polls, each yielding a record (second pop sees _last_record still set).
+    mock_consumer.poll.side_effect = [
+      {TopicPartition("scrapy-testq", 0): [mock_record]},
+      {TopicPartition("scrapy-testq", 0): [mock_record]},
+    ]
+    backend._consumer = mock_consumer
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+      backend.pop("testq", timeout=0.0)  # sets _last_record
+      backend.pop("testq", timeout=0.0)  # previous still unacked → warning
+
+    assert "pop() called while previous message is unacked" in caplog.text
+    assert "CONCURRENT_REQUESTS>1" in caplog.text
+
+  def test_nack_is_in_session_noop_that_clears_record(self, mocker):
+    """R11/R12: nack() is an in-session no-op — clears the tracked record, does NOT commit.
+
+    The offset stays uncommitted so the message re-delivers on the next
+    consumer restart (at-least-once retry). Within a running session nack
+    can't re-deliver, so it just drops the tracked record (so a subsequent
+    pop doesn't spuriously warn).
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    backend._consumer = mock_consumer
+    backend._last_record = mocker.MagicMock()
+
+    backend.nack("testq")
+
+    assert backend._last_record is None
+    # The whole point of nack: do NOT commit — the offset must stay uncommitted.
+    mock_consumer.commit.assert_not_called()
+
   def test_pop_creates_consumer_if_none(self, mocker):
     """Test pop creates consumer if not already created."""
     config = KafkaSettings()

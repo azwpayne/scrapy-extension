@@ -113,6 +113,11 @@ class KafkaBackend(Backend, QueueBackend):
     self._admin_client: KafkaAdminClient | None = None
     # Cache known topics to avoid repeated existence checks
     self._known_topics: set[str] = set()
+    # Topic the consumer is currently subscribed to, so pop() only
+    # re-subscribes when it changes — mirrors RocketMQ's _ensure_subscribed
+    # (R7). Avoids a redundant subscribe() on every pop of the same queue
+    # (Scrapy's next_request pops the same queue every tick). R2-E3.
+    self._subscribed_topic: str | None = None
 
   def connect(self) -> None:
     """Establish connection to Kafka based on deployment mode.
@@ -294,6 +299,7 @@ class KafkaBackend(Backend, QueueBackend):
     if self._consumer:
       self._consumer.close()
       self._consumer = None
+      self._subscribed_topic = None
     if self._admin_client:
       self._admin_client.close()
       self._admin_client = None
@@ -428,7 +434,12 @@ class KafkaBackend(Backend, QueueBackend):
         )
 
       assert self._consumer is not None
-      self._consumer.subscribe([topic_name])
+      # Subscribe only when the topic changes. kafka-python's subscribe() is
+      # idempotent on unchanged topics, but skipping the redundant call avoids
+      # needless subscription-state work on every pop of the same queue (R2-E3).
+      if self._subscribed_topic != topic_name:
+        self._consumer.subscribe([topic_name])
+        self._subscribed_topic = topic_name
 
       # Poll for messages
       timeout_ms = int(timeout * 1000)

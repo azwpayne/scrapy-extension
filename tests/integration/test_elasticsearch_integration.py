@@ -43,13 +43,16 @@ import uuid
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-  not os.environ.get("SCRAPY_TEST_ES_HOSTS"),
-  reason=(
-    "Set SCRAPY_TEST_ES_HOSTS (comma-separated, e.g. http://localhost:9200) "
-    "to run ElasticSearch integration tests against a live instance."
+pytestmark = [
+  pytest.mark.integration,
+  pytest.mark.skipif(
+    not os.environ.get("SCRAPY_TEST_ES_HOSTS"),
+    reason=(
+      "Set SCRAPY_TEST_ES_HOSTS (comma-separated, e.g. http://localhost:9200) "
+      "to run ElasticSearch integration tests against a live instance."
+    ),
   ),
-)
+]
 
 
 @pytest.fixture(scope="module")

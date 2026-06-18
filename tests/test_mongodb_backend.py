@@ -71,6 +71,51 @@ def test_mongodb_backend_push_pop(mocker):
   assert result == b"test_item"
 
 
+def test_mongodb_backend_push_raises_queue_error_on_pymongo_error(mocker):
+  """Push wraps a PyMongoError as QueueError (lines 409-411).
+
+  Pins the error-wrapping contract — callers catch QueueError, never the
+  raw PyMongoError (mirrors the redis/rabbitmq/kafka contract-pinning,
+  R65-R67).
+  """
+  from pymongo.errors import PyMongoError
+
+  from scrapy_extension.backends.mongodb import MongoDBBackend
+  from scrapy_extension.exceptions import QueueError
+  from scrapy_extension.settings import MongoDBSettings
+
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._queue_collection = mock_collection
+  mock_collection.insert_one.side_effect = PyMongoError("push failed")
+
+  with pytest.raises(QueueError, match="Failed to push to queue test_queue"):
+    backend.push("test_queue", b"item", priority=1.0)
+
+
+def test_mongodb_backend_pop_raises_queue_error_on_pymongo_error(mocker):
+  """Pop wraps a PyMongoError as QueueError (lines 434-436)."""
+  from pymongo.errors import PyMongoError
+
+  from scrapy_extension.backends.mongodb import MongoDBBackend
+  from scrapy_extension.exceptions import QueueError
+  from scrapy_extension.settings import MongoDBSettings
+
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._queue_collection = mock_collection
+  mock_collection.find_one_and_delete.side_effect = PyMongoError("pop failed")
+
+  with pytest.raises(QueueError, match="Failed to pop from queue test_queue"):
+    backend.pop("test_queue")
+
+
 def test_mongodb_backend_queue_len(mocker):
   """Test MongoDB backend queue length."""
   config = MongoDBSettings()

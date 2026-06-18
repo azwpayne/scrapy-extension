@@ -570,6 +570,29 @@ class TestOnSpiderClosed:
 
     mock_close.assert_called_once()
 
+  def test_swallows_close_backend_error(self, mocker, caplog):
+    """R3-H6: a close_backend() failure is swallowed — Scrapy's signal chain stays intact.
+
+    If close_backend raises (network error on disconnect, etc.), the exception
+    must NOT propagate through Scrapy's signal dispatcher — other
+    spider_closed handlers (stats, extensions, logging) still need to fire.
+    Same invariant as the scheduler's ack/nack error-swallow (R64).
+    """
+    import logging
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    mocker.patch.object(spider, "close_backend", side_effect=RuntimeError("close failed"))
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+      spider._on_spider_closed(spider, reason="finished")
+
+    # Must NOT propagate; the failure is logged instead.
+    assert "close_backend() failed" in caplog.text
+
   def test_ignores_other_spider_instances(self, mocker):
     """Test that _on_spider_closed ignores other spider instances."""
 

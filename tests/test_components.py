@@ -1,7 +1,8 @@
 """Tests for Scrapy components."""
 
-import pytest
 from unittest.mock import ANY
+
+import pytest
 from scrapy import Field, Item
 from scrapy.http import Request
 
@@ -643,6 +644,92 @@ class TestBackendScheduler:
 
     scheduler._on_spider_error(failure=None, response=None, spider=mock_spider)
     queue_nack_spy.assert_called_once()
+
+  def test_connect_ack_signals_is_idempotent(self, mock_connection_manager, mocker):
+    """R12: _connect_ack_signals short-circuits when already wired (line 136)."""
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    mock_spider = mock_connection_manager.get_queue_backend()
+    mock_spider.name = "test_spider"
+    mock_spider.crawler = mocker.MagicMock()
+    scheduler.open(mock_spider)
+
+    connect_count = mock_spider.crawler.signals.connect.call_count
+    # Second call must return early via the _signals_connected guard.
+    scheduler._connect_ack_signals(mock_spider)
+    assert mock_spider.crawler.signals.connect.call_count == connect_count
+
+  def test_on_response_received_noop_when_queue_none(self, mock_connection_manager, mocker):
+    """R12: _on_response_received returns early when _queue is None (line 161)."""
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    mock_spider = mock_connection_manager.get_queue_backend()
+    mock_spider.name = "test_spider"
+    mock_spider.crawler = mocker.MagicMock()
+    scheduler.open(mock_spider)
+    scheduler._queue = None  # not-yet-opened / already-closed
+
+    # Must not raise (and must not attempt ack on a None queue).
+    scheduler._on_response_received(response=None, request=None, spider=mock_spider)
+
+  def test_on_response_received_swallows_queue_error(self, mock_connection_manager, mocker):
+    """R12: a QueueError from ack() is swallowed — signal chain stays intact (164-165)."""
+    from scrapy_extension.exceptions import QueueError
+
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    mock_spider = mock_connection_manager.get_queue_backend()
+    mock_spider.name = "test_spider"
+    mock_spider.crawler = mocker.MagicMock()
+    scheduler.open(mock_spider)
+
+    queue = scheduler._queue
+    assert queue is not None
+    ack_spy = mocker.patch.object(queue, "ack", side_effect=QueueError("ack failed"))
+
+    # Must NOT propagate — the handler's try/except protects Scrapy's signal chain.
+    scheduler._on_response_received(response=None, request=None, spider=mock_spider)
+    ack_spy.assert_called_once()
+
+  def test_on_spider_error_noop_when_queue_none(self, mock_connection_manager, mocker):
+    """R12: _on_spider_error returns early when _queue is None (line 176)."""
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    mock_spider = mock_connection_manager.get_queue_backend()
+    mock_spider.name = "test_spider"
+    mock_spider.crawler = mocker.MagicMock()
+    scheduler.open(mock_spider)
+    scheduler._queue = None
+
+    scheduler._on_spider_error(failure=None, response=None, spider=mock_spider)
+
+  def test_on_spider_error_swallows_queue_error(self, mock_connection_manager, mocker):
+    """R12: a QueueError from nack() is swallowed — signal chain stays intact (179-180)."""
+    from scrapy_extension.exceptions import QueueError
+
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    mock_spider = mock_connection_manager.get_queue_backend()
+    mock_spider.name = "test_spider"
+    mock_spider.crawler = mocker.MagicMock()
+    scheduler.open(mock_spider)
+
+    queue = scheduler._queue
+    assert queue is not None
+    nack_spy = mocker.patch.object(queue, "nack", side_effect=QueueError("nack failed"))
+
+    scheduler._on_spider_error(failure=None, response=None, spider=mock_spider)
+    nack_spy.assert_called_once()
 
   def test_enqueue_request_enqueues_stats(self, mock_connection_manager, mock_spider):
     """Test enqueue_request increments stats on successful enqueue."""

@@ -275,7 +275,7 @@ uv run pytest --cov=src/scrapy_extension --cov-report=term-missing
 uv run poe test
 ```
 
-Test infrastructure includes: pytest-xdist (parallel), hypothesis (property-based), pytest-mock, faker, pytest-cov, mutmut (mutation testing), and more.
+Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage), pytest-ruff (lint), pytest-socket (network isolation), and more.
 
 ## License
 

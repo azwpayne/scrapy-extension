@@ -225,6 +225,86 @@ def test_rabbitmq_backend_ack_idempotent_when_no_pending(mocker):
   backend.ack("test_queue")
   backend.ack("test_queue")
 
+
+def test_rabbitmq_backend_ack_raises_queue_error_on_amqp_error(mocker):
+  """R11: ack() wraps a basic_ack AMQPError as QueueError (lines 483-485).
+
+  Pins the error-wrapping contract — callers catch QueueError, never the
+  raw AMQPError.
+  """
+  from pika.exceptions import AMQPError
+
+  from scrapy_extension.exceptions import QueueError
+
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend._last_delivery_tag = 42
+  mock_channel.basic_ack.side_effect = AMQPError("ack failed")
+
+  with pytest.raises(QueueError, match="Failed to ack RabbitMQ message"):
+    backend.ack("test_queue")
+  # finally still clears the tracked tag even on failure
+  assert backend._last_delivery_tag is None
+
+
+def test_rabbitmq_backend_nack_raises_queue_error_on_amqp_error(mocker):
+  """R11: nack() wraps a basic_nack AMQPError as QueueError (lines 498-500)."""
+  from pika.exceptions import AMQPError
+
+  from scrapy_extension.exceptions import QueueError
+
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend._last_delivery_tag = 99
+  mock_channel.basic_nack.side_effect = AMQPError("nack failed")
+
+  with pytest.raises(QueueError, match="Failed to nack RabbitMQ message"):
+    backend.nack("test_queue")
+  assert backend._last_delivery_tag is None
+
+
+def test_rabbitmq_backend_pop_warns_when_previous_unacked(mocker, caplog):
+  """R18: pop() while a previous message is unacked warns about CONCURRENT_REQUESTS>1.
+
+  Pins the concurrent-pop detection — surfaces the misconfiguration that
+  breaks ack tracking under CONCURRENT_REQUESTS>1.
+  """
+  import logging
+
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  method_frame = mocker.MagicMock(delivery_tag=1)
+  mock_channel.basic_get.return_value = (method_frame, None, b"body")
+
+  caplog.clear()
+  with caplog.at_level(logging.WARNING):
+    backend.pop("test_queue")  # sets _last_delivery_tag
+    backend.pop("test_queue")  # previous still unacked → warning
+
+  assert "pop() called while previous message is unacked" in caplog.text
+  assert "CONCURRENT_REQUESTS>1" in caplog.text
+
   assert mock_channel.basic_ack.call_count == 0
 
 

@@ -825,6 +825,84 @@ class TestRedisBackendQueueOperations:
     assert result == b"payload"
     mock_redis.pipeline.assert_called_with(transaction=True)
 
+  def test_pop_raises_on_unexpected_payload_type(self, redis_settings, mock_redis, mocker):
+    """R5: a non-None/int/str/bytes pop result → QueueError (defensive)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_script = mocker.MagicMock()
+    mock_script.return_value = 3.14  # float — none of the expected Lua return types
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+
+    with pytest.raises(QueueError, match="Unexpected payload type from pop script"):
+      backend.pop("test_queue")
+
+  def test_consume_payload_raises_on_pipeline_redis_error(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """Blocking-pop consume: a RedisError from the pipeline → QueueError."""
+    from redis.exceptions import RedisError
+
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    pipe = mock_redis.pipeline.return_value
+    pipe.execute.side_effect = RedisError("pipe broke")
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+
+    with pytest.raises(QueueError, match="Failed to consume payload"):
+      backend.pop("test_queue", timeout=5.0)
+
+  def test_consume_payload_raises_on_orphan_member(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """R4: a ZSET member with no payload (None) → QueueError (queue corruption)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    pipe = mock_redis.pipeline.return_value
+    pipe.execute.return_value = [None, 1]  # payload missing → orphan member
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+
+    with pytest.raises(QueueError, match="Queue corruption"):
+      backend.pop("test_queue", timeout=5.0)
+
+  def test_consume_payload_normalizes_str_to_bytes(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """Blocking-pop + decode_responses=True: str payload → bytes (R6 normalization)."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    pipe = mock_redis.pipeline.return_value
+    pipe.execute.return_value = ["str_payload", 1]  # str under decode_responses
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+
+    assert backend.pop("test_queue", timeout=5.0) == b"str_payload"
+
+  def test_consume_payload_raises_on_unexpected_type(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """Blocking-pop consume: a non-None/str/bytes payload → QueueError."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    pipe = mock_redis.pipeline.return_value
+    pipe.execute.return_value = [3.14, 1]  # float — unexpected payload type
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+
+    with pytest.raises(QueueError, match="Unexpected payload type from HGET"):
+      backend.pop("test_queue", timeout=5.0)
+
 
 class TestRedisBackendSetOperations:
   """Test RedisBackend set operations with error handling."""

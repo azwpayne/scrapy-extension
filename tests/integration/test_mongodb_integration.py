@@ -34,13 +34,16 @@ import uuid
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-  not os.environ.get("SCRAPY_TEST_MONGODB_URI"),
-  reason=(
-    "Set SCRAPY_TEST_MONGODB_URI (e.g. mongodb://localhost:27017) to run "
-    "MongoDB integration tests against a live instance."
+pytestmark = [
+  pytest.mark.integration,
+  pytest.mark.skipif(
+    not os.environ.get("SCRAPY_TEST_MONGODB_URI"),
+    reason=(
+      "Set SCRAPY_TEST_MONGODB_URI (e.g. mongodb://localhost:27017) to run "
+      "MongoDB integration tests against a live instance."
+    ),
   ),
-)
+]
 
 
 @pytest.fixture(scope="module")

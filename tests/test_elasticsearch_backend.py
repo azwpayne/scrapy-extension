@@ -91,12 +91,18 @@ class TestConnection:
 
     assert backend.is_connected()
 
-  def test_connect_cloud_missing_id(self):
-    from scrapy_extension.exceptions import BackendConnectionError
+  def test_cloud_mode_missing_id_fails_at_construction(self):
+    """R52: CLOUD mode without cloud_id fails at construction (fail-fast).
 
-    backend = ElasticSearchBackend(ElasticSearchSettings(mode=ElasticSearchMode.CLOUD))
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
+    Mirrors the Redis SENTINEL validator (R8). Previously this surfaced as a
+    BackendConnectionError at connect() time; now it's a pydantic
+    ValidationError at ElasticSearchSettings construction — closer to the
+    misconfiguration.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="cloud_id"):
+      ElasticSearchSettings(mode=ElasticSearchMode.CLOUD)
 
   def test_disconnect(self, mocker):
     mock_client = mocker.MagicMock(
@@ -198,6 +204,36 @@ class TestQueue:
 
     assert b.pop("q") == b"won"
     assert b._client.search.call_count == 2
+
+  def test_pop_returns_none_when_all_attempts_lose_race(self, mocker):
+    """R10: if all 3 optimistic-lock attempts lose the race (every delete
+    conflicts), pop returns None — caller treats it as empty and polls again.
+
+    Exactly-one-winner semantics without a distributed lock. This is the
+    exhaustion tail of ``test_pop_retries_on_conflict`` (line 238): when no
+    attempt wins within ``max_attempts``, the queue is treated as drained.
+    """
+    from elasticsearch import ConflictError
+
+    b = _mock_backend(mocker)
+    # Every search finds a doc; every delete loses the race (conflict).
+    b._client.search.return_value = {
+      "hits": {
+        "hits": [
+          {
+            "_id": "1",
+            "_seq_no": 10,
+            "_primary_term": 1,
+            "_source": {"item": "bG9zdA=="},
+          }
+        ]
+      }
+    }
+    b._client.delete.side_effect = ConflictError("conflict", 409, body={})
+
+    assert b.pop("q") is None
+    # All 3 attempts tried (max_attempts); each searched then lost the race.
+    assert b._client.search.call_count == 3
 
   def test_pop_empty(self, mocker):
     b = _mock_backend(mocker)
