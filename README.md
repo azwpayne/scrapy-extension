@@ -203,7 +203,7 @@ All components follow Scrapy's `from_settings()` / `from_crawler()` factory patt
 SCHEDULER = "scrapy_extension.schedule.scheduler.BackendScheduler"
 ```
 
-Integrates `BackendQueue` for request distribution and `BackendDupeFilter` for deduplication (when the backend supports sets).
+Integrates `BackendQueue` for request distribution and `BackendDupeFilter` for deduplication (when the backend supports sets). For Kafka/RabbitMQ, ack/nack is tied to Scrapy's `response_received` signal only; it does not wait for callback or item pipeline completion.
 
 ### DupeFilter
 

@@ -351,6 +351,30 @@ class TestBuildBackendSettings:
     result = spider._build_backend_settings()
     assert "url" not in result
 
+  def test_rabbitmq_does_not_fall_through_to_elasticsearch(self):
+    """R43: rabbitmq branch must not fall through to elasticsearch.
+
+    Previously the branch was ``elif backend_value == "rabbitmq" and
+    self.rabbitmq_url is not None:`` — the only branch that combined the
+    backend guard with a field check. With ``backend_type=RABBITMQ`` and
+    ``rabbitmq_url`` unset, the elif was False and control fell into the
+    elasticsearch branch, merging ES shortcut attrs into a rabbitmq
+    backend. Now branches on backend_type alone, like the other 5 backends.
+    """
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.RABBITMQ
+      # Cross-contamination: ES attrs set on a rabbitmq spider
+      elasticsearch_hosts = ["http://es:9200"]
+      elasticsearch_cloud_id = "dep:dXMtY2VudHJhbA=="
+      elasticsearch_api_key = "encoded-key"
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    # RabbitMQ selected -> no ES keys leaked in, no url either
+    assert result == {}
+
   def test_explicit_backend_settings_merged_first(self):
     """Test that explicit backend_settings are merged first."""
 
@@ -378,11 +402,30 @@ class TestBuildBackendSettings:
     assert result["host"] == "shortcut_host"
     assert result["port"] == 9999
 
-  def test_elasticsearch_shortcuts_not_in_class(self):
-    """Test that ElasticSearch backend type has no shortcut attributes in mixin."""
-    # Note: The mixin does not define elasticsearch_* shortcuts,
-    # but ElasticSearch backend type is supported. Only explicit
-    # backend_settings would be used.
+  def test_elasticsearch_shortcuts(self):
+    """R24-A1: ElasticSearch backend type now has shortcut attributes.
+
+  Previously the mixin defined shortcuts only for Redis/MongoDB/Kafka/
+  RabbitMQ — ES users had to use backend_settings explicitly. R24-A1
+  added elasticsearch_hosts / elasticsearch_cloud_id / elasticsearch_api_key
+  for symmetry.
+  """
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ELASTICSEARCH
+      elasticsearch_hosts = ["http://es:9200"]
+      elasticsearch_cloud_id = "my-deployment:dXMtY2VudHJhbA=="
+      elasticsearch_api_key = "encoded-key"
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result["hosts"] == ["http://es:9200"]
+    assert result["cloud_id"] == "my-deployment:dXMtY2VudHJhbA=="
+    assert result["api_key"] == "encoded-key"
+
+  def test_elasticsearch_explicit_settings_still_work(self):
+    """Explicit backend_settings remain a valid path for ES configuration."""
 
     class TestSpider(BackendSpiderMixin, Spider):
       name = "test_spider"
@@ -392,6 +435,25 @@ class TestBuildBackendSettings:
     spider = TestSpider()
     result = spider._build_backend_settings()
     assert result["hosts"] == ["http://localhost:9200"]
+
+  def test_rocketmq_shortcuts(self):
+    """R24-A1: RocketMQ backend now has shortcut attributes.
+
+  Mirrors the existing Redis/MongoDB/Kafka/RabbitMQ shortcut pattern.
+  """
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ROCKETMQ
+      rocketmq_namesrv_address = "rmq:9876"
+      rocketmq_access_key = "AK"
+      rocketmq_secret_key = "SK"
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result["namesrv_address"] == "rmq:9876"
+    assert result["access_key"] == "AK"
+    assert result["secret_key"] == "SK"
 
 
 class TestConnectSignals:

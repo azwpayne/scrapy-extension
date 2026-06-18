@@ -134,11 +134,70 @@ class TestQueue:
   def test_pop_with_items(self, mocker):
     b = _mock_backend(mocker)
     b._client.search.return_value = {
-      "hits": {"hits": [{"_id": "1", "_source": {"item": "aXRlbQ=="}}]}
+      "hits": {
+        "hits": [
+          {
+            "_id": "1",
+            "_seq_no": 42,
+            "_primary_term": 1,
+            "_source": {"item": "aXRlbQ=="},
+          }
+        ]
+      }
     }
 
     assert b.pop("q") == b"item"
-    b._client.delete.assert_called_once_with(index="scrapy_queue", id="1")
+    b._client.delete.assert_called_once_with(
+      index="scrapy_queue",
+      id="1",
+      if_seq_no=42,
+      if_primary_term=1,
+    )
+
+  def test_pop_retries_on_conflict(self, mocker):
+    """R1-P1-13: pop must retry the search-delete cycle on ConflictError.
+
+    Concurrent workers may claim the same doc; optimistic locking via
+    if_seq_no/if_primary_term makes the loser's delete fail with HTTP 409.
+    The backend should retry to find the next available item.
+    """
+    from elasticsearch import ConflictError
+
+    b = _mock_backend(mocker)
+    # First search returns a doc that loses the race; second returns a winner.
+    b._client.search.side_effect = [
+      {
+        "hits": {
+          "hits": [
+            {
+              "_id": "1",
+              "_seq_no": 10,
+              "_primary_term": 1,
+              "_source": {"item": "bG9zdA=="},
+            }
+          ]
+        }
+      },
+      {
+        "hits": {
+          "hits": [
+            {
+              "_id": "2",
+              "_seq_no": 20,
+              "_primary_term": 1,
+              "_source": {"item": "d29u"},
+            }
+          ]
+        }
+      },
+    ]
+    b._client.delete.side_effect = [
+      ConflictError("conflict", 409, body={}),
+      None,
+    ]
+
+    assert b.pop("q") == b"won"
+    assert b._client.search.call_count == 2
 
   def test_pop_empty(self, mocker):
     b = _mock_backend(mocker)
@@ -253,9 +312,15 @@ class TestStorage:
     assert 3500 < b.ttl("k") <= 3600
 
   def test_ttl_not_found(self, mocker):
+    """R48: a missing key returns None, not -1 (distinguish absent from expired).
+
+    Pre-R48 this asserted ``== -1``, codifying the same absent/expired
+    conflation that R5 fixed on Redis and MongoDB. ElasticSearch was missed
+    in that sweep.
+    """
     b = _mock_backend(mocker)
     b._client.get.side_effect = _make_not_found_error()
-    assert b.ttl("k") == -1
+    assert b.ttl("k") is None
 
   def test_clear_storage(self, mocker):
     b = _mock_backend(mocker)
@@ -323,6 +388,35 @@ class TestSet:
     b = _mock_backend(mocker)
     b.clear_set("s")
     b._client.delete_by_query.assert_called_once()
+
+  def test_add_duplicate_via_conflict_error(self, mocker):
+    """R31-A1: modern ES client raises ConflictError on op_type=create + existing doc.
+
+    The RequestError-with-string-match path is defensive legacy support.
+    ConflictError is the canonical 8.x signal for HTTP 409 version conflict.
+    """
+    from elasticsearch import ConflictError
+
+    b = _mock_backend(mocker)
+    b._client.index.side_effect = ConflictError(
+      "version conflict", mocker.MagicMock(), "body"
+    )
+    assert b.add("s", b"item") is False
+
+  def test_add_transport_error_propagates(self, mocker):
+    """R31-A1: TransportError (network/auth) must propagate, NOT return False.
+
+    Previously the broad ``except TransportError: return False`` conflated
+    any transport failure with "already existed" — the dupefilter's
+    ``return not added`` then treated every backend error as a duplicate,
+    silently dropping new requests during network blips / cluster red.
+    """
+    from elasticsearch import TransportError
+
+    b = _mock_backend(mocker)
+    b._client.index.side_effect = TransportError("connection refused")
+    with pytest.raises(TransportError):
+      b.add("s", b"item")
 
 
 class TestPing:

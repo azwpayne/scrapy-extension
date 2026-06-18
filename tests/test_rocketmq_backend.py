@@ -1,6 +1,6 @@
 """Tests for RocketMQ backend implementation."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,7 +12,6 @@ from scrapy_extension.exceptions import (
     QueueError,
 )
 from scrapy_extension.settings import RocketMQMode, RocketMQSettings
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -641,6 +640,68 @@ def test_pop_unexpected_error(mocker):
     assert "Failed to pop from queue" in str(exc_info.value)
 
 
+def test_pop_subscribes_to_topic_before_receive(mocker):
+    """Pop must subscribe the consumer to the queue's topic before receiving.
+
+    Regression for R1-P1-12: pre-fix, pop computed topic_name but never used
+    it. The consumer received from nothing (or whatever default subscription
+    existed), so messages pushed to the topic were never delivered.
+    """
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+
+    mock_msg = mocker.MagicMock()
+    mock_msg.body = b"data"
+    mock_consumer.receive.return_value = [mock_msg]
+
+    backend.pop("my_queue")
+
+    mock_consumer.subscribe.assert_called_once_with("scrapy-queue_my_queue")
+
+
+def test_pop_subscribes_only_once_per_topic(mocker):
+    """Repeated pop calls for the same queue subscribe exactly once."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+
+    mock_consumer.receive.return_value = []
+
+    backend.pop("my_queue")
+    backend.pop("my_queue")
+    backend.pop("my_queue")
+
+    assert mock_consumer.subscribe.call_count == 1
+
+
+def test_pop_subscribes_distinct_topics_for_distinct_queues(mocker):
+    """Different queue names subscribe to different topics."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+
+    mock_consumer.receive.return_value = []
+
+    backend.pop("queue_a")
+    backend.pop("queue_b")
+
+    subscribed = {call.args[0] for call in mock_consumer.subscribe.call_args_list}
+    assert subscribed == {"scrapy-queue_queue_a", "scrapy-queue_queue_b"}
+
+
+def test_connect_starts_consumer(mocker):
+    """connect() must call consumer.start() — without it receive() fails."""
+    _, _, mock_consumer, _ = _make_connected_backend(mocker)
+    mock_consumer.start.assert_called_once()
+
+
+def test_disconnect_clears_subscribed_topics(mocker):
+    """disconnect() clears the subscription cache so reconnect re-subscribes."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+
+    mock_consumer.receive.return_value = []
+    backend.pop("my_queue")
+    assert "scrapy-queue_my_queue" in backend._subscribed_topics
+
+    backend.disconnect()
+    assert len(backend._subscribed_topics) == 0
+
+
 # ---------------------------------------------------------------------------
 # queue_len
 # ---------------------------------------------------------------------------
@@ -804,94 +865,38 @@ def test_get_storage_topic_name(mocker):
 # ---------------------------------------------------------------------------
 
 
-def test_store_not_connected():
-    """Test store raises QueueError when not connected."""
+def test_store_not_connected_raises_not_implemented():
+    """Test store raises NotImplementedError when not connected."""
     config = RocketMQSettings()
     backend = RocketMQBackend(config)
 
-    with pytest.raises(QueueError) as exc_info:
+    with pytest.raises(NotImplementedError) as exc_info:
         backend.store("key1", b"data")
-    assert "Not connected" in str(exc_info.value)
+    assert "does not support store" in str(exc_info.value)
 
 
-def test_store_success(mocker):
-    """Test successful store sends message via producer."""
+def test_store_connected_raises_not_implemented(mocker):
+    """Test store raises NotImplementedError when connected."""
     backend, mock_producer, _, mock_message_cls = _make_connected_backend(mocker)
 
-    mock_msg = mocker.MagicMock()
-    mock_message_cls.return_value = mock_msg
+    with pytest.raises(NotImplementedError) as exc_info:
+        backend.store("my_key", b"my_data")
 
-    backend.store("my_key", b"my_data")
-
-    mock_message_cls.assert_called_once_with(backend.config.storage_topic_prefix)
-    mock_msg.set_keys.assert_called_once_with("my_key")
-    mock_msg.set_body.assert_called_once_with(b"my_data")
-    mock_msg.set_delay_time_level.assert_not_called()
-    mock_producer.send.assert_called_once_with(mock_msg)
+    assert "does not support store" in str(exc_info.value)
+    mock_message_cls.assert_not_called()
+    mock_producer.send.assert_not_called()
 
 
-def test_store_with_ttl(mocker):
-    """Test store with TTL sets delay time level."""
+def test_store_with_ttl_connected_raises_not_implemented(mocker):
+    """Test store with TTL still raises NotImplementedError."""
     backend, mock_producer, _, mock_message_cls = _make_connected_backend(mocker)
 
-    mock_msg = mocker.MagicMock()
-    mock_message_cls.return_value = mock_msg
+    with pytest.raises(NotImplementedError) as exc_info:
+        backend.store("my_key", b"my_data", ttl=7200)
 
-    backend.store("my_key", b"my_data", ttl=7200)
-
-    mock_msg.set_delay_time_level.assert_called_once_with(2)  # 7200 // 3600 = 2
-
-
-def test_store_with_ttl_max_clamp(mocker):
-    """Test store with very large TTL is clamped to max 18."""
-    backend, _, _, mock_message_cls = _make_connected_backend(mocker)
-
-    mock_msg = mocker.MagicMock()
-    mock_message_cls.return_value = mock_msg
-
-    backend.store("my_key", b"my_data", ttl=100000)
-
-    # max(1, min(100000 // 3600, 18)) = max(1, min(27, 18)) = 18
-    mock_msg.set_delay_time_level.assert_called_once_with(18)
-
-
-def test_store_with_ttl_min_clamp(mocker):
-    """Test store with TTL < 3600 is clamped to min 1."""
-    backend, _, _, mock_message_cls = _make_connected_backend(mocker)
-
-    mock_msg = mocker.MagicMock()
-    mock_message_cls.return_value = mock_msg
-
-    backend.store("my_key", b"my_data", ttl=100)
-
-    # max(1, min(100 // 3600, 18)) = max(1, min(0, 18)) = max(1, 0) = 1
-    mock_msg.set_delay_time_level.assert_called_once_with(1)
-
-
-def test_store_oserror(mocker):
-    """Test store raises QueueError on OSError."""
-    backend, mock_producer, _, mock_message_cls = _make_connected_backend(mocker)
-
-    mock_msg = mocker.MagicMock()
-    mock_message_cls.return_value = mock_msg
-    mock_producer.send.side_effect = OSError("Network error")
-
-    with pytest.raises(QueueError) as exc_info:
-        backend.store("key1", b"data")
-    assert "Failed to store data" in str(exc_info.value)
-
-
-def test_store_unexpected_error(mocker):
-    """Test store raises QueueError on unexpected exception."""
-    backend, mock_producer, _, mock_message_cls = _make_connected_backend(mocker)
-
-    mock_msg = mocker.MagicMock()
-    mock_message_cls.return_value = mock_msg
-    mock_producer.send.side_effect = RuntimeError("unexpected")
-
-    with pytest.raises(QueueError) as exc_info:
-        backend.store("key1", b"data")
-    assert "Failed to store data" in str(exc_info.value)
+    assert "does not support store" in str(exc_info.value)
+    mock_message_cls.assert_not_called()
+    mock_producer.send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1010,8 +1015,8 @@ def test_rocketmq_settings_custom_values():
     )
     assert settings.mode == RocketMQMode.CLUSTER
     assert settings.namesrv_address == "rocketmq-cluster:9876"
-    assert settings.access_key == "mykey"
-    assert settings.secret_key == "mysecret"  # noqa: S105
+    assert settings.access_key.get_secret_value() == "mykey"
+    assert settings.secret_key.get_secret_value() == "mysecret"
 
 
 def test_rocketmq_mode_enum_values():

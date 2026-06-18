@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 try:
     from pymongo import ASCENDING, MongoClient
@@ -24,15 +24,20 @@ except ImportError as e:
     ) from e
 
 from scrapy_extension.backends.base import (
-  Backend,
-  BackendType,
-  QueueBackend,
-  SetBackend,
-  StorageBackend,
-  _hash_item,
-  _validate_key_name,
+    Backend,
+    BackendType,
+    QueueBackend,
+    SetBackend,
+    StorageBackend,
+    _hash_item,
+    _validate_key_name,
+    secret_value,
 )
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError, QueueError
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
+)
 from scrapy_extension.settings import MongoDBMode
 
 if TYPE_CHECKING:
@@ -61,7 +66,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   """
 
   # Read preference mapping - defined as class constant to avoid recreating
-  _READ_PREF_MAP: dict[str, str] = {
+  _READ_PREF_MAP: ClassVar[dict[str, str]] = {
     "primary": "primary",
     "secondary": "secondary",
     "nearest": "nearest",
@@ -177,7 +182,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # Add authentication
     if self.config.username and self.config.password:
       kwargs["username"] = self.config.username
-      kwargs["password"] = self.config.password
+      kwargs["password"] = secret_value(self.config.password)
       if self.config.auth_source:
         kwargs["authSource"] = self.config.auth_source
       if self.config.auth_mechanism:
@@ -405,7 +410,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to push to queue {queue_name}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="push") from e
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:  # noqa: ARG002
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
     Args:
@@ -632,13 +637,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
 
     Returns:
-        Seconds remaining, None if no TTL, -1 if expired.
+        Seconds remaining, None if no TTL or key doesn't exist,
+        -1 if expired (rare since MongoDB TTL index auto-deletes).
     """
     self._assert_connected()
     assert self._storage_collection is not None
     result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
     if result is None:
-      return -1
+      return None
     if "expireAt" not in result:
       return None
 
@@ -656,8 +662,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self._assert_connected()
     assert self._storage_collection is not None
     if prefix:
-      # Limit prefix length to prevent regex DoS attacks (ReDoS)
-      prefix = prefix[:128]
       pattern = re.escape(prefix)
       self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
     else:

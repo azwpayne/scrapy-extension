@@ -6,7 +6,7 @@ This module provides a Scrapy dupefilter component using backend set interfaces.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from scrapy_extension.utils.request import request_fingerprint
 
@@ -17,6 +17,17 @@ if TYPE_CHECKING:
   from scrapy.settings import Settings
 
   from scrapy_extension.backends.connectors import ConnectionManager
+
+  class _Fingerprinter(Protocol):
+    """Duck type for Scrapy's request fingerprinter.
+
+    Mirrors ``scrapy.http.request.RequestFingerprinter`` (and any custom
+    ``REQUEST_FINGERPRINTER_CLASS``) — the ``fingerprint(request) -> bytes``
+    contract. Used so ``BackendDupeFilter`` can honor a configured custom
+    fingerprinter instead of always defaulting to the module function.
+    """
+
+    def fingerprint(self, request: Request) -> bytes: ...
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +50,7 @@ class BackendDupeFilter:
     key: str = "dupefilter",
     *,
     debug: bool = False,
+    fingerprinter: _Fingerprinter | None = None,
   ) -> None:
     """Initialize the dupefilter.
 
@@ -46,10 +58,18 @@ class BackendDupeFilter:
         connection_manager: Connection manager for backend access.
         key: Key for the fingerprints set.
         debug: Whether to log filtered requests.
+        fingerprinter: Optional Scrapy request fingerprinter. When provided
+            (normally threaded from ``crawler.request_fingerprinter`` via
+            ``from_crawler``), fingerprints respect a configured
+            ``REQUEST_FINGERPRINTER_CLASS``. When ``None``, falls back to
+            ``scrapy.utils.request.fingerprint`` — which is byte-identical to
+            the default fingerprinter, so omitting this is fully backward-
+            compatible (verified R45).
     """
     self.connection_manager = connection_manager
     self.key = key
     self.debug = debug
+    self._fingerprinter = fingerprinter
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendDupeFilter:
@@ -79,23 +99,30 @@ class BackendDupeFilter:
   def from_crawler(cls, crawler: Crawler) -> BackendDupeFilter:
     """Create dupefilter from crawler.
 
+    Threads ``crawler.request_fingerprinter`` so the dupefilter honors a
+    configured ``REQUEST_FINGERPRINTER_CLASS`` (otherwise fingerprints are
+    byte-identical to the default — see ``__init__``).
+
     Args:
         crawler: The Scrapy crawler instance.
 
     Returns:
         A new BackendDupeFilter instance.
     """
-    return cls.from_settings(crawler.settings)
+    dupefilter = cls.from_settings(crawler.settings)
+    dupefilter._fingerprinter = getattr(crawler, "request_fingerprinter", None)
+    return dupefilter
 
   def open(self) -> None:
     """Open the dupefilter (no-op for backend-based)."""
 
   def close(self, reason: str) -> None:
-    """Close the dupefilter (no-op for backend-based).
+    """Close the dupefilter.
 
     Args:
         reason: The reason for closing.
     """
+    self.connection_manager.close()
 
   def log(self, request: Request, spider: Spider) -> None:
     """Log a filtered request.
@@ -124,9 +151,11 @@ class BackendDupeFilter:
 
     try:
       set_backend = self.connection_manager.get_set_backend()
-    except NotImplementedError:
-      logger.debug("Backend does not support set operations; skipping dedup")
-      return False
+    except NotImplementedError as exc:
+      raise RuntimeError(
+        "Configured backend does not support set/duplicate filtering; "
+        "use a backend with SetBackend or disable BackendDupeFilter."
+      ) from exc
 
     # Use atomic add — return True (duplicate) if item already existed
     added = set_backend.add(self.key, fingerprint.encode())
@@ -135,10 +164,19 @@ class BackendDupeFilter:
   def request_fingerprint(self, request: Request) -> str:
     """Generate a fingerprint for a request.
 
+    Uses the configured Scrapy fingerprinter (``crawler.request_fingerprinter``)
+    when one was provided via ``from_crawler``; otherwise falls back to
+    ``scrapy.utils.request.fingerprint``. The two are byte-identical for the
+    default fingerprinter (verified R45), so this only diverges when the
+    operator has set a custom ``REQUEST_FINGERPRINTER_CLASS`` — exactly the
+    case that should diverge.
+
     Args:
         request: The request to fingerprint.
 
     Returns:
-        A unique fingerprint string.
+        A unique fingerprint string (hex).
     """
+    if self._fingerprinter is not None:
+      return self._fingerprinter.fingerprint(request).hex()
     return request_fingerprint(request)

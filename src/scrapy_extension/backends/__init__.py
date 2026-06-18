@@ -7,6 +7,8 @@ Concrete backend classes are lazily loaded via PEP 562 __getattr__ to avoid
 importing optional dependencies at module level.
 """
 
+import importlib
+
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -31,10 +33,8 @@ _BACKEND_MODULES = {
 }
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> object:
     if name in _BACKEND_MODULES:
-        import importlib
-
         module_path, attr_name = _BACKEND_MODULES[name]
         try:
             module = importlib.import_module(module_path)
@@ -52,7 +52,10 @@ __all__ = [
     "Backend",
     "BackendType",
     "ConnectionManager",
+    "ElasticSearchBackend",
     "JSONSerializer",
+    "KafkaBackend",
+    "MongoDBBackend",
     "QueueBackend",
     "RabbitMQBackend",
     "RedisBackend",

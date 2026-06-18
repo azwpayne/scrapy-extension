@@ -51,6 +51,7 @@ class BackendPipeline:
     self.connection_manager = connection_manager
     self.key_prefix = key_prefix
     self.ttl = ttl
+    self._storage_supported: bool | None = None
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -96,9 +97,23 @@ class BackendPipeline:
   def open_spider(self, spider: Spider) -> None:
     """Called when a spider opens.
 
+    Detects whether the configured backend supports storage. If not
+    (Kafka, RabbitMQ, RocketMQ), the pipeline degrades to a no-op and
+    logs a warning so the operator knows items aren't being persisted.
+
     Args:
         spider: The spider instance.
     """
+    try:
+      self.connection_manager.get_storage_backend()
+      self._storage_supported = True
+    except NotImplementedError:
+      self._storage_supported = False
+      logger.warning(
+        "Backend %s does not support storage. "
+        "Pipeline will be a no-op — items will not be persisted.",
+        self.connection_manager.backend_type.value,
+      )
     logger.info("Pipeline opened for spider %s", spider.name)
 
   def close_spider(self, spider: Spider) -> None:
@@ -108,22 +123,61 @@ class BackendPipeline:
         spider: The spider instance.
     """
     logger.info("Pipeline closed for spider %s", spider.name)
+    self.connection_manager.close()
 
   def process_item(self, item: Item, spider: Spider) -> Item:
     """Process and store an item.
+
+    Best-effort: catches storage errors so a temporary backend failure
+    doesn't kill the spider. The item is returned unchanged either way
+    so downstream pipelines continue. Storage errors are logged and
+    counted in spider stats.
 
     Args:
         item: The item to process.
         spider: The spider instance.
 
     Returns:
-        The processed item.
+        The processed item (always).
     """
+    if self._storage_supported is False:
+      self._inc_stat(spider, "pipeline/storage_skipped")
+      return item
+
     key = self._generate_item_key(spider)
     data = self._serialize_item(item)
-    self._store_item(key, data)
+    try:
+      self._store_item(key, data)
+    except Exception as e:
+      logger.warning(
+        "Failed to store item %s: %s. Item will not be persisted.",
+        key,
+        e,
+      )
+      self._inc_stat(spider, "pipeline/storage_errors")
+      return item
     logger.debug("Stored item: %s", key)
     return item
+
+  @staticmethod
+  def _inc_stat(spider: Spider, stat_name: str) -> None:
+    """Increment a Scrapy stat, tolerating missing crawler/stats.
+
+    Defensively chains ``spider.crawler.stats`` via ``getattr`` because
+    legacy spider classes (or test doubles) may not expose ``crawler``.
+    Silent skip when the chain is broken — the spider continues either
+    way; a missing counter is preferable to crashing the pipeline.
+
+    Args:
+        spider: The spider instance (must have ``crawler.stats`` for the
+            stat to be recorded).
+        stat_name: The Scrapy stats key to increment.
+    """
+    crawler = getattr(spider, "crawler", None)
+    stats = getattr(crawler, "stats", None) if crawler is not None else None
+    if stats is not None:
+      stats.inc_value(stat_name)
+
 
   def _generate_item_key(self, spider: Spider) -> str:
     """Generate a unique key for the item.

@@ -2,6 +2,7 @@
 
 import pytest
 from pydantic import ValidationError
+
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.settings import RedisSettings, Settings
 
@@ -77,7 +78,7 @@ class TestRedisSettings:
     assert settings.password is None
 
     settings = RedisSettings(password="secret")
-    assert settings.password == "secret"  # noqa: S105
+    assert settings.password.get_secret_value() == "secret"
 
   def test_from_env_vars(self, monkeypatch):
     """Test loading from environment variables."""
@@ -148,5 +149,67 @@ def test_rabbitmq_settings_defaults():
   assert settings.host == "localhost"
   assert settings.port == 5672
   assert settings.username == "guest"
-  assert settings.password == "guest"  # noqa: S105
+  assert settings.password.get_secret_value() == "guest"
   assert settings.max_priority == 255
+
+
+class TestConfigurationErrorRedaction:
+  """R2-B6 / R26-C1: ConfigurationError must not retain secrets.
+
+  Defensive design — current backend code only passes non-sensitive
+  ``setting_value`` (mode, sentinels, defaults), but future contributors
+  may pass credentials. The redaction at ``__init__`` time ensures the
+  raw value never lives on the exception object, so ``repr(exc)`` and
+  debug-logging the exception cannot leak.
+  """
+
+  def test_secretstr_setting_value_is_redacted(self):
+    """A SecretStr value is masked regardless of setting_name."""
+    from pydantic import SecretStr
+
+    from scrapy_extension.exceptions import ConfigurationError
+
+    exc = ConfigurationError(
+      "invalid",
+      setting_name="uri",
+      setting_value=SecretStr("hunter2"),
+    )
+    assert exc.setting_value == "***REDACTED***"
+    assert "hunter2" not in repr(exc)
+
+  def test_sensitive_setting_name_redacts_any_value(self):
+    """Names containing 'password', 'secret', 'api_key', 'token' trigger redaction."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    for sensitive_name in (
+      "password",
+      "rabbitmq_password",
+      "API_KEY",
+      "auth_token",
+      "confluent_api_secret",
+    ):
+      exc = ConfigurationError(
+        "invalid", setting_name=sensitive_name, setting_value="plain-string-secret"
+      )
+      assert exc.setting_value == "***REDACTED***", sensitive_name
+
+  def test_non_sensitive_value_is_preserved(self):
+    """Non-sensitive names + non-secret values pass through unchanged (for debugging)."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    exc = ConfigurationError(
+      "invalid mode",
+      setting_name="mode",
+      setting_value="INVALID_MODE",
+    )
+    assert exc.setting_value == "INVALID_MODE"
+
+  def test_no_setting_passed_preserves_none(self):
+    """Default (no name/value) leaves setting_value as None."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    exc = ConfigurationError("just a message")
+    assert exc.setting_name is None
+    assert exc.setting_value is None
+
+

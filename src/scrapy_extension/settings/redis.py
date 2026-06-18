@@ -4,9 +4,11 @@
 # @blog    : https://paynewu.com/
 # @mail    : paynewu0719@gmail.com
 # @desc    :
+from __future__ import annotations
+
 from enum import Enum
 
-from pydantic import Field
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -87,7 +89,7 @@ class RedisSettings(BaseSettings):
   )
 
   # === Authentication ===
-  password: str | None = Field(
+  password: SecretStr | None = Field(
     default=None,
     description="Redis authentication password",
   )
@@ -140,7 +142,7 @@ class RedisSettings(BaseSettings):
     default="mymaster",
     description="Master name configured in sentinel",
   )
-  sentinel_password: str | None = Field(
+  sentinel_password: SecretStr | None = Field(
     default=None,
     description="Password for sentinel authentication (if different from redis)",
   )
@@ -194,3 +196,30 @@ class RedisSettings(BaseSettings):
     default=False,
     description="Verify hostname matches certificate",
   )
+
+  @model_validator(mode="after")
+  def validate_mode_requirements(self) -> RedisSettings:
+    """Validate that mode-specific settings are present for the chosen mode.
+
+    Sentinel mode requires ``sentinels`` and ``sentinel_master_name``.
+    Cluster mode benefits from ``cluster_startup_nodes`` but falls back
+    to ``host:port`` if not set (warning only).
+
+    Raises:
+        ValueError: If a mode-specific required field is missing.
+    """
+    if self.mode == RedisMode.SENTINEL:
+      missing = []
+      if not self.sentinels:
+        missing.append("sentinels")
+      if not self.sentinel_master_name:
+        missing.append("sentinel_master_name")
+      if missing:
+        fields = " and ".join(missing)
+        msg = (
+          f"Redis SENTINEL mode requires '{fields}' to be set. "
+          f"Got sentinels={self.sentinels!r}, "
+          f"sentinel_master_name={self.sentinel_master_name!r}."
+        )
+        raise ValueError(msg)
+    return self

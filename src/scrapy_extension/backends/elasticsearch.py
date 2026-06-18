@@ -5,23 +5,30 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 try:
-    from elasticsearch import Elasticsearch, NotFoundError, RequestError, TransportError
+    from elasticsearch import (
+        ConflictError,
+        Elasticsearch,
+        NotFoundError,
+        RequestError,
+        TransportError,
+    )
 except ImportError as e:
     raise ImportError(
         "ElasticSearch backend requires 'elasticsearch'. Install with: pip install scrapy-extension[elasticsearch]"
     ) from e
 
 from scrapy_extension.backends.base import (
-  Backend,
-  BackendType,
-  QueueBackend,
-  SetBackend,
-  StorageBackend,
+    Backend,
+    BackendType,
+    QueueBackend,
+    SetBackend,
+    StorageBackend,
+    _validate_key_name,
+    secret_value,
 )
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
@@ -30,26 +37,6 @@ if TYPE_CHECKING:
   from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 logger = logging.getLogger(__name__)
-
-# Key name validation pattern
-_KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
-
-
-def _validate_key_name(name: str, field_name: str = "name") -> None:
-    """Validate key/queue/index name to prevent injection.
-
-    Args:
-        name: The name to validate.
-        field_name: Field name for error messages.
-
-    Raises:
-        ValueError: If name contains invalid characters.
-    """
-    if not name or not _KEY_NAME_PATTERN.match(name):
-        raise ValueError(
-            f"Invalid {field_name}: {name!r}. "
-            f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
-        )
 
 
 def _b64encode(data: bytes) -> str:
@@ -84,9 +71,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "retry_on_timeout": self.config.retry_on_timeout,
     }
     if self.config.api_key:
-      kwargs["api_key"] = self.config.api_key
+      kwargs["api_key"] = secret_value(self.config.api_key)
     elif self.config.username and self.config.password:
-      kwargs["basic_auth"] = (self.config.username, self.config.password)
+      kwargs["basic_auth"] = (self.config.username, secret_value(self.config.password))
     return kwargs
 
   def connect(self) -> None:
@@ -197,39 +184,58 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except TransportError as e:
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:  # noqa: ARG002
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
+
+    Atomic via optimistic locking: the search returns ``_seq_no`` and
+    ``_primary_term`` for each hit, and the delete passes them as
+    ``if_seq_no`` / ``if_primary_term``. If another worker deleted or
+    modified the doc between search and delete, ES raises
+    ``ConflictError`` (HTTP 409) and we retry the search to find the
+    next available item.
 
     Args:
         queue_name: Name of the queue.
         timeout: Seconds to wait (unused for ElasticSearch, blocking not supported).
 
     Returns:
-        The popped item, or None if queue is empty.
+        The popped item, or None if queue is empty (or all attempts lost
+        the race to concurrent consumers).
 
     Raises:
-        QueueError: If the pop operation fails.
+        QueueError: If the pop operation fails (non-conflict transport error).
         ValueError: If queue_name contains invalid characters.
     """
     _validate_key_name(queue_name, "queue_name")
-    try:
-      resp = self.client.search(
-        index=self.config.queue_index,
-        query={"term": {"queue_name": queue_name}},
-        sort=[{"priority": "asc"}, {"created_at": "asc"}],
-        size=1,
-      )
-      hits = resp.get("hits", {}).get("hits", [])
-      if not hits:
+    max_attempts = 3
+    for _attempt in range(max_attempts):
+      try:
+        resp = self.client.search(
+          index=self.config.queue_index,
+          query={"term": {"queue_name": queue_name}},
+          sort=[{"priority": "asc"}, {"created_at": "asc"}],
+          size=1,
+        )
+        hits = resp.get("hits", {}).get("hits", [])
+        if not hits:
+          return None
+        doc = hits[0]
+        try:
+          self.client.delete(
+            index=self.config.queue_index,
+            id=doc["_id"],
+            if_seq_no=doc["_seq_no"],
+            if_primary_term=doc["_primary_term"],
+          )
+        except ConflictError:
+          # Lost the race to another worker — retry to find the next item.
+          continue
+        return _b64decode(doc["_source"]["item"])
+      except NotFoundError:
         return None
-      doc = hits[0]
-      self.client.delete(index=self.config.queue_index, id=doc["_id"])
-    except NotFoundError:
-      return None
-    except TransportError as e:
-      raise QueueError(str(e), queue_name=queue_name, operation="pop") from e
-    else:
-      return _b64decode(doc["_source"]["item"])
+      except TransportError as e:
+        raise QueueError(str(e), queue_name=queue_name, operation="pop") from e
+    return None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -297,14 +303,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self.client.index(
         index=self.config.set_index, id=doc_id, document=doc, op_type="create"
       )
+    except ConflictError:
+      return False
     except RequestError as e:
       if "version_conflict" in str(e).lower():
         return False
       raise
-    except TransportError:
-      return False
-    else:
-      return True
+    return True
 
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.
@@ -328,13 +333,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         True if item exists in the set.
     """
-    try:
-      response = self.client.exists(
-        index=self.config.set_index, id=self._set_doc_id(set_name, item)
-      )
-      return bool(response)
-    except TransportError:
-      return False
+    response = self.client.exists(
+      index=self.config.set_index, id=self._set_doc_id(set_name, item)
+    )
+    return bool(response)
 
   def set_len(self, set_name: str) -> int:
     """Get set size.
@@ -389,10 +391,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return None
-    except TransportError:
-      return None
-    else:
-      return _b64decode(resp["_source"]["data"])
+    return _b64decode(resp["_source"]["data"])
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -422,11 +421,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If key contains invalid characters.
     """
     _validate_key_name(key, "key")
-    try:
-      response = self.client.exists(index=self.config.storage_index, id=key)
-      return bool(response)
-    except TransportError:
-      return False
+    response = self.client.exists(index=self.config.storage_index, id=key)
+    return bool(response)
 
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
@@ -435,22 +431,24 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
 
     Returns:
-        Seconds remaining, None if no TTL, -1 if expired.
+        Seconds remaining, None if no TTL or key is absent, -1 if expired.
+
+    Note:
+        A missing key returns None (not -1) so callers can distinguish
+        "doesn't exist" from "expired" — matching the R5 contract fix on
+        Redis and MongoDB. Pre-R48 this conflated the two via -1.
     """
     try:
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
-      return -1
-    except TransportError:
       return None
-    else:
-      expire_str = resp["_source"].get("expireAt")
-      if not expire_str:
-        return None
-      remaining = (
-        datetime.fromisoformat(expire_str) - datetime.now(tz=timezone.utc)
-      ).total_seconds()
-      return -1 if remaining <= 0 else max(0, int(remaining))
+    expire_str = resp["_source"].get("expireAt")
+    if not expire_str:
+      return None
+    remaining = (
+      datetime.fromisoformat(expire_str) - datetime.now(tz=timezone.utc)
+    ).total_seconds()
+    return -1 if remaining <= 0 else max(0, int(remaining))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
@@ -496,10 +494,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self.client.delete(index=index, id=doc_id)
     except NotFoundError:
       return False
-    except TransportError:
-      return False
-    else:
-      return True
+    return True
 
   def _delete_by_term(self, index: str, field: str, value: str) -> None:
     """Delete all documents matching a term query.

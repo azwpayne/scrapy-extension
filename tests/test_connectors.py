@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from scrapy_extension.backends.base import (
   BackendType,
   QueueBackend,
@@ -388,13 +389,13 @@ class TestConnectionManagerGetBackendInterface:
       def push(self, queue_name, item, priority=0.0):
         pass
 
-      def pop(self, queue_name, timeout=0.0):  # noqa: ARG002
+      def pop(self, queue_name, timeout=0.0):
         return None
 
-      def queue_len(self, queue_name):  # noqa: ARG002
+      def queue_len(self, queue_name):
         return 0
 
-      def clear_queue(self, queue_name):  # noqa: ARG002
+      def clear_queue(self, queue_name):
         pass
 
     mock_backend = MockQueueBackend()
@@ -445,19 +446,19 @@ class TestConnectionManagerGetBackendInterface:
       def backend_type(self):
         return BackendType.REDIS
 
-      def add(self, set_name, item):  # noqa: ARG002
+      def add(self, set_name, item):
         return True
 
-      def remove(self, set_name, item):  # noqa: ARG002
+      def remove(self, set_name, item):
         return True
 
-      def contains(self, set_name, item):  # noqa: ARG002
+      def contains(self, set_name, item):
         return True
 
-      def set_len(self, set_name):  # noqa: ARG002
+      def set_len(self, set_name):
         return 0
 
-      def clear_set(self, set_name):  # noqa: ARG002
+      def clear_set(self, set_name):
         pass
 
     mock_backend = MockSetBackend()
@@ -508,22 +509,22 @@ class TestConnectionManagerGetBackendInterface:
       def backend_type(self):
         return BackendType.REDIS
 
-      def store(self, key, data, ttl=None):  # noqa: ARG002
+      def store(self, key, data, ttl=None):
         pass
 
-      def retrieve(self, key):  # noqa: ARG002
+      def retrieve(self, key):
         return None
 
-      def delete(self, key):  # noqa: ARG002
+      def delete(self, key):
         return True
 
-      def exists(self, key):  # noqa: ARG002
+      def exists(self, key):
         return True
 
-      def ttl(self, key):  # noqa: ARG002
+      def ttl(self, key):
         return None
 
-      def clear_storage(self, prefix=None):  # noqa: ARG002
+      def clear_storage(self, prefix=None):
         pass
 
     mock_backend = MockStorageBackend()

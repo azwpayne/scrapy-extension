@@ -6,12 +6,96 @@ backend implementations must follow.
 
 from __future__ import annotations
 
+__all__ = [
+  "Backend",
+  "BackendType",
+  "JSONSerializer",
+  "QueueBackend",
+  "Serializer",
+  "SetBackend",
+  "StorageBackend",
+]
+
+import base64
 import hashlib
 import json
 import re
+import uuid
 from abc import ABC, abstractmethod
+from datetime import date, datetime
+from decimal import Decimal
 from enum import Enum
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Protocol
+
+from pydantic import SecretStr
+
+
+def _json_default(obj: object) -> object:
+  """JSON default handler for types Scrapy request dicts commonly contain.
+
+  Handles the types that appear in real-world ``request.meta``:
+  - ``datetime`` / ``date`` → ISO 8601 string (round-trips via ``datetime.fromisoformat``)
+  - ``bytes`` / ``bytearray`` → base64-encoded ASCII string
+  - ``Decimal`` → ``str`` (preserves exact decimal representation, avoids float drift)
+  - ``UUID`` → ``str`` (canonical hex form)
+  - ``set`` / ``frozenset`` → ``list`` (JSON has no set type; order undefined)
+  - ``Enum`` → ``.value`` (preserves the enum's declared value, not the member)
+  - ``pathlib.Path`` → ``str`` (preserves the path representation)
+
+  Everything else raises ``TypeError`` — surfacing the caller's bug rather
+  than silently ``str()``-ing it (which produced ``"b'x'"`` for bytes and
+  lost the original value).
+
+  Args:
+      obj: The non-JSON-native object to convert.
+
+  Returns:
+      A JSON-native representation (str, list, int, etc.).
+
+  Raises:
+      TypeError: If the object's type isn't handled.
+  """
+  if isinstance(obj, (datetime, date)):
+    return obj.isoformat()
+  if isinstance(obj, (bytes, bytearray)):
+    return base64.b64encode(bytes(obj)).decode("ascii")
+  if isinstance(obj, Decimal):
+    return str(obj)
+  if isinstance(obj, uuid.UUID):
+    return str(obj)
+  if isinstance(obj, (set, frozenset)):
+    return list(obj)
+  if isinstance(obj, Enum):
+    return obj.value
+  if isinstance(obj, Path):
+    return str(obj)
+  type_name = type(obj).__name__
+  raise TypeError(
+    f"Object of type {type_name} is not JSON serializable. "
+    f"Pre-serialize {type_name} instances before pushing to the queue, "
+    f"or extend scrapy_extension.backends.base._json_default."
+  )
+
+
+def secret_value(s: SecretStr | str | None) -> str | None:
+  """Extract the raw string from a SecretStr (or pass through plain str).
+
+  Defensive against plain ``str`` values that bypass pydantic validation
+  (e.g., ``config.password = "x"`` after construction, which doesn't
+  coerce to SecretStr unless ``validate_assignment=True``).
+
+  Args:
+      s: A SecretStr, plain str, or None.
+
+  Returns:
+      The secret's raw string value, or None.
+  """
+  if s is None:
+    return None
+  if isinstance(s, SecretStr):
+    return s.get_secret_value()
+  return s
 
 
 class Serializer(Protocol):
@@ -21,7 +105,7 @@ class Serializer(Protocol):
   and deserializing data for backend storage.
   """
 
-  def serialize(self, obj: Any) -> bytes:
+  def serialize(self, obj: object) -> bytes:
     """Serialize an object to bytes.
 
     Args:
@@ -32,7 +116,7 @@ class Serializer(Protocol):
     """
     ...
 
-  def deserialize(self, data: bytes) -> Any:
+  def deserialize(self, data: bytes) -> object:
     """Deserialize bytes to an object.
 
     Args:
@@ -51,18 +135,25 @@ class JSONSerializer:
   serializing basic Python types and simple objects.
   """
 
-  def serialize(self, obj: Any) -> bytes:
+  def serialize(self, obj: object) -> bytes:
     """Serialize an object to JSON bytes.
+
+    Uses ``_json_default`` to handle common non-JSON-native types found in
+    Scrapy request dicts (datetime → ISO, bytes → base64). Truly unexpected
+    types raise TypeError with a clear message — no silent ``str()`` coercion.
 
     Args:
         obj: The object to serialize.
 
     Returns:
         JSON-encoded bytes.
-    """
-    return json.dumps(obj, default=str).encode("utf-8")
 
-  def deserialize(self, data: bytes) -> Any:
+    Raises:
+        TypeError: If the object contains types not handled by _json_default.
+    """
+    return json.dumps(obj, default=_json_default).encode("utf-8")
+
+  def deserialize(self, data: bytes) -> object:
     """Deserialize JSON bytes to an object.
 
     Args:
@@ -108,7 +199,7 @@ def _hash_item(item: bytes) -> str:
     return hashlib.sha256(item).hexdigest()
 
 
-def _get_mode_text(mode: Any) -> str:
+def _get_mode_text(mode: object) -> str:
     """Get a displayable string for a mode enum value.
 
     Args:
@@ -141,6 +232,15 @@ class BackendType(str, Enum):
   RABBITMQ = "rabbitmq"
   ELASTICSEARCH = "elasticsearch"
   ROCKETMQ = "rocketmq"
+
+  @classmethod
+  def _missing_(cls, value: object) -> BackendType | None:
+    valid = ", ".join(repr(m.value) for m in cls)
+    msg = (
+      f"{value!r} is not a valid {cls.__name__}. "
+      f"Valid values: {valid}."
+    )
+    raise ValueError(msg)
 
 
 class Backend(ABC):
@@ -247,6 +347,35 @@ class QueueBackend(ABC):
     Args:
         queue_name: The name of the queue.
     """
+
+  def ack(self, queue_name: str) -> None:
+    """Acknowledge the last-popped message for ``queue_name``.
+
+    Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) implement
+    this as a no-op: their pop is already atomic, so there is no
+    "unacked" state to transition. Message-queue backends (Kafka,
+    RabbitMQ) override to commit the offset / basic_ack the delivery.
+
+    The default no-op makes ack() safe to call from the scheduler even
+    when the backend doesn't need it.
+
+    Args:
+        queue_name: The name of the queue whose last message should be
+            acknowledged.
+    """
+    del queue_name
+
+  def nack(self, queue_name: str) -> None:
+    """Negatively acknowledge the last-popped message for ``queue_name``.
+
+    Atomic backends implement this as a no-op. Message-queue backends
+    override to requeue / re-deliver the message for another consumer.
+
+    Args:
+        queue_name: The name of the queue whose last message should be
+            negatively acknowledged.
+    """
+    del queue_name
 
 
 class SetBackend(ABC):
@@ -376,7 +505,6 @@ class StorageBackend(ABC):
     """Clear all stored data, optionally filtered by prefix.
 
     Args:
-        prefix:
-        - If provided, only clear keys starting with this prefix.
-        - If None, clear all storage data.
+        prefix: If provided, only clear keys starting with this prefix. If None,
+            clear all storage data.
     """

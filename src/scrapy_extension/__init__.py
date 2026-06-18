@@ -7,6 +7,8 @@ for multiple backends: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, and Rocke
 from __future__ import annotations
 
 import importlib
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 from scrapy_extension.backends.base import (
     Backend,
@@ -32,7 +34,11 @@ from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings.base import Settings
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 
-__version__ = "0.1.0"
+try:
+    __version__ = _pkg_version("scrapy-extension")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
 
 # Optional imports: (module_path, attribute_name)
 # These are lazily loaded via __getattr__ so that backend-specific dependencies

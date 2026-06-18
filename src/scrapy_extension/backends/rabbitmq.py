@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import re
 import ssl
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -25,11 +24,17 @@ except ImportError as e:
         "RabbitMQ backend requires 'pika'. Install with: pip install scrapy-extension[rabbitmq]"
     ) from e
 
-from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
+from scrapy_extension.backends.base import (
+    Backend,
+    BackendType,
+    QueueBackend,
+    _validate_key_name,
+    secret_value,
+)
 from scrapy_extension.exceptions import (
-  BackendConnectionError,
-  ConfigurationError,
-  QueueError,
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
 )
 from scrapy_extension.settings import RabbitMQMode
 
@@ -37,26 +42,6 @@ if TYPE_CHECKING:
   from scrapy_extension.settings import RabbitMQSettings
 
 logger = logging.getLogger(__name__)
-
-# Key name validation pattern - only allow alphanumeric, dots, underscores, hyphens, colons, slashes
-_KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:/-]+$")
-
-
-def _validate_key_name(name: str, field_name: str = "name") -> None:
-    """Validate key/queue name to prevent injection.
-
-    Args:
-        name: The name to validate.
-        field_name: Field name for error messages.
-
-    Raises:
-        ValueError: If name contains invalid characters.
-    """
-    if not name or not _KEY_NAME_PATTERN.match(name):
-        raise ValueError(
-            f"Invalid {field_name}: {name!r}. "
-            f"Only alphanumeric, dots, underscores, hyphens, colons, and slashes allowed."
-        )
 
 
 class RabbitMQBackend(Backend, QueueBackend):
@@ -81,6 +66,9 @@ class RabbitMQBackend(Backend, QueueBackend):
     self.config = config
     self._connection: pika.BlockingConnection | None = None
     self._channel: pika.channel.Channel | None = None
+    self._declared_queues: set[str] = set()
+    self._last_delivery_tag: int | None = None
+    self._ssl_warning_emitted: bool = False
 
   def connect(self) -> None:
     """Establish connection to RabbitMQ based on deployment mode.
@@ -106,6 +94,15 @@ class RabbitMQBackend(Backend, QueueBackend):
         setting_name="mode",
         setting_value=self.config.mode,
       )
+    if not getattr(self.config, "ssl_enabled", False) and not self._ssl_warning_emitted:
+      logger.warning(
+        "RabbitMQ connecting without SSL — credentials (username/password) "
+        "traverse the network in cleartext. Set ssl_enabled=True (and "
+        "configure ssl_cafile / ssl_certfile / ssl_keyfile as needed) for "
+        "any deployment outside localhost. (warning emitted once per "
+        "backend instance)"
+      )
+      self._ssl_warning_emitted = True
     try:
       if self.config.mode == RabbitMQMode.STANDALONE:
         self._connect_standalone()
@@ -142,8 +139,16 @@ class RabbitMQBackend(Backend, QueueBackend):
     # Default to CERT_REQUIRED for security
     return ssl.CERT_REQUIRED
 
-  def _build_common_parameters(self) -> pika.ConnectionParameters:
+  def _build_common_parameters(
+    self,
+    host: str | None = None,
+    port: int | None = None,
+  ) -> pika.ConnectionParameters:
     """Build common RabbitMQ connection parameters.
+
+    Args:
+        host: Optional hostname override.
+        port: Optional port override.
 
     Returns:
         ConnectionParameters with common settings.
@@ -155,7 +160,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     if (
       self.config.mode != RabbitMQMode.STANDALONE
       and self.config.username == "guest"
-      and self.config.password == "guest"  # noqa: S105
+      and self.config.password == "guest"
     ):
       msg = (
         "Default 'guest/guest' credentials are insecure for non-standalone modes. "
@@ -168,7 +173,7 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
     credentials = pika.PlainCredentials(
       self.config.username,
-      self.config.password,
+      secret_value(self.config.password),
     )
 
     # Build SSL options if enabled
@@ -180,16 +185,16 @@ class RabbitMQBackend(Backend, QueueBackend):
           certfile=self.config.ssl_certfile,
           keyfile=self.config.ssl_keyfile,
         )
+
+      verify_mode = self._get_ssl_verify_mode()
+      if verify_mode == ssl.CERT_NONE:
+        ssl_context.check_hostname = False
+      ssl_context.verify_mode = verify_mode
       ssl_options = pika.SSLOptions(ssl_context)
 
-      # Set SSL verification mode using ssl module constants directly
-      ssl_context.verify_mode = self._get_ssl_verify_mode()
-      if ssl_context.verify_mode == ssl.CERT_NONE:
-        ssl_context.check_hostname = False
-
     return pika.ConnectionParameters(
-      host=self.config.host,
-      port=self.config.port,
+      host=host or self.config.host,
+      port=port or self.config.port,
       virtual_host=self.config.virtual_host,
       credentials=credentials,
       heartbeat=self.config.heartbeat,
@@ -214,18 +219,27 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Uses cluster_nodes for failover if primary node is unavailable.
     """
-    parameters = self._build_common_parameters()
-
-    # If cluster nodes are configured, use them for connection attempts
     if self.config.cluster_nodes:
-      all_hosts = [f"{self.config.host}:{self.config.port}", *self.config.cluster_nodes]
+      parameters = [self._build_common_parameters()]
+      all_hosts = [f"{self.config.host}:{self.config.port}"]
+
+      for node in self.config.cluster_nodes:
+        host, separator, port_text = node.partition(":")
+        port = int(port_text) if separator and port_text else self.config.port
+        parameters.append(self._build_common_parameters(host=host, port=port))
+        all_hosts.append(f"{host}:{port}")
+
       logger.debug("Connecting to RabbitMQ cluster with hosts: %s", all_hosts)
+      connection_parameters: pika.ConnectionParameters | list[pika.ConnectionParameters] = (
+        parameters
+      )
     else:
       logger.debug(
         "Connecting to RabbitMQ cluster at %s:%s", self.config.host, self.config.port
       )
+      connection_parameters = self._build_common_parameters()
 
-    self._connection = pika.BlockingConnection(parameters)
+    self._connection = pika.BlockingConnection(connection_parameters)
     self._channel = self._connection.channel()
     self._setup_qos()
     logger.debug("Connected to RabbitMQ cluster")
@@ -241,10 +255,6 @@ class RabbitMQBackend(Backend, QueueBackend):
     # Setup HA policy for queues if configured
     if self._channel and self.config.ha_mode:
       try:
-        # Set HA policy for the virtual host
-        policy_name = (
-          "ha-all" if self.config.ha_mode == "all" else f"ha-{self.config.ha_mode}"
-        )
         definition: dict[str, Any] = {"ha-mode": self.config.ha_mode}
         if self.config.ha_params:
           definition["ha-params"] = (
@@ -288,6 +298,7 @@ class RabbitMQBackend(Backend, QueueBackend):
       with contextlib.suppress(AMQPError):
         self._connection.close()
       self._connection = None
+    self._declared_queues.clear()
 
   def is_connected(self) -> bool:
     """Check if RabbitMQ is connected.
@@ -318,11 +329,17 @@ class RabbitMQBackend(Backend, QueueBackend):
   def _ensure_queue_exists(self, queue_name: str) -> None:
     """Ensure RabbitMQ queue exists.
 
+    Declares the queue idempotently. After the first successful declare
+    in a session, subsequent calls are skipped — re-declaring with
+    different arguments (e.g. ``x-max-priority``) raises
+    ``PRECONDITION_FAILED`` and kills the channel.
+
     Args:
         queue_name: Name of the queue.
 
     Raises:
-        QueueError: If queue declaration fails.
+        QueueError: If queue declaration fails. The message includes
+            recovery guidance when ``PRECONDITION_FAILED`` is detected.
     """
     if self._channel is None:
       msg = "Not connected to RabbitMQ"
@@ -331,6 +348,8 @@ class RabbitMQBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="declare",
       )
+    if queue_name in self._declared_queues:
+      return
     try:
       self._channel.queue_declare(
         queue=queue_name,
@@ -339,12 +358,22 @@ class RabbitMQBackend(Backend, QueueBackend):
         arguments={"x-max-priority": self.config.max_priority},
       )
     except AMQPError as e:
-      msg = f"Failed to declare queue {queue_name}: {e}"
+      error_text = str(e)
+      if "PRECONDITION_FAILED" in error_text or "PRECONDITION" in error_text:
+        msg = (
+          f"Queue {queue_name} exists with incompatible arguments: {e}. "
+          f"Drop the queue first or align config "
+          f"(durable={self.config.durable}, "
+          f"x-max-priority={self.config.max_priority})."
+        )
+      else:
+        msg = f"Failed to declare queue {queue_name}: {e}"
       raise QueueError(
         msg,
         queue_name=queue_name,
         operation="declare",
       ) from e
+    self._declared_queues.add(queue_name)
 
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
@@ -371,7 +400,7 @@ class RabbitMQBackend(Backend, QueueBackend):
       self._ensure_queue_exists(queue_name)
 
       # Clamp priority to valid range
-      clamped_priority = min(int(priority), self.config.max_priority)
+      clamped_priority = max(0, min(int(priority), self.config.max_priority))
 
       # Cast delivery_mode to Literal[1, 2] for pika compatibility
       delivery_mode: Literal[1, 2] = 1 if self.config.delivery_mode == 1 else 2
@@ -394,7 +423,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         operation="push",
       ) from e
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:  # noqa: ARG002
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
     Args:
@@ -423,8 +452,13 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
 
       if method_frame:
-        # Acknowledge the message
-        self._channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+        if self._last_delivery_tag is not None:
+          logger.warning(
+            "pop() called while previous message is unacked — "
+            "CONCURRENT_REQUESTS>1 breaks ack tracking. "
+            "Set CONCURRENT_REQUESTS=1 for correct at-least-once delivery."
+          )
+        self._last_delivery_tag = method_frame.delivery_tag
         return body
     except AMQPError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
@@ -434,6 +468,38 @@ class RabbitMQBackend(Backend, QueueBackend):
         operation="pop",
       ) from e
     return None
+
+  def ack(self, queue_name: str) -> None:
+    """Acknowledge the last-popped message via ``basic_ack``.
+
+    Idempotent: clears the tracked delivery tag after acking so duplicate
+    ack calls are safe (calling basic_ack with an already-acked tag raises
+    a channel error).
+    """
+    if self._channel is None or self._last_delivery_tag is None:
+      return
+    try:
+      self._channel.basic_ack(delivery_tag=self._last_delivery_tag)
+    except AMQPError as e:
+      msg = f"Failed to ack RabbitMQ message: {e}"
+      raise QueueError(msg, operation="ack") from e
+    finally:
+      self._last_delivery_tag = None
+
+  def nack(self, queue_name: str) -> None:
+    """Negatively acknowledge the last-popped message; requeue for retry."""
+    if self._channel is None or self._last_delivery_tag is None:
+      return
+    try:
+      self._channel.basic_nack(
+        delivery_tag=self._last_delivery_tag,
+        requeue=True,
+      )
+    except AMQPError as e:
+      msg = f"Failed to nack RabbitMQ message: {e}"
+      raise QueueError(msg, operation="nack") from e
+    finally:
+      self._last_delivery_tag = None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.

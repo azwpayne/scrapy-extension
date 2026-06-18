@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,7 +65,7 @@ class RabbitMQSettings(BaseSettings):
     default="guest",
     description="RabbitMQ username. MUST override in production via SCRAPY_RABBITMQ_USERNAME.",
   )
-  password: str = Field(
+  password: SecretStr = Field(
     default="guest",
     description="RabbitMQ password. MUST override in production via SCRAPY_RABBITMQ_PASSWORD.",
   )

@@ -45,7 +45,7 @@ class TestBuildKwargs:
     settings = ElasticSearchSettings(username="user", password="pass")
     backend = ElasticSearchBackend(settings)
     kwargs = backend._build_kwargs()
-    assert kwargs["basic_auth"] == ("user", "pass")
+    assert kwargs["basic_auth"] == ("user", "pass")  # secret_value() extracts the raw string
 
   def test_ca_certs_in_kwargs(self, mocker):
     """Test ca_certs is included when set."""
@@ -183,7 +183,14 @@ class TestAdd:
   """Test add method exception handling."""
 
   def test_add_transport_error(self, mocker):
-    """Test add returns False when TransportError is raised."""
+    """R31-A1: TransportError must propagate, NOT return False.
+
+    The previous ``except TransportError: return False`` conflated every
+    transport-level failure (network blip, broker down, auth) with the
+    "already existed" signal. The dupefilter's ``return not added`` then
+    treated every backend error as a duplicate, silently dropping new
+    requests during coordinated outages.
+    """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -199,14 +206,20 @@ class TestAdd:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    assert backend.add("s", b"item") is False
+    with pytest.raises(TransportError, match="Index failed"):
+      backend.add("s", b"item")
 
 
 class TestContains:
   """Test contains method exception handling."""
 
   def test_contains_transport_error(self, mocker):
-    """Test contains returns False when TransportError is raised."""
+    """R34-A1: TransportError on contains must propagate, NOT return False.
+
+    Returning False conflated "not in set" with "couldn't check". The
+    standard ``if not set.contains(fp): set.add(fp)`` pattern would
+    produce duplicates during cluster instability.
+    """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -222,14 +235,22 @@ class TestContains:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    assert backend.contains("s", b"item") is False
+    with pytest.raises(TransportError, match="Exists failed"):
+      backend.contains("s", b"item")
 
 
 class TestRetrieve:
   """Test retrieve method exception handling."""
 
   def test_retrieve_transport_error(self, mocker):
-    """Test retrieve returns None when TransportError is raised."""
+    """R32-A1: TransportError on retrieve must propagate, NOT return None.
+
+    Returning None on TransportError conflated "key doesn't exist" with
+    "couldn't reach the cluster". Callers writing ``if storage.retrieve(k)
+    is None: create_new()`` would silently overwrite existing data during
+    any network blip / cluster red — silent data loss. Only NotFoundError
+    (HTTP 404) legitimately produces None.
+    """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -245,14 +266,21 @@ class TestRetrieve:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    assert backend.retrieve("k") is None
+    with pytest.raises(TransportError, match="Get failed"):
+      backend.retrieve("k")
 
 
 class TestExists:
   """Test exists method exception handling."""
 
   def test_exists_transport_error(self, mocker):
-    """Test exists returns False when TransportError is raised."""
+    """R33-A1: TransportError on exists must propagate, NOT return False.
+
+    Same shape as the R32 retrieve bug: returning False on TransportError
+    conflated "key doesn't exist" with "couldn't reach the cluster".
+    Callers writing ``if not storage.exists(k): create_new()`` would
+    silently overwrite existing data during network blips.
+    """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -268,14 +296,20 @@ class TestExists:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    assert backend.exists("k") is False
+    with pytest.raises(TransportError, match="Exists failed"):
+      backend.exists("k")
 
 
 class TestTTL:
   """Test ttl method exception handling."""
 
   def test_ttl_transport_error(self, mocker):
-    """Test ttl returns None when TransportError is raised."""
+    """R34-A1: TransportError on ttl must propagate, NOT return None.
+
+    Returning None conflated "no TTL set" with "couldn't reach the
+    cluster". Callers can't distinguish "key has no expiry" from
+    "couldn't check" — the contract is None = no TTL, -1 = expired.
+    """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -291,14 +325,21 @@ class TestTTL:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    assert backend.ttl("k") is None
+    with pytest.raises(TransportError, match="Get failed"):
+      backend.ttl("k")
 
 
 class TestDeleteById:
   """Test _delete_by_id method exception handling."""
 
   def test_delete_by_id_transport_error(self, mocker):
-    """Test _delete_by_id returns False when TransportError is raised."""
+    """R34-A1: TransportError on _delete_by_id must propagate, NOT return False.
+
+    Returning False conflated "doc didn't exist" (NotFoundError) with
+    "couldn't reach the cluster". The storage.delete contract says
+    False = "didn't exist"; real errors propagate so the public method
+    can surface them to callers.
+    """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -314,7 +355,8 @@ class TestDeleteById:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    assert backend._delete_by_id("index", "doc_id") is False
+    with pytest.raises(TransportError, match="Delete failed"):
+      backend._delete_by_id("index", "doc_id")
 
 
 class TestDeleteByQuery:

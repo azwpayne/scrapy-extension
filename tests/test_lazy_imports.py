@@ -11,7 +11,6 @@ import pytest
 import scrapy_extension
 import scrapy_extension.backends
 
-
 # ---------------------------------------------------------------------------
 # 1. Core imports always available (no optional deps needed)
 # ---------------------------------------------------------------------------
@@ -112,8 +111,8 @@ class TestLazyBackendImports:
 
     def test_lazy_backend_consistent_on_repeated_access(self) -> None:
         """Repeated getattr calls should return the same class."""
-        cls1 = getattr(scrapy_extension, "RedisBackend")
-        cls2 = getattr(scrapy_extension, "RedisBackend")
+        cls1 = scrapy_extension.RedisBackend
+        cls2 = scrapy_extension.RedisBackend
         assert cls1 is cls2
 
 
@@ -261,11 +260,6 @@ class TestBackendsInitLazyImports:
             Backend,
             BackendType,
             ConnectionManager,
-            JSONSerializer,
-            QueueBackend,
-            Serializer,
-            SetBackend,
-            StorageBackend,
         )
 
         assert Backend is not None
@@ -372,13 +366,10 @@ class TestAllExported:
             )
 
     def test_backends_all_contains_backend_classes(self) -> None:
-        """backends/__init__.py __all__ must contain lazy backend classes."""
-        expected = [
-            "RedisBackend",
-            "RabbitMQBackend",
-            "RocketMQBackend",
-        ]
-        for name in expected:
+        """backends.__all__ must contain every lazy backend class."""
+        from scrapy_extension.backends import _BACKEND_MODULES
+
+        for name in _BACKEND_MODULES:
             assert name in scrapy_extension.backends.__all__, (
                 f"{name} missing from backends.__all__"
             )
@@ -416,3 +407,207 @@ class TestLazyImportIsolation:
             assert name in _BACKEND_EXTRAS, (
                 f"{name} in _OPTIONAL_IMPORTS but missing from _BACKEND_EXTRAS"
             )
+
+
+# ---------------------------------------------------------------------------
+# 10. ImportError path — all backends give actionable install hints (R2-A3)
+# ---------------------------------------------------------------------------
+
+
+class TestBackendImportErrorMessage:
+    """Each backend module raises ImportError with install instructions when its
+    optional dep is missing. Covers all 6 backends, not just RabbitMQ.
+    """
+
+    BACKEND_MODULES = [
+        ("scrapy_extension.backends.redis", "redis", "pip install scrapy-extension[redis]"),
+        ("scrapy_extension.backends.mongodb", "pymongo", "pip install scrapy-extension[mongodb]"),
+        ("scrapy_extension.backends.kafka", "kafka", "pip install scrapy-extension[kafka]"),
+        ("scrapy_extension.backends.rabbitmq", "pika", "pip install scrapy-extension[rabbitmq]"),
+        (
+            "scrapy_extension.backends.elasticsearch",
+            "elasticsearch",
+            "pip install scrapy-extension[elasticsearch]",
+        ),
+        # Note: RocketMQ uses deferred imports inside connect(), not a
+        # module-level guard. Its ImportError path is tested in
+        # test_rocketmq_backend.py::test_connect_*_error.
+    ]
+
+    @pytest.mark.parametrize("module_path,dep_name,install_hint", BACKEND_MODULES)
+    def test_missing_dep_raises_with_install_hint(
+        self,
+        mocker,
+        module_path: str,
+        dep_name: str,
+        install_hint: str,
+    ) -> None:
+        """Importing a backend without its dep should raise ImportError with the
+        correct install hint in the message.
+        """
+        import builtins
+        import importlib
+
+        original_import = builtins.__import__
+
+        def blocking_import(name, *args, **kwargs):
+            if name == dep_name or name.startswith(dep_name + "."):
+                raise ImportError(f"No module named '{dep_name}' (mocked)")
+            return original_import(name, *args, **kwargs)
+
+        mocker.patch.object(builtins, "__import__", side_effect=blocking_import)
+
+        # Purge any cached version of the module so the import guard re-runs.
+        import sys
+
+        cached = sys.modules.pop(module_path, None)
+        try:
+            with pytest.raises(ImportError) as exc_info:
+                importlib.import_module(module_path)
+            assert install_hint in str(exc_info.value), (
+                f"Expected install hint {install_hint!r} in error message, "
+                f"got: {exc_info.value}"
+            )
+        finally:
+            if cached is not None:
+                sys.modules[module_path] = cached
+
+
+class TestVersionFromPackageMetadata:
+  """R26-D1: __version__ must come from package metadata, not hardcoded.
+
+  Previously ``__version__ = "0.1.0"`` was hardcoded in ``__init__.py``.
+  Bumping the version in ``pyproject.toml`` without bumping ``__init__.py``
+  produced a silent drift — ``scrapy_extension.__version__`` said one
+  thing, ``pip show scrapy-extension`` said another. The fix reads from
+  ``importlib.metadata`` so there's a single source of truth.
+  """
+
+  def test_version_is_non_empty_string(self):
+    """__version__ resolves to a non-empty string in all environments."""
+    assert isinstance(scrapy_extension.__version__, str)
+    assert scrapy_extension.__version__, "version must not be empty"
+
+  def test_version_matches_installed_metadata(self):
+    """When installed, __version__ matches the package's recorded version."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+      expected = version("scrapy-extension")
+    except PackageNotFoundError:
+      pytest.skip("package not installed; dev fallback path")
+    assert scrapy_extension.__version__ == expected
+
+
+class TestBackendsWildcardImport:
+  """R36-A1: scrapy_extension.backends.__all__ must list every backend.
+
+  Previously __all__ listed 3 of 6 backend classes (omitted
+  MongoDBBackend, KafkaBackend, ElasticSearchBackend) while
+  _BACKEND_MODULES had all 6. ``from scrapy_extension.backends import *``
+  silently missed the 3 unlisted names; users had to know to use
+  explicit imports. The fix makes __all__ match _BACKEND_MODULES.
+  """
+
+  def test_all_lists_every_backend_module(self):
+    """__all__ must include every key from _BACKEND_MODULES."""
+    from scrapy_extension.backends import _BACKEND_MODULES, __all__
+
+    missing = set(_BACKEND_MODULES) - set(__all__)
+    assert not missing, f"__all__ missing backend names: {sorted(missing)}"
+
+  def test_wildcard_import_resolves_all_backend_names(self):
+    """All backend names in __all__ must resolve via PEP 562 __getattr__."""
+    import scrapy_extension.backends as backends
+
+    for name in (
+      "RedisBackend",
+      "MongoDBBackend",
+      "KafkaBackend",
+      "RabbitMQBackend",
+      "ElasticSearchBackend",
+      "RocketMQBackend",
+    ):
+      assert name in backends.__all__, name
+      cls = getattr(backends, name)
+      assert isinstance(cls, type), f"{name} did not resolve to a class"
+
+
+class TestBaseModuleAll:
+  """R23-D3: scrapy_extension.backends.base must declare __all__.
+
+  Without __all__, ``from scrapy_extension.backends.base import *`` leaks
+  every non-underscored symbol including package-internal helpers like
+  ``secret_value`` and ``KEY_NAME_PATTERN``. The fix lists only the 7
+  user-facing ABCs / serializer / enum as the public surface.
+  """
+
+  def test_all_lists_public_surface(self):
+    """__all__ must list the 7 public ABCs / serializer / enum."""
+    from scrapy_extension.backends import base
+
+    expected = {
+      "Backend",
+      "BackendType",
+      "JSONSerializer",
+      "QueueBackend",
+      "Serializer",
+      "SetBackend",
+      "StorageBackend",
+    }
+    assert set(base.__all__) == expected
+
+  def test_all_names_resolve_to_objects(self):
+    """Every name in __all__ must resolve to an attribute on the module."""
+    from scrapy_extension.backends import base
+
+    for name in base.__all__:
+      assert hasattr(base, name), f"__all__ lists {name!r} but module has no such attr"
+
+  def test_helpers_not_in_all(self):
+    """Package-internal helpers must not be in __all__ even if non-underscored.
+
+  ``secret_value`` and ``KEY_NAME_PATTERN`` lack leading underscores but
+  are package-internal (used by backends to unwrap SecretStr / share
+  validation). End users should not depend on them — they're not in
+  __all__ and may be renamed in a future refactor.
+  """
+    from scrapy_extension.backends import base
+
+    assert "secret_value" not in base.__all__
+    assert "KEY_NAME_PATTERN" not in base.__all__
+
+
+class TestAllModulesInvariants:
+  """R39-A1: every module with __all__ must have its names actually resolve.
+
+  R36 closed backends/__init__.py drift; R37 closed base.py. R39 sweeps
+  the remaining 4 modules (scrapy_extension/__init__, settings/__init__,
+  exceptions/__init__, utils/__init__) with the same invariant: every
+  name in __all__ must resolve to a real attribute on the module. This
+  catches drift the moment a contributor adds a name to __all__ without
+  the corresponding import (or vice versa).
+  """
+
+  @pytest.mark.parametrize(
+    "module_path",
+    [
+      "scrapy_extension",
+      "scrapy_extension.settings",
+      "scrapy_extension.exceptions",
+      "scrapy_extension.utils",
+    ],
+  )
+  def test_all_names_resolve(self, module_path):
+    """Every name in __all__ must resolve to an attribute on the module."""
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    for name in mod.__all__:
+      assert hasattr(mod, name), (
+        f"{module_path}.__all__ lists {name!r} but module has no such attribute"
+      )
+
+
+
+

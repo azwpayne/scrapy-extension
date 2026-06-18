@@ -4,6 +4,7 @@ This module tests the multi-mode support for Kafka, MongoDB, and RabbitMQ backen
 """
 
 import pytest
+
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.exceptions import ConfigurationError
 
@@ -168,7 +169,7 @@ class TestKafkaBackendModes:
     assert call_kwargs["security_protocol"] == "SASL_SSL"
     assert call_kwargs["sasl_mechanism"] == "PLAIN"
     assert call_kwargs["sasl_plain_username"] == "test_key"
-    assert call_kwargs["sasl_plain_password"] == "test_secret"  # noqa: S105
+    assert call_kwargs["sasl_plain_password"] == "test_secret"
 
   def test_confluent_mode_fallback_to_sasl(
     self,

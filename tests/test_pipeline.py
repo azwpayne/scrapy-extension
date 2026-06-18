@@ -3,6 +3,7 @@
 from typing import cast
 
 from scrapy import Field, Item
+
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
@@ -208,6 +209,18 @@ class TestBackendPipelineCloseSpider:
 
     assert "Pipeline closed for spider test_spider" in caplog.text
 
+  def test_close_spider_calls_connection_manager_close(
+    self, mock_connection_manager, mocker
+  ):
+    """Test that close_spider shuts down the connection manager."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    pipeline.close_spider(mock_spider)
+
+    mock_connection_manager.close.assert_called_once_with()
+
 
 class TestBackendPipelineProcessItem:
   """Test BackendPipeline.process_item method."""
@@ -286,3 +299,86 @@ class TestBackendPipelineProcessItem:
     assert result is item
     assert result["name"] == "Original"
     assert result["value"] == 456
+
+  def test_process_item_survives_storage_error(self, mock_connection_manager, mocker):
+    """R3-G5: storage errors must not kill the spider.
+
+    The pipeline catches exceptions from the storage backend, logs a warning,
+    and returns the item unchanged so downstream pipelines continue.
+    """
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      key_prefix="items",
+    )
+    pipeline._storage_supported = True
+
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_storage.store.side_effect = RuntimeError("connection refused")
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    item = SampleItem(name="Test", value=1)
+    result = pipeline.process_item(item, mock_spider)
+
+    # Pipeline returned the item, didn't raise.
+    assert result is item
+    # Storage was attempted.
+    assert mock_storage.store.call_count == 1
+
+  def test_open_spider_detects_no_storage_support(self, mock_connection_manager, mocker):
+    """R3-G5: backends without storage (Kafka, RabbitMQ) degrade to no-op."""
+    mock_connection_manager.get_storage_backend.side_effect = NotImplementedError
+    mock_connection_manager.backend_type.value = "kafka"
+
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    pipeline.open_spider(mock_spider)
+    assert pipeline._storage_supported is False
+
+    # process_item is a no-op — no store call attempted.
+    item = SampleItem(name="Test", value=1)
+    result = pipeline.process_item(item, mock_spider)
+    assert result is item
+    mock_connection_manager.get_storage_backend.assert_called_once()
+
+  def test_process_item_increments_storage_skipped_when_unsupported(
+    self, mock_connection_manager, mocker
+  ):
+    """R23-A1: storage-skipped path increments pipeline/storage_skipped stat.
+
+    Without this counter, an operator running Kafka/RabbitMQ/RocketMQ
+    sees zero items in storage and zero error counts — items are silently
+    dropped. The skipped counter surfaces the no-op so dashboards can
+    distinguish "no items scraped" from "items scraped but not persisted".
+    """
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = False  # bypass open_spider
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+    item = SampleItem(name="Test", value=1)
+
+    pipeline.process_item(item, mock_spider)
+
+    mock_spider.crawler.stats.inc_value.assert_called_with("pipeline/storage_skipped")
+
+  def test_inc_stat_skips_silently_when_no_crawler(self, mock_connection_manager, mocker):
+    """R23-A1: _inc_stat tolerates spiders without a crawler attribute.
+
+    Legacy spiders (or test doubles without ``crawler``) would otherwise
+    raise AttributeError, masking the original storage event the stat
+    was supposed to record. Silent skip — the spider continues.
+    """
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+
+    # Spider without .crawler — simulates legacy / test scenarios
+    bare_spider = mocker.MagicMock(spec=["name"])
+    bare_spider.name = "legacy"
+
+    # Must not raise
+    pipeline._inc_stat(bare_spider, "pipeline/storage_errors")
+    pipeline._inc_stat(bare_spider, "pipeline/storage_skipped")
+

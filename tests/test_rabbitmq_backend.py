@@ -31,6 +31,81 @@ def test_rabbitmq_backend_connect(mocker):
   mock_instance.channel.assert_called_once()
 
 
+def test_rabbitmq_backend_warns_when_ssl_disabled(mocker, caplog):
+  """R2-B3: default ssl_enabled=False triggers a one-shot cleartext warning.
+
+  Operators running across datacenters / clouds need to know their
+  RabbitMQ credentials traverse the network in cleartext. The warning
+  fires on first connect (not on every reconnect) so logs stay readable.
+  """
+  import logging
+
+  config = RabbitMQSettings()  # ssl_enabled defaults to False
+  assert config.ssl_enabled is False
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_instance.is_open = True
+  mock_instance.channel.return_value = mocker.MagicMock()
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  with caplog.at_level(logging.WARNING, logger="scrapy_extension.backends.rabbitmq"):
+    backend.connect()
+
+  assert any(
+    "without SSL" in rec.message and "cleartext" in rec.message for rec in caplog.records
+  ), "expected cleartext-credential warning when ssl_enabled=False"
+  assert backend._ssl_warning_emitted is True
+
+
+def test_rabbitmq_backend_ssl_warning_debounces_across_reconnects(mocker, caplog):
+  """R2-B3: warning fires once per backend instance — not on every connect.
+
+  Reconnect cycles (network blip, broker restart) would otherwise flood
+  the logs with the same warning. The debounce flag persists for the
+  instance lifetime; a fresh backend (new settings, new process) re-warns.
+  """
+  import logging
+
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_instance.is_open = True
+  mock_instance.channel.return_value = mocker.MagicMock()
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  with caplog.at_level(logging.WARNING, logger="scrapy_extension.backends.rabbitmq"):
+    backend.connect()
+    backend.disconnect()
+    backend.connect()  # second connect — should NOT re-warn
+
+  ssl_warnings = [
+    rec for rec in caplog.records if "without SSL" in rec.message
+  ]
+  assert len(ssl_warnings) == 1, "SSL warning must fire exactly once per instance"
+
+
+def test_rabbitmq_backend_no_warning_when_ssl_enabled(mocker, caplog):
+  """R2-B3: ssl_enabled=True produces no cleartext warning."""
+  import logging
+
+  config = RabbitMQSettings(ssl_enabled=True)
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_instance.is_open = True
+  mock_instance.channel.return_value = mocker.MagicMock()
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  with caplog.at_level(logging.WARNING, logger="scrapy_extension.backends.rabbitmq"):
+    backend.connect()
+
+  assert not any("without SSL" in rec.message for rec in caplog.records), (
+    "ssl_enabled=True must not emit the cleartext warning"
+  )
+
+
 def test_rabbitmq_backend_push(mocker):
   """Test RabbitMQ backend push."""
   config = RabbitMQSettings()
@@ -51,8 +126,8 @@ def test_rabbitmq_backend_push(mocker):
   assert call_kwargs["body"] == b"test_item"
 
 
-def test_rabbitmq_backend_pop(mocker):
-  """Test RabbitMQ backend pop."""
+def test_rabbitmq_backend_push_clamps_negative_priority_to_zero(mocker):
+  """Negative priorities must map to the lowest valid RabbitMQ priority."""
   config = RabbitMQSettings()
   backend = RabbitMQBackend(config)
 
@@ -61,7 +136,27 @@ def test_rabbitmq_backend_pop(mocker):
   mock_instance.channel.return_value = mock_channel
   mocker.patch("pika.BlockingConnection", return_value=mock_instance)
 
-  # Mock message return
+  backend.connect()
+  backend.push("test_queue", b"test_item", priority=-2)
+
+  properties = mock_channel.basic_publish.call_args[1]["properties"]
+  assert properties.priority == 0
+
+
+def test_rabbitmq_backend_pop_does_not_auto_ack_after_round_12(mocker):
+  """Round 12: pop no longer auto-acks — ack is driven by Scrapy signals.
+
+  The delivery tag is tracked but basic_ack isn't called until the
+  scheduler's response_received signal fires.
+  """
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
   mock_method = mocker.MagicMock()
   mock_method.delivery_tag = "tag123"
   mock_channel.basic_get.return_value = (mock_method, None, b"test_item")
@@ -70,7 +165,67 @@ def test_rabbitmq_backend_pop(mocker):
   result = backend.pop("test_queue")
 
   assert result == b"test_item"
-  mock_channel.basic_ack.assert_called_once_with(delivery_tag="tag123")
+  assert backend._last_delivery_tag == "tag123"
+  # No auto-ack — the scheduler signal handler calls ack() after download.
+  mock_channel.basic_ack.assert_not_called()
+
+
+def test_rabbitmq_backend_ack_calls_basic_ack(mocker):
+  """R1-P1-14 Phase 1: ack() invokes basic_ack with the tracked delivery tag."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend._last_delivery_tag = 42
+
+  backend.ack("test_queue")
+
+  mock_channel.basic_ack.assert_called_once_with(delivery_tag=42)
+  assert backend._last_delivery_tag is None
+
+
+def test_rabbitmq_backend_nack_calls_basic_nack_with_requeue(mocker):
+  """R1-P1-14 Phase 1: nack() requeues the message for retry."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend._last_delivery_tag = 99
+
+  backend.nack("test_queue")
+
+  mock_channel.basic_nack.assert_called_once_with(
+    delivery_tag=99,
+    requeue=True,
+  )
+  assert backend._last_delivery_tag is None
+
+
+def test_rabbitmq_backend_ack_idempotent_when_no_pending(mocker):
+  """ack() with no tracked delivery tag is a no-op."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend.ack("test_queue")
+  backend.ack("test_queue")
+
+  assert mock_channel.basic_ack.call_count == 0
 
 
 def test_rabbitmq_backend_pop_empty(mocker):
@@ -243,6 +398,30 @@ def test_rabbitmq_backend_get_ssl_verify_mode_cert_none():
   assert result == ssl.CERT_NONE
 
 
+def test_rabbitmq_backend_build_common_parameters_cert_none_disables_hostname_check(
+  mocker,
+):
+  """CERT_NONE must disable hostname checks before verify_mode is lowered."""
+  config = RabbitMQSettings(
+    ssl_enabled=True,
+    ssl_verify_mode="CERT_NONE",
+  )
+  backend = RabbitMQBackend(config)
+
+  ssl_context = ssl.create_default_context()
+  create_default_context = mocker.patch(
+    "ssl.create_default_context",
+    return_value=ssl_context,
+  )
+
+  parameters = backend._build_common_parameters()
+
+  create_default_context.assert_called_once_with(cafile=config.ssl_cafile)
+  assert parameters.ssl_options is not None
+  assert ssl_context.verify_mode == ssl.CERT_NONE
+  assert ssl_context.check_hostname is False
+
+
 def test_rabbitmq_backend_get_ssl_verify_mode_cert_optional():
   """Test _get_ssl_verify_mode returns CERT_OPTIONAL (line 113)."""
   config = RabbitMQSettings()
@@ -268,7 +447,7 @@ def test_rabbitmq_backend_guest_credentials_non_standalone(mocker):
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.CLUSTER
   config.username = "guest"
-  config.password = "guest"  # noqa: S105
+  config.password = "guest"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -289,8 +468,8 @@ def test_rabbitmq_backend_mirrored_queues_ha_mode(mocker):
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.MIRRORED_QUEUES
   config.ha_mode = "all"
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -310,8 +489,8 @@ def test_rabbitmq_backend_mirrored_queues_ha_sync_mode(mocker):
   config.mode = RabbitMQMode.MIRRORED_QUEUES
   config.ha_mode = "nodes"
   config.ha_sync_mode = "manual"
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -329,8 +508,8 @@ def test_rabbitmq_backend_mirrored_queues_amqp_error(mocker):
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.MIRRORED_QUEUES
   config.ha_mode = "all"
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -432,6 +611,71 @@ def test_rabbitmq_backend_ensure_queue_exists_amqp_error(mocker):
   with pytest.raises(QueueError) as exc_info:
     backend._ensure_queue_exists("test_queue")
   assert "Declare failed" in str(exc_info.value)
+
+
+def test_rabbitmq_backend_ensure_queue_exists_skips_redeclare(mocker):
+  """After the first successful declare, subsequent calls must skip queue_declare.
+
+  Regression for R1-P0-7: re-declaring an existing queue with different
+  args raises PRECONDITION_FAILED and kills the channel. The backend tracks
+  declared queues in-session to avoid this.
+  """
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend._ensure_queue_exists("test_queue")
+  backend._ensure_queue_exists("test_queue")
+  backend._ensure_queue_exists("test_queue")
+
+  assert mock_channel.queue_declare.call_count == 1
+
+
+def test_rabbitmq_backend_ensure_queue_exists_precondition_failed(mocker):
+  """PRECONDITION_FAILED error message must include recovery guidance."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  mock_channel.queue_declare.side_effect = pika.exceptions.AMQPError(
+    "PRECONDITION_FAILED - inequivalent arg 'x-max-priority'"
+  )
+
+  with pytest.raises(QueueError) as exc_info:
+    backend._ensure_queue_exists("test_queue")
+  assert "incompatible arguments" in str(exc_info.value)
+  assert "Drop the queue" in str(exc_info.value)
+
+
+def test_rabbitmq_backend_disconnect_clears_declared_queues(mocker):
+  """disconnect() must clear the declared-queue cache so reconnect re-declares."""
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mock_instance.is_open = True
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  backend.connect()
+  backend._ensure_queue_exists("test_queue")
+  assert "test_queue" in backend._declared_queues
+
+  backend.disconnect()
+  assert len(backend._declared_queues) == 0
 
 
 def test_rabbitmq_backend_push_no_channel():
@@ -583,8 +827,8 @@ def test_rabbitmq_backend_ssl_disabled(mocker):
   """Test SSL is disabled when ssl_enabled=False (default)."""
   config = RabbitMQSettings()
   config.ssl_enabled = False
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -605,8 +849,8 @@ def test_rabbitmq_backend_get_ssl_verify_mode(mocker):
   from scrapy_extension.settings import RabbitMQSettings
 
   config = RabbitMQSettings()
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   # Test CERT_NONE
@@ -623,21 +867,39 @@ def test_rabbitmq_backend_get_ssl_verify_mode(mocker):
 
 
 def test_rabbitmq_backend_connect_cluster_with_nodes(mocker):
-  """Test _connect_cluster with cluster_nodes configured (lines 221-222)."""
+  """Test _connect_cluster passes failover parameters with primary first."""
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.CLUSTER
-  config.cluster_nodes = ["node2:5672", "node3:5672"]
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.host = "node1"
+  config.port = 5672
+  config.cluster_nodes = ["node2:5672", "node3:5673"]
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
   mock_channel = mocker.MagicMock()
   mock_instance.channel.return_value = mock_channel
   mock_instance.is_open = True
-  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+  mock_parameters = [mocker.MagicMock(), mocker.MagicMock(), mocker.MagicMock()]
+  mock_connection_parameters = mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.ConnectionParameters",
+    side_effect=mock_parameters,
+  )
+  mock_blocking_connection = mocker.patch(
+    "pika.BlockingConnection",
+    return_value=mock_instance,
+  )
 
   backend.connect()
+
+  assert mock_connection_parameters.call_args_list[0].kwargs["host"] == "node1"
+  assert mock_connection_parameters.call_args_list[0].kwargs["port"] == 5672
+  assert mock_connection_parameters.call_args_list[1].kwargs["host"] == "node2"
+  assert mock_connection_parameters.call_args_list[1].kwargs["port"] == 5672
+  assert mock_connection_parameters.call_args_list[2].kwargs["host"] == "node3"
+  assert mock_connection_parameters.call_args_list[2].kwargs["port"] == 5673
+  mock_blocking_connection.assert_called_once_with(mock_parameters)
   assert backend.is_connected()
 
 
@@ -646,8 +908,8 @@ def test_rabbitmq_backend_mirrored_queues_no_ha_mode(mocker):
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.MIRRORED_QUEUES
   config.ha_mode = None
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -666,8 +928,8 @@ def test_rabbitmq_backend_mirrored_queues_ha_params_non_digit(mocker):
   config.mode = RabbitMQMode.MIRRORED_QUEUES
   config.ha_mode = "nodes"
   config.ha_params = "node1,node2"
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -687,8 +949,8 @@ def test_rabbitmq_backend_mirrored_queues_ha_params_digit(mocker):
   config.ha_mode = "exactly"
   config.ha_params = "2"
   config.ha_sync_mode = "automatic"
-  config.username = "user"  # noqa: S106
-  config.password = "pass"  # noqa: S105
+  config.username = "user"
+  config.password = "pass"
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()

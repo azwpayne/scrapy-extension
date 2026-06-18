@@ -52,7 +52,7 @@ def test_mongodb_backend_push_pop(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._queue_collection = mock_collection  # noqa: SLF001
+  backend._queue_collection = mock_collection
 
   # Test push
   backend.push("test_queue", b"test_item", priority=1.0)
@@ -79,7 +79,7 @@ def test_mongodb_backend_queue_len(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._queue_collection = mock_collection  # noqa: SLF001
+  backend._queue_collection = mock_collection
   mock_collection.count_documents.return_value = 5
 
   result = backend.queue_len("test_queue")
@@ -97,7 +97,7 @@ def test_mongodb_backend_clear_queue(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._queue_collection = mock_collection  # noqa: SLF001
+  backend._queue_collection = mock_collection
 
   backend.clear_queue("test_queue")
   mock_collection.delete_many.assert_called_once_with({"queue_name": "test_queue"})
@@ -111,7 +111,7 @@ def test_mongodb_backend_set_operations(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._set_collection = mock_collection  # noqa: SLF001
+  backend._set_collection = mock_collection
 
   # Test add
   mock_collection.insert_one.return_value = mocker.MagicMock()
@@ -141,7 +141,7 @@ def test_mongodb_backend_set_remove(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._set_collection = mock_collection  # noqa: SLF001
+  backend._set_collection = mock_collection
 
   # Test remove success
   mock_delete_result = mocker.MagicMock()
@@ -164,7 +164,7 @@ def test_mongodb_backend_set_len(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._set_collection = mock_collection  # noqa: SLF001
+  backend._set_collection = mock_collection
   mock_collection.count_documents.return_value = 3
 
   result = backend.set_len("test_set")
@@ -182,7 +182,7 @@ def test_mongodb_backend_clear_set(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._set_collection = mock_collection  # noqa: SLF001
+  backend._set_collection = mock_collection
 
   backend.clear_set("test_set")
   mock_collection.delete_many.assert_called_once_with({"set_name": "test_set"})
@@ -196,7 +196,7 @@ def test_mongodb_backend_storage_operations(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._storage_collection = mock_collection  # noqa: SLF001
+  backend._storage_collection = mock_collection
 
   # Test store
   backend.store("test_key", b"test_data")
@@ -228,7 +228,7 @@ def test_mongodb_backend_storage_ttl(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._storage_collection = mock_collection  # noqa: SLF001
+  backend._storage_collection = mock_collection
 
   # Test with TTL
   future_time = datetime.now(tz=timezone.utc) + timedelta(seconds=3600)
@@ -246,7 +246,7 @@ def test_mongodb_backend_storage_ttl(mocker):
   # Test non-existent key
   mock_collection.find_one.return_value = None
   result = backend.ttl("missing_key")
-  assert result == -1
+  assert result is None
 
 
 # -----------------------------------------------------------------------------
@@ -297,13 +297,13 @@ def test_mongodb_backend_build_client_kwargs_cached(mocker):
   backend.connect()
 
   # First call builds kwargs
-  kwargs1 = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs1 = backend._build_client_kwargs()
 
   # Modify the returned dict to verify we get a copy
   kwargs1["custom_key"] = "custom_value"
 
   # Second call should return a copy, not the cached dict with our modification
-  kwargs2 = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs2 = backend._build_client_kwargs()
   assert "custom_key" not in kwargs2
 
 
@@ -315,7 +315,7 @@ def test_mongodb_backend_build_client_kwargs_w(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("w") == 2
 
 
@@ -327,7 +327,7 @@ def test_mongodb_backend_build_client_kwargs_journal(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("journal") is True
 
 
@@ -339,7 +339,7 @@ def test_mongodb_backend_build_client_kwargs_w_timeout_ms(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("wtimeoutMS") == 5000
 
 
@@ -351,7 +351,7 @@ def test_mongodb_backend_build_client_kwargs_tls_cert_file(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("tlsCertificateKeyFile") == "/path/to/cert.pem"
 
 
@@ -363,7 +363,7 @@ def test_mongodb_backend_build_client_kwargs_tls_key_file_no_cert(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("tlsCertificateKeyFile") == "/path/to/key.pem"
 
 
@@ -375,7 +375,7 @@ def test_mongodb_backend_build_client_kwargs_tls_allow_invalid(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("tlsAllowInvalidCertificates") is True
 
 
@@ -392,7 +392,7 @@ def test_mongodb_backend_build_client_kwargs_auth(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("username") == "admin"
   assert kwargs.get("password") == "secret"
   assert kwargs.get("authSource") == "admin"
@@ -407,7 +407,7 @@ def test_mongodb_backend_build_client_kwargs_read_preference(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
 
-  kwargs = backend._build_client_kwargs()  # noqa: SLF001
+  kwargs = backend._build_client_kwargs()
   assert kwargs.get("readPreference") == "secondary"
 
 
@@ -418,7 +418,7 @@ def test_mongodb_backend_initialize_collections_raises_when_client_none():
   # _client is None by default
 
   with pytest.raises(BackendConnectionError) as exc_info:
-    backend._initialize_collections()  # noqa: SLF001
+    backend._initialize_collections()
   assert "MongoDB client not initialized" in str(exc_info.value)
 
 
@@ -515,10 +515,10 @@ def test_mongodb_backend_create_indexes_raises_when_collections_none(mocker):
   backend.connect()
 
   # Set collections to None to simulate uninitialized state
-  backend._queue_collection = None  # noqa: SLF001
+  backend._queue_collection = None
 
   with pytest.raises(BackendConnectionError) as exc_info:
-    backend._create_indexes()  # noqa: SLF001
+    backend._create_indexes()
   assert "Collections not initialized" in str(exc_info.value)
 
 
@@ -564,10 +564,10 @@ def test_mongodb_backend_assert_connected_raises(mocker):
   backend.connect()
 
   # Set collections to None to simulate disconnected state
-  backend._queue_collection = None  # noqa: SLF001
+  backend._queue_collection = None
 
   with pytest.raises(BackendConnectionError) as exc_info:
-    backend._assert_connected()  # noqa: SLF001
+    backend._assert_connected()
   assert "Not connected" in str(exc_info.value)
 
 
@@ -579,7 +579,7 @@ def test_mongodb_backend_pop_returns_none_when_empty(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._queue_collection = mock_collection  # noqa: SLF001
+  backend._queue_collection = mock_collection
   mock_collection.find_one_and_delete.return_value = None
 
   result = backend.pop("empty_queue")
@@ -596,7 +596,7 @@ def test_mongodb_backend_add_returns_false_on_duplicate_key(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._set_collection = mock_collection  # noqa: SLF001
+  backend._set_collection = mock_collection
   mock_collection.insert_one.side_effect = DuplicateKeyError("duplicate")
 
   result = backend.add("test_set", b"duplicate_item")
@@ -611,7 +611,7 @@ def test_mongodb_backend_store_with_ttl(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._storage_collection = mock_collection  # noqa: SLF001
+  backend._storage_collection = mock_collection
 
   backend.store("test_key", b"test_data", ttl=3600)
 
@@ -629,7 +629,7 @@ def test_mongodb_backend_retrieve_returns_none_when_not_found(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._storage_collection = mock_collection  # noqa: SLF001
+  backend._storage_collection = mock_collection
   mock_collection.find_one.return_value = None
 
   result = backend.retrieve("missing_key")
@@ -644,7 +644,7 @@ def test_mongodb_backend_clear_storage_with_prefix(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._storage_collection = mock_collection  # noqa: SLF001
+  backend._storage_collection = mock_collection
 
   backend.clear_storage(prefix="test_")
 
@@ -662,7 +662,7 @@ def test_mongodb_backend_clear_storage_without_prefix(mocker):
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
   backend.connect()
   mock_collection = mocker.MagicMock()
-  backend._storage_collection = mock_collection  # noqa: SLF001
+  backend._storage_collection = mock_collection
 
   backend.clear_storage(prefix=None)
 

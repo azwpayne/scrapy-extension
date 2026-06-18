@@ -2,7 +2,7 @@
 
 from enum import Enum
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,8 +28,8 @@ class RocketMQSettings(BaseSettings):
 
     # === Connection ===
     namesrv_address: str = Field(default="localhost:9876")
-    access_key: str | None = Field(default=None)
-    secret_key: str | None = Field(default=None)
+    access_key: SecretStr | None = Field(default=None)
+    secret_key: SecretStr | None = Field(default=None)
 
     # === Consumer Group ===
     consumer_group: str = Field(default="scrapy-extension-consumer")

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -131,7 +131,7 @@ class MongoDBSettings(BaseSettings):
     default=None,
     description="MongoDB username",
   )
-  password: str | None = Field(
+  password: SecretStr | None = Field(
     default=None,
     description="MongoDB password",
   )

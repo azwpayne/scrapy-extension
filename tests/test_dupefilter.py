@@ -1,5 +1,6 @@
 """Tests for BackendDupeFilter component."""
 
+import pytest
 from scrapy.http import Request
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
@@ -140,6 +141,46 @@ class TestBackendDupeFilterClassMethods:
     assert dupefilter.key == "crawler:filter"
     assert dupefilter.debug is True
 
+  def test_from_crawler_threads_request_fingerprinter(self, mocker):
+    """R45: from_crawler wires crawler.request_fingerprinter into the dupefilter."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    sentinel_fp = mocker.MagicMock(name="custom-fingerprinter")
+    mock_crawler = mocker.Mock()
+    mock_crawler.request_fingerprinter = sentinel_fp
+    mock_crawler.settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+    }.get(key, default)
+    mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
+      "DUPEFILTER_DEBUG": False,
+    }.get(key, default)
+    mock_crawler.settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
+    assert dupefilter._fingerprinter is sentinel_fp
+
+  def test_from_crawler_falls_back_when_no_fingerprinter(self, mocker):
+    """R45: a crawler without request_fingerprinter degrades to the default fn."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_crawler = mocker.Mock(spec=["settings"])  # no request_fingerprinter attr
+    mock_crawler.settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+    }.get(key, default)
+    mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
+      "DUPEFILTER_DEBUG": False,
+    }.get(key, default)
+    mock_crawler.settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
+    assert dupefilter._fingerprinter is None
+
 
 class TestBackendDupeFilterOpenClose:
   """Test BackendDupeFilter open and close methods."""
@@ -159,6 +200,14 @@ class TestBackendDupeFilterOpenClose:
     dupefilter.close("finished")
     dupefilter.close("closed")
     dupefilter.close("")
+
+  def test_close_calls_connection_manager_close(self, mock_connection_manager):
+    """Test close shuts down the connection manager."""
+    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+
+    dupefilter.close("finished")
+
+    mock_connection_manager.close.assert_called_once_with()
 
 
 class TestBackendDupeFilterLog:
@@ -246,7 +295,7 @@ class TestBackendDupeFilterRequestSeen:
     mock_set_backend.add.assert_called_once()
 
   def test_request_seen_backend_not_implemented(self, mock_connection_manager):
-    """Test request_seen returns False when backend does not support sets."""
+    """Test request_seen raises when backend does not support sets."""
     dupefilter = BackendDupeFilter(
       connection_manager=mock_connection_manager,
       key="test:dupefilter",
@@ -257,16 +306,16 @@ class TestBackendDupeFilterRequestSeen:
     )
 
     request = Request(url="https://example.com")
-    result = dupefilter.request_seen(request)
 
-    assert result is False  # Skip dedup when sets not supported
+    with pytest.raises(RuntimeError, match="does not support set/duplicate filtering"):
+      dupefilter.request_seen(request)
+
     mock_connection_manager.get_set_backend.assert_called_once()
 
   def test_request_seen_get_set_backend_raises_not_implemented_error(
-    self, mock_connection_manager, caplog
+    self, mock_connection_manager
   ):
-    """Test request_seen logs debug message when set operations not supported."""
-    import logging
+    """Test request_seen raises clear guidance when set operations unsupported."""
 
     dupefilter = BackendDupeFilter(
       connection_manager=mock_connection_manager,
@@ -279,14 +328,13 @@ class TestBackendDupeFilterRequestSeen:
 
     request = Request(url="https://example.com")
 
-    with caplog.at_level(logging.DEBUG):
-      result = dupefilter.request_seen(request)
+    with pytest.raises(RuntimeError) as exc_info:
+      dupefilter.request_seen(request)
 
-    assert result is False
-    assert (
-      "Backend does not support set operations" in caplog.text
-      or "skipping dedup" in caplog.text
-    )
+    message = str(exc_info.value)
+    assert "does not support set/duplicate filtering" in message
+    assert "use a backend with SetBackend" in message
+    assert "disable BackendDupeFilter" in message
 
   def test_request_seen_uses_fingerprint(self, mock_connection_manager):
     """Test request_seen uses request_fingerprint for fingerprinting."""
@@ -359,6 +407,44 @@ class TestBackendDupeFilterRequestFingerprint:
 
     # Should be valid hex
     int(fp, 16)
+
+  def test_request_fingerprint_uses_injected_fingerprinter(
+    self, mock_connection_manager, mocker
+  ):
+    """R45: an injected fingerprinter is used instead of the default module function.
+
+    BackendDupeFilter previously hardcoded ``scrapy.utils.request.fingerprint``,
+    silently ignoring any configured ``REQUEST_FINGERPRINTER_CLASS``. Now it
+    delegates to the injected fingerprinter (threaded from
+    ``crawler.request_fingerprinter`` via ``from_crawler``) when present.
+    """
+    mock_fp = mocker.MagicMock()
+    mock_fp.fingerprint.return_value = b"\xde\xad\xbe\xef"
+
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      fingerprinter=mock_fp,
+    )
+
+    request = Request(url="https://example.com")
+    result = dupefilter.request_fingerprint(request)
+
+    mock_fp.fingerprint.assert_called_once_with(request)
+    assert result == b"\xde\xad\xbe\xef".hex()  # "deadbeef"
+
+  def test_request_fingerprint_falls_back_when_no_fingerprinter(
+    self, mock_connection_manager
+  ):
+    """R45: without an injected fingerprinter, behavior is unchanged (default fn)."""
+    from scrapy.utils.request import fingerprint as scrapy_fingerprint
+
+    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    assert dupefilter._fingerprinter is None
+
+    request = Request(url="https://example.com")
+    assert (
+      dupefilter.request_fingerprint(request) == scrapy_fingerprint(request).hex()
+    )
 
 
 class TestBackendDupeFilterIntegration:

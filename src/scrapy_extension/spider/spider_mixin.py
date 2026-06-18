@@ -6,9 +6,12 @@ to Scrapy spiders, enabling distributed crawling capabilities.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from scrapy import Spider, signals
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import BackendType
@@ -18,13 +21,14 @@ if TYPE_CHECKING:
   from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
-class BackendSpiderMixin:
-  name: str  # provided by Spider when used as mixin
-  """Mixin class for spiders to integrate with backend components.
+class BackendSpiderMixin(Spider):
+  """Spider subclass that integrates with backend components.
 
-  This mixin provides convenient access to backend functionality including
-  queues, dupefilters, and schedulers. It handles connection lifecycle
-  management through Scrapy signals.
+  Inherits from :class:`scrapy.Spider` so ``self`` is statically a Spider,
+  enabling ``BackendQueue`` to resolve callback/errback names during request
+  deserialization. Provides convenient access to backend functionality
+  including queues, dupefilters, and schedulers, with connection lifecycle
+  management via Scrapy signals.
 
   Attributes:
       backend_type: The type of backend to use (e.g., REDIS, MONGODB).
@@ -39,7 +43,7 @@ class BackendSpiderMixin:
       rabbitmq_url: Shortcut for RabbitMQ connection URL.
 
   Example:
-      class MySpider(BackendSpiderMixin, Spider):
+      class MySpider(BackendSpiderMixin):
           name = "myspider"
           backend_type = BackendType.REDIS
           redis_host = "localhost"
@@ -69,6 +73,16 @@ class BackendSpiderMixin:
 
   # RabbitMQ shortcut settings
   rabbitmq_url: str | None = None
+
+  # ElasticSearch shortcut settings
+  elasticsearch_hosts: list[str] | None = None
+  elasticsearch_cloud_id: str | None = None
+  elasticsearch_api_key: str | None = None
+
+  # RocketMQ shortcut settings
+  rocketmq_namesrv_address: str | None = None
+  rocketmq_access_key: str | None = None
+  rocketmq_secret_key: str | None = None
 
   def __init__(self, **kwargs: Any) -> None:
     """Initialize the mixin.
@@ -156,8 +170,23 @@ class BackendSpiderMixin:
     elif backend_value == "kafka":
       if self.kafka_bootstrap_servers is not None:
         settings["bootstrap_servers"] = self.kafka_bootstrap_servers
-    elif backend_value == "rabbitmq" and self.rabbitmq_url is not None:
-      settings["url"] = self.rabbitmq_url
+    elif backend_value == "rabbitmq":
+      if self.rabbitmq_url is not None:
+        settings["url"] = self.rabbitmq_url
+    elif backend_value == "elasticsearch":
+      if self.elasticsearch_hosts is not None:
+        settings["hosts"] = self.elasticsearch_hosts
+      if self.elasticsearch_cloud_id is not None:
+        settings["cloud_id"] = self.elasticsearch_cloud_id
+      if self.elasticsearch_api_key is not None:
+        settings["api_key"] = self.elasticsearch_api_key
+    elif backend_value == "rocketmq":
+      if self.rocketmq_namesrv_address is not None:
+        settings["namesrv_address"] = self.rocketmq_namesrv_address
+      if self.rocketmq_access_key is not None:
+        settings["access_key"] = self.rocketmq_access_key
+      if self.rocketmq_secret_key is not None:
+        settings["secret_key"] = self.rocketmq_secret_key
 
     return settings
 
@@ -180,15 +209,23 @@ class BackendSpiderMixin:
     if spider is self and self._connection_manager is not None:
       self._connection_manager.connect()
 
-  def _on_spider_closed(self, spider: Spider, reason: str = "") -> None:  # noqa: ARG002
+  def _on_spider_closed(self, spider: Spider, reason: str = "") -> None:
     """Handle spider_closed signal.
+
+    Wrapped in try/except so a failure in ``close_backend`` doesn't break
+    Scrapy's signal chain — other spider_closed handlers (stats, logging,
+    extensions) still need to fire.
 
     Args:
         spider: The spider instance that was closed.
         reason: The reason for closing the spider (unused, provided by Scrapy).
     """
-    if spider is self:
+    if spider is not self:
+      return
+    try:
       self.close_backend()
+    except Exception:
+      logger.exception("close_backend() failed during spider_closed signal")
 
   def get_queue(self, queue_name: str | None = None) -> BackendQueue:
     """Get the backend queue for this spider.
@@ -217,6 +254,7 @@ class BackendSpiderMixin:
       self._queue = BackendQueue(
         connection_manager=self._connection_manager,
         queue_name=name,
+        spider=self,
       )
 
     return self._queue
@@ -269,7 +307,6 @@ class BackendSpiderMixin:
       self._scheduler = BackendScheduler(
         connection_manager=self._connection_manager,
         queue_key=f"{self.name}:queue",
-        dupefilter_key=f"{self.name}:dupefilter",
       )
 
     return self._scheduler

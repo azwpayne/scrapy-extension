@@ -20,6 +20,14 @@ def mock_connection_manager(mocker):
 
 
 @pytest.fixture
+def mock_spider(mocker):
+  """Create a mock Scrapy spider for BackendQueue callback resolution."""
+  from scrapy import Spider
+
+  return mocker.MagicMock(spec=Spider)
+
+
+@pytest.fixture
 def sample_request():
   """Create a sample Scrapy request."""
   from scrapy.http import Request

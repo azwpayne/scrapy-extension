@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -75,7 +75,7 @@ class KafkaSettings(BaseSettings):
     default=None,
     description="SASL username",
   )
-  sasl_password: str | None = Field(
+  sasl_password: SecretStr | None = Field(
     default=None,
     description="SASL password",
   )
@@ -97,11 +97,11 @@ class KafkaSettings(BaseSettings):
   )
 
   # === Confluent Cloud Settings ===
-  confluent_api_key: str | None = Field(
+  confluent_api_key: SecretStr | None = Field(
     default=None,
     description="Confluent Cloud API key",
   )
-  confluent_api_secret: str | None = Field(
+  confluent_api_secret: SecretStr | None = Field(
     default=None,
     description="Confluent Cloud API secret",
   )
@@ -158,8 +158,12 @@ class KafkaSettings(BaseSettings):
     description="Auto offset reset (earliest, latest)",
   )
   enable_auto_commit: bool = Field(
-    default=True,
-    description="Enable auto commit",
+    default=False,
+    description=(
+      "Enable auto commit. Defaults to False so callers control ack timing "
+      "via QueueBackend.ack(); auto-commit acks before processing and "
+      "loses messages if the worker crashes mid-request."
+    ),
   )
   auto_commit_interval_ms: int = Field(
     default=5000,

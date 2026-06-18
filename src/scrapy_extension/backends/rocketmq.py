@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
   QueueBackend,
-  _hash_item,
-  _validate_key_name,
+  secret_value,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.settings import RocketMQMode
@@ -38,6 +37,7 @@ class RocketMQBackend(Backend, QueueBackend):
     self.config = config
     self._producer = None
     self._consumer = None
+    self._subscribed_topics: set[str] = set()
 
   def connect(self) -> None:
     """Establish connection to RocketMQ.
@@ -48,7 +48,7 @@ class RocketMQBackend(Backend, QueueBackend):
     """
     try:
       from rocketmq.auth.credentials import PlainCredentials
-      from rocketmq.client import Producer, PushConsumer
+      from rocketmq.client import Producer
       from rocketmq.consumer import SimpleConsumer
       from rocketmq.endpoint import Endpoint
     except ImportError as e:
@@ -76,8 +76,8 @@ class RocketMQBackend(Backend, QueueBackend):
       credentials = None
       if self.config.access_key and self.config.secret_key:
         credentials = PlainCredentials(
-          self.config.access_key,
-          self.config.secret_key,
+          secret_value(self.config.access_key),
+          secret_value(self.config.secret_key),
         )
 
       # Create producer
@@ -95,6 +95,7 @@ class RocketMQBackend(Backend, QueueBackend):
         credentials=credentials,
         request_timeout_ms=self.config.send_timeout,
       )
+      self._consumer.start()
 
       logger.debug(
         "Connected to RocketMQ at %s", self.config.namesrv_address
@@ -116,6 +117,7 @@ class RocketMQBackend(Backend, QueueBackend):
     if self._consumer:
       self._consumer.shutdown()
       self._consumer = None
+    self._subscribed_topics.clear()
     logger.debug("Disconnected from RocketMQ")
 
   def is_connected(self) -> bool:
@@ -130,7 +132,16 @@ class RocketMQBackend(Backend, QueueBackend):
     """Check RocketMQ health.
 
     Returns:
-      True if connected and responsive.
+      True if the backend reports connected and both the producer and
+      consumer clients are initialized.
+
+    Note:
+      This is a **local-state** check (``is_connected`` + client presence),
+      not a broker round-trip — unlike Redis's ``PING`` or Kafka's
+      ``list_topics``. A broker that has gone down but whose socket hasn't
+      timed out may still report True. A real liveness probe would need a
+      broker round-trip; the right one for RocketMQ is an open design
+      question (R1-P2-16) left to the operator.
     """
     if not self.is_connected():
       return False
@@ -156,6 +167,23 @@ class RocketMQBackend(Backend, QueueBackend):
       Full topic name.
     """
     return f"{self.config.topic_prefix}_{queue_name}"
+
+  def _ensure_subscribed(self, topic_name: str) -> None:
+    """Ensure the consumer is subscribed to ``topic_name``.
+
+    RocketMQ's SimpleConsumer only receives messages from topics it has
+    subscribed to. Without this call, ``receive()`` returns nothing
+    regardless of what producers push. Subscriptions are tracked in-session
+    to avoid the overhead of re-subscribing on every pop.
+
+    Args:
+      topic_name: Full topic name to subscribe to.
+    """
+    if topic_name in self._subscribed_topics:
+      return
+    if self._consumer is not None:
+      self._consumer.subscribe(topic_name)
+      self._subscribed_topics.add(topic_name)
 
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to queue.
@@ -209,6 +237,7 @@ class RocketMQBackend(Backend, QueueBackend):
 
     try:
       topic_name = self._get_topic_name(queue_name)
+      self._ensure_subscribed(topic_name)
       timeout_ms = int(timeout * 1000) if timeout > 0 else 3000
       messages = self._consumer.receive(timeout_ms)
       if not messages:
@@ -360,32 +389,12 @@ class RocketMQBackend(Backend, QueueBackend):
         key: Storage key.
         data: Data to store (bytes).
         ttl: Optional time-to-live in seconds.
+
+    Raises:
+        NotImplementedError: RocketMQ does not support storage operations.
     """
-    from scrapy_extension.exceptions import QueueError
-
-    if not self.is_connected():
-      msg = "Not connected to RocketMQ"
-      raise QueueError(msg)
-
-    try:
-      from rocketmq.message import Message
-
-      topic_name = self._get_storage_topic_name()
-      msg = Message(topic_name)
-      msg.set_keys(key)
-      msg.set_body(data)
-      if ttl is not None:
-        # RocketMQ max delay time level is 18 hours
-        msg.set_delay_time_level(max(1, min(ttl // 3600, 18)))
-      self._producer.send(msg)
-    except OSError as e:
-      # Network-level send failures
-      msg = f"Failed to store data: {e}"
-      raise QueueError(msg) from e
-    except Exception as e:
-      # Unexpected errors during message send
-      msg = f"Failed to store data: {e}"
-      raise QueueError(msg) from e
+    msg = "RocketMQ does not support store(). Use a dedicated backend for key-value storage."
+    raise NotImplementedError(msg)
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.

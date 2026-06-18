@@ -24,7 +24,13 @@ except ImportError as e:
         "Kafka backend requires 'kafka-python'. Install with: pip install scrapy-extension[kafka]"
     ) from e
 
-from scrapy_extension.backends.base import Backend, BackendType, QueueBackend, _get_mode_text
+from scrapy_extension.backends.base import (
+    Backend,
+    BackendType,
+    QueueBackend,
+    _get_mode_text,
+    secret_value,
+)
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
@@ -35,6 +41,26 @@ from scrapy_extension.settings import KafkaMode
 # Topic name validation pattern - only allow alphanumeric, dots, underscores, hyphens
 # Uses \Z instead of $ to match only at absolute end of string (not before trailing newline)
 TOPIC_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+\Z")
+
+
+class _RedactedStr(str):
+  """str subclass that hides its value in repr().
+
+  Used for SASL passwords in client config dicts so that ``repr(config)``
+  and traceback dumps of locals don't reveal the raw credential. The
+  underlying value remains a normal ``str`` for client libraries
+  (kafka-python) that consume it via ``str()`` semantics.
+
+  Note: this is defense-in-depth against accidental logging / Sentry
+  capture, NOT against an adversary who can read process memory. The
+  raw value is still reachable via ``str(instance)`` or by indexing.
+  """
+
+  __slots__ = ()
+
+  def __repr__(self) -> str:
+    return "<redacted>"
+
 
 
 def _validate_topic_name(name: str) -> None:
@@ -83,6 +109,7 @@ class KafkaBackend(Backend, QueueBackend):
     self.config = config
     self._producer: KafkaProducer | None = None
     self._consumer: KafkaConsumer | None = None
+    self._last_record: Any = None
     self._admin_client: KafkaAdminClient | None = None
     # Cache known topics to avoid repeated existence checks
     self._known_topics: set[str] = set()
@@ -156,7 +183,7 @@ class KafkaBackend(Backend, QueueBackend):
       ):
         config["sasl_mechanism"] = self.config.sasl_mechanism
         config["sasl_plain_username"] = self.config.sasl_username
-        config["sasl_plain_password"] = self.config.sasl_password
+        config["sasl_plain_password"] = _RedactedStr(secret_value(self.config.sasl_password))
 
       if self.config.ssl_cafile:
         config["ssl_cafile"] = self.config.ssl_cafile
@@ -168,40 +195,77 @@ class KafkaBackend(Backend, QueueBackend):
 
     return config
 
+  def _bootstrap_servers(self) -> str:
+    """Return bootstrap servers for the current Kafka mode."""
+    if self.config.mode == KafkaMode.CLUSTER and self.config.cluster_brokers:
+      return ",".join(self.config.cluster_brokers)
+    if self.config.mode == KafkaMode.CONFLUENT:
+      return self.config.confluent_bootstrap_servers or self.config.bootstrap_servers
+    return self.config.bootstrap_servers
+
+  def _build_client_security_config(self) -> dict[str, Any]:
+    """Build consumer/admin-safe security config without producer-only args."""
+    if self.config.mode == KafkaMode.CONFLUENT:
+      if self.config.confluent_api_key and self.config.confluent_api_secret:
+        return {
+          "security_protocol": "SASL_SSL",
+          "sasl_mechanism": "PLAIN",
+          "sasl_plain_username": secret_value(self.config.confluent_api_key),
+          "sasl_plain_password": secret_value(self.config.confluent_api_secret),
+        }
+
+    common_config = self._build_common_config()
+    client_config: dict[str, Any] = {}
+    for key in (
+      "security_protocol",
+      "sasl_mechanism",
+      "sasl_plain_username",
+      "sasl_plain_password",
+      "ssl_cafile",
+      "ssl_certfile",
+      "ssl_keyfile",
+      "ssl_check_hostname",
+    ):
+      if key in common_config:
+        client_config[key] = common_config[key]
+    return client_config
+
+  def _build_producer_config(self) -> dict[str, Any]:
+    """Build producer config with mode-specific bootstrap and security settings."""
+    config = self._build_common_config()
+    config["bootstrap_servers"] = self._bootstrap_servers()
+    if self.config.mode == KafkaMode.CONFLUENT:
+      config.update(self._build_client_security_config())
+    return config
+
   def _connect_standalone(self) -> None:
     """Connect to standalone Kafka broker."""
-    common_config = self._build_common_config()
+    bootstrap = self._bootstrap_servers()
+    producer_config = self._build_producer_config()
+    client_security_config = self._build_client_security_config()
 
-    self._producer = KafkaProducer(
-      bootstrap_servers=self.config.bootstrap_servers,
-      **common_config,
-    )
+    self._producer = KafkaProducer(**producer_config)
     self._admin_client = KafkaAdminClient(
-      bootstrap_servers=self.config.bootstrap_servers,
+      bootstrap_servers=bootstrap,
       client_id="scrapy-extension-admin",
+      **client_security_config,
     )
-    logger.debug("Connected to standalone Kafka at %s", self.config.bootstrap_servers)
+    logger.debug("Connected to standalone Kafka at %s", bootstrap)
 
   def _connect_cluster(self) -> None:
     """Connect to Kafka cluster.
 
     Uses cluster_brokers if configured, otherwise falls back to bootstrap_servers.
     """
-    common_config = self._build_common_config()
+    bootstrap = self._bootstrap_servers()
+    producer_config = self._build_producer_config()
+    client_security_config = self._build_client_security_config()
 
-    # Use cluster brokers if available
-    if self.config.cluster_brokers:
-      bootstrap = ",".join(self.config.cluster_brokers)
-    else:
-      bootstrap = self.config.bootstrap_servers
-
-    self._producer = KafkaProducer(
-      bootstrap_servers=bootstrap,
-      **common_config,
-    )
+    self._producer = KafkaProducer(**producer_config)
     self._admin_client = KafkaAdminClient(
       bootstrap_servers=bootstrap,
       client_id="scrapy-extension-admin",
+      **client_security_config,
     )
     logger.debug("Connected to Kafka cluster at %s", bootstrap)
 
@@ -210,51 +274,17 @@ class KafkaBackend(Backend, QueueBackend):
 
     Uses SASL/SSL authentication with Confluent-specific settings.
     """
-    if self.config.confluent_api_key and self.config.confluent_api_secret:
-      # Use Confluent Cloud API key/secret
-      bootstrap = (
-        self.config.confluent_bootstrap_servers or self.config.bootstrap_servers
-      )
+    bootstrap = self._bootstrap_servers()
+    producer_config = self._build_producer_config()
+    client_security_config = self._build_client_security_config()
 
-      self._producer = KafkaProducer(
-        bootstrap_servers=bootstrap,
-        security_protocol="SASL_SSL",
-        sasl_mechanism="PLAIN",
-        sasl_plain_username=self.config.confluent_api_key,
-        sasl_plain_password=self.config.confluent_api_secret,
-        acks=self.config.acks,
-        retries=self.config.retries,
-        batch_size=self.config.batch_size,
-        linger_ms=self.config.linger_ms,
-        compression_type=self.config.compression_type,
-        max_in_flight_requests_per_connection=self.config.max_in_flight_requests_per_connection,
-        request_timeout_ms=self.config.request_timeout_ms,
-      )
-      self._admin_client = KafkaAdminClient(
-        bootstrap_servers=bootstrap,
-        client_id="scrapy-extension-admin",
-        security_protocol="SASL_SSL",
-        sasl_mechanism="PLAIN",
-        sasl_plain_username=self.config.confluent_api_key,
-        sasl_plain_password=self.config.confluent_api_secret,
-      )
-      logger.debug("Connected to Confluent Cloud at %s", bootstrap)
-    else:
-      # Fall back to configured SASL settings
-      common_config = self._build_common_config()
-      bootstrap = (
-        self.config.confluent_bootstrap_servers or self.config.bootstrap_servers
-      )
-
-      self._producer = KafkaProducer(
-        bootstrap_servers=bootstrap,
-        **common_config,
-      )
-      self._admin_client = KafkaAdminClient(
-        bootstrap_servers=bootstrap,
-        client_id="scrapy-extension-admin",
-      )
-      logger.debug("Connected to Confluent-compatible cluster at %s", bootstrap)
+    self._producer = KafkaProducer(**producer_config)
+    self._admin_client = KafkaAdminClient(
+      bootstrap_servers=bootstrap,
+      client_id="scrapy-extension-admin",
+      **client_security_config,
+    )
+    logger.debug("Connected to Confluent Cloud at %s", bootstrap)
 
   def disconnect(self) -> None:
     """Close Kafka connection."""
@@ -352,7 +382,7 @@ class KafkaBackend(Backend, QueueBackend):
     try:
       self._ensure_topic_exists(queue_name)
       topic_name = f"scrapy-{queue_name}"
-      partition = min(int(priority), self.config.max_priority_partitions - 1)
+      partition = max(0, min(int(priority), self.config.max_priority_partitions - 1))
 
       assert self._producer is not None
       future = self._producer.send(topic_name, value=item, partition=partition)
@@ -387,13 +417,14 @@ class KafkaBackend(Backend, QueueBackend):
       # Create consumer if not exists
       if self._consumer is None:
         self._consumer = KafkaConsumer(
-          bootstrap_servers=self.config.bootstrap_servers,
+          bootstrap_servers=self._bootstrap_servers(),
           group_id=self.config.group_id,
           auto_offset_reset=self.config.auto_offset_reset,
           enable_auto_commit=self.config.enable_auto_commit,
           auto_commit_interval_ms=self.config.auto_commit_interval_ms,
           max_poll_records=self.config.max_poll_records,
           session_timeout_ms=self.config.session_timeout_ms,
+          **self._build_client_security_config(),
         )
 
       assert self._consumer is not None
@@ -405,6 +436,13 @@ class KafkaBackend(Backend, QueueBackend):
 
       for records in messages.values():
         for record in records:
+          if self._last_record is not None:
+            logger.warning(
+              "pop() called while previous message is unacked — "
+              "CONCURRENT_REQUESTS>1 breaks ack tracking. "
+              "Set CONCURRENT_REQUESTS=1 for correct at-least-once delivery."
+            )
+          self._last_record = record
           return record.value
     except KafkaError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
@@ -414,6 +452,30 @@ class KafkaBackend(Backend, QueueBackend):
         operation="pop",
       ) from e
     return None
+
+  def ack(self, queue_name: str) -> None:
+    """Commit the last-popped offset so it isn't re-delivered on restart.
+
+    Idempotent: clears the tracked record after committing so duplicate
+    ack calls are safe.
+    """
+    if self._consumer is None or self._last_record is None:
+      return
+    try:
+      self._consumer.commit()
+    except KafkaError as e:
+      msg = f"Failed to ack Kafka message: {e}"
+      raise QueueError(msg, operation="ack") from e
+    finally:
+      self._last_record = None
+
+  def nack(self, queue_name: str) -> None:
+    """Kafka cannot re-deliver a polled message within the same session.
+
+    The record's offset is not committed, so on the next consumer restart
+    the message is re-delivered. Within a running session, nack is a no-op.
+    """
+    self._last_record = None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -431,28 +493,43 @@ class KafkaBackend(Backend, QueueBackend):
         This is eventually consistent and should be used for monitoring only.
     """
     _validate_topic_name(queue_name)
-    try:
-      topic_name = f"scrapy-{queue_name}"
-      assert self._admin_client is not None
-      topic_meta = self._admin_client.describe_topics([topic_name])
-      partition_ids = [p["partition"] for p in topic_meta[0]["partitions"]]
-      tps = [TopicPartition(topic_name, pid) for pid in partition_ids]
-
-      # Use a temporary consumer to query offsets
-      temp_consumer = KafkaConsumer(
-        bootstrap_servers=self.config.bootstrap_servers,
-        group_id=None,
-      )
+    if self._consumer is not None:
       try:
-        begin_offsets = temp_consumer.beginning_offsets(tps)
-        end_offsets = temp_consumer.end_offsets(tps)
-        total = sum(end_offsets[tp] - begin_offsets[tp] for tp in tps)
-      finally:
-        temp_consumer.close()
+        assignment = self._consumer.assignment()
+        if not assignment:
+          return 0
+        end_offsets = self._consumer.end_offsets(assignment)
+        total = sum(
+          max(0, end_offsets[tp] - self._consumer.position(tp))
+          for tp in assignment
+        )
+      except KafkaError:
+        return 0
+      return total
+
+    topic_name = f"scrapy-{queue_name}"
+    temp_consumer = KafkaConsumer(
+      bootstrap_servers=self._bootstrap_servers(),
+      group_id=self.config.group_id,
+      enable_auto_commit=False,
+      **self._build_client_security_config(),
+    )
+    try:
+      partitions = temp_consumer.partitions_for_topic(topic_name)
+      if not partitions:
+        return 0
+      assignment = {TopicPartition(topic_name, partition) for partition in partitions}
+      temp_consumer.assign(list(assignment))
+      end_offsets = temp_consumer.end_offsets(list(assignment))
+      total = sum(
+        max(0, end_offsets[tp] - temp_consumer.position(tp))
+        for tp in assignment
+      )
     except KafkaError:
       return 0
-    else:
-      return total
+    finally:
+      temp_consumer.close()
+    return total
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.

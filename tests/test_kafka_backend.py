@@ -125,7 +125,7 @@ class TestKafkaBackendBuildCommonConfig:
     assert result["security_protocol"] == "SASL_SSL"
     assert result["sasl_mechanism"] == "PLAIN"
     assert result["sasl_plain_username"] == "myuser"
-    assert result["sasl_plain_password"] == "mypass"  # noqa: S105
+    assert result["sasl_plain_password"] == "mypass"
     assert result["ssl_cafile"] == "/path/to/cafile"
     assert result["ssl_certfile"] == "/path/to/certfile"
     assert result["ssl_keyfile"] == "/path/to/keyfile"
@@ -256,7 +256,7 @@ class TestKafkaBackendConfluentMode:
       security_protocol="SASL_SSL",
       sasl_mechanism="PLAIN",
       sasl_username="user",
-      sasl_password="pass",  # noqa: S105
+      sasl_password="pass",
     )
     backend = KafkaBackend(config)
 
@@ -273,6 +273,30 @@ class TestKafkaBackendConfluentMode:
     backend.connect()
 
     assert backend.is_connected()
+
+
+class TestKafkaBackendPush:
+  """Tests for push() priority mapping."""
+
+  def test_push_clamps_negative_priority_to_partition_zero(self, mocker):
+    """Negative priorities must map to the lowest valid partition."""
+    config = KafkaSettings(max_priority_partitions=10)
+    backend = KafkaBackend(config)
+
+    mock_future = mocker.MagicMock()
+    mock_producer = mocker.MagicMock()
+    mock_producer.send.return_value = mock_future
+    backend._producer = mock_producer
+    backend._admin_client = mocker.MagicMock()
+
+    backend.push("test-queue", b"item", priority=-3)
+
+    mock_producer.send.assert_called_once_with(
+      "scrapy-test-queue",
+      value=b"item",
+      partition=0,
+    )
+    mock_future.get.assert_called_once_with(timeout=10)
 
 
 class TestKafkaBackendDisconnect:
@@ -531,6 +555,64 @@ class TestKafkaBackendPop:
 
     assert result == b"data"
 
+  def test_pop_cluster_mode_uses_cluster_bootstrap_servers(self, mocker):
+    """Test pop creates consumer with cluster brokers in cluster mode."""
+    config = KafkaSettings(
+      mode=KafkaMode.CLUSTER,
+      bootstrap_servers="fallback:9092",
+      cluster_brokers=["broker1:9092", "broker2:9092"],
+    )
+    backend = KafkaBackend(config)
+
+    mock_consumer = mocker.MagicMock()
+    mock_record = mocker.MagicMock()
+    mock_record.value = b"data"
+    mock_consumer.poll.return_value = {
+      TopicPartition("scrapy-testq", 0): [mock_record],
+    }
+    consumer_cls = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer",
+      return_value=mock_consumer,
+    )
+
+    result = backend.pop("testq", timeout=0.0)
+
+    assert result == b"data"
+    assert consumer_cls.call_args.kwargs["bootstrap_servers"] == "broker1:9092,broker2:9092"
+
+  def test_pop_confluent_mode_uses_security_config(self, mocker):
+    """Test pop creates consumer with Confluent SASL/SSL settings."""
+    config = KafkaSettings(
+      mode=KafkaMode.CONFLUENT,
+      bootstrap_servers="fallback:9092",
+      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+      confluent_api_key="test_key",
+      confluent_api_secret="test_secret",
+    )
+    backend = KafkaBackend(config)
+
+    mock_consumer = mocker.MagicMock()
+    mock_record = mocker.MagicMock()
+    mock_record.value = b"data"
+    mock_consumer.poll.return_value = {
+      TopicPartition("scrapy-testq", 0): [mock_record],
+    }
+    consumer_cls = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer",
+      return_value=mock_consumer,
+    )
+
+    result = backend.pop("testq", timeout=0.0)
+
+    assert result == b"data"
+    assert consumer_cls.call_args.kwargs["bootstrap_servers"] == (
+      "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+    )
+    assert consumer_cls.call_args.kwargs["security_protocol"] == "SASL_SSL"
+    assert consumer_cls.call_args.kwargs["sasl_mechanism"] == "PLAIN"
+    assert consumer_cls.call_args.kwargs["sasl_plain_username"] == "test_key"
+    assert consumer_cls.call_args.kwargs["sasl_plain_password"] == "test_secret"
+
   def test_pop_raises_queue_error_on_kafka_error(self, mocker):
     """Test pop raises QueueError on KafkaError."""
     config = KafkaSettings()
@@ -546,57 +628,156 @@ class TestKafkaBackendPop:
     assert exc_info.value.queue_name == "testq"
     assert exc_info.value.operation == "pop"
 
+  def test_pop_does_not_auto_ack_after_round_12(self, mocker):
+    """Round 12: pop no longer auto-commits — ack is driven by Scrapy signals.
+
+    This preserves at-least-once semantics: if the worker crashes before
+    the signal fires, the offset isn't committed and the message
+    re-delivers on consumer restart.
+    """
+    from kafka.structs import TopicPartition
+
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    mock_record = mocker.MagicMock()
+    mock_record.value = b"payload"
+    tp = TopicPartition("test_topic", 0)
+    mock_consumer.poll.return_value = {tp: [mock_record]}
+    backend._consumer = mock_consumer
+
+    result = backend.pop("testq")
+
+    assert result == b"payload"
+    # The record is tracked for signal-driven ack, but NOT committed yet.
+    assert backend._last_record is mock_record
+    mock_consumer.commit.assert_not_called()
+
+  def test_ack_commits_tracked_record(self, mocker):
+    """ack() commits the offset after the signal fires."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    backend._consumer = mock_consumer
+    backend._last_record = mocker.MagicMock()
+
+    backend.ack("testq")
+
+    mock_consumer.commit.assert_called_once()
+    assert backend._last_record is None
+
+  def test_ack_is_idempotent(self, mocker):
+    """Calling ack twice is safe — second call is a no-op (no tracked record)."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    backend._consumer = mock_consumer
+
+    backend.ack("testq")
+    backend.ack("testq")
+
+    assert mock_consumer.commit.call_count == 0
+
+  def test_ack_raises_on_commit_failure(self, mocker):
+    """ack() wraps commit errors as QueueError."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.commit.side_effect = KafkaError("commit failed")
+    backend._consumer = mock_consumer
+    backend._last_record = mocker.MagicMock()
+
+    with pytest.raises(QueueError, match="ack"):
+      backend.ack("testq")
+
 
 class TestKafkaBackendQueueLen:
-  """Tests for queue_len method."""
+  """Tests for queue_len method.
 
-  def test_queue_len_success(self, mocker):
-    """Test queue_len returns correct count."""
+  R3-G4: queue_len now reuses the existing consumer instead of creating a
+  temporary one per call. Uses end_offsets - position for lag calculation.
+  """
+
+  def test_queue_len_returns_lag_from_consumer(self, mocker):
+    """queue_len returns sum(end_offset - position) across assigned partitions."""
     config = KafkaSettings()
     backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.describe_topics.return_value = [
-      {
-        "partition": 0,
-        "partitions": [
-          {"partition": 0},
-          {"partition": 1},
-        ],
-      },
-    ]
-    backend._admin_client = mock_admin
+    tp0 = TopicPartition("scrapy-testq", 0)
+    tp1 = TopicPartition("scrapy-testq", 1)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.assignment.return_value = {tp0, tp1}
+    mock_consumer.end_offsets.return_value = {tp0: 10, tp1: 5}
+    mock_consumer.position.side_effect = lambda tp: {tp0: 3, tp1: 1}[tp]
+    backend._consumer = mock_consumer
 
-    mock_temp_consumer = mocker.MagicMock()
-    mock_temp_consumer.beginning_offsets.return_value = {
-      TopicPartition("scrapy-testq", 0): 0,
-      TopicPartition("scrapy-testq", 1): 0,
-    }
-    mock_temp_consumer.end_offsets.return_value = {
-      TopicPartition("scrapy-testq", 0): 10,
-      TopicPartition("scrapy-testq", 1): 5,
-    }
-    mocker.patch(
+    result = backend.queue_len("testq")
+
+    assert result == 11  # (10-3) + (5-1) = 11
+
+  def test_queue_len_creates_temp_consumer_with_confluent_security_config(self, mocker):
+    """queue_len temporary consumer reuses Confluent bootstrap and security settings."""
+    config = KafkaSettings(
+      mode=KafkaMode.CONFLUENT,
+      bootstrap_servers="fallback:9092",
+      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+      confluent_api_key="test_key",
+      confluent_api_secret="test_secret",
+      group_id="lag-checker",
+    )
+    backend = KafkaBackend(config)
+
+    tp = TopicPartition("scrapy-testq", 0)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.partitions_for_topic.return_value = {0}
+    mock_consumer.end_offsets.return_value = {tp: 8}
+    mock_consumer.position.return_value = 3
+    consumer_cls = mocker.patch(
       "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=mock_temp_consumer,
+      return_value=mock_consumer,
     )
 
     result = backend.queue_len("testq")
 
-    assert result == 15  # (10-0) + (5-0) = 15
+    assert result == 5
+    assert consumer_cls.call_args.kwargs["bootstrap_servers"] == (
+      "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+    )
+    assert consumer_cls.call_args.kwargs["security_protocol"] == "SASL_SSL"
+    assert consumer_cls.call_args.kwargs["sasl_mechanism"] == "PLAIN"
+    assert consumer_cls.call_args.kwargs["sasl_plain_username"] == "test_key"
+    assert consumer_cls.call_args.kwargs["sasl_plain_password"] == "test_secret"
+    mock_consumer.close.assert_called_once()
 
-  def test_queue_len_returns_zero_on_kafka_error(self, mocker):
-    """Test queue_len returns 0 on KafkaError."""
+  def test_queue_len_returns_zero_when_no_consumer(self, mocker):
+    """queue_len returns 0 before consumer is created (no pop called yet)."""
     config = KafkaSettings()
     backend = KafkaBackend(config)
+    backend._consumer = None
+    mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.describe_topics.side_effect = KafkaError("Describe failed")
-    backend._admin_client = mock_admin
+    assert backend.queue_len("testq") == 0
 
-    result = backend.queue_len("testq")
+  def test_queue_len_returns_zero_when_no_assignment(self, mocker):
+    """queue_len returns 0 when consumer hasn't been assigned partitions yet."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.assignment.return_value = set()
+    backend._consumer = mock_consumer
 
-    assert result == 0
+    assert backend.queue_len("testq") == 0
+
+  def test_queue_len_returns_zero_on_kafka_error(self, mocker):
+    """queue_len returns 0 on KafkaError from end_offsets/position."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.assignment.return_value = {TopicPartition("t", 0)}
+    mock_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
+    backend._consumer = mock_consumer
+
+    assert backend.queue_len("testq") == 0
 
 
 class TestKafkaBackendClearQueue:
@@ -705,3 +886,42 @@ def test_kafka_backend_only_implements_queuebackend():
 
   assert isinstance(backend, Backend)
   assert isinstance(backend, QueueBackend)
+
+
+def test_kafka_sasl_password_repr_does_not_leak():
+  """R2-B2: SASL password in producer config must be redacted in repr().
+
+  Without _RedactedStr wrapping, ``repr(config)`` (e.g., in a Sentry
+  traceback capturing locals) would show the raw password. The wrapper
+  keeps the value usable as a str for kafka-python while hiding it from
+  repr-based introspection.
+  """
+  from scrapy_extension.backends.kafka import _RedactedStr
+
+  secret = _RedactedStr("hunter2-secret-password")
+  assert str(secret) == "hunter2-secret-password"  # value intact for client lib
+  assert "hunter2" not in repr(secret)
+  assert "<redacted>" in repr(secret)
+
+
+def test_kafka_build_common_config_redacts_sasl_password(mocker):
+  """R2-B2: _build_common_config returns dict whose repr doesn't leak SASL password."""
+  from scrapy_extension.backends.kafka import KafkaBackend
+  from scrapy_extension.settings.kafka import KafkaSettings
+
+  config = KafkaSettings(
+    security_protocol="SASL_PLAINTEXT",
+    sasl_mechanism="PLAIN",
+    sasl_username="alice",
+    sasl_password="super-secret-pwd",
+  )
+  backend = KafkaBackend(config)
+  built = backend._build_common_config()
+
+  assert built["sasl_plain_username"] == "alice"
+  # Value is usable as a normal string
+  assert str(built["sasl_plain_password"]) == "super-secret-pwd"
+  # But repr of the dict (the leak vector for Sentry / debug logs) hides it
+  assert "super-secret-pwd" not in repr(built)
+  assert "<redacted>" in repr(built)
+

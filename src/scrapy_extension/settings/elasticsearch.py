@@ -6,7 +6,7 @@ ElasticSearch backend connections.
 
 from enum import Enum
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -71,7 +71,7 @@ class ElasticSearchSettings(BaseSettings):
   )
 
   # === Authentication ===
-  api_key: str | None = Field(
+  api_key: SecretStr | None = Field(
     default=None,
     description="API key for authentication",
   )
@@ -79,7 +79,7 @@ class ElasticSearchSettings(BaseSettings):
     default=None,
     description="Basic auth username",
   )
-  password: str | None = Field(
+  password: SecretStr | None = Field(
     default=None,
     description="Basic auth password",
   )

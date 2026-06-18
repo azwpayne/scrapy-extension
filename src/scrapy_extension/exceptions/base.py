@@ -3,6 +3,24 @@
 This module defines the exception hierarchy used throughout the package.
 """
 
+from __future__ import annotations
+
+_REDACTED = "***REDACTED***"
+_SENSITIVE_NAME_FRAGMENTS = ("password", "secret", "api_key", "apikey", "token", "credential")
+
+
+def _is_sensitive_name(name: object) -> bool:
+  """Heuristic: does this setting name suggest the value is secret?"""
+  if not isinstance(name, str):
+    return False
+  lowered = name.lower()
+  return any(frag in lowered for frag in _SENSITIVE_NAME_FRAGMENTS)
+
+
+def _is_secret_value(value: object) -> bool:
+  """Detect SecretStr / SecretBytes from pydantic without importing pydantic."""
+  return type(value).__name__ in {"SecretStr", "SecretBytes"}
+
 
 class BackendError(Exception):
   """Base exception for all backend-related errors.
@@ -80,9 +98,19 @@ class ConfigurationError(BackendError):
   This includes invalid settings, missing required parameters,
   and validation failures.
 
+  The ``setting_value`` attribute is automatically redacted when either:
+  - The value is a pydantic ``SecretStr`` / ``SecretBytes`` (detected by type
+    name, no pydantic import required)
+  - The ``setting_name`` contains a sensitive fragment (``password``,
+    ``secret``, ``api_key``, ``apikey``, ``token``, ``credential``)
+
+  Redaction prevents accidental secret leaks via ``repr(exc)`` or
+  debug-logging the exception. The raw value is never retained on the
+  exception object once redacted.
+
   Attributes:
       setting_name: The name of the setting that caused the error.
-      setting_value: The invalid value that was provided.
+      setting_value: The invalid value (or ``***REDACTED***`` if sensitive).
   """
 
   def __init__(
@@ -93,4 +121,7 @@ class ConfigurationError(BackendError):
   ) -> None:
     super().__init__(message)
     self.setting_name = setting_name
-    self.setting_value = setting_value
+    if _is_sensitive_name(setting_name) or _is_secret_value(setting_value):
+      self.setting_value = _REDACTED
+    else:
+      self.setting_value = setting_value
