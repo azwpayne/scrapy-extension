@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (defensive against repr / traceback / debugger leaks).
 - Explicit `__all__` on `base.py`, `backends/__init__.py`, and verified
   across every module with a public surface.
+- ElasticSearch CLOUD mode fail-fast: `ElasticSearchSettings` now rejects
+  `mode=CLOUD` without `cloud_id` at construction (was a connect-time error).
+- CI workflow (`.github/workflows/ci.yml`): unit tests across Python
+  3.10–3.14 on every push/PR.
+- Integration test suites for RabbitMQ, Kafka, and RocketMQ (completing
+  the sextet) — skip-by-default, gated on `SCRAPY_TEST_*` env vars.
+- `LICENSE` (MIT).
 
 ### Changed
 
@@ -92,6 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ConnectionManager.close()` catches `Exception` (was a narrow
   `RuntimeError, ValueError, AttributeError` tuple) so a disconnect error
   can't skip registry eviction or break the caller's close chain.
+- License metadata migrated to PEP 639: `license = "MIT"` SPDX expression
+  + `license-files = ["LICENSE"]` (deprecated `License ::` classifier
+  removed). Distributions now bundle the license text.
+- `uv_build` build-system pin widened to `<0.12` (was `<0.11.0`, which
+  excluded uv 0.11 and could break builds in uv-0.11-only environments).
 
 ### Fixed
 
@@ -131,9 +143,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "expired").
 - RocketMQ `ping()` docstring overstated "responsive" — it is a
   local-state check, not a broker round-trip.
+- Kafka `pop()` re-subscribed the consumer on every call (even for the
+  same queue); now caches the subscription, mirroring RocketMQ's pattern.
 
 ### Removed
 
 - `BackendQueue.peek()` — non-atomic, documented as unsafe, no production
   callers.
 - 29 unused test dependencies (see Changed: test group trimmed).
+- Orphaned `[tool.pyrefly]` and `[tool.mutmut]` config sections (those
+  tools were removed in the test-dep trim).

@@ -4350,6 +4350,193 @@ uv run ruff check                        # All checks passed
 uv run pytest -q                         # 769 passed, 27 skipped (unchanged)
 ```
 
+---
+
+## Round 82 — CHANGELOG brought current with the committed R52–R81 (R82-A1)
+
+Loop iteration (45th). The operator committed R52–R81 (`d313cd6`, iteration 44) — resolving the long-standing uncommitted-work risk. That exposed a doc gap: `CHANGELOG.md` stopped at R50 (R51's update), so the just-shipped user-facing changes weren't in the package's changelog.
+
+### Added in this batch
+
+#### ✅ R82-A1: CHANGELOG `[Unreleased]` reflects R52–R81's user-facing changes (docs)
+
+**Files**: `CHANGELOG.md`
+
+Backfilled the four sections with R52–R81 items that affect users/contributors (omitting pure test-internal fixes — R60/R62/R72/R73 don't change shipped behavior):
+
+- **Added**: ES CLOUD fail-fast validation (R52); CI workflow (R59/R78); RabbitMQ/Kafka/RocketMQ integration suites (R54–R56, completing the sextet); `LICENSE` (R77).
+- **Changed**: license metadata → PEP 639 SPDX + `license-files` (R76/R77); `uv_build` pin widened to `<0.12` (R76).
+- **Fixed**: Kafka `pop()` subscribe caching (R57).
+- **Removed**: orphaned `[tool.pyrefly]`/`[tool.mutmut]` config (R75).
+
+**Verified**: section structure intact (`Added→Changed→Fixed→Removed`), 139→155 lines.
+
+### Note
+
+This CHANGELOG change (and this review-doc entry) are now the uncommitted delta on top of `d313cd6` — small, doc-only, for the operator to fold into the next commit.
+
+### Verification
+
+```bash
+grep -nE "^### |^## " CHANGELOG.md   # [Unreleased]→Added→Changed→Fixed→Removed, in order
+```
+
+---
+
+## Round 83 — Mutation-testing lens: pinned contracts are mutation-secure (R83, no retained code change)
+
+Loop iteration (48th). A genuinely new lens: **mutation testing** — do the R63–R70 contract-pinned tests actually *catch* a broken contract, or do they merely pass (the R31 failure mode where a mock codified the wrong contract)? Mutated two pinned contracts, ran their tests, reverted.
+
+### Verified — both mutation-secure
+
+| Mutation (the broken contract) | Tests that caught it |
+|---|---|
+| ES `ttl`: `except NotFoundError: return None` → `return -1` (the R48 bug) | `test_ttl_not_found` FAILED (`assert -1 is None`) |
+| Redis `add`: `sadd(...) == 1` → `!= 1` (inverts the R31 contract) | `test_set_add` + `test_set_add_already_exists` both FAILED |
+
+Both pinned contracts **caught their regression** — the tests actively detect contract violations, not just pass on the happy path. This is the meta-quality validation the contract-pinning arc (R63–R70) needed: the new tests are *effective*, not the R31-style "mock that codified the bug as the contract."
+
+### Method note
+
+Mutations done via atomic `sed` mutate → pytest → `sed` revert → verify, all in one Bash call — interruption-safe (the revert always runs). After both rounds: source files confirmed restored (no stray markers), full suite 769/27 green, ruff clean.
+
+### Meta
+
+This closes the loop on a worry raised way back in R31 ("mock-based tests can preserve bugs as contracts"). The R63–R70 contract tests, sampled across two distinct contract types (set-membership semantics + storage-ttl semantics), are mutation-secure. The lens rotation (now ~16 lenses) has one more data point: **mutation testing** confirms the test suite's contracts are real, not theatrical.
+
+### Verification
+
+```bash
+# (mutations applied + reverted in-flight; final state:)
+grep -rn "MUT-R83\|MUTATION-TEST" src/ tests/   # (none — clean)
+uv run pytest -q                                 # 769 passed, 27 skipped
+uv run ruff check                                # All checks passed
+```
+
+---
+
+## Round 84 — Mutation lens extended: error-wrapping contract also mutation-secure (R84, no retained code change)
+
+Loop iteration (49th). R83 sampled two contract types (storage-ttl, set-membership) and both were mutation-secure. This round tests a third, more consequential type — **error-wrapping** (the "callers catch `QueueError`, never the raw backend exception" invariant) — to confirm it across types, not just within one.
+
+### Verified — mutation-secure (3/3 contract types)
+
+| Mutation | Tests that caught it |
+|---|---|
+| RabbitMQ `ack`: `raise QueueError(...)` → `raise e` (re-raise raw `AMQPError`) | `test_rabbitmq_backend_ack_raises_queue_error_on_amqp_error` FAILED (raw `AMQPError` ≠ `QueueError`) |
+
+Across R83 + R84, **three distinct contract types** are now mutation-verified:
+
+| Type | Round | Mutation caught by |
+|---|---|---|
+| storage-ttl (missing→None) | R83 (ES, R48) | `test_ttl_not_found` |
+| set-membership (add duplicate→False) | R83 (Redis, R31) | `test_set_add` + `test_set_add_already_exists` |
+| error-wrapping (raw→QueueError) | R84 (RabbitMQ, R66) | `test_rabbitmq_backend_ack_raises_queue_error_on_amqp_error` |
+
+### Conclusion of the mutation lens
+
+Three representative contracts across three distinct semantics, **all caught their regression**. This is strong evidence the R63–R70 contract-pinning arc (and R48/R66) produces tests that actively detect contract violations — not the R31 failure mode (mock codifying the wrong contract). The mutation-testing lens is now thoroughly applied; further mutations would sample the same types (error-wrapping / dedup / ttl) and are expected to confirm. Source fully restored after each (no markers, 769/27 green, ruff clean).
+
+### Verification
+
+```bash
+# (all mutations applied + reverted in-flight; final state:)
+grep -rn "MUT-R83\|MUTATION-TEST" src/ tests/   # (none — clean)
+uv run pytest -q                                 # 769 passed, 27 skipped
+```
+
+---
+
+## Round 85 — Added CONTRIBUTING.md (dev onboarding) + self-caught broken link (R85-A1)
+
+Loop iteration (51st). Fresh-eyes lens: the project had **no CONTRIBUTING.md** (nor CODE_OF_CONDUCT/templates), and the 6 integration-test env vars lived only in test docstrings — a contributor couldn't discover how to run the integration suite centrally. Created the missing dev-onboarding doc.
+
+### Added in this batch
+
+#### ✅ R85-A1: `CONTRIBUTING.md` (P2-doc)
+
+**Files**: `CONTRIBUTING.md` (new)
+
+Centralizes, with commands verified across this loop: dev setup (`uv sync --group test`), unit tests (`pytest` / `-m "not integration"`), the **integration env-var table** (all 6 `SCRAPY_TEST_*` + the optional `SCRAPY_TEST_MONGODB_DB`), the `poe` Python matrix (3.10–3.14 + 3.14t, with the lxml-GIL caveat from R81), lint, coverage (≥95% target), build, the CI workflow + its commented integration stub, and architecture pointers (`.claude/CLAUDE.md`, this review doc).
+
+#### Self-caught broken link (R60 discipline on own output)
+
+Verification caught that the initial CONTRIBUTING linked `CLAUDE.md` (root) — which **doesn't exist**; the architecture doc is at `.claude/CLAUDE.md`. Fixed before the doc shipped a dead link to contributors. Same "verify, don't assume" lesson as R60–R62, applied to my own new artifact.
+
+### Verified
+
+- All 6 `SCRAPY_TEST_*` env vars match the actual `skipif` gates in the integration suites ✓
+- `SCRAPY_TEST_MONGODB_DB` optional override present ✓
+- All linked paths resolve (`.claude/CLAUDE.md`, review doc, `ci.yml`) ✓; no stray root-`CLAUDE.md` refs
+- `poe test` / `test-py310`…`test-py314t` tasks exist ✓
+- Commands (pytest/ruff/cov/build) all verified across R58–R82
+
+### Verification
+
+```bash
+for v in SCRAPY_TEST_REDIS_URL SCRAPY_TEST_MONGODB_URI SCRAPY_TEST_ES_HOSTS SCRAPY_TEST_RABBITMQ_URL SCRAPY_TEST_KAFKA_BOOTSTRAP SCRAPY_TEST_ROCKETMQ_NAMESRV; do grep -rq "\"$v\"" tests/integration/ && echo "$v ✓"; done
+[ -f .claude/CLAUDE.md ] && [ -f docs/code-review-2026-06-15.md ] && [ -f .github/workflows/ci.yml ] && echo "links ✓"
+```
+
+---
+
+## Round 86 — Added SECURITY.md (vuln-disclosure policy) (R86-A1)
+
+Loop iteration (52nd). Same fresh-eyes lens as R85: this package is **security-relevant** — it brokers backend connections carrying credentials, and shipped a dedicated R2-B security workstream (SecretStr R13, `ConfigurationError` redaction R26, Kafka SASL `_RedactedStr` R28, RabbitMQ SSL warning R27). Yet it had no `SECURITY.md` (no disclosure channel, no supported-versions statement). The policy capstone to that code work was missing.
+
+### Added in this batch
+
+#### ✅ R86-A1: `SECURITY.md` (P2-doc)
+
+**Files**: `SECURITY.md` (new)
+
+Concise policy: supported versions (latest `0.1.x` only, pre-1.0); private reporting (GitHub Security Advisory preferred + author email, matching `pyproject`); scope (the package itself — its connection mgmt, serialization, components — explicitly *not* the upstream client libs or Scrapy; credential-handling bugs in scope, cross-referencing the R13/R26–R28 secret-handling work).
+
+### Verified
+
+- GitHub advisory URL + email match `[project]` (`azwpayne/scrapy-extension`, `paynewu0719@gmail.com`) ✓
+- Review-doc round refs (13 security/packaging, 26 ConfigurationError redaction, 28 Kafka SASL) are the security rounds ✓
+- Version `0.1.0` → "latest `0.1.x`" claim ✓
+
+### Note on scope of further doc additions
+
+`CONTRIBUTING` (R85) and `SECURITY` (R86) were genuine gaps with functional content (dev onboarding; disclosure channel). Further community files (CODE_OF_CONDUCT, ISSUE/PR templates) would be template-filling for a solo project — declining those unless the project grows contributors.
+
+### Verification
+
+```bash
+grep -nE "github.com/azwpayne|paynewu0719" pyproject.toml   # matches SECURITY.md
+grep -nE "^## Round (13|26|28)" docs/code-review-2026-06-15.md  # security rounds
+```
+
+---
+
+## Round 87 — examples/ audit: accurate, not stale (R87, no code change)
+
+Loop iteration (53rd). The last un-audited surface: `examples/` (a full demo Scrapy project — 18 files, one spider per backend, last touched Apr/May before R43–R86). Verified the examples aren't stale against the API changes this loop shipped.
+
+### Verified — clean
+
+- **No removed/changed API**: `grep` for `.peek()` (removed R9), `cast(…Spider` (removed R4), `enable_auto_commit=True` / `auto_ack` (changed R11/R12) → **none** in examples.
+- **Current surface in use**: every backend spider references `BackendSpiderMixin` / `setup_backend` / `BackendType` / `get_queue` / `connection_manager` (4–5 each).
+- **All parse cleanly** (ast.parse over all 18 `.py`).
+- **Spot-checked `quotes_redis.py`**: correct imports, `backend_type = BackendType.REDIS`, `setup_backend()` called in `__init__` after `super().__init__(**kwargs)` — the documented pattern.
+
+### Minor observation (not actioned)
+
+The spider classes declare `class X(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):` — listing `scrapy.Spider` explicitly is **redundant** post-R4 (BackendSpiderMixin now extends Spider), but **harmless** (MRO resolves it; the code runs). Not updated across the 8 user-facing demo files — they're correct, and a cosmetic MRO edit on working example code isn't worth the regression risk. Flagged for the operator if they want the examples to match R4's idiomatic `class X(BackendSpiderMixin):` form.
+
+### Where the autonomous surface now stands
+
+With `examples/` confirmed accurate, **every directory is audited**: src/ (all modules ≥97%, contracts pinned + mutation-verified), tests/ (769/27, isolation fixed), config (clean), packaging (clean build, LICENSE, PEP 639), CI (3.10–3.14), docs (README/CHANGELOG/CONTRIBUTING/SECURITY all current), and examples (current API, correct). The locally-verifiable surface is comprehensively exhausted across ~18 lenses.
+
+### Verification
+
+```bash
+grep -rnE "\.peek\(|cast\(.*Spider|enable_auto_commit\s*=\s*True" examples/   # (none)
+uv run python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('examples/examples/**/*.py',recursive=True)]; print('parse ✓')"
+```
+
 
 
 
