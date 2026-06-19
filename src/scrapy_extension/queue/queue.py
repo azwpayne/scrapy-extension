@@ -15,6 +15,8 @@ from scrapy.utils.request import request_from_dict
 
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import SerializationError
+from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 
 if TYPE_CHECKING:
   from scrapy import Spider
@@ -44,6 +46,7 @@ class BackendQueue:
     queue_name: str,
     *,
     spider: Spider | None = None,
+    queue_strategy: QueueStrategy | None = None,
   ) -> None:
     """Initialize the backend queue.
 
@@ -52,10 +55,18 @@ class BackendQueue:
         queue_name: Name of the queue.
         spider: Optional spider reference for restoring callback/errback
             functions during request deserialization.
+        queue_strategy: Optional queue-semantics strategy. When ``None``
+            (default), a ``PassthroughQueueStrategy`` delegates push/pop to the
+            QueueBackend unchanged — preserving the pre-strategy behavior.
     """
     self.connection_manager = connection_manager
     self.queue_name = queue_name
     self._spider = spider
+    self._strategy: QueueStrategy = (
+      queue_strategy
+      if queue_strategy is not None
+      else PassthroughQueueStrategy(connection_manager)
+    )
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -117,7 +128,8 @@ class BackendQueue:
         serializer="json",
       ) from e
 
-    self.connection_manager.get_queue_backend().push(self.queue_name, data, priority)
+    delay = float(request.meta.get("delay") or 0.0)
+    self._strategy.push(self.queue_name, data, priority=priority, delay=delay)
 
   def pop(self, timeout: float = 0.0) -> Request | None:
     """Pop a request from the queue.
@@ -131,7 +143,7 @@ class BackendQueue:
     Raises:
         SerializationError: If the request cannot be deserialized.
     """
-    data = self.connection_manager.get_queue_backend().pop(self.queue_name, timeout)
+    data = self._strategy.pop(self.queue_name, timeout)
     if data is None:
       return None
 
@@ -172,11 +184,11 @@ class BackendQueue:
     Returns:
         Number of requests.
     """
-    return self.connection_manager.get_queue_backend().queue_len(self.queue_name)
+    return self._strategy.queue_len(self.queue_name)
 
   def clear(self) -> None:
     """Clear all requests from the queue."""
-    self.connection_manager.get_queue_backend().clear_queue(self.queue_name)
+    self._strategy.clear(self.queue_name)
 
   def ack(self) -> None:
     """Acknowledge the last-popped request.
