@@ -11,6 +11,7 @@ from scrapy_extension.settings.elasticsearch import (
 )
 from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
 from scrapy_extension.settings.mongodb import MongoDBMode, MongoDBSettings
+from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
 from scrapy_extension.settings.rabbitmq import RabbitMQMode, RabbitMQSettings
 from scrapy_extension.settings.redis import RedisMode, RedisSettings
 from scrapy_extension.settings.rocketmq import RocketMQMode, RocketMQSettings
@@ -22,6 +23,8 @@ __all__ = [
   "KafkaSettings",
   "MongoDBMode",
   "MongoDBSettings",
+  "PulsarMode",
+  "PulsarSettings",
   "RabbitMQMode",
   "RabbitMQSettings",
   "RedisMode",

@@ -30,6 +30,7 @@ _BACKEND_MODULES = {
         "ElasticSearchBackend",
     ),
     "RocketMQBackend": ("scrapy_extension.backends.rocketmq", "RocketMQBackend"),
+    "PulsarBackend": ("scrapy_extension.backends.pulsar", "PulsarBackend"),
 }
 
 
@@ -56,6 +57,7 @@ __all__ = [
     "JSONSerializer",
     "KafkaBackend",
     "MongoDBBackend",
+    "PulsarBackend",
     "QueueBackend",
     "RabbitMQBackend",
     "RedisBackend",
