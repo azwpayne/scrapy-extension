@@ -21,6 +21,15 @@ from scrapy_extension.backends.base import (
 )
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
+from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
+from scrapy_extension.dupefilter.filters.factory import (
+    DedupeStrategy,
+    build_membership_filter,
+)
+from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
+from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     BackendError,
@@ -125,9 +134,13 @@ __all__ = [
     # Spider
     "BackendSpiderMixin",
     "BackendType",
+    # Dedup strategy (subsystem ①)
+    "BloomMembershipFilter",
     "ConfigurationError",
     # Connection
     "ConnectionManager",
+    "CuckooMembershipFilter",
+    "DedupeStrategy",
     "ElasticSearchBackend",
     "ElasticSearchMode",
     "ElasticSearchSettings",
@@ -135,6 +148,8 @@ __all__ = [
     "KafkaBackend",
     "KafkaMode",
     "KafkaSettings",
+    "MembershipFilter",
+    "MemoryMembershipFilter",
     "MongoDBBackend",
     "MongoDBMode",
     "MongoDBSettings",
@@ -153,7 +168,9 @@ __all__ = [
     # Serialization
     "Serializer",
     "SetBackend",
+    "SetMembershipFilter",
     # Configuration
     "Settings",
     "StorageBackend",
+    "build_membership_filter",
 ]

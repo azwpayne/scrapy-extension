@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Protocol
 
+from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:
@@ -33,14 +35,18 @@ logger = logging.getLogger(__name__)
 
 
 class BackendDupeFilter:
-  """Scrapy duplicate filter using backend set interface.
+  """Scrapy duplicate filter using a pluggable membership-filter strategy.
 
-  This dupefilter uses a SetBackend to store request fingerprints
-  and filter out duplicate requests.
+  Delegates duplicate detection to a
+  :class:`~scrapy_extension.dupefilter.filters.base.MembershipFilter`. The
+  default strategy is ``SetMembershipFilter`` (exact, cross-worker,
+  byte-identical to the previous hardcoded ``SetBackend`` behavior); other
+  strategies (memory, bloom, cuckoo) are selected via ``SCRAPY_DEDUP_STRATEGY``
+  (wired in ``from_settings``).
 
   Attributes:
       connection_manager: The connection manager for backend access.
-      key: The key for the fingerprints set.
+      key: The key for the fingerprints set / filter scope.
       debug: Whether to log filtered requests.
   """
 
@@ -51,12 +57,13 @@ class BackendDupeFilter:
     *,
     debug: bool = False,
     fingerprinter: _Fingerprinter | None = None,
+    membership_filter: MembershipFilter | None = None,
   ) -> None:
     """Initialize the dupefilter.
 
     Args:
         connection_manager: Connection manager for backend access.
-        key: Key for the fingerprints set.
+        key: Key for the fingerprints set / filter scope.
         debug: Whether to log filtered requests.
         fingerprinter: Optional Scrapy request fingerprinter. When provided
             (normally threaded from ``crawler.request_fingerprinter`` via
@@ -65,11 +72,23 @@ class BackendDupeFilter:
             ``scrapy.utils.request.fingerprint`` — which is byte-identical to
             the default fingerprinter, so omitting this is fully backward-
             compatible (verified R45).
+        membership_filter: Optional membership-filter strategy. When ``None``
+            (default), a ``SetMembershipFilter`` is built from the connection
+            manager and key — preserving the pre-strategy behavior exactly.
+            Pass a custom filter (memory, bloom, cuckoo, ...) to override.
     """
     self.connection_manager = connection_manager
     self.key = key
     self.debug = debug
     self._fingerprinter = fingerprinter
+    # Use ``is None`` (not ``or``): a MembershipFilter defines __len__, so an
+    # empty filter (len == 0) would be falsy and ``or`` would wrongly discard
+    # it. Only fall through when no filter was supplied at all.
+    self._filter: MembershipFilter = (
+      membership_filter
+      if membership_filter is not None
+      else SetMembershipFilter(connection_manager, key)
+    )
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendDupeFilter:
@@ -83,16 +102,35 @@ class BackendDupeFilter:
     """
     from scrapy_extension.backends.base import BackendType
     from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.dupefilter.filters.factory import (
+      DedupeStrategy,
+      build_membership_filter,
+    )
 
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
       settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
     )
+    key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
+    strategy = DedupeStrategy(
+      settings.get("SCRAPY_DEDUP_STRATEGY", DedupeStrategy.SET.value)
+    )
+    membership_filter = build_membership_filter(
+      strategy,
+      manager,
+      key=key,
+      memory_maxsize=settings.get("SCRAPY_DEDUP_MEMORY_MAXSIZE"),
+      bloom_capacity=settings.get("SCRAPY_DEDUP_BLOOM_CAPACITY", 1_000_000),
+      bloom_error_rate=settings.get("SCRAPY_DEDUP_BLOOM_ERROR_RATE", 0.001),
+      cuckoo_capacity=settings.get("SCRAPY_DEDUP_CUCKOO_CAPACITY", 1_000_000),
+      cuckoo_error_rate=settings.get("SCRAPY_DEDUP_CUCKOO_ERROR_RATE", 0.001),
+    )
     return cls(
       connection_manager=manager,
-      key=settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter"),
+      key=key,
       debug=settings.getbool("DUPEFILTER_DEBUG", default=False),
+      membership_filter=membership_filter,
     )
 
   @classmethod
@@ -114,14 +152,16 @@ class BackendDupeFilter:
     return dupefilter
 
   def open(self) -> None:
-    """Open the dupefilter (no-op for backend-based)."""
+    """Open the dupefilter and its membership filter (no-op for set)."""
+    self._filter.open()
 
   def close(self, reason: str) -> None:
-    """Close the dupefilter.
+    """Close the dupefilter and its membership filter.
 
     Args:
         reason: The reason for closing.
     """
+    self._filter.close()
     self.connection_manager.close()
 
   def log(self, request: Request, spider: Spider) -> None:
@@ -150,15 +190,14 @@ class BackendDupeFilter:
     fingerprint = self.request_fingerprint(request)
 
     try:
-      set_backend = self.connection_manager.get_set_backend()
+      added = self._filter.add(fingerprint.encode())
     except NotImplementedError as exc:
       raise RuntimeError(
         "Configured backend does not support set/duplicate filtering; "
         "use a backend with SetBackend or disable BackendDupeFilter."
       ) from exc
 
-    # Use atomic add — return True (duplicate) if item already existed
-    added = set_backend.add(self.key, fingerprint.encode())
+    # add() returns True when the item was newly added; a duplicate maps to False.
     return not added
 
   def request_fingerprint(self, request: Request) -> str:
