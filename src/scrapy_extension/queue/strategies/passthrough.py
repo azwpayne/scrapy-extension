@@ -20,17 +20,24 @@ class PassthroughQueueStrategy(QueueStrategy):
   """
 
   def push(
-    self, queue_name: str, item: bytes, *, priority: float = 0.0, delay: float = 0.0
+    self,
+    queue_name: str,
+    item: bytes,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
   ) -> None:
-    """Push straight to the QueueBackend (delay ignored).
+    """Push straight to the QueueBackend (delay/source ignored).
 
     Args:
         queue_name: The queue name.
         item: Serialized item bytes.
         priority: Priority passed through to the backend.
         delay: Ignored (passthrough is not a delay queue).
+        source: Ignored (passthrough does no fairness routing).
     """
-    del delay
+    del delay, source
     self._connection_manager.get_queue_backend().push(queue_name, item, priority)
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:

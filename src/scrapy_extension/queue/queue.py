@@ -129,7 +129,10 @@ class BackendQueue:
       ) from e
 
     delay = float(request.meta.get("delay") or 0.0)
-    self._strategy.push(self.queue_name, data, priority=priority, delay=delay)
+    source = str(request.meta.get("source") or "default")
+    self._strategy.push(
+      self.queue_name, data, priority=priority, delay=delay, source=source
+    )
 
   def pop(self, timeout: float = 0.0) -> Request | None:
     """Pop a request from the queue.

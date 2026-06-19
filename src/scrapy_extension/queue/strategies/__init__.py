@@ -11,8 +11,10 @@ __all__ = [
   "DelayQueueStrategy",
   "PassthroughQueueStrategy",
   "QueueStrategy",
+  "RoundRobinQueueStrategy",
 ]
 
 from scrapy_extension.queue.strategies.base import QueueStrategy
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
+from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy

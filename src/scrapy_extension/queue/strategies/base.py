@@ -39,7 +39,13 @@ class QueueStrategy(ABC):
 
   @abstractmethod
   def push(
-    self, queue_name: str, item: bytes, *, priority: float = 0.0, delay: float = 0.0
+    self,
+    queue_name: str,
+    item: bytes,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
   ) -> None:
     """Push a serialized item. Strategies define ordering/holding semantics.
 
@@ -48,6 +54,7 @@ class QueueStrategy(ABC):
         item: Serialized item bytes.
         priority: Caller-supplied priority (semantics depend on strategy).
         delay: Optional delay in seconds before the item becomes poppable.
+        source: Optional source tag (used by round-robin fairness strategies).
     """
 
   @abstractmethod

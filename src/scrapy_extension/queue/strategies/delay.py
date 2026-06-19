@@ -67,7 +67,13 @@ class DelayQueueStrategy(QueueStrategy):
     self._seq = itertools.count()
 
   def push(
-    self, queue_name: str, item: bytes, *, priority: float = 0.0, delay: float = 0.0
+    self,
+    queue_name: str,
+    item: bytes,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
   ) -> None:
     """Push an item, holding it until ready if a delay is set.
 
@@ -76,7 +82,9 @@ class DelayQueueStrategy(QueueStrategy):
         item: Serialized item bytes.
         priority: Priority for the live-queue push (used once drained).
         delay: Delay seconds; 0 falls back to ``default_delay``.
+        source: Ignored (delay strategy holds by ready-time, not source).
     """
+    del source
     effective = delay if delay > 0 else self._default_delay
     if effective <= 0:
       self._connection_manager.get_queue_backend().push(queue_name, item, priority)
