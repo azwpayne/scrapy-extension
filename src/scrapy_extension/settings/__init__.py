@@ -10,6 +10,7 @@ from scrapy_extension.settings.elasticsearch import (
   ElasticSearchSettings,
 )
 from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
+from scrapy_extension.settings.memcached import MemcachedMode, MemcachedSettings
 from scrapy_extension.settings.mongodb import MongoDBMode, MongoDBSettings
 from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
 from scrapy_extension.settings.rabbitmq import RabbitMQMode, RabbitMQSettings
@@ -21,6 +22,8 @@ __all__ = [
   "ElasticSearchSettings",
   "KafkaMode",
   "KafkaSettings",
+  "MemcachedMode",
+  "MemcachedSettings",
   "MongoDBMode",
   "MongoDBSettings",
   "PulsarMode",
