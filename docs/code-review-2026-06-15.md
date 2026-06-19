@@ -4537,6 +4537,41 @@ grep -rnE "\.peek\(|cast\(.*Spider|enable_auto_commit\s*=\s*True" examples/   # 
 uv run python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('examples/examples/**/*.py',recursive=True)]; print('parse ✓')"
 ```
 
+---
+
+## Round 88 — Complexity audit (C901): 2 functions > threshold (R88, finding — not actioned)
+
+Loop iteration (56th). A genuinely new lens: **cyclomatic complexity**. The project's ruff config selects `B/F/I/RUF/UP` (not `C901`); ran it ad hoc (`ruff check --select C901 src/`) to find complexity hotspots.
+
+### Findings
+
+| Function | Complexity | Note |
+|---|---|---|
+| `spider_mixin._build_backend_settings` | **18** (>10) | the 6-branch elif chain per backend; **the function R43's fall-through bug lived in** |
+| `mongodb._build_client_kwargs` | 13 (>10) | TLS + auth + write-concern + read-preference accumulation |
+
+### Refactor opportunity (offered, not actioned)
+
+`_build_backend_settings`'s elif chain is **where R43's fall-through bug lived** (RabbitMQ branch fell through to ES). Note: R43 already **eliminated that bug class** — all 6 branches now match on `backend_type` alone (no `and field is not None` guard remains), so the elif chain is already fall-through-safe. A dispatch refactor — a `_SHORTCUT_BUILDERS = {"redis": "_build_redis_settings", …}` map + per-backend builder methods + a one-line dispatcher — would:
+- drop `_build_backend_settings` complexity from 18 → ~5, and
+- distribute the logic into small per-backend builders (each ~3–5).
+
+It would be **complexity/readability only** — no additional correctness benefit (R43 already closed the fall-through).
+
+**Not actioned** because: the function works and is tested (R43 fall-through regression, R38 ES/RocketMQ shortcuts, the Mongo/Kafka shortcut tests); R43 just touched this logic; and explicit-elif-vs-dispatch is a readability judgment the operator should make. Flagged as a candidate — the existing test suite would validate the refactor if taken.
+
+`_build_client_kwargs` (13) is a milder candidate (split into `_tls_kwargs`/`_auth_kwargs`/`_write_concern_kwargs`); same reasoning — working, tested, optional.
+
+### Meta
+
+The complexity lens is new (C901 isn't in the project's ruff selection). Unlike the recent clean-confirmations (warnings R-last, examples R87), this round **found** two real hotspots — one in the function where R43's bug lived (since fixed; the refactor would be complexity-only). Whether to refactor is the operator's call; the finding is recorded so it's not re-derived.
+
+### Verification
+
+```bash
+uv run ruff check --select C901 src/   # 2 findings: _build_backend_settings (18), _build_client_kwargs (13)
+```
+
 
 
 
