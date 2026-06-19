@@ -17,6 +17,7 @@ from scrapy_extension.queue.strategies.base import QueueStrategy
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
+from scrapy_extension.queue.strategies.throttle import ThrottleQueueStrategy
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -33,6 +34,7 @@ class QueueStrategyType(str, Enum):
   PASSTHROUGH = "passthrough"
   DELAY = "delay"
   ROUND_ROBIN = "round_robin"
+  THROTTLE = "throttle"
 
   @classmethod
   def _missing_(cls, value: object) -> QueueStrategyType:
@@ -45,6 +47,7 @@ def build_queue_strategy(
   connection_manager: ConnectionManager,
   *,
   default_delay: float = 0.0,
+  min_interval: float = 0.0,
 ) -> QueueStrategy:
   """Build the queue strategy for ``strategy_type``.
 
@@ -65,4 +68,6 @@ def build_queue_strategy(
     return DelayQueueStrategy(connection_manager, default_delay=default_delay)
   if strategy_type is QueueStrategyType.ROUND_ROBIN:
     return RoundRobinQueueStrategy(connection_manager)
+  if strategy_type is QueueStrategyType.THROTTLE:
+    return ThrottleQueueStrategy(connection_manager, min_interval=min_interval)
   raise ConfigurationError(f"Unknown queue strategy: {strategy_type!r}")

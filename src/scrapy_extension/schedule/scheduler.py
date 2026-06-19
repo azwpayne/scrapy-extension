@@ -104,6 +104,7 @@ class BackendScheduler:
       strategy_type,
       manager,
       default_delay=settings.getfloat("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
+      min_interval=settings.getfloat("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
     )
     return cls(
       connection_manager=manager,
