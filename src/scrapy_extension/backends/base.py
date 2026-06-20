@@ -227,6 +227,7 @@ class BackendType(str, Enum):
       PULSAR: Pulsar backend for distributed crawling (queue-only).
       MEMCACHED: Memcached backend (StorageBackend — KV with TTL).
       SQS: Amazon SQS backend (queue-only MQ).
+      DYNAMODB: DynamoDB backend (StorageBackend — NoSQL KV).
   """
 
   REDIS = "redis"
@@ -238,6 +239,7 @@ class BackendType(str, Enum):
   PULSAR = "pulsar"
   MEMCACHED = "memcached"
   SQS = "sqs"
+  DYNAMODB = "dynamodb"
 
   @classmethod
   def _missing_(cls, value: object) -> BackendType | None:

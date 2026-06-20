@@ -33,6 +33,7 @@ _BACKEND_MODULES = {
     "PulsarBackend": ("scrapy_extension.backends.pulsar", "PulsarBackend"),
     "MemcachedBackend": ("scrapy_extension.backends.memcached", "MemcachedBackend"),
     "SqsBackend": ("scrapy_extension.backends.sqs", "SqsBackend"),
+    "DynamoDBBackend": ("scrapy_extension.backends.dynamodb", "DynamoDBBackend"),
 }
 
 
@@ -55,6 +56,7 @@ __all__ = [
     "Backend",
     "BackendType",
     "ConnectionManager",
+    "DynamoDBBackend",
     "ElasticSearchBackend",
     "JSONSerializer",
     "KafkaBackend",

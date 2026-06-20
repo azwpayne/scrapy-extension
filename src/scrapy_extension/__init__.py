@@ -55,6 +55,7 @@ except PackageNotFoundError:
 # required when the corresponding class is actually used.
 _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     # Backend classes
+    "DynamoDBBackend": ("scrapy_extension.backends.dynamodb", "DynamoDBBackend"),
     "ElasticSearchBackend": ("scrapy_extension.backends.elasticsearch", "ElasticSearchBackend"),
     "KafkaBackend": ("scrapy_extension.backends.kafka", "KafkaBackend"),
     "MemcachedBackend": ("scrapy_extension.backends.memcached", "MemcachedBackend"),
@@ -65,6 +66,8 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     "RocketMQBackend": ("scrapy_extension.backends.rocketmq", "RocketMQBackend"),
     "SqsBackend": ("scrapy_extension.backends.sqs", "SqsBackend"),
     # Settings classes
+    "DynamoDBMode": ("scrapy_extension.settings.dynamodb", "DynamoDBMode"),
+    "DynamoDBSettings": ("scrapy_extension.settings.dynamodb", "DynamoDBSettings"),
     "ElasticSearchMode": ("scrapy_extension.settings.elasticsearch", "ElasticSearchMode"),
     "ElasticSearchSettings": ("scrapy_extension.settings.elasticsearch", "ElasticSearchSettings"),
     "KafkaMode": ("scrapy_extension.settings.kafka", "KafkaMode"),
@@ -87,6 +90,9 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
 
 # Extra name -> pip extras mapping for helpful error messages
 _BACKEND_EXTRAS: dict[str, str] = {
+    "DynamoDBBackend": "dynamodb",
+    "DynamoDBMode": "dynamodb",
+    "DynamoDBSettings": "dynamodb",
     "ElasticSearchBackend": "elasticsearch",
     "ElasticSearchMode": "elasticsearch",
     "ElasticSearchSettings": "elasticsearch",
@@ -159,6 +165,9 @@ __all__ = [
     "ConnectionManager",
     "CuckooMembershipFilter",
     "DedupeStrategy",
+    "DynamoDBBackend",
+    "DynamoDBMode",
+    "DynamoDBSettings",
     "ElasticSearchBackend",
     "ElasticSearchMode",
     "ElasticSearchSettings",

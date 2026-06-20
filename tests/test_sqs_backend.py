@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-_boto3_mock = MagicMock(name="boto3")
-sys.modules.setdefault("boto3", _boto3_mock)
+sys.modules.setdefault("boto3", MagicMock())
+import boto3  # noqa: E402 — the mocked module actually in sys.modules
 
 from scrapy_extension.backends.base import (  # noqa: E402
   BackendType,
@@ -34,7 +34,7 @@ def _connected(mocker, **client_children):
   client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
   for attr, val in client_children.items():
     getattr(client, attr).return_value = val
-  mocker.patch.object(_boto3_mock, "client", return_value=client)
+  mocker.patch.object(boto3, "client", return_value=client)
   b.connect()
   return b, client
 
@@ -59,17 +59,17 @@ class TestSqsConnect:
   def test_connect_creates_client(self, mocker) -> None:
     b = _make_backend()
     client = mocker.MagicMock()
-    mocker.patch.object(_boto3_mock, "client", return_value=client)
+    mocker.patch.object(boto3, "client", return_value=client)
     b.connect()
-    _boto3_mock.client.assert_called_once()
-    args, kwargs = _boto3_mock.client.call_args
+    boto3.client.assert_called_once()
+    args, kwargs = boto3.client.call_args
     assert args == ("sqs",)
     assert kwargs["region_name"] == "us-east-1"
     assert b.is_connected() is True
 
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
-    mocker.patch.object(_boto3_mock, "client", side_effect=RuntimeError("boom"))
+    mocker.patch.object(boto3, "client", side_effect=RuntimeError("boom"))
     with pytest.raises(BackendConnectionError):
       b.connect()
 
