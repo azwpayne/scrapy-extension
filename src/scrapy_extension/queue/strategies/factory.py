@@ -70,4 +70,4 @@ def build_queue_strategy(
     return RoundRobinQueueStrategy(connection_manager)
   if strategy_type is QueueStrategyType.THROTTLE:
     return ThrottleQueueStrategy(connection_manager, min_interval=min_interval)
-  raise ConfigurationError(f"Unknown queue strategy: {strategy_type!r}")
+  raise ConfigurationError(f"Unknown queue strategy: {strategy_type!r}")  # pragma: no cover

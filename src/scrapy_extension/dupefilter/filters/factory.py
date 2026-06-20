@@ -86,4 +86,4 @@ def build_membership_filter(
     return CuckooMembershipFilter(
       capacity=cuckoo_capacity, error_rate=cuckoo_error_rate
     )
-  raise ConfigurationError(f"Unknown dedup strategy: {strategy!r}")
+  raise ConfigurationError(f"Unknown dedup strategy: {strategy!r}")  # pragma: no cover

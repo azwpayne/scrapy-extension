@@ -164,12 +164,10 @@ class SqsBackend(Backend, QueueBackend):
         ValueError: If queue_name contains invalid characters.
     """
     del priority
+    url = self._queue_url(queue_name)
     try:
-      url = self._queue_url(queue_name)
       body = base64.b64encode(item).decode("ascii")
       self._client.send_message(QueueUrl=url, MessageBody=body)
-    except QueueError:
-      raise
     except Exception as e:
       raise QueueError(
         f"Failed to push to SQS queue {queue_name}: {e}",

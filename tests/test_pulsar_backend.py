@@ -13,8 +13,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-_pulsar_mock = MagicMock(name="pulsar")
-sys.modules.setdefault("pulsar", _pulsar_mock)
+sys.modules.setdefault("pulsar", MagicMock())
+import pulsar  # noqa: E402 — the mocked module actually in sys.modules
 
 from scrapy_extension.backends.base import (  # noqa: E402
   BackendType,
@@ -36,7 +36,7 @@ def _connected(mocker, **client_children):
   client = mocker.MagicMock()
   for attr, val in client_children.items():
     getattr(client, attr).return_value = val
-  mocker.patch.object(_pulsar_mock, "Client", return_value=client)
+  mocker.patch.object(pulsar, "Client", return_value=client)
   b.connect()
   return b, client
 
@@ -61,22 +61,22 @@ class TestPulsarConnect:
   def test_connect_creates_client(self, mocker) -> None:
     b = _make_backend()
     client = mocker.MagicMock()
-    mocker.patch.object(_pulsar_mock, "Client", return_value=client)
+    mocker.patch.object(pulsar, "Client", return_value=client)
     b.connect()
-    _pulsar_mock.Client.assert_called_once_with("pulsar://localhost:6650")
+    pulsar.Client.assert_called_once_with("pulsar://localhost:6650")
     assert b.is_connected() is True
 
   def test_connect_failure_raises_connection_error(self, mocker) -> None:
     b = _make_backend()
-    mocker.patch.object(_pulsar_mock, "Client", side_effect=RuntimeError("boom"))
+    mocker.patch.object(pulsar, "Client", side_effect=RuntimeError("boom"))
     with pytest.raises(BackendConnectionError):
       b.connect()
     assert b.is_connected() is False
 
   def test_connect_with_auth_token(self, mocker) -> None:
     b = _make_backend(auth_token="secret-token")
-    mocker.patch.object(_pulsar_mock, "Client", return_value=mocker.MagicMock())
-    auth_mock = mocker.patch.object(_pulsar_mock, "AuthenticationToken")
+    mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+    auth_mock = mocker.patch.object(pulsar, "AuthenticationToken")
     b.connect()
     auth_mock.assert_called_once_with("secret-token")
 
