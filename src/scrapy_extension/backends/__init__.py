@@ -30,6 +30,10 @@ _BACKEND_MODULES = {
         "ElasticSearchBackend",
     ),
     "RocketMQBackend": ("scrapy_extension.backends.rocketmq", "RocketMQBackend"),
+    "PulsarBackend": ("scrapy_extension.backends.pulsar", "PulsarBackend"),
+    "MemcachedBackend": ("scrapy_extension.backends.memcached", "MemcachedBackend"),
+    "SqsBackend": ("scrapy_extension.backends.sqs", "SqsBackend"),
+    "DynamoDBBackend": ("scrapy_extension.backends.dynamodb", "DynamoDBBackend"),
 }
 
 
@@ -52,15 +56,19 @@ __all__ = [
     "Backend",
     "BackendType",
     "ConnectionManager",
+    "DynamoDBBackend",
     "ElasticSearchBackend",
     "JSONSerializer",
     "KafkaBackend",
+    "MemcachedBackend",
     "MongoDBBackend",
+    "PulsarBackend",
     "QueueBackend",
     "RabbitMQBackend",
     "RedisBackend",
     "RocketMQBackend",
     "Serializer",
     "SetBackend",
+    "SqsBackend",
     "StorageBackend",
 ]

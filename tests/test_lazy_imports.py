@@ -429,6 +429,10 @@ class TestBackendImportErrorMessage:
             "elasticsearch",
             "pip install scrapy-extension[elasticsearch]",
         ),
+        ("scrapy_extension.backends.pulsar", "pulsar", "pip install scrapy-extension[pulsar]"),
+        ("scrapy_extension.backends.memcached", "pymemcache", "pip install scrapy-extension[memcached]"),
+        ("scrapy_extension.backends.sqs", "boto3", "pip install scrapy-extension[sqs]"),
+        ("scrapy_extension.backends.dynamodb", "boto3", "pip install scrapy-extension[dynamodb]"),
         # Note: RocketMQ uses deferred imports inside connect(), not a
         # module-level guard. Its ImportError path is tested in
         # test_rocketmq_backend.py::test_connect_*_error.

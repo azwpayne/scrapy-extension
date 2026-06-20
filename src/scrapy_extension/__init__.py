@@ -21,6 +21,15 @@ from scrapy_extension.backends.base import (
 )
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
+from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
+from scrapy_extension.dupefilter.filters.factory import (
+    DedupeStrategy,
+    build_membership_filter,
+)
+from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
+from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     BackendError,
@@ -46,38 +55,59 @@ except PackageNotFoundError:
 # required when the corresponding class is actually used.
 _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     # Backend classes
+    "DynamoDBBackend": ("scrapy_extension.backends.dynamodb", "DynamoDBBackend"),
     "ElasticSearchBackend": ("scrapy_extension.backends.elasticsearch", "ElasticSearchBackend"),
     "KafkaBackend": ("scrapy_extension.backends.kafka", "KafkaBackend"),
+    "MemcachedBackend": ("scrapy_extension.backends.memcached", "MemcachedBackend"),
     "MongoDBBackend": ("scrapy_extension.backends.mongodb", "MongoDBBackend"),
+    "PulsarBackend": ("scrapy_extension.backends.pulsar", "PulsarBackend"),
     "RabbitMQBackend": ("scrapy_extension.backends.rabbitmq", "RabbitMQBackend"),
     "RedisBackend": ("scrapy_extension.backends.redis", "RedisBackend"),
     "RocketMQBackend": ("scrapy_extension.backends.rocketmq", "RocketMQBackend"),
+    "SqsBackend": ("scrapy_extension.backends.sqs", "SqsBackend"),
     # Settings classes
+    "DynamoDBMode": ("scrapy_extension.settings.dynamodb", "DynamoDBMode"),
+    "DynamoDBSettings": ("scrapy_extension.settings.dynamodb", "DynamoDBSettings"),
     "ElasticSearchMode": ("scrapy_extension.settings.elasticsearch", "ElasticSearchMode"),
     "ElasticSearchSettings": ("scrapy_extension.settings.elasticsearch", "ElasticSearchSettings"),
     "KafkaMode": ("scrapy_extension.settings.kafka", "KafkaMode"),
     "KafkaSettings": ("scrapy_extension.settings.kafka", "KafkaSettings"),
+    "MemcachedMode": ("scrapy_extension.settings.memcached", "MemcachedMode"),
+    "MemcachedSettings": ("scrapy_extension.settings.memcached", "MemcachedSettings"),
     "MongoDBMode": ("scrapy_extension.settings.mongodb", "MongoDBMode"),
     "MongoDBSettings": ("scrapy_extension.settings.mongodb", "MongoDBSettings"),
+    "PulsarMode": ("scrapy_extension.settings.pulsar", "PulsarMode"),
+    "PulsarSettings": ("scrapy_extension.settings.pulsar", "PulsarSettings"),
     "RabbitMQMode": ("scrapy_extension.settings.rabbitmq", "RabbitMQMode"),
     "RabbitMQSettings": ("scrapy_extension.settings.rabbitmq", "RabbitMQSettings"),
     "RedisMode": ("scrapy_extension.settings.redis", "RedisMode"),
     "RedisSettings": ("scrapy_extension.settings.redis", "RedisSettings"),
     "RocketMQMode": ("scrapy_extension.settings.rocketmq", "RocketMQMode"),
     "RocketMQSettings": ("scrapy_extension.settings.rocketmq", "RocketMQSettings"),
+    "SqsMode": ("scrapy_extension.settings.sqs", "SqsMode"),
+    "SqsSettings": ("scrapy_extension.settings.sqs", "SqsSettings"),
 }
 
 # Extra name -> pip extras mapping for helpful error messages
 _BACKEND_EXTRAS: dict[str, str] = {
+    "DynamoDBBackend": "dynamodb",
+    "DynamoDBMode": "dynamodb",
+    "DynamoDBSettings": "dynamodb",
     "ElasticSearchBackend": "elasticsearch",
     "ElasticSearchMode": "elasticsearch",
     "ElasticSearchSettings": "elasticsearch",
     "KafkaBackend": "kafka",
     "KafkaMode": "kafka",
     "KafkaSettings": "kafka",
+    "MemcachedBackend": "memcached",
+    "MemcachedMode": "memcached",
+    "MemcachedSettings": "memcached",
     "MongoDBBackend": "mongodb",
     "MongoDBMode": "mongodb",
     "MongoDBSettings": "mongodb",
+    "PulsarBackend": "pulsar",
+    "PulsarMode": "pulsar",
+    "PulsarSettings": "pulsar",
     "RabbitMQBackend": "rabbitmq",
     "RabbitMQMode": "rabbitmq",
     "RabbitMQSettings": "rabbitmq",
@@ -87,6 +117,9 @@ _BACKEND_EXTRAS: dict[str, str] = {
     "RocketMQBackend": "rocketmq",
     "RocketMQMode": "rocketmq",
     "RocketMQSettings": "rocketmq",
+    "SqsBackend": "sqs",
+    "SqsMode": "sqs",
+    "SqsSettings": "sqs",
 }
 
 
@@ -125,9 +158,16 @@ __all__ = [
     # Spider
     "BackendSpiderMixin",
     "BackendType",
+    # Dedup strategy (subsystem ①)
+    "BloomMembershipFilter",
     "ConfigurationError",
     # Connection
     "ConnectionManager",
+    "CuckooMembershipFilter",
+    "DedupeStrategy",
+    "DynamoDBBackend",
+    "DynamoDBMode",
+    "DynamoDBSettings",
     "ElasticSearchBackend",
     "ElasticSearchMode",
     "ElasticSearchSettings",
@@ -135,9 +175,17 @@ __all__ = [
     "KafkaBackend",
     "KafkaMode",
     "KafkaSettings",
+    "MembershipFilter",
+    "MemcachedBackend",
+    "MemcachedMode",
+    "MemcachedSettings",
+    "MemoryMembershipFilter",
     "MongoDBBackend",
     "MongoDBMode",
     "MongoDBSettings",
+    "PulsarBackend",
+    "PulsarMode",
+    "PulsarSettings",
     "QueueBackend",
     "QueueError",
     "RabbitMQBackend",
@@ -153,7 +201,12 @@ __all__ = [
     # Serialization
     "Serializer",
     "SetBackend",
+    "SetMembershipFilter",
     # Configuration
     "Settings",
+    "SqsBackend",
+    "SqsMode",
+    "SqsSettings",
     "StorageBackend",
+    "build_membership_filter",
 ]

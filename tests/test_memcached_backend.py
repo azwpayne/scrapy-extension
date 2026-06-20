@@ -1,0 +1,148 @@
+"""Tests for MemcachedBackend (subsystem ③) — mocked pymemcache.
+
+Injects a stub ``pymemcache`` package into ``sys.modules`` so the backend's
+module-level ``from pymemcache.client.base import Client`` succeeds without
+the dependency installed, then patches the backend's captured
+``MemcachedClient`` name to assert call patterns.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+from unittest.mock import MagicMock
+
+import pytest
+
+# Stub the pymemcache package so the backend imports cleanly.
+if "pymemcache" not in sys.modules:
+  _pkg = types.ModuleType("pymemcache")
+  _pkg_client = types.ModuleType("pymemcache.client")
+  _pkg_base = types.ModuleType("pymemcache.client.base")
+  _pkg_base.Client = MagicMock(name="MemcachedClient")
+  sys.modules["pymemcache"] = _pkg
+  sys.modules["pymemcache.client"] = _pkg_client
+  sys.modules["pymemcache.client.base"] = _pkg_base
+
+import scrapy_extension.backends.memcached as memcached_mod  # noqa: E402
+from scrapy_extension.backends.base import (  # noqa: E402
+  BackendType,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
+)
+from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
+from scrapy_extension.exceptions import BackendConnectionError  # noqa: E402
+from scrapy_extension.settings import MemcachedMode, MemcachedSettings  # noqa: E402
+
+
+def _make_backend(**overrides) -> MemcachedBackend:
+  return MemcachedBackend(MemcachedSettings(**overrides))
+
+
+def _connected(mocker):
+  b = _make_backend()
+  client = mocker.MagicMock()
+  # Patch the backend's captured MemcachedClient name (bound at import).
+  mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+  b.connect()
+  return b, client
+
+
+class TestMemcachedBackendType:
+  def test_backend_type_is_memcached(self) -> None:
+    assert _make_backend().backend_type is BackendType.MEMCACHED
+
+  def test_storage_only_no_queue_no_set(self) -> None:
+    b = _make_backend()
+    assert isinstance(b, StorageBackend)
+    assert not isinstance(b, QueueBackend)
+    assert not isinstance(b, SetBackend)
+
+  def test_settings_defaults(self) -> None:
+    s = MemcachedSettings()
+    assert s.mode is MemcachedMode.STANDALONE
+    assert s.host == "localhost"
+    assert s.port == 11211
+
+
+class TestMemcachedConnect:
+  def test_connect_creates_client_and_stats(self, mocker) -> None:
+    b, client = _connected(mocker)
+    memcached_mod.MemcachedClient.assert_called_once_with(("localhost", 11211))
+    client.stats.assert_called_once()
+    assert b.is_connected() is True
+
+  def test_connect_failure_raises(self, mocker) -> None:
+    b = _make_backend()
+    mocker.patch.object(
+      memcached_mod, "MemcachedClient", side_effect=RuntimeError("nope")
+    )
+    with pytest.raises(BackendConnectionError):
+      b.connect()
+    assert b.is_connected() is False
+
+  def test_disconnect_closes_client(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b.disconnect()
+    client.close.assert_called_once()
+    assert b.is_connected() is False
+
+
+class TestMemcachedStorageOps:
+  def test_store_sets_with_ttl(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b.store("key1", b"value", ttl=60)
+    client.set.assert_called_once_with("key1", b"value", expire=60)
+
+  def test_store_without_ttl(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b.store("key1", b"value")
+    client.set.assert_called_once_with("key1", b"value", expire=None)
+
+  def test_retrieve_gets(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get.return_value = b"payload"
+    assert b.retrieve("key1") == b"payload"
+    client.get.assert_called_once_with("key1")
+
+  def test_retrieve_missing_returns_none(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get.return_value = None
+    assert b.retrieve("key1") is None
+
+  def test_delete_returns_bool(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.delete.return_value = True
+    assert b.delete("key1") is True
+    client.delete.assert_called_once_with("key1")
+
+  def test_exists_uses_get(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get.return_value = b"x"
+    assert b.exists("key1") is True
+    client.get.assert_called_once_with("key1")
+
+  def test_exists_missing(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get.return_value = None
+    assert b.exists("key1") is False
+
+  def test_ttl_returns_none(self, mocker) -> None:
+    b, _ = _connected(mocker)
+    assert b.ttl("key1") is None
+
+  def test_clear_storage_flushes_all(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b.clear_storage()
+    client.flush_all.assert_called_once()
+
+  def test_clear_storage_ignores_prefix(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b.clear_storage(prefix="foo")
+    client.flush_all.assert_called_once()  # prefix ignored
+
+  def test_invalid_key_raises(self, mocker) -> None:
+    b, _ = _connected(mocker)
+    with pytest.raises(ValueError):
+      b.store("bad key!", b"x")

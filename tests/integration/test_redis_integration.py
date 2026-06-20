@@ -129,7 +129,7 @@ def test_same_priority_fifo(redis_backend, unique_prefix):
 
 
 def test_priority_ordering(redis_backend, unique_prefix):
-  """Higher priority pops first (ZPOPMAX on score)."""
+  """Higher priority pops first (ZPOPMIN on score)."""
   queue = f"{unique_prefix}:prio"
   redis_backend.push(queue, b"low", priority=1.0)
   redis_backend.push(queue, b"high", priority=10.0)

@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _POP_LUA = """
-local popped = redis.call('ZPOPMAX', KEYS[1])
+local popped = redis.call('ZPOPMIN', KEYS[1])
 if #popped == 0 then return nil end
 local member = popped[1]
 local payload = redis.call('HGET', KEYS[2], member)
@@ -395,7 +395,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         queue_name: Name of the queue.
         item: Item to push (bytes).
-        priority: Priority value (lower = more urgent).
+        priority: Priority value (higher = more urgent).
 
     Raises:
         QueueError: If the push operation fails.
@@ -421,13 +421,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
-    Non-blocking path (``timeout=0``) runs ZPOPMAX + HGET + HDEL inside a
+    Non-blocking path (``timeout=0``) runs ZPOPMIN + HGET + HDEL inside a
     single Lua ``EVAL`` — fully atomic, no orphan window between ZSET
     removal and payload consumption. This is the path Scrapy's scheduler
     uses on every tick.
 
     Blocking path (``timeout>0``) cannot use Lua (Redis forbids blocking
-    commands inside scripts); falls back to ``bzpopmax`` followed by an
+    commands inside scripts); falls back to ``bzpopmin`` followed by an
     atomic MULTI/EXEC for HGET+HDEL.
 
     Raises ``QueueError`` if a ZSET member was popped but its payload is
@@ -449,7 +449,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     payload_key = self._payload_key(queue_name)
     try:
       if timeout > 0:
-        bz_result = self.client.bzpopmax(queue_name, timeout=timeout)
+        bz_result = self.client.bzpopmin(queue_name, timeout=timeout)
         if bz_result is None:
           return None
         return self._consume_payload(payload_key, bz_result[1])

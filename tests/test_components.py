@@ -546,6 +546,7 @@ class TestBackendScheduler:
       connection_manager=mock_connection_manager,
       queue_name="configured:queue",
       spider=spider,
+      queue_strategy=ANY,
     )
 
   def test_close_calls_connection_manager_close(self, mock_connection_manager, mock_spider):

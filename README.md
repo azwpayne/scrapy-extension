@@ -1,6 +1,6 @@
 # Scrapy Extension
 
-Distributed crawling for Scrapy with pluggable backends: **Redis**, **MongoDB**, **Kafka**, **RabbitMQ**, **ElasticSearch**, and **RocketMQ**.
+Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**, **Kafka**, **RabbitMQ**, **ElasticSearch**, **RocketMQ**, **Pulsar**, **SQS**, **Memcached**, **DynamoDB**) and pluggable strategy layers for dedup and queue semantics.
 
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -8,10 +8,12 @@ Distributed crawling for Scrapy with pluggable backends: **Redis**, **MongoDB**,
 
 ## Features
 
-- **6 Backends**: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ
+- **10 Backends**: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ, Pulsar, SQS, Memcached, DynamoDB
 - **Multi-Mode**: Standalone, cluster, cloud deployments per backend
+- **Pluggable Dedup**: Set / Memory / **Bloom** / **Cuckoo** filters via `SCRAPY_DEDUP_STRATEGY`
+- **Pluggable Queue Semantics**: Passthrough / **Delay** / **RoundRobin** / **Throttle** via `SCRAPY_QUEUE_STRATEGY`
 - **Distributed Queue**: Priority-based request queue across spiders
-- **Duplicate Filtering**: Cross-instance URL deduplication via `SetBackend`
+- **Duplicate Filtering**: Cross-instance URL deduplication (default: `SetBackend`)
 - **Item Storage**: Key-value storage with TTL support via `StorageBackend`
 - **Type Safe**: Full type annotations, `py.typed` marker
 - **Secure**: Input validation on key names, topic names, and queue identifiers
@@ -26,6 +28,10 @@ pip install scrapy-extension[kafka]           # Kafka backend (kafka-python)
 pip install scrapy-extension[rabbitmq]        # RabbitMQ backend (pika)
 pip install scrapy-extension[elasticsearch]   # ElasticSearch backend
 pip install scrapy-extension[rocketmq]        # RocketMQ backend
+pip install scrapy-extension[pulsar]          # Pulsar backend (pulsar-client)
+pip install scrapy-extension[sqs]             # Amazon SQS backend (boto3)
+pip install scrapy-extension[memcached]       # Memcached backend (pymemcache)
+pip install scrapy-extension[dynamodb]        # DynamoDB backend (boto3)
 pip install scrapy-extension[all]             # All backends
 ```
 
@@ -109,6 +115,38 @@ SCRAPY_BACKEND_TYPE = "rocketmq"
 SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
 ```
 
+### Pulsar (standalone, cluster)
+
+```python
+SCRAPY_BACKEND_TYPE = "pulsar"
+SCRAPY_PULSAR_SERVICE_URL = "pulsar://localhost:6655"
+```
+
+### Amazon SQS (standalone=LocalStack, cloud=AWS)
+
+```python
+SCRAPY_BACKEND_TYPE = "sqs"
+SCRAPY_SQS_REGION_NAME = "us-east-1"
+SCRAPY_SQS_ENDPOINT_URL = "http://localhost:4566"  # LocalStack
+```
+
+### Memcached (standalone, NoSQL KV)
+
+```python
+SCRAPY_BACKEND_TYPE = "memcached"
+SCRAPY_MEMCACHED_HOST = "localhost"
+SCRAPY_MEMCACHED_PORT = 11211
+```
+
+### DynamoDB (standalone=LocalStack, cloud=AWS, NoSQL KV)
+
+```python
+SCRAPY_BACKEND_TYPE = "dynamodb"
+SCRAPY_DYNAMODB_TABLE_NAME = "scrapy-extension"
+SCRAPY_DYNAMODB_REGION_NAME = "us-east-1"
+SCRAPY_DYNAMODB_ENDPOINT_URL = "http://localhost:4566"  # LocalStack
+```
+
 See [`examples/`](examples) for all deployment modes (Sentinel, Cluster, Atlas, Confluent, etc).
 
 ## Backend Capabilities
@@ -121,14 +159,50 @@ See [`examples/`](examples) for all deployment modes (Sentinel, Cluster, Atlas, 
 | Kafka         | Yes   | No  | No      | standalone, cluster, confluent               |
 | RabbitMQ      | Yes   | No  | No      | standalone, cluster, mirrored_queues         |
 | RocketMQ      | Yes   | Stub | Stub   | standalone, cluster, cloud                   |
+| Pulsar        | Yes   | No  | No      | standalone, cluster                          |
+| SQS           | Yes   | No  | No      | standalone (LocalStack), cloud (AWS)         |
+| Memcached     | No    | No  | Yes     | standalone                                   |
+| DynamoDB      | No    | No  | Yes     | standalone (LocalStack), cloud (AWS)         |
 
 - **Yes** — fully implemented
 - **No** — not available (raises `NotImplementedError`)
 - **Stub** — method signatures exist but raise `NotImplementedError` at runtime
 
-**Kafka, RabbitMQ**: Queue-only. For deduplication and storage, use Redis, MongoDB, or ElasticSearch.
+**Kafka, RabbitMQ, Pulsar, SQS**: Queue-only. For deduplication and storage, use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB.
 
 **RocketMQ**: Queue is functional. Set and Storage methods exist but raise `NotImplementedError` at runtime. Pair with a full-featured backend for dedup/storage.
+
+**Memcached, DynamoDB**: Storage-only (key-value with TTL). Pair with a queue-capable backend for request distribution.
+
+## Pluggable Strategy Layers
+
+Two strategy layers sit above the backend interfaces, selected via Scrapy settings — no code change required. Defaults preserve prior behavior exactly.
+
+### Dedup strategy — `SCRAPY_DEDUP_STRATEGY`
+
+`BackendDupeFilter` delegates to a `MembershipFilter`:
+
+| Strategy | Exact? | Cross-worker? | Delete? | Notes |
+|----------|--------|---------------|---------|-------|
+| `set` (default) | yes | yes | yes | `SetBackend`-backed; byte-identical to prior behavior |
+| `memory` | yes | no | yes | in-process, optional LRU cap (`SCRAPY_DEDUP_MEMORY_MAXSIZE`) |
+| `bloom` | no (FP) | no | no | pure-stdlib bit-vector; `SCRAPY_DEDUP_BLOOM_CAPACITY` / `_ERROR_RATE` |
+| `cuckoo` | no (FP) | no | yes | pure-stdlib; `SCRAPY_DEDUP_CUCKOO_CAPACITY` / `_ERROR_RATE` |
+
+Probabilistic filters never produce false negatives; in-memory filters are per-process (single-worker). Use `set` for multi-worker exact dedup.
+
+### Queue semantics — `SCRAPY_QUEUE_STRATEGY`
+
+`BackendQueue` delegates bytes-level push/pop to a `QueueStrategy` (task-queue types beyond queue/stack/priority):
+
+| Strategy | Behavior |
+|----------|----------|
+| `passthrough` (default) | delegates to `QueueBackend` unchanged (prior behavior) |
+| `delay` | holds items until `now + delay`; per-request via `request.meta['delay']` or `SCRAPY_QUEUE_DELAY_DEFAULT` |
+| `round_robin` | fair dispatch across `request.meta['source']` (no starvation) |
+| `throttle` | rate-limited pops (`SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL`) |
+
+`delay` / `round_robin` hold state in-process (single-worker v1); `passthrough` / `throttle` use the backend queue.
 
 ## Architecture
 
@@ -211,7 +285,7 @@ Integrates `BackendQueue` for request distribution and `BackendDupeFilter` for d
 DUPEFILTER_CLASS = "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter"
 ```
 
-Uses `SetBackend.add()` for atomic duplicate detection. Gracefully skips dedup for queue-only backends (Kafka, RabbitMQ).
+Uses a `MembershipFilter` for duplicate detection (default: `SetBackend.add()`). Select the strategy via `SCRAPY_DEDUP_STRATEGY` (see [Pluggable Strategy Layers](#pluggable-strategy-layers)). Gracefully skips dedup for queue-only backends (Kafka, RabbitMQ, Pulsar, SQS).
 
 ### Pipeline
 

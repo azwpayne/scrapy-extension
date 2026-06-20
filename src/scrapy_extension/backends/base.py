@@ -224,6 +224,10 @@ class BackendType(str, Enum):
       RABBITMQ: RabbitMQ backend for distributed crawling.
       ELASTICSEARCH: ElasticSearch backend for distributed crawling.
       ROCKETMQ: RocketMQ backend for distributed crawling.
+      PULSAR: Pulsar backend for distributed crawling (queue-only).
+      MEMCACHED: Memcached backend (StorageBackend — KV with TTL).
+      SQS: Amazon SQS backend (queue-only MQ).
+      DYNAMODB: DynamoDB backend (StorageBackend — NoSQL KV).
   """
 
   REDIS = "redis"
@@ -232,6 +236,10 @@ class BackendType(str, Enum):
   RABBITMQ = "rabbitmq"
   ELASTICSEARCH = "elasticsearch"
   ROCKETMQ = "rocketmq"
+  PULSAR = "pulsar"
+  MEMCACHED = "memcached"
+  SQS = "sqs"
+  DYNAMODB = "dynamodb"
 
   @classmethod
   def _missing_(cls, value: object) -> BackendType | None:

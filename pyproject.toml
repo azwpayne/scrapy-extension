@@ -44,6 +44,10 @@ kafka = ["kafka-python>=2.0.2,<3"]
 rabbitmq = ["pika>=1.3.2,<2"]
 elasticsearch = ["elasticsearch>=8.12.0,<9"]
 rocketmq = ["rocketmq-client-python>=2.0.0,<3"]
+pulsar = ["pulsar-client>=2.11.0,<4"]
+memcached = ["pymemcache>=4.0,<5"]
+sqs = ["boto3>=1.34,<2"]
+dynamodb = ["boto3>=1.34,<2"]
 all = [
     "redis>=7.3.0,<9",
     "pymongo>=4.8.0,<5",
@@ -51,6 +55,9 @@ all = [
     "pika>=1.3.2,<2",
     "elasticsearch>=8.12.0,<9",
     "rocketmq-client-python>=2.0.0,<3",
+    "pulsar-client>=2.11.0,<4",
+    "pymemcache>=4.0,<5",
+    "boto3>=1.34,<2",
 ]
 
 [dependency-groups]

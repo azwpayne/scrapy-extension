@@ -1,0 +1,165 @@
+"""Tests for DynamoDBBackend (subsystem ③) — mocked boto3.
+
+Injects a mock ``boto3`` into ``sys.modules`` (shared with the SQS test) and
+patches the canonical ``boto3.resource`` (module-attribute pattern) to assert
+call patterns against a fake Table.
+"""
+
+from __future__ import annotations
+
+import sys
+from unittest.mock import MagicMock
+
+import pytest
+
+sys.modules.setdefault("boto3", MagicMock())
+import boto3  # noqa: E402 — the (mocked) module actually in sys.modules
+
+from scrapy_extension.backends.base import (  # noqa: E402
+  BackendType,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
+)
+from scrapy_extension.backends.dynamodb import DynamoDBBackend  # noqa: E402
+from scrapy_extension.exceptions import BackendConnectionError  # noqa: E402
+from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings  # noqa: E402
+
+
+def _make_backend(**overrides) -> DynamoDBBackend:
+  return DynamoDBBackend(DynamoDBSettings(**overrides))
+
+
+def _connected(mocker):
+  b = _make_backend()
+  resource = mocker.MagicMock()
+  table = mocker.MagicMock()
+  table.load.return_value = None  # table already exists
+  resource.Table.return_value = table
+  mocker.patch.object(boto3, "resource", return_value=resource)
+  b.connect()
+  return b, table
+
+
+class TestDynamoDBBackendType:
+  def test_backend_type_is_dynamodb(self) -> None:
+    assert _make_backend().backend_type is BackendType.DYNAMODB
+
+  def test_storage_only(self) -> None:
+    b = _make_backend()
+    assert isinstance(b, StorageBackend)
+    assert not isinstance(b, QueueBackend)
+    assert not isinstance(b, SetBackend)
+
+  def test_settings_defaults(self) -> None:
+    s = DynamoDBSettings()
+    assert s.mode is DynamoDBMode.STANDALONE
+    assert s.table_name == "scrapy-extension"
+
+
+class TestDynamoDBConnect:
+  def test_connect_loads_existing_table(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.load.assert_called_once()
+    assert b.is_connected() is True
+
+  def test_connect_creates_table_when_missing(self, mocker) -> None:
+    b = _make_backend()
+    resource = mocker.MagicMock()
+    new_table = mocker.MagicMock()
+    existing = mocker.MagicMock()
+    existing.load.side_effect = RuntimeError("not found")  # triggers create
+    resource.Table.return_value = existing
+    resource.create_table.return_value = new_table
+    mocker.patch.object(boto3, "resource", return_value=resource)
+    b.connect()
+    resource.create_table.assert_called_once()
+    new_table.wait_until_exists.assert_called_once()
+
+  def test_connect_failure_raises(self, mocker) -> None:
+    b = _make_backend()
+    mocker.patch.object(boto3, "resource", side_effect=RuntimeError("boom"))
+    with pytest.raises(BackendConnectionError):
+      b.connect()
+
+
+class TestDynamoDBStorageOps:
+  def test_store_without_ttl(self, mocker) -> None:
+    b, table = _connected(mocker)
+    b.store("key1", b"value")
+    args, kwargs = table.put_item.call_args
+    assert kwargs["Item"] == {"pk": "key1", "value": b"value"}
+
+  def test_store_with_ttl_sets_expire_at(self, mocker) -> None:
+    b, table = _connected(mocker)
+    b.store("key1", b"value", ttl=60)
+    item = table.put_item.call_args.kwargs["Item"]
+    assert item["pk"] == "key1"
+    assert item["value"] == b"value"
+    assert "expire_at" in item
+
+  def test_retrieve_returns_value(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {"Item": {"pk": "key1", "value": b"payload"}}
+    assert b.retrieve("key1") == b"payload"
+
+  def test_retrieve_missing_returns_none(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {}
+    assert b.retrieve("key1") is None
+
+  def test_retrieve_expired_deletes_and_returns_none(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "key1", "value": b"x", "expire_at": 1.0}  # epoch in 1970
+    }
+    assert b.retrieve("key1") is None
+    table.delete_item.assert_called_once_with(Key={"pk": "key1"})
+
+  def test_delete_returns_bool(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.delete_item.return_value = {"Attributes": {"pk": "key1"}}
+    assert b.delete("key1") is True
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "key1"}, ReturnValues="ALL_OLD"
+    )
+
+  def test_delete_missing_returns_false(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.delete_item.return_value = {}
+    assert b.delete("key1") is False
+
+  def test_exists_true_for_current(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {"Item": {"pk": "k", "value": b"x"}}
+    assert b.exists("k") is True
+
+  def test_exists_false_for_expired(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {"Item": {"pk": "k", "expire_at": 1.0}}
+    assert b.exists("k") is False
+
+  def test_ttl_returns_remaining(self, mocker) -> None:
+    b, table = _connected(mocker)
+    future = 9999999999.0  # year 2286
+    table.get_item.return_value = {"Item": {"pk": "k", "expire_at": future}}
+    assert b.ttl("k") is not None
+    assert b.ttl("k") >= 0
+
+  def test_ttl_none_without_expire_at(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {"Item": {"pk": "k", "value": b"x"}}
+    assert b.ttl("k") is None
+
+  def test_clear_storage_scans_and_deletes(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.scan.return_value = {"Items": [{"pk": "a"}, {"pk": "b"}]}
+    batch = mocker.MagicMock()
+    table.batch_writer.return_value.__enter__.return_value = batch
+    b.clear_storage()
+    assert batch.delete_item.call_count == 2
+
+  def test_invalid_key_raises(self, mocker) -> None:
+    b, _ = _connected(mocker)
+    with pytest.raises(ValueError):
+      b.store("bad key!", b"x")

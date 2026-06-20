@@ -26,6 +26,8 @@ if TYPE_CHECKING:
   from twisted.internet.defer import Deferred
   from twisted.python.failure import Failure
 
+  from scrapy_extension.queue.strategies.base import QueueStrategy
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +57,7 @@ class BackendScheduler:
     queue_key: str = "scheduler:queue",
     stats: StatsCollector | None = None,
     dupefilter: Any | None = None,
+    queue_strategy: QueueStrategy | None = None,
   ) -> None:
     """Initialize the scheduler.
 
@@ -63,11 +66,15 @@ class BackendScheduler:
         queue_key: Key for the request queue.
         stats: Optional stats collector for metrics.
         dupefilter: Optional dupefilter implementing Scrapy's request_seen/log API.
+        queue_strategy: Optional queue-semantics strategy threaded into the
+            BackendQueue. When ``None`` (default), BackendQueue uses
+            PassthroughQueueStrategy (current behavior).
     """
     self.connection_manager = connection_manager
     self.queue_key = queue_key
     self.stats = stats
     self.dupefilter = dupefilter
+    self._queue_strategy = queue_strategy
     self._queue: BackendQueue | None = None
     self._spider: Spider | None = None
     self._signals_connected: bool = False
@@ -75,15 +82,34 @@ class BackendScheduler:
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendScheduler:
-    """Create scheduler from Scrapy settings."""
+    """Create scheduler from Scrapy settings.
+
+    Selects the queue strategy from ``SCRAPY_QUEUE_STRATEGY`` (default
+    ``passthrough``). The delay strategy reads ``SCRAPY_QUEUE_DELAY_DEFAULT``.
+    """
+    from scrapy_extension.queue.strategies.factory import (
+      QueueStrategyType,
+      build_queue_strategy,
+    )
+
     backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
       settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
     )
+    strategy_type = QueueStrategyType(
+      settings.get("SCRAPY_QUEUE_STRATEGY", QueueStrategyType.PASSTHROUGH.value)
+    )
+    queue_strategy = build_queue_strategy(
+      strategy_type,
+      manager,
+      default_delay=settings.getfloat("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
+      min_interval=settings.getfloat("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
+    )
     return cls(
       connection_manager=manager,
       queue_key=settings.get("SCRAPY_QUEUE_KEY", "scheduler:queue"),
+      queue_strategy=queue_strategy,
     )
 
   @classmethod
@@ -121,6 +147,7 @@ class BackendScheduler:
       connection_manager=self.connection_manager,
       queue_name=self.queue_key,
       spider=spider,
+      queue_strategy=self._queue_strategy,
     )
     self._connect_ack_signals(spider)
     logger.info("Scheduler opened for spider %s", spider.name)

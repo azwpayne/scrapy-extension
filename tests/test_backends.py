@@ -626,10 +626,10 @@ class TestRedisBackendQueueOperations:
     assert "push" in str(exc_info.value).lower()
 
   def test_queue_pop_blocking(self, redis_settings, mock_redis, mocker):
-    """Test blocking pop with BZPOPMAX."""
+    """Test blocking pop with BZPOPMIN."""
     from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.bzpopmax.return_value = ("test_queue", b"member-1", 1.0)
+    mock_redis.bzpopmin.return_value = ("test_queue", b"member-1", 1.0)
     # Simulate payload sidecar returning the stored item
     pipe = mock_redis.pipeline.return_value
     pipe.execute.return_value = [b"blocked_data", 1]
@@ -637,13 +637,13 @@ class TestRedisBackendQueueOperations:
     backend = RedisBackend(redis_settings)
     result = backend.pop("test_queue", timeout=5.0)
     assert result == b"blocked_data"
-    mock_redis.bzpopmax.assert_called_once_with("test_queue", timeout=5.0)
+    mock_redis.bzpopmin.assert_called_once_with("test_queue", timeout=5.0)
 
   def test_queue_pop_blocking_timeout(self, redis_settings, mock_redis, mocker):
     """Test blocking pop returns None on timeout."""
     from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.bzpopmax.return_value = None
+    mock_redis.bzpopmin.return_value = None
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
     result = backend.pop("test_queue", timeout=1.0)
@@ -767,10 +767,10 @@ class TestRedisBackendQueueOperations:
   def test_non_blocking_pop_uses_lua_script(
     self, redis_settings, mock_redis, mocker
   ):
-    """Non-blocking pop must use a Lua script for ZPOPMAX+HGET+HDEL atomicity.
+    """Non-blocking pop must use a Lua script for ZPOPMIN+HGET+HDEL atomicity.
 
     Regression for R5-C1: the previous pipeline(transaction=True) approach
-    left an orphan window between ZPOPMAX and HGET/HDEL if the worker
+    left an orphan window between ZPOPMIN and HGET/HDEL if the worker
     crashed mid-pop.
     """
     from scrapy_extension.backends.redis import RedisBackend
@@ -784,7 +784,7 @@ class TestRedisBackendQueueOperations:
 
     mock_redis.register_script.assert_called_once()
     script_body = mock_redis.register_script.call_args.args[0]
-    assert "ZPOPMAX" in script_body
+    assert "ZPOPMIN" in script_body
     assert "HGET" in script_body
     assert "HDEL" in script_body
     mock_script.assert_called_once()
@@ -816,7 +816,7 @@ class TestRedisBackendQueueOperations:
     """Blocking pop (timeout>0) cannot use Lua; falls back to MULTI/EXEC pipeline."""
     from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.bzpopmax.return_value = ("test_queue", b"member-1", 1.0)
+    mock_redis.bzpopmin.return_value = ("test_queue", b"member-1", 1.0)
     pipe = mock_redis.pipeline.return_value
     pipe.execute.return_value = [b"payload", 1]
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
@@ -848,7 +848,7 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
-    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    mock_redis.bzpopmin.return_value = ("test_queue", b"member", 1.0)
     pipe = mock_redis.pipeline.return_value
     pipe.execute.side_effect = RedisError("pipe broke")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
@@ -864,7 +864,7 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
-    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    mock_redis.bzpopmin.return_value = ("test_queue", b"member", 1.0)
     pipe = mock_redis.pipeline.return_value
     pipe.execute.return_value = [None, 1]  # payload missing → orphan member
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
@@ -879,7 +879,7 @@ class TestRedisBackendQueueOperations:
     """Blocking-pop + decode_responses=True: str payload → bytes (R6 normalization)."""
     from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    mock_redis.bzpopmin.return_value = ("test_queue", b"member", 1.0)
     pipe = mock_redis.pipeline.return_value
     pipe.execute.return_value = ["str_payload", 1]  # str under decode_responses
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
@@ -894,7 +894,7 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
-    mock_redis.bzpopmax.return_value = ("test_queue", b"member", 1.0)
+    mock_redis.bzpopmin.return_value = ("test_queue", b"member", 1.0)
     pipe = mock_redis.pipeline.return_value
     pipe.execute.return_value = [3.14, 1]  # float — unexpected payload type
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
