@@ -63,6 +63,7 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     "RabbitMQBackend": ("scrapy_extension.backends.rabbitmq", "RabbitMQBackend"),
     "RedisBackend": ("scrapy_extension.backends.redis", "RedisBackend"),
     "RocketMQBackend": ("scrapy_extension.backends.rocketmq", "RocketMQBackend"),
+    "SqsBackend": ("scrapy_extension.backends.sqs", "SqsBackend"),
     # Settings classes
     "ElasticSearchMode": ("scrapy_extension.settings.elasticsearch", "ElasticSearchMode"),
     "ElasticSearchSettings": ("scrapy_extension.settings.elasticsearch", "ElasticSearchSettings"),
@@ -80,6 +81,8 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     "RedisSettings": ("scrapy_extension.settings.redis", "RedisSettings"),
     "RocketMQMode": ("scrapy_extension.settings.rocketmq", "RocketMQMode"),
     "RocketMQSettings": ("scrapy_extension.settings.rocketmq", "RocketMQSettings"),
+    "SqsMode": ("scrapy_extension.settings.sqs", "SqsMode"),
+    "SqsSettings": ("scrapy_extension.settings.sqs", "SqsSettings"),
 }
 
 # Extra name -> pip extras mapping for helpful error messages
@@ -108,6 +111,9 @@ _BACKEND_EXTRAS: dict[str, str] = {
     "RocketMQBackend": "rocketmq",
     "RocketMQMode": "rocketmq",
     "RocketMQSettings": "rocketmq",
+    "SqsBackend": "sqs",
+    "SqsMode": "sqs",
+    "SqsSettings": "sqs",
 }
 
 
@@ -189,6 +195,9 @@ __all__ = [
     "SetMembershipFilter",
     # Configuration
     "Settings",
+    "SqsBackend",
+    "SqsMode",
+    "SqsSettings",
     "StorageBackend",
     "build_membership_filter",
 ]

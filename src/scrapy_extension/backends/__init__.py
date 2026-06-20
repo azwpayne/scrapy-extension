@@ -32,6 +32,7 @@ _BACKEND_MODULES = {
     "RocketMQBackend": ("scrapy_extension.backends.rocketmq", "RocketMQBackend"),
     "PulsarBackend": ("scrapy_extension.backends.pulsar", "PulsarBackend"),
     "MemcachedBackend": ("scrapy_extension.backends.memcached", "MemcachedBackend"),
+    "SqsBackend": ("scrapy_extension.backends.sqs", "SqsBackend"),
 }
 
 
@@ -66,5 +67,6 @@ __all__ = [
     "RocketMQBackend",
     "Serializer",
     "SetBackend",
+    "SqsBackend",
     "StorageBackend",
 ]
