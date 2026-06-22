@@ -12,6 +12,7 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 - **Multi-Mode**: Standalone, cluster, cloud deployments per backend
 - **Pluggable Dedup**: Set / Memory / **Bloom** / **Cuckoo** filters via `SCRAPY_DEDUP_STRATEGY`
 - **Pluggable Queue Semantics**: Passthrough / **Delay** / **RoundRobin** / **Throttle** via `SCRAPY_QUEUE_STRATEGY`
+- **Multi-Backend Coexistence**: bind queue / dedup / storage to *different* backends via `SCRAPY_{QUEUE,SET,STORAGE}_BACKEND_TYPE` (e.g. queue in Redis, dedup + data in MongoDB)
 - **Distributed Queue**: Priority-based request queue across spiders
 - **Duplicate Filtering**: Cross-instance URL deduplication (default: `SetBackend`)
 - **Item Storage**: Key-value storage with TTL support via `StorageBackend`
@@ -173,6 +174,41 @@ See [`examples/`](examples) for all deployment modes (Sentinel, Cluster, Atlas, 
 **RocketMQ**: Queue is functional. Set and Storage methods exist but raise `NotImplementedError` at runtime. Pair with a full-featured backend for dedup/storage.
 
 **Memcached, DynamoDB**: Storage-only (key-value with TTL). Pair with a queue-capable backend for request distribution.
+
+## Multi-Backend Coexistence
+
+The three components — **Scheduler** (queue), **DupeFilter** (set), **Pipeline** (storage) — can each bind to a *different* backend. This unlocks hybrid topologies that play to each backend's strengths: a high-throughput queue in Kafka, exact cross-worker dedup in Redis, durable item storage in MongoDB.
+
+| Component | Per-component keys | Fallback (backward compat) |
+|-----------|-------------------|------|
+| Scheduler (queue) | `SCRAPY_QUEUE_BACKEND_TYPE` / `SCRAPY_QUEUE_BACKEND_SETTINGS` | `SCRAPY_BACKEND_TYPE` / `SCRAPY_BACKEND_SETTINGS` |
+| DupeFilter (set) | `SCRAPY_SET_BACKEND_TYPE` / `SCRAPY_SET_BACKEND_SETTINGS` | `SCRAPY_BACKEND_TYPE` / `SCRAPY_BACKEND_SETTINGS` |
+| Pipeline (storage) | `SCRAPY_STORAGE_BACKEND_TYPE` / `SCRAPY_STORAGE_BACKEND_SETTINGS` | `SCRAPY_BACKEND_TYPE` / `SCRAPY_BACKEND_SETTINGS` |
+
+When a per-component type key is set, that component uses its per-component settings; otherwise it falls back to the global keys — so existing single-backend configurations keep working unchanged.
+
+**Example: queue in Redis-Cluster, dedup fingerprints + scraped data in MongoDB**
+
+```python
+# settings.py
+SCHEDULER = "scrapy_extension.schedule.scheduler.BackendScheduler"
+DUPEFILTER_CLASS = "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter"
+ITEM_PIPELINES = {"scrapy_extension.pipeline.pipeline.BackendPipeline": 300}
+
+# Queue: Redis-Cluster
+SCRAPY_QUEUE_BACKEND_TYPE = "redis"
+SCRAPY_QUEUE_BACKEND_SETTINGS = {"mode": "cluster", "startup_nodes": [...]}
+
+# Dedup fingerprints: MongoDB
+SCRAPY_SET_BACKEND_TYPE = "mongodb"
+SCRAPY_SET_BACKEND_SETTINGS = {"uri": "mongodb://mongo:27017", "database": "scrapy"}
+
+# Scraped data: MongoDB (same cluster, separate connection manager entry)
+SCRAPY_STORAGE_BACKEND_TYPE = "mongodb"
+SCRAPY_STORAGE_BACKEND_SETTINGS = {"uri": "mongodb://mongo:27017", "database": "scrapy"}
+```
+
+> **Constraint**: each backend must implement the interface its component needs — queue backends must implement `QueueBackend`, dedup backends `SetBackend`, storage backends `StorageBackend` (see the [capabilities matrix](#backend-capabilities)). The `ConnectionManager` registry keys one pooled connection per `backend_type:settings_hash`, so co-located backends (e.g. set + storage both MongoDB, same URI) share a single connection.
 
 ## Pluggable Strategy Layers
 
@@ -354,3 +390,12 @@ Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomiz
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+TODO:
+- [ ] Documentation
+- [ ] Pluggable serializers
+- [x] Multi-Backend Coexistence — queue/set/storage bind independently via `SCRAPY_{QUEUE,SET,STORAGE}_BACKEND_TYPE`
+- [ ] Pluggable schedulers
+- [ ] Pluggable storages
+- [ ] Pluggable queues

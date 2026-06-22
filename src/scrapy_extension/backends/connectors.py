@@ -28,6 +28,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def resolve_backend_config(
+  settings: Any,
+  type_key: str,
+  settings_key: str,
+) -> tuple[BackendType, dict[str, Any]]:
+  """Resolve a component's backend config, preferring per-component keys.
+
+  Multi-backend coexistence: each component (queue / set / storage) can bind
+  to its own backend via a per-component key pair — e.g. queue seeds in
+  Redis-Cluster while dedup fingerprints live in MongoDB. When the
+  per-component ``type_key`` is set, the component uses the per-component
+  ``settings_key``; otherwise it falls back to the global
+  ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so existing
+  single-backend configurations keep working unchanged.
+
+  Args:
+      settings: A Scrapy Settings-like object exposing ``get``/``getdict``.
+      type_key: The per-component backend-type setting key
+          (e.g. ``"SCRAPY_QUEUE_BACKEND_TYPE"``).
+      settings_key: The per-component backend-settings setting key
+          (e.g. ``"SCRAPY_QUEUE_BACKEND_SETTINGS"``).
+
+  Returns:
+      A ``(backend_type, settings_dict)`` tuple ready for
+      ``ConnectionManager.get_manager(...)``.
+  """
+  per_component_type = settings.get(type_key)
+  if per_component_type:
+    return BackendType(per_component_type), settings.getdict(settings_key, {})
+  return (
+    BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis")),
+    settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
+  )
+
+
 class ConnectionManager:
   """Lazy singleton connection manager for backends.
 

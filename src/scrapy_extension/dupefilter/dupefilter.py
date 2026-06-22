@@ -94,23 +94,35 @@ class BackendDupeFilter:
   def from_settings(cls, settings: Settings) -> BackendDupeFilter:
     """Create dupefilter from Scrapy settings.
 
+    Backend selection: ``SCRAPY_SET_BACKEND_TYPE`` /
+    ``SCRAPY_SET_BACKEND_SETTINGS`` override the global
+    ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so the dedup set
+    can bind to a different backend than the queue or storage pipeline
+    (multi-backend coexistence). Unset → falls back to the global keys.
+
     Args:
         settings: Scrapy settings object.
 
     Returns:
         A new BackendDupeFilter instance.
     """
-    from scrapy_extension.backends.base import BackendType
-    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.connectors import (
+      ConnectionManager,
+      resolve_backend_config,
+    )
     from scrapy_extension.dupefilter.filters.factory import (
       DedupeStrategy,
       build_membership_filter,
     )
 
-    backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
+    backend_type, backend_settings = resolve_backend_config(
+      settings,
+      type_key="SCRAPY_SET_BACKEND_TYPE",
+      settings_key="SCRAPY_SET_BACKEND_SETTINGS",
+    )
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
-      settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
+      settings=backend_settings,
     )
     key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
     strategy = DedupeStrategy(

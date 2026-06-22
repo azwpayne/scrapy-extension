@@ -12,8 +12,11 @@ from typing import TYPE_CHECKING, Any
 from scrapy import signals
 from scrapy.utils.misc import load_object
 
-from scrapy_extension.backends.base import BackendType, _validate_key_name
-from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.base import _validate_key_name
+from scrapy_extension.backends.connectors import (
+  ConnectionManager,
+  resolve_backend_config,
+)
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 
@@ -86,16 +89,26 @@ class BackendScheduler:
 
     Selects the queue strategy from ``SCRAPY_QUEUE_STRATEGY`` (default
     ``passthrough``). The delay strategy reads ``SCRAPY_QUEUE_DELAY_DEFAULT``.
+
+    Backend selection: ``SCRAPY_QUEUE_BACKEND_TYPE`` /
+    ``SCRAPY_QUEUE_BACKEND_SETTINGS`` override the global
+    ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so the queue can
+    bind to a different backend than the dedup filter or storage pipeline
+    (multi-backend coexistence). Unset → falls back to the global keys.
     """
     from scrapy_extension.queue.strategies.factory import (
       QueueStrategyType,
       build_queue_strategy,
     )
 
-    backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
+    backend_type, backend_settings = resolve_backend_config(
+      settings,
+      type_key="SCRAPY_QUEUE_BACKEND_TYPE",
+      settings_key="SCRAPY_QUEUE_BACKEND_SETTINGS",
+    )
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
-      settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
+      settings=backend_settings,
     )
     strategy_type = QueueStrategyType(
       settings.get("SCRAPY_QUEUE_STRATEGY", QueueStrategyType.PASSTHROUGH.value)

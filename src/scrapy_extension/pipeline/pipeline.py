@@ -62,19 +62,31 @@ class BackendPipeline:
   def from_settings(cls, settings: Settings) -> BackendPipeline:
     """Create pipeline from Scrapy settings.
 
+    Backend selection: ``SCRAPY_STORAGE_BACKEND_TYPE`` /
+    ``SCRAPY_STORAGE_BACKEND_SETTINGS`` override the global
+    ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so item storage
+    can bind to a different backend than the queue or dedup set
+    (multi-backend coexistence). Unset → falls back to the global keys.
+
     Args:
         settings: Scrapy settings object.
 
     Returns:
         A new BackendPipeline instance.
     """
-    from scrapy_extension.backends.base import BackendType
-    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.connectors import (
+      ConnectionManager,
+      resolve_backend_config,
+    )
 
-    backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis"))
+    backend_type, backend_settings = resolve_backend_config(
+      settings,
+      type_key="SCRAPY_STORAGE_BACKEND_TYPE",
+      settings_key="SCRAPY_STORAGE_BACKEND_SETTINGS",
+    )
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
-      settings=settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
+      settings=backend_settings,
     )
     return cls(
       connection_manager=manager,
