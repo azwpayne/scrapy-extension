@@ -392,10 +392,3 @@ Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomiz
 MIT — see [LICENSE](LICENSE).
 
 
-TODO:
-- [ ] Documentation
-- [ ] Pluggable serializers
-- [x] Multi-Backend Coexistence — queue/set/storage bind independently via `SCRAPY_{QUEUE,SET,STORAGE}_BACKEND_TYPE`
-- [ ] Pluggable schedulers
-- [ ] Pluggable storages
-- [ ] Pluggable queues

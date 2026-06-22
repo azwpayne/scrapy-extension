@@ -20,7 +20,7 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import Backend
@@ -28,10 +28,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+QUEUE_CAPABLE_BACKENDS: set[BackendType] = {
+  BackendType.REDIS,
+  BackendType.MONGODB,
+  BackendType.KAFKA,
+  BackendType.RABBITMQ,
+  BackendType.ELASTICSEARCH,
+  BackendType.ROCKETMQ,
+  BackendType.PULSAR,
+  BackendType.SQS,
+}
+SET_CAPABLE_BACKENDS: set[BackendType] = {
+  BackendType.REDIS,
+  BackendType.MONGODB,
+  BackendType.ELASTICSEARCH,
+}
+STORAGE_CAPABLE_BACKENDS: set[BackendType] = {
+  BackendType.REDIS,
+  BackendType.MONGODB,
+  BackendType.ELASTICSEARCH,
+  BackendType.MEMCACHED,
+  BackendType.DYNAMODB,
+}
+
+
 def resolve_backend_config(
   settings: Any,
   type_key: str,
   settings_key: str,
+  *,
+  required_capabilities: set[BackendType] | None = None,
+  component_name: str = "",
 ) -> tuple[BackendType, dict[str, Any]]:
   """Resolve a component's backend config, preferring per-component keys.
 
@@ -43,24 +70,53 @@ def resolve_backend_config(
   ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so existing
   single-backend configurations keep working unchanged.
 
+  Capability validation (I-1): when ``required_capabilities`` is supplied,
+  the resolved backend type must be in that set or ``ConfigurationError``
+  is raised at config time (fail-fast). This prevents a late, confusing
+  crash mid-crawl — e.g. configuring Kafka (queue-only) for dedup and only
+  discovering it when ``request_seen()`` fires on the first request.
+
+  Empty-string normalization (I-3): ``SCRAPY_BACKEND_TYPE=""`` (e.g. from
+  an empty env var) is treated as unset and falls back to ``"redis"``,
+  rather than raising ``ValueError`` inside ``BackendType("")``.
+
   Args:
       settings: A Scrapy Settings-like object exposing ``get``/``getdict``.
-      type_key: The per-component backend-type setting key
-          (e.g. ``"SCRAPY_QUEUE_BACKEND_TYPE"``).
-      settings_key: The per-component backend-settings setting key
-          (e.g. ``"SCRAPY_QUEUE_BACKEND_SETTINGS"``).
+      type_key: The per-component backend-type setting key.
+      settings_key: The per-component backend-settings setting key.
+      required_capabilities: Optional allowlist of backend types that satisfy
+          this component's interface (queue/set/storage). ``None`` skips
+          validation (backward compatible).
+      component_name: Human-readable component name for error messages
+          (e.g. ``"queue"``, ``"set"``, ``"storage"``).
 
   Returns:
       A ``(backend_type, settings_dict)`` tuple ready for
       ``ConnectionManager.get_manager(...)``.
+
+  Raises:
+      ConfigurationError: If ``required_capabilities`` is set and the
+          resolved backend type is not in it.
   """
   per_component_type = settings.get(type_key)
   if per_component_type:
-    return BackendType(per_component_type), settings.getdict(settings_key, {})
-  return (
-    BackendType(settings.get("SCRAPY_BACKEND_TYPE", "redis")),
-    settings.getdict("SCRAPY_BACKEND_SETTINGS", {}),
-  )
+    backend_type = BackendType(per_component_type)
+    backend_settings = settings.getdict(settings_key, {})
+    source_key = type_key
+  else:
+    backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE") or "redis")
+    backend_settings = settings.getdict("SCRAPY_BACKEND_SETTINGS", {})
+    source_key = "SCRAPY_BACKEND_TYPE"
+
+  if required_capabilities is not None and backend_type not in required_capabilities:
+    capable = sorted(b.value for b in required_capabilities)
+    msg = (
+      f"Backend {backend_type.value!r} does not support the {component_name} "
+      f"interface required by this component. Capable backends: {capable}."
+    )
+    raise ConfigurationError(msg, setting_name=source_key)
+
+  return backend_type, backend_settings
 
 
 class ConnectionManager:
@@ -260,6 +316,15 @@ class ConnectionManager:
     Closes the connection and cleans up resources. Also removes the
     instance from the class-level registry so subsequent
     ``get_manager()`` calls create a fresh manager.
+
+    Idempotent and safe under shared-manager scenarios (I-2): when multiple
+    components (e.g. dupefilter + pipeline) resolve to the same
+    ``backend_type:settings_hash`` registry key, they share one
+    ``ConnectionManager`` instance. Each component's ``close()`` calls this
+    method; the first call disconnects and evicts the registry entry, and
+    subsequent calls are no-ops (guarded by ``if self._backend:``). Scrapy
+    serializes component shutdown today, so no concurrent-close hazard —
+    but the idempotent contract is what makes co-located backends safe.
     """
     with self._lock:
       if self._backend:

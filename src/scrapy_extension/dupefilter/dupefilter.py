@@ -107,6 +107,7 @@ class BackendDupeFilter:
         A new BackendDupeFilter instance.
     """
     from scrapy_extension.backends.connectors import (
+      SET_CAPABLE_BACKENDS,
       ConnectionManager,
       resolve_backend_config,
     )
@@ -119,6 +120,8 @@ class BackendDupeFilter:
       settings,
       type_key="SCRAPY_SET_BACKEND_TYPE",
       settings_key="SCRAPY_SET_BACKEND_SETTINGS",
+      required_capabilities=SET_CAPABLE_BACKENDS,
+      component_name="set",
     )
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,

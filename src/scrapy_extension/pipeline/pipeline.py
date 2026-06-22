@@ -75,6 +75,7 @@ class BackendPipeline:
         A new BackendPipeline instance.
     """
     from scrapy_extension.backends.connectors import (
+      STORAGE_CAPABLE_BACKENDS,
       ConnectionManager,
       resolve_backend_config,
     )
@@ -83,6 +84,8 @@ class BackendPipeline:
       settings,
       type_key="SCRAPY_STORAGE_BACKEND_TYPE",
       settings_key="SCRAPY_STORAGE_BACKEND_SETTINGS",
+      required_capabilities=STORAGE_CAPABLE_BACKENDS,
+      component_name="storage",
     )
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,

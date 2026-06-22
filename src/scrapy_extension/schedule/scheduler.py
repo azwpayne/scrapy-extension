@@ -14,6 +14,7 @@ from scrapy.utils.misc import load_object
 
 from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.backends.connectors import (
+  QUEUE_CAPABLE_BACKENDS,
   ConnectionManager,
   resolve_backend_config,
 )
@@ -105,6 +106,8 @@ class BackendScheduler:
       settings,
       type_key="SCRAPY_QUEUE_BACKEND_TYPE",
       settings_key="SCRAPY_QUEUE_BACKEND_SETTINGS",
+      required_capabilities=QUEUE_CAPABLE_BACKENDS,
+      component_name="queue",
     )
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
