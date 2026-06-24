@@ -395,14 +395,55 @@ class TestBackendQueuePush:
     mock_connection_manager.get_queue_backend().nack.assert_called_once_with("test_queue")
 
   def test_decode_body_raises_on_invalid_base64(self):
-    """R17: _decode_body raises SerializationError on non-base64 body.
+    """R17/D1: _decode_body raises SerializationError on structurally corrupt body.
 
-    Covers the corruption-detection path: a queued request whose body isn't
-    valid base64 (queue tampering, version skew) surfaces as a loud
-    SerializationError, not a silent wrong decode.
+    After D1, valid-UTF-8 non-base64 bodies are migrated (legacy format). The
+    corruption path that still raises is a body that is neither valid base64
+    nor UTF-8-encodable — e.g. a lone surrogate, the only ``str`` content that
+    ``encode("utf-8")`` rejects. Surfaces as a loud SerializationError, not a
+    silent wrong decode.
     """
+    # Lone surrogate: str.encode("utf-8") raises UnicodeEncodeError.
+    corrupt_body = "\udcff"
     with pytest.raises(SerializationError, match="Invalid base64 body"):
-      BackendQueue._decode_body({"body": "!!!not-base64!!!"})
+      BackendQueue._decode_body({"body": corrupt_body})
+
+  def test_decode_body_falls_back_for_legacy_utf8_body(self):
+    """D1: legacy non-base64 UTF-8 body round-trips instead of being dropped.
+
+    Pre-base64 package versions wrote raw UTF-8/latin-1 bodies to the queue.
+    On rolling upgrade, those queued items would hit ``b64decode(validate=True)``
+    and raise ``SerializationError`` → scheduler silently drops the request.
+
+    Fix: detect a legacy body (not valid base64 but valid UTF-8) and fall
+    back to ``body.encode("utf-8")`` + emit a one-time ``DeprecationWarning``.
+    Structural corruption (not valid base64 AND not UTF-8-encodable) still raises.
+    """
+    import warnings
+
+    legacy_body_str = "hello world"  # valid UTF-8, not valid base64-padding
+    request_dict = {"body": legacy_body_str}
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      BackendQueue._decode_body(request_dict)
+
+    assert request_dict["body"] == b"hello world"
+    assert any(
+      issubclass(w.category, DeprecationWarning)
+      and "legacy" in str(w.message).lower()
+      for w in caught
+    ), f"Expected a legacy-body DeprecationWarning, got: {caught}"
+
+  def test_decode_body_structural_corruption_still_raises(self):
+    """D1: a lone surrogate (neither base64 nor UTF-8-encodable) still raises.
+
+    The legacy fallback must not mask genuine corruption — only UTF-8-encodable
+    bodies (the pre-base64 format) are migrated; a lone surrogate raises.
+    """
+    # Lone surrogate: str.encode("utf-8") raises UnicodeEncodeError.
+    with pytest.raises(SerializationError, match="Invalid base64 body"):
+      BackendQueue._decode_body({"body": "\udcff"})
 
   def test_push_raises_serialization_error_on_exception(self, mock_connection_manager, mock_spider):
     """Test push raises SerializationError when request serialization fails."""
@@ -618,3 +659,122 @@ class TestBackendQueueClear:
     mock_connection_manager.get_queue_backend().clear_queue.assert_called_once_with(
       "test_queue"
     )
+
+
+class TestBackendQueueMaxItemBytes:
+  """D2: configurable per-item byte cap to prevent DoS via oversize payloads."""
+
+  def test_push_oversize_payload_raises_and_increments_stat(
+    self, mock_connection_manager, mocker
+  ):
+    """D2: an oversize serialized request raises SerializationError + bumps stat.
+
+    A hostile target can push arbitrarily large request bodies; storage backends
+    with caps (Memcached 1 MB, DynamoDB 400 KB) throw and the item is silently
+    dropped. The cap surfaces the oversize condition loudly at push time with
+    a stat increment so operators can see it on dashboards.
+    """
+    # Use an unspec'd mock so spider.crawler.stats is reachable (the production
+    # code resolves stats defensively via getattr).
+    spider = mocker.Mock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+      max_item_bytes=64,
+    )
+    request = Request(url="https://example.com", body=b"x" * 200)
+
+    with pytest.raises(SerializationError, match="exceeds.*max"):
+      queue.push(request)
+
+    spider.crawler.stats.inc_value.assert_called_with(
+      "scheduler/queue/oversize_dropped"
+    )
+    # Backend push never happened — rejected before strategy.push.
+    mock_connection_manager.get_queue_backend().push.assert_not_called()
+
+  def test_push_normal_size_payload_succeeds(
+    self, mock_connection_manager, mock_spider
+  ):
+    """D2: a normal-size payload is unaffected by the cap."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      max_item_bytes=1_048_576,
+    )
+    request = Request(url="https://example.com")
+    queue.push(request)
+
+    mock_connection_manager.get_queue_backend().push.assert_called_once()
+
+  def test_push_no_spider_stats_does_not_raise(self, mock_connection_manager):
+    """D2: stat increment tolerates a queue without spider.crawler.stats.
+
+    Mirrors the pipeline's defensive ``_inc_stat``: a missing crawler must not
+    crash the push path — the SerializationError is still raised (the loud
+    signal) but the stat is skipped.
+    """
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      max_item_bytes=64,
+    )
+    request = Request(url="https://example.com", body=b"x" * 200)
+
+    with pytest.raises(SerializationError, match="exceeds.*max"):
+      queue.push(request)
+
+  def test_default_max_item_bytes_allows_typical_request(
+    self, mock_connection_manager, mock_spider
+  ):
+    """D2: default cap (1 MiB) allows typical request payloads."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+    assert queue.max_item_bytes == 1_048_576
+    request = Request(url="https://example.com", body=b"x" * 10_000)
+    queue.push(request)
+    mock_connection_manager.get_queue_backend().push.assert_called_once()
+
+
+class TestBackendQueueMonitorWiring:
+  """Unit F: BackendQueue emits monitor hooks on push/pop (additive)."""
+
+  def test_push_with_explicit_monitor_emits_on_push(
+    self, mock_connection_manager, mocker
+  ):
+    """Push with a ScrapyStatsMonitor increments queue/push_count."""
+    from scrapy.statscollectors import MemoryStatsCollector
+
+    from scrapy_extension.monitor import ScrapyStatsMonitor
+
+    stats = MemoryStatsCollector(mocker.MagicMock())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      monitor=ScrapyStatsMonitor(stats),
+    )
+    queue.push(Request(url="https://example.com"))
+    assert stats.get_value("queue/push_count") == 1
+
+  def test_pop_with_explicit_monitor_emits_on_pop(
+    self, mock_connection_manager, mocker
+  ):
+    """Pop with a ScrapyStatsMonitor increments queue/pop_count."""
+    from scrapy.statscollectors import MemoryStatsCollector
+
+    from scrapy_extension.monitor import ScrapyStatsMonitor
+
+    stats = MemoryStatsCollector(mocker.MagicMock())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      monitor=ScrapyStatsMonitor(stats),
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+    queue.pop()
+    assert stats.get_value("queue/pop_count") == 1

@@ -7,7 +7,10 @@ from scrapy import Field, Item
 from scrapy.http import Request
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
-from scrapy_extension.exceptions import QueueError, SerializationError
+from scrapy_extension.exceptions import (
+  QueueError,
+  SerializationError,
+)
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -623,7 +626,7 @@ class TestBackendScheduler:
     )
 
   def test_signal_handlers_call_queue_ack_nack(self, mock_connection_manager, mocker):
-    """The wired signal handlers call queue.ack()/nack() on the right events."""
+    """The wired signal handlers call queue.ack()/nack() with the request's token."""
     scheduler = BackendScheduler(
       connection_manager=mock_connection_manager,
       queue_key="test:queue",
@@ -639,12 +642,20 @@ class TestBackendScheduler:
     queue_ack_spy = mocker.patch.object(queue, "ack")
     queue_nack_spy = mocker.patch.object(queue, "nack")
 
-    # Fire the signal handlers directly
-    scheduler._on_response_received(response=None, request=None, spider=mock_spider)
-    queue_ack_spy.assert_called_once()
+    # Fire the signal handlers directly with a request carrying an ack token.
+    mock_request = mocker.MagicMock()
+    mock_request.meta = {"_backend_ack_token": "sig-tok"}
+    mock_response = mocker.MagicMock()
+    mock_response.request = mock_request
+    scheduler._on_response_received(
+      response=mock_response, request=mock_request, spider=mock_spider
+    )
+    queue_ack_spy.assert_called_once_with(token="sig-tok")
 
-    scheduler._on_spider_error(failure=None, response=None, spider=mock_spider)
-    queue_nack_spy.assert_called_once()
+    scheduler._on_spider_error(
+      failure=None, response=mock_response, spider=mock_spider
+    )
+    queue_nack_spy.assert_called_once_with(token="sig-tok")
 
   def test_connect_ack_signals_is_idempotent(self, mock_connection_manager, mocker):
     """R12: _connect_ack_signals short-circuits when already wired (line 136)."""
@@ -839,6 +850,200 @@ class TestBackendScheduler:
 
     scheduler.open(valid_spider)  # must not raise
     assert scheduler._spider is valid_spider
+
+
+class TestSchedulerAckConcurrencyCorrect:
+  """Tier-2 Unit H: the E1 fail-fast gate is GONE — ack is concurrency-correct.
+
+  The previous gate raised ``ConfigurationError`` for Kafka/RabbitMQ under
+  ``CONCURRENT_REQUESTS > 1`` because pop() tracked a single ack slot. With
+  the in-flight-set fix (pop_with_ack + per-message ack tokens), ack is now
+  correct under any concurrency, so the gate and the
+  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out are removed.
+  """
+
+  @staticmethod
+  def _make_settings(backend_type: str, concurrent: int):
+    """Build a Scrapy-Settings-like mock resolving the queue backend + concurrency."""
+    from unittest.mock import Mock
+
+    settings = Mock()
+    backend_map = {
+      "SCRAPY_BACKEND_TYPE": backend_type,
+      "SCRAPY_QUEUE_KEY": "scheduler:queue",
+    }
+
+    def get(key, default=None):
+      if key == "CONCURRENT_REQUESTS":
+        return concurrent
+      return backend_map.get(key, default)
+
+    settings.get.side_effect = get
+    settings.getfloat.return_value = 0.0
+    settings.getdict.return_value = {}
+
+    def getint(key, default=0):
+      if key == "CONCURRENT_REQUESTS":
+        return concurrent
+      return default
+
+    settings.getint.side_effect = getint
+    return settings
+
+  def test_kafka_with_concurrency_gt_1_no_longer_raises(self, mocker):
+    """Kafka + CONCURRENT_REQUESTS=16 no longer raises (ack is concurrency-correct)."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("kafka", concurrent=16)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+
+    assert scheduler.queue_key == "scheduler:queue"
+
+  def test_rabbitmq_with_concurrency_gt_1_no_longer_raises(self, mocker):
+    """RabbitMQ + CONCURRENT_REQUESTS=4 no longer raises."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("rabbitmq", concurrent=4)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+
+    assert scheduler.queue_key == "scheduler:queue"
+
+  def test_opt_out_flag_no_longer_referenced(self):
+    """The E1 gate method, opt-out flag attribute, and single-slot set are removed."""
+    from scrapy_extension.schedule.scheduler import BackendScheduler
+
+    # The gate method and supporting class attributes are gone.
+    assert not hasattr(BackendScheduler, "_enforce_ack_concurrency_gate")
+    assert not hasattr(BackendScheduler, "_ACK_SINGLE_SLOT_BACKENDS")
+    assert not hasattr(BackendScheduler, "_ACK_UNSAFE_OPT_OUT")
+    # No settings read for the opt-out flag remains (defensive: also check
+    # the from_settings method body, not the whole class docstring).
+    import inspect
+
+    from_settings_src = inspect.getsource(BackendScheduler.from_settings)
+    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" not in from_settings_src
+    assert "_enforce_ack_concurrency_gate" not in from_settings_src
+
+  def test_from_crawler_allows_kafka_concurrency(self, mocker):
+    """from_crawler (real Scrapy entry point) no longer gates Kafka concurrency."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_crawler = mocker.Mock()
+    mock_crawler.settings = self._make_settings("kafka", concurrent=8)
+    mock_crawler.stats = mocker.Mock()
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_crawler(mock_crawler)  # must not raise
+
+    assert scheduler.queue_key == "scheduler:queue"
+
+
+class TestSchedulerAckTokenFlow:
+  """Tier-2 Unit H: pop→request→response→ack token correlation.
+
+  The scheduler reads ``request.meta["_backend_ack_token"]`` on
+  response_received / spider_error and forwards it to
+  ``BackendQueue.ack(token=…)`` / ``nack(token=…)`` so the backend acks
+  the *specific* message — correct under CONCURRENT_REQUESTS>1.
+  """
+
+  def test_pop_injects_ack_token_into_request_meta(self, mocker):
+    """BackendQueue.pop injects _backend_ack_token from pop_with_ack into request.meta.
+
+    Uses a concrete backend stub that overrides pop_with_ack so the override
+    detection routes through the token-correlated path (mirrors Kafka/RabbitMQ).
+    """
+    from scrapy_extension.backends.base import QueueBackend
+
+    class _TokenBackend(QueueBackend):
+      """Stub backend overriding pop_with_ack (override-detection target)."""
+
+      def push(self, queue_name, item, priority=0.0):  # noqa: D401, ARG002
+        """No-op push for the stub."""
+
+      def pop(self, queue_name, timeout=0.0):  # noqa: D401, ARG002
+        """Single-value pop (not used when pop_with_ack is overridden)."""
+        return None
+
+      def pop_with_ack(self, queue_name, timeout=0.0):  # noqa: D401, ARG002
+        """Token-correlated pop — returns the stubbed (bytes, token) tuple."""
+        return (
+          b'{"url": "https://example.com", "callback": null}',
+          ("opaque-token",),
+        )
+
+      def queue_len(self, queue_name):  # noqa: D401, ARG002
+        """Stub length."""
+        return 0
+
+      def clear_queue(self, queue_name):  # noqa: D401, ARG002
+        """Stub clear."""
+
+    backend = _TokenBackend()
+    cm = mocker.MagicMock()
+    cm.get_queue_backend.return_value = backend
+    queue = BackendQueue(connection_manager=cm, queue_name="q")
+
+    request = queue.pop(timeout=0)
+
+    assert request is not None
+    assert request.meta["_backend_ack_token"] == ("opaque-token",)
+
+  def test_pop_omits_token_key_for_atomic_backends(self, mock_connection_manager):
+    """Atomic-pop backends (token=None) leave request.meta untouched.
+
+    The default pop_with_ack returns (pop(), None); BackendQueue.pop does
+    NOT inject the key when token is None, so atomic-backend requests
+    roundtrip byte-identically (no surprise meta key).
+    """
+    mock_qb = mock_connection_manager.get_queue_backend()
+    mock_qb.pop.return_value = b'{"url": "https://example.com", "callback": null}'
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+    )
+
+    request = queue.pop(timeout=0)
+
+    assert request is not None
+    assert "_backend_ack_token" not in request.meta
+
+  def test_on_response_received_forwards_token_to_ack(self, mocker):
+    """_on_response_received reads _backend_ack_token and forwards it to ack(token=...)."""
+    mock_cm = mocker.MagicMock()
+    scheduler = BackendScheduler(connection_manager=mock_cm)
+    mock_queue = mocker.MagicMock()
+    scheduler._queue = mock_queue
+
+    mock_request = mocker.MagicMock()
+    mock_request.meta = {"_backend_ack_token": "tok-123"}
+    mock_response = mocker.MagicMock()
+
+    scheduler._on_response_received(mock_response, mock_request, spider=mocker.MagicMock())
+
+    mock_queue.ack.assert_called_once_with(token="tok-123")
+
+  def test_on_spider_error_forwards_token_to_nack(self, mocker):
+    """_on_spider_error reads token from response.request.meta and forwards to nack(token=...)."""
+    mock_cm = mocker.MagicMock()
+    scheduler = BackendScheduler(connection_manager=mock_cm)
+    mock_queue = mocker.MagicMock()
+    scheduler._queue = mock_queue
+
+    mock_request = mocker.MagicMock()
+    mock_request.meta = {"_backend_ack_token": "tok-456"}
+    mock_response = mocker.MagicMock()
+    mock_response.request = mock_request
+
+    scheduler._on_spider_error(
+        mocker.MagicMock(), mock_response, spider=mocker.MagicMock()
+    )
+
+    mock_queue.nack.assert_called_once_with(token="tok-456")
 
 
 class TestBackendDupeFilter:

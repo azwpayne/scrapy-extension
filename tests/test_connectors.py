@@ -708,3 +708,515 @@ class TestConnectionManagerCreateBackendAllTypes:
     # Backend/Settings swap inside a match arm).
     assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
 
+
+class TestResolveBackendConfigEnumNormalization:
+  """A3: ``resolve_backend_config`` must not crash on programmatic enum values.
+
+  Previously ``BackendType(per_component_type)`` raised ``ValueError`` if the
+  value was an invalid string OR a value that ``BackendType.__call__`` could
+  not coerce (e.g. an int passed by a programmatic caller). The crash
+  surfaced as an untyped ``ValueError`` deep in ``from_settings`` instead of
+  a ``ConfigurationError`` with the offending setting name + value attached.
+  """
+
+  @staticmethod
+  def _make_settings(values: dict[str, object]) -> MagicMock:
+    """Build a Scrapy-settings-like stub returning per-key values.
+
+    ``resolve_backend_config`` calls ``settings.get(key)`` and
+    ``settings.getdict(key, default)``; a ``MagicMock`` spec'd to a dict-like
+    gives predictable per-key behavior without dragging in scrapy.Settings.
+    """
+    settings = MagicMock()
+
+    def _get(key, default=None):
+      return values.get(key, default)
+
+    def _getdict(key, default=None):
+      v = values.get(key, default)
+      if v is None:
+        return {}
+      return dict(v)
+
+    settings.get.side_effect = _get
+    settings.getdict.side_effect = _getdict
+    return settings
+
+  def test_enum_instance_passthrough_per_component(self):
+    """A BackendType instance passed as the per-component value must pass
+    through ``resolve_backend_config`` unchanged (no ValueError, no
+    re-coercion crash)."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+
+    settings = self._make_settings(
+      {"SCRAPY_QUEUE_BACKEND_TYPE": BackendType.MONGODB}
+    )
+    backend_type, _ = resolve_backend_config(
+      settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+    )
+    assert backend_type is BackendType.MONGODB
+
+  def test_string_value_resolves_per_component(self):
+    """A plain string (the typical Scrapy settings path) must still resolve."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+
+    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "kafka"})
+    backend_type, _ = resolve_backend_config(
+      settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+    )
+    assert backend_type is BackendType.KAFKA
+
+  def test_invalid_string_raises_configuration_error(self):
+    """An invalid backend type string must raise ``ConfigurationError``
+    (not bare ``ValueError``) so the caller sees a typed error with the
+    offending setting name + value attached."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.exceptions import ConfigurationError
+
+    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "not-a-backend"})
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+      )
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
+    assert exc_info.value.setting_value == "not-a-backend"
+
+  def test_invalid_global_raises_configuration_error(self):
+    """Same normalization on the GLOBAL fallback path
+    (``SCRAPY_BACKEND_TYPE``)."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.exceptions import ConfigurationError
+
+    settings = self._make_settings({"SCRAPY_BACKEND_TYPE": "bogus"})
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+      )
+    assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
+    assert exc_info.value.setting_value == "bogus"
+
+  def test_non_string_value_raises_configuration_error(self):
+    """A non-string, non-enum value (e.g. an int from a programmatic caller)
+    must raise ``ConfigurationError`` rather than the raw ``ValueError``
+    that ``BackendType(123)`` produces internally."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.exceptions import ConfigurationError
+
+    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": 123})
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+      )
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
+
+
+class TestConnectionManagerRefcount:
+  """A1: shared ConnectionManager.close() must refcount co-located holders.
+
+  When two components (scheduler queue + dupefilter) resolve to the same
+  ``backend_type:settings_hash`` registry key, ``get_manager()`` returns the
+  SAME instance. The old ``close()`` unconditionally disconnected + evicted,
+  so the first component to close tore the connection out from under the
+  other during shutdown.
+  """
+
+  def test_get_manager_acquires_refcount(self):
+    """Each ``get_manager()`` call for the same key must increment the
+    shared manager's refcount (one acquire per get)."""
+    manager = ConnectionManager.get_manager(BackendType.REDIS)
+    assert manager._users == 1
+    manager2 = ConnectionManager.get_manager(BackendType.REDIS)
+    assert manager is manager2
+    assert manager._users == 2
+
+  def test_close_last_holder_evicts_and_reconnects_fresh(self, mocker):
+    """Closing the LAST holder evicts the registry entry; a subsequent
+    ``get_manager(same key)`` returns a FRESH manager (different ``id``)
+    that reconnects from scratch."""
+    mocker.patch.object(ConnectionManager, "_create_backend")
+    mock_backend = mocker.MagicMock()
+    ConnectionManager._create_backend.return_value = mock_backend
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "reconnect-test"}
+    )
+    manager._backend = mock_backend
+    first_id = id(manager)
+
+    manager.close()
+
+    # Backend was disconnected and _backend cleared.
+    mock_backend.disconnect.assert_called_once()
+    assert manager._backend is None
+
+    # Registry evicted → fresh manager on next get.
+    manager_after = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "reconnect-test"}
+    )
+    assert id(manager_after) != first_id
+    assert manager_after is not manager
+
+  def test_colocated_close_one_keeps_backend_alive(self, mocker):
+    """Two holders share one manager. Closing ONE must NOT disconnect the
+    backend or evict the registry — the other holder still needs it."""
+    mocker.patch.object(ConnectionManager, "_create_backend")
+    mock_backend = mocker.MagicMock()
+    ConnectionManager._create_backend.return_value = mock_backend
+
+    holder_a = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated"}
+    )
+    holder_b = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated"}
+    )
+    assert holder_a is holder_b
+    assert holder_a._users == 2
+
+    holder_a._backend = mock_backend
+
+    # First close — must NOT tear down.
+    holder_a.close()
+
+    mock_backend.disconnect.assert_not_called()
+    assert holder_a._backend is mock_backend  # backend still wired
+    # Registry still holds the manager.
+    key = ConnectionManager._registry_key(
+      BackendType.REDIS, {"host": "colocated"}
+    )
+    assert key in ConnectionManager._managers
+    # Refcount decremented to the remaining holder.
+    assert holder_b._users == 1
+
+  def test_colocated_close_both_disconnects_and_evicts(self, mocker):
+    """Closing BOTH holders (last one out) disconnects the backend AND
+    evicts the registry entry."""
+    mocker.patch.object(ConnectionManager, "_create_backend")
+    mock_backend = mocker.MagicMock()
+    ConnectionManager._create_backend.return_value = mock_backend
+
+    holder_a = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated-both"}
+    )
+    holder_b = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated-both"}
+    )
+    holder_a._backend = mock_backend
+
+    holder_a.close()
+    holder_b.close()
+
+    mock_backend.disconnect.assert_called_once()
+    key = ConnectionManager._registry_key(
+      BackendType.REDIS, {"host": "colocated-both"}
+    )
+    assert key not in ConnectionManager._managers
+
+  def test_concurrent_get_manager_same_key_one_shared_instance(self):
+    """Under concurrency, N threads hitting the same registry key must
+    resolve to exactly ONE shared manager (no registry race creating
+    duplicates) with refcount == N."""
+    import threading
+
+    results: list[ConnectionManager] = []
+    errors: list[BaseException] = []
+    n = 20
+    barrier = threading.Barrier(n)
+
+    def worker():
+      try:
+        barrier.wait()
+        m = ConnectionManager.get_manager(
+          BackendType.REDIS, {"host": "concurrent-shared"}
+        )
+        results.append(m)
+      except BaseException as e:  # noqa: BLE001 - surface any failure
+        errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join()
+
+    assert errors == []
+    assert len(results) == n
+    first = results[0]
+    assert all(r is first for r in results)
+    assert first._users == n
+
+  def test_concurrent_get_manager_distinct_keys_n_instances(self):
+    """N threads with distinct keys → N distinct managers, each refcount 1."""
+    import threading
+
+    results: list[ConnectionManager] = []
+    errors: list[BaseException] = []
+    n = 10
+    barrier = threading.Barrier(n)
+
+    def worker(i: int):
+      try:
+        barrier.wait()
+        m = ConnectionManager.get_manager(
+          BackendType.REDIS, {"host": f"concurrent-distinct-{i}"}
+        )
+        results.append(m)
+      except BaseException as e:  # noqa: BLE001
+        errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join()
+
+    assert errors == []
+    assert len(results) == n
+    assert len({id(r) for r in results}) == n
+    assert all(r._users == 1 for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker wiring (Unit J): default-off is byte-identical, opt-in
+# wraps hot-path ops and fail-fasts with BackendError when OPEN.
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreakerWiringDefaultOff:
+  """When ``SCRAPY_CIRCUIT_BREAKER_ENABLED`` is unset, backends are unwrapped.
+
+  The default path must return the raw backend instance with zero overhead
+  and byte-identical behavior — no proxy, no breaker, no behavior change.
+  """
+
+  def test_default_returns_raw_backend_unwrapped(self, monkeypatch):
+    # Ensure the env var is unset so the lazy builder resolves to disabled.
+    monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-default-off"}
+    )
+    try:
+      # Force the lazy breaker resolution before touching .backend so we
+      # don't depend on a real Redis connection for this assertion.
+      assert manager._get_breaker() is None
+      # _breaker_configured is sticky-True after first resolution; the value
+      # is what matters — None means disabled.
+      assert manager._breaker is None
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+  def test_disabled_get_queue_backend_returns_identity(self, monkeypatch):
+    """Disabled path returns the SAME object the backend property yields.
+
+    We bypass the real connect by stubbing ``backend`` to return a fake and
+    asserting ``get_queue_backend()`` returns it unchanged (``is``).
+    """
+    monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-identity"}
+    )
+    try:
+      fake_qb = _FakeRedisQueueBackend()
+      # Bypass connect: assign the backend directly.
+      manager._backend = fake_qb
+      assert manager.get_queue_backend() is fake_qb
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+
+class TestCircuitBreakerWiringEnabled:
+  """When the breaker is enabled, hot-path ops wrap + OPEN fail-fast."""
+
+  def test_enabled_wraps_queue_hot_path_and_open_failfast(self, monkeypatch):
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-on"}
+    )
+    try:
+      fake_qb = _FailingRedisQueueBackend()
+      manager._backend = fake_qb
+      wrapped = manager.get_queue_backend()
+      # Wrapped is a proxy, NOT the raw backend.
+      assert wrapped is not fake_qb
+
+      # Trip the breaker via the wrapped hot-path op.
+      with pytest.raises(RuntimeError):
+        wrapped.push("q", b"x")
+
+      from scrapy_extension.backends.circuit_breaker import (
+        CircuitBreakerOpenError,
+      )
+
+      # Now OPEN — a subsequent push must fail-fast with BackendError subclass.
+      with pytest.raises(CircuitBreakerOpenError):
+        wrapped.push("q", b"x")
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+  def test_enabled_non_network_methods_not_blocked(self, monkeypatch):
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-on-nonblock"}
+    )
+    try:
+      fake_qb = _FailingRedisQueueBackend()
+      manager._backend = fake_qb
+      wrapped = manager.get_queue_backend()
+
+      # Trip via push.
+      with pytest.raises(RuntimeError):
+        wrapped.push("q", b"x")
+
+      # Non-network methods still work — they're forwarded, not breaker-wrapped.
+      wrapped.clear_queue("q")
+      assert fake_qb.clear_calls == 1
+      # is_connected forwards too.
+      assert wrapped.is_connected() is True
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+  def test_single_breaker_shared_across_interfaces(self, monkeypatch):
+    """Queue+set+storage on one manager share a single breaker instance.
+
+    A failure on the queue hot-path trips the shared breaker so the storage
+    interface also rejects — they share the failure signal.
+    """
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-shared"}
+    )
+    try:
+      fake = _FakeRedisAllBackend()
+      manager._backend = fake
+      qb = manager.get_queue_backend()
+      # Trip via queue.
+      fake.push = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+      # Re-wrap to capture the failing push (proxy snapshots at construction).
+      qb = manager.get_queue_backend()
+      with pytest.raises(RuntimeError):
+        qb.push("q", b"x")
+      # The shared breaker is now OPEN.
+      assert manager._breaker is not None
+      assert manager._breaker.state.value == "open"
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+
+# ---------------------------------------------------------------------------
+# Fakes for breaker-wiring tests — real backends need a live service; these
+# stubs satisfy the interface ABCs so we can drive the proxy without a broker.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRedisQueueBackend(QueueBackend):
+  def __init__(self) -> None:
+    self.clear_calls = 0
+    self.ack_calls = 0
+
+  def connect(self) -> None: ...
+  def disconnect(self) -> None: ...
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  @property
+  def backend_type(self):
+    return BackendType.REDIS
+
+  def push(self, queue_name, item, priority=0.0) -> None: ...
+  def pop(self, queue_name, timeout=0.0):
+    return None
+
+  def queue_len(self, queue_name) -> int:
+    return 0
+
+  def clear_queue(self, queue_name) -> None:
+    self.clear_calls += 1
+
+  def ack(self, queue_name) -> None:
+    self.ack_calls += 1
+
+
+class _FailingRedisQueueBackend(_FakeRedisQueueBackend):
+  def push(self, queue_name, item, priority=0.0) -> None:
+    raise RuntimeError("backend on fire")
+
+
+class _FakeRedisAllBackend(QueueBackend, SetBackend, StorageBackend):
+  def __init__(self) -> None:
+    self.clear_calls = 0
+
+  def connect(self) -> None: ...
+  def disconnect(self) -> None: ...
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  @property
+  def backend_type(self):
+    return BackendType.REDIS
+
+  # Queue
+  def push(self, queue_name, item, priority=0.0) -> None: ...
+  def pop(self, queue_name, timeout=0.0):
+    return None
+
+  def queue_len(self, queue_name) -> int:
+    return 0
+
+  def clear_queue(self, queue_name) -> None:
+    self.clear_calls += 1
+
+  def ack(self, queue_name) -> None: ...
+  def nack(self, queue_name) -> None: ...
+  # Set
+  def add(self, set_name, item) -> bool:
+    return True
+
+  def remove(self, set_name, item) -> bool:
+    return False
+
+  def contains(self, set_name, item) -> bool:
+    return False
+
+  def set_len(self, set_name) -> int:
+    return 0
+
+  def clear_set(self, set_name) -> None: ...
+  # Storage
+  def store(self, key, data, ttl=None) -> None: ...
+  def retrieve(self, key):
+    return None
+
+  def delete(self, key) -> bool:
+    return False
+
+  def exists(self, key) -> bool:
+    return False
+
+  def ttl(self, key):
+    return None
+
+  def clear_storage(self, prefix=None) -> None: ...
+

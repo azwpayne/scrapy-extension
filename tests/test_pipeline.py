@@ -2,9 +2,11 @@
 
 from typing import cast
 
+import pytest
 from scrapy import Field, Item
 
 from scrapy_extension.backends.base import JSONSerializer
+from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
 
@@ -382,3 +384,231 @@ class TestBackendPipelineProcessItem:
     pipeline._inc_stat(bare_spider, "pipeline/storage_errors")
     pipeline._inc_stat(bare_spider, "pipeline/storage_skipped")
 
+
+class TestBackendPipelineMaxItemBytes:
+  """D2: configurable per-item byte cap to prevent DoS via oversize payloads."""
+
+  def test_process_item_oversize_raises_and_increments_stat(
+    self, mock_connection_manager, mocker
+  ):
+    """D2: an oversize serialized item raises SerializationError + bumps stat.
+
+    A hostile target can push arbitrarily large item payloads; storage backends
+    with caps (Memcached 1 MB, DynamoDB 400 KB) throw and the item is silently
+    dropped. The cap surfaces the oversize condition loudly at store time with
+    a stat increment so operators can see it on dashboards.
+
+    Note: unlike a transient storage error (which the pipeline swallows to keep
+    the spider alive), an oversize payload is a deterministic validation
+    failure — it raises so the operator sees it, not silently dropped.
+    """
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_item_bytes=32,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    big_item = SampleItem(name="X" * 200, value=1)
+
+    with pytest.raises(SerializationError, match="exceeds.*max"):
+      pipeline.process_item(big_item, mock_spider)
+
+    mock_spider.crawler.stats.inc_value.assert_called_with(
+      "pipeline/oversize_dropped"
+    )
+    mock_connection_manager.get_storage_backend().store.assert_not_called()
+
+  def test_process_item_normal_size_succeeds(
+    self, mock_connection_manager, mocker
+  ):
+    """D2: a normal-size item is unaffected by the cap."""
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_item_bytes=1_048_576,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    item = SampleItem(name="Test", value=123)
+    result = pipeline.process_item(item, mock_spider)
+
+    assert result is item
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_default_max_item_bytes_is_one_mib(self, mock_connection_manager):
+    """D2: default cap is 1 MiB (matches Memcached's 1 MB ceiling)."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    assert pipeline.max_item_bytes == 1_048_576
+
+  def test_from_settings_reads_max_item_bytes(self, mocker):
+    """D2: from_settings reads SCRAPY_PIPELINE_MAX_ITEM_BYTES."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_PIPELINE_MAX_ITEM_BYTES": 2048,
+    }.get(key, default)
+    mock_settings.getint.return_value = 2048
+    mock_settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    pipeline = BackendPipeline.from_settings(mock_settings)
+    assert pipeline.max_item_bytes == 2048
+
+
+
+class TestBackendPipelineStorageStrategy:
+  """Tier-2: BackendPipeline delegates _store_item to a StorageStrategy."""
+
+  def test_default_strategy_is_passthrough(self, mock_connection_manager):
+    """Default strategy is PassthroughStorageStrategy (back-compat)."""
+    from scrapy_extension.storage.strategies.passthrough import (
+      PassthroughStorageStrategy,
+    )
+
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    assert isinstance(pipeline.storage_strategy, PassthroughStorageStrategy)
+
+  def test_passthrough_is_byte_identical_to_pre_strategy(
+    self, mock_connection_manager, mocker
+  ):
+    """Default passthrough must call store(key, data, ttl=self.ttl) exactly."""
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager, ttl=300
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    item = SampleItem(name="x", value=1)
+    pipeline.process_item(item, mock_spider)
+
+    store = mock_connection_manager.get_storage_backend().store
+    store.assert_called_once()
+    args, kwargs = store.call_args
+    # Two acceptable shapes: positional (key, data) with ttl= kw, or all-kwargs.
+    assert kwargs.get("ttl") == 300
+    assert len(args) >= 2
+    assert isinstance(args[0], str)
+    assert isinstance(args[1], (bytes, bytearray))
+
+  def test_batched_strategy_buffers_until_close(
+    self, mock_connection_manager, mocker
+  ):
+    """A batched strategy buffers items and flushes on close_spider."""
+    from scrapy_extension.storage.strategies.batched import (
+      BatchedStorageStrategy,
+    )
+
+    strat = BatchedStorageStrategy(threshold=100)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strat,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    pipeline.process_item(SampleItem(name="a", value=1), mock_spider)
+    pipeline.process_item(SampleItem(name="b", value=2), mock_spider)
+
+    store = mock_connection_manager.get_storage_backend().store
+    # Buffered — no writes yet.
+    assert store.call_count == 0
+    assert strat.pending == 2
+
+    pipeline.close_spider(mock_spider)  # drains the buffer
+    assert store.call_count == 2
+    assert strat.pending == 0
+
+  def test_max_item_bytes_still_rejects_oversize_with_strategy(
+    self, mock_connection_manager, mocker
+  ):
+    """D2 cap still applies per-item BEFORE the strategy sees the bytes."""
+    from scrapy_extension.storage.strategies.batched import (
+      BatchedStorageStrategy,
+    )
+
+    strat = BatchedStorageStrategy(threshold=100)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_item_bytes=32,
+      storage_strategy=strat,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    big_item = SampleItem(name="x" * 100, value=1)
+    with pytest.raises(SerializationError):
+      pipeline.process_item(big_item, mock_spider)
+
+    # Nothing buffered, nothing stored.
+    assert strat.pending == 0
+    mock_connection_manager.get_storage_backend().store.assert_not_called()
+
+  def test_from_settings_reads_storage_strategy(self, mocker):
+    """from_settings reads SCRAPY_STORAGE_STRATEGY and builds the strategy."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.storage.strategies.batched import (
+      BatchedStorageStrategy,
+    )
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_STORAGE_STRATEGY": "batched",
+    }.get(key, default)
+    mock_settings.getint.return_value = 0
+    mock_settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    pipeline = BackendPipeline.from_settings(mock_settings)
+    assert isinstance(pipeline.storage_strategy, BatchedStorageStrategy)
+
+  def test_from_settings_default_strategy_is_passthrough(self, mocker):
+    """from_settings defaults to passthrough when SCRAPY_STORAGE_STRATEGY unset."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.storage.strategies.passthrough import (
+      PassthroughStorageStrategy,
+    )
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+    }.get(key, default)
+    mock_settings.getint.return_value = 0
+    mock_settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    pipeline = BackendPipeline.from_settings(mock_settings)
+    assert isinstance(pipeline.storage_strategy, PassthroughStorageStrategy)
+
+  def test_close_spider_calls_strategy_close(
+    self, mock_connection_manager, mocker
+  ):
+    """close_spider flushes the strategy before closing the connection manager."""
+    strat = mocker.Mock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strat,
+    )
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    pipeline.close_spider(mock_spider)
+
+    strat.close.assert_called_once()
+    mock_connection_manager.close.assert_called_once()

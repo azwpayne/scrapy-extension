@@ -753,239 +753,49 @@ def test_clear_queue_connected(mocker):
 
 
 # ---------------------------------------------------------------------------
-# _get_set_topic_name
+# Set / Storage — RocketMQBackend (queue) does NOT carry set/storage methods
 # ---------------------------------------------------------------------------
+#
+# E3: the former per-method NotImplementedError stubs on RocketMQBackend were
+# unreachable dead code (connector capability gating excludes RocketMQ from
+# SET_CAPABLE_BACKENDS / STORAGE_CAPABLE_BACKENDS). They are replaced by the
+# dedicated guard classes RocketMQSetBackend / RocketMQStorageBackend, which
+# raise ConfigurationError at construction. These tests pin the new contract:
+# the queue backend is queue-only; the set/storage surface lives on the guard
+# classes (see the E3 section at the end of this file).
 
 
-def test_get_set_topic_name(mocker):
-    """Test _get_set_topic_name returns prefixed set name."""
-    backend, _, _, _ = _make_connected_backend(mocker)
-    result = backend._get_set_topic_name("my_set")
-    assert result == f"{backend.config.set_topic_prefix}_my_set"
+def test_rocketmq_backend_has_no_set_methods():
+    """E3: RocketMQBackend (queue) no longer carries SetBackend methods.
 
-
-# ---------------------------------------------------------------------------
-# Set operations — add
-# ---------------------------------------------------------------------------
-
-
-def test_add_not_connected():
-    """Test add raises QueueError when not connected."""
+    The set stubs were removed; set semantics are rejected at config time
+    (SET_CAPABLE_BACKENDS) and, if gating is bypassed, by RocketMQSetBackend.
+    """
     config = RocketMQSettings()
     backend = RocketMQBackend(config)
-
-    with pytest.raises(QueueError) as exc_info:
-        backend.add("test_set", b"item")
-    assert "Not connected" in str(exc_info.value)
-
-
-def test_add_connected_raises_not_implemented(mocker):
-    """Test add raises NotImplementedError when connected."""
-    backend, _, _, _ = _make_connected_backend(mocker)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.add("test_set", b"item")
-    assert "does not implement SetBackend.add()" in str(exc_info.value)
+    for attr in ("add", "remove", "contains", "set_len", "clear_set"):
+        assert not hasattr(backend, attr), (
+            f"RocketMQBackend should not expose set method {attr!r} "
+            f"(moved to guard class RocketMQSetBackend)"
+        )
 
 
-# ---------------------------------------------------------------------------
-# Set operations — remove
-# ---------------------------------------------------------------------------
-
-
-def test_remove_raises_not_implemented():
-    """Test remove raises NotImplementedError."""
+def test_rocketmq_backend_has_no_storage_methods():
+    """E3: RocketMQBackend (queue) no longer carries StorageBackend methods."""
     config = RocketMQSettings()
     backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.remove("test_set", b"item")
-    assert "does not implement SetBackend.remove()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Set operations — contains
-# ---------------------------------------------------------------------------
-
-
-def test_contains_raises_not_implemented():
-    """Test contains raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.contains("test_set", b"item")
-    assert "does not implement SetBackend.contains()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Set operations — set_len
-# ---------------------------------------------------------------------------
-
-
-def test_set_len_raises_not_implemented():
-    """Test set_len raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.set_len("test_set")
-    assert "does not implement SetBackend.set_len()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Set operations — clear_set
-# ---------------------------------------------------------------------------
-
-
-def test_clear_set_not_connected():
-    """Test clear_set returns silently when not connected."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-    # Should not raise
-    backend.clear_set("test_set")
-
-
-def test_clear_set_connected(mocker):
-    """Test clear_set logs warning when connected."""
-    backend, _, _, _ = _make_connected_backend(mocker)
-    # Should not raise, just log a warning
-    backend.clear_set("test_set")
-
-
-# ---------------------------------------------------------------------------
-# _get_storage_topic_name
-# ---------------------------------------------------------------------------
-
-
-def test_get_storage_topic_name(mocker):
-    """Test _get_storage_topic_name returns storage topic prefix."""
-    backend, _, _, _ = _make_connected_backend(mocker)
-    result = backend._get_storage_topic_name()
-    assert result == backend.config.storage_topic_prefix
-
-
-# ---------------------------------------------------------------------------
-# Storage operations — store
-# ---------------------------------------------------------------------------
-
-
-def test_store_not_connected_raises_not_implemented():
-    """Test store raises NotImplementedError when not connected."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.store("key1", b"data")
-    assert "does not implement StorageBackend.store()" in str(exc_info.value)
-
-
-def test_store_connected_raises_not_implemented(mocker):
-    """Test store raises NotImplementedError when connected."""
-    backend, mock_producer, _, mock_message_cls = _make_connected_backend(mocker)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.store("my_key", b"my_data")
-
-    assert "does not implement StorageBackend.store()" in str(exc_info.value)
-    mock_message_cls.assert_not_called()
-    mock_producer.send.assert_not_called()
-
-
-def test_store_with_ttl_connected_raises_not_implemented(mocker):
-    """Test store with TTL still raises NotImplementedError."""
-    backend, mock_producer, _, mock_message_cls = _make_connected_backend(mocker)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.store("my_key", b"my_data", ttl=7200)
-
-    assert "does not implement StorageBackend.store()" in str(exc_info.value)
-    mock_message_cls.assert_not_called()
-    mock_producer.send.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Storage operations — retrieve
-# ---------------------------------------------------------------------------
-
-
-def test_retrieve_raises_not_implemented():
-    """Test retrieve raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.retrieve("key1")
-    assert "does not implement StorageBackend.retrieve()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Storage operations — delete
-# ---------------------------------------------------------------------------
-
-
-def test_delete_raises_not_implemented():
-    """Test delete raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.delete("key1")
-    assert "does not implement StorageBackend.delete()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Storage operations — exists
-# ---------------------------------------------------------------------------
-
-
-def test_exists_raises_not_implemented():
-    """Test exists raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.exists("key1")
-    assert "does not implement StorageBackend.exists()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Storage operations — ttl
-# ---------------------------------------------------------------------------
-
-
-def test_ttl_raises_not_implemented():
-    """Test ttl raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.ttl("key1")
-    assert "does not implement StorageBackend.ttl()" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Storage operations — clear_storage
-# ---------------------------------------------------------------------------
-
-
-def test_clear_storage_raises_not_implemented():
-    """Test clear_storage raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.clear_storage()
-    assert "does not implement StorageBackend.clear_storage()" in str(exc_info.value)
-
-
-def test_clear_storage_with_prefix_raises_not_implemented():
-    """Test clear_storage with prefix raises NotImplementedError."""
-    config = RocketMQSettings()
-    backend = RocketMQBackend(config)
-
-    with pytest.raises(NotImplementedError):
-        backend.clear_storage(prefix="my-prefix")
+    for attr in (
+        "store",
+        "retrieve",
+        "delete",
+        "exists",
+        "ttl",
+        "clear_storage",
+    ):
+        assert not hasattr(backend, attr), (
+            f"RocketMQBackend should not expose storage method {attr!r} "
+            f"(moved to guard class RocketMQStorageBackend)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1049,72 +859,6 @@ def test_rocketmq_settings_none_keys():
     settings = RocketMQSettings(access_key=None, secret_key=None)
     assert settings.access_key is None
     assert settings.secret_key is None
-
-
-# ---------------------------------------------------------------------------
-# SetBackend / StorageBackend stubs — direct NotImplementedError on instance
-# ---------------------------------------------------------------------------
-
-
-def test_set_stubs_raise_not_implemented_on_connected_backend(mocker):
-    """All SetBackend stubs raise NotImplementedError on a connected backend.
-
-    Layer-1 guard: even when the backend is wired up and connected, RocketMQ
-    cannot serve set semantics. The stub message must point users at a
-    capable backend (Redis/MongoDB/ElasticSearch).
-    """
-    backend, _, _, _ = _make_connected_backend(mocker)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.add("s", b"item")
-    assert "SetBackend.add()" in str(exc_info.value)
-    assert "Redis" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.remove("s", b"item")
-    assert "SetBackend.remove()" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.contains("s", b"item")
-    assert "SetBackend.contains()" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.set_len("s")
-    assert "SetBackend.set_len()" in str(exc_info.value)
-
-
-def test_storage_stubs_raise_not_implemented_on_connected_backend(mocker):
-    """All StorageBackend stubs raise NotImplementedError on a connected backend.
-
-    Layer-1 guard: RocketMQ has no key-value storage. Each stub message must
-    name the interface, explain why, and list capable storage backends.
-    """
-    backend, _, _, _ = _make_connected_backend(mocker)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.store("k", b"v")
-    assert "StorageBackend.store()" in str(exc_info.value)
-    assert "DynamoDB" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.retrieve("k")
-    assert "StorageBackend.retrieve()" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.delete("k")
-    assert "StorageBackend.delete()" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.exists("k")
-    assert "StorageBackend.exists()" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.ttl("k")
-    assert "StorageBackend.ttl()" in str(exc_info.value)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        backend.clear_storage()
-    assert "StorageBackend.clear_storage()" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -1205,3 +949,54 @@ def test_resolve_backend_config_accepts_rocketmq_for_queue():
   )
   assert backend_type is BackendType.ROCKETMQ
   assert backend_settings == {}
+
+
+# ---------------------------------------------------------------------------
+# E3: class-level guard — RocketMQSetBackend / RocketMQStorageBackend
+# ---------------------------------------------------------------------------
+
+
+def test_rocketmq_set_backend_construction_raises_configuration_error():
+  """E3: instantiating RocketMQSetBackend fails fast with a typed error.
+
+  Replaces the unreachable per-method ``NotImplementedError`` stubs. The
+  connector layer already excludes RocketMQ from SET_CAPABLE_BACKENDS, so
+  the stubs were misleading dead code. A class-level ``__init__`` guard
+  surfaces the misconfiguration immediately and with a typed error if
+  someone bypasses the connector gating.
+  """
+  from scrapy_extension.backends.rocketmq import RocketMQSetBackend
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    RocketMQSetBackend(RocketMQSettings())
+
+  msg = str(exc_info.value)
+  assert "RocketMQ" in msg
+  assert "set" in msg.lower()
+  assert "SCRAPY_SET_BACKEND_TYPE" in msg
+
+
+def test_rocketmq_storage_backend_construction_raises_configuration_error():
+  """E3: instantiating RocketMQStorageBackend fails fast with a typed error."""
+  from scrapy_extension.backends.rocketmq import RocketMQStorageBackend
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    RocketMQStorageBackend(RocketMQSettings())
+
+  msg = str(exc_info.value)
+  assert "RocketMQ" in msg
+  assert "storage" in msg.lower()
+  assert "SCRAPY_STORAGE_BACKEND_TYPE" in msg
+
+
+def test_rocketmq_set_backend_class_is_importable():
+  """E3: the guard classes remain importable (lazy-import architecture preserved)."""
+  from scrapy_extension.backends.rocketmq import (
+    RocketMQBackend,
+    RocketMQSetBackend,
+    RocketMQStorageBackend,
+  )
+
+  assert RocketMQBackend is not None
+  assert RocketMQSetBackend is not None
+  assert RocketMQStorageBackend is not None

@@ -26,7 +26,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import SecretStr
 
@@ -356,34 +356,75 @@ class QueueBackend(ABC):
         queue_name: The name of the queue.
     """
 
-  def ack(self, queue_name: str) -> None:
-    """Acknowledge the last-popped message for ``queue_name``.
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop an item together with an opaque ack token.
+
+    For atomic-pop backends (Redis, MongoDB, ElasticSearch, RocketMQ) the
+    default implementation returns ``(self.pop(queue_name, timeout), None)`` —
+    there is no separate ack step, so the token is ``None``.
+
+    Message-queue backends (Kafka, RabbitMQ) override to return a
+    backend-specific token that the scheduler carries in
+    ``request.meta["_backend_ack_token"]`` and hands back to
+    :meth:`ack` / :meth:`nack` so the *specific* message that was popped
+    is acked — not merely the last-popped one. This is what makes ack
+    correct under ``CONCURRENT_REQUESTS > 1`` (N pops before any ack no
+    longer overwrite a single slot).
+
+    Args:
+        queue_name: The name of the queue.
+        timeout: Seconds to wait for an item (0 = non-blocking).
+
+    Returns:
+        A ``(item, token)`` tuple. ``item`` is ``None`` when the queue is
+        empty; ``token`` is backend-specific (``None`` for atomic-pop
+        backends, opaque to callers).
+
+    Raises:
+        QueueError: If the pop operation fails.
+    """
+    return (self.pop(queue_name, timeout), None)
+
+  def ack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Acknowledge a popped message for ``queue_name``.
 
     Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) implement
     this as a no-op: their pop is already atomic, so there is no
     "unacked" state to transition. Message-queue backends (Kafka,
     RabbitMQ) override to commit the offset / basic_ack the delivery.
 
+    When ``token`` is provided (the scheduler always provides it for
+    message-queue backends), the override acks the *specific* message
+    identified by that token — correct under ``CONCURRENT_REQUESTS > 1``.
+    When ``token`` is ``None`` (atomic backends, or legacy single-pop
+    callers), overrides fall back to acking the last-popped message.
+
     The default no-op makes ack() safe to call from the scheduler even
     when the backend doesn't need it.
 
     Args:
-        queue_name: The name of the queue whose last message should be
+        queue_name: The name of the queue whose message should be
             acknowledged.
+        token: Opaque ack token returned by :meth:`pop_with_ack`. When
+            ``None``, overrides ack the last-popped message (legacy).
     """
-    del queue_name
+    del queue_name, token
 
-  def nack(self, queue_name: str) -> None:
-    """Negatively acknowledge the last-popped message for ``queue_name``.
+  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Negatively acknowledge a popped message for ``queue_name``.
 
     Atomic backends implement this as a no-op. Message-queue backends
     override to requeue / re-deliver the message for another consumer.
 
     Args:
-        queue_name: The name of the queue whose last message should be
+        queue_name: The name of the queue whose message should be
             negatively acknowledged.
+        token: Opaque ack token returned by :meth:`pop_with_ack`. When
+            ``None``, overrides nack the last-popped message (legacy).
     """
-    del queue_name
+    del queue_name, token
 
 
 class SetBackend(ABC):

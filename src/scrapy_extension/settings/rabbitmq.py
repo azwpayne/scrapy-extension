@@ -62,12 +62,16 @@ class RabbitMQSettings(BaseSettings):
     description="RabbitMQ server port",
   )
   username: str = Field(
-    default="guest",
-    description="RabbitMQ username. MUST override in production via SCRAPY_RABBITMQ_USERNAME.",
+    description=(
+      "RabbitMQ username (REQUIRED). No default is provided to prevent "
+      "silent fallback to the guest account; set via SCRAPY_RABBITMQ_USERNAME."
+    ),
   )
   password: SecretStr = Field(
-    default=SecretStr("guest"),
-    description="RabbitMQ password. MUST override in production via SCRAPY_RABBITMQ_PASSWORD.",
+    description=(
+      "RabbitMQ password (REQUIRED). No default is provided to prevent "
+      "silent fallback to the guest account; set via SCRAPY_RABBITMQ_PASSWORD."
+    ),
   )
   virtual_host: str = Field(
     default="/",

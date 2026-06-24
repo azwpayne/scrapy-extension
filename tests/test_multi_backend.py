@@ -474,11 +474,11 @@ class TestResolveBackendConfig:
     assert backend_type == BackendType.MONGODB
     assert backend_settings == {}
 
-  def test_invalid_backend_type_raises_value_error(self, mock_settings):
-    """Edge case: invalid backend type string → ValueError from BackendType()."""
+  def test_invalid_backend_type_raises_configuration_error(self, mock_settings):
+    """Invalid backend type string → ConfigurationError (fail-fast, typed)."""
     settings = mock_settings(gets={"SCRAPY_QUEUE_BACKEND_TYPE": "not-a-real-backend"})
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigurationError):
       resolve_backend_config(
         settings,
         type_key="SCRAPY_QUEUE_BACKEND_TYPE",

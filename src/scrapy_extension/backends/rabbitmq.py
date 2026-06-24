@@ -71,7 +71,15 @@ class RabbitMQBackend(Backend, QueueBackend):
     self._connection: pika.BlockingConnection | None = None
     self._channel: pika.channel.Channel | None = None
     self._declared_queues: set[str] = set()
+    # Legacy single-slot for the ``ack(token=None)`` fallback path. Kept so
+    # external callers that pop() then ack() without a token still work.
     self._last_delivery_tag: int | None = None
+    # In-flight delivery tags for correctness under CONCURRENT_REQUESTS>1.
+    # Every pop_with_ack adds its tag here; ack(token) basic_acks the
+    # specific tag and removes it. Without this, N pops before any ack
+    # overwrite _last_delivery_tag and only the last-popped message is
+    # ackable — silent at-least-once violation.
+    self._in_flight_tags: set[int] = set()
     self._ssl_warning_emitted: bool = False
 
   def connect(self) -> None:
@@ -430,6 +438,12 @@ class RabbitMQBackend(Backend, QueueBackend):
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
+    Tracks the popped delivery tag in ``_last_delivery_tag`` for the
+    legacy ``ack(token=None)`` path. Prefer :meth:`pop_with_ack` under
+    ``CONCURRENT_REQUESTS > 1`` — that path tracks every popped delivery
+    tag in the in-flight set so ack(token) acks the *specific* message,
+    not merely the last-popped one.
+
     Args:
         queue_name: Name of the queue.
         timeout: Seconds to wait (unused for RabbitMQ, blocking not supported).
@@ -439,6 +453,55 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Raises:
         QueueError: If the pop operation fails.
+    """
+    body, _tag = self._basic_get(queue_name)
+    return body
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop an item together with its RabbitMQ delivery tag.
+
+    Records the delivery tag in the in-flight set so :meth:`ack` can
+    ``basic_ack`` the specific message — correct under
+    ``CONCURRENT_REQUESTS > 1`` (no single-slot overwrite, no message
+    lost/skipped).
+
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (unused for RabbitMQ).
+
+    Returns:
+        ``(body, delivery_tag)`` where ``delivery_tag`` is the int AMQP
+        delivery tag, or ``(None, None)`` when the queue is empty.
+
+    Raises:
+        QueueError: If the pop operation fails.
+    """
+    del timeout  # RabbitMQ basic_get is non-blocking; timeout is unused.
+    body, tag = self._basic_get(queue_name, track_in_flight=True)
+    return (body, tag)
+
+  def _basic_get(
+    self, queue_name: str, *, track_in_flight: bool = False
+  ) -> tuple[bytes | None, int | None]:
+    """Fetch one message via ``basic_get(auto_ack=False)``.
+
+    Shared by :meth:`pop` and :meth:`pop_with_ack` so channel validation,
+    queue declaration, and error wrapping live in one place.
+
+    Args:
+        queue_name: Name of the queue.
+        track_in_flight: When True (pop_with_ack path), add the delivery
+            tag to the in-flight set so ack(token) can ack it. When False
+            (legacy pop path), only set ``_last_delivery_tag``.
+
+    Returns:
+        ``(body, delivery_tag)``. ``body`` is ``None`` when the queue is
+        empty.
+
+    Raises:
+        QueueError: If the get fails at the AMQP layer.
     """
     if self._channel is None:
       msg = "Not connected to RabbitMQ"
@@ -456,14 +519,11 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
 
       if method_frame:
-        if self._last_delivery_tag is not None:
-          logger.warning(
-            "pop() called while previous message is unacked — "
-            "CONCURRENT_REQUESTS>1 breaks ack tracking. "
-            "Set CONCURRENT_REQUESTS=1 for correct at-least-once delivery."
-          )
-        self._last_delivery_tag = method_frame.delivery_tag
-        return body
+        delivery_tag = method_frame.delivery_tag
+        self._last_delivery_tag = delivery_tag
+        if track_in_flight:
+          self._in_flight_tags.add(delivery_tag)
+        return (body, delivery_tag)
     except AMQPError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(
@@ -471,15 +531,49 @@ class RabbitMQBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
-    return None
+    return (None, None)
 
-  def ack(self, queue_name: str) -> None:
-    """Acknowledge the last-popped message via ``basic_ack``.
+  def ack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Ack a popped message via ``basic_ack``.
 
-    Idempotent: clears the tracked delivery tag after acking so duplicate
-    ack calls are safe (calling basic_ack with an already-acked tag raises
-    a channel error).
+    With a ``token`` (the scheduler path under
+    ``CONCURRENT_REQUESTS > 1``): ``basic_ack(delivery_tag=token,
+    multiple=False)`` the specific message and remove it from the
+    in-flight set. Order-independent — ack the right tag regardless of
+    pop/ack interleaving.
+
+    Without a ``token`` (legacy single-pop caller): ``basic_ack`` the
+    tracked ``_last_delivery_tag``. Only correct for
+    ``CONCURRENT_REQUESTS=1``.
+
+    Idempotent: clears the tracked tag after acking so duplicate ack
+    calls on the legacy path are safe (calling ``basic_ack`` with an
+    already-acked tag raises a channel error).
+
+    Args:
+        queue_name: Name of the queue (unused; kept for interface symmetry).
+        token: A delivery tag from :meth:`pop_with_ack`, or ``None`` for
+            the legacy last-tag path.
+
+    Raises:
+        QueueError: If ``basic_ack`` fails at the AMQP layer.
     """
+    del queue_name
+    if token is not None:
+      delivery_tag = int(token)
+      if self._channel is None:
+        return
+      try:
+        self._channel.basic_ack(delivery_tag=delivery_tag, multiple=False)
+      except AMQPError as e:
+        msg = f"Failed to ack RabbitMQ message: {e}"
+        raise QueueError(msg, operation="ack") from e
+      finally:
+        self._in_flight_tags.discard(delivery_tag)
+        if self._last_delivery_tag == delivery_tag:
+          self._last_delivery_tag = None
+      return
+    # Legacy path: ack the tracked last-popped tag.
     if self._channel is None or self._last_delivery_tag is None:
       return
     try:
@@ -490,8 +584,36 @@ class RabbitMQBackend(Backend, QueueBackend):
     finally:
       self._last_delivery_tag = None
 
-  def nack(self, queue_name: str) -> None:
-    """Negatively acknowledge the last-popped message; requeue for retry."""
+  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Nack a popped message; requeue it for retry.
+
+    With a ``token``: ``basic_nack(delivery_tag=token, requeue=True)`` the
+    specific message. Without a ``token``: nack the tracked last-popped
+    tag (legacy).
+
+    Args:
+        queue_name: Name of the queue (unused; interface symmetry).
+        token: A delivery tag from :meth:`pop_with_ack`, or ``None``.
+
+    Raises:
+        QueueError: If ``basic_nack`` fails at the AMQP layer.
+    """
+    del queue_name
+    if token is not None:
+      delivery_tag = int(token)
+      if self._channel is None:
+        return
+      try:
+        self._channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+      except AMQPError as e:
+        msg = f"Failed to nack RabbitMQ message: {e}"
+        raise QueueError(msg, operation="nack") from e
+      finally:
+        self._in_flight_tags.discard(delivery_tag)
+        if self._last_delivery_tag == delivery_tag:
+          self._last_delivery_tag = None
+      return
+    # Legacy path: nack the tracked last-popped tag.
     if self._channel is None or self._last_delivery_tag is None:
       return
     try:

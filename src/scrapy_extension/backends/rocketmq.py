@@ -24,8 +24,14 @@ class RocketMQBackend(Backend, QueueBackend):
   """RocketMQ backend implementation.
 
   Note: RocketMQ only supports QueueBackend operations.
-  SetBackend and StorageBackend are not supported by RocketMQ.
-  Attempting to use get_set_backend() or get_storage_backend() will raise NotImplementedError.
+  SetBackend and StorageBackend are not supported by RocketMQ. Configuring
+  RocketMQ for the set/storage component is rejected at config time by
+  ``resolve_backend_config`` (RocketMQ is excluded from
+  ``SET_CAPABLE_BACKENDS`` / ``STORAGE_CAPABLE_BACKENDS``). If that gating is
+  bypassed, instantiation fails fast via the dedicated guard classes
+  ``RocketMQSetBackend`` / ``RocketMQStorageBackend`` (raise
+  ``ConfigurationError`` in ``__init__``) rather than per-method
+  ``NotImplementedError`` stubs.
   """
 
   def __init__(self, config: RocketMQSettings) -> None:
@@ -295,225 +301,80 @@ class RocketMQBackend(Backend, QueueBackend):
     # RocketMQ doesn't support purge, log warning
     logger.warning("clear_queue not supported in RocketMQ")
 
-  def _get_set_topic_name(self, set_name: str) -> str:
-    """Get full topic name for set.
 
-    Args:
-      set_name: Base set name.
+# ---------------------------------------------------------------------------
+# Set / Storage — class-level guard (replaces former per-method stubs)
+# ---------------------------------------------------------------------------
+#
+# RocketMQ is excluded from SET_CAPABLE_BACKENDS and STORAGE_CAPABLE_BACKENDS
+# at the connector layer, so these classes are unreachable under normal config
+# resolution (resolve_backend_config raises ConfigurationError first). They
+# exist as the fail-fast surface for anyone who bypasses that gating and
+# instantiates them directly — replacing the former per-method
+# NotImplementedError stubs that lived on RocketMQBackend and were unreachable
+# dead code. The dedicated classes raise a typed ConfigurationError at
+# construction with an actionable message pointing at the correct settings.
 
-    Returns:
-      Full topic name.
-    """
-    return f"{self.config.set_topic_prefix}_{set_name}"
 
-  def add(self, set_name: str, item: bytes) -> bool:
-    """Add item to set.
+def _unsupported_component_guard(
+  component: str, setting_key: str
+) -> ConfigurationError:
+  """Build the ConfigurationError raised when RocketMQ is bound to an
+  unsupported component (set/storage) via direct instantiation that bypasses
+  the connector capability gating.
 
-    Args:
-        set_name: Name of the set.
-        item: Item to add (bytes).
+  Args:
+      component: The unsupported component name (``"set"`` / ``"storage"``).
+      setting_key: The Scrapy setting that selects the component backend.
 
-    Returns:
-        True if added.
+  Returns:
+      A ``ConfigurationError`` with an actionable message.
+  """
+  if component == "storage":
+    alternatives = "redis, mongodb, elasticsearch, memcached, or dynamodb"
+  else:
+    alternatives = "redis, mongodb, or elasticsearch"
+  msg = (
+    f"RocketMQ does not support {component} operations: it is a message "
+    f"queue with no native set/membership or key-value semantics. Select a "
+    f"different backend via {setting_key} (e.g. {alternatives})."
+  )
+  return ConfigurationError(msg, setting_name=setting_key)
 
-    Raises:
-        NotImplementedError: RocketMQ does not support atomic add-or-skip set operations.
-        QueueError: If not connected.
-    """
-    del set_name, item
-    from scrapy_extension.exceptions import QueueError
 
-    if not self.is_connected():
-      msg = "Not connected to RocketMQ"
-      raise QueueError(msg)
+class RocketMQSetBackend(RocketMQBackend):
+  """Guard class: RocketMQ cannot serve the ``SetBackend`` interface.
 
-    msg = (
-      "RocketMQBackend does not implement SetBackend.add(): "
-      "RocketMQ has no native set/membership semantics. "
-      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
-    )
-    raise NotImplementedError(msg)
+  RocketMQ is excluded from ``SET_CAPABLE_BACKENDS`` at the connector layer, so
+  this class is only reachable if an operator bypasses that gating and
+  instantiates it directly. Construction fails fast with a typed
+  ``ConfigurationError`` (replacing the former per-method ``NotImplementedError``
+  stubs, which were unreachable dead code under normal config resolution).
+  """
 
-  def remove(self, set_name: str, item: bytes) -> bool:
-    """Remove item from set.
-
-    Args:
-        set_name: Name of the set.
-        item: Item to remove.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support atomic remove from sets.
-    """
-    del set_name, item
-    msg = (
-      "RocketMQBackend does not implement SetBackend.remove(): "
-      "RocketMQ has no native set/membership semantics. "
-      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
-    )
-    raise NotImplementedError(msg)
-
-  def contains(self, set_name: str, item: bytes) -> bool:
-    """Check if item is in set.
-
-    Args:
-        set_name: Name of the set.
-        item: Item to check.
-
-    Returns:
-        True if item exists.
+  def __init__(self, config: RocketMQSettings) -> None:
+    """Reject construction — RocketMQ does not support the set interface.
 
     Raises:
-        NotImplementedError: RocketMQ does not support set membership queries.
+        ConfigurationError: Always.
     """
-    del set_name, item
-    msg = (
-      "RocketMQBackend does not implement SetBackend.contains(): "
-      "RocketMQ has no native set/membership semantics. "
-      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
-    )
-    raise NotImplementedError(msg)
+    raise _unsupported_component_guard("set", "SCRAPY_SET_BACKEND_TYPE")
 
-  def set_len(self, set_name: str) -> int:
-    """Get set size.
 
-    Args:
-        set_name: Name of the set.
+class RocketMQStorageBackend(RocketMQBackend):
+  """Guard class: RocketMQ cannot serve the ``StorageBackend`` interface.
 
-    Returns:
-        Number of items in set.
+  RocketMQ is excluded from ``STORAGE_CAPABLE_BACKENDS`` at the connector layer,
+  so this class is only reachable if an operator bypasses that gating and
+  instantiates it directly. Construction fails fast with a typed
+  ``ConfigurationError`` (replacing the former per-method ``NotImplementedError``
+  stubs, which were unreachable dead code under normal config resolution).
+  """
+
+  def __init__(self, config: RocketMQSettings) -> None:
+    """Reject construction — RocketMQ does not support the storage interface.
 
     Raises:
-        NotImplementedError: RocketMQ does not support set size queries.
+        ConfigurationError: Always.
     """
-    del set_name
-    msg = (
-      "RocketMQBackend does not implement SetBackend.set_len(): "
-      "RocketMQ has no native set/membership semantics. "
-      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
-    )
-    raise NotImplementedError(msg)
-
-  def clear_set(self, set_name: str) -> None:
-    """Clear all items from set.
-
-    Args:
-        set_name: Name of the set.
-    """
-    if not self.is_connected():
-      return
-    logger.warning("clear_set not fully supported in RocketMQ")
-
-  def _get_storage_topic_name(self) -> str:
-    """Get full topic name for storage.
-
-    Returns:
-      Storage topic name.
-    """
-    return self.config.storage_topic_prefix
-
-  def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-    """Store data with key.
-
-    Args:
-        key: Storage key.
-        data: Data to store (bytes).
-        ttl: Optional time-to-live in seconds.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support storage operations.
-    """
-    del key, data, ttl
-    msg = (
-      "RocketMQBackend does not implement StorageBackend.store(): "
-      "RocketMQ is a message queue, not a key-value store. "
-      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
-    )
-    raise NotImplementedError(msg)
-
-  def retrieve(self, key: str) -> bytes | None:
-    """Retrieve data by key.
-
-    Args:
-        key: Storage key.
-
-    Returns:
-        Stored data, or None if not found.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support point-in-time key retrieval.
-    """
-    del key
-    msg = (
-      "RocketMQBackend does not implement StorageBackend.retrieve(): "
-      "RocketMQ is a message queue, not a key-value store. "
-      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
-    )
-    raise NotImplementedError(msg)
-
-  def delete(self, key: str) -> bool:
-    """Delete data by key.
-
-    Args:
-        key: Storage key.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support key-based deletion.
-    """
-    del key
-    msg = (
-      "RocketMQBackend does not implement StorageBackend.delete(): "
-      "RocketMQ is a message queue, not a key-value store. "
-      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
-    )
-    raise NotImplementedError(msg)
-
-  def exists(self, key: str) -> bool:
-    """Check if key exists.
-
-    Args:
-        key: Storage key.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support key-based existence checks.
-    """
-    del key
-    msg = (
-      "RocketMQBackend does not implement StorageBackend.exists(): "
-      "RocketMQ is a message queue, not a key-value store. "
-      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
-    )
-    raise NotImplementedError(msg)
-
-  def ttl(self, key: str) -> int | None:
-    """Get remaining time-to-live.
-
-    Args:
-        key: Storage key.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support TTL queries.
-    """
-    del key
-    msg = (
-      "RocketMQBackend does not implement StorageBackend.ttl(): "
-      "RocketMQ is a message queue, not a key-value store. "
-      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
-    )
-    raise NotImplementedError(msg)
-
-  def clear_storage(self, prefix: str | None = None) -> None:
-    """Clear all stored data.
-
-    Args:
-        prefix: If provided, only clear keys starting with this prefix.
-
-    Raises:
-        NotImplementedError: RocketMQ does not support storage clearing.
-    """
-    del prefix
-    msg = (
-      "RocketMQBackend does not implement StorageBackend.clear_storage(): "
-      "RocketMQ is a message queue, not a key-value store. "
-      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
-    )
-    raise NotImplementedError(msg)
+    raise _unsupported_component_guard("storage", "SCRAPY_STORAGE_BACKEND_TYPE")

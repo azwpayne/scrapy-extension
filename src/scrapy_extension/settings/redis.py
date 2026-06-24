@@ -193,8 +193,13 @@ class RedisSettings(BaseSettings):
     description="Path to client private key file for SSL",
   )
   ssl_check_hostname: bool = Field(
-    default=False,
-    description="Verify hostname matches certificate",
+    default=True,
+    description=(
+      "Verify TLS certificate hostname matches the connected host. "
+      "Defaults to True to prevent MITM via misconfigured ssl_enabled. "
+      "Operators using IP-only service discovery may set this to False "
+      "(not recommended; prefer DNS/SNI)."
+    ),
   )
 
   @model_validator(mode="after")

@@ -275,7 +275,7 @@ class TestKafkaBackendConfluentMode:
     assert backend.is_connected()
 
 
-class TestKafkaBackendPush:
+class TestKafkaBackendPushPriorityMapping:
   """Tests for push() priority mapping."""
 
   def test_push_clamps_negative_priority_to_partition_zero(self, mocker):
@@ -558,12 +558,14 @@ class TestKafkaBackendPop:
     mock_consumer.subscribe.assert_any_call(["scrapy-queue_a"])
     mock_consumer.subscribe.assert_any_call(["scrapy-queue_b"])
 
-  def test_pop_warns_when_previous_unacked(self, mocker, caplog):
-    """R18: pop() while a previous record is unacked warns about CONCURRENT_REQUESTS>1.
+  def test_pop_does_not_warn_on_concurrent_pops(self, mocker, caplog):
+    """Tier-2 Unit H: the single-slot defect warning is GONE.
 
-    Pins Kafka's concurrent-pop detection — surfaces the misconfiguration that
-    breaks ack tracking under CONCURRENT_REQUESTS>1 (mirrors the RabbitMQ
-    equivalent, R66).
+    Previously pop() warned about CONCURRENT_REQUESTS>1 because the single
+    _last_record slot would be overwritten. With the in-flight-set fix
+    (pop_with_ack tracks every popped offset), concurrent pops no longer
+    warn — they're correct. This test pins the warning's absence so a
+    regression to the single-slot path is caught.
     """
     import logging
 
@@ -575,7 +577,7 @@ class TestKafkaBackendPop:
     mock_consumer = mocker.MagicMock()
     mock_record = mocker.MagicMock()
     mock_record.value = b"data"
-    # Two polls, each yielding a record (second pop sees _last_record still set).
+    # Two polls, each yielding a record (second pop happens before any ack).
     mock_consumer.poll.side_effect = [
       {TopicPartition("scrapy-testq", 0): [mock_record]},
       {TopicPartition("scrapy-testq", 0): [mock_record]},
@@ -584,11 +586,11 @@ class TestKafkaBackendPop:
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-      backend.pop("testq", timeout=0.0)  # sets _last_record
-      backend.pop("testq", timeout=0.0)  # previous still unacked → warning
+      backend.pop("testq", timeout=0.0)
+      backend.pop("testq", timeout=0.0)  # concurrent pop — no longer a defect
 
-    assert "pop() called while previous message is unacked" in caplog.text
-    assert "CONCURRENT_REQUESTS>1" in caplog.text
+    assert "pop() called while previous message is unacked" not in caplog.text
+    assert "CONCURRENT_REQUESTS>1" not in caplog.text
 
   def test_nack_is_in_session_noop_that_clears_record(self, mocker):
     """R11/R12: nack() is an in-session no-op — clears the tracked record, does NOT commit.
@@ -1000,3 +1002,185 @@ def test_kafka_build_common_config_redacts_sasl_password(mocker):
   assert "super-secret-pwd" not in repr(built)
   assert "<redacted>" in repr(built)
 
+
+def test_kafka_build_client_security_config_redacts_confluent_credentials():
+  """E2: Confluent api_key/secret must be redacted in repr of the client config.
+
+  SASL password is already wrapped in ``_RedactedStr``, but Confluent Cloud
+  credentials (``confluent_api_key`` / ``confluent_api_secret``) are plumbed
+  into ``sasl_plain_username`` / ``sasl_plain_password`` without redaction,
+  so ``repr(config)`` and traceback dumps of locals leak them.
+  """
+  from scrapy_extension.backends.kafka import KafkaBackend
+  from scrapy_extension.settings.kafka import KafkaSettings
+
+  config = KafkaSettings(
+    mode=KafkaMode.CONFLUENT,
+    confluent_bootstrap_servers="pkc-xxx.confluent.cloud:9092",
+    confluent_api_key="CKEY_TOP_SECRET_123",
+    confluent_api_secret="CSECRET_TOP_SECRET_456",
+  )
+  backend = KafkaBackend(config)
+  client_config = backend._build_client_security_config()
+
+  # Values remain usable as normal strings for kafka-python.
+  assert str(client_config["sasl_plain_username"]) == "CKEY_TOP_SECRET_123"
+  assert str(client_config["sasl_plain_password"]) == "CSECRET_TOP_SECRET_456"
+  # But repr of the config dict (Sentry / debug-log leak vector) hides both.
+  assert "CKEY_TOP_SECRET_123" not in repr(client_config)
+  assert "CSECRET_TOP_SECRET_456" not in repr(client_config)
+  assert "<redacted>" in repr(client_config)
+
+
+
+class TestKafkaBackendPopWithAckConcurrency:
+  """Tier-2 Unit H: pop_with_ack + ack(token) correctness under CONCURRENT_REQUESTS>1.
+
+  These tests prove no message is lost or skipped when N messages are popped
+  before any is acked, and that acking out of order commits only the contiguous
+  low-watermark (no unprocessed record ever skipped).
+  """
+
+  @staticmethod
+  def _make_backend_with_records(mocker, records):
+    """Build a KafkaBackend whose consumer.poll yields the given records in order.
+
+    Each record is a MagicMock with .value/.partition/.offset/.topic set.
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.poll.side_effect = [
+      {TopicPartition("scrapy-testq", r.partition): [r]} for r in records
+    ] + [{}] * 5  # subsequent polls return empty
+    mock_consumer.position.return_value = 0  # watermark base for partition 0
+    backend._consumer = mock_consumer
+    return backend, mock_consumer
+
+  @staticmethod
+  def _record(mocker, partition, offset, value=b"x", topic="scrapy-testq"):
+    r = mocker.MagicMock()
+    r.partition = partition
+    r.offset = offset
+    r.value = value
+    r.topic = topic
+    return r
+
+  def test_concurrent_pops_return_distinct_tokens(self, mocker):
+    """(a) N concurrent pop_with_ack calls return N distinct (partition, offset) tokens."""
+    records = [
+      self._record(mocker, 0, 0, b"a"),
+      self._record(mocker, 0, 1, b"b"),
+      self._record(mocker, 0, 2, b"c"),
+    ]
+    backend, _consumer = self._make_backend_with_records(mocker, records)
+
+    tokens = []
+    for _ in range(3):
+      _value, token = backend.pop_with_ack("testq", timeout=0.0)
+      tokens.append(token)
+
+    # Three distinct tokens, each correlating to its specific offset.
+    assert all(t is not None for t in tokens)
+    assert len({(t.partition, t.offset) for t in tokens}) == 3
+    assert [t.offset for t in tokens] == [0, 1, 2]
+
+  def test_reverse_order_ack_commits_only_contiguous_watermark(self, mocker):
+    """(b) ack offsets 0,1,2 in REVERSE order; watermark advances only contiguously.
+
+    pop offsets 0,1,2 ; ack 2 then 1 → no commit yet (gap at 0);
+    ack 0 → commit advances to watermark 3 (all three processed).
+    """
+    records = [
+      self._record(mocker, 0, 0),
+      self._record(mocker, 0, 1),
+      self._record(mocker, 0, 2),
+    ]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+
+    _v0, t0 = backend.pop_with_ack("testq")
+    _v1, t1 = backend.pop_with_ack("testq")
+    _v2, t2 = backend.pop_with_ack("testq")
+
+    # ack offset 2 → no contiguous run from base 0 (0,1 still in-flight)
+    backend.ack("testq", token=t2)
+    mock_consumer.commit.assert_not_called()
+
+    # ack offset 1 → still gap at 0, no commit
+    backend.ack("testq", token=t1)
+    mock_consumer.commit.assert_not_called()
+
+    # ack offset 0 → contiguous run complete, commit advances to 3
+    backend.ack("testq", token=t0)
+    mock_consumer.commit.assert_called_once()
+    committed_map = mock_consumer.commit.call_args.args[0]
+    tp, oam = next(iter(committed_map.items()))
+    assert tp == TopicPartition("scrapy-testq", 0)
+    assert oam.offset == 3
+
+  def test_no_offset_skipped_under_concurrency(self, mocker):
+    """(c) Interleaved pop/ack never skips an unprocessed offset.
+
+    pop 0, pop 1, ack 1 (no commit — 0 unacked), pop 2, ack 0 → commit to 2.
+    Offset 1 was acked out of order but the watermark only advances to 2
+    (offset 2 still in-flight). Then ack 2 → commit to 3.
+    """
+    records = [
+      self._record(mocker, 0, 0),
+      self._record(mocker, 0, 1),
+      self._record(mocker, 0, 2),
+    ]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+
+    _v0, t0 = backend.pop_with_ack("testq")
+    _v1, t1 = backend.pop_with_ack("testq")
+    backend.ack("testq", token=t1)  # ack 1 — gap at 0
+    mock_consumer.commit.assert_not_called()
+    _v2, t2 = backend.pop_with_ack("testq")
+    backend.ack("testq", token=t0)  # ack 0 — contiguous 0,1 done → commit to 2
+
+    committed_map = mock_consumer.commit.call_args.args[0]
+    _tp, oam = next(iter(committed_map.items()))
+    assert oam.offset == 2  # offset 2 not yet acked — NOT skipped
+
+    backend.ack("testq", token=t2)  # ack 2 → commit to 3
+    final_map = mock_consumer.commit.call_args.args[0]
+    _tp2, oam2 = next(iter(final_map.items()))
+    assert oam2.offset == 3
+
+  def test_ack_token_none_legacy_fallback_commits_last_record(self, mocker):
+    """(d) ack(token=None) legacy fallback commits the last-popped record wholesale."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    backend._consumer = mock_consumer
+    backend._last_record = mocker.MagicMock()
+
+    backend.ack("testq", token=None)  # legacy path
+
+    mock_consumer.commit.assert_called_once_with()  # bare commit, no offset map
+
+  def test_nack_does_not_commit_redeliver_semantics(self, mocker):
+    """(e) nack(token) does NOT commit — offset stays uncommitted → re-delivered on restart."""
+    records = [self._record(mocker, 0, 0)]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+    _value, token = backend.pop_with_ack("testq")
+
+    backend.nack("testq", token=token)
+
+    mock_consumer.commit.assert_not_called()
+    # The offset stays in-flight so the watermark can never advance past it.
+    assert 0 in backend._in_flight[0]
+
+  def test_ack_idempotent_on_duplicate_token(self, mocker):
+    """Acking the same token twice does not double-commit or advance past the run."""
+    records = [self._record(mocker, 0, 0), self._record(mocker, 0, 1)]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+    _v0, t0 = backend.pop_with_ack("testq")
+    _v1, t1 = backend.pop_with_ack("testq")
+
+    backend.ack("testq", token=t0)  # commit to 1 (0 done, 1 in-flight)
+    first_commit_count = mock_consumer.commit.call_count
+    backend.ack("testq", token=t0)  # duplicate — no-op (already discarded)
+
+    assert mock_consumer.commit.call_count == first_commit_count

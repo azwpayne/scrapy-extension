@@ -235,7 +235,8 @@ class TestRedisBackend:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = b"test_data"
+    # New signal scheme: [1, payload] = success.
+    mock_script.return_value = [1, b"test_data"]
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
@@ -247,12 +248,54 @@ class TestRedisBackend:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = None  # Empty queue signal from Lua script
+    # New signal scheme: [0, None] = empty queue.
+    mock_script.return_value = [0, None]
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
     result = backend.pop("test_queue")
     assert result is None
+
+  def test_queue_pop_lost_payload_race_returns_none(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """B1: concurrent-consumer race must NOT raise — recoverable.
+
+    Two consumers race ZPOPMIN; the loser finds its payload already HDEL'd.
+    This is an item-consumed-elsewhere race, not corruption: pop() must
+    return None (DEBUG-log, no raise).
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_script = mocker.MagicMock()
+    # New signal scheme: [2, None] = member popped but payload gone (race).
+    mock_script.return_value = [2, None]
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    result = backend.pop("test_queue")
+    assert result is None
+
+  def test_queue_pop_corruption_raises_queueerror(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """B1: structural corruption (unexpected payload type) raises QueueError.
+
+    Only a genuine invariant violation — payload decoded to a non-bytes /
+    non-str shape that cannot be normalized — escalates to QueueError.
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_script = mocker.MagicMock()
+    # New signal scheme: [3, msg] = structural corruption (e.g. Lua
+    # surfaced an unexpected payload type). We surface it as QueueError.
+    mock_script.return_value = [3, "unexpected payload type: float"]
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    with pytest.raises(QueueError):
+      backend.pop("test_queue")
 
   def test_set_add(self, redis_settings, mock_redis, mocker):
     """Test set add operation."""
@@ -516,6 +559,258 @@ class TestRedisBackendModes:
     assert len(call_kwargs["startup_nodes"]) == 1
 
 
+class TestRedisSentinelClusterWiring:
+  """Exercise Sentinel/Cluster connection paths beyond constructor-level mocks.
+
+  These tests mock the CLIENT returned by Sentinel.master_for() / RedisCluster,
+  but let the real Sentinel / RedisCluster classes (or lightly-mocked versions
+  that still exercise the parsing + wiring logic) run, proving:
+  - sentinel_tuples parsing (``rsplit(':', 1)`` + ``int(port)``)
+  - Sentinel(...).master_for(master_name) call shape + master client stored as self._client
+  - ClusterNode wiring from cluster_startup_nodes
+  - malformed sentinel/node entries surface a clear error
+  """
+
+  @pytest.fixture
+  def mock_master_client(self, mocker):
+    """Mock master client returned by Sentinel.master_for()."""
+    client = mocker.Mock()
+    client.ping.return_value = True
+    return client
+
+  def test_sentinel_parses_tuples_and_calls_master_for(self, mock_master_client, mocker):
+    """_connect_sentinel parses sentinel_tuples, calls Sentinel(sentinels).master_for(name).
+
+    Sentinel is real-captured-then-mocked: we verify the parsed sentinel_tuples
+    are passed to Sentinel() in exactly the ``(host, int(port))`` shape, and that
+    master_for is called with the configured master_name. The master client is
+    then stored as self._client and is_operable through ping().
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel-a:26379", "sentinel-b:26380", "sentinel-c:26381"],
+      sentinel_master_name="mymaster",
+      password="secret",
+    )
+
+    captured_sentinel = {}
+
+    def fake_sentinel_factory(sentinels, **kwargs):
+      captured_sentinel["sentinels"] = sentinels
+      captured_sentinel["kwargs"] = kwargs
+      instance = mocker.Mock()
+      instance.master_for.return_value = mock_master_client
+      return instance
+
+    mocker.patch("scrapy_extension.backends.redis.Sentinel", side_effect=fake_sentinel_factory)
+
+    backend = RedisBackend(settings)
+    backend.connect()
+
+    # 1) sentinel_tuples parsed as (host, int_port) tuples
+    assert captured_sentinel["sentinels"] == [
+      ("sentinel-a", 26379),
+      ("sentinel-b", 26380),
+      ("sentinel-c", 26381),
+    ]
+    # all ports coerced to int (not str)
+    assert all(isinstance(p, int) for _, p in captured_sentinel["sentinels"])
+
+    # 2) master_for called with the configured master_name
+    sentinel_instance = backend._sentinel
+    sentinel_instance.master_for.assert_called_once()
+    assert sentinel_instance.master_for.call_args.args[0] == "mymaster"
+
+    # 3) master client is stored as self._client and responds to ping
+    assert backend._client is mock_master_client
+    assert backend._master_client is mock_master_client
+    mock_master_client.ping.assert_called()
+    assert backend.is_connected()
+
+  def test_sentinel_master_client_is_operable_for_set(self, mock_master_client, mocker):
+    """The discovered master client flows through to real ops (set/ping)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel1:26379"],
+      sentinel_master_name="mymaster",
+    )
+
+    sentinel_instance = mocker.Mock()
+    sentinel_instance.master_for.return_value = mock_master_client
+    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=sentinel_instance)
+
+    backend = RedisBackend(settings)
+    backend.connect()
+
+    # The client property returns the master client — set() routes through it.
+    assert backend.client is mock_master_client
+    backend.client.set("k", "v")
+    mock_master_client.set.assert_called_once_with("k", "v")
+
+  def test_sentinel_empty_sentinels_raises_configuration_error(self, mocker):
+    """Empty sentinels list → ConfigurationError.
+
+    Pydantic's mode-validator rejects empty ``sentinels`` at construction, so we
+    bypass it by constructing with a valid config then mutating ``sentinels`` to
+    [] before connect() — exercising the defensive guard in _connect_sentinel.
+    """
+    from pydantic import ValidationError as PydanticValidationError
+
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    # Construction with empty sentinels is rejected by the validator
+    with pytest.raises(PydanticValidationError):
+      RedisSettings(mode=RedisMode.SENTINEL, sentinels=[])
+
+    # Defensive guard: build valid, then blank out sentinels pre-connect
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel1:26379"],
+      sentinel_master_name="mymaster",
+    )
+    settings.sentinels = []
+
+    backend = RedisBackend(settings)
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+    assert exc_info.value.setting_name == "sentinels"
+
+  def test_sentinel_malformed_entry_no_port_raises(self, mocker):
+    """Malformed sentinel entry (no ``:port``) surfaces a clear ValueError.
+
+    The parser does ``host, port_str = sentinel_str.rsplit(":", 1)``; a bare
+    "host" raises ValueError("not enough values to unpack"). This propagates
+    raw from connect() (not wrapped in BackendConnectionError, since ValueError
+    is not a RedisError).
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel-without-port"],
+      sentinel_master_name="mymaster",
+    )
+
+    backend = RedisBackend(settings)
+    with pytest.raises(ValueError):
+      backend.connect()
+
+  def test_sentinel_malformed_entry_non_numeric_port_raises(self, mocker):
+    """Non-numeric port in a sentinel entry raises ValueError on int() coercion."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel1:not-a-port"],
+      sentinel_master_name="mymaster",
+    )
+
+    backend = RedisBackend(settings)
+    with pytest.raises(ValueError):
+      backend.connect()
+
+  def test_cluster_parses_startup_nodes_into_cluster_nodes(self, mock_master_client, mocker):
+    """_connect_cluster parses cluster_startup_nodes into ClusterNode objects.
+
+    Captures the RedisCluster(startup_nodes=...) call and asserts each entry is
+    a real ClusterNode with the right host and int port.
+    """
+    from redis.cluster import ClusterNode
+
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER,
+      cluster_startup_nodes=["node-a:7000", "node-b:7001", "node-c:7002"],
+      password="secret",
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_cluster_factory(*args, **kwargs):
+      captured["kwargs"] = kwargs
+      mock_client = mocker.Mock()
+      mock_client.ping.return_value = True
+      return mock_client
+
+    mocker.patch("scrapy_extension.backends.redis.RedisCluster", side_effect=fake_cluster_factory)
+
+    backend = RedisBackend(settings)
+    backend.connect()
+
+    startup_nodes = captured["kwargs"]["startup_nodes"]
+    assert len(startup_nodes) == 3
+    # Each entry is a real ClusterNode (not a tuple/str) with host + int port
+    assert all(isinstance(n, ClusterNode) for n in startup_nodes)
+    assert [(n.host, n.port) for n in startup_nodes] == [
+      ("node-a", 7000),
+      ("node-b", 7001),
+      ("node-c", 7002),
+    ]
+    assert all(isinstance(n.port, int) for n in startup_nodes)
+
+  def test_cluster_malformed_startup_node_raises(self, mocker):
+    """Malformed cluster node (no port) raises ValueError during parsing."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.CLUSTER,
+      cluster_startup_nodes=["node-no-port"],
+    )
+
+    backend = RedisBackend(settings)
+    with pytest.raises(ValueError):
+      backend.connect()
+
+  def test_cluster_no_failover_rediscovery_path_exists(self, mock_master_client, mocker):
+    """Document the failover gap: the backend delegates failover to the
+    master_for() proxy and has no explicit discover_master() / reconnect path.
+
+    Sentinel.master_for() returns a proxy that lazily re-discovers the master
+    on MasterNotFoundError-style exceptions (handled inside redis-py). The
+    backend code does NOT call discover_master() itself, nor does it reconnect
+    on connection loss beyond a fresh connect() call. This test pins that
+    behavior so a future change is intentional.
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.settings import RedisMode, RedisSettings
+
+    settings = RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel1:26379"],
+      sentinel_master_name="mymaster",
+    )
+
+    sentinel_instance = mocker.Mock()
+    sentinel_instance.master_for.return_value = mock_master_client
+    # Ensure discover_master is never invoked by _connect_sentinel
+    sentinel_instance.discover_master = mocker.Mock()
+    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=sentinel_instance)
+
+    backend = RedisBackend(settings)
+    backend.connect()
+
+    # Failover delegation: the backend builds the connection via master_for()
+    # only — it never queries discover_master() during a normal connect.
+    sentinel_instance.master_for.assert_called_once()
+    sentinel_instance.discover_master.assert_not_called()
+    # And there is no public reconnect/re-discovery method on the backend
+    assert not hasattr(backend, "discover_master")
+    assert not hasattr(backend, "reconnect")
+
+
 class TestRedisBackendDisconnect:
   """Test RedisBackend disconnect functionality."""
 
@@ -748,20 +1043,34 @@ class TestRedisBackendQueueOperations:
     assert payload_key.startswith("{test_queue}:")
 
   def test_pop_raises_on_missing_payload(self, redis_settings, mock_redis, mocker):
-    """Pop must raise QueueError when a ZSET member has no payload (queue corruption).
+    """B1: a lost-payload race must NOT raise; structural corruption must.
 
-    Regression for R4-C1: the Lua script returns -1 when HGET misses;
-    pop must convert that to a loud QueueError, not silently return None.
+    Previously the Lua script returned ``-1`` when HGET missed and pop
+    escalated every such miss to QueueError. B1 distinguishes:
+
+    - lost-payload race (``[2, _]`` — another consumer won ZPOPMIN and
+      HDEL'd the payload first): recoverable → pop returns None, no raise.
+    - structural corruption (``[3, msg]`` — payload decoded to an
+      unexpected type): QueueError, so the caller can surface it.
+
+    Regression for R4-C1 / B1.
     """
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
-    mock_script = mocker.MagicMock()
-    mock_script.return_value = -1  # Orphan marker from Lua script
-    mock_redis.register_script.return_value = mock_script
+    # Lost-payload race: recoverable, returns None (no raise).
+    mock_script_race = mocker.MagicMock()
+    mock_script_race.return_value = [2, None]
+    mock_redis.register_script.return_value = mock_script_race
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError, match="Queue corruption"):
+    assert backend.pop("test_queue") is None
+
+    # Structural corruption: loud QueueError.
+    mock_script_corrupt = mocker.MagicMock()
+    mock_script_corrupt.return_value = [3, "unexpected payload type: float"]
+    mock_redis.register_script.return_value = mock_script_corrupt
+    with pytest.raises(QueueError, match="Structural corruption"):
       backend.pop("test_queue")
 
   def test_non_blocking_pop_uses_lua_script(
@@ -776,7 +1085,7 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = b"payload"
+    mock_script.return_value = [1, b"payload"]  # New signal scheme: [1, payload] = success.
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
@@ -802,7 +1111,8 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = "string_payload"  # decode_responses=True
+    # New signal scheme: [1, payload] = success; decode_responses=True → str payload.
+    mock_script.return_value = [1, "string_payload"]
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
@@ -826,17 +1136,17 @@ class TestRedisBackendQueueOperations:
     mock_redis.pipeline.assert_called_with(transaction=True)
 
   def test_pop_raises_on_unexpected_payload_type(self, redis_settings, mock_redis, mocker):
-    """R5: a non-None/int/str/bytes pop result → QueueError (defensive)."""
+    """R5: a pop result that is not a 2-element [status, payload] list → QueueError (defensive)."""
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = 3.14  # float — none of the expected Lua return types
+    mock_script.return_value = 3.14  # float — not the expected [status, payload] list shape
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
 
-    with pytest.raises(QueueError, match="Unexpected payload type from pop script"):
+    with pytest.raises(QueueError, match="Corrupt pop result"):
       backend.pop("test_queue")
 
   def test_consume_payload_raises_on_pipeline_redis_error(

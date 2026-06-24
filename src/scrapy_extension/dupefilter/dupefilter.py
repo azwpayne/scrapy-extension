@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Protocol
 
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
+from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
+from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:
@@ -58,6 +60,7 @@ class BackendDupeFilter:
     debug: bool = False,
     fingerprinter: _Fingerprinter | None = None,
     membership_filter: MembershipFilter | None = None,
+    monitor: Monitor | None = None,
   ) -> None:
     """Initialize the dupefilter.
 
@@ -76,11 +79,17 @@ class BackendDupeFilter:
             (default), a ``SetMembershipFilter`` is built from the connection
             manager and key — preserving the pre-strategy behavior exactly.
             Pass a custom filter (memory, bloom, cuckoo, ...) to override.
+        monitor: Optional observability monitor. When ``None`` (default),
+            :class:`~scrapy_extension.monitor.NullMonitor` (no-op). Wired to a
+            :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` in
+            :meth:`from_crawler` when ``crawler.stats`` is available, so dedup
+            hit/miss stats are default-on. Emitted hooks are additive.
     """
     self.connection_manager = connection_manager
     self.key = key
     self.debug = debug
     self._fingerprinter = fingerprinter
+    self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
     # Use ``is None`` (not ``or``): a MembershipFilter defines __len__, so an
     # empty filter (len == 0) would be falsy and ``or`` would wrongly discard
     # it. Only fall through when no filter was supplied at all.
@@ -164,6 +173,12 @@ class BackendDupeFilter:
     """
     dupefilter = cls.from_settings(crawler.settings)
     dupefilter._fingerprinter = getattr(crawler, "request_fingerprinter", None)
+    # Default-on observability: wire a ScrapyStatsMonitor when crawler.stats is
+    # available so dedup hit/miss counts show up on the Scrapy stats dump
+    # without an explicit ``monitor=`` kwarg. Additive — existing stats untouched.
+    stats = getattr(crawler, "stats", None)
+    if stats is not None:
+      dupefilter._monitor = ScrapyStatsMonitor(stats)
     return dupefilter
 
   def open(self) -> None:
@@ -213,7 +228,12 @@ class BackendDupeFilter:
       ) from exc
 
     # add() returns True when the item was newly added; a duplicate maps to False.
-    return not added
+    seen = not added
+    if seen:
+      self._monitor.on_dedup_hit(fingerprint)
+    else:
+      self._monitor.on_dedup_miss(fingerprint)
+    return seen
 
   def request_fingerprint(self, request: Request) -> str:
     """Generate a fingerprint for a request.

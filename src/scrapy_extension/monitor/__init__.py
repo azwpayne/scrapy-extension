@@ -5,11 +5,23 @@
 # @blog    : https://paynewu.com/
 # @mail    : paynewu0719@gmail.com
 
-"""Monitoring integration namespace."""
+"""Observability namespace (Unit F — Tier-2).
+
+Exports the monitor interface and its two implementations:
+
+- :class:`Monitor` — the no-op base protocol every component accepts.
+- :class:`NullMonitor` — the safe default (no crawler / no stats).
+- :class:`ScrapyStatsMonitor` — emits namespaced Scrapy stats; wired by
+  ``from_crawler`` factories when ``crawler.stats`` is available.
+
+Components (``BackendQueue``, ``BackendDupeFilter``, later the pipeline)
+accept a ``monitor: Monitor = NullMonitor()`` and call hooks at their seam
+points. The wiring is additive — existing stat keys are unchanged.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+__all__ = ["Monitor", "NullMonitor", "ScrapyStatsMonitor"]
 
-if TYPE_CHECKING:
-  ...
+from scrapy_extension.monitor.base import Monitor, NullMonitor
+from scrapy_extension.monitor.stats import ScrapyStatsMonitor
