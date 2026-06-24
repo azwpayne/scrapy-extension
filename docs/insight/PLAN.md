@@ -3,6 +3,25 @@
 Phased execution. **Tier 1 = 5 file-disjoint work units** (parallel-safe fan-out). Tier 2/3 deferred.
 See [INSIGHT.md](./INSIGHT.md) for evidence, [SPEC.md](./SPEC.md) for goals/constraints.
 
+## STATUS — live tracker (branch `fix/hardening-tier1-correctness-security`)
+
+| Commit | Scope | State |
+|---|---|---|
+| `3651fc0` | **Tier-1** — 10 correctness/security fixes (Units A–E) | ✅ done — 1090 passed |
+| `2a34648` | **Tier-2/3 r2** — observability (F), storage strategy (G), property tests (I) | ✅ done — 1153 passed |
+| `4950a58` | **Tier-2/3 r3** — circuit-breaker (J), integration CI (K), Sentinel/Cluster tests (L), kafka-ng (M) | ✅ done — 1190 passed |
+| `08f2a69` | **Tier-2 H** — ack in-flight-set (concurrency-correct at-least-once) | ✅ done — 1203 passed |
+
+**Final verify:** 1203 passed / 27 skipped / 0 failed · ruff clean · mypy clean (65 files) · bandit clean.
+
+**Residual (not done — small / needs infra):**
+- Sentinel/Cluster malformed-entry errors propagate raw `ValueError` (round-3 pinned this; wrap in `BackendConnectionError`).
+- No explicit Sentinel failover re-discovery path (delegated to redis-py `master_for` proxy).
+- RocketMQ integration tests (need a runner image with native `librocketmq`).
+- SQS/Pulsar in-flight-set ack (H shipped signature compat only; pin `CONCURRENT_REQUESTS=1` for them).
+- Entry-point plugin registration for backends (architect bet #2). ES atomic pop (bet #6).
+
+
 ## Tier 1 — In-scope (parallel fan-out; disjoint files)
 
 ### Unit A — `backends/connectors.py`  *(CRITICAL + HIGH + MEDIUM)*
