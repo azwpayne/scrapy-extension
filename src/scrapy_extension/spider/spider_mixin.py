@@ -7,7 +7,7 @@ to Scrapy spiders, enabling distributed crawling capabilities.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from scrapy import Spider, signals
 
@@ -146,8 +146,71 @@ class BackendSpiderMixin(Spider):
       shortcuts["password"] = self.redis_password
     return shortcuts
 
+  def _build_mongodb_settings(self) -> dict[str, Any]:
+    """Build MongoDB-specific shortcut settings."""
+    shortcuts: dict[str, Any] = {}
+    if self.mongodb_uri is not None:
+      shortcuts["uri"] = self.mongodb_uri
+    if self.mongodb_db is not None:
+      shortcuts["database"] = self.mongodb_db
+    return shortcuts
+
+  def _build_kafka_settings(self) -> dict[str, Any]:
+    """Build Kafka-specific shortcut settings."""
+    shortcuts: dict[str, Any] = {}
+    if self.kafka_bootstrap_servers is not None:
+      shortcuts["bootstrap_servers"] = self.kafka_bootstrap_servers
+    return shortcuts
+
+  def _build_rabbitmq_settings(self) -> dict[str, Any]:
+    """Build RabbitMQ-specific shortcut settings."""
+    shortcuts: dict[str, Any] = {}
+    if self.rabbitmq_url is not None:
+      shortcuts["url"] = self.rabbitmq_url
+    return shortcuts
+
+  def _build_elasticsearch_settings(self) -> dict[str, Any]:
+    """Build ElasticSearch-specific shortcut settings."""
+    shortcuts: dict[str, Any] = {}
+    if self.elasticsearch_hosts is not None:
+      shortcuts["hosts"] = self.elasticsearch_hosts
+    if self.elasticsearch_cloud_id is not None:
+      shortcuts["cloud_id"] = self.elasticsearch_cloud_id
+    if self.elasticsearch_api_key is not None:
+      shortcuts["api_key"] = self.elasticsearch_api_key
+    return shortcuts
+
+  def _build_rocketmq_settings(self) -> dict[str, Any]:
+    """Build RocketMQ-specific shortcut settings."""
+    shortcuts: dict[str, Any] = {}
+    if self.rocketmq_namesrv_address is not None:
+      shortcuts["namesrv_address"] = self.rocketmq_namesrv_address
+    if self.rocketmq_access_key is not None:
+      shortcuts["access_key"] = self.rocketmq_access_key
+    if self.rocketmq_secret_key is not None:
+      shortcuts["secret_key"] = self.rocketmq_secret_key
+    return shortcuts
+
+  # Map of backend value -> shortcut-settings builder. Extracted as a
+  # class-level constant so ``_build_backend_settings`` stays a flat
+  # dispatch (no per-backend branching), keeping cyclomatic complexity
+  # bounded as backends are added.
+  _BACKEND_SHORTCUT_BUILDERS: ClassVar[dict[str, str]] = {
+    "redis": "_build_redis_settings",
+    "mongodb": "_build_mongodb_settings",
+    "kafka": "_build_kafka_settings",
+    "rabbitmq": "_build_rabbitmq_settings",
+    "elasticsearch": "_build_elasticsearch_settings",
+    "rocketmq": "_build_rocketmq_settings",
+  }
+
   def _build_backend_settings(self) -> dict[str, Any]:
     """Build backend settings from shortcut attributes.
+
+    Merges explicit ``backend_settings`` (if any) with the per-backend
+    shortcut builder selected by ``backend_type.value``. Backends without
+    shortcut attributes (e.g. Pulsar, SQS, Memcached, DynamoDB) have no
+    builder entry and contribute nothing — preserving prior behavior.
 
     Returns:
         Dictionary of backend settings merged from class attributes.
@@ -158,35 +221,12 @@ class BackendSpiderMixin(Spider):
     if self.backend_settings:
       settings.update(self.backend_settings)
 
-    # Add shortcut settings based on backend type
+    # Add shortcut settings based on backend type (no per-backend branching —
+    # dispatch via the _BACKEND_SHORTCUT_BUILDERS table).
     backend_value = self.backend_type.value if self.backend_type else None
-    if backend_value == "redis":
-      settings.update(self._build_redis_settings())
-    elif backend_value == "mongodb":
-      if self.mongodb_uri is not None:
-        settings["uri"] = self.mongodb_uri
-      if self.mongodb_db is not None:
-        settings["database"] = self.mongodb_db
-    elif backend_value == "kafka":
-      if self.kafka_bootstrap_servers is not None:
-        settings["bootstrap_servers"] = self.kafka_bootstrap_servers
-    elif backend_value == "rabbitmq":
-      if self.rabbitmq_url is not None:
-        settings["url"] = self.rabbitmq_url
-    elif backend_value == "elasticsearch":
-      if self.elasticsearch_hosts is not None:
-        settings["hosts"] = self.elasticsearch_hosts
-      if self.elasticsearch_cloud_id is not None:
-        settings["cloud_id"] = self.elasticsearch_cloud_id
-      if self.elasticsearch_api_key is not None:
-        settings["api_key"] = self.elasticsearch_api_key
-    elif backend_value == "rocketmq":
-      if self.rocketmq_namesrv_address is not None:
-        settings["namesrv_address"] = self.rocketmq_namesrv_address
-      if self.rocketmq_access_key is not None:
-        settings["access_key"] = self.rocketmq_access_key
-      if self.rocketmq_secret_key is not None:
-        settings["secret_key"] = self.rocketmq_secret_key
+    builder_name = self._BACKEND_SHORTCUT_BUILDERS.get(backend_value or "")
+    if builder_name is not None:
+      settings.update(getattr(self, builder_name)())
 
     return settings
 

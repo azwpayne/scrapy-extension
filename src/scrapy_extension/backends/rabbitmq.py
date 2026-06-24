@@ -43,6 +43,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# RabbitMQ broker default credential (well-known; operators override via settings).
+# Used to detect the insecure default guest/guest login in non-standalone modes.
+_DEFAULT_GUEST_CREDENTIAL = "guest"  # nosec B105
+
 
 class RabbitMQBackend(Backend, QueueBackend):
   """RabbitMQ backend implementation with multi-mode support.
@@ -159,8 +163,8 @@ class RabbitMQBackend(Backend, QueueBackend):
     # Warn/fail if using default guest credentials in non-standalone mode
     if (
       self.config.mode != RabbitMQMode.STANDALONE
-      and self.config.username == "guest"
-      and self.config.password == "guest"
+      and self.config.username == _DEFAULT_GUEST_CREDENTIAL
+      and self.config.password == _DEFAULT_GUEST_CREDENTIAL
     ):
       msg = (
         "Default 'guest/guest' credentials are insecure for non-standalone modes. "

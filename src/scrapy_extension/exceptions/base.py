@@ -113,6 +113,9 @@ class ConfigurationError(BackendError):
       setting_value: The invalid value (or ``***REDACTED***`` if sensitive).
   """
 
+  setting_name: str | None
+  setting_value: object
+
   def __init__(
     self,
     message: str,

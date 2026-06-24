@@ -160,33 +160,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "heartbeatFrequencyMS": self.config.heartbeat_frequency_ms,
     }
 
-    # Add write concern if specified
-    if self.config.w is not None:
-      kwargs["w"] = self.config.w
-    if self.config.journal is not None:
-      kwargs["journal"] = self.config.journal
-    if self.config.w_timeout_ms is not None:
-      kwargs["wtimeoutMS"] = self.config.w_timeout_ms
-
-    # Add TLS/SSL settings
-    if self.config.tls_enabled:
-      kwargs["tls"] = True
-      if self.config.tls_ca_file:
-        kwargs["tlsCAFile"] = self.config.tls_ca_file
-      if self.config.tls_cert_file:
-        kwargs["tlsCertificateKeyFile"] = self.config.tls_cert_file
-      if self.config.tls_key_file and not self.config.tls_cert_file:
-        kwargs["tlsCertificateKeyFile"] = self.config.tls_key_file
-      kwargs["tlsAllowInvalidCertificates"] = self.config.tls_allow_invalid_certificates
-
-    # Add authentication
-    if self.config.username and self.config.password:
-      kwargs["username"] = self.config.username
-      kwargs["password"] = secret_value(self.config.password)
-      if self.config.auth_source:
-        kwargs["authSource"] = self.config.auth_source
-      if self.config.auth_mechanism:
-        kwargs["authMechanism"] = self.config.auth_mechanism
+    kwargs.update(self._write_concern_kwargs())
+    kwargs.update(self._tls_kwargs())
+    kwargs.update(self._auth_kwargs())
 
     # Add read preference
     read_pref = self._get_read_preference()
@@ -195,6 +171,45 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     # Cache for future use
     self._client_kwargs = kwargs.copy()
+    return kwargs
+
+  def _write_concern_kwargs(self) -> dict[str, Any]:
+    """Build write-concern kwargs from config (w / journal / wtimeoutMS)."""
+    kwargs: dict[str, Any] = {}
+    if self.config.w is not None:
+      kwargs["w"] = self.config.w
+    if self.config.journal is not None:
+      kwargs["journal"] = self.config.journal
+    if self.config.w_timeout_ms is not None:
+      kwargs["wtimeoutMS"] = self.config.w_timeout_ms
+    return kwargs
+
+  def _tls_kwargs(self) -> dict[str, Any]:
+    """Build TLS/SSL kwargs from config (empty when tls disabled)."""
+    kwargs: dict[str, Any] = {}
+    if not self.config.tls_enabled:
+      return kwargs
+    kwargs["tls"] = True
+    if self.config.tls_ca_file:
+      kwargs["tlsCAFile"] = self.config.tls_ca_file
+    if self.config.tls_cert_file:
+      kwargs["tlsCertificateKeyFile"] = self.config.tls_cert_file
+    if self.config.tls_key_file and not self.config.tls_cert_file:
+      kwargs["tlsCertificateKeyFile"] = self.config.tls_key_file
+    kwargs["tlsAllowInvalidCertificates"] = self.config.tls_allow_invalid_certificates
+    return kwargs
+
+  def _auth_kwargs(self) -> dict[str, Any]:
+    """Build authentication kwargs from config (empty when no credentials)."""
+    kwargs: dict[str, Any] = {}
+    if not (self.config.username and self.config.password):
+      return kwargs
+    kwargs["username"] = self.config.username
+    kwargs["password"] = secret_value(self.config.password)
+    if self.config.auth_source:
+      kwargs["authSource"] = self.config.auth_source
+    if self.config.auth_mechanism:
+      kwargs["authMechanism"] = self.config.auth_mechanism
     return kwargs
 
   def _compute_read_preference(self) -> str | None:
@@ -397,7 +412,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
-    assert self._queue_collection is not None
+    if self._queue_collection is None:
+      msg = "MongoDBBackend not connected: queue collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     doc = {
       "queue_name": queue_name,
       "item": item,
@@ -424,7 +441,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         QueueError: If the pop operation fails.
     """
     self._assert_connected()
-    assert self._queue_collection is not None
+    if self._queue_collection is None:
+      msg = "MongoDBBackend not connected: queue collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     try:
       # MongoDB doesn't support blocking pop, so we ignore timeout
       result = self._queue_collection.find_one_and_delete(
@@ -452,7 +471,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Number of items in the queue (capped at 100000).
     """
     self._assert_connected()
-    assert self._queue_collection is not None
+    if self._queue_collection is None:
+      msg = "MongoDBBackend not connected: queue collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     return self._queue_collection.count_documents(
       {"queue_name": queue_name}, limit=100000
     )
@@ -464,7 +485,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         queue_name: Name of the queue.
     """
     self._assert_connected()
-    assert self._queue_collection is not None
+    if self._queue_collection is None:
+      msg = "MongoDBBackend not connected: queue collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     self._queue_collection.delete_many({"queue_name": queue_name})
 
   # SetBackend implementation
@@ -479,7 +502,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if added, False if already existed.
     """
     self._assert_connected()
-    assert self._set_collection is not None
+    if self._set_collection is None:
+      msg = "MongoDBBackend not connected: set collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     doc = {
       "set_name": set_name,
       "item_hash": _hash_item(item),
@@ -504,7 +529,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if removed, False if didn't exist.
     """
     self._assert_connected()
-    assert self._set_collection is not None
+    if self._set_collection is None:
+      msg = "MongoDBBackend not connected: set collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._set_collection.delete_one(
       {
         "set_name": set_name,
@@ -524,7 +551,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if item exists in the set.
     """
     self._assert_connected()
-    assert self._set_collection is not None
+    if self._set_collection is None:
+      msg = "MongoDBBackend not connected: set collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._set_collection.find_one(
       {
         "set_name": set_name,
@@ -547,7 +576,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Number of items in the set (capped at 100000).
     """
     self._assert_connected()
-    assert self._set_collection is not None
+    if self._set_collection is None:
+      msg = "MongoDBBackend not connected: set collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     return self._set_collection.count_documents(
       {"set_name": set_name}, limit=100000
     )
@@ -559,7 +590,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         set_name: Name of the set.
     """
     self._assert_connected()
-    assert self._set_collection is not None
+    if self._set_collection is None:
+      msg = "MongoDBBackend not connected: set collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     self._set_collection.delete_many({"set_name": set_name})
 
   # StorageBackend implementation
@@ -572,7 +605,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ttl: Optional time-to-live in seconds.
     """
     self._assert_connected()
-    assert self._storage_collection is not None
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     doc: dict[str, Any] = {
       "key": key,
       "data": data,
@@ -596,7 +631,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Stored data, or None if not found.
     """
     self._assert_connected()
-    assert self._storage_collection is not None
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._storage_collection.find_one({"key": key})
     if result:
       return result.get("data")
@@ -612,7 +649,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if deleted, False if didn't exist.
     """
     self._assert_connected()
-    assert self._storage_collection is not None
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._storage_collection.delete_one({"key": key})
     return result.deleted_count > 0
 
@@ -626,7 +665,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         True if key exists.
     """
     self._assert_connected()
-    assert self._storage_collection is not None
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._storage_collection.find_one({"key": key}, {"_id": 1})
     return result is not None
 
@@ -641,7 +682,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         -1 if expired (rare since MongoDB TTL index auto-deletes).
     """
     self._assert_connected()
-    assert self._storage_collection is not None
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
     if result is None:
       return None
@@ -660,7 +703,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                If None, clear all storage data.
     """
     self._assert_connected()
-    assert self._storage_collection is not None
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
     if prefix:
       pattern = re.escape(prefix)
       self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})

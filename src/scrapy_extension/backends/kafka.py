@@ -362,7 +362,9 @@ class KafkaBackend(Backend, QueueBackend):
         num_partitions=self.config.max_priority_partitions,
         replication_factor=self.config.replication_factor,
       )
-      assert self._admin_client is not None
+      if self._admin_client is None:
+        msg = "KafkaBackend not connected: admin client is None"
+        raise BackendConnectionError(msg, backend_type="kafka")
       self._admin_client.create_topics([new_topic])
       self._known_topics.add(topic_name)
       logger.debug("Created Kafka topic: %s", topic_name)
@@ -390,7 +392,9 @@ class KafkaBackend(Backend, QueueBackend):
       topic_name = f"scrapy-{queue_name}"
       partition = max(0, min(int(priority), self.config.max_priority_partitions - 1))
 
-      assert self._producer is not None
+      if self._producer is None:
+        msg = "KafkaBackend not connected: producer is None"
+        raise BackendConnectionError(msg, backend_type="kafka")
       future = self._producer.send(topic_name, value=item, partition=partition)
       # Wait for send to complete (synchronous for reliability)
       future.get(timeout=10)
@@ -433,7 +437,9 @@ class KafkaBackend(Backend, QueueBackend):
           **self._build_client_security_config(),
         )
 
-      assert self._consumer is not None
+      if self._consumer is None:
+        msg = "KafkaBackend not connected: consumer is None"
+        raise BackendConnectionError(msg, backend_type="kafka")
       # Subscribe only when the topic changes. kafka-python's subscribe() is
       # idempotent on unchanged topics, but skipping the redundant call avoids
       # needless subscription-state work on every pop of the same queue (R2-E3).
@@ -554,7 +560,9 @@ class KafkaBackend(Backend, QueueBackend):
     _validate_topic_name(queue_name)
     try:
       topic_name = f"scrapy-{queue_name}"
-      assert self._admin_client is not None
+      if self._admin_client is None:
+        msg = "KafkaBackend not connected: admin client is None"
+        raise BackendConnectionError(msg, backend_type="kafka")
       self._admin_client.delete_topics([topic_name])
       # Recreate topic
       new_topic = NewTopic(

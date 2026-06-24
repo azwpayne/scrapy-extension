@@ -71,7 +71,12 @@ class CuckooMembershipFilter(MembershipFilter):
     self._num_buckets = m
     self._buckets: list[list[bytes]] = [[] for _ in range(m)]
     self._count = 0
-    self._rng = random.Random()
+    # nosec B311: random.Random drives only the cuckoo-kick eviction slot
+    # selection, a non-cryptographic choice. Switching to ``secrets`` would
+    # change the distribution and subtly alter the filter's false-positive
+    # behavior without any security benefit — fingerprints are keyed by
+    # SHA-256, not by this RNG.
+    self._rng = random.Random()  # nosec B311 - eviction-slot jitter, not cryptographic
 
   @property
   def num_buckets(self) -> int:

@@ -104,7 +104,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def _ensure_indices(self) -> None:
     """Create indices if they don't exist."""
-    assert self._client is not None
+    if self._client is None:
+      msg = "ElasticSearchBackend not connected: client is None"
+      raise BackendConnectionError(msg, backend_type="elasticsearch")
     for name in (
       self.config.queue_index,
       self.config.set_index,
@@ -153,9 +155,15 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         The ElasticSearch client instance.
+
+    Raises:
+        BackendConnectionError: If the client cannot be initialized.
     """
     if self._client is None:
       self.connect()
+    if self._client is None:
+      msg = "ElasticSearchBackend not connected: client is None after connect()"
+      raise BackendConnectionError(msg, backend_type="elasticsearch")
     return self._client
 
   # ---- Queue ----

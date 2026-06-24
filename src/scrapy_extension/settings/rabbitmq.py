@@ -66,7 +66,7 @@ class RabbitMQSettings(BaseSettings):
     description="RabbitMQ username. MUST override in production via SCRAPY_RABBITMQ_USERNAME.",
   )
   password: SecretStr = Field(
-    default="guest",
+    default=SecretStr("guest"),
     description="RabbitMQ password. MUST override in production via SCRAPY_RABBITMQ_PASSWORD.",
   )
   virtual_host: str = Field(

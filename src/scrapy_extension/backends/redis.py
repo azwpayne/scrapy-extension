@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 try:
     from redis import Redis
@@ -337,7 +337,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     if self._client is None:
       self.connect()
-    return self._client
+    return cast("Redis | RedisCluster", self._client)
 
   @property
   def _pop_script(self) -> Any:
@@ -348,12 +348,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     EVAL. Avoids stale references if ``self._client`` is replaced by a
     reconnect.
     """
-    return self.client.register_script(_POP_LUA)
+    return cast("Redis", self.client).register_script(_POP_LUA)
 
   @property
   def _push_script(self) -> Any:
     """Compiled Lua script for atomic FIFO-preserving push."""
-    return self.client.register_script(_PUSH_LUA)
+    return cast("Redis", self.client).register_script(_PUSH_LUA)
 
   # QueueBackend implementation using Sorted Sets
   def _payload_key(self, queue_name: str) -> str:
@@ -452,7 +452,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         bz_result = self.client.bzpopmin(queue_name, timeout=timeout)
         if bz_result is None:
           return None
-        return self._consume_payload(payload_key, bz_result[1])
+        member = cast("tuple[Any, Any]", bz_result)[1]
+        return self._consume_payload(payload_key, member)
       result = self._pop_script(keys=[queue_name, payload_key])
     except RedisError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
@@ -497,8 +498,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     try:
       pipe = self.client.pipeline(transaction=True)
-      pipe.hget(payload_key, member)
-      pipe.hdel(payload_key, member)
+      field = cast("str", member)
+      pipe.hget(payload_key, field)
+      pipe.hdel(payload_key, field)
       payload, _ = pipe.execute()
     except RedisError as e:
       msg = f"Failed to consume payload from {payload_key}: {e}"
@@ -539,7 +541,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     try:
-      return self.client.zcard(queue_name)
+      return cast("int", self.client.zcard(queue_name))
     except RedisError:
       return 0
 
@@ -610,7 +612,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If set_name contains invalid characters.
     """
     _validate_key_name(set_name, "set_name")
-    result = self.client.sismember(set_name, item)
+    result = self.client.sismember(set_name, cast("str", item))
     return bool(result)
 
   def set_len(self, set_name: str) -> int:
@@ -627,7 +629,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return self.client.scard(set_name)
+      return cast("int", self.client.scard(set_name))
     except RedisError:
       return 0
 
@@ -732,7 +734,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If key contains invalid characters.
     """
     _validate_key_name(key, "key")
-    result = self.client.ttl(key)
+    result = cast("int", self.client.ttl(key))
     # redis-py ttl() returns int: -2 = no key, -1 = no TTL, >= 0 = TTL seconds.
     # Per StorageBackend contract, both "missing key" and "no TTL" return None.
     if result < 0:
