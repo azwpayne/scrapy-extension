@@ -79,6 +79,7 @@ test = [
     "pytest-mypy",
     "pytest-ruff",
     "pytest-bandit",
+    "hypothesis>=6,<7",
     # Backend deps — tests import backend modules directly, which triggers
     # the module-level lazy-import guard. All backends must be installable
     # for the test suite to collect.

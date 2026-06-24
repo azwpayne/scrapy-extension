@@ -739,3 +739,42 @@ class TestBackendQueueMaxItemBytes:
     request = Request(url="https://example.com", body=b"x" * 10_000)
     queue.push(request)
     mock_connection_manager.get_queue_backend().push.assert_called_once()
+
+
+class TestBackendQueueMonitorWiring:
+  """Unit F: BackendQueue emits monitor hooks on push/pop (additive)."""
+
+  def test_push_with_explicit_monitor_emits_on_push(
+    self, mock_connection_manager, mocker
+  ):
+    """Push with a ScrapyStatsMonitor increments queue/push_count."""
+    from scrapy.statscollectors import MemoryStatsCollector
+
+    from scrapy_extension.monitor import ScrapyStatsMonitor
+
+    stats = MemoryStatsCollector(mocker.MagicMock())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      monitor=ScrapyStatsMonitor(stats),
+    )
+    queue.push(Request(url="https://example.com"))
+    assert stats.get_value("queue/push_count") == 1
+
+  def test_pop_with_explicit_monitor_emits_on_pop(
+    self, mock_connection_manager, mocker
+  ):
+    """Pop with a ScrapyStatsMonitor increments queue/pop_count."""
+    from scrapy.statscollectors import MemoryStatsCollector
+
+    from scrapy_extension.monitor import ScrapyStatsMonitor
+
+    stats = MemoryStatsCollector(mocker.MagicMock())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      monitor=ScrapyStatsMonitor(stats),
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+    queue.pop()
+    assert stats.get_value("queue/pop_count") == 1

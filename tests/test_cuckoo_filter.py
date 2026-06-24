@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 
 import pytest
+from hypothesis import HealthCheck, Verbosity, given, settings
+from hypothesis import strategies as st
 
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 
@@ -115,3 +117,84 @@ class TestCuckooMembershipFilterOps:
     flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
     flt.open()
     flt.close()
+
+
+class TestCuckooMembershipFilterProperties:
+  """Hypothesis property tests for the cardinal claims (subsystem ①).
+
+  These complement ``test_false_positive_rate_bounded`` (a seeded loop) with
+  two claim-verifying properties:
+
+  - ``test_no_false_negatives_property``: every inserted item reports present.
+  - ``test_false_positive_rate_property``: FP rate over unseen keys stays
+    bounded by a generous multiple of ``error_rate`` — probabilistic filters
+    must never false-negative and their FP must stay within design bounds.
+
+  Uses ``hypothesis`` with a ``derandomize``-style seeded profile so CI is
+  reproducible: the same ``--hYPOTHESIS_SEED`` / fixed ``random_factory``
+  produces the same generated cases every run.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _derandomize_profile(self) -> None:
+    """Pin hypothesis to a derandomized profile for deterministic FP-rate checks."""
+    settings.register_profile(
+      "ci_derandomized",
+      derandomize=True,
+      max_examples=50,
+      deadline=None,
+      suppress_health_check=[HealthCheck.too_slow],
+      verbosity=Verbosity.normal,
+    )
+    settings.load_profile("ci_derandomized")
+
+  @given(
+    items=st.lists(
+      st.binary(min_size=1, max_size=32),
+      min_size=0,
+      max_size=200,
+      unique=True,
+    )
+  )
+  def test_no_false_negatives_property(self, items: list[bytes]) -> None:
+    """Cardinal guarantee: for any inserted set, ``item in filter`` is always True.
+
+    The cuckoo filter only ever moves a fingerprint between its two valid
+    buckets during eviction — it never drops one — so containment of an
+    inserted item is invariant. This property pins that contract against
+    arbitrary item sets up to ~85% load (200 items, default sizing).
+    """
+    flt = CuckooMembershipFilter(capacity=250, error_rate=0.01)
+    for item in items:
+      flt.add(item)
+    for item in items:
+      assert item in flt, f"cuckoo false negative for {item!r}"
+
+  def test_false_positive_rate_property(self) -> None:
+    """FP rate over unseen keys stays within 5x target (derandomized, deterministic).
+
+    Inserts ~capacity distinct items, then probes ``capacity`` unseen keys.
+    Asserts ``rate < target * 5``. Mirrors ``test_bloom_filter.py``'s
+    ``test_false_positive_rate_bounded``. Deterministic because the filter's
+    internal eviction RNG is seeded with a fixed value and the probe keys are
+    generated from a fixed seed.
+    """
+    capacity = 2000
+    target = 0.05
+    # Fixed internal RNG so eviction-slot selection is reproducible.
+    flt = CuckooMembershipFilter(capacity=capacity, error_rate=target)
+    flt._rng = random.Random(424242)  # noqa: SLF001 — pin eviction jitter
+    for i in range(capacity):
+      flt.add(f"seen-{i}".encode())
+    # Confirm no false negatives first (the never-FN guarantee).
+    for i in range(capacity):
+      assert f"seen-{i}".encode() in flt
+    rng = random.Random(987654321)  # fixed probe seed → reproducible FP sample
+    probes = 4000
+    fp = sum(
+      1 for _ in range(probes) if f"unseen-{rng.randrange(1 << 60)}".encode() in flt
+    )
+    rate = fp / probes
+    # 5x target margin: proves low FP without flakiness; cuckoo's theoretical
+    # FP at target load is ~2b·error_rate, well under this bound.
+    assert rate < target * 5, f"cuckoo FP rate {rate:.3f} exceeded {target * 5}"

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from scrapy_extension.queue.strategies.factory import (
   QueueStrategyType,
@@ -100,3 +102,80 @@ class TestFactoryRoundRobin:
   def test_invalid_strategy_string(self) -> None:
     with pytest.raises(ValueError, match="not a valid QueueStrategyType"):
       QueueStrategyType("bogus")
+
+
+class TestRoundRobinFairnessProperty:
+  """Hypothesis property tests for the round-robin "no starvation" invariant.
+
+  Pins the claim in ``round_robin.py``'s docstring: "every non-empty source
+  is served before any source is served twice." Stated as an output property:
+  in the drained sequence, for every prefix, no source's count exceeds every
+  other non-empty source's count by more than 1. Equivalently — no source is
+  served ``k+1`` times before every other non-empty source has been served
+  ``k`` times. 100 hypothesis-generated cases.
+  """
+
+  @given(
+    counts=st.lists(
+      st.integers(min_value=0, max_value=8),
+      min_size=1,
+      max_size=6,
+    )
+  )
+  @settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+  )
+  def test_no_source_starvation_property(self, counts: list[int]) -> None:
+    """Full drain interleaves sources fairly — no source outpaces another by >1.
+
+    Given N sources with arbitrary item counts (some possibly zero), a full
+    drain yields an output order where, at every prefix, the max times any
+    source has been served is at most one more than the min over sources that
+    still have remaining items (the non-empty ones at that point in the drain).
+    """
+    strategy = RoundRobinQueueStrategy(object())
+    n_sources = len(counts)
+    # Seed each source with its allotted count of unique items. Items are
+    # source-tagged so we can attribute each popped byte back to its source.
+    expected_total = sum(counts)
+    for src_idx in range(n_sources):
+      source = f"src{src_idx}"
+      for i in range(counts[src_idx]):
+        # Encode source index into the item so we can recover it after pop.
+        strategy.push("q", f"{src_idx}:{i}".encode(), source=source)
+
+    drained: list[int] = []
+    while len(drained) < expected_total:
+      item = strategy.pop("q")
+      assert item is not None, "pop returned None before all items drained"
+      src_idx_str, _ = item.decode().split(":", 1)
+      drained.append(int(src_idx_str))
+    # Final pop must report empty.
+    assert strategy.pop("q") is None
+
+    # The fairness invariant: track per-source served counts over the drain
+    # order. After each pop, the served-count of the just-served source must
+    # not exceed the served-count of any source that still has pending items
+    # by more than 1. (Pending = total allotted minus served so far.)
+    served = [0] * n_sources
+    for served_src in drained:
+      served[served_src] += 1
+      # For every OTHER source that still has pending items, its served count
+      # must be >= served[served_src] - 1 (i.e. our just-served source did not
+      # jump ahead by more than one full round).
+      for other in range(n_sources):
+        if other == served_src:
+          continue
+        pending_other = counts[other] - served[other]
+        if pending_other > 0:
+          assert served[served_src] - served[other] <= 1, (
+            f"starvation: src{served_src} served {served[served_src]}x while "
+            f"src{other} (still pending) served only {served[other]}x "
+            f"(drain prefix {drained[:sum(served) + 0]})"
+          )
+
+    # Sanity: every source was served exactly its allotted count.
+    for src_idx in range(n_sources):
+      assert served[src_idx] == counts[src_idx]

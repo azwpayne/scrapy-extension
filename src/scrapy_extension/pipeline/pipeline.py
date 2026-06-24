@@ -13,6 +13,13 @@ from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import SerializationError
+from scrapy_extension.storage.strategies import (
+  StorageStrategy,
+  create_storage_strategy,
+)
+from scrapy_extension.storage.strategies.passthrough import (
+  PassthroughStorageStrategy,
+)
 
 if TYPE_CHECKING:
   from scrapy import Item, Spider
@@ -37,6 +44,9 @@ class BackendPipeline:
       key_prefix: Prefix for stored item keys.
       ttl: Optional TTL in seconds for items.
       serializer: Serializer for item encoding.
+      storage_strategy: Strategy layer governing how items reach the backend
+          (passthrough default — byte-identical to pre-strategy behavior;
+          ``batched`` buffers + flushes on threshold/close).
   """
 
   def __init__(
@@ -45,6 +55,7 @@ class BackendPipeline:
     key_prefix: str = "items",
     ttl: int | None = None,
     max_item_bytes: int = DEFAULT_PIPELINE_MAX_ITEM_BYTES,
+    storage_strategy: StorageStrategy | None = None,
   ) -> None:
     """Initialize the pipeline.
 
@@ -56,11 +67,18 @@ class BackendPipeline:
             item. Oversize payloads raise ``SerializationError`` at store time
             (D2 — DoS guard against capped storage backends like Memcached
             1 MB, DynamoDB 400 KB).
+        storage_strategy: Persistence strategy. ``None`` defaults to
+            :class:`PassthroughStorageStrategy` (byte-identical to the
+            pre-strategy store call). Selected via ``SCRAPY_STORAGE_STRATEGY``
+            in :meth:`from_settings`.
     """
     self.connection_manager = connection_manager
     self.key_prefix = key_prefix
     self.ttl = ttl
     self.max_item_bytes = max_item_bytes
+    self.storage_strategy: StorageStrategy = (
+      storage_strategy if storage_strategy is not None else PassthroughStorageStrategy()
+    )
     self._storage_supported: bool | None = None
 
   @cached_property
@@ -101,6 +119,8 @@ class BackendPipeline:
       backend_type=backend_type,
       settings=backend_settings,
     )
+    storage_strategy_name = settings.get("SCRAPY_STORAGE_STRATEGY", "passthrough")
+    storage_strategy = create_storage_strategy(storage_strategy_name)
     return cls(
       connection_manager=manager,
       key_prefix=settings.get("SCRAPY_PIPELINE_KEY_PREFIX", "items"),
@@ -108,6 +128,7 @@ class BackendPipeline:
       max_item_bytes=settings.getint(
         "SCRAPY_PIPELINE_MAX_ITEM_BYTES", DEFAULT_PIPELINE_MAX_ITEM_BYTES
       ),
+      storage_strategy=storage_strategy,
     )
 
   @classmethod
@@ -147,10 +168,14 @@ class BackendPipeline:
   def close_spider(self, spider: Spider) -> None:
     """Called when a spider closes.
 
+    Flushes any buffered items via the storage strategy before shutting the
+    connection manager down (so batched strategies drain on spider close).
+
     Args:
         spider: The spider instance.
     """
     logger.info("Pipeline closed for spider %s", spider.name)
+    self.storage_strategy.close()
     self.connection_manager.close()
 
   def process_item(self, item: Item, spider: Spider) -> Item:
@@ -248,10 +273,19 @@ class BackendPipeline:
     return self._serializer.serialize(item_dict)
 
   def _store_item(self, key: str, data: bytes) -> None:
-    """Store serialized item.
+    """Store serialized item via the configured storage strategy.
+
+    The default :class:`PassthroughStorageStrategy` delegates straight to
+    ``storage_backend.store(key, data, ttl=self.ttl)`` — byte-identical to the
+    pre-strategy behavior. Batched strategies buffer the item and flush later.
 
     Args:
         key: Storage key.
         data: Serialized item data.
     """
-    self.connection_manager.get_storage_backend().store(key, data, ttl=self.ttl)
+    self.storage_strategy.store(
+      self.connection_manager.get_storage_backend(),
+      key,
+      data,
+      ttl=self.ttl,
+    )

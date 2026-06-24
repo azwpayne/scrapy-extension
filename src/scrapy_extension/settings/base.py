@@ -71,3 +71,12 @@ class Settings(BaseSettings):
       "Memcached 1 MB, DynamoDB 400 KB)."
     ),
   )
+  storage_strategy: Literal["passthrough", "batched"] = Field(
+    default="passthrough",
+    description=(
+      "Item-persistence strategy for BackendPipeline. ``passthrough`` (default) "
+      "writes each item straight to the backend — byte-identical to the "
+      "pre-strategy behavior. ``batched`` buffers items and flushes in bulk at "
+      "a threshold / on spider close."
+    ),
+  )

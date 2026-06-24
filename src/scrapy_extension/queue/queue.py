@@ -16,6 +16,8 @@ from scrapy.utils.request import request_from_dict
 
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import SerializationError
+from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
+from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.queue.strategies.base import QueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 
@@ -52,6 +54,7 @@ class BackendQueue:
     spider: Spider | None = None,
     queue_strategy: QueueStrategy | None = None,
     max_item_bytes: int = DEFAULT_QUEUE_MAX_ITEM_BYTES,
+    monitor: Monitor | None = None,
   ) -> None:
     """Initialize the backend queue.
 
@@ -66,6 +69,12 @@ class BackendQueue:
         max_item_bytes: Maximum serialized bytes permitted for a single queued
             request. Oversize payloads raise ``SerializationError`` at push
             time (D2 — DoS guard against capped storage backends).
+        monitor: Optional observability monitor. When ``None`` (default),
+            resolved default-on: if ``spider.crawler.stats`` is reachable a
+            :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` is wired;
+            otherwise a :class:`~scrapy_extension.monitor.NullMonitor` (no-op,
+            no crash). Emitted hooks are additive — existing stat keys are
+            unchanged.
     """
     self.connection_manager = connection_manager
     self.queue_name = queue_name
@@ -76,6 +85,7 @@ class BackendQueue:
       if queue_strategy is not None
       else PassthroughQueueStrategy(connection_manager)
     )
+    self._monitor: Monitor = monitor if monitor is not None else self._resolve_monitor(spider)
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -151,6 +161,7 @@ class BackendQueue:
     self._strategy.push(
       self.queue_name, data, priority=priority, delay=delay, source=source
     )
+    self._monitor.on_push(self.queue_name, priority)
 
   def pop(self, timeout: float = 0.0) -> Request | None:
     """Pop a request from the queue.
@@ -165,6 +176,19 @@ class BackendQueue:
         SerializationError: If the request cannot be deserialized.
     """
     data = self._strategy.pop(self.queue_name, timeout)
+    # Emit on every pop call — ``queue/pop_count`` is the consumer-liveness
+    # signal (pop attempts per second), independent of whether an item was
+    # returned. A worker popping an empty queue is itself operability signal.
+    self._monitor.on_pop(self.queue_name)
+    # Sample depth after each pop — this is the backpressure signal (architect's
+    # #1 operability gap). Cheaper than a periodic timer and aligns the sample
+    # with an event that already touched the backend. Guarded so a depth-sampling
+    # failure can never break a successful pop.
+    try:
+      self._monitor.on_queue_depth(self.queue_name, self._strategy.queue_len(self.queue_name))
+    except Exception:  # noqa: BLE001
+      logger.debug("monitor.on_queue_depth raised; ignored", exc_info=True)
+
     if data is None:
       return None
 
@@ -278,6 +302,33 @@ class BackendQueue:
     stats = getattr(crawler, "stats", None) if crawler is not None else None
     if stats is not None:
       stats.inc_value(stat_name)
+
+  @staticmethod
+  def _resolve_monitor(spider: Spider | None) -> Monitor:
+    """Default-on monitor resolution from a spider.
+
+    When a spider is present and exposes ``crawler.stats``, wire a
+    :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` so observability is
+    on without an explicit ``monitor=`` kwarg. Otherwise (no spider, no
+    crawler, or no stats) return a :class:`~scrapy_extension.monitor.NullMonitor`
+    — the no-op default that never crashes a hook call.
+
+    The ``getattr`` chain mirrors :meth:`_inc_stat`: the queue is often built
+    without a spider (unit tests, ad-hoc use), and legacy spiders may not
+    expose ``crawler``. Default-on where possible, safe everywhere else.
+
+    Args:
+        spider: Optional spider to resolve a stats collector from.
+
+    Returns:
+        A ``ScrapyStatsMonitor`` if ``spider.crawler.stats`` is reachable,
+        else a ``NullMonitor``.
+    """
+    crawler = getattr(spider, "crawler", None) if spider is not None else None
+    stats = getattr(crawler, "stats", None) if crawler is not None else None
+    if stats is not None:
+      return ScrapyStatsMonitor(stats)
+    return NullMonitor()
 
   def close(self) -> None:
     """Close the queue, delegating to the queue strategy's lifecycle hook.
