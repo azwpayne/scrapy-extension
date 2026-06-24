@@ -21,6 +21,7 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
+from scrapy_extension.backends.circuit_breaker import CircuitBreaker
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 
 if TYPE_CHECKING:
@@ -286,6 +287,13 @@ class ConnectionManager:
     # a slow backend don't block threads that merely want to READ _backend.
     self._connecting: bool = False
     self._connected_event = threading.Event()
+    # Circuit-breaker holder. Lazily constructed on first
+    # ``get_*_backend()`` call from the env-loaded ``Settings``
+    # (``SCRAPY_CIRCUIT_BREAKER_ENABLED``). ``None`` while disabled — which
+    # is the default, so the default path returns the raw backend with zero
+    # overhead and byte-identical behavior.
+    self._breaker: CircuitBreaker | None = None
+    self._breaker_configured: bool = False
 
   @classmethod
   def get_manager(
@@ -595,8 +603,56 @@ class ConnectionManager:
       return False
     return self._backend.is_connected()
 
+  def _get_breaker(self) -> CircuitBreaker | None:
+    """Lazily resolve the per-manager circuit breaker from env settings.
+
+    Reads the breaker config once (``SCRAPY_CIRCUIT_BREAKER_ENABLED`` +
+    threshold + reset-timeout) and caches the result on the instance:
+
+    - When disabled (the default), ``_breaker`` is set to ``None`` and the
+      ``get_*_backend()`` methods return the raw backend unchanged —
+      byte-identical to pre-breaker behavior, zero proxy overhead.
+    - When enabled, a single :class:`CircuitBreaker` is constructed and
+      shared by every wrapped interface returned from this manager, so a
+      queue+set+storage on the same backend share one failure signal.
+
+    The Settings object is constructed lazily inside the lock so import-time
+    side effects (pydantic env scan) are deferred to first use — important
+    because this module is imported eagerly via ``backends/__init__`` and the
+    env may not be fully populated at import time.
+
+    Returns:
+        The manager's breaker, or ``None`` when the feature is disabled.
+    """
+    if self._breaker_configured:
+      return self._breaker
+    with self._lock:
+      if self._breaker_configured:
+        return self._breaker
+      # Imported lazily to avoid a settings-module import cycle at module
+      # load time and to keep the breaker config read deferred to first use.
+      from scrapy_extension.settings import Settings
+
+      settings = Settings()
+      if settings.circuit_breaker_enabled:
+        self._breaker = CircuitBreaker(
+          name=f"{self.backend_type.value}-backend",
+          failure_threshold=settings.circuit_breaker_failure_threshold,
+          reset_timeout=settings.circuit_breaker_reset_timeout,
+        )
+      else:
+        self._breaker = None
+      self._breaker_configured = True
+      return self._breaker
+
   def get_queue_backend(self) -> QueueBackend:
     """Get the queue backend interface.
+
+    When the circuit breaker is enabled, the returned backend's hot-path
+    ops (``push`` / ``pop`` / ``queue_len``) are wrapped under the breaker;
+    non-network methods (``clear_queue``, ``ack``, ``nack``,
+    ``is_connected``) forward unchanged. When disabled (default) the raw
+    backend is returned byte-identically.
 
     Returns:
         The QueueBackend interface of the backend.
@@ -605,10 +661,20 @@ class ConnectionManager:
     if not isinstance(backend, QueueBackend):
       msg = f"Backend {backend.__class__.__name__} does not support queue operations"
       raise NotImplementedError(msg)
-    return backend
+    breaker = self._get_breaker()
+    if breaker is None:
+      return backend
+    from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
+
+    return wrap_queue_backend(backend, breaker)
 
   def get_set_backend(self) -> SetBackend:
     """Get the set backend interface.
+
+    When the circuit breaker is enabled, the returned backend's hot-path
+    ops (``add`` / ``contains`` / ``remove``) are wrapped under the breaker;
+    non-network methods forward unchanged. When disabled (default) the raw
+    backend is returned byte-identically.
 
     Returns:
         The SetBackend interface of the backend.
@@ -617,10 +683,21 @@ class ConnectionManager:
     if not isinstance(backend, SetBackend):
       msg = f"Backend {backend.__class__.__name__} does not support set operations"
       raise NotImplementedError(msg)
-    return backend
+    breaker = self._get_breaker()
+    if breaker is None:
+      return backend
+    from scrapy_extension.backends.circuit_breaker import wrap_set_backend
+
+    return wrap_set_backend(backend, breaker)
 
   def get_storage_backend(self) -> StorageBackend:
     """Get the storage backend interface.
+
+    When the circuit breaker is enabled, the returned backend's hot-path
+    ops (``store`` / ``retrieve`` / ``delete``) are wrapped under the
+    breaker; non-network methods (``exists``, ``ttl``, ``clear_storage``)
+    forward unchanged. When disabled (default) the raw backend is returned
+    byte-identically.
 
     Returns:
         The StorageBackend interface of the backend.
@@ -629,4 +706,9 @@ class ConnectionManager:
     if not isinstance(backend, StorageBackend):
       msg = f"Backend {backend.__class__.__name__} does not support storage operations"
       raise NotImplementedError(msg)
-    return backend
+    breaker = self._get_breaker()
+    if breaker is None:
+      return backend
+    from scrapy_extension.backends.circuit_breaker import wrap_storage_backend
+
+    return wrap_storage_backend(backend, breaker)

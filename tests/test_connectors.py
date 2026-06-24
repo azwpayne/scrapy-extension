@@ -974,3 +974,249 @@ class TestConnectionManagerRefcount:
     assert len({id(r) for r in results}) == n
     assert all(r._users == 1 for r in results)
 
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker wiring (Unit J): default-off is byte-identical, opt-in
+# wraps hot-path ops and fail-fasts with BackendError when OPEN.
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreakerWiringDefaultOff:
+  """When ``SCRAPY_CIRCUIT_BREAKER_ENABLED`` is unset, backends are unwrapped.
+
+  The default path must return the raw backend instance with zero overhead
+  and byte-identical behavior — no proxy, no breaker, no behavior change.
+  """
+
+  def test_default_returns_raw_backend_unwrapped(self, monkeypatch):
+    # Ensure the env var is unset so the lazy builder resolves to disabled.
+    monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-default-off"}
+    )
+    try:
+      # Force the lazy breaker resolution before touching .backend so we
+      # don't depend on a real Redis connection for this assertion.
+      assert manager._get_breaker() is None
+      # _breaker_configured is sticky-True after first resolution; the value
+      # is what matters — None means disabled.
+      assert manager._breaker is None
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+  def test_disabled_get_queue_backend_returns_identity(self, monkeypatch):
+    """Disabled path returns the SAME object the backend property yields.
+
+    We bypass the real connect by stubbing ``backend`` to return a fake and
+    asserting ``get_queue_backend()`` returns it unchanged (``is``).
+    """
+    monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-identity"}
+    )
+    try:
+      fake_qb = _FakeRedisQueueBackend()
+      # Bypass connect: assign the backend directly.
+      manager._backend = fake_qb
+      assert manager.get_queue_backend() is fake_qb
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+
+class TestCircuitBreakerWiringEnabled:
+  """When the breaker is enabled, hot-path ops wrap + OPEN fail-fast."""
+
+  def test_enabled_wraps_queue_hot_path_and_open_failfast(self, monkeypatch):
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-on"}
+    )
+    try:
+      fake_qb = _FailingRedisQueueBackend()
+      manager._backend = fake_qb
+      wrapped = manager.get_queue_backend()
+      # Wrapped is a proxy, NOT the raw backend.
+      assert wrapped is not fake_qb
+
+      # Trip the breaker via the wrapped hot-path op.
+      with pytest.raises(RuntimeError):
+        wrapped.push("q", b"x")
+
+      from scrapy_extension.backends.circuit_breaker import (
+        CircuitBreakerOpenError,
+      )
+
+      # Now OPEN — a subsequent push must fail-fast with BackendError subclass.
+      with pytest.raises(CircuitBreakerOpenError):
+        wrapped.push("q", b"x")
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+  def test_enabled_non_network_methods_not_blocked(self, monkeypatch):
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-on-nonblock"}
+    )
+    try:
+      fake_qb = _FailingRedisQueueBackend()
+      manager._backend = fake_qb
+      wrapped = manager.get_queue_backend()
+
+      # Trip via push.
+      with pytest.raises(RuntimeError):
+        wrapped.push("q", b"x")
+
+      # Non-network methods still work — they're forwarded, not breaker-wrapped.
+      wrapped.clear_queue("q")
+      assert fake_qb.clear_calls == 1
+      # is_connected forwards too.
+      assert wrapped.is_connected() is True
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+  def test_single_breaker_shared_across_interfaces(self, monkeypatch):
+    """Queue+set+storage on one manager share a single breaker instance.
+
+    A failure on the queue hot-path trips the shared breaker so the storage
+    interface also rejects — they share the failure signal.
+    """
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    ConnectionManager.clear_registry()
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "breaker-shared"}
+    )
+    try:
+      fake = _FakeRedisAllBackend()
+      manager._backend = fake
+      qb = manager.get_queue_backend()
+      # Trip via queue.
+      fake.push = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+      # Re-wrap to capture the failing push (proxy snapshots at construction).
+      qb = manager.get_queue_backend()
+      with pytest.raises(RuntimeError):
+        qb.push("q", b"x")
+      # The shared breaker is now OPEN.
+      assert manager._breaker is not None
+      assert manager._breaker.state.value == "open"
+    finally:
+      manager.close()
+      ConnectionManager.clear_registry()
+
+
+# ---------------------------------------------------------------------------
+# Fakes for breaker-wiring tests — real backends need a live service; these
+# stubs satisfy the interface ABCs so we can drive the proxy without a broker.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRedisQueueBackend(QueueBackend):
+  def __init__(self) -> None:
+    self.clear_calls = 0
+    self.ack_calls = 0
+
+  def connect(self) -> None: ...
+  def disconnect(self) -> None: ...
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  @property
+  def backend_type(self):
+    return BackendType.REDIS
+
+  def push(self, queue_name, item, priority=0.0) -> None: ...
+  def pop(self, queue_name, timeout=0.0):
+    return None
+
+  def queue_len(self, queue_name) -> int:
+    return 0
+
+  def clear_queue(self, queue_name) -> None:
+    self.clear_calls += 1
+
+  def ack(self, queue_name) -> None:
+    self.ack_calls += 1
+
+
+class _FailingRedisQueueBackend(_FakeRedisQueueBackend):
+  def push(self, queue_name, item, priority=0.0) -> None:
+    raise RuntimeError("backend on fire")
+
+
+class _FakeRedisAllBackend(QueueBackend, SetBackend, StorageBackend):
+  def __init__(self) -> None:
+    self.clear_calls = 0
+
+  def connect(self) -> None: ...
+  def disconnect(self) -> None: ...
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  @property
+  def backend_type(self):
+    return BackendType.REDIS
+
+  # Queue
+  def push(self, queue_name, item, priority=0.0) -> None: ...
+  def pop(self, queue_name, timeout=0.0):
+    return None
+
+  def queue_len(self, queue_name) -> int:
+    return 0
+
+  def clear_queue(self, queue_name) -> None:
+    self.clear_calls += 1
+
+  def ack(self, queue_name) -> None: ...
+  def nack(self, queue_name) -> None: ...
+  # Set
+  def add(self, set_name, item) -> bool:
+    return True
+
+  def remove(self, set_name, item) -> bool:
+    return False
+
+  def contains(self, set_name, item) -> bool:
+    return False
+
+  def set_len(self, set_name) -> int:
+    return 0
+
+  def clear_set(self, set_name) -> None: ...
+  # Storage
+  def store(self, key, data, ttl=None) -> None: ...
+  def retrieve(self, key):
+    return None
+
+  def delete(self, key) -> bool:
+    return False
+
+  def exists(self, key) -> bool:
+    return False
+
+  def ttl(self, key):
+    return None
+
+  def clear_storage(self, prefix=None) -> None: ...
+

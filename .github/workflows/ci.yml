@@ -11,8 +11,8 @@ permissions:
 jobs:
   # Fast unit job — runs on every push/PR. No external services required.
   # Integration tests (tests/integration/, marker `integration`) are
-  # deselected here; they need live backends and are run separately (see
-  # the integration-tests job below, disabled by default).
+  # deselected here; they need live backends and are run in the parallel
+  # integration-tests job below.
   unit-tests:
     runs-on: ubuntu-latest
     strategy:
@@ -34,50 +34,108 @@ jobs:
       - name: Unit tests (integration deselected)
         run: uv run pytest -m "not integration" --tb=short -q
 
-  # Integration job — DISABLED by default (commented out). Wiring it fully is
-  # left to the operator because (a) it needs 5 service containers, (b) the
-  # SCRAPY_TEST_* env vars must point at them, and (c) RocketMQ additionally
-  # needs the native librocketmq library, which isn't in standard GitHub
-  # images. To enable: uncomment, add `services:` blocks for redis/mongodb/
-  # elasticsearch/rabbitmq/kafka (mirror the standard GitHub Actions service
-  # patterns), wire the env vars to `localhost:<port>`, and for RocketMQ use a
-  # custom image that ships librocketmq (or exclude it). See R58 in
-  # docs/code-review-2026-06-15.md.
+  # Integration job — runs the 27 tests under tests/integration/ against
+  # containerized backends. Runs in parallel with unit-tests so it never
+  # blocks the fast unit lane.
   #
-  # integration-tests:
-  #   runs-on: ubuntu-latest
-  #   services:
-  #     redis:
-  #       image: redis:7
-  #       ports: ["6379:6379"]
-  #     mongodb:
-  #       image: mongo:7
-  #       ports: ["27017:27017"]
-  #     elasticsearch:
-  #       image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
-  #       env:
-  #         discovery.type: single-node
-  #         xpack.security.enabled: "false"
-  #       ports: ["9200:9200"]
-  #     rabbitmq:
-  #       image: rabbitmq:3
-  #       ports: ["5672:5672"]
-  #     kafka:
-  #       image: bitnami/kafka:3.7
-  #       ports: ["9092:9092"]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: "3.12"
-  #     - run: pip install uv
-  #     - run: uv sync --group test --all-extras
-  #     - name: Wait for services to be healthy
-  #       run: sleep 30
-  #     - env:
-  #         SCRAPY_TEST_REDIS_URL: redis://localhost:6379/0
-  #         SCRAPY_TEST_MONGODB_URI: mongodb://localhost:27017
-  #         SCRAPY_TEST_ES_HOSTS: http://localhost:9200
-  #         SCRAPY_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
-  #         SCRAPY_TEST_KAFKA_BOOTSTRAP: localhost:9092
-  #       run: uv run pytest tests/integration -m integration --tb=short -q
+  # Service healthchecks: redis/mongodb/elasticsearch/rabbitmq all expose
+  # a real healthcheck command. Kafka has no trivial CLI healthcheck in the
+  # bitnami image, so we fall back to a TCP port probe in a wait step.
+  #
+  # RocketMQ is intentionally EXCLUDED (continue-on-error + --ignore in the
+  # pytest invocation): its backend imports `rocketmq-client-python`, which
+  # requires the native `librocketmq` shared library that isn't installable
+  # on the stock GitHub runner. The test file's own skip guard fires only
+  # when SCRAPY_TEST_ROCKETMQ_NAMESRV is *unset* — so we deliberately leave
+  # it unset and also --ignore the file to keep collection clean. R58.
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -q 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -sf localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmqctl status"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      kafka:
+        image: bitnami/kafka:3.7
+        env:
+          KAFKA_CFG_NODE_ID: "1"
+          KAFKA_CFG_PROCESS_ROLES: controller,broker
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+        ports:
+          - 9092:9092
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Sync dependencies (test group + all backend extras)
+        run: uv sync --group test --all-extras
+      - name: Wait for Kafka port (no CLI healthcheck in bitnami image)
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/9092) >/dev/null 2>&1; then
+              echo "Kafka broker accepting connections on 9092"
+              exit 0
+            fi
+            echo "kafka not ready ($i/30)"; sleep 5
+          done
+          echo "Kafka did not become ready in time" >&2
+          exit 1
+      - name: Run integration tests
+        env:
+          SCRAPY_TEST_REDIS_URL: redis://localhost:6379/0
+          SCRAPY_TEST_MONGODB_URI: mongodb://localhost:27017
+          SCRAPY_TEST_ES_HOSTS: http://localhost:9200
+          SCRAPY_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+          SCRAPY_TEST_KAFKA_BOOTSTRAP: localhost:9092
+          # SCRAPY_TEST_ROCKETMQ_NAMESRV deliberately UNSET — see job header.
+        run: >
+          uv run pytest tests/integration
+          --ignore=tests/integration/test_rocketmq_integration.py
+          -m integration --tb=short -q

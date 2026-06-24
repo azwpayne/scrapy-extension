@@ -80,3 +80,30 @@ class Settings(BaseSettings):
       "a threshold / on spider close."
     ),
   )
+  circuit_breaker_enabled: bool = Field(
+    default=False,
+    description=(
+      "Opt-in circuit breaker for hot-path backend ops (push/pop/add/contains/"
+      "store/retrieve/delete). When False (default) the ConnectionManager returns "
+      "raw backends unchanged — byte-identical to pre-breaker behavior, zero "
+      "overhead. When True, each returned backend is wrapped so a degraded "
+      "backend trips the breaker (fail-fast BackendError) instead of silently "
+      "dropping requests forever."
+    ),
+  )
+  circuit_breaker_failure_threshold: int = Field(
+    default=5,
+    ge=1,
+    description=(
+      "Consecutive failures required to trip a CLOSED breaker to OPEN. "
+      "Effective only when ``circuit_breaker_enabled`` is True."
+    ),
+  )
+  circuit_breaker_reset_timeout: float = Field(
+    default=30.0,
+    ge=0,
+    description=(
+      "Seconds an OPEN breaker waits before allowing a HALF_OPEN probe call. "
+      "Effective only when ``circuit_breaker_enabled`` is True."
+    ),
+  )
