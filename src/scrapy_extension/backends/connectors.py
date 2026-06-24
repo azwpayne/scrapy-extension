@@ -7,6 +7,7 @@ for all backend types.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import logging
 import random
@@ -50,6 +51,82 @@ STORAGE_CAPABLE_BACKENDS: set[BackendType] = {
   BackendType.MEMCACHED,
   BackendType.DYNAMODB,
 }
+
+# Dispatch table mapping each BackendType to its lazy import paths
+# (backend_class_path, settings_class_path). Imports happen on demand via
+# importlib.import_module + getattr, which mirrors the original per-arm
+# ``from scrapy_extension.backends.<x> import XBackend`` semantics — keeping
+# the import path stable so tests that patch the canonical module attribute
+# (e.g. ``mocker.patch("scrapy_extension.backends.redis.RedisBackend")``)
+# continue to intercept construction.
+_BACKEND_FACTORIES: dict[BackendType, tuple[str, str]] = {
+  BackendType.REDIS: (
+    "scrapy_extension.backends.redis.RedisBackend",
+    "scrapy_extension.settings.RedisSettings",
+  ),
+  BackendType.MONGODB: (
+    "scrapy_extension.backends.mongodb.MongoDBBackend",
+    "scrapy_extension.settings.MongoDBSettings",
+  ),
+  BackendType.KAFKA: (
+    "scrapy_extension.backends.kafka.KafkaBackend",
+    "scrapy_extension.settings.KafkaSettings",
+  ),
+  BackendType.RABBITMQ: (
+    "scrapy_extension.backends.rabbitmq.RabbitMQBackend",
+    "scrapy_extension.settings.RabbitMQSettings",
+  ),
+  BackendType.ELASTICSEARCH: (
+    "scrapy_extension.backends.elasticsearch.ElasticSearchBackend",
+    "scrapy_extension.settings.ElasticSearchSettings",
+  ),
+  BackendType.ROCKETMQ: (
+    "scrapy_extension.backends.rocketmq.RocketMQBackend",
+    "scrapy_extension.settings.RocketMQSettings",
+  ),
+  BackendType.PULSAR: (
+    "scrapy_extension.backends.pulsar.PulsarBackend",
+    "scrapy_extension.settings.PulsarSettings",
+  ),
+  BackendType.SQS: (
+    "scrapy_extension.backends.sqs.SqsBackend",
+    "scrapy_extension.settings.SqsSettings",
+  ),
+  BackendType.MEMCACHED: (
+    "scrapy_extension.backends.memcached.MemcachedBackend",
+    "scrapy_extension.settings.MemcachedSettings",
+  ),
+  BackendType.DYNAMODB: (
+    "scrapy_extension.backends.dynamodb.DynamoDBBackend",
+    "scrapy_extension.settings.DynamoDBSettings",
+  ),
+}
+
+
+def _load_object(dotted_path: str) -> Any:
+  """Lazily import and return the attribute at ``dotted_path``.
+
+  Mirrors ``from <module> import <name>`` so tests that patch the canonical
+  module attribute (e.g. ``scrapy_extension.backends.redis.RedisBackend``)
+  still intercept the resolved class.
+
+  Args:
+      dotted_path: Fully-qualified ``module.submodule.Attr`` path.
+
+  Returns:
+      The resolved attribute.
+
+  Raises:
+      ValueError: If the path has no attribute separator.
+      ImportError: If the module cannot be imported.
+      AttributeError: If the attribute is missing from the module.
+  """
+  module_path, _, name = dotted_path.rpartition(".")
+  if not module_path:
+    msg = f"Invalid dotted path: {dotted_path!r}"
+    raise ValueError(msg)
+  module = importlib.import_module(module_path)
+  return getattr(module, name)
 
 
 def resolve_backend_config(
@@ -198,47 +275,28 @@ class ConnectionManager:
   def _create_backend(self) -> Backend:
     """Create a backend instance based on type.
 
+    Dispatches via the module-level ``_BACKEND_FACTORIES`` table to keep
+    this method's cyclomatic complexity flat regardless of how many backends
+    exist. Each entry's class path is resolved lazily (via
+    ``importlib.import_module`` + ``getattr``), preserving the original
+    per-arm lazy-import semantics so optional backend dependencies stay
+    loaded-on-demand and tests that patch the canonical module attribute
+    still intercept construction.
+
     Returns:
         A new backend instance.
 
     Raises:
         ValueError: If the backend type is not supported.
     """
-    match self.backend_type:
-      case BackendType.REDIS:
-        from scrapy_extension.backends.redis import RedisBackend
-        from scrapy_extension.settings import RedisSettings
-
-        config = RedisSettings(**self.settings)
-        return RedisBackend(config)
-      case BackendType.MONGODB:
-        from scrapy_extension.backends.mongodb import MongoDBBackend
-        from scrapy_extension.settings import MongoDBSettings
-
-        return MongoDBBackend(MongoDBSettings(**self.settings))
-      case BackendType.KAFKA:
-        from scrapy_extension.backends.kafka import KafkaBackend
-        from scrapy_extension.settings import KafkaSettings
-
-        return KafkaBackend(KafkaSettings(**self.settings))
-      case BackendType.RABBITMQ:
-        from scrapy_extension.backends.rabbitmq import RabbitMQBackend
-        from scrapy_extension.settings import RabbitMQSettings
-
-        return RabbitMQBackend(RabbitMQSettings(**self.settings))
-      case BackendType.ELASTICSEARCH:
-        from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-        from scrapy_extension.settings import ElasticSearchSettings
-
-        return ElasticSearchBackend(ElasticSearchSettings(**self.settings))
-      case BackendType.ROCKETMQ:
-        from scrapy_extension.backends.rocketmq import RocketMQBackend
-        from scrapy_extension.settings import RocketMQSettings
-
-        return RocketMQBackend(RocketMQSettings(**self.settings))
-      case _:
-        msg = f"Unsupported backend type: {self.backend_type}"
-        raise ValueError(msg)
+    try:
+      backend_path, settings_path = _BACKEND_FACTORIES[self.backend_type]
+    except KeyError:
+      msg = f"Unsupported backend type: {self.backend_type}"
+      raise ValueError(msg) from None
+    backend_cls = _load_object(backend_path)
+    settings_cls = _load_object(settings_path)
+    return backend_cls(settings_cls(**self.settings))
 
   def connect(self) -> None:
     """Establish connection with retry logic.
@@ -272,7 +330,10 @@ class ConnectionManager:
           # outage (e.g., Redis failover). See AWS Architecture Blog:
           # "Exponential Backoff and Jitter".
           delay = retry_delay * (2**attempt)
-          time.sleep(random.uniform(0, delay))
+          # nosec B311: random.uniform is intentional full-jitter backoff,
+          # not a cryptographic primitive. Switching to secrets would remove
+          # the bounded-range API we rely on without improving security.
+          time.sleep(random.uniform(0, delay))  # nosec B311 - jitter, not cryptographic
       else:
         logger.debug("Connected to %s", self.backend_type.value)
         return
@@ -378,7 +439,15 @@ class ConnectionManager:
       with self._lock:
         if self._backend is None:
           self.connect()
-    assert self._backend is not None
+    if self._backend is None:
+      # Defensive: connect() should either set _backend (success) or raise.
+      # If we land here, connect() returned without connecting and without
+      # raising — that is a contract violation, not a user input problem.
+      # The explicit guard (rather than ``assert``) keeps the check live
+      # under ``python -O`` and produces a clear, typed error instead of a
+      # bare AssertionError.
+      msg = "connect() did not produce a backend"
+      raise BackendConnectionError(msg, backend_type=self.backend_type.value)
     return self._backend
 
   def is_connected(self) -> bool:

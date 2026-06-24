@@ -86,6 +86,9 @@ class RocketMQBackend(Backend, QueueBackend):
         endpoint=Endpoint(self.config.namesrv_address),
         credentials=credentials,
       )
+      if self._producer is None:
+        msg = "RocketMQBackend producer initialization returned None"
+        raise BackendConnectionError(msg, backend_type="rocketmq")
       self._producer.start()
 
       # Create simple consumer for pop operations
@@ -95,6 +98,9 @@ class RocketMQBackend(Backend, QueueBackend):
         credentials=credentials,
         request_timeout_ms=self.config.send_timeout,
       )
+      if self._consumer is None:
+        msg = "RocketMQBackend consumer initialization returned None"
+        raise BackendConnectionError(msg, backend_type="rocketmq")
       self._consumer.start()
 
       logger.debug(
@@ -209,6 +215,9 @@ class RocketMQBackend(Backend, QueueBackend):
       msg = Message(topic_name)
       msg.set_keys(str(priority))  # Use priority as key for ordering
       msg.set_body(item)
+      if self._producer is None:
+        error = "RocketMQBackend not connected: producer is None"
+        raise QueueError(error)
       self._producer.send(msg)
     except OSError as e:
       # Network-level send failures
@@ -239,6 +248,9 @@ class RocketMQBackend(Backend, QueueBackend):
       topic_name = self._get_topic_name(queue_name)
       self._ensure_subscribed(topic_name)
       timeout_ms = int(timeout * 1000) if timeout > 0 else 3000
+      if self._consumer is None:
+        error = "RocketMQBackend not connected: consumer is None"
+        raise QueueError(error)
       messages = self._consumer.receive(timeout_ms)
       if not messages:
         return None
@@ -315,8 +327,9 @@ class RocketMQBackend(Backend, QueueBackend):
       raise QueueError(msg)
 
     msg = (
-      "RocketMQ does not support atomic add-or-skip set operations. "
-      "Use push() to add items and contains() to check existence."
+      "RocketMQBackend does not implement SetBackend.add(): "
+      "RocketMQ has no native set/membership semantics. "
+      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
     )
     raise NotImplementedError(msg)
 
@@ -330,7 +343,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support atomic remove from sets.
     """
-    msg = "RocketMQ does not support atomic remove from sets. Use push() without dedup instead."
+    msg = (
+      "RocketMQBackend does not implement SetBackend.remove(): "
+      "RocketMQ has no native set/membership semantics. "
+      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
+    )
     raise NotImplementedError(msg)
 
   def contains(self, set_name: str, item: bytes) -> bool:
@@ -346,7 +363,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support set membership queries.
     """
-    msg = "RocketMQ does not support contains(). Use push() with a dedup mechanism instead."
+    msg = (
+      "RocketMQBackend does not implement SetBackend.contains(): "
+      "RocketMQ has no native set/membership semantics. "
+      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
+    )
     raise NotImplementedError(msg)
 
   def set_len(self, set_name: str) -> int:
@@ -361,7 +382,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support set size queries.
     """
-    msg = "RocketMQ does not support set_len(). Use pop() to drain and count items."
+    msg = (
+      "RocketMQBackend does not implement SetBackend.set_len(): "
+      "RocketMQ has no native set/membership semantics. "
+      "Use Redis, MongoDB, or ElasticSearch for dedup (set) operations."
+    )
     raise NotImplementedError(msg)
 
   def clear_set(self, set_name: str) -> None:
@@ -393,7 +418,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support storage operations.
     """
-    msg = "RocketMQ does not support store(). Use a dedicated backend for key-value storage."
+    msg = (
+      "RocketMQBackend does not implement StorageBackend.store(): "
+      "RocketMQ is a message queue, not a key-value store. "
+      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
+    )
     raise NotImplementedError(msg)
 
   def retrieve(self, key: str) -> bytes | None:
@@ -408,7 +437,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support point-in-time key retrieval.
     """
-    msg = "RocketMQ does not support retrieve(). Use a dedicated database for key-value storage."
+    msg = (
+      "RocketMQBackend does not implement StorageBackend.retrieve(): "
+      "RocketMQ is a message queue, not a key-value store. "
+      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
+    )
     raise NotImplementedError(msg)
 
   def delete(self, key: str) -> bool:
@@ -420,7 +453,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support key-based deletion.
     """
-    msg = "RocketMQ does not support key-based deletion. Use a different backend for storage."
+    msg = (
+      "RocketMQBackend does not implement StorageBackend.delete(): "
+      "RocketMQ is a message queue, not a key-value store. "
+      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
+    )
     raise NotImplementedError(msg)
 
   def exists(self, key: str) -> bool:
@@ -432,7 +469,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support key-based existence checks.
     """
-    msg = "RocketMQ does not support exists(). Use a different backend for storage."
+    msg = (
+      "RocketMQBackend does not implement StorageBackend.exists(): "
+      "RocketMQ is a message queue, not a key-value store. "
+      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
+    )
     raise NotImplementedError(msg)
 
   def ttl(self, key: str) -> int | None:
@@ -444,7 +485,11 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support TTL queries.
     """
-    msg = "RocketMQ does not support ttl(). Use a different backend for storage."
+    msg = (
+      "RocketMQBackend does not implement StorageBackend.ttl(): "
+      "RocketMQ is a message queue, not a key-value store. "
+      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
+    )
     raise NotImplementedError(msg)
 
   def clear_storage(self, prefix: str | None = None) -> None:
@@ -456,5 +501,9 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support storage clearing.
     """
-    msg = "RocketMQ does not support clear_storage(). Use a different backend for storage."
+    msg = (
+      "RocketMQBackend does not implement StorageBackend.clear_storage(): "
+      "RocketMQ is a message queue, not a key-value store. "
+      "Use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB for storage."
+    )
     raise NotImplementedError(msg)

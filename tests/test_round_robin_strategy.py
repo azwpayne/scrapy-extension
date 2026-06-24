@@ -73,6 +73,24 @@ class TestRoundRobinQueueStrategy:
     s.push("q", b"a2", source="A")  # reuse same source
     assert s.pop("q") == b"a2"
 
+  def test_state_not_shared_across_instances(self) -> None:
+    """Per-process state: a second strategy instance sees nothing of the first.
+
+    RoundRobinQueueStrategy holds items in-process (per-instance deques),
+    NOT shared across workers. Pushing to instance A must not be visible to
+    instance B — pin the non-sharing contract so regressions (e.g. moving
+    state to a shared backend) are caught.
+    """
+    instance_a = RoundRobinQueueStrategy(object())
+    instance_b = RoundRobinQueueStrategy(object())
+    instance_a.push("q", b"x", source="A")
+    instance_a.push("q", b"y", source="B")
+    # Instance B observes zero items and cannot pop what A holds.
+    assert instance_b.queue_len("q") == 0
+    assert instance_b.pop("q") is None
+    # Instance A still owns its own items.
+    assert instance_a.queue_len("q") == 2
+
 
 class TestFactoryRoundRobin:
   def test_build_round_robin(self, mock_connection_manager) -> None:

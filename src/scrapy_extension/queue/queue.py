@@ -216,3 +216,16 @@ class BackendQueue:
     re-delivered.
     """
     self.connection_manager.get_queue_backend().nack(self.queue_name)
+
+  def close(self) -> None:
+    """Close the queue, delegating to the queue strategy's lifecycle hook.
+
+    Forwards to ``self._strategy.close()`` so strategies that hold in-process
+    state (e.g. ``DelayQueueStrategy``'s held-item heap) can emit shutdown
+    warnings / release resources. The backend connection itself is owned by
+    the ``ConnectionManager`` and closed separately by the scheduler.
+
+    Safe to call when no strategy lifecycle work is needed — the default
+    ``QueueStrategy.close()`` is a no-op.
+    """
+    self._strategy.close()

@@ -13,11 +13,14 @@ __all__ = ["DelayQueueStrategy"]
 
 import heapq
 import itertools
+import logging
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from scrapy_extension.queue.strategies.base import QueueStrategy
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -134,8 +137,32 @@ class DelayQueueStrategy(QueueStrategy):
   def clear(self, queue_name: str) -> None:
     """Clear the live queue and all held items.
 
+    Unlike :meth:`close`, this does NOT warn about discarded held items:
+    ``clear`` is an explicit flush requested by the caller, so silent
+    discard is the intended contract. ``close`` warns because held items
+    present at shutdown indicate unexpected loss.
+
     Args:
         queue_name: The queue name.
     """
     self._connection_manager.get_queue_backend().clear_queue(queue_name)
+    self._holding.clear()
+
+  def close(self) -> None:
+    """Release resources, warning about any held (delayed) items.
+
+    Held items live in-process, so any still-pending delayed items are
+    lost on close/restart. Make that loss non-silent: emit a WARNING with
+    the discarded count, then clear the holding heap.
+
+    If ``_holding`` is empty, this is a quiet no-op (clears nothing).
+    """
+    held = len(self._holding)
+    if held > 0:
+      logger.warning(
+        "DelayQueueStrategy close: discarding %d held delayed item(s) "
+        "from the in-process holding queue; these delayed items are lost "
+        "on close/restart (non-silent data loss).",
+        held,
+      )
     self._holding.clear()

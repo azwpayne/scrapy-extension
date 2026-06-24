@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+import types
+from unittest.mock import MagicMock
+
 import pytest
 
 from scrapy_extension.backends.base import (
@@ -12,6 +16,58 @@ from scrapy_extension.backends.base import (
 )
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import BackendConnectionError
+
+
+# --- SDK stubs for backends whose optional deps are absent in the test env ---
+# Mirrors tests/test_memcached_backend.py: inject a stub package into sys.modules
+# so the backend's module-level ``import pulsar`` / ``import boto3`` /
+# ``from pymemcache.client.base import Client`` succeeds without the dep installed.
+def _ensure_sdk_stub(module_dotted: str, attrs: dict[str, object] | None = None) -> None:
+  """Inject (or extend) a stub package at ``module_dotted`` in sys.modules.
+
+  Creates each parent package so attribute access like ``pulsar.Client`` works
+  once the leaf module is imported.
+  """
+  parts = module_dotted.split(".")
+  attrs = attrs or {}
+  for i in range(1, len(parts) + 1):
+    name = ".".join(parts[:i])
+    if name not in sys.modules:
+      mod = types.ModuleType(name)
+      sys.modules[name] = mod
+  leaf = sys.modules[module_dotted]
+  for k, v in attrs.items():
+    setattr(leaf, k, v)
+
+
+_ensure_sdk_stub("pulsar", {"Client": MagicMock(name="PulsarClient")})
+_ensure_sdk_stub("boto3")
+_ensure_sdk_stub("pymemcache")
+_ensure_sdk_stub("pymemcache.client")
+_ensure_sdk_stub("pymemcache.client.base", {"Client": MagicMock(name="MemcachedClient")})
+# rocketmq-client-python is also absent in the test env.
+_ensure_sdk_stub("rocketmq")
+_ensure_sdk_stub("rocketmq.client", {"Producer": MagicMock, "PushConsumer": MagicMock})
+
+
+# Expected concrete class name per BackendType. Asserting ``type(backend).__name__``
+# (in addition to ``backend.backend_type``) catches a case block wiring the WRONG
+# Backend/Settings pair — e.g. ``PulsarBackend(SqsSettings(...))`` would still report
+# ``backend_type is PULSAR`` (a hardcoded property) but the constructed class name
+# would mismatch. This pins the per-case wiring, not just dispatch success.
+_EXPECTED_BACKEND_CLASS: dict[BackendType, str] = {
+  BackendType.REDIS: "RedisBackend",
+  BackendType.MONGODB: "MongoDBBackend",
+  BackendType.KAFKA: "KafkaBackend",
+  BackendType.RABBITMQ: "RabbitMQBackend",
+  BackendType.ELASTICSEARCH: "ElasticSearchBackend",
+  BackendType.ROCKETMQ: "RocketMQBackend",
+  BackendType.PULSAR: "PulsarBackend",
+  BackendType.SQS: "SqsBackend",
+  BackendType.MEMCACHED: "MemcachedBackend",
+  BackendType.DYNAMODB: "DynamoDBBackend",
+}
+
 
 
 class TestConnectionManagerCreateBackend:
@@ -560,3 +616,65 @@ class TestConnectionManagerSingleton:
     manager2 = ConnectionManager.get_manager(BackendType.REDIS, {"host": "otherhost"})
 
     assert manager1 is not manager2
+
+
+class TestConnectionManagerCreateBackendAllTypes:
+  """Regression: _create_backend must support ALL 10 BackendType values.
+
+  Previously only 6 (REDIS, MONGODB, KAFKA, RABBITMQ, ELASTICSEARCH, ROCKETMQ)
+  were handled; PULSAR, SQS, MEMCACHED, DYNAMODB fell through to
+  ``case _: raise ValueError("Unsupported backend type")`` despite being
+  listed in the QUEUE_CAPABLE / STORAGE_CAPABLE sets and the README's
+  "10 Backends" claim. Configuring them via standard Scrapy settings routed
+  through ConnectionManager and crashed.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _clear_registry_between_tests(self):
+    """Ensure managers do not leak across parametrized invocations."""
+    ConnectionManager.clear_registry()
+    yield
+    ConnectionManager.clear_registry()
+
+  @pytest.mark.parametrize(
+    "backend_type",
+    list(BackendType),
+    ids=[bt.name for bt in BackendType],
+  )
+  def test_create_backend_supports_all_backend_types(self, backend_type):
+    """Every BackendType must build via _create_backend without ValueError.
+
+    SDKs absent from the test env are stubbed at module top. We only exercise
+    construction — connect() is never called (no real services).
+    """
+    manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})
+    backend = manager._create_backend()
+
+    assert backend.backend_type is backend_type
+    # Pin the per-case wiring: the right concrete class must be constructed,
+    # not merely one whose backend_type property matches (guards against a
+    # Backend/Settings swap inside a match arm).
+    assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
+
+  @pytest.mark.parametrize(
+    "backend_type",
+    [
+      BackendType.PULSAR,
+      BackendType.SQS,
+      BackendType.MEMCACHED,
+      BackendType.DYNAMODB,
+    ],
+    ids=["pulsar", "sqs", "memcached", "dynamodb"],
+  )
+  def test_create_backend_regression_for_four_new_backends(self, backend_type):
+    """Direct regression for the P0 bug: each of the 4 newly-added backends
+    must build via _create_backend (previously raised ValueError)."""
+    manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})
+    backend = manager._create_backend()
+
+    assert backend.backend_type is backend_type
+    # Pin the per-case wiring: the right concrete class must be constructed,
+    # not merely one whose backend_type property matches (guards against a
+    # Backend/Settings swap inside a match arm).
+    assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
+

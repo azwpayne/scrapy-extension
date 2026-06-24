@@ -41,13 +41,30 @@ class BackendScheduler:
   Uses QueueBackend for request queueing and applies duplicate filtering
   through the configured ``DUPEFILTER_CLASS`` when present.
 
-  Message-queue backends (Kafka, RabbitMQ) ack on Scrapy's
-  ``response_received`` signal and nack on ``spider_error``. This confirms
-  downloader-level response delivery; it does not wait for callback or item
-  pipeline completion. Atomic backends (Redis, MongoDB, ElasticSearch,
-  RocketMQ) inherit no-op ack/nack. For correct ack behavior under concurrent
-  processing, set ``CONCURRENT_REQUESTS=1`` when using a message-queue
-  backend.
+  Ack/nack semantics (important — read before tuning concurrency):
+
+  1. **Ack fires on ``response_received``, NOT on callback/pipeline
+     completion.** For message-queue backends (Kafka, RabbitMQ), a message
+     is acked as soon as Scrapy's downloader delivers the response
+     (``signals.response_received``) and nacked on ``signals.spider_error``.
+     The ack is *download-level*: it does **not** wait for the spider
+     callback, the item pipeline, or any post-download processing. A crash
+     between ack and pipeline completion drops the item (at-most-once for
+     the pipeline side); a crash before ack re-delivers the message
+     (at-least-once for the download side).
+
+  2. **Set ``CONCURRENT_REQUESTS=1`` for at-least-once correctness with
+     message-queue backends** (Kafka, RabbitMQ). With concurrency > 1 the
+     scheduler pops and acks multiple messages before any of them finish
+     processing, so ordering and at-least-once guarantees weaken. Pin
+     concurrency to 1 when those guarantees matter; throughput can instead
+     be scaled by adding worker processes (each with its own consumer).
+
+  3. **Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) are
+     unaffected** by the above — their pop is a single atomic operation
+     with no separate ack/nack step, so the ``response_received`` wiring is
+     a no-op for them. ``CONCURRENT_REQUESTS`` can be tuned freely on atomic
+     backends.
 
   Attributes:
       connection_manager: The connection manager for backend access.
@@ -167,6 +184,7 @@ class BackendScheduler:
     )
     self._connect_ack_signals(spider)
     logger.info("Scheduler opened for spider %s", spider.name)
+    return None
 
   def _connect_ack_signals(self, spider: Spider) -> None:
     """Wire response_received → ack, spider_error → nack.
@@ -234,11 +252,20 @@ class BackendScheduler:
         self._on_spider_error,
         signal=signals.spider_error,
       )
+    # Close the queue strategy FIRST so it can warn about / release any
+    # in-process held state (e.g. DelayQueueStrategy's delayed items) while
+    # the backend is still connected. Must precede connection_manager.close().
+    if self._queue is not None:
+      try:
+        self._queue.close()
+      except Exception:
+        logger.exception("Failed to close queue strategy during shutdown")
     self.connection_manager.close()
     self._queue = None
     self._spider = None
     self._connected_signals = None
     self._signals_connected = False
+    return None
 
   def enqueue_request(self, request: Request) -> bool:
     """Enqueue a request.
