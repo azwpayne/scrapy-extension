@@ -172,16 +172,20 @@ def resolve_backend_config(
       ``ConnectionManager.get_manager(...)``.
 
   Raises:
-      ConfigurationError: If ``required_capabilities`` is set and the
-          resolved backend type is not in it.
+      ConfigurationError: If the resolved backend type value cannot be
+          coerced to a valid ``BackendType``, or if ``required_capabilities``
+          is set and the resolved backend type is not in it.
   """
   per_component_type = settings.get(type_key)
   if per_component_type:
-    backend_type = BackendType(per_component_type)
+    backend_type, source_key = _coerce_backend_type(
+      per_component_type, type_key
+    ), type_key
     backend_settings = settings.getdict(settings_key, {})
-    source_key = type_key
   else:
-    backend_type = BackendType(settings.get("SCRAPY_BACKEND_TYPE") or "redis")
+    backend_type = _coerce_backend_type(
+      settings.get("SCRAPY_BACKEND_TYPE") or "redis", "SCRAPY_BACKEND_TYPE"
+    )
     backend_settings = settings.getdict("SCRAPY_BACKEND_SETTINGS", {})
     source_key = "SCRAPY_BACKEND_TYPE"
 
@@ -194,6 +198,43 @@ def resolve_backend_config(
     raise ConfigurationError(msg, setting_name=source_key)
 
   return backend_type, backend_settings
+
+
+def _coerce_backend_type(value: object, setting_name: str) -> BackendType:
+  """Normalize a config value into a ``BackendType``.
+
+  ``BackendType(value)`` raises bare ``ValueError`` for invalid strings and
+  for non-string/non-enum values (e.g. an int from a programmatic caller).
+  That ``ValueError`` surfaces deep inside ``from_settings`` with no setting
+  name attached, so the operator sees an untyped crash instead of a typed
+  ``ConfigurationError`` pointing at the offending setting. This wrapper
+  normalizes first (``BackendType`` instance passes through; anything else
+  is coerced via ``str()`` then ``BackendType``) and converts a coercion
+  failure into a ``ConfigurationError`` carrying the setting name + value.
+
+  Args:
+      value: The raw setting value (``BackendType``, ``str``, or other).
+      setting_name: The setting key the value came from — attached to the
+          raised ``ConfigurationError`` for operator triage.
+
+  Returns:
+      The resolved ``BackendType`` member.
+
+  Raises:
+      ConfigurationError: If ``value`` does not map to a valid member.
+  """
+  if isinstance(value, BackendType):
+    return value
+  try:
+    return BackendType(str(value))
+  except ValueError:
+    msg = (
+      f"Invalid backend type {value!r} for setting {setting_name!r}. "
+      f"Valid values: {sorted(b.value for b in BackendType)}."
+    )
+    raise ConfigurationError(
+      msg, setting_name=setting_name, setting_value=value
+    ) from None
 
 
 class ConnectionManager:
@@ -231,6 +272,20 @@ class ConnectionManager:
     self.settings = settings or {}
     self._backend: Backend | None = None
     self._lock = threading.Lock()
+    # Refcount of outstanding ``get_manager()`` acquire calls sharing this
+    # instance (A1). The manager is only created via ``get_manager()``, so
+    # the constructor sets the initial count to 0; ``get_manager()`` then
+    # increments to 1 on first insertion. Each subsequent acquire bumps it;
+    # each ``close()`` (release) decrements; only the last holder actually
+    # disconnects + evicts the registry entry.
+    self._users: int = 0
+    # Single-connect ownership flag (A2). The first thread to enter the slow
+    # path takes ownership under ``_lock``; peers wait on ``_connected_event``
+    # until the owner finishes connect() — which runs its retry loop (and
+    # time.sleep backoff) WITHOUT holding ``_lock``, so peers backing off on
+    # a slow backend don't block threads that merely want to READ _backend.
+    self._connecting: bool = False
+    self._connected_event = threading.Event()
 
   @classmethod
   def get_manager(
@@ -238,7 +293,16 @@ class ConnectionManager:
     backend_type: BackendType,
     settings: dict[str, Any] | None = None,
   ) -> ConnectionManager:
-    """Get or create a connection manager.
+    """Get or create a connection manager (acquire semantics).
+
+    Each call registers an acquire on the returned instance: the shared
+    manager's ``_users`` refcount is incremented under the registry lock.
+    Callers MUST pair every successful ``get_manager()`` with a ``close()``
+    (release). Only the LAST holder's ``close()`` disconnects the backend
+    and evicts the registry entry — earlier holders' closes are no-ops on
+    the backend, so co-located components (e.g. scheduler queue +
+    dupefilter sharing one Redis) don't tear each other's connection down
+    during shutdown.
 
     Args:
         backend_type: The type of backend.
@@ -251,9 +315,12 @@ class ConnectionManager:
     key = cls._registry_key(backend_type, normalized_settings)
 
     with cls._registry_lock:
-      if key not in cls._managers:
-        cls._managers[key] = cls(backend_type, normalized_settings)
-      return cls._managers[key]
+      manager = cls._managers.get(key)
+      if manager is None:
+        manager = cls(backend_type, normalized_settings)
+        cls._managers[key] = manager
+      manager._users += 1
+      return manager
 
   @staticmethod
   def _registry_key(
@@ -372,21 +439,38 @@ class ConnectionManager:
     self._backend = backend
 
   def close(self) -> None:
-    """Close the backend connection.
+    """Release this holder's acquire on the shared manager (refcount).
 
-    Closes the connection and cleans up resources. Also removes the
-    instance from the class-level registry so subsequent
-    ``get_manager()`` calls create a fresh manager.
+    Pairs with ``get_manager()`` (acquire). Decrements ``_users`` under the
+    registry lock; only when the count drops to zero (the LAST holder) does
+    this method actually disconnect the backend and evict the registry
+    entry. Earlier holders' closes are no-ops on the backend — so
+    co-located components (e.g. scheduler queue + dupefilter sharing one
+    Redis) don't tear each other's connection down during shutdown.
 
-    Idempotent and safe under shared-manager scenarios (I-2): when multiple
-    components (e.g. dupefilter + pipeline) resolve to the same
-    ``backend_type:settings_hash`` registry key, they share one
-    ``ConnectionManager`` instance. Each component's ``close()`` calls this
-    method; the first call disconnects and evicts the registry entry, and
-    subsequent calls are no-ops (guarded by ``if self._backend:``). Scrapy
-    serializes component shutdown today, so no concurrent-close hazard —
-    but the idempotent contract is what makes co-located backends safe.
+    Disconnect-path error handling mirrors R25-A1's connect-path cleanup
+    (broad ``Exception`` catch): disconnecting a possibly-broken backend
+    can raise anything (OSError from the socket layer, a backend-specific
+    error). ``close()`` must still complete the registry eviction so the
+    next ``get_manager()`` creates a fresh manager — never propagate out of
+    the close chain.
     """
+    cls = type(self)
+    key = cls._registry_key(self.backend_type, self.settings)
+    with cls._registry_lock:
+      # A ``close()`` without a matching ``get_manager()`` (e.g. a bare
+      # ``ConnectionManager(...)`` constructed in tests) has _users == 0;
+      # clamp at zero and fall through to the teardown path so such an
+      # instance still disconnects its backend.
+      if self._users > 0:
+        self._users -= 1
+      is_last_holder = self._users <= 0
+      if is_last_holder:
+        cls._managers.pop(key, None)
+
+    if not is_last_holder:
+      return
+
     with self._lock:
       if self._backend:
         try:
@@ -398,47 +482,98 @@ class ConnectionManager:
           # backend can raise anything: an OSError from the socket layer that
           # the backend's own disconnect didn't self-suppress, or a
           # backend-specific error. close() must still complete registry
-          # eviction (below) — never propagate out of the close chain.
+          # eviction (above) — never propagate out of the close chain.
           logger.warning("Error during disconnect: %s", e)
         finally:
           self._backend = None
-      # Remove from registry so the next get_manager() doesn't return
-      # a closed instance. Compute the key the same way get_manager does.
-      key = type(self)._registry_key(self.backend_type, self.settings)
-      cls = type(self)
-      with cls._registry_lock:
-        cls._managers.pop(key, None)
 
   @classmethod
   def clear_registry(cls) -> None:
-    """Close and clear all registered managers.
+    """Close and clear all registered managers (force-teardown).
 
     Intended for test isolation: the class-level ``_managers`` dict
     otherwise accumulates entries across test runs, causing both a
     slow memory leak and cross-test pollution (one test's manager is
-    returned for another test's get_manager call).
+    returned for another test's get_manager call). Bypasses the refcount
+    (each registered manager's backend is disconnected unconditionally)
+    so a full teardown is possible even if some holders skipped their
+    paired ``close()``.
     """
     with cls._registry_lock:
       managers = list(cls._managers.values())
       cls._managers.clear()
     for manager in managers:
-      with contextlib.suppress(Exception):
-        manager.close()
+      with manager._lock:
+        if manager._backend:
+          with contextlib.suppress(Exception):
+            manager._backend.disconnect()
+          manager._backend = None
 
   @property
   def backend(self) -> Backend:
     """Get the backend instance, connecting if necessary.
 
+    A2 — fast path / slow path split with single-connect ownership:
+
+    - Fast path: lock-free read of ``self._backend``. A non-None value is
+      stable (only ever transitioned ``None``→backend under ``_lock``), so a
+      lock-free read is safe for the already-connected case and avoids
+      contending on ``_lock`` at all once warm.
+    - Slow path: under ``_lock``, take ownership of connecting via the
+      ``_connecting`` flag. Peers that find ``_connecting`` set wait on
+      ``_connected_event`` (released by the owner once connect resolves) —
+      they do NOT spin on ``_lock`` while the owner backs off.
+    - The owner runs ``connect()`` (which performs ``time.sleep`` between
+      retry attempts) WITHOUT holding ``_lock``. This is the load-bearing
+      fix: a slow-connecting backend no longer blocks every peer thread
+      sharing the manager.
+
+    Single-connect invariant preserved: exactly one ``connect()`` fires on
+    first access; all peers see the same connected backend.
+
     Returns:
         The backend instance.
 
     Raises:
-        ConnectionError: If connection fails.
+        BackendConnectionError: If connection fails or ``connect()``
+            violates its contract (returns without setting ``_backend``).
     """
-    if self._backend is None:
+    # Fast path: lock-free read.
+    if self._backend is not None:
+      return self._backend
+
+    while True:
       with self._lock:
-        if self._backend is None:
-          self.connect()
+        # Re-check under lock: another thread may have connected while we
+        # were waiting on _lock.
+        if self._backend is not None:
+          return self._backend
+        if not self._connecting:
+          # Take ownership of connecting.
+          self._connecting = True
+          self._connected_event.clear()
+          break
+        # Another thread owns the connect; wait OUTSIDE the lock below.
+        wait_event = self._connected_event
+
+      # Wait for the owner to resolve connect() — without holding _lock.
+      wait_event.wait()
+
+    # Owner path: connect WITHOUT holding _lock so the retry-loop
+    # time.sleep backoff does not block peer threads (A2).
+    connect_error: BaseException | None = None
+    try:
+      self.connect()
+    except BaseException as e:  # noqa: BLE001 - re-signal to all waiters
+      connect_error = e
+    finally:
+      with self._lock:
+        self._connecting = False
+        self._connected_event.set()
+
+    if connect_error is not None:
+      raise connect_error
+
     if self._backend is None:
       # Defensive: connect() should either set _backend (success) or raise.
       # If we land here, connect() returned without connecting and without

@@ -708,3 +708,269 @@ class TestConnectionManagerCreateBackendAllTypes:
     # Backend/Settings swap inside a match arm).
     assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
 
+
+class TestResolveBackendConfigEnumNormalization:
+  """A3: ``resolve_backend_config`` must not crash on programmatic enum values.
+
+  Previously ``BackendType(per_component_type)`` raised ``ValueError`` if the
+  value was an invalid string OR a value that ``BackendType.__call__`` could
+  not coerce (e.g. an int passed by a programmatic caller). The crash
+  surfaced as an untyped ``ValueError`` deep in ``from_settings`` instead of
+  a ``ConfigurationError`` with the offending setting name + value attached.
+  """
+
+  @staticmethod
+  def _make_settings(values: dict[str, object]) -> MagicMock:
+    """Build a Scrapy-settings-like stub returning per-key values.
+
+    ``resolve_backend_config`` calls ``settings.get(key)`` and
+    ``settings.getdict(key, default)``; a ``MagicMock`` spec'd to a dict-like
+    gives predictable per-key behavior without dragging in scrapy.Settings.
+    """
+    settings = MagicMock()
+
+    def _get(key, default=None):
+      return values.get(key, default)
+
+    def _getdict(key, default=None):
+      v = values.get(key, default)
+      if v is None:
+        return {}
+      return dict(v)
+
+    settings.get.side_effect = _get
+    settings.getdict.side_effect = _getdict
+    return settings
+
+  def test_enum_instance_passthrough_per_component(self):
+    """A BackendType instance passed as the per-component value must pass
+    through ``resolve_backend_config`` unchanged (no ValueError, no
+    re-coercion crash)."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+
+    settings = self._make_settings(
+      {"SCRAPY_QUEUE_BACKEND_TYPE": BackendType.MONGODB}
+    )
+    backend_type, _ = resolve_backend_config(
+      settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+    )
+    assert backend_type is BackendType.MONGODB
+
+  def test_string_value_resolves_per_component(self):
+    """A plain string (the typical Scrapy settings path) must still resolve."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+
+    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "kafka"})
+    backend_type, _ = resolve_backend_config(
+      settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+    )
+    assert backend_type is BackendType.KAFKA
+
+  def test_invalid_string_raises_configuration_error(self):
+    """An invalid backend type string must raise ``ConfigurationError``
+    (not bare ``ValueError``) so the caller sees a typed error with the
+    offending setting name + value attached."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.exceptions import ConfigurationError
+
+    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "not-a-backend"})
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+      )
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
+    assert exc_info.value.setting_value == "not-a-backend"
+
+  def test_invalid_global_raises_configuration_error(self):
+    """Same normalization on the GLOBAL fallback path
+    (``SCRAPY_BACKEND_TYPE``)."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.exceptions import ConfigurationError
+
+    settings = self._make_settings({"SCRAPY_BACKEND_TYPE": "bogus"})
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+      )
+    assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
+    assert exc_info.value.setting_value == "bogus"
+
+  def test_non_string_value_raises_configuration_error(self):
+    """A non-string, non-enum value (e.g. an int from a programmatic caller)
+    must raise ``ConfigurationError`` rather than the raw ``ValueError``
+    that ``BackendType(123)`` produces internally."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.exceptions import ConfigurationError
+
+    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": 123})
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+      )
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
+
+
+class TestConnectionManagerRefcount:
+  """A1: shared ConnectionManager.close() must refcount co-located holders.
+
+  When two components (scheduler queue + dupefilter) resolve to the same
+  ``backend_type:settings_hash`` registry key, ``get_manager()`` returns the
+  SAME instance. The old ``close()`` unconditionally disconnected + evicted,
+  so the first component to close tore the connection out from under the
+  other during shutdown.
+  """
+
+  def test_get_manager_acquires_refcount(self):
+    """Each ``get_manager()`` call for the same key must increment the
+    shared manager's refcount (one acquire per get)."""
+    manager = ConnectionManager.get_manager(BackendType.REDIS)
+    assert manager._users == 1
+    manager2 = ConnectionManager.get_manager(BackendType.REDIS)
+    assert manager is manager2
+    assert manager._users == 2
+
+  def test_close_last_holder_evicts_and_reconnects_fresh(self, mocker):
+    """Closing the LAST holder evicts the registry entry; a subsequent
+    ``get_manager(same key)`` returns a FRESH manager (different ``id``)
+    that reconnects from scratch."""
+    mocker.patch.object(ConnectionManager, "_create_backend")
+    mock_backend = mocker.MagicMock()
+    ConnectionManager._create_backend.return_value = mock_backend
+
+    manager = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "reconnect-test"}
+    )
+    manager._backend = mock_backend
+    first_id = id(manager)
+
+    manager.close()
+
+    # Backend was disconnected and _backend cleared.
+    mock_backend.disconnect.assert_called_once()
+    assert manager._backend is None
+
+    # Registry evicted → fresh manager on next get.
+    manager_after = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "reconnect-test"}
+    )
+    assert id(manager_after) != first_id
+    assert manager_after is not manager
+
+  def test_colocated_close_one_keeps_backend_alive(self, mocker):
+    """Two holders share one manager. Closing ONE must NOT disconnect the
+    backend or evict the registry — the other holder still needs it."""
+    mocker.patch.object(ConnectionManager, "_create_backend")
+    mock_backend = mocker.MagicMock()
+    ConnectionManager._create_backend.return_value = mock_backend
+
+    holder_a = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated"}
+    )
+    holder_b = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated"}
+    )
+    assert holder_a is holder_b
+    assert holder_a._users == 2
+
+    holder_a._backend = mock_backend
+
+    # First close — must NOT tear down.
+    holder_a.close()
+
+    mock_backend.disconnect.assert_not_called()
+    assert holder_a._backend is mock_backend  # backend still wired
+    # Registry still holds the manager.
+    key = ConnectionManager._registry_key(
+      BackendType.REDIS, {"host": "colocated"}
+    )
+    assert key in ConnectionManager._managers
+    # Refcount decremented to the remaining holder.
+    assert holder_b._users == 1
+
+  def test_colocated_close_both_disconnects_and_evicts(self, mocker):
+    """Closing BOTH holders (last one out) disconnects the backend AND
+    evicts the registry entry."""
+    mocker.patch.object(ConnectionManager, "_create_backend")
+    mock_backend = mocker.MagicMock()
+    ConnectionManager._create_backend.return_value = mock_backend
+
+    holder_a = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated-both"}
+    )
+    holder_b = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "colocated-both"}
+    )
+    holder_a._backend = mock_backend
+
+    holder_a.close()
+    holder_b.close()
+
+    mock_backend.disconnect.assert_called_once()
+    key = ConnectionManager._registry_key(
+      BackendType.REDIS, {"host": "colocated-both"}
+    )
+    assert key not in ConnectionManager._managers
+
+  def test_concurrent_get_manager_same_key_one_shared_instance(self):
+    """Under concurrency, N threads hitting the same registry key must
+    resolve to exactly ONE shared manager (no registry race creating
+    duplicates) with refcount == N."""
+    import threading
+
+    results: list[ConnectionManager] = []
+    errors: list[BaseException] = []
+    n = 20
+    barrier = threading.Barrier(n)
+
+    def worker():
+      try:
+        barrier.wait()
+        m = ConnectionManager.get_manager(
+          BackendType.REDIS, {"host": "concurrent-shared"}
+        )
+        results.append(m)
+      except BaseException as e:  # noqa: BLE001 - surface any failure
+        errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join()
+
+    assert errors == []
+    assert len(results) == n
+    first = results[0]
+    assert all(r is first for r in results)
+    assert first._users == n
+
+  def test_concurrent_get_manager_distinct_keys_n_instances(self):
+    """N threads with distinct keys → N distinct managers, each refcount 1."""
+    import threading
+
+    results: list[ConnectionManager] = []
+    errors: list[BaseException] = []
+    n = 10
+    barrier = threading.Barrier(n)
+
+    def worker(i: int):
+      try:
+        barrier.wait()
+        m = ConnectionManager.get_manager(
+          BackendType.REDIS, {"host": f"concurrent-distinct-{i}"}
+        )
+        results.append(m)
+      except BaseException as e:  # noqa: BLE001
+        errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join()
+
+    assert errors == []
+    assert len(results) == n
+    assert len({id(r) for r in results}) == n
+    assert all(r._users == 1 for r in results)
+

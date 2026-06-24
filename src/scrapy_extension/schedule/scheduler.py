@@ -12,13 +12,17 @@ from typing import TYPE_CHECKING, Any
 from scrapy import signals
 from scrapy.utils.misc import load_object
 
-from scrapy_extension.backends.base import _validate_key_name
+from scrapy_extension.backends.base import BackendType, _validate_key_name
 from scrapy_extension.backends.connectors import (
   QUEUE_CAPABLE_BACKENDS,
   ConnectionManager,
   resolve_backend_config,
 )
-from scrapy_extension.exceptions import QueueError, SerializationError
+from scrapy_extension.exceptions import (
+  ConfigurationError,
+  QueueError,
+  SerializationError,
+)
 from scrapy_extension.queue.queue import BackendQueue
 
 if TYPE_CHECKING:
@@ -101,6 +105,58 @@ class BackendScheduler:
     self._signals_connected: bool = False
     self._connected_signals = None
 
+  # Backends whose ``pop`` tracks only the last-popped message for ack.
+  # Under ``CONCURRENT_REQUESTS > 1`` earlier messages leak (uncommitted /
+  # requeued), silently breaking at-least-once. The full in-flight-set fix
+  # is deferred; this gate surfaces the misconfiguration at construction.
+  _ACK_SINGLE_SLOT_BACKENDS: frozenset[BackendType] = frozenset(
+    {BackendType.KAFKA, BackendType.RABBITMQ}
+  )
+  _ACK_UNSAFE_OPT_OUT = "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS"
+
+  @classmethod
+  def _enforce_ack_concurrency_gate(
+    cls, settings: Settings, backend_type: BackendType
+  ) -> None:
+    """Fail-fast if an ack-single-slot backend runs under concurrency > 1.
+
+    Kafka/RabbitMQ ``pop`` track a single ack slot; with
+    ``CONCURRENT_REQUESTS > 1`` Scrapy pops and acks multiple messages before
+    any finish, so only the last-popped message is ackable — earlier ones
+    leak (Kafka: uncommitted → re-delivered on restart; RabbitMQ: requeued on
+    disconnect). This converts that silent data-loss into a loud
+    ``ConfigurationError`` unless the operator explicitly opts out via
+    ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=true``.
+
+    Atomic-pop backends (Redis, MongoDB, ElasticSearch, RocketMQ) are
+    unaffected — their pop is a single atomic operation with no separate ack
+    step — so the gate only targets the single-slot backends.
+    """
+    if backend_type not in cls._ACK_SINGLE_SLOT_BACKENDS:
+      return
+    concurrent_requests = settings.getint("CONCURRENT_REQUESTS", 1)
+    if concurrent_requests <= 1:
+      return
+    opt_out = str(
+      settings.get(cls._ACK_UNSAFE_OPT_OUT, "") or ""
+    ).strip().lower()
+    if opt_out == "true":
+      return
+    msg = (
+      f"Queue backend {backend_type.value!r} with CONCURRENT_REQUESTS="
+      f"{concurrent_requests} breaks at-least-once delivery: "
+      f"{backend_type.value.capitalize()} pop() tracks only the last-popped "
+      f"message for ack, so under concurrency > 1 earlier messages leak "
+      f"(uncommitted/requeued → re-delivered). Set CONCURRENT_REQUESTS=1 for "
+      f"correct at-least-once semantics, or acknowledge the risk by setting "
+      f"{cls._ACK_UNSAFE_OPT_OUT}=true."
+    )
+    raise ConfigurationError(
+      msg,
+      setting_name="CONCURRENT_REQUESTS",
+      setting_value=concurrent_requests,
+    )
+
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendScheduler:
     """Create scheduler from Scrapy settings.
@@ -113,6 +169,17 @@ class BackendScheduler:
     ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so the queue can
     bind to a different backend than the dedup filter or storage pipeline
     (multi-backend coexistence). Unset → falls back to the global keys.
+
+    Raises:
+        ConfigurationError: If the queue backend is Kafka or RabbitMQ (whose
+            ``pop`` tracks only the last-popped message for ack) AND
+            ``CONCURRENT_REQUESTS > 1`` AND the operator has not opted out via
+            ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=true``. Under concurrency > 1
+            only the last-popped message is ackable, so earlier messages leak
+            (Kafka: uncommitted → re-delivered; RabbitMQ: requeued on
+            disconnect), silently breaking at-least-once. The full in-flight-set
+            fix is deferred; this gate converts silent data loss into a loud
+            config error.
     """
     from scrapy_extension.queue.strategies.factory import (
       QueueStrategyType,
@@ -126,6 +193,7 @@ class BackendScheduler:
       required_capabilities=QUEUE_CAPABLE_BACKENDS,
       component_name="queue",
     )
+    cls._enforce_ack_concurrency_gate(settings, backend_type)
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
       settings=backend_settings,

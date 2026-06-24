@@ -56,3 +56,17 @@ def _isolate_connection_manager_registry():
 
   ConnectionManager.clear_registry()
   yield
+
+
+@pytest.fixture(autouse=True)
+def _rabbitmq_test_credentials(monkeypatch):
+  """Provide RabbitMQ creds via env so bare ``RabbitMQSettings()`` constructs in tests.
+
+  Production still requires explicit credentials (``settings/rabbitmq.py`` has no
+  default for ``username``/``password`` — the C2 security fix). This fixture only
+  restores pre-C2 test convenience for the ~60 backend tests that mock pika and
+  never cared about creds. Tests asserting the required-creds contract must
+  ``monkeypatch.delenv`` these two variables.
+  """
+  monkeypatch.setenv("SCRAPY_RABBITMQ_USERNAME", "guest")
+  monkeypatch.setenv("SCRAPY_RABBITMQ_PASSWORD", "guest")

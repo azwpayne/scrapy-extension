@@ -2,9 +2,11 @@
 
 from typing import cast
 
+import pytest
 from scrapy import Field, Item
 
 from scrapy_extension.backends.base import JSONSerializer
+from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
 
@@ -381,4 +383,82 @@ class TestBackendPipelineProcessItem:
     # Must not raise
     pipeline._inc_stat(bare_spider, "pipeline/storage_errors")
     pipeline._inc_stat(bare_spider, "pipeline/storage_skipped")
+
+
+class TestBackendPipelineMaxItemBytes:
+  """D2: configurable per-item byte cap to prevent DoS via oversize payloads."""
+
+  def test_process_item_oversize_raises_and_increments_stat(
+    self, mock_connection_manager, mocker
+  ):
+    """D2: an oversize serialized item raises SerializationError + bumps stat.
+
+    A hostile target can push arbitrarily large item payloads; storage backends
+    with caps (Memcached 1 MB, DynamoDB 400 KB) throw and the item is silently
+    dropped. The cap surfaces the oversize condition loudly at store time with
+    a stat increment so operators can see it on dashboards.
+
+    Note: unlike a transient storage error (which the pipeline swallows to keep
+    the spider alive), an oversize payload is a deterministic validation
+    failure — it raises so the operator sees it, not silently dropped.
+    """
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_item_bytes=32,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    big_item = SampleItem(name="X" * 200, value=1)
+
+    with pytest.raises(SerializationError, match="exceeds.*max"):
+      pipeline.process_item(big_item, mock_spider)
+
+    mock_spider.crawler.stats.inc_value.assert_called_with(
+      "pipeline/oversize_dropped"
+    )
+    mock_connection_manager.get_storage_backend().store.assert_not_called()
+
+  def test_process_item_normal_size_succeeds(
+    self, mock_connection_manager, mocker
+  ):
+    """D2: a normal-size item is unaffected by the cap."""
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_item_bytes=1_048_576,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    item = SampleItem(name="Test", value=123)
+    result = pipeline.process_item(item, mock_spider)
+
+    assert result is item
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_default_max_item_bytes_is_one_mib(self, mock_connection_manager):
+    """D2: default cap is 1 MiB (matches Memcached's 1 MB ceiling)."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    assert pipeline.max_item_bytes == 1_048_576
+
+  def test_from_settings_reads_max_item_bytes(self, mocker):
+    """D2: from_settings reads SCRAPY_PIPELINE_MAX_ITEM_BYTES."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_PIPELINE_MAX_ITEM_BYTES": 2048,
+    }.get(key, default)
+    mock_settings.getint.return_value = 2048
+    mock_settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    pipeline = BackendPipeline.from_settings(mock_settings)
+    assert pipeline.max_item_bytes == 2048
 

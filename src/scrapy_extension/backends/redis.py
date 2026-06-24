@@ -48,12 +48,15 @@ logger = logging.getLogger(__name__)
 
 _POP_LUA = """
 local popped = redis.call('ZPOPMIN', KEYS[1])
-if #popped == 0 then return nil end
+if #popped == 0 then return {0, false} end
 local member = popped[1]
 local payload = redis.call('HGET', KEYS[2], member)
 redis.call('HDEL', KEYS[2], member)
-if not payload then return -1 end
-return payload
+if not payload then return {2, false} end
+if type(payload) ~= 'string' then
+  return {3, 'unexpected payload type: ' .. type(payload)}
+end
+return {1, payload}
 """
 
 _PUSH_LUA = """
@@ -439,19 +442,29 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     commands inside scripts); falls back to ``bzpopmin`` followed by an
     atomic MULTI/EXEC for HGET+HDEL.
 
-    Raises ``QueueError`` if a ZSET member was popped but its payload is
-    missing — that signals queue corruption (ZSET and payload hash out of
-    sync) which the caller must surface, not silently treat as empty.
+    Three outcomes are distinguished by the pop path, so a recoverable
+    race is never escalated to a hard error:
+
+    - **Empty queue**: the ZSET had no member. Returns ``None`` (no error).
+    - **Lost-payload race**: a ZSET member was popped but its payload was
+      already consumed by a concurrent consumer (the loser of a
+      ``ZPOPMIN`` race finds the payload ``HDEL``'d before its ``HGET``).
+      This is an item-consumed-elsewhere race, not corruption — DEBUG-log
+      and return ``None`` so the scheduler simply retries on the next tick.
+    - **Structural corruption**: the Lua script surfaced a payload whose
+      type cannot be normalized to bytes (an invariant violation).
+      Raises ``QueueError`` so the caller can surface it.
 
     Args:
         queue_name: Name of the queue.
         timeout: Seconds to wait (0 = non-blocking).
 
     Returns:
-        The popped item, or None if queue is empty.
+        The popped item, or None if the queue is empty or the item was
+        consumed by a concurrent consumer.
 
     Raises:
-        QueueError: If the pop fails, or if a ZSET member has no payload.
+        QueueError: If the pop fails, or on structural corruption.
         ValueError: If queue_name contains invalid characters.
     """
     _validate_key_name(queue_name, "queue_name")
@@ -471,21 +484,50 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
-    if result is None:
-      return None
-    # Lua script returns -1 (integer) when the popped member has no payload.
-    if isinstance(result, int):
+    # The Lua script returns a 2-element table {status, payload_or_errmsg}
+    # so a real payload can never collide with a control signal:
+    #   {0, _}             empty queue          -> None
+    #   {1, payload}       success              -> bytes(payload)
+    #   {2, _}             lost-payload race    -> DEBUG log, None
+    #   {3, errmsg}        structural corruption -> QueueError
+    # redis-py decodes Lua tables as Python lists. A legacy / unexpected
+    # non-list result is treated as corruption (defensive — the script
+    # always returns a list now, but a future edit could regress).
+    if not isinstance(result, list) or len(result) < 2:
       msg = (
-        f"Queue corruption: ZSET member in {queue_name} has no payload in "
-        f"{payload_key}. The ZSET and payload hash are out of sync."
+        f"Corrupt pop result from {queue_name}: expected a 2-element "
+        f"[status, payload] list, got {type(result).__name__}: {result!r}"
       )
       raise QueueError(msg, queue_name=queue_name, operation="pop")
-    # decode_responses=True returns str; normalize to bytes for the queue contract.
-    if isinstance(result, str):
-      return result.encode("utf-8")
-    if isinstance(result, (bytes, bytearray)):
-      return bytes(result)
-    msg = f"Unexpected payload type from pop script: {type(result).__name__}"
+    status = result[0]
+    detail = result[1]
+    if status == 0:
+      return None
+    if status == 1:
+      # decode_responses=True returns str; normalize to bytes for the queue contract.
+      if isinstance(detail, str):
+        return detail.encode("utf-8")
+      if isinstance(detail, (bytes, bytearray)):
+        return bytes(detail)
+      msg = (
+        f"Corrupt payload from {queue_name}: expected bytes/str but got "
+        f"{type(detail).__name__}"
+      )
+      raise QueueError(msg, queue_name=queue_name, operation="pop")
+    if status == 2:
+      # Recoverable concurrent-consumer race: another worker already
+      # consumed this item's payload. Not corruption — retry next tick.
+      logger.debug(
+        "Lost-payload race on %s: ZSET member popped but payload already "
+        "consumed by a concurrent consumer. Returning None (no error).",
+        queue_name,
+      )
+      return None
+    # status == 3 (or any unexpected status) is structural corruption.
+    msg = (
+      f"Structural corruption on queue {queue_name}: {detail}. The ZSET "
+      f"and payload hash are in an unexpected state."
+    )
     raise QueueError(msg, queue_name=queue_name, operation="pop")
 
   def _consume_payload(self, payload_key: str, member: str | bytes) -> bytes:

@@ -235,7 +235,8 @@ class TestRedisBackend:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = b"test_data"
+    # New signal scheme: [1, payload] = success.
+    mock_script.return_value = [1, b"test_data"]
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
@@ -247,12 +248,54 @@ class TestRedisBackend:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = None  # Empty queue signal from Lua script
+    # New signal scheme: [0, None] = empty queue.
+    mock_script.return_value = [0, None]
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
     result = backend.pop("test_queue")
     assert result is None
+
+  def test_queue_pop_lost_payload_race_returns_none(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """B1: concurrent-consumer race must NOT raise — recoverable.
+
+    Two consumers race ZPOPMIN; the loser finds its payload already HDEL'd.
+    This is an item-consumed-elsewhere race, not corruption: pop() must
+    return None (DEBUG-log, no raise).
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_script = mocker.MagicMock()
+    # New signal scheme: [2, None] = member popped but payload gone (race).
+    mock_script.return_value = [2, None]
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    result = backend.pop("test_queue")
+    assert result is None
+
+  def test_queue_pop_corruption_raises_queueerror(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """B1: structural corruption (unexpected payload type) raises QueueError.
+
+    Only a genuine invariant violation — payload decoded to a non-bytes /
+    non-str shape that cannot be normalized — escalates to QueueError.
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_script = mocker.MagicMock()
+    # New signal scheme: [3, msg] = structural corruption (e.g. Lua
+    # surfaced an unexpected payload type). We surface it as QueueError.
+    mock_script.return_value = [3, "unexpected payload type: float"]
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    with pytest.raises(QueueError):
+      backend.pop("test_queue")
 
   def test_set_add(self, redis_settings, mock_redis, mocker):
     """Test set add operation."""
@@ -748,20 +791,34 @@ class TestRedisBackendQueueOperations:
     assert payload_key.startswith("{test_queue}:")
 
   def test_pop_raises_on_missing_payload(self, redis_settings, mock_redis, mocker):
-    """Pop must raise QueueError when a ZSET member has no payload (queue corruption).
+    """B1: a lost-payload race must NOT raise; structural corruption must.
 
-    Regression for R4-C1: the Lua script returns -1 when HGET misses;
-    pop must convert that to a loud QueueError, not silently return None.
+    Previously the Lua script returned ``-1`` when HGET missed and pop
+    escalated every such miss to QueueError. B1 distinguishes:
+
+    - lost-payload race (``[2, _]`` — another consumer won ZPOPMIN and
+      HDEL'd the payload first): recoverable → pop returns None, no raise.
+    - structural corruption (``[3, msg]`` — payload decoded to an
+      unexpected type): QueueError, so the caller can surface it.
+
+    Regression for R4-C1 / B1.
     """
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
-    mock_script = mocker.MagicMock()
-    mock_script.return_value = -1  # Orphan marker from Lua script
-    mock_redis.register_script.return_value = mock_script
+    # Lost-payload race: recoverable, returns None (no raise).
+    mock_script_race = mocker.MagicMock()
+    mock_script_race.return_value = [2, None]
+    mock_redis.register_script.return_value = mock_script_race
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError, match="Queue corruption"):
+    assert backend.pop("test_queue") is None
+
+    # Structural corruption: loud QueueError.
+    mock_script_corrupt = mocker.MagicMock()
+    mock_script_corrupt.return_value = [3, "unexpected payload type: float"]
+    mock_redis.register_script.return_value = mock_script_corrupt
+    with pytest.raises(QueueError, match="Structural corruption"):
       backend.pop("test_queue")
 
   def test_non_blocking_pop_uses_lua_script(
@@ -776,7 +833,7 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = b"payload"
+    mock_script.return_value = [1, b"payload"]  # New signal scheme: [1, payload] = success.
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
@@ -802,7 +859,8 @@ class TestRedisBackendQueueOperations:
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = "string_payload"  # decode_responses=True
+    # New signal scheme: [1, payload] = success; decode_responses=True → str payload.
+    mock_script.return_value = [1, "string_payload"]
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
@@ -826,17 +884,17 @@ class TestRedisBackendQueueOperations:
     mock_redis.pipeline.assert_called_with(transaction=True)
 
   def test_pop_raises_on_unexpected_payload_type(self, redis_settings, mock_redis, mocker):
-    """R5: a non-None/int/str/bytes pop result → QueueError (defensive)."""
+    """R5: a pop result that is not a 2-element [status, payload] list → QueueError (defensive)."""
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import QueueError
 
     mock_script = mocker.MagicMock()
-    mock_script.return_value = 3.14  # float — none of the expected Lua return types
+    mock_script.return_value = 3.14  # float — not the expected [status, payload] list shape
     mock_redis.register_script.return_value = mock_script
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
 
-    with pytest.raises(QueueError, match="Unexpected payload type from pop script"):
+    with pytest.raises(QueueError, match="Corrupt pop result"):
       backend.pop("test_queue")
 
   def test_consume_payload_raises_on_pipeline_redis_error(

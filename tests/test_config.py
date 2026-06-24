@@ -89,6 +89,16 @@ class TestRedisSettings:
     assert settings.host == "redis.example.com"
     assert settings.port == 6380
 
+  def test_ssl_check_hostname_defaults_to_true(self):
+    """R2-C1: TLS hostname verification must be ON by default.
+
+    A misconfigured env that flips ``ssl_enabled=True`` must NOT silently
+    accept any valid-CA cert for an unrelated domain (MITM). Operators who
+    need IP-only service discovery must opt out explicitly.
+    """
+    settings = RedisSettings()
+    assert settings.ssl_check_hostname is True
+
 
 class TestMongoDBSettings:
   """Test MongoDBSettings."""
@@ -143,14 +153,39 @@ def test_kafka_settings_from_env(monkeypatch):
 
 
 def test_rabbitmq_settings_defaults():
+  """R2-C2: username/password are required (no silent guest/guest fallback).
+
+  Construction must fail fast when creds are missing. Tests that exercise
+  non-auth fields pass explicit test credentials.
+  """
   from scrapy_extension.settings import RabbitMQSettings
 
-  settings = RabbitMQSettings()
+  settings = RabbitMQSettings(username="test-user", password="test-pass")
   assert settings.host == "localhost"
   assert settings.port == 5672
-  assert settings.username == "guest"
-  assert settings.password.get_secret_value() == "guest"
+  assert settings.username == "test-user"
+  assert settings.password.get_secret_value() == "test-pass"
   assert settings.max_priority == 255
+
+
+def test_rabbitmq_settings_requires_username_and_password(monkeypatch):
+  """R2-C2: missing creds must raise ValidationError (no guest/guest default)."""
+  from scrapy_extension.settings import RabbitMQSettings
+
+  # The ``_rabbitmq_test_credentials`` autouse fixture (conftest) sets these so
+  # bare ``RabbitMQSettings()`` works elsewhere; this test asserts the
+  # required-creds contract, so they must be absent here.
+  monkeypatch.delenv("SCRAPY_RABBITMQ_USERNAME", raising=False)
+  monkeypatch.delenv("SCRAPY_RABBITMQ_PASSWORD", raising=False)
+
+  with pytest.raises(ValidationError):
+    RabbitMQSettings()
+
+  with pytest.raises(ValidationError):
+    RabbitMQSettings(password="p")
+
+  with pytest.raises(ValidationError):
+    RabbitMQSettings(username="u")
 
 
 class TestConfigurationErrorRedaction:

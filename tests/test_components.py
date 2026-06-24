@@ -7,7 +7,11 @@ from scrapy import Field, Item
 from scrapy.http import Request
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
-from scrapy_extension.exceptions import QueueError, SerializationError
+from scrapy_extension.exceptions import (
+  ConfigurationError,
+  QueueError,
+  SerializationError,
+)
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -839,6 +843,123 @@ class TestBackendScheduler:
 
     scheduler.open(valid_spider)  # must not raise
     assert scheduler._spider is valid_spider
+
+
+class TestSchedulerAckConcurrencyGate:
+  """E1: fail-fast gate for the ack/nack single-slot defect.
+
+  Kafka/RabbitMQ pop() track only the last-popped message for ack; under
+  ``CONCURRENT_REQUESTS > 1`` earlier messages leak (Kafka: uncommitted →
+  re-delivered; RabbitMQ: requeued on disconnect). The scheduler must turn
+  this silent data-loss into a loud ``ConfigurationError`` at construction
+  time, unless the operator explicitly opts out via
+  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=true``.
+  """
+
+  @staticmethod
+  def _make_settings(backend_type: str, concurrent: int, opt_out: bool = False):
+    """Build a Scrapy-Settings-like mock resolving the queue backend + concurrency."""
+    from unittest.mock import Mock
+
+    settings = Mock()
+    backend_map = {
+      "SCRAPY_BACKEND_TYPE": backend_type,
+      "SCRAPY_QUEUE_KEY": "scheduler:queue",
+    }
+
+    def get(key, default=None):
+      if key == "CONCURRENT_REQUESTS":
+        return concurrent
+      if key == "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS":
+        return "true" if opt_out else None
+      return backend_map.get(key, default)
+
+    settings.get.side_effect = get
+    settings.getfloat.return_value = 0.0
+    settings.getdict.return_value = {}
+
+    def getint(key, default=0):
+      if key == "CONCURRENT_REQUESTS":
+        return concurrent
+      return default
+
+    settings.getint.side_effect = getint
+    return settings
+
+  def test_kafka_with_concurrency_gt_1_raises_configuration_error(self, mocker):
+    """Kafka queue + CONCURRENT_REQUESTS=16 (default) → ConfigurationError."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("kafka", concurrent=16)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      BackendScheduler.from_settings(settings)
+
+    msg = str(exc_info.value)
+    assert "CONCURRENT_REQUESTS" in msg
+    assert "at-least-once" in msg.lower() or "at-least-once" in msg
+    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" in msg
+
+  def test_rabbitmq_with_concurrency_gt_1_raises_configuration_error(self, mocker):
+    """RabbitMQ queue + CONCURRENT_REQUESTS=4 → ConfigurationError."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("rabbitmq", concurrent=4)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      BackendScheduler.from_settings(settings)
+
+    msg = str(exc_info.value)
+    assert "CONCURRENT_REQUESTS" in msg
+    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" in msg
+
+  def test_kafka_with_opt_out_allows_concurrency_gt_1(self, mocker):
+    """Opt-out flag unblocks Kafka under concurrency > 1 (operator acknowledges the risk)."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("kafka", concurrent=16, opt_out=True)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+    assert scheduler.queue_key == "scheduler:queue"
+
+  def test_kafka_with_concurrency_eq_1_allows(self, mocker):
+    """Kafka + CONCURRENT_REQUESTS=1 (at-least-once correct) → allowed."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("kafka", concurrent=1)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+    assert scheduler.queue_key == "scheduler:queue"
+
+  def test_redis_with_concurrency_gt_1_allows(self, mocker):
+    """Atomic-pop Redis backend + concurrency > 1 → allowed (no false positives).
+
+    Redis pop is a single atomic ZPOPMIN with no separate ack step, so the
+    single-slot ack defect does not apply.
+    """
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    settings = self._make_settings("redis", concurrent=16)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+    assert scheduler.queue_key == "scheduler:queue"
+
+  def test_gate_fires_via_from_crawler(self, mocker):
+    """The gate is reachable via from_crawler (the real Scrapy entry point)."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_crawler = mocker.Mock()
+    mock_crawler.settings = self._make_settings("kafka", concurrent=8)
+    mock_crawler.stats = mocker.Mock()
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    with pytest.raises(ConfigurationError):
+      BackendScheduler.from_crawler(mock_crawler)
 
 
 class TestBackendDupeFilter:

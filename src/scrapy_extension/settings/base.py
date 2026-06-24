@@ -51,3 +51,23 @@ class Settings(BaseSettings):
     ge=0,
     description="Delay between retry attempts in seconds",
   )
+  queue_max_item_bytes: int = Field(
+    default=1_048_576,
+    gt=0,
+    description=(
+      "Maximum serialized bytes allowed for a single queued request. "
+      "Requests exceeding this are rejected with SerializationError at push "
+      "time (preventing silent drops by capped storage backends). Default "
+      "1 MiB matches the Memcached 1 MB ceiling."
+    ),
+  )
+  pipeline_max_item_bytes: int = Field(
+    default=1_048_576,
+    gt=0,
+    description=(
+      "Maximum serialized bytes allowed for a single stored item. "
+      "Items exceeding this are rejected with SerializationError at store "
+      "time (preventing silent drops by capped storage backends like "
+      "Memcached 1 MB, DynamoDB 400 KB)."
+    ),
+  )

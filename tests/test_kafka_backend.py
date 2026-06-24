@@ -275,7 +275,7 @@ class TestKafkaBackendConfluentMode:
     assert backend.is_connected()
 
 
-class TestKafkaBackendPush:
+class TestKafkaBackendPushPriorityMapping:
   """Tests for push() priority mapping."""
 
   def test_push_clamps_negative_priority_to_partition_zero(self, mocker):
@@ -999,4 +999,33 @@ def test_kafka_build_common_config_redacts_sasl_password(mocker):
   # But repr of the dict (the leak vector for Sentry / debug logs) hides it
   assert "super-secret-pwd" not in repr(built)
   assert "<redacted>" in repr(built)
+
+
+def test_kafka_build_client_security_config_redacts_confluent_credentials():
+  """E2: Confluent api_key/secret must be redacted in repr of the client config.
+
+  SASL password is already wrapped in ``_RedactedStr``, but Confluent Cloud
+  credentials (``confluent_api_key`` / ``confluent_api_secret``) are plumbed
+  into ``sasl_plain_username`` / ``sasl_plain_password`` without redaction,
+  so ``repr(config)`` and traceback dumps of locals leak them.
+  """
+  from scrapy_extension.backends.kafka import KafkaBackend
+  from scrapy_extension.settings.kafka import KafkaSettings
+
+  config = KafkaSettings(
+    mode=KafkaMode.CONFLUENT,
+    confluent_bootstrap_servers="pkc-xxx.confluent.cloud:9092",
+    confluent_api_key="CKEY_TOP_SECRET_123",
+    confluent_api_secret="CSECRET_TOP_SECRET_456",
+  )
+  backend = KafkaBackend(config)
+  client_config = backend._build_client_security_config()
+
+  # Values remain usable as normal strings for kafka-python.
+  assert str(client_config["sasl_plain_username"]) == "CKEY_TOP_SECRET_123"
+  assert str(client_config["sasl_plain_password"]) == "CSECRET_TOP_SECRET_456"
+  # But repr of the config dict (Sentry / debug-log leak vector) hides both.
+  assert "CKEY_TOP_SECRET_123" not in repr(client_config)
+  assert "CSECRET_TOP_SECRET_456" not in repr(client_config)
+  assert "<redacted>" in repr(client_config)
 

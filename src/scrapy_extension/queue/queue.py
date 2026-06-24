@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import warnings
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
 
 logger = logging.getLogger(__name__)
+
+#: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
+DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
 
 
 class BackendQueue:
@@ -47,6 +51,7 @@ class BackendQueue:
     *,
     spider: Spider | None = None,
     queue_strategy: QueueStrategy | None = None,
+    max_item_bytes: int = DEFAULT_QUEUE_MAX_ITEM_BYTES,
   ) -> None:
     """Initialize the backend queue.
 
@@ -58,10 +63,14 @@ class BackendQueue:
         queue_strategy: Optional queue-semantics strategy. When ``None``
             (default), a ``PassthroughQueueStrategy`` delegates push/pop to the
             QueueBackend unchanged — preserving the pre-strategy behavior.
+        max_item_bytes: Maximum serialized bytes permitted for a single queued
+            request. Oversize payloads raise ``SerializationError`` at push
+            time (D2 — DoS guard against capped storage backends).
     """
     self.connection_manager = connection_manager
     self.queue_name = queue_name
     self._spider = spider
+    self.max_item_bytes = max_item_bytes
     self._strategy: QueueStrategy = (
       queue_strategy
       if queue_strategy is not None
@@ -128,6 +137,15 @@ class BackendQueue:
         serializer="json",
       ) from e
 
+    if len(data) > self.max_item_bytes:
+      self._inc_stat("scheduler/queue/oversize_dropped")
+      msg = (
+        f"Serialized request ({len(data)} bytes) exceeds max_item_bytes "
+        f"({self.max_item_bytes}). Rejecting push to avoid silent drop by "
+        f"capped storage backends."
+      )
+      raise SerializationError(msg, data=request, serializer="json")
+
     delay = float(request.meta.get("delay") or 0.0)
     source = str(request.meta.get("source") or "default")
     self._strategy.push(
@@ -169,6 +187,14 @@ class BackendQueue:
     Reverses ``_request_to_dict``'s base64 encoding so Scrapy's
     ``request_from_dict`` receives raw bytes.
 
+    Legacy migration (D1): pre-base64 package versions wrote raw UTF-8/latin-1
+    bodies to the queue. On rolling upgrade those items would hit
+    ``b64decode(validate=True)`` and raise, causing the scheduler to silently
+    drop them. To preserve those items, a body that fails base64 validation
+    but is valid UTF-8 is migrated to its UTF-8 bytes with a one-time
+    ``DeprecationWarning``. Structural corruption (neither valid base64 nor
+    valid UTF-8) still raises ``SerializationError``.
+
     Args:
         request_dict: The deserialized request dict to mutate.
     """
@@ -177,9 +203,27 @@ class BackendQueue:
       return
     try:
       request_dict["body"] = base64.b64decode(body, validate=True)
-    except (binascii.Error, ValueError) as e:
-      msg = f"Invalid base64 body in queued request: {e}"
-      raise SerializationError(msg, data=body, serializer="json") from e
+    except (binascii.Error, ValueError):
+      # D1: attempt legacy migration — pre-base64 bodies were raw UTF-8.
+      if isinstance(body, str):
+        try:
+          legacy_bytes = body.encode("utf-8")
+        except UnicodeEncodeError:
+          legacy_bytes = None
+      else:
+        legacy_bytes = None
+      if legacy_bytes is not None:
+        warnings.warn(
+          "legacy non-base64 queue body; will be unsupported after the "
+          "next major. Re-queue the request with a current package version "
+          "to migrate it.",
+          DeprecationWarning,
+          stacklevel=2,
+        )
+        request_dict["body"] = legacy_bytes
+        return
+      msg = "Invalid base64 body in queued request: body is not valid base64"
+      raise SerializationError(msg, data=body, serializer="json")
 
   def __len__(self) -> int:
     """Get the number of requests in the queue.
@@ -216,6 +260,24 @@ class BackendQueue:
     re-delivered.
     """
     self.connection_manager.get_queue_backend().nack(self.queue_name)
+
+  def _inc_stat(self, stat_name: str) -> None:
+    """Increment a Scrapy stat, tolerating missing spider/crawler/stats.
+
+    Defensively chains ``self._spider.crawler.stats`` via ``getattr`` because
+    the queue may be constructed without a spider (e.g. in tests) and legacy
+    spiders may not expose ``crawler``. Silent skip when the chain is broken —
+    the ``SerializationError`` already surfaced the condition; a missing
+    counter is preferable to crashing the push path. Mirrors the pipeline's
+    ``_inc_stat``.
+
+    Args:
+        stat_name: The Scrapy stats key to increment.
+    """
+    crawler = getattr(self._spider, "crawler", None) if self._spider else None
+    stats = getattr(crawler, "stats", None) if crawler is not None else None
+    if stats is not None:
+      stats.inc_value(stat_name)
 
   def close(self) -> None:
     """Close the queue, delegating to the queue strategy's lifecycle hook.

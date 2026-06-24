@@ -215,8 +215,12 @@ class KafkaBackend(Backend, QueueBackend):
         return {
           "security_protocol": "SASL_SSL",
           "sasl_mechanism": "PLAIN",
-          "sasl_plain_username": secret_value(self.config.confluent_api_key),
-          "sasl_plain_password": secret_value(self.config.confluent_api_secret),
+          "sasl_plain_username": _RedactedStr(
+            secret_value(self.config.confluent_api_key)
+          ),
+          "sasl_plain_password": _RedactedStr(
+            secret_value(self.config.confluent_api_secret)
+          ),
         }
 
     common_config = self._build_common_config()
