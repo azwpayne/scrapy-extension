@@ -301,16 +301,23 @@ class PulsarBackend(Backend, QueueBackend):
     self._last_msg = msg
     return _message_bytes(msg)
 
-  def ack(self, queue_name: str) -> None:
+  def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Acknowledge the last-popped message so it isn't re-delivered.
+
+    ``token`` is accepted for interface compatibility with the concurrency-
+    correct ack path (see QueueBackend.pop_with_ack) but not yet used —
+    Pulsar still tracks a single ``_last_msg`` slot. The full in-flight-set
+    fix for Pulsar is a follow-up; until then pin ``CONCURRENT_REQUESTS=1``
+    for strict at-least-once.
 
     Args:
         queue_name: The queue name.
+        token: Unused (accepted for signature compatibility).
 
     Raises:
         QueueError: If the acknowledge fails.
     """
-    del queue_name
+    del queue_name, token
     if self._consumer is None or self._last_msg is None:
       return
     try:
@@ -320,7 +327,7 @@ class PulsarBackend(Backend, QueueBackend):
     finally:
       self._last_msg = None
 
-  def nack(self, queue_name: str) -> None:
+  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Negative-acknowledge the last message for re-delivery.
 
     If the client supports ``negative_acknowledge``, the message is scheduled
@@ -329,8 +336,9 @@ class PulsarBackend(Backend, QueueBackend):
 
     Args:
         queue_name: The queue name.
+        token: Unused (accepted for signature compatibility).
     """
-    del queue_name
+    del queue_name, token
     if self._consumer is None or self._last_msg is None:
       return
     try:

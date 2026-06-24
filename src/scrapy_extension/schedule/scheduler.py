@@ -12,14 +12,13 @@ from typing import TYPE_CHECKING, Any
 from scrapy import signals
 from scrapy.utils.misc import load_object
 
-from scrapy_extension.backends.base import BackendType, _validate_key_name
+from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.backends.connectors import (
   QUEUE_CAPABLE_BACKENDS,
   ConnectionManager,
   resolve_backend_config,
 )
 from scrapy_extension.exceptions import (
-  ConfigurationError,
   QueueError,
   SerializationError,
 )
@@ -57,18 +56,28 @@ class BackendScheduler:
      the pipeline side); a crash before ack re-delivers the message
      (at-least-once for the download side).
 
-  2. **Set ``CONCURRENT_REQUESTS=1`` for at-least-once correctness with
-     message-queue backends** (Kafka, RabbitMQ). With concurrency > 1 the
-     scheduler pops and acks multiple messages before any of them finish
-     processing, so ordering and at-least-once guarantees weaken. Pin
-     concurrency to 1 when those guarantees matter; throughput can instead
-     be scaled by adding worker processes (each with its own consumer).
+  2. **Concurrent ack is correct.** ``BackendQueue.pop`` calls
+     ``pop_with_ack`` and carries the returned token in
+     ``request.meta["_backend_ack_token"]``; this scheduler reads it on
+     ``response_received`` / ``spider_error`` and forwards it to
+     ``BackendQueue.ack(token=…)`` / ``nack(token=…)``. The backend acks
+     the *specific* message identified by that token (Kafka commits the
+     contiguous low-watermark for the token's partition; RabbitMQ
+     ``basic_ack``s the token's delivery tag) — so under
+     ``CONCURRENT_REQUESTS > 1`` no message is skipped or lost. The
+     previous ``CONCURRENT_REQUESTS=1`` restriction and the
+     ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out have been removed.
 
-  3. **Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) are
+  3. **At-least-once on crash is inherent.** A worker crash before ack
+     fires leaves the message unacked (Kafka: offset uncommitted; RabbitMQ:
+     delivery unacked) → it is re-delivered on reconnect/restart. This is
+     the intended at-least-once guarantee, not a defect.
+
+  4. **Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) are
      unaffected** by the above — their pop is a single atomic operation
      with no separate ack/nack step, so the ``response_received`` wiring is
-     a no-op for them. ``CONCURRENT_REQUESTS`` can be tuned freely on atomic
-     backends.
+     a no-op for them (their token is ``None``). ``CONCURRENT_REQUESTS``
+     can be tuned freely on atomic backends.
 
   Attributes:
       connection_manager: The connection manager for backend access.
@@ -105,58 +114,6 @@ class BackendScheduler:
     self._signals_connected: bool = False
     self._connected_signals = None
 
-  # Backends whose ``pop`` tracks only the last-popped message for ack.
-  # Under ``CONCURRENT_REQUESTS > 1`` earlier messages leak (uncommitted /
-  # requeued), silently breaking at-least-once. The full in-flight-set fix
-  # is deferred; this gate surfaces the misconfiguration at construction.
-  _ACK_SINGLE_SLOT_BACKENDS: frozenset[BackendType] = frozenset(
-    {BackendType.KAFKA, BackendType.RABBITMQ}
-  )
-  _ACK_UNSAFE_OPT_OUT = "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS"
-
-  @classmethod
-  def _enforce_ack_concurrency_gate(
-    cls, settings: Settings, backend_type: BackendType
-  ) -> None:
-    """Fail-fast if an ack-single-slot backend runs under concurrency > 1.
-
-    Kafka/RabbitMQ ``pop`` track a single ack slot; with
-    ``CONCURRENT_REQUESTS > 1`` Scrapy pops and acks multiple messages before
-    any finish, so only the last-popped message is ackable — earlier ones
-    leak (Kafka: uncommitted → re-delivered on restart; RabbitMQ: requeued on
-    disconnect). This converts that silent data-loss into a loud
-    ``ConfigurationError`` unless the operator explicitly opts out via
-    ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=true``.
-
-    Atomic-pop backends (Redis, MongoDB, ElasticSearch, RocketMQ) are
-    unaffected — their pop is a single atomic operation with no separate ack
-    step — so the gate only targets the single-slot backends.
-    """
-    if backend_type not in cls._ACK_SINGLE_SLOT_BACKENDS:
-      return
-    concurrent_requests = settings.getint("CONCURRENT_REQUESTS", 1)
-    if concurrent_requests <= 1:
-      return
-    opt_out = str(
-      settings.get(cls._ACK_UNSAFE_OPT_OUT, "") or ""
-    ).strip().lower()
-    if opt_out == "true":
-      return
-    msg = (
-      f"Queue backend {backend_type.value!r} with CONCURRENT_REQUESTS="
-      f"{concurrent_requests} breaks at-least-once delivery: "
-      f"{backend_type.value.capitalize()} pop() tracks only the last-popped "
-      f"message for ack, so under concurrency > 1 earlier messages leak "
-      f"(uncommitted/requeued → re-delivered). Set CONCURRENT_REQUESTS=1 for "
-      f"correct at-least-once semantics, or acknowledge the risk by setting "
-      f"{cls._ACK_UNSAFE_OPT_OUT}=true."
-    )
-    raise ConfigurationError(
-      msg,
-      setting_name="CONCURRENT_REQUESTS",
-      setting_value=concurrent_requests,
-    )
-
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendScheduler:
     """Create scheduler from Scrapy settings.
@@ -170,16 +127,10 @@ class BackendScheduler:
     bind to a different backend than the dedup filter or storage pipeline
     (multi-backend coexistence). Unset → falls back to the global keys.
 
-    Raises:
-        ConfigurationError: If the queue backend is Kafka or RabbitMQ (whose
-            ``pop`` tracks only the last-popped message for ack) AND
-            ``CONCURRENT_REQUESTS > 1`` AND the operator has not opted out via
-            ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=true``. Under concurrency > 1
-            only the last-popped message is ackable, so earlier messages leak
-            (Kafka: uncommitted → re-delivered; RabbitMQ: requeued on
-            disconnect), silently breaking at-least-once. The full in-flight-set
-            fix is deferred; this gate converts silent data loss into a loud
-            config error.
+    Ack correctness under ``CONCURRENT_REQUESTS > 1`` is handled at the
+    backend layer (per-message ack tokens + contiguous watermark commit /
+    per-tag basic_ack), so no concurrency gate is applied here. See the
+    class docstring for the at-least-once semantics.
     """
     from scrapy_extension.queue.strategies.factory import (
       QueueStrategyType,
@@ -193,7 +144,6 @@ class BackendScheduler:
       required_capabilities=QUEUE_CAPABLE_BACKENDS,
       component_name="queue",
     )
-    cls._enforce_ack_concurrency_gate(settings, backend_type)
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
       settings=backend_settings,
@@ -284,12 +234,24 @@ class BackendScheduler:
     request: Request,
     spider: Spider,
   ) -> None:
-    """Ack the last-popped message after the download succeeded."""
-    del response, request, spider
+    """Ack the specific popped message after the download succeeded.
+
+    Reads the ack token the pop path injected into
+    ``request.meta["_backend_ack_token"]`` and forwards it to
+    ``BackendQueue.ack(token=…)`` so the backend acks the *specific*
+    message (Kafka contiguous watermark / RabbitMQ per-tag basic_ack) —
+    correct under ``CONCURRENT_REQUESTS > 1``.
+    """
+    del response, spider
     if self._queue is None:
       return
+    token = (
+      request.meta.get("_backend_ack_token")
+      if request is not None and getattr(request, "meta", None) is not None
+      else None
+    )
     try:
-      self._queue.ack()
+      self._queue.ack(token=token)
     except QueueError:
       logger.exception("Failed to ack message after response_received")
 
@@ -299,12 +261,20 @@ class BackendScheduler:
     response: Response,
     spider: Spider,
   ) -> None:
-    """Nack the last-popped message so it re-delivers for retry."""
-    del failure, response, spider
+    """Nack the specific popped message so it re-delivers for retry.
+
+    Reads the ack token from ``response.request.meta`` (the request that
+    failed) and forwards it to ``BackendQueue.nack(token=…)``.
+    """
+    del failure, spider
     if self._queue is None:
       return
+    token = None
+    failed_request = getattr(response, "request", None) if response is not None else None
+    if failed_request is not None and getattr(failed_request, "meta", None) is not None:
+      token = failed_request.meta.get("_backend_ack_token")
     try:
-      self._queue.nack()
+      self._queue.nack(token=token)
     except QueueError:
       logger.exception("Failed to nack message after spider_error")
 

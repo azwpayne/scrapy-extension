@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from scrapy.utils.request import request_from_dict
 
-from scrapy_extension.backends.base import JSONSerializer
+from scrapy_extension.backends.base import JSONSerializer, QueueBackend
 from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import Monitor
@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 #: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
 DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
+
+#: Meta key carrying the backend ack token from pop → request → response → ack.
+#: Atomic-pop backends set this to ``None`` (harmless); message-queue backends
+#: (Kafka, RabbitMQ) set it to a backend-specific token so the scheduler can
+#: ack the *specific* message that produced this request — correct under
+#: ``CONCURRENT_REQUESTS > 1``.
+BACKEND_ACK_TOKEN_META_KEY = "_backend_ack_token"
 
 
 class BackendQueue:
@@ -166,6 +173,14 @@ class BackendQueue:
   def pop(self, timeout: float = 0.0) -> Request | None:
     """Pop a request from the queue.
 
+    Calls the backend's ``pop_with_ack`` and injects the returned ack token
+    into ``request.meta["_backend_ack_token"]`` so the scheduler can ack the
+    *specific* message that produced this request — correct under
+    ``CONCURRENT_REQUESTS > 1``. For atomic-pop backends the token is
+    ``None`` (harmless). The scheduler reads it on ``response_received`` /
+    ``spider_error`` and forwards it to :meth:`BackendQueue.ack` /
+    :meth:`BackendQueue.nack`.
+
     Args:
         timeout: Seconds to wait for an item (0 = non-blocking).
 
@@ -175,7 +190,7 @@ class BackendQueue:
     Raises:
         SerializationError: If the request cannot be deserialized.
     """
-    data = self._strategy.pop(self.queue_name, timeout)
+    data, ack_token = self._pop_with_ack(timeout)
     # Emit on every pop call — ``queue/pop_count`` is the consumer-liveness
     # signal (pop attempts per second), independent of whether an item was
     # returned. A worker popping an empty queue is itself operability signal.
@@ -195,7 +210,7 @@ class BackendQueue:
     try:
       request_dict = cast("dict[str, Any]", self._serializer.deserialize(data))
       self._decode_body(request_dict)
-      return request_from_dict(request_dict, spider=self._spider)
+      request = request_from_dict(request_dict, spider=self._spider)
     except Exception as e:
       msg = f"Failed to deserialize request: {e}"
       raise SerializationError(
@@ -203,6 +218,55 @@ class BackendQueue:
         data=data,
         serializer="json",
       ) from e
+    # Carry the backend ack token through the request so the scheduler can
+    # correlate ack/nack back to the specific message that was popped. Only
+    # inject when there's an actual token — atomic-pop backends return None
+    # and we leave request.meta untouched (keeps the roundtrip byte-identical
+    # for them; the scheduler reads .get() which returns None either way).
+    if ack_token is not None:
+      request.meta[BACKEND_ACK_TOKEN_META_KEY] = ack_token
+    return request
+
+  def _pop_with_ack(self, timeout: float) -> tuple[bytes | None, Any | None]:
+    """Pop bytes + ack token, honoring the queue-semantics strategy.
+
+    The passthrough strategy (default) delegates to the backend's
+    ``pop_with_ack`` so the ack token correlates to the specific popped
+    message (correct under ``CONCURRENT_REQUESTS > 1``). For in-process
+    reordering strategies (delay / round_robin / throttle) the strategy's
+    own ``pop`` is used and the token is ``None`` — those strategies hold
+    items in-process and break per-message backend ack correlation by
+    construction, so ack falls back to the backend's legacy last-message
+    path (acceptable: those strategies are not the concurrency-correctness
+    target of this fix).
+
+    Only backends that genuinely override ``pop_with_ack`` (Kafka,
+    RabbitMQ) take the token-correlated path. Atomic-pop backends (Redis,
+    MongoDB, ElasticSearch, RocketMQ) inherit the default
+    ``pop_with_ack → (pop(), None)``, and legacy test mocks that stub only
+    ``pop`` are detected and routed through ``pop()`` with token ``None``
+    so their existing assertions stay valid.
+    """
+    from scrapy_extension.queue.strategies.passthrough import (
+      PassthroughQueueStrategy,
+    )
+
+    if isinstance(self._strategy, PassthroughQueueStrategy):
+      backend = self.connection_manager.get_queue_backend()
+      # Only use the token-correlated path when the backend's class
+      # actually overrides pop_with_ack (Kafka/RabbitMQ). Atomic-pop
+      # backends inherit the base default and keep the plain pop() path.
+      backend_cls = getattr(backend, "__class__", None)
+      override = (
+        backend_cls is not None
+        and getattr(backend_cls, "pop_with_ack", None) is not None
+        and backend_cls.pop_with_ack is not QueueBackend.pop_with_ack
+      )
+      if override:
+        return backend.pop_with_ack(self.queue_name, timeout)
+      data = backend.pop(self.queue_name, timeout)
+      return (data, None)
+    return (self._strategy.pop(self.queue_name, timeout), None)
 
   @staticmethod
   def _decode_body(request_dict: dict[str, Any]) -> None:
@@ -261,29 +325,44 @@ class BackendQueue:
     """Clear all requests from the queue."""
     self._strategy.clear(self.queue_name)
 
-  def ack(self) -> None:
-    """Acknowledge the last-popped request.
+  def ack(self, *, token: Any | None = None) -> None:
+    """Acknowledge the popped request identified by ``token``.
 
     Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) implement
     this as a no-op. Message-queue backends (Kafka, RabbitMQ) commit the
     offset / ack the delivery so the message isn't re-delivered.
 
-    Call after the spider has successfully processed the request popped
-    from this queue. Wired automatically by ``BackendScheduler`` in a
-    future round; for now, callers invoke explicitly.
-    """
-    self.connection_manager.get_queue_backend().ack(self.queue_name)
+    When ``token`` is provided (read from
+    ``request.meta["_backend_ack_token"]`` by the scheduler), the backend
+    acks the *specific* message — correct under
+    ``CONCURRENT_REQUESTS > 1``. When ``None``, the backend acks its
+    last-popped message (legacy single-slot path).
 
-  def nack(self) -> None:
-    """Negatively acknowledge the last-popped request.
+    Args:
+        token: Opaque ack token from ``BackendQueue.pop``'s meta injection,
+            or ``None``.
+    """
+    backend = self.connection_manager.get_queue_backend()
+    if token is not None:
+      backend.ack(self.queue_name, token=token)
+    else:
+      backend.ack(self.queue_name)
+
+  def nack(self, *, token: Any | None = None) -> None:
+    """Negatively acknowledge the popped request identified by ``token``.
 
     Atomic backends: no-op. Message-queue backends: requeue the message
     so another consumer (or this one, later) can retry.
 
-    Call when the spider failed to process the request and you want it
-    re-delivered.
+    Args:
+        token: Opaque ack token from ``BackendQueue.pop``'s meta injection,
+            or ``None``.
     """
-    self.connection_manager.get_queue_backend().nack(self.queue_name)
+    backend = self.connection_manager.get_queue_backend()
+    if token is not None:
+      backend.nack(self.queue_name, token=token)
+    else:
+      backend.nack(self.queue_name)
 
   def _inc_stat(self, stat_name: str) -> None:
     """Increment a Scrapy stat, tolerating missing spider/crawler/stats.

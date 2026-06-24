@@ -277,11 +277,13 @@ def test_rabbitmq_backend_nack_raises_queue_error_on_amqp_error(mocker):
   assert backend._last_delivery_tag is None
 
 
-def test_rabbitmq_backend_pop_warns_when_previous_unacked(mocker, caplog):
-  """R18: pop() while a previous message is unacked warns about CONCURRENT_REQUESTS>1.
+def test_rabbitmq_backend_pop_does_not_warn_on_concurrent_pops(mocker, caplog):
+  """Tier-2 Unit H: the single-slot defect warning is GONE.
 
-  Pins the concurrent-pop detection — surfaces the misconfiguration that
-  breaks ack tracking under CONCURRENT_REQUESTS>1.
+  Previously pop() warned about CONCURRENT_REQUESTS>1 because the single
+  _last_delivery_tag slot would be overwritten. With the in-flight-set fix
+  (pop_with_ack tracks every delivery tag), concurrent pops no longer warn
+  — they're correct. This pins the warning's absence to catch regressions.
   """
   import logging
 
@@ -300,10 +302,10 @@ def test_rabbitmq_backend_pop_warns_when_previous_unacked(mocker, caplog):
   caplog.clear()
   with caplog.at_level(logging.WARNING):
     backend.pop("test_queue")  # sets _last_delivery_tag
-    backend.pop("test_queue")  # previous still unacked → warning
+    backend.pop("test_queue")  # concurrent pop — no longer a defect
 
-  assert "pop() called while previous message is unacked" in caplog.text
-  assert "CONCURRENT_REQUESTS>1" in caplog.text
+  assert "pop() called while previous message is unacked" not in caplog.text
+  assert "CONCURRENT_REQUESTS>1" not in caplog.text
 
   assert mock_channel.basic_ack.call_count == 0
 
@@ -1087,3 +1089,104 @@ def test_rabbitmq_backend_disconnect_only_connection(mocker):
   backend.disconnect()
   mock_instance.close.assert_called_once()
   assert backend._connection is None
+
+
+class TestRabbitMQBackendPopWithAckConcurrency:
+  """Tier-2 Unit H: pop_with_ack + ack(token) correctness under CONCURRENT_REQUESTS>1.
+
+  Proves N concurrent pops return N distinct delivery tags and ack(token=tag)
+  basic_acks the RIGHT tag regardless of pop/ack order.
+  """
+
+  @staticmethod
+  def _make_backend(mocker, delivery_tags):
+    """Build a connected RabbitMQBackend whose basic_get yields the given tags in order."""
+    config = RabbitMQSettings()
+    backend = RabbitMQBackend(config)
+    mock_instance = mocker.MagicMock()
+    mock_channel = mocker.MagicMock()
+    mock_instance.channel.return_value = mock_channel
+    mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+    backend.connect()
+
+    method_frames = [mocker.MagicMock(delivery_tag=tag) for tag in delivery_tags]
+    bodies = [bytes([tag]) for tag in delivery_tags]
+    mock_channel.basic_get.side_effect = [
+      (method_frames[i], None, bodies[i]) for i in range(len(delivery_tags))
+    ] + [(None, None, None)] * 3  # subsequent gets return empty
+    return backend, mock_channel
+
+  def test_concurrent_pops_return_distinct_delivery_tags(self, mocker):
+    """(a) N concurrent pops return N distinct delivery tags."""
+    backend, _channel = self._make_backend(mocker, [10, 20, 30])
+
+    results = [backend.pop_with_ack("q") for _ in range(3)]
+    tags = [token for _body, token in results]
+
+    assert all(t is not None for t in tags)
+    assert len(set(tags)) == 3
+    assert sorted(tags) == [10, 20, 30]
+
+  def test_ack_token_acks_right_tag_regardless_of_order(self, mocker):
+    """(b) ack(token=tag_i) calls basic_ack(delivery_tag=tag_i) for the RIGHT tag, any order."""
+    backend, mock_channel = self._make_backend(mocker, [10, 20, 30])
+
+    _b0, t0 = backend.pop_with_ack("q")  # tag 10
+    _b1, t1 = backend.pop_with_ack("q")  # tag 20
+    _b2, t2 = backend.pop_with_ack("q")  # tag 30
+
+    # Ack in reverse order — each must ack its own tag.
+    backend.ack("q", token=t2)
+    backend.ack("q", token=t1)
+    backend.ack("q", token=t0)
+
+    acked_tags = {
+      call.kwargs.get("delivery_tag") for call in mock_channel.basic_ack.call_args_list
+    }
+    assert acked_tags == {10, 20, 30}
+    # multiple=False — never bulk-ack (would skip an unacked peer).
+    for call in mock_channel.basic_ack.call_args_list:
+      assert call.kwargs.get("multiple") is False
+
+  def test_in_flight_set_empties_as_each_acked(self, mocker):
+    """(c) The in-flight delivery-tag set drains as each message is acked."""
+    backend, _channel = self._make_backend(mocker, [10, 20, 30])
+
+    _b0, t0 = backend.pop_with_ack("q")
+    _b1, t1 = backend.pop_with_ack("q")
+    _b2, t2 = backend.pop_with_ack("q")
+
+    assert backend._in_flight_tags == {10, 20, 30}
+    backend.ack("q", token=t1)
+    assert backend._in_flight_tags == {10, 30}
+    backend.ack("q", token=t0)
+    assert backend._in_flight_tags == {30}
+    backend.ack("q", token=t2)
+    assert backend._in_flight_tags == set()
+
+  def test_nack_token_calls_basic_nack_with_requeue(self, mocker):
+    """(d) nack(token=tag) calls basic_nack(delivery_tag=tag, requeue=True)."""
+    backend, mock_channel = self._make_backend(mocker, [42])
+
+    _body, token = backend.pop_with_ack("q")
+
+    backend.nack("q", token=token)
+
+    mock_channel.basic_nack.assert_called_once_with(delivery_tag=42, requeue=True)
+    assert 42 not in backend._in_flight_tags
+
+  def test_ack_token_none_legacy_fallback(self, mocker):
+    """(e) ack(token=None) legacy fallback basic_acks the last-popped tag."""
+    config = RabbitMQSettings()
+    backend = RabbitMQBackend(config)
+    mock_instance = mocker.MagicMock()
+    mock_channel = mocker.MagicMock()
+    mock_instance.channel.return_value = mock_channel
+    mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+    backend.connect()
+    backend._last_delivery_tag = 99  # legacy single-slot set by old pop()
+
+    backend.ack("q", token=None)
+
+    mock_channel.basic_ack.assert_called_once_with(delivery_tag=99)
+    assert backend._last_delivery_tag is None

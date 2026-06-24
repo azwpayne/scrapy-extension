@@ -212,16 +212,23 @@ class SqsBackend(Backend, QueueBackend):
     body = msg.get("Body", "")
     return base64.b64decode(body)
 
-  def ack(self, queue_name: str) -> None:
+  def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Delete the last-popped message so it isn't redelivered.
+
+    ``token`` is accepted for interface compatibility with the concurrency-
+    correct ack path (see QueueBackend.pop_with_ack) but not yet used — SQS
+    still tracks a single ``_last_receipt`` slot. The full in-flight-set
+    fix for SQS is a follow-up; until then pin ``CONCURRENT_REQUESTS=1``
+    for strict at-least-once.
 
     Args:
         queue_name: The queue name.
+        token: Unused (accepted for signature compatibility).
 
     Raises:
         QueueError: If the delete fails.
     """
-    del queue_name
+    del queue_name, token
     if self._client is None or self._last_receipt is None:
       return
     url = next(iter(self._queue_urls.values()), None)
@@ -234,13 +241,14 @@ class SqsBackend(Backend, QueueBackend):
     finally:
       self._last_receipt = None
 
-  def nack(self, queue_name: str) -> None:
+  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """No-op: SQS redelivers an unacked message after the visibility timeout.
 
     Args:
         queue_name: The queue name.
+        token: Unused (accepted for signature compatibility).
     """
-    del queue_name
+    del queue_name, token
     self._last_receipt = None
 
   def queue_len(self, queue_name: str) -> int:
