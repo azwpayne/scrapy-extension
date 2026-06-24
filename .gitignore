@@ -353,3 +353,12 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Agent/orchestration tooling state (local only — never commit)
+.claude-flow/
+.swarm/
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
+*.rvf
+*.rvf.lock
+
