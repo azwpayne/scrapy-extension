@@ -13,9 +13,11 @@ Scrapy crawl:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -93,3 +95,71 @@ class TestBackendSchedulerCloseInvokesQueueClose:
     scheduler.close(reason="never-opened")  # must not raise
 
     manager.close.assert_called_once_with()
+
+
+class TestSchedulerCloseFiresDelayStrategyWarningE2E:
+  """End-to-end: scheduler.close() → BackendQueue.close() →
+  DelayQueueStrategy.close() must fire the non-silent-loss WARNING when held
+  delayed items exist at shutdown.
+
+  The two halves of this chain are pinned in isolation above (scheduler
+  calls ``_queue.close()``; BackendQueue.close forwards to
+  ``_strategy.close()``). This test proves them together with REAL objects —
+  a real ``DelayQueueStrategy`` holding a delayed item, wrapped in a real
+  ``BackendQueue``, set as a real ``BackendScheduler``'s ``_queue`` — so the
+  P1 "non-silent loss" guarantee is shown to actually fire in the integrated
+  shutdown lifecycle, not just in isolation.
+
+  The connection_manager is a MagicMock with a no-op ``.close()`` (scheduler
+  also tears it down during close) and a ``get_queue_backend()`` returning a
+  MagicMock — the delay strategy's holding path never reaches the backend on
+  close (only ``_drain_ready`` does, and close does not drain).
+  """
+
+  def test_delay_strategy_warning_fires_through_scheduler_close(
+    self, caplog
+  ) -> None:
+    # Real delay strategy seeded with one held item.
+    fake_manager = MagicMock(name="ConnectionManager")
+    fake_manager.get_queue_backend.return_value = MagicMock(name="QueueBackend")
+    strategy = DelayQueueStrategy(connection_manager=fake_manager)
+
+    # Push a delayed item. effective delay > 0 parks it in the in-process
+    # holding heap; the backend's push is never touched.
+    strategy.push("q", b"delayed-payload", delay=3600.0)
+    assert len(strategy._holding) == 1
+
+    # Real BackendQueue wrapping the real strategy.
+    queue = BackendQueue(
+      connection_manager=fake_manager,
+      queue_name="q",
+      queue_strategy=strategy,
+    )
+
+    # Real scheduler with the queue wired in (as open() would do).
+    # fake_manager.close() must be a no-op so scheduler teardown completes.
+    scheduler = BackendScheduler(connection_manager=fake_manager)
+    scheduler._queue = queue
+
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+      scheduler.close(reason="done")
+
+    # The warning must have fired through the integrated close chain.
+    warnings = [
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING
+      and "discarding" in r.getMessage()
+      and "held delayed item" in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+      f"Expected exactly one DelayQueueStrategy discard warning through the "
+      f"scheduler close path; got {len(warnings)}: "
+      f"{[r.getMessage() for r in caplog.records]}"
+    )
+    # Held count is surfaced in the message (non-silent loss is quantitative).
+    assert "1 held" in warnings[0].getMessage()
+
+    # Holding heap cleared after warning, and scheduler teardown completed.
+    assert strategy._holding == []
+    fake_manager.close.assert_called_once_with()

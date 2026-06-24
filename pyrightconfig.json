@@ -1,0 +1,44 @@
+{
+  // Pyright/ty config for scrapy-extension.
+  //
+  // Design context:
+  //   - Core package imports with ZERO backend deps (PEP 562 lazy imports).
+  //   - Each backend wraps its optional dep in `try/except ImportError` with
+  //     install instructions. Installed deps: redis, pymongo, kafka-python,
+  //     pika, elasticsearch. Genuinely-uninstalled optional deps whose import
+  //     lives inside a guarded try/except: rocketmq, pulsar, pymemcache, boto3.
+  //   - mypy is configured with `ignore_missing_imports = true`; this config
+  //     mirrors that stance for missing optional-dep imports.
+  //
+  // Tradeoff for `reportMissingImports: "warning"`:
+  //   We do NOT set this to "none" — a blanket suppression would hide REAL
+  //   typos in imports the project actually ships (e.g. stdlib, scrapy, our
+  //   own src/scrapy_extension modules). "warning" surfaces optional-dep
+  //   missing imports as non-blocking noise while still letting genuine
+  //   import mistakes show up at error severity in the IDE. The expected
+  //   warnings for rocketmq/pulsar/pymemcache/boto3 correspond to modules
+  //   that are ALWAYS imported inside `try/except ImportError`, so their
+  //   absence is by design, not a defect.
+  //
+  // Note: no `$schema` — pyright 1.1.410 (the version resolved by `uv run`)
+  // emits "Config contains unrecognized setting" for `$schema` and for
+  // `importMode`, so both are intentionally omitted here.
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalOperand": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportOptionalCall": "warning",
+  "reportOptionalIterable": "warning",
+  "reportOptionalContextManager": "warning",
+  "reportGeneralTypeIssues": "warning",
+  "reportCallIssue": "warning",
+  "reportInvalidTypeForm": "warning",
+  "reportAttributeAccessIssue": "warning",
+  "reportArgumentType": "warning",
+  "reportReturnType": "warning"
+}

@@ -320,6 +320,7 @@ class RocketMQBackend(Backend, QueueBackend):
         NotImplementedError: RocketMQ does not support atomic add-or-skip set operations.
         QueueError: If not connected.
     """
+    del set_name, item
     from scrapy_extension.exceptions import QueueError
 
     if not self.is_connected():
@@ -343,6 +344,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support atomic remove from sets.
     """
+    del set_name, item
     msg = (
       "RocketMQBackend does not implement SetBackend.remove(): "
       "RocketMQ has no native set/membership semantics. "
@@ -363,6 +365,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support set membership queries.
     """
+    del set_name, item
     msg = (
       "RocketMQBackend does not implement SetBackend.contains(): "
       "RocketMQ has no native set/membership semantics. "
@@ -382,6 +385,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support set size queries.
     """
+    del set_name
     msg = (
       "RocketMQBackend does not implement SetBackend.set_len(): "
       "RocketMQ has no native set/membership semantics. "
@@ -418,6 +422,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support storage operations.
     """
+    del key, data, ttl
     msg = (
       "RocketMQBackend does not implement StorageBackend.store(): "
       "RocketMQ is a message queue, not a key-value store. "
@@ -437,6 +442,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support point-in-time key retrieval.
     """
+    del key
     msg = (
       "RocketMQBackend does not implement StorageBackend.retrieve(): "
       "RocketMQ is a message queue, not a key-value store. "
@@ -453,6 +459,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support key-based deletion.
     """
+    del key
     msg = (
       "RocketMQBackend does not implement StorageBackend.delete(): "
       "RocketMQ is a message queue, not a key-value store. "
@@ -469,6 +476,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support key-based existence checks.
     """
+    del key
     msg = (
       "RocketMQBackend does not implement StorageBackend.exists(): "
       "RocketMQ is a message queue, not a key-value store. "
@@ -485,6 +493,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support TTL queries.
     """
+    del key
     msg = (
       "RocketMQBackend does not implement StorageBackend.ttl(): "
       "RocketMQ is a message queue, not a key-value store. "
@@ -501,6 +510,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
         NotImplementedError: RocketMQ does not support storage clearing.
     """
+    del prefix
     msg = (
       "RocketMQBackend does not implement StorageBackend.clear_storage(): "
       "RocketMQ is a message queue, not a key-value store. "

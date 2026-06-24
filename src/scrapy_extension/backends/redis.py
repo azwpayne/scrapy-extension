@@ -348,11 +348,20 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     EVAL. Avoids stale references if ``self._client`` is replaced by a
     reconnect.
     """
+    # Cast to ``Redis`` (not the runtime-accurate ``Redis | RedisCluster``)
+    # because redis-py's stubs type ``register_script`` as a method on
+    # ``Redis`` only, even though ``RedisCluster`` also exposes it at runtime.
+    # Widening the cast to the union reintroduces mypy ``[misc]`` errors
+    # (RedisCluster not in the stub's ``register_script`` signature) — the
+    # narrower cast is the pragmatic, type-ignore-free choice here.
     return cast("Redis", self.client).register_script(_POP_LUA)
 
   @property
   def _push_script(self) -> Any:
     """Compiled Lua script for atomic FIFO-preserving push."""
+    # See ``_pop_script`` for why this casts to ``Redis`` rather than the
+    # ``Redis | RedisCluster`` union (redis-py stub limitation; the method
+    # exists on RedisCluster at runtime).
     return cast("Redis", self.client).register_script(_PUSH_LUA)
 
   # QueueBackend implementation using Sorted Sets

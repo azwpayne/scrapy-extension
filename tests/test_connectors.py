@@ -377,6 +377,36 @@ class TestConnectionManagerBackendProperty:
 
     assert result is mock_backend
 
+  def test_backend_raises_when_connect_returns_without_setting_backend(self, mocker):
+    """Defensive guard: if ``connect()`` returns without raising AND without
+    setting ``self._backend`` (a contract violation), the ``backend`` property
+    must raise ``BackendConnectionError`` rather than returning ``None``.
+
+    Exercises the ``if self._backend is None: raise BackendConnectionError``
+    branch in the property (connectors.py ``backend`` getter). The mock makes
+    ``connect()`` a no-op that never assigns ``_backend``, simulating the
+    violation. The guard is the load-bearing safety net — ``assert`` would be
+    stripped under ``python -O``, and returning ``None`` would crash callers
+    downstream with a confusing ``AttributeError`` instead of a typed error.
+    """
+    # connect() returns normally but does NOT set self._backend — the
+    # contract violation the defensive guard exists to catch.
+    mocker.patch.object(ConnectionManager, "connect", return_value=None)
+
+    manager = ConnectionManager(BackendType.REDIS)
+    manager._backend = None  # explicit: nothing wired the backend
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      _ = manager.backend  # property access triggers the defensive guard
+
+    msg = str(exc_info.value)
+    assert "connect()" in msg
+    assert "backend" in msg
+
+    # Registry hygiene: this test constructed a bare manager (not via
+    # get_manager), but clear anyway to match the file's isolation pattern.
+    ConnectionManager.clear_registry()
+
 
 class TestConnectionManagerIsConnected:
   """Tests for is_connected method."""
