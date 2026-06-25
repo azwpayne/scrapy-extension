@@ -248,3 +248,79 @@ class TestConfigurationErrorRedaction:
     assert exc.setting_value is None
 
 
+class TestBackpressureSettings:
+  """Round-4 BP-1: backpressure pause/resume depth settings.
+
+  Two additive, default-``None`` fields (zero compat break) configuring the
+  scheduler's depth-gated pull-rate throttle. ``pause_at`` is the queue depth
+  at/above which ``next_request`` returns None (Scrapy's contract-correct
+  "slow down" signal); ``resume_at`` is the depth at/below which it resumes
+  (hysteresis, prevents flapping). When only ``pause_at`` is set the scheduler
+  defaults ``resume_at := pause_at`` at consume time, so no cross-check fires.
+  """
+
+  def test_both_unset_defaults_to_none(self):
+    """Default-off: both None → feature disabled (byte-identical to pre-BP)."""
+    settings = Settings()
+    assert settings.backpressure_pause_at is None
+    assert settings.backpressure_resume_at is None
+
+  def test_only_pause_at_set_accepted(self):
+    """Only pause_at set → cross-check skipped (resume defaults to pause later)."""
+    settings = Settings(backpressure_pause_at=10)
+    assert settings.backpressure_pause_at == 10
+    assert settings.backpressure_resume_at is None
+
+  def test_resume_below_pause_accepted(self):
+    """resume_at=5, pause_at=10 → valid hysteresis band."""
+    settings = Settings(backpressure_pause_at=10, backpressure_resume_at=5)
+    assert settings.backpressure_pause_at == 10
+    assert settings.backpressure_resume_at == 5
+
+  def test_resume_above_pause_rejected(self):
+    """resume_at > pause_at → ConfigurationError (would never resume)."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      Settings(backpressure_pause_at=10, backpressure_resume_at=15)
+    assert exc_info.value.setting_name == "backpressure_resume_at"
+
+  def test_negative_pause_at_rejected(self):
+    """pause_at < 0 → ConfigurationError (depth cannot be negative)."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError):
+      Settings(backpressure_pause_at=-1)
+
+  def test_negative_resume_at_rejected(self):
+    """resume_at < 0 → ConfigurationError."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError):
+      Settings(backpressure_pause_at=10, backpressure_resume_at=-1)
+
+  def test_resume_equals_pause_accepted(self):
+    """resume_at == pause_at → valid (no hysteresis, but not invalid)."""
+    settings = Settings(backpressure_pause_at=10, backpressure_resume_at=10)
+    assert settings.backpressure_pause_at == 10
+    assert settings.backpressure_resume_at == 10
+
+  def test_only_resume_at_set_accepted(self):
+    """Only resume_at set → accepted (pause_at None at settings layer; scheduler treats feature off)."""
+    settings = Settings(backpressure_resume_at=5)
+    assert settings.backpressure_pause_at is None
+    assert settings.backpressure_resume_at == 5
+
+  def test_pause_at_from_env(self, monkeypatch):
+    """Loads from SCRAPY_BACKPRESSURE_PAUSE_AT env var."""
+    monkeypatch.setenv("SCRAPY_BACKPRESSURE_PAUSE_AT", "10")
+    settings = Settings()
+    assert settings.backpressure_pause_at == 10
+
+  def test_resume_at_from_env(self, monkeypatch):
+    """Loads from SCRAPY_BACKPRESSURE_RESUME_AT env var."""
+    monkeypatch.setenv("SCRAPY_BACKPRESSURE_RESUME_AT", "5")
+    settings = Settings()
+    assert settings.backpressure_resume_at == 5
+
+
