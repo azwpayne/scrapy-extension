@@ -57,18 +57,33 @@ class SqsBackend(Backend, QueueBackend):
   handle for ack. queue_len reads ApproximateNumberOfMessages; clear_queue
   purges.
 
+  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=False``.
+  SQS ack tracks a SINGLE ``_last_receipt`` slot — N pops before any ack
+  overwrite it and only the last-popped message is ackable. Under
+  ``CONCURRENT_REQUESTS > 1`` this silently violates at-least-once. The
+  scheduler gate (round-2) raises ``ConfigurationError`` unless the
+  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set. The real
+  in-flight-set fix is a follow-up (Tier-2).
+
+  Per-pop URL tracking (round-2 C3 fix): ``_last_receipt`` is a
+  ``(queue_url, receipt_handle)`` tuple so :meth:`ack` deletes against the
+  queue the message was popped from, not an arbitrary cached URL.
+
   Attributes:
       config: SqsSettings instance.
       _client: The boto3 SQS client (None until connected).
       _queue_urls: Per-queue cached QueueUrl values.
-      _last_receipt: ReceiptHandle of the last-popped message (for ack).
+      _last_receipt: ``(queue_url, receipt_handle)`` of the last-popped msg.
   """
+
+  requires_ack = True
+  supports_concurrent_ack = False
 
   def __init__(self, config: SqsSettings) -> None:
     self.config = config
     self._client: Any = None
     self._queue_urls: dict[str, str] = {}
-    self._last_receipt: str | None = None
+    self._last_receipt: tuple[str, str] | None = None
 
   def connect(self) -> None:
     """Create the boto3 SQS client.
@@ -178,6 +193,11 @@ class SqsBackend(Backend, QueueBackend):
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Receive one message from the SQS queue.
 
+    Records ``(queue_url, receipt_handle)`` in ``_last_receipt`` so the
+    subsequent :meth:`ack` deletes against the queue this message was
+    popped from (round-2 C3 fix — previously ack resolved an arbitrary
+    cached URL and could delete the wrong queue under multi-queue use).
+
     Args:
         queue_name: Name of the queue.
         timeout: Seconds to long-poll (capped at 20; 0 = short poll).
@@ -208,18 +228,25 @@ class SqsBackend(Backend, QueueBackend):
     if not messages:
       return None
     msg = messages[0]
-    self._last_receipt = msg.get("ReceiptHandle")
+    receipt = msg.get("ReceiptHandle")
+    # Track the URL the message arrived FROM, so ack deletes the right queue.
+    self._last_receipt = (url, receipt) if receipt is not None else None
     body = msg.get("Body", "")
     return base64.b64decode(body)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Delete the last-popped message so it isn't redelivered.
 
+    Deletes against the queue URL the message was popped FROM (recorded in
+    ``_last_receipt``), not an arbitrary cached URL — correct under
+    multi-queue SQS use (round-2 C3 fix).
+
     ``token`` is accepted for interface compatibility with the concurrency-
     correct ack path (see QueueBackend.pop_with_ack) but not yet used — SQS
     still tracks a single ``_last_receipt`` slot. The full in-flight-set
-    fix for SQS is a follow-up; until then pin ``CONCURRENT_REQUESTS=1``
-    for strict at-least-once.
+    fix for SQS is a follow-up; until then the scheduler gate pins
+    ``CONCURRENT_REQUESTS=1`` for strict at-least-once (overridable via
+    ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS``).
 
     Args:
         queue_name: The queue name.
@@ -231,11 +258,9 @@ class SqsBackend(Backend, QueueBackend):
     del queue_name, token
     if self._client is None or self._last_receipt is None:
       return
-    url = next(iter(self._queue_urls.values()), None)
-    if url is None:
-      return
+    url, receipt = self._last_receipt
     try:
-      self._client.delete_message(QueueUrl=url, ReceiptHandle=self._last_receipt)
+      self._client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
     except Exception as e:
       raise QueueError(f"Failed to ack SQS message: {e}", operation="ack") from e
     finally:

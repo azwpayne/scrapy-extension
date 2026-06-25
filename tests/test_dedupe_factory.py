@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from scrapy.http import Request
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters import factory as factory_module
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
 from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
@@ -162,3 +165,119 @@ class TestDupeFilterWithProbabilisticStrategy:
     req = Request(url="https://example.com/page")
     assert df.request_seen(req) is False
     assert df.request_seen(req) is True
+
+
+class TestPerProcessStrategyWarning:
+  """D3 (Theme C): factory warns once when a per-process dedup strategy is selected.
+
+  Bloom / cuckoo / memory filters are in-process — cross-worker duplicates pass
+  silently. Operators assuming distributed dedup need a loud signal at selection
+  time, not just in class docstrings. The warning is emitted exactly once per
+  process per strategy (idempotent via a module-level ``_warned`` set).
+  """
+
+  @pytest.fixture(autouse=True)
+  def _reset_factory_warning_cache(self):
+    """Reset the module-level warning cache so each test re-triggers the check.
+
+    ``_warned`` is process-global; without reset the second test in this
+    class would observe zero warnings purely because the first already fired
+    one — masking regressions. This is test isolation, not gaming: the
+    production behavior we assert (warn-once per process) is verified by
+    ``test_warning_emitted_only_once_per_process``.
+    """
+    factory_module._warned.clear()
+    yield
+    factory_module._warned.clear()
+
+  def test_bloom_strategy_emits_exactly_one_warning(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+      build_membership_filter(
+        DedupeStrategy.BLOOM,
+        mock_connection_manager,
+        bloom_capacity=100,
+        bloom_error_rate=0.01,
+      )
+    warnings = [
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING and r.name == factory_module.__name__
+    ]
+    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"
+    msg = warnings[0].getMessage()
+    # Must state the per-process scope and point at the distributed alternative.
+    assert "per-process" in msg.lower() or "in-process" in msg.lower()
+    assert "set" in msg.lower()
+
+  def test_cuckoo_strategy_emits_warning(self, mock_connection_manager, caplog) -> None:
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+      build_membership_filter(
+        DedupeStrategy.CUCKOO,
+        mock_connection_manager,
+        cuckoo_capacity=100,
+        cuckoo_error_rate=0.01,
+      )
+    warnings = [
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING and r.name == factory_module.__name__
+    ]
+    assert len(warnings) == 1
+
+  def test_memory_strategy_emits_warning(self, mock_connection_manager, caplog) -> None:
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+      build_membership_filter(
+        DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
+      )
+    warnings = [
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING and r.name == factory_module.__name__
+    ]
+    assert len(warnings) == 1
+
+  def test_set_strategy_emits_no_warning(self, mock_connection_manager, caplog) -> None:
+    """The default set strategy is cross-worker (backend-backed) → no warning."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+      build_membership_filter(DedupeStrategy.SET, mock_connection_manager, key="k")
+    warnings = [
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING and r.name == factory_module.__name__
+    ]
+    assert len(warnings) == 0
+
+  def test_warning_emitted_only_once_per_process(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    """Building a per-process strategy twice in the same process warns once.
+
+    Guards against log spam when many dupefilters are constructed (e.g. one
+    per spider in a multi-spider process).
+    """
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+      build_membership_filter(
+        DedupeStrategy.BLOOM,
+        mock_connection_manager,
+        bloom_capacity=100,
+        bloom_error_rate=0.01,
+      )
+      build_membership_filter(
+        DedupeStrategy.BLOOM,
+        mock_connection_manager,
+        bloom_capacity=200,
+        bloom_error_rate=0.02,
+      )
+    warnings = [
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING and r.name == factory_module.__name__
+    ]
+    assert len(warnings) == 1

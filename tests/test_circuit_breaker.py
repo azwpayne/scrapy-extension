@@ -8,6 +8,7 @@ non-network operations unchanged.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -536,3 +537,114 @@ class TestStorageBackendProxy:
     wrapped.store("k", b"v", ttl=10)
     assert backend.stored == [("k", b"v")]
     assert breaker.failure_count == 0
+
+
+# ---------------------------------------------------------------------------
+# E3 — queue_len is an admin/observability probe, NOT hot-path traffic.
+# A transient failure in the stats query must NOT cascade into a full traffic
+# shutdown by tripping the breaker.
+# ---------------------------------------------------------------------------
+
+
+class TestQueueLenNotHotPath:
+  def test_queue_len_failures_do_not_trip_the_breaker(self):
+    """queue_len is an observability probe — failures must not trip the breaker.
+
+    Pre-fix (queue_len in _HOT_PATH): N consecutive queue_len failures trip the
+    breaker → RED. Post-fix (queue_len removed from _HOT_PATH): queue_len is
+    forwarded unwrapped, so failures never reach the breaker → GREEN.
+    """
+    backend = _FakeQueueBackend()
+    # queue_len always fails; push/pop succeed.
+    backend.queue_len = _boom  # type: ignore[method-assign]
+    breaker = CircuitBreaker("q", failure_threshold=3)
+    wrapped = wrap_queue_backend(backend, breaker)
+
+    # Hammer queue_len well past the failure threshold.
+    for _ in range(10):
+      with pytest.raises(RuntimeError):
+        wrapped.queue_len("q")
+
+    # Breaker must remain CLOSED — queue_len is an admin probe, not traffic.
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+
+    # And traffic ops (push/pop) still work through the breaker.
+    wrapped.push("q", b"x", 1.0)
+    assert backend.pushed == [("q", b"x", 1.0)]
+    assert breaker.state is BreakerState.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# E4 — single half-open probe under concurrency.
+# When the breaker is OPEN and the reset_timeout elapses, only ONE thread must
+# issue the probe call. The lock is released between _allow_call() (OPEN→
+# HALF_OPEN) and func(), so N threads in the reset window can all flip to
+# HALF_OPEN and call the backend concurrently.
+# ---------------------------------------------------------------------------
+
+
+class TestHalfOpenSingleProbe:
+  def test_concurrent_probes_issue_exactly_one_func_call(self):
+    """N threads blocked on an OPEN breaker, clock advances past reset_timeout,
+    all released → exactly ONE func() probe call reaches the backend.
+
+    Pre-fix (lock released between OPEN→HALF_OPEN and func): multiple threads
+    observe HALF_OPEN and call func concurrently → call_count > 1 → RED.
+    Post-fix (probe serialized): exactly one call → GREEN.
+    """
+    clock = FakeClock()
+    breaker = CircuitBreaker(
+      "q", failure_threshold=1, reset_timeout=30.0, time_fn=clock
+    )
+    # Trip the breaker to OPEN.
+    with pytest.raises(RuntimeError):
+      breaker.call(_boom)
+    assert breaker.state is BreakerState.OPEN
+
+    call_count = [0]
+    call_lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def probe(*_a, **_k):
+      # The race window is the gap between _allow_call() flipping to
+      # HALF_OPEN and this func body executing. Count callers atomically.
+      with call_lock:
+        call_count[0] += 1
+      # Sleep briefly to widen the race window so other threads can enter
+      # if the lock is dropped prematurely.
+      time.sleep(0.02)
+      return "ok"
+
+    def worker():
+      barrier.wait()
+      try:
+        breaker.call(probe)
+      except CircuitBreakerOpenError:
+        pass  # allowed — some threads may still see OPEN if not chosen as probe
+
+    n_threads = 8
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+
+    # Advance the clock past the reset timeout BEFORE releasing the threads,
+    # so every thread's _allow_call() will observe HALF_OPEN on its first call.
+    clock.advance(30.0)
+
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join()
+
+    # The single-probe contract: at most ONE func() call.
+    # (We assert <= 1 rather than == 1 because if the first probe SUCCEEDS the
+    # breaker closes immediately and subsequent threads legitimately proceed —
+    # but those subsequent calls are CLOSED-state traffic calls, not probes,
+    # and with the fix only the first thread reaches func() while in HALF_OPEN.
+    # The race we are fixing is multiple CONCURRENT probes during the
+    # HALF_OPEN window itself. A correct fix makes call_count == 1: the probe
+    # runs under the lock, so the first thread closes the breaker before any
+    # other thread enters func().)
+    assert call_count[0] == 1, (
+      f"expected exactly one probe call, got {call_count[0]} — "
+      "multiple threads observed HALF_OPEN concurrently"
+    )

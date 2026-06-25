@@ -853,17 +853,19 @@ class TestBackendScheduler:
 
 
 class TestSchedulerAckConcurrencyCorrect:
-  """Tier-2 Unit H: the E1 fail-fast gate is GONE — ack is concurrency-correct.
+  """Round-2 (C1): capability-aware ack-concurrency gate.
 
-  The previous gate raised ``ConfigurationError`` for Kafka/RabbitMQ under
-  ``CONCURRENT_REQUESTS > 1`` because pop() tracked a single ack slot. With
-  the in-flight-set fix (pop_with_ack + per-message ack tokens), ack is now
-  correct under any concurrency, so the gate and the
-  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out are removed.
+  The H-commit removed the ``CONCURRENT_REQUESTS>1`` fail-fast guard for
+  ALL ack-using backends, but only Kafka/RabbitMQ got the real in-flight-
+  set fix. SQS/Pulsar kept single-slot ack and lost their safety net.
+  Round-2 re-introduces the gate, now capability-aware: it inspects
+  ``QueueBackend.requires_ack`` / ``supports_concurrent_ack`` and only
+  raises for single-slot-ack backends under concurrency (unless the
+  explicit ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set).
   """
 
   @staticmethod
-  def _make_settings(backend_type: str, concurrent: int):
+  def _make_settings(backend_type: str, concurrent: int, opt_out: bool = False):
     """Build a Scrapy-Settings-like mock resolving the queue backend + concurrency."""
     from unittest.mock import Mock
 
@@ -871,11 +873,14 @@ class TestSchedulerAckConcurrencyCorrect:
     backend_map = {
       "SCRAPY_BACKEND_TYPE": backend_type,
       "SCRAPY_QUEUE_KEY": "scheduler:queue",
+      "SCRAPY_QUEUE_STRATEGY": "passthrough",
     }
 
     def get(key, default=None):
       if key == "CONCURRENT_REQUESTS":
         return concurrent
+      if key == "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS":
+        return opt_out
       return backend_map.get(key, default)
 
     settings.get.side_effect = get
@@ -890,8 +895,8 @@ class TestSchedulerAckConcurrencyCorrect:
     settings.getint.side_effect = getint
     return settings
 
-  def test_kafka_with_concurrency_gt_1_no_longer_raises(self, mocker):
-    """Kafka + CONCURRENT_REQUESTS=16 no longer raises (ack is concurrency-correct)."""
+  def test_kafka_with_concurrency_gt_1_passes(self, mocker):
+    """Kafka + CONCURRENT_REQUESTS=16 passes (real in-flight set)."""
     from scrapy_extension.backends.connectors import ConnectionManager
 
     settings = self._make_settings("kafka", concurrent=16)
@@ -901,8 +906,8 @@ class TestSchedulerAckConcurrencyCorrect:
 
     assert scheduler.queue_key == "scheduler:queue"
 
-  def test_rabbitmq_with_concurrency_gt_1_no_longer_raises(self, mocker):
-    """RabbitMQ + CONCURRENT_REQUESTS=4 no longer raises."""
+  def test_rabbitmq_with_concurrency_gt_1_passes(self, mocker):
+    """RabbitMQ + CONCURRENT_REQUESTS=4 passes (real in-flight set)."""
     from scrapy_extension.backends.connectors import ConnectionManager
 
     settings = self._make_settings("rabbitmq", concurrent=4)
@@ -912,24 +917,21 @@ class TestSchedulerAckConcurrencyCorrect:
 
     assert scheduler.queue_key == "scheduler:queue"
 
-  def test_opt_out_flag_no_longer_referenced(self):
-    """The E1 gate method, opt-out flag attribute, and single-slot set are removed."""
+  def test_gate_method_and_opt_out_exist(self):
+    """Round-2 re-introduces the capability-aware gate + opt-out."""
     from scrapy_extension.schedule.scheduler import BackendScheduler
 
-    # The gate method and supporting class attributes are gone.
-    assert not hasattr(BackendScheduler, "_enforce_ack_concurrency_gate")
-    assert not hasattr(BackendScheduler, "_ACK_SINGLE_SLOT_BACKENDS")
-    assert not hasattr(BackendScheduler, "_ACK_UNSAFE_OPT_OUT")
-    # No settings read for the opt-out flag remains (defensive: also check
-    # the from_settings method body, not the whole class docstring).
+    # The capability-aware gate method exists (round-2 C1 fix).
+    assert hasattr(BackendScheduler, "_enforce_ack_concurrency_gate")
+    # The opt-out flag is read in from_settings (capability-aware gate).
     import inspect
 
     from_settings_src = inspect.getsource(BackendScheduler.from_settings)
-    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" not in from_settings_src
-    assert "_enforce_ack_concurrency_gate" not in from_settings_src
+    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" in from_settings_src
+    assert "_enforce_ack_concurrency_gate" in from_settings_src
 
   def test_from_crawler_allows_kafka_concurrency(self, mocker):
-    """from_crawler (real Scrapy entry point) no longer gates Kafka concurrency."""
+    """from_crawler (real Scrapy entry point) does not gate Kafka concurrency."""
     from scrapy_extension.backends.connectors import ConnectionManager
 
     mock_crawler = mocker.Mock()

@@ -12,7 +12,8 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import JSONSerializer
-from scrapy_extension.exceptions import SerializationError
+from scrapy_extension.exceptions import BackendError, SerializationError
+from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
   StorageStrategy,
   create_storage_strategy,
@@ -47,6 +48,11 @@ class BackendPipeline:
       storage_strategy: Strategy layer governing how items reach the backend
           (passthrough default — byte-identical to pre-strategy behavior;
           ``batched`` buffers + flushes on threshold/close).
+      max_storage_errors: C2 escalation threshold. ``None`` (default) keeps the
+          best-effort swallow-and-stat behavior; an int N re-raises the storage
+          error wrapped as :class:`~scrapy_extension.exceptions.BackendError`
+          once consecutive failures exceed N (counter resets on a successful
+          store).
   """
 
   def __init__(
@@ -56,6 +62,9 @@ class BackendPipeline:
     ttl: int | None = None,
     max_item_bytes: int = DEFAULT_PIPELINE_MAX_ITEM_BYTES,
     storage_strategy: StorageStrategy | None = None,
+    *,
+    max_storage_errors: int | None = None,
+    monitor: Monitor | None = None,
   ) -> None:
     """Initialize the pipeline.
 
@@ -71,6 +80,20 @@ class BackendPipeline:
             :class:`PassthroughStorageStrategy` (byte-identical to the
             pre-strategy store call). Selected via ``SCRAPY_STORAGE_STRATEGY``
             in :meth:`from_settings`.
+        max_storage_errors: C2 escalation. ``None`` (default) preserves the
+            best-effort behavior (storage errors swallowed, item returned,
+            ``pipeline/storage_errors`` stat incremented). When set to N, the
+            pipeline tracks consecutive storage failures and re-raises the
+            error wrapped as :class:`~scrapy_extension.exceptions.BackendError`
+            once the consecutive count exceeds N — surfacing a persistent
+            storage outage loudly instead of silently reporting success.
+            Counter resets to 0 on every successful store.
+        monitor: Optional observability monitor. When ``None`` (default),
+            :class:`~scrapy_extension.monitor.base.NullMonitor` (no-op). Wired
+            to a :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` in
+            :meth:`from_crawler` when ``crawler.stats`` is available, so the
+            ``pipeline/store_count`` stat is default-on. Emitted hooks are
+            additive — existing component stats untouched.
     """
     self.connection_manager = connection_manager
     self.key_prefix = key_prefix
@@ -79,7 +102,10 @@ class BackendPipeline:
     self.storage_strategy: StorageStrategy = (
       storage_strategy if storage_strategy is not None else PassthroughStorageStrategy()
     )
+    self.max_storage_errors = max_storage_errors
+    self._consecutive_storage_errors = 0
     self._storage_supported: bool | None = None
+    self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -121,6 +147,8 @@ class BackendPipeline:
     )
     storage_strategy_name = settings.get("SCRAPY_STORAGE_STRATEGY", "passthrough")
     storage_strategy = create_storage_strategy(storage_strategy_name)
+    raw_max_errors = settings.get("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS")
+    max_storage_errors = int(raw_max_errors) if raw_max_errors is not None else None
     return cls(
       connection_manager=manager,
       key_prefix=settings.get("SCRAPY_PIPELINE_KEY_PREFIX", "items"),
@@ -129,11 +157,18 @@ class BackendPipeline:
         "SCRAPY_PIPELINE_MAX_ITEM_BYTES", DEFAULT_PIPELINE_MAX_ITEM_BYTES
       ),
       storage_strategy=storage_strategy,
+      max_storage_errors=max_storage_errors,
     )
 
   @classmethod
   def from_crawler(cls, crawler: Crawler) -> BackendPipeline:
     """Create pipeline from crawler.
+
+    Default-on observability: wires a
+    :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` when
+    ``crawler.stats`` is available so the ``pipeline/store_count`` stat shows
+    up on the Scrapy stats dump without an explicit ``monitor=`` kwarg.
+    Additive — existing stats (``pipeline/storage_errors`` etc.) untouched.
 
     Args:
         crawler: The Scrapy crawler instance.
@@ -141,7 +176,16 @@ class BackendPipeline:
     Returns:
         A new BackendPipeline instance.
     """
-    return cls.from_settings(crawler.settings)
+    pipeline = cls.from_settings(crawler.settings)
+    # Default-on observability — mirrors the dupefilter wiring. Only override
+    # when no explicit monitor was provided (operators passing a custom monitor
+    # via from_settings win over the default).
+    stats = getattr(crawler, "stats", None)
+    if stats is not None and isinstance(pipeline._monitor, NullMonitor):
+      from scrapy_extension.monitor import ScrapyStatsMonitor
+
+      pipeline._monitor = ScrapyStatsMonitor(stats)
+    return pipeline
 
   def open_spider(self, spider: Spider) -> None:
     """Called when a spider opens.
@@ -223,7 +267,24 @@ class BackendPipeline:
         e,
       )
       self._inc_stat(spider, "pipeline/storage_errors")
+      # C2: opt-in loud-fail. Default (max_storage_errors=None) keeps the
+      # best-effort swallow-and-stat behavior — zero compat break. When set,
+      # track consecutive failures and re-raise once the count exceeds N so a
+      # persistent storage outage surfaces instead of being silently absorbed
+      # as a success-shaped item return.
+      if self.max_storage_errors is not None:
+        self._consecutive_storage_errors += 1
+        if self._consecutive_storage_errors > self.max_storage_errors:
+          raise BackendError(
+            f"Pipeline exceeded max_storage_errors ({self.max_storage_errors}): "
+            f"{self._consecutive_storage_errors} consecutive storage failures "
+            f"(last error on key {key!r}: {e})"
+          ) from e
       return item
+    # Success: reset the consecutive counter and emit the on_store hook
+    # (failure path does not emit — it has its own stat, pipeline/storage_errors).
+    self._consecutive_storage_errors = 0
+    self._monitor.on_store(key)
     logger.debug("Stored item: %s", key)
     return item
 

@@ -19,6 +19,8 @@ from scrapy_extension.backends.connectors import (
   resolve_backend_config,
 )
 from scrapy_extension.exceptions import (
+  BackendError,
+  ConfigurationError,
   QueueError,
   SerializationError,
 )
@@ -47,37 +49,48 @@ class BackendScheduler:
   Ack/nack semantics (important — read before tuning concurrency):
 
   1. **Ack fires on ``response_received``, NOT on callback/pipeline
-     completion.** For message-queue backends (Kafka, RabbitMQ), a message
-     is acked as soon as Scrapy's downloader delivers the response
-     (``signals.response_received``) and nacked on ``signals.spider_error``.
-     The ack is *download-level*: it does **not** wait for the spider
-     callback, the item pipeline, or any post-download processing. A crash
-     between ack and pipeline completion drops the item (at-most-once for
-     the pipeline side); a crash before ack re-delivers the message
-     (at-least-once for the download side).
+     completion.** For message-queue backends (Kafka, RabbitMQ, SQS,
+     Pulsar), a message is acked as soon as Scrapy's downloader delivers
+     the response (``signals.response_received``) and nacked on
+     ``signals.spider_error``. The ack is *download-level*: it does **not**
+     wait for the spider callback, the item pipeline, or any post-download
+     processing. A crash between ack and pipeline completion drops the
+     item (at-most-once for the pipeline side); a crash before ack
+     re-delivers the message (at-least-once for the download side).
 
-  2. **Concurrent ack is correct.** ``BackendQueue.pop`` calls
-     ``pop_with_ack`` and carries the returned token in
-     ``request.meta["_backend_ack_token"]``; this scheduler reads it on
-     ``response_received`` / ``spider_error`` and forwards it to
-     ``BackendQueue.ack(token=…)`` / ``nack(token=…)``. The backend acks
-     the *specific* message identified by that token (Kafka commits the
-     contiguous low-watermark for the token's partition; RabbitMQ
-     ``basic_ack``s the token's delivery tag) — so under
-     ``CONCURRENT_REQUESTS > 1`` no message is skipped or lost. The
-     previous ``CONCURRENT_REQUESTS=1`` restriction and the
-     ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out have been removed.
+  2. **Concurrent-ack correctness is per-backend, gated at from_settings.**
+     Backends declare ``QueueBackend.requires_ack`` /
+     ``supports_concurrent_ack``:
+
+     - **Atomic-pop backends** (Redis, MongoDB, ElasticSearch, RocketMQ):
+       ``requires_ack=False``. pop removes the item in one step; ack/nack
+       are no-ops. ``CONCURRENT_REQUESTS`` is unrestricted.
+     - **Real in-flight-set backends** (Kafka, RabbitMQ):
+       ``requires_ack=True``, ``supports_concurrent_ack=True``.
+       ``pop_with_ack`` returns a per-message token tracked in an in-flight
+       set; ``ack(token=…)`` commits the specific offset / basic_acks the
+       specific delivery tag. N pops before any ack no longer overwrite a
+       single slot — correct under ``CONCURRENT_REQUESTS > 1``.
+       ``CONCURRENT_REQUESTS`` is unrestricted.
+     - **Single-slot-ack backends** (SQS, Pulsar): ``requires_ack=True``,
+       ``supports_concurrent_ack=False``. Ack tracks ONE receipt slot; N
+       pops before any ack overwrite it and only the last-popped message
+       is ackable → silent at-least-once violation under
+       ``CONCURRENT_REQUESTS > 1``. The ``from_settings`` gate raises
+       ``ConfigurationError`` here unless the explicit
+       ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set. The real
+       in-flight-set fix for these backends is a follow-up (Tier-2).
 
   3. **At-least-once on crash is inherent.** A worker crash before ack
      fires leaves the message unacked (Kafka: offset uncommitted; RabbitMQ:
-     delivery unacked) → it is re-delivered on reconnect/restart. This is
+     delivery unacked; SQS: visibility timeout expires; Pulsar: retry
+     policy redelivers) → it is re-delivered on reconnect/restart. This is
      the intended at-least-once guarantee, not a defect.
 
-  4. **Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) are
-     unaffected** by the above — their pop is a single atomic operation
-     with no separate ack/nack step, so the ``response_received`` wiring is
-     a no-op for them (their token is ``None``). ``CONCURRENT_REQUESTS``
-     can be tuned freely on atomic backends.
+  4. **Dedup outage does not crash the spider.** ``enqueue_request`` runs
+     ``dupefilter.request_seen`` INSIDE its try-block; a ``QueueError`` /
+     ``BackendError`` from the dedup backend degrades to default-enqueue
+     (the URL is not lost) + a ``scheduler/dupefilter_error`` stat bump.
 
   Attributes:
       connection_manager: The connection manager for backend access.
@@ -127,10 +140,16 @@ class BackendScheduler:
     bind to a different backend than the dedup filter or storage pipeline
     (multi-backend coexistence). Unset → falls back to the global keys.
 
-    Ack correctness under ``CONCURRENT_REQUESTS > 1`` is handled at the
-    backend layer (per-message ack tokens + contiguous watermark commit /
-    per-tag basic_ack), so no concurrency gate is applied here. See the
-    class docstring for the at-least-once semantics.
+    **Ack-concurrency gate (round-2, C1 fix).** After the queue backend is
+    resolved, the backend's ``QueueBackend.requires_ack`` /
+    ``supports_concurrent_ack`` class attributes are inspected. If the
+    backend requires ack but does NOT support concurrent ack (SQS, Pulsar —
+    single-slot ack) AND ``CONCURRENT_REQUESTS > 1`` AND the explicit
+    ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is NOT set, this
+    raises :class:`ConfigurationError`. Atomic backends (Redis/Mongo/ES/
+    RocketMQ) and real in-flight-set backends (Kafka/RabbitMQ) are
+    unaffected. Read the opt-out via ``settings.get(..., False)`` — it is
+    NOT a pydantic field. See the class docstring for the full contract.
     """
     from scrapy_extension.queue.strategies.factory import (
       QueueStrategyType,
@@ -148,6 +167,14 @@ class BackendScheduler:
       backend_type=backend_type,
       settings=backend_settings,
     )
+
+    # Ack-concurrency gate (round-2 C1 fix). Inspect the backend CLASS —
+    # no instantiation/connection needed. Single-slot-ack backends (SQS,
+    # Pulsar) under CONCURRENT_REQUESTS>1 silently lose N-1/N acks; the
+    # gate converts that silent defect into a loud fail-fast unless the
+    # operator explicitly opts in via SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS.
+    BackendScheduler._enforce_ack_concurrency_gate(settings, backend_type)
+
     strategy_type = QueueStrategyType(
       settings.get("SCRAPY_QUEUE_STRATEGY", QueueStrategyType.PASSTHROUGH.value)
     )
@@ -161,6 +188,55 @@ class BackendScheduler:
       connection_manager=manager,
       queue_key=settings.get("SCRAPY_QUEUE_KEY", "scheduler:queue"),
       queue_strategy=queue_strategy,
+    )
+
+  @staticmethod
+  def _enforce_ack_concurrency_gate(settings: Settings, backend_type: Any) -> None:
+    """Raise ConfigurationError for single-slot-ack backends under concurrency.
+
+    Reads ``QueueBackend.requires_ack`` / ``supports_concurrent_ack`` from
+    the backend CLASS (no instantiation — pure attribute read via the
+    lazy class lookup in ``_BACKEND_FACTORIES``). Single-slot-ack backends
+    (SQS, Pulsar) silently lose N-1 of N acks under ``CONCURRENT_REQUESTS
+    > 1``; this gate makes that loud unless the operator opts in via
+    ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS``.
+
+    Args:
+        settings: Scrapy settings (read ``CONCURRENT_REQUESTS`` + opt-out).
+        backend_type: The resolved ``BackendType`` for the queue component.
+
+    Raises:
+        ConfigurationError: If the backend requires ack, does not support
+            concurrent ack, ``CONCURRENT_REQUESTS > 1``, and the opt-out
+            is not set.
+    """
+    from scrapy_extension.backends.connectors import _BACKEND_FACTORIES, _load_object
+
+    backend_cls = _load_object(_BACKEND_FACTORIES[backend_type][0])
+    requires_ack = getattr(backend_cls, "requires_ack", False)
+    supports_concurrent = getattr(backend_cls, "supports_concurrent_ack", True)
+    if not requires_ack or supports_concurrent:
+      return
+    concurrent = int(settings.get("CONCURRENT_REQUESTS", 16))
+    if concurrent <= 1:
+      return
+    opt_out = bool(settings.get("SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS", False))
+    if opt_out:
+      return
+    msg = (
+      f"Backend {backend_type.value!r} requires explicit ack but does NOT "
+      f"support concurrent ack (single-slot ack). Under "
+      f"CONCURRENT_REQUESTS={concurrent} (>1), only the last-popped "
+      f"message is ackable and the rest are silently lost (at-least-once "
+      f"violation). Either (a) pin CONCURRENT_REQUESTS=1, (b) switch to a "
+      f"concurrency-safe backend (Kafka/RabbitMQ), or (c) set "
+      f"SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True to opt in to the "
+      f"known-broken mode (NOT recommended — silent data loss)."
+    )
+    raise ConfigurationError(
+      msg,
+      setting_name="CONCURRENT_REQUESTS",
+      setting_value=concurrent,
     )
 
   @classmethod
@@ -183,6 +259,17 @@ class BackendScheduler:
     ``yield self.scheduler.open(spider)`` (yielding None is a no-op in
     both inlineCallbacks and async-first reactor modes).
 
+    **Queue-key templating (round-2, C8 fix).** If ``self.queue_key``
+    contains the literal token ``{spider}``, the token is substituted with
+    ``spider.name`` BEFORE constructing the BackendQueue. This lets two
+    spiders on the same backend use disjoint queues
+    (``SCRAPY_QUEUE_KEY="q:{spider}"``) — without it, the default
+    ``scheduler:queue`` is shared across spiders (silent cross-spider
+    request leakage / contamination). Default key unchanged → existing
+    single-spider deployments are unaffected. Multi-spider footgun: with
+    templating, the dedup set is still shared unless separately templated
+    (see dupefilter_key in BackendDupeFilter).
+
     Args:
         spider: The spider instance.
 
@@ -194,6 +281,12 @@ class BackendScheduler:
     """
     _validate_key_name(spider.name, field_name="spider.name")
     self._spider = spider
+    # Resolve {spider} template in queue_key at open() (round-2 C8 fix).
+    # str.replace (not str.format) so brace-bearing keys like
+    # "q:{spider}-{date}" don't raise KeyError on the unrelated {date};
+    # matches the dupefilter path's .replace() substitution.
+    if "{spider}" in self.queue_key:
+      self.queue_key = self.queue_key.replace("{spider}", spider.name)
     self._queue = BackendQueue(
       connection_manager=self.connection_manager,
       queue_name=self.queue_key,
@@ -311,6 +404,14 @@ class BackendScheduler:
     Applies duplicate filtering through the configured ``DUPEFILTER_CLASS``
     unless ``request.dont_filter`` is set.
 
+    **Dedup-outage envelope (round-2, C6 fix).** The
+    ``dupefilter.request_seen`` call is INSIDE the try-block. A
+    ``QueueError`` / ``BackendError`` from the dedup backend (partial
+    connectivity: queue up, dedup backend down) is logged, the
+    ``scheduler/dupefilter_error`` stat is incremented, and the request is
+    default-enqueued (NOT dropped) so no URL is lost. The spider stays up
+    in degraded mode rather than crashing on an unhandled exception.
+
     Args:
         request: The request to enqueue.
 
@@ -321,17 +422,23 @@ class BackendScheduler:
       msg = "Scheduler not opened"
       raise RuntimeError(msg)
 
-    if (
-      self.dupefilter is not None
-      and not request.dont_filter
-      and self.dupefilter.request_seen(request)
-    ):
-      if self._spider is not None:
-        self.dupefilter.log(request, self._spider)
-      return False
-
     priority = request.priority
+    phase = "dedup"
     try:
+      # Dedup check is INSIDE the try (round-2 C6 fix) so a dedup-backend
+      # outage degrades to default-enqueue instead of crashing the spider.
+      # `phase` distinguishes WHICH call raised so the stat + retry are
+      # attributed correctly (review follow-up: the prior branch couldn't
+      # tell a dedup raise from a push raise → wrong stat + redundant retry).
+      if (
+        self.dupefilter is not None
+        and not request.dont_filter
+        and self.dupefilter.request_seen(request)
+      ):
+        if self._spider is not None:
+          self.dupefilter.log(request, self._spider)
+        return False
+      phase = "push"
       self._queue.push(request, priority=priority)
       if self.stats:
         self.stats.inc_value("scheduler/enqueued")
@@ -340,8 +447,25 @@ class BackendScheduler:
       if self.stats:
         self.stats.inc_value("scheduler/serialization_errors")
       return False
-    except QueueError:
+    except (QueueError, BackendError):
+      if phase == "dedup":
+        # Dedup-backend outage: degrade to enqueue (don't lose the URL),
+        # attribute to the dedup-error stat.
+        logger.exception("Failed to consult dupefilter; defaulting to enqueue")
+        if self.stats:
+          self.stats.inc_value("scheduler/dupefilter_error")
+        try:
+          self._queue.push(request, priority=priority)
+          if self.stats:
+            self.stats.inc_value("scheduler/enqueued")
+        except (QueueError, SerializationError, BackendError):
+          logger.exception("Failed to enqueue request after dedup outage")
+          return False
+        return True
+      # phase == "push": a plain queue-push failure (not a dedup outage).
       logger.exception("Failed to enqueue request")
+      if self.stats:
+        self.stats.inc_value("scheduler/queue_error")
       return False
     else:
       return True

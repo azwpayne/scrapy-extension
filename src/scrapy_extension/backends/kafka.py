@@ -140,6 +140,12 @@ class KafkaBackend(Backend, QueueBackend):
   Supports standalone, cluster, and confluent deployment modes.
   Does NOT implement SetBackend or StorageBackend.
 
+  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
+  Kafka pops carry an ack token (partition, offset) tracked in a per-
+  partition in-flight set; :meth:`ack` commits the contiguous low-watermark
+  for the token's partition. N pops before any ack no longer overwrite a
+  single slot — ack is correct under ``CONCURRENT_REQUESTS > 1``.
+
   Attributes:
       config: KafkaSettings instance with connection parameters.
       _producer: The Kafka producer instance.
@@ -147,6 +153,9 @@ class KafkaBackend(Backend, QueueBackend):
       _admin_client: The Kafka admin client instance.
       _known_topics: Set of topics known to exist (cached to avoid repeated checks).
   """
+
+  requires_ack = True
+  supports_concurrent_ack = True
 
   def __init__(self, config: KafkaSettings) -> None:
     """Initialize Kafka backend.

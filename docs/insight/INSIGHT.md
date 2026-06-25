@@ -17,7 +17,7 @@ security-reviewer/sonnet, test-engineer/sonnet, explore/haiku) + orchestrator fa
 | **CRITICAL** | Shared `ConnectionManager.close()` has **no refcounting** — colocated components (queue + dedup on the same Redis) tear the connection down out from under each other during shutdown ordering. | `backends/connectors.py:374` (close), `:236` (get_manager), `:255` (registry set) | grep confirms no `_users`/refcount exists |
 | **HIGH** | Ack/nack **single-slot** (`_last_record` / `_last_delivery_tag`) — under default `CONCURRENT_REQUESTS=16` only the last popped msg is ackable → **silent at-least-once violation** (Kafka/RabbitMQ). Code only **warns**, does not enforce. | `backends/kafka.py:112,456-462,479-487`; `backends/rabbitmq.py:74,459-465,483-486`; `schedule/scheduler.py:56-66` | warn at `kafka.py:459`, `rabbitmq.py:462` |
 | **HIGH** | Redis `_POP_LUA` escalates a **benign concurrent-consumer payload race** to a hard `QueueError` (treats a lost `HGET` as corruption). | `backends/redis.py:49-57,474-489` | integer `-1` sentinel |
-| MEDIUM | ES queue pop = **search-then-delete** (non-atomic) → duplicate delivery under competing consumers. | `backends/elasticsearch.py:196-224` | |
+| MEDIUM | ES queue pop = **search-then-delete** (non-atomic) → duplicate delivery under competing consumers. | `backends/elasticsearch.py:196-224` | ✅ **RESOLVED** (round-2 verified: atomic via `if_seq_no`/`if_primary_term` + conflict retry, `elasticsearch.py:195-246`; test `test_pop_retries_on_conflict`) |
 | MEDIUM | `DelayQueueStrategy` holds items **in-process** (`heapq`); loses them on worker restart — distributed-correctness hole. | `queue/strategies/delay.py:38-39,69,151-168` | self-documented as v1 debt |
 
 ## Theme B — Connection lifecycle & concurrency

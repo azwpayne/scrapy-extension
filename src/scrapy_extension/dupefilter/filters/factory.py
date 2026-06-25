@@ -9,6 +9,7 @@ from __future__ import annotations
 
 __all__ = ["DedupeStrategy", "build_membership_filter"]
 
+import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,13 @@ from scrapy_extension.exceptions import ConfigurationError
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
+
+logger = logging.getLogger(__name__)
+
+# Module-level cache so the warning fires once per process per strategy even
+# when many dupefilters are constructed (multi-spider process). Tests reset
+# this to verify the warn-once contract from a clean slate.
+_warned: set[DedupeStrategy] = set()
 
 
 class DedupeStrategy(str, Enum):
@@ -42,6 +50,41 @@ class DedupeStrategy(str, Enum):
   def _missing_(cls, value: object) -> DedupeStrategy:
     valid = ", ".join(repr(m.value) for m in cls)
     raise ValueError(f"{value!r} is not a valid {cls.__name__}. Valid: {valid}.")
+
+
+# Per-process strategies whose state is invisible to other workers. The library
+# markets itself as distributed, so selecting one of these silently degrades the
+# cross-worker dedup contract. The factory warns once per process per strategy
+# (idempotent) to surface the limitation at selection time — class docstrings
+# alone were not enough (INSIGHTS-2026-06-25 Theme C).
+_PER_PROCESS_STRATEGIES: frozenset[DedupeStrategy] = frozenset(
+  {DedupeStrategy.MEMORY, DedupeStrategy.BLOOM, DedupeStrategy.CUCKOO}
+)
+
+
+def _warn_per_process_scope(strategy: DedupeStrategy) -> None:
+  """Emit a one-time per-process warning when ``strategy`` is per-process.
+
+  Bloom / cuckoo / memory filters live in-process: cross-worker duplicates
+  pass silently. Operators assuming distributed dedup need a loud signal at
+  selection time. Idempotent via the module-level ``_warned`` set so a
+  multi-spider process does not spam the log.
+
+  Args:
+      strategy: The selected dedup strategy.
+  """
+  if strategy not in _PER_PROCESS_STRATEGIES:
+    return
+  if strategy in _warned:
+    return
+  _warned.add(strategy)
+  logger.warning(
+    "Dedup strategy %r is per-process — its state is not shared across "
+    "workers, so cross-worker duplicate requests will pass undetected. "
+    "For cross-worker dedup, use the default 'set' strategy (or a "
+    "MemoryMembershipFilter backed by a shared backend).",
+    strategy.value,
+  )
 
 
 def build_membership_filter(
@@ -74,6 +117,7 @@ def build_membership_filter(
   Raises:
       ConfigurationError: If ``strategy`` is not a known DedupeStrategy.
   """
+  _warn_per_process_scope(strategy)
   if strategy is DedupeStrategy.SET:
     return SetMembershipFilter(connection_manager, key)
   if strategy is DedupeStrategy.MEMORY:

@@ -61,12 +61,16 @@ class BackendDupeFilter:
     fingerprinter: _Fingerprinter | None = None,
     membership_filter: MembershipFilter | None = None,
     monitor: Monitor | None = None,
+    clear_on_open: bool = False,
   ) -> None:
     """Initialize the dupefilter.
 
     Args:
         connection_manager: Connection manager for backend access.
-        key: Key for the fingerprints set / filter scope.
+        key: Key for the fingerprints set / filter scope. May contain the
+            literal placeholder ``"{spider}"``; when present it is
+            substituted with ``spider.name`` at :meth:`open` time so each
+            spider gets its own dedup scope (C8 fix).
         debug: Whether to log filtered requests.
         fingerprinter: Optional Scrapy request fingerprinter. When provided
             (normally threaded from ``crawler.request_fingerprinter`` via
@@ -84,10 +88,14 @@ class BackendDupeFilter:
             :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` in
             :meth:`from_crawler` when ``crawler.stats`` is available, so dedup
             hit/miss stats are default-on. Emitted hooks are additive.
+        clear_on_open: When True, :meth:`open` clears any prior fingerprints
+            before the run begins (C5 fix). Default False → zero compat break
+            (re-running a spider sees the prior run's fingerprints, as before).
     """
     self.connection_manager = connection_manager
     self.key = key
     self.debug = debug
+    self.clear_on_open = clear_on_open
     self._fingerprinter = fingerprinter
     self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
     # Use ``is None`` (not ``or``): a MembershipFilter defines __len__, so an
@@ -155,6 +163,9 @@ class BackendDupeFilter:
       key=key,
       debug=settings.getbool("DUPEFILTER_DEBUG", default=False),
       membership_filter=membership_filter,
+      clear_on_open=settings.getbool(
+        "SCRAPY_DUPEFILTER_CLEAR_ON_OPEN", default=False
+      ),
     )
 
   @classmethod
@@ -181,9 +192,56 @@ class BackendDupeFilter:
       dupefilter._monitor = ScrapyStatsMonitor(stats)
     return dupefilter
 
-  def open(self) -> None:
-    """Open the dupefilter and its membership filter (no-op for set)."""
+  def open(self, spider: Spider | None = None) -> None:
+    """Open the dupefilter and its membership filter.
+
+    Called by Scrapy's engine with no args (stock scheduler calls
+    ``self.df.open()``); accepts an optional ``spider`` for explicit invocation
+    (e.g. from a custom scheduler's ``open(spider)``). When a spider is
+    provided, two additive behaviors activate (both default-off / no-op when
+    no spider is passed or the relevant setting is unset):
+
+    1. ``{spider}`` key templating (C8): if :attr:`key` contains the literal
+       placeholder ``"{spider}"``, it is substituted with ``spider.name`` and
+       the resolved key is propagated to the underlying membership filter
+       (for backend-backed filters like :class:`SetMembershipFilter`) so each
+       spider gets its own dedup scope. Keys without the placeholder are
+       passed through unchanged.
+    2. ``SCRAPY_DUPEFILTER_CLEAR_ON_OPEN`` (C5): when the dupefilter was
+       constructed with ``clear_on_open=True``, any prior fingerprints are
+       cleared before the run begins — so a re-run / resume crawl is not
+       silently blocked by stale state.
+
+    Args:
+        spider: The spider opening the crawl (optional).
+    """
+    if spider is not None:
+      self._resolve_spider_key(spider)
     self._filter.open()
+    if self.clear_on_open:
+      self.clear()
+
+  def _resolve_spider_key(self, spider: Spider) -> None:
+    """Substitute ``{spider}`` in :attr:`key` with ``spider.name``, propagating
+    to the underlying membership filter.
+
+    No-op when the key does not contain the placeholder. Only backend-backed
+    filters (those exposing a mutable ``key`` attribute, e.g.
+    :class:`SetMembershipFilter`) receive the propagated update; in-process
+    filters (memory/bloom/cuckoo) ignore the key entirely, so the placeholder
+    has no effect there — consistent with their per-process scope.
+    """
+    if "{spider}" not in self.key:
+      return
+    templated = self.key
+    resolved = templated.replace("{spider}", spider.name)
+    self.key = resolved
+    # Propagate to backend-backed filters that expose a writable ``key``. The
+    # filter was built from the same templated key, so only rewrite when its
+    # key still equals the templated form — a caller who passed a custom
+    # filter with a different key is not silently overwritten.
+    if getattr(self._filter, "key", None) == templated:
+      self._filter.key = resolved  # type: ignore[attr-defined]
 
   def close(self, reason: str) -> None:
     """Close the dupefilter and its membership filter.
@@ -193,6 +251,15 @@ class BackendDupeFilter:
     """
     self._filter.close()
     self.connection_manager.close()
+
+  def clear(self) -> None:
+    """Clear all tracked fingerprints via the membership filter.
+
+    Used by :meth:`open` when ``clear_on_open=True`` (C5 fix). Delegates to
+    the underlying strategy's :meth:`MembershipFilter.clear`, so every
+    concrete filter (set/memory/bloom/cuckoo) supports it.
+    """
+    self._filter.clear()
 
   def log(self, request: Request, spider: Spider) -> None:
     """Log a filtered request.

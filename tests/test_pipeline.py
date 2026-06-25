@@ -6,7 +6,7 @@ import pytest
 from scrapy import Field, Item
 
 from scrapy_extension.backends.base import JSONSerializer
-from scrapy_extension.exceptions import SerializationError
+from scrapy_extension.exceptions import BackendError, SerializationError
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
 
@@ -612,3 +612,190 @@ class TestBackendPipelineStorageStrategy:
 
     strat.close.assert_called_once()
     mock_connection_manager.close.assert_called_once()
+
+
+class TestBackendPipelineStorageEscalation:
+  """C2 (round 2): opt-in loud-fail after N consecutive storage errors.
+
+  Default (``max_storage_errors=None``) preserves the swallow-and-stat
+  behavior — zero compat break. When set to an int N, the pipeline tracks
+  consecutive storage failures and re-raises (wrapped as ``BackendError``)
+  once the consecutive count exceeds N, so a persistent storage outage
+  surfaces loudly instead of being silently swallowed as success.
+  """
+
+  def test_default_none_preserves_swallow_and_stat(
+    self, mock_connection_manager, mocker
+  ):
+    """Default (None) = current best-effort behavior: raise → item returned + stat."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = True
+
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_storage.store.side_effect = RuntimeError("connection refused")
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    item = SampleItem(name="x", value=1)
+    result = pipeline.process_item(item, mock_spider)
+
+    assert result is item
+    mock_spider.crawler.stats.inc_value.assert_called_with("pipeline/storage_errors")
+
+  def test_escalation_raises_after_threshold_exceeded(
+    self, mock_connection_manager, mocker
+  ):
+    """N=2: two consecutive raises swallowed; the THIRD raises ``BackendError``.
+
+    Pre-B1 this raises ``AttributeError`` (no ``max_storage_errors`` kwarg) /
+    never escalates — RED. Post-B1 the 3rd failure exceeds the threshold and
+    re-raises wrapped as ``BackendError``.
+    """
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_storage_errors=2,
+    )
+    pipeline._storage_supported = True
+
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_storage.store.side_effect = RuntimeError("connection refused")
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    # 1st and 2nd consecutive failures: swallowed (count=1, count=2).
+    pipeline.process_item(SampleItem(name="a", value=1), mock_spider)
+    pipeline.process_item(SampleItem(name="b", value=2), mock_spider)
+
+    # 3rd consecutive failure: count becomes 3 > 2 → escalate.
+    with pytest.raises(BackendError, match="consecutive storage"):
+      pipeline.process_item(SampleItem(name="c", value=3), mock_spider)
+
+  def test_successful_store_resets_consecutive_counter(
+    self, mock_connection_manager, mocker
+  ):
+    """A successful store between two failures resets the counter.
+
+    With N=2: fail, fail, SUCCESS (reset), fail, fail → the next (3rd in a row
+    since reset) would escalate, but only 2 consecutive have happened since
+    the reset, so no escalation. Verifies the counter is consecutive, not
+    cumulative.
+    """
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      max_storage_errors=2,
+    )
+    pipeline._storage_supported = True
+
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    # Two consecutive failures (swallowed).
+    mock_storage.store.side_effect = RuntimeError("connection refused")
+    pipeline.process_item(SampleItem(name="a", value=1), mock_spider)
+    pipeline.process_item(SampleItem(name="b", value=2), mock_spider)
+
+    # Success — resets the consecutive counter to 0.
+    mock_storage.store.side_effect = None
+    pipeline.process_item(SampleItem(name="ok", value=3), mock_spider)
+
+    # Two more consecutive failures: only 2 since reset, NOT > 2 → no escalate.
+    mock_storage.store.side_effect = RuntimeError("connection refused")
+    pipeline.process_item(SampleItem(name="d", value=4), mock_spider)
+    result = pipeline.process_item(SampleItem(name="e", value=5), mock_spider)
+
+    # Item returned, not raised — counter was reset by the intervening success.
+    assert result is not None
+    assert mock_storage.store.call_count == 5
+
+
+class TestBackendPipelineMonitorWiring:
+  """C2/F (round 2): ``on_store`` hook invoked after a successful store.
+
+  Mirrors the dupefilter monitor wiring — an optional ``Monitor`` threaded
+  through ``from_crawler``; ``NullMonitor`` default preserves prior behavior.
+  The hook fires only on success, never on failure (the failure path has its
+  own stat, ``pipeline/storage_errors``).
+  """
+
+  def test_on_store_invoked_on_success(self, mock_connection_manager, mocker):
+    """A successful store calls ``monitor.on_store(key)`` with the storage key.
+
+    Pre-B2 the pipeline has no ``monitor`` kwarg — RED (AttributeError / hook
+    never called). Post-B2 the hook fires exactly once per successful store.
+    """
+    monitor = mocker.Mock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    pipeline.process_item(SampleItem(name="x", value=1), mock_spider)
+
+    monitor.on_store.assert_called_once()
+    call_key = monitor.on_store.call_args[0][0]
+    assert isinstance(call_key, str)
+    assert call_key  # non-empty
+
+  def test_on_store_not_invoked_on_failure(self, mock_connection_manager, mocker):
+    """A failed store must NOT call ``on_store`` (failure path has its own stat)."""
+    monitor = mocker.Mock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_storage.store.side_effect = RuntimeError("connection refused")
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    pipeline.process_item(SampleItem(name="x", value=1), mock_spider)
+
+    monitor.on_store.assert_not_called()
+
+  def test_default_monitor_is_null_when_unset(self, mock_connection_manager):
+    """When no monitor is passed, the pipeline holds a ``NullMonitor`` (no-op).
+
+    Preserves prior behavior exactly — calling ``on_store`` on a NullMonitor
+    is a no-op, so existing single-call-store tests stay green.
+    """
+    from scrapy_extension.monitor.base import NullMonitor
+
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    assert isinstance(pipeline._monitor, NullMonitor)
+
+  def test_from_crawler_wires_scrapy_stats_monitor(self, mocker):
+    """from_crawler wires ScrapyStatsMonitor when crawler.stats is available.
+
+    Mirrors the dupefilter pattern — default-on telemetry without an explicit
+    ``monitor=`` kwarg. Additive: ``pipeline/store_count`` is a new stat, the
+    existing ``pipeline/storage_errors`` stat is untouched.
+    """
+    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.monitor.stats import ScrapyStatsMonitor
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis"
+    }.get(key, default)
+    mock_settings.getint.return_value = 0
+    mock_settings.getdict.return_value = {}
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    mock_crawler = mocker.Mock()
+    mock_crawler.settings = mock_settings
+    mock_crawler.stats = mocker.Mock()
+
+    pipeline = BackendPipeline.from_crawler(mock_crawler)
+
+    assert isinstance(pipeline._monitor, ScrapyStatsMonitor)

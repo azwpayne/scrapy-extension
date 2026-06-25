@@ -118,7 +118,8 @@ class TestSqsPushPop:
       "Messages": [{"Body": base64.b64encode(b"hello").decode(), "ReceiptHandle": "rh"}]
     }
     assert b.pop("queue1") == b"hello"
-    assert b._last_receipt == "rh"
+    # _last_receipt is a (queue_url, receipt_handle) tuple (round-2 C3 fix).
+    assert b._last_receipt == ("https://sqs/test", "rh")
 
   def test_pop_returns_none_when_empty(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -182,3 +183,98 @@ class TestSqsLenClear:
     b, client = _connected(mocker)
     b.clear_queue("queue1")
     client.purge_queue.assert_called_once_with(QueueUrl="https://sqs/test")
+
+
+def _connected_multi_queue(mocker, urls: dict[str, str]):
+  """Connect a backend whose queue-URL cache resolves multiple queues.
+
+  ``urls`` maps queue_name -> QueueUrl. ``get_queue_url`` is patched to
+  return the right URL per call, mirroring real SQS resolution.
+  """
+  b = _make_backend()
+  client = mocker.MagicMock()
+
+  def _get_queue_url(*, QueueName):  # noqa: N803 — boto3 kwarg name
+    for qname, url in urls.items():
+      if QueueName.endswith(qname):
+        return {"QueueUrl": url}
+    raise RuntimeError(f"unexpected QueueName={QueueName!r}")
+
+  client.get_queue_url.side_effect = _get_queue_url
+  mocker.patch.object(boto3, "client", return_value=client)
+  b.connect()
+  return b, client
+
+
+class TestSqsAckCorrectQueueUrl:
+  """Unit A (A4 / C3 HIGH): ack deletes against the queue the msg was popped from.
+
+  Pre-fix SQS ``ack`` resolved the QueueUrl via
+  ``next(iter(self._queue_urls.values()))`` — the first-cached queue, NOT
+  necessarily the source queue of the popped message. With >=2 queues, a
+  message popped from queue B could be ``delete_message``d against queue A's
+  URL, never actually deleting the message (silent redeliver) and possibly
+  erroring on AWS. The fix tracks ``(queue_url, receipt_handle)`` per pop.
+
+  This test is HYPOTHESIS-gated: it MUST fail pre-fix (C3 RED).
+  """
+
+  def test_ack_after_pop_from_queue_b_targets_queue_b_url(self, mocker) -> None:
+    """pop from qB -> ack deletes with QueueUrl=qB_url, NOT qA_url."""
+    import base64
+
+    urls = {"qA": "https://sqs/qA-url", "qB": "https://sqs/qB-url"}
+    b, client = _connected_multi_queue(mocker, urls)
+
+    # Seed the URL cache in a known order by touching qA first, so the
+    # pre-fix `next(iter(...))` resolves to qA (proving the bug is real,
+    # not masked by dict ordering).
+    b._queue_url("qA")
+    b._queue_url("qB")
+    # Sanity: the cache is populated and iteration order is qA, qB.
+    assert list(b._queue_urls.values()) == [
+      "https://sqs/qA-url",
+      "https://sqs/qB-url",
+    ]
+
+    # Pop a message FROM qB with a distinct receipt handle.
+    client.receive_message.return_value = {
+      "Messages": [
+        {
+          "Body": base64.b64encode(b"from-b").decode(),
+          "ReceiptHandle": "rh-from-b",
+        }
+      ]
+    }
+    popped = b.pop("qB")
+    assert popped == b"from-b"
+
+    # Ack it.
+    b.ack("qB")
+
+    # CRITICAL: delete_message MUST target qB's URL, not qA's.
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/qB-url", ReceiptHandle="rh-from-b"
+    )
+
+  def test_ack_records_correct_url_across_queues(self, mocker) -> None:
+    """Round-trip pop+ack across two queues acks each against its own URL."""
+    import base64
+
+    urls = {"qA": "https://sqs/qA-url", "qB": "https://sqs/qB-url"}
+    b, client = _connected_multi_queue(mocker, urls)
+
+    # Pop from qA then qB (single-slot, so qA's receipt is overwritten —
+    # that's the documented limitation; here we just check ack-after-pop
+    # targets the LAST popped queue's URL).
+    client.receive_message.side_effect = [
+      {"Messages": [{"Body": base64.b64encode(b"a").decode(), "ReceiptHandle": "rh-a"}]},
+      {"Messages": [{"Body": base64.b64encode(b"b").decode(), "ReceiptHandle": "rh-b"}]},
+    ]
+    b.pop("qA")
+    b.pop("qB")
+    b.ack("qB")  # acks the last-popped (qB)
+
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/qB-url", ReceiptHandle="rh-b"
+    )

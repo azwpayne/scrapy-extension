@@ -19,7 +19,9 @@ See [INSIGHT.md](./INSIGHT.md) for evidence, [SPEC.md](./SPEC.md) for goals/cons
 - No explicit Sentinel failover re-discovery path (delegated to redis-py `master_for` proxy).
 - RocketMQ integration tests (need a runner image with native `librocketmq`).
 - SQS/Pulsar in-flight-set ack (H shipped signature compat only; pin `CONCURRENT_REQUESTS=1` for them).
-- Entry-point plugin registration for backends (architect bet #2). ES atomic pop (bet #6).
+- Entry-point plugin registration for backends (architect bet #2).
+- ~~ES atomic pop (bet #6).~~ ✅ DONE — `elasticsearch.py:195-246` uses `if_seq_no`/`if_primary_term` + conflict retry (verified round-2).
+- ~~Integration CI job re-enable.~~ ✅ DONE — `.github/workflows/ci.yml:51` live, 5 services (verified round-2).
 
 
 ## Tier 1 — In-scope (parallel fan-out; disjoint files)

@@ -531,3 +531,163 @@ class TestBackendDupeFilterIntegration:
 
     assert result is False
     mock_set_backend.add.assert_called_once()
+
+
+class TestBackendDupeFilterClearOnOpen:
+  """D1 (C5 HIGH): SCRAPY_DUPEFILTER_CLEAR_ON_OPEN resets the dedup set at open()."""
+
+  def test_clear_on_open_resets_seen_fingerprints(self, mocker):
+    """clear_on_open=True: add fp → seen True → open(spider) → same request seen False.
+
+    Pre-fix (RED): ``open(spider)`` is a no-op for the set filter, so the
+    previously-seen fingerprint stays and the same request is reported
+    seen=True on the second ``request_seen`` call. Post-fix (GREEN):
+    ``open(spider)`` calls ``self.clear()`` and the second call returns False.
+    """
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+      "SCRAPY_DEDUP_STRATEGY": "set",
+    }.get(key, default)
+    mock_settings.getbool.side_effect = lambda key, default=False: {
+      "DUPEFILTER_DEBUG": False,
+      "SCRAPY_DUPEFILTER_CLEAR_ON_OPEN": True,
+    }.get(key, default)
+    mock_settings.getdict.return_value = {}
+
+    mock_manager = mocker.Mock()
+    mock_set_backend = mocker.Mock()
+    # First add → newly added (True); after clear, the second add must also be
+    # newly added (True) — proving the set was cleared.
+    mock_set_backend.add.side_effect = [True, True]
+    mock_manager.get_set_backend.return_value = mock_set_backend
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+
+    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+    spider = mocker.Mock(name="spider")
+    spider.name = "test_spider"
+
+    request = Request(url="https://example.com/page")
+    # First sighting: newly added → not a duplicate.
+    assert dupefilter.request_seen(request) is False
+    # Same request again: backend side_effect returns True on the 2nd call,
+    # but without clear-on-open the dupefilter's own dedup state would still
+    # consider it seen. After the fix, open(spider) clears the backend set.
+    dupefilter.open(spider)
+    mock_set_backend.clear_set.assert_called_once()
+    # After clear, the same request must be newly added again (not seen).
+    assert dupefilter.request_seen(request) is False
+
+  def test_clear_on_open_default_is_false_preserves_behavior(self, mocker):
+    """Default (clear_on_open=False): open(spider) does NOT clear the set.
+
+    Ensures the new opt-in is additive — zero compat break when the setting
+    is not explicitly enabled.
+    """
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+      "SCRAPY_DEDUP_STRATEGY": "set",
+    }.get(key, default)
+    mock_settings.getbool.side_effect = lambda key, default=False: {
+      "DUPEFILTER_DEBUG": False,
+    }.get(key, default)
+    mock_settings.getdict.return_value = {}
+
+    mock_manager = mocker.Mock()
+    mock_set_backend = mocker.Mock()
+    mock_manager.get_set_backend.return_value = mock_set_backend
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+
+    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+    spider = mocker.Mock(name="spider")
+    spider.name = "test_spider"
+
+    dupefilter.open(spider)
+    mock_set_backend.clear_set.assert_not_called()
+
+
+class TestBackendDupeFilterSpiderKeyTemplating:
+  """D2 (C8 HIGH): {spider} placeholder substituted in the dedup key at open()."""
+
+  def test_spider_placeholder_substituted_in_key(self, mocker):
+    """Key 'dupefilter:{spider}' + spider.name 'foo' → backend key 'dupefilter:foo'.
+
+    Pre-fix (RED): the key is passed verbatim ('dupefilter:{spider}') to the
+    backend — the literal placeholder is sent as the set name. Post-fix
+    (GREEN): ``open(spider)`` substitutes ``spider.name`` so the resolved
+    backend key contains 'foo'.
+    """
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_DUPEFILTER_KEY": "dupefilter:{spider}",
+      "SCRAPY_DEDUP_STRATEGY": "set",
+    }.get(key, default)
+    mock_settings.getbool.side_effect = lambda key, default=False: {
+      "DUPEFILTER_DEBUG": False,
+    }.get(key, default)
+    mock_settings.getdict.return_value = {}
+
+    mock_manager = mocker.Mock()
+    mock_set_backend = mocker.Mock()
+    mock_set_backend.add.return_value = True
+    mock_manager.get_set_backend.return_value = mock_set_backend
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+
+    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+    spider = mocker.Mock(name="spider")
+    spider.name = "foo"
+
+    dupefilter.open(spider)
+
+    request = Request(url="https://example.com/page")
+    dupefilter.request_seen(request)
+
+    # The resolved backend key passed to SetBackend.add must contain the
+    # substituted spider name, not the literal placeholder.
+    call_args = mock_set_backend.add.call_args
+    resolved_key = call_args[0][0]
+    assert "foo" in resolved_key
+    assert "{spider}" not in resolved_key
+
+  def test_no_placeholder_keeps_key_verbatim(self, mocker):
+    """Keys without '{spider}' are passed through unchanged at open(spider)."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_BACKEND_TYPE": "redis",
+      "SCRAPY_DUPEFILTER_KEY": "static:dupefilter",
+      "SCRAPY_DEDUP_STRATEGY": "set",
+    }.get(key, default)
+    mock_settings.getbool.side_effect = lambda key, default=False: {
+      "DUPEFILTER_DEBUG": False,
+    }.get(key, default)
+    mock_settings.getdict.return_value = {}
+
+    mock_manager = mocker.Mock()
+    mock_set_backend = mocker.Mock()
+    mock_set_backend.add.return_value = True
+    mock_manager.get_set_backend.return_value = mock_set_backend
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+
+    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+    spider = mocker.Mock(name="spider")
+    spider.name = "irrelevant"
+
+    dupefilter.open(spider)
+
+    request = Request(url="https://example.com/page")
+    dupefilter.request_seen(request)
+
+    call_args = mock_set_backend.add.call_args
+    assert call_args[0][0] == "static:dupefilter"
