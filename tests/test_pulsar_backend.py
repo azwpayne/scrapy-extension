@@ -21,7 +21,10 @@ from scrapy_extension.backends.base import (  # noqa: E402
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.backends.pulsar import PulsarBackend  # noqa: E402
+from scrapy_extension.backends.pulsar import (  # noqa: E402
+  PulsarBackend,
+  _PulsarAckToken,
+)
 from scrapy_extension.exceptions import BackendConnectionError, QueueError  # noqa: E402
 from scrapy_extension.settings import PulsarMode, PulsarSettings  # noqa: E402
 
@@ -185,6 +188,193 @@ class TestPulsarAckNack:
     b.nack("queue1")
     consumer.negative_acknowledge.assert_called_once_with(msg)
     assert b._last_msg is None
+
+
+class TestPulsarRealAck:
+  """Real per-message ack (round-3): in-flight set + _PulsarAckToken.
+
+  Pulsar's Shared subscription is natively per-message —
+  ``consumer.acknowledge(msg_id)`` targets one specific message. These
+  tests prove the in-flight-set ack is correct under
+  ``CONCURRENT_REQUESTS > 1`` (N pops before any ack no longer overwrite
+  a single slot).
+  """
+
+  def test_supports_concurrent_ack_is_true(self) -> None:
+    b = _make_backend()
+    assert b.requires_ack is True
+    assert b.supports_concurrent_ack is True
+
+  def test_pop_with_ack_returns_bytes_and_token(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"hello"
+    msg_id = mocker.MagicMock(name="msg_id_a")
+    msg.message_id.return_value = msg_id
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    value, token = b.pop_with_ack("queue1", timeout=1.0)
+    assert value == b"hello"
+    assert isinstance(token, _PulsarAckToken)
+    assert token.message_id is msg_id
+    assert token in b._in_flight
+
+  def test_pop_with_ack_empty_returns_none_none(self, mocker) -> None:
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = RuntimeError("timed out")
+    b, _ = _connected(mocker, subscribe=consumer)
+    value, token = b.pop_with_ack("queue1")
+    assert value is None
+    assert token is None
+    assert b._in_flight == set()
+
+  def test_multi_pop_then_ack_each_by_own_token(self, mocker) -> None:
+    """Three pops with no acks between, then ack each by its OWN token.
+
+    RED pre-fix: single-slot _last_msg only holds the 3rd message, so the
+    first two acks would no-op (or only the 3rd message gets acked).
+    GREEN post-fix: each ack hits the right message_id and the in-flight
+    set empties.
+    """
+    msg_ids = [mocker.MagicMock(name=f"id_{i}") for i in range(3)]
+    msgs = []
+    for i, mid in enumerate(msg_ids):
+      m = mocker.MagicMock(name=f"msg_{i}")
+      m.data.return_value = f"payload-{i}".encode()
+      m.message_id.return_value = mid
+      msgs.append(m)
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = msgs
+    b, _ = _connected(mocker, subscribe=consumer)
+
+    # Pop 3 without acking between — each builds its own token.
+    tokens = []
+    for _ in range(3):
+      value, token = b.pop_with_ack("queue1", timeout=1.0)
+      assert token is not None
+      tokens.append(token)
+    assert len(b._in_flight) == 3
+
+    # Ack each by its OWN token — distinct message_ids, correct each.
+    consumer.acknowledge.reset_mock()
+    for token in tokens:
+      b.ack("queue1", token=token)
+    # Three distinct acknowledge(message_id) calls, in token order.
+    assert consumer.acknowledge.call_count == 3
+    actual_ids = [call.args[0] for call in consumer.acknowledge.call_args_list]
+    assert actual_ids == [t.message_id for t in tokens]
+    assert len(set(id(x) for x in actual_ids)) == 3  # 3 distinct objects
+    assert b._in_flight == set()
+
+  def test_ack_with_token_discards_from_in_flight(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg_id = mocker.MagicMock()
+    msg.message_id.return_value = msg_id
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+    assert token is not None
+    assert len(b._in_flight) == 1
+    b.ack("q", token=token)
+    consumer.acknowledge.assert_called_once_with(msg_id)
+    assert b._in_flight == set()
+
+  def test_ack_with_token_idempotent_re_ack(self, mocker) -> None:
+    """Re-acking a discarded token is a safe no-op on the in-flight set."""
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+    b.ack("q", token=token)
+    # Second ack on the same token — acknowledge fires again (Pulsar ack is
+    # idempotent at the broker) but the in-flight set stays empty.
+    b.ack("q", token=token)
+    assert consumer.acknowledge.call_count == 2
+    assert b._in_flight == set()
+
+  def test_nack_with_token_calls_negative_acknowledge(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg_id = mocker.MagicMock()
+    msg.message_id.return_value = msg_id
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+    b.nack("q", token=token)
+    consumer.negative_acknowledge.assert_called_once_with(msg_id)
+    assert b._in_flight == set()
+
+  def test_nack_with_token_no_op_when_client_lacks_method(self, mocker) -> None:
+    """Client without negative_acknowledge: nack(token) is a safe no-op."""
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    # Remove negative_acknowledge to simulate older client.
+    del consumer.negative_acknowledge
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+    b.nack("q", token=token)  # must not raise
+    assert b._in_flight == set()
+
+  def test_crash_mid_ack_leaves_messages_in_flight(self, mocker) -> None:
+    """Pop 2, ack neither → both stay in _in_flight (re-delivered on restart).
+
+    At-least-once: an unacked message is redelivered by Pulsar on consumer
+    restart, so a crash mid-batch never loses work.
+    """
+    msg_ids = [mocker.MagicMock(name=f"id_{i}") for i in range(2)]
+    msgs = []
+    for i, mid in enumerate(msg_ids):
+      m = mocker.MagicMock()
+      m.data.return_value = f"p-{i}".encode()
+      m.message_id.return_value = mid
+      msgs.append(m)
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = msgs
+    b, _ = _connected(mocker, subscribe=consumer)
+    b.pop_with_ack("q")
+    b.pop_with_ack("q")
+    # No acks — both remain in-flight.
+    assert len(b._in_flight) == 2
+    consumer.acknowledge.assert_not_called()
+
+  def test_legacy_pop_then_ack_without_token(self, mocker) -> None:
+    """Legacy path: pop() then ack(token=None) via _last_msg still works."""
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"legacy"
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    value = b.pop("q")
+    assert value == b"legacy"
+    assert b._last_msg is msg
+    b.ack("q")  # no token — legacy path
+    consumer.acknowledge.assert_called_once_with(msg)
+    assert b._last_msg is None
+
+  def test_ack_token_equality_and_repr(self) -> None:
+    """_PulsarAckToken equality is by message_id identity; repr is informative."""
+    mid1 = object()
+    mid2 = object()
+    t1a = _PulsarAckToken(message_id=mid1, topic="t")
+    t1b = _PulsarAckToken(message_id=mid1, topic="t")
+    t2 = _PulsarAckToken(message_id=mid2, topic="t")
+    assert t1a == t1b
+    assert t1a != t2
+    assert t1a != "not-a-token"
+    # Hashable (set membership).
+    assert len({t1a, t1b, t2}) == 2
+    r = repr(t1a)
+    assert "_PulsarAckToken" in r
+    assert "topic='t'" in r
 
 
 class TestPulsarLenClear:

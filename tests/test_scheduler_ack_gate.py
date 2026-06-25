@@ -77,34 +77,59 @@ def _make_settings(
 class TestAckCapabilityGate:
   """A3: scheduler.from_settings gates single-slot-ack backends under concurrency."""
 
-  def test_sqs_with_concurrency_gt_1_raises(self, mocker) -> None:
-    """SQS (single-slot ack) + CONCURRENT_REQUESTS=16 -> ConfigurationError."""
+  def test_sqs_with_concurrency_gt_1_passes(self, mocker) -> None:
+    """SQS has a real in-flight set (round-3) -> concurrency-safe, no raise."""
+    settings = _make_settings("sqs", concurrent=16)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+    assert scheduler.queue_key == "scheduler:queue"
+
+  def test_gate_fires_for_synthetic_single_slot_backend(self, mocker) -> None:
+    """After round-3 every real backend is concurrency-safe, so the gate
+    mechanism is covered by a synthetic single-slot stub — it must still
+    fire for any future backend that declares requires_ack=True /
+    supports_concurrent_ack=False."""
+
+    class _SingleSlotStub:
+      requires_ack = True
+      supports_concurrent_ack = False
+
+    mocker.patch(
+      "scrapy_extension.backends.connectors._load_object",
+      return_value=_SingleSlotStub,
+    )
     settings = _make_settings("sqs", concurrent=16)
     mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
 
     with pytest.raises(ConfigurationError) as excinfo:
       BackendScheduler.from_settings(settings)
+    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" in str(excinfo.value)
 
-    msg = str(excinfo.value)
-    # Names the offending backend and the opt-out so operators can act.
-    assert "sqs" in msg.lower()
-    assert "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS" in msg
+  def test_gate_opt_out_for_synthetic_single_slot_backend(self, mocker) -> None:
+    """The opt-out flag still disables the gate for a single-slot backend."""
 
-  def test_sqs_with_concurrency_gt_1_opt_out_passes(self, mocker) -> None:
-    """Explicit opt-out flag -> SQS + CONCURRENT_REQUESTS=16 does not raise."""
+    class _SingleSlotStub:
+      requires_ack = True
+      supports_concurrent_ack = False
+
+    mocker.patch(
+      "scrapy_extension.backends.connectors._load_object",
+      return_value=_SingleSlotStub,
+    )
     settings = _make_settings("sqs", concurrent=16, opt_out=True)
     mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
 
     scheduler = BackendScheduler.from_settings(settings)  # must not raise
     assert scheduler.queue_key == "scheduler:queue"
 
-  def test_pulsar_with_concurrency_gt_1_raises(self, mocker) -> None:
-    """Pulsar (single-slot ack) + CONCURRENT_REQUESTS=4 -> ConfigurationError."""
+  def test_pulsar_with_concurrency_gt_1_passes(self, mocker) -> None:
+    """Pulsar has a real in-flight set (round-3) -> concurrency-safe, no raise."""
     settings = _make_settings("pulsar", concurrent=4)
     mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
 
-    with pytest.raises(ConfigurationError):
-      BackendScheduler.from_settings(settings)
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+    assert scheduler.queue_key == "scheduler:queue"
 
   def test_kafka_with_concurrency_gt_1_passes(self, mocker) -> None:
     """Kafka has a real in-flight set -> concurrency-safe, no raise."""
@@ -166,19 +191,19 @@ class TestAckCapabilityDefaults:
 class TestAckCapabilityDeclarations:
   """A2: each backend declares its capability correctly."""
 
-  def test_sqs_declared_single_slot(self) -> None:
-    """SQS: requires_ack=True, supports_concurrent_ack=False."""
+  def test_sqs_declared_concurrent_safe(self) -> None:
+    """SQS: requires_ack=True, supports_concurrent_ack=True (real in-flight, round-3)."""
     from scrapy_extension.backends.sqs import SqsBackend
 
     assert SqsBackend.requires_ack is True
-    assert SqsBackend.supports_concurrent_ack is False
+    assert SqsBackend.supports_concurrent_ack is True
 
-  def test_pulsar_declared_single_slot(self) -> None:
-    """Pulsar: requires_ack=True, supports_concurrent_ack=False."""
+  def test_pulsar_declared_concurrent_safe(self) -> None:
+    """Pulsar: requires_ack=True, supports_concurrent_ack=True (real in-flight, round-3)."""
     from scrapy_extension.backends.pulsar import PulsarBackend
 
     assert PulsarBackend.requires_ack is True
-    assert PulsarBackend.supports_concurrent_ack is False
+    assert PulsarBackend.supports_concurrent_ack is True
 
   def test_kafka_declared_concurrent_safe(self) -> None:
     """Kafka: requires_ack=True, supports_concurrent_ack=True (real in-flight)."""

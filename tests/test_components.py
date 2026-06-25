@@ -853,15 +853,16 @@ class TestBackendScheduler:
 
 
 class TestSchedulerAckConcurrencyCorrect:
-  """Round-2 (C1): capability-aware ack-concurrency gate.
+  """Round-2 (C1) + round-3: capability-aware ack-concurrency gate.
 
-  The H-commit removed the ``CONCURRENT_REQUESTS>1`` fail-fast guard for
-  ALL ack-using backends, but only Kafka/RabbitMQ got the real in-flight-
-  set fix. SQS/Pulsar kept single-slot ack and lost their safety net.
-  Round-2 re-introduces the gate, now capability-aware: it inspects
-  ``QueueBackend.requires_ack`` / ``supports_concurrent_ack`` and only
-  raises for single-slot-ack backends under concurrency (unless the
-  explicit ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set).
+  Round-2 re-introduced the gate (the H-commit had removed it) as
+  capability-aware: inspect ``QueueBackend.requires_ack`` /
+  ``supports_concurrent_ack`` and raise for single-slot-ack backends under
+  ``CONCURRENT_REQUESTS>1`` (opt-out: ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS``).
+  Round-3 promoted SQS/Pulsar to real in-flight-set ack, so every shipped
+  backend is now concurrency-safe and the gate no longer fires for any of
+  them — it remains as a backstop for any future single-slot backend
+  (covered via a synthetic stub in test_scheduler_ack_gate.py).
   """
 
   @staticmethod
