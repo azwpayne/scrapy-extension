@@ -23,6 +23,7 @@ except ImportError as e:
         "MongoDB backend requires 'pymongo'. Install with: pip install scrapy-extension[mongodb]"
     ) from e
 
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -205,7 +206,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if not (self.config.username and self.config.password):
       return kwargs
     kwargs["username"] = self.config.username
-    kwargs["password"] = secret_value(self.config.password)
+    kwargs["password"] = _redact(secret_value(self.config.password))
     if self.config.auth_source:
       kwargs["authSource"] = self.config.auth_source
     if self.config.auth_mechanism:

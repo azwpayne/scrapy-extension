@@ -35,17 +35,21 @@ class TestBuildKwargs:
 
   def test_api_key_in_kwargs(self):
     """Test api_key is included in kwargs when set."""
-    settings = ElasticSearchSettings(api_key="test_key")
+    # https:// host — round-6 SEC-3 forbids credentials over cleartext http://.
+    settings = ElasticSearchSettings(hosts=["https://localhost:9200"], api_key="test_key")
     backend = ElasticSearchBackend(settings)
     kwargs = backend._build_kwargs()
-    assert kwargs["api_key"] == "test_key"
+    assert kwargs["api_key"] == "test_key"  # _RedactedStr is a str subclass → value-equal
 
   def test_basic_auth_in_kwargs(self):
     """Test basic_auth is included when username/password set."""
-    settings = ElasticSearchSettings(username="user", password="pass")
+    # https:// host — round-6 SEC-3 forbids credentials over cleartext http://.
+    settings = ElasticSearchSettings(
+      hosts=["https://localhost:9200"], username="user", password="pass"
+    )
     backend = ElasticSearchBackend(settings)
     kwargs = backend._build_kwargs()
-    assert kwargs["basic_auth"] == ("user", "pass")  # secret_value() extracts the raw string
+    assert kwargs["basic_auth"] == ("user", "pass")  # password redacted but str-value-equal
 
   def test_ca_certs_in_kwargs(self, mocker):
     """Test ca_certs is included when set."""

@@ -26,6 +26,7 @@ except ImportError as e:
         "Kafka backend requires 'kafka-python'. Install with: pip install scrapy-extension[kafka]"
     ) from e
 
+from scrapy_extension.backends._redaction import _RedactedStr
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -43,26 +44,6 @@ from scrapy_extension.settings import KafkaMode
 # Topic name validation pattern - only allow alphanumeric, dots, underscores, hyphens
 # Uses \Z instead of $ to match only at absolute end of string (not before trailing newline)
 TOPIC_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+\Z")
-
-
-class _RedactedStr(str):
-  """str subclass that hides its value in repr().
-
-  Used for SASL passwords in client config dicts so that ``repr(config)``
-  and traceback dumps of locals don't reveal the raw credential. The
-  underlying value remains a normal ``str`` for client libraries
-  (kafka-python) that consume it via ``str()`` semantics.
-
-  Note: this is defense-in-depth against accidental logging / Sentry
-  capture, NOT against an adversary who can read process memory. The
-  raw value is still reachable via ``str(instance)`` or by indexing.
-  """
-
-  __slots__ = ()
-
-  def __repr__(self) -> str:
-    return "<redacted>"
-
 
 
 def _validate_topic_name(name: str) -> None:

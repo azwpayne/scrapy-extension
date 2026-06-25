@@ -513,3 +513,52 @@ class TestConnectionManager:
 
     manager = ConnectionManager.get_manager(BackendType.ELASTICSEARCH)
     assert isinstance(manager.get_queue_backend(), ElasticSearchBackend)
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 (round-6): ElasticSearch api_key / password redaction in _build_kwargs.
+# ---------------------------------------------------------------------------
+
+
+def test_elasticsearch_api_key_redacted_in_kwargs_repr():
+  """SEC-1: the api_key plumbed into Elasticsearch() kwargs is wrapped in
+  _RedactedStr so ``repr(kwargs)`` doesn't leak it. Value preserved for auth.
+  """
+  from scrapy_extension.backends._redaction import _RedactedStr
+  from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+  from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
+
+  config = ElasticSearchSettings(
+    mode="standalone",
+    hosts=["https://localhost:9200"],
+    api_key="top-secret-es-api-key",
+  )
+  backend = ElasticSearchBackend(config)
+  kwargs = backend._build_kwargs()
+
+  key = kwargs["api_key"]
+  assert str(key) == "top-secret-es-api-key"
+  assert "top-secret-es-api-key" not in repr(kwargs)
+  assert isinstance(key, _RedactedStr)
+
+
+def test_elasticsearch_basic_auth_password_redacted_in_kwargs_repr():
+  """SEC-1: the basic_auth password tuple element is wrapped in _RedactedStr."""
+  from scrapy_extension.backends._redaction import _RedactedStr
+  from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+  from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
+
+  config = ElasticSearchSettings(
+    mode="standalone",
+    hosts=["https://localhost:9200"],
+    username="alice",
+    password="top-secret-es-pwd",
+  )
+  backend = ElasticSearchBackend(config)
+  kwargs = backend._build_kwargs()
+
+  username, password = kwargs["basic_auth"]
+  assert username == "alice"
+  assert str(password) == "top-secret-es-pwd"
+  assert "top-secret-es-pwd" not in repr(kwargs)
+  assert isinstance(password, _RedactedStr)

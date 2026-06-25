@@ -21,6 +21,7 @@ except ImportError as e:
         "ElasticSearch backend requires 'elasticsearch'. Install with: pip install scrapy-extension[elasticsearch]"
     ) from e
 
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -71,9 +72,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "retry_on_timeout": self.config.retry_on_timeout,
     }
     if self.config.api_key:
-      kwargs["api_key"] = secret_value(self.config.api_key)
+      kwargs["api_key"] = _redact(secret_value(self.config.api_key))
     elif self.config.username and self.config.password:
-      kwargs["basic_auth"] = (self.config.username, secret_value(self.config.password))
+      kwargs["basic_auth"] = (
+        self.config.username,
+        _redact(secret_value(self.config.password)),
+      )
     return kwargs
 
   def connect(self) -> None:

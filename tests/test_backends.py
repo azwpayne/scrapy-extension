@@ -684,14 +684,16 @@ class TestRedisSentinelClusterWiring:
     assert exc_info.value.setting_name == "sentinels"
 
   def test_sentinel_malformed_entry_no_port_raises(self, mocker):
-    """Malformed sentinel entry (no ``:port``) surfaces a clear ValueError.
+    """SEC-6: malformed sentinel entry (no ``:port``) is wrapped as
+    BackendConnectionError, not surfaced as a raw ValueError.
 
     The parser does ``host, port_str = sentinel_str.rsplit(":", 1)``; a bare
-    "host" raises ValueError("not enough values to unpack"). This propagates
-    raw from connect() (not wrapped in BackendConnectionError, since ValueError
-    is not a RedisError).
+    "host" raises ValueError("not enough values to unpack"). Pre-SEC-6 this
+    propagated raw (not a RedisError, so the connect() except clauses missed
+    it). SEC-6 wraps the parse + ping in try/except → BackendConnectionError.
     """
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
     from scrapy_extension.settings import RedisMode, RedisSettings
 
     settings = RedisSettings(
@@ -701,12 +703,17 @@ class TestRedisSentinelClusterWiring:
     )
 
     backend = RedisBackend(settings)
-    with pytest.raises(ValueError):
+    with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
+    assert exc_info.value.backend_type == "redis"
+    # The original ValueError is chained for debuggability.
+    assert isinstance(exc_info.value.__cause__, ValueError)
 
   def test_sentinel_malformed_entry_non_numeric_port_raises(self, mocker):
-    """Non-numeric port in a sentinel entry raises ValueError on int() coercion."""
+    """SEC-6: non-numeric port in a sentinel entry is wrapped as
+    BackendConnectionError (was raw ValueError from int() coercion)."""
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
     from scrapy_extension.settings import RedisMode, RedisSettings
 
     settings = RedisSettings(
@@ -716,8 +723,10 @@ class TestRedisSentinelClusterWiring:
     )
 
     backend = RedisBackend(settings)
-    with pytest.raises(ValueError):
+    with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
+    assert exc_info.value.backend_type == "redis"
+    assert isinstance(exc_info.value.__cause__, ValueError)
 
   def test_cluster_parses_startup_nodes_into_cluster_nodes(self, mock_master_client, mocker):
     """_connect_cluster parses cluster_startup_nodes into ClusterNode objects.
@@ -761,8 +770,10 @@ class TestRedisSentinelClusterWiring:
     assert all(isinstance(n.port, int) for n in startup_nodes)
 
   def test_cluster_malformed_startup_node_raises(self, mocker):
-    """Malformed cluster node (no port) raises ValueError during parsing."""
+    """SEC-6: malformed cluster node (no port) is wrapped as
+    BackendConnectionError (was raw ValueError during parsing)."""
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
     from scrapy_extension.settings import RedisMode, RedisSettings
 
     settings = RedisSettings(
@@ -771,8 +782,10 @@ class TestRedisSentinelClusterWiring:
     )
 
     backend = RedisBackend(settings)
-    with pytest.raises(ValueError):
+    with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
+    assert exc_info.value.backend_type == "redis"
+    assert isinstance(exc_info.value.__cause__, ValueError)
 
   def test_cluster_no_failover_rediscovery_path_exists(self, mock_master_client, mocker):
     """Document the failover gap: the backend delegates failover to the
@@ -1992,3 +2005,60 @@ class TestRedisBackendCoverageGaps:
     backend.clear_storage()
 
     mock_cluster.flushall.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# SEC-6 (round-6): Sentinel/Cluster malformed-entry + ping() wrap.
+# (The 3 tests above were updated in place; this covers the ping-failure path.)
+# ---------------------------------------------------------------------------
+
+
+def test_sentinel_ping_failure_wrapped_as_connection_error(mocker):
+  """SEC-6: a ``master_for(...).ping()`` failure (bad master name, unreachable
+  sentinels) is wrapped as BackendConnectionError, not surfaced as whatever
+  raw exception redis-py raises (which varies across versions)."""
+  from scrapy_extension.backends.redis import RedisBackend
+  from scrapy_extension.exceptions import BackendConnectionError
+  from scrapy_extension.settings import RedisMode, RedisSettings
+
+  settings = RedisSettings(
+    mode=RedisMode.SENTINEL,
+    sentinels=["sentinel-a:26379"],
+    sentinel_master_name="mymaster",
+    password="secret",
+  )
+
+  mock_sentinel = mocker.Mock()
+  mock_master = mocker.Mock()
+  mock_master.ping.side_effect = RuntimeError("master unknown")
+  mock_sentinel.master_for.return_value = mock_master
+  mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel)
+
+  backend = RedisBackend(settings)
+  with pytest.raises(BackendConnectionError) as exc_info:
+    backend.connect()
+  assert exc_info.value.backend_type == "redis"
+  assert "master unknown" in str(exc_info.value)
+
+
+def test_cluster_ping_failure_wrapped_as_connection_error(mocker):
+  """SEC-6: a RedisCluster ping() failure is wrapped as BackendConnectionError."""
+  from scrapy_extension.backends.redis import RedisBackend
+  from scrapy_extension.exceptions import BackendConnectionError
+  from scrapy_extension.settings import RedisMode, RedisSettings
+
+  settings = RedisSettings(
+    mode=RedisMode.CLUSTER,
+    cluster_startup_nodes=["node-a:7000"],
+    password="secret",
+  )
+
+  mock_cluster = mocker.Mock()
+  mock_cluster.ping.side_effect = RuntimeError("cluster unreachable")
+  mocker.patch("scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster)
+
+  backend = RedisBackend(settings)
+  with pytest.raises(BackendConnectionError) as exc_info:
+    backend.connect()
+  assert exc_info.value.backend_type == "redis"
+  assert "cluster unreachable" in str(exc_info.value)
