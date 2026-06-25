@@ -307,7 +307,33 @@ class QueueBackend(ABC):
   """Interface for queue operations.
 
   Backends that support queue operations must implement this interface.
+
+  Ack-capability contract (round-2):
+
+  - ``requires_ack``: True when ``pop`` yields a message that the caller
+    MUST subsequently acknowledge via :meth:`ack` (else the message is
+    redelivered). False for atomic-pop backends (Redis, MongoDB,
+    ElasticSearch, RocketMQ) — their pop removes the item in one step, so
+    ack/nack are no-ops and the scheduler's ack wiring is inert.
+  - ``supports_concurrent_ack``: True when ack is safe under
+    ``CONCURRENT_REQUESTS > 1`` (i.e. the backend tracks per-message ack
+    state — Kafka/RabbitMQ via an in-flight set). False for single-slot
+    ack backends (SQS, Pulsar) where N pops before any ack overwrite a
+    single receipt slot. The scheduler's ``from_settings`` gate raises
+    ``ConfigurationError`` for ``requires_ack and not
+    supports_concurrent_ack`` under ``CONCURRENT_REQUESTS > 1`` unless the
+    explicit ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set.
+
+  Defaults (``requires_ack=False``, ``supports_concurrent_ack=True``) keep
+  atomic-pop backends untouched and are the safe baseline for any new
+  QueueBackend that does not override them.
   """
+
+  requires_ack: bool = False
+  """True if pop yields a message needing explicit :meth:`ack` (MQ backends)."""
+
+  supports_concurrent_ack: bool = True
+  """True if ack is correct under ``CONCURRENT_REQUESTS > 1`` (real in-flight set)."""
 
   @abstractmethod
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:

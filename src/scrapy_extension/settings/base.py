@@ -80,6 +80,17 @@ class Settings(BaseSettings):
       "a threshold / on spider close."
     ),
   )
+  pipeline_max_storage_errors: int | None = Field(
+    default=None,
+    description=(
+      "C2 escalation: max consecutive storage errors before the pipeline "
+      "re-raises (wrapped as BackendError) instead of swallowing. ``None`` "
+      "(default) preserves the best-effort swallow-and-stat behavior — zero "
+      "compat break. When set to N, the consecutive counter is reset to 0 on "
+      "every successful store; a persistent outage surfaces loudly after N+1 "
+      "consecutive failures instead of being silently absorbed as success."
+    ),
+  )
   circuit_breaker_enabled: bool = Field(
     default=False,
     description=(

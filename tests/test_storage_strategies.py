@@ -152,6 +152,85 @@ class TestBatchedStorageStrategy:
     assert len(keys) == total
 
 
+class TestBatchedStoragePartialFailure:
+  """C4 — at-least-once flush: a mid-batch store failure must not silently
+  drop the un-written tail (insight round-2, HIGH). The un-written items must
+  remain buffered for the next flush, and the error must surface to the caller.
+  """
+
+  def test_partial_failure_keeps_tail_buffered_and_reraises(self, mocker) -> None:
+    """Store raises on item 2 of 3 → item 3 stays in _buffer AND the
+    exception propagates. Pre-fix: _buffer is cleared up-front, so item 3 is
+    silently lost and no exception surfaces (RED).
+    """
+    backend = mocker.Mock()
+    call_state = {"n": 0}
+
+    def flaky_store(key, value, ttl=None):  # noqa: ARG001
+      call_state["n"] += 1
+      if call_state["n"] == 2:
+        raise RuntimeError("backend down on item 2")
+
+    backend.store.side_effect = flaky_store
+
+    strat = BatchedStorageStrategy(threshold=3)
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+    # 3rd store hits threshold → triggers _flush_to → item-2 store raises.
+    with pytest.raises(RuntimeError, match="backend down on item 2"):
+      strat.store(backend, "k3", b"v3")
+
+    # Item 3 was never written (item 2 raised before reaching it). At-least-once
+    # requires it remain buffered for the next flush — NOT silently dropped.
+    buffered_keys = [k for k, _v, _t in strat._buffer]
+    assert "k3" in buffered_keys, (
+      f"C4 regression: item k3 silently lost on partial flush; buffer={buffered_keys}"
+    )
+    # Item 1 was written; item 2 raised; backend.store called exactly twice.
+    assert backend.store.call_count == 2
+
+  def test_green_path_leaves_buffer_empty(self, mocker) -> None:
+    """All stores succeed → buffer drained, no exception (regression guard)."""
+    backend = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=3)
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+    strat.store(backend, "k3", b"v3")  # threshold → flush
+
+    assert backend.store.call_count == 3
+    assert strat.pending == 0
+    assert strat._buffer == []
+
+  def test_partial_failure_then_retry_flushes_tail(self, mocker) -> None:
+    """After a partial flush, the buffered tail must be flushable on retry
+    once the backend recovers (at-least-once is observable end-to-end).
+    """
+    backend = mocker.Mock()
+    state = {"n": 0}
+
+    def recover_store(key, value, ttl=None):  # noqa: ARG001
+      state["n"] += 1
+      # Raise on the FIRST flush (item 2 of the first batch); succeed after.
+      if state["n"] == 2 and not getattr(recover_store, "_recovered", False):
+        recover_store._recovered = True  # type: ignore[attr-defined]
+        raise RuntimeError("transient item-2 failure")
+
+    backend.store.side_effect = recover_store
+
+    strat = BatchedStorageStrategy(threshold=3)
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+    with pytest.raises(RuntimeError):
+      strat.store(backend, "k3", b"v3")
+
+    # k3 buffered. Recover: a manual flush drains it.
+    strat.flush()
+    # k3 (and only k3 — k1/k2 already attempted) now written.
+    written_keys = [c.args[0] for c in backend.store.call_args_list]
+    assert "k3" in written_keys
+    assert strat.pending == 0
+
+
 class TestStorageStrategyFactory:
   def test_passthrough(self) -> None:
     strat = create_storage_strategy("passthrough")

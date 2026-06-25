@@ -116,6 +116,14 @@ class PulsarBackend(Backend, QueueBackend):
   ``clear_queue`` is best-effort: it drops the cached consumer/producers and
   relies on topic retention / admin tooling for actual cleanup.
 
+  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=False``.
+  Pulsar ack tracks a SINGLE ``_last_msg`` slot — N pops before any ack
+  overwrite it and only the last-popped message is ackable. Under
+  ``CONCURRENT_REQUESTS > 1`` this silently violates at-least-once. The
+  scheduler gate (round-2) raises ``ConfigurationError`` unless the
+  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set. The real
+  in-flight-set fix is a follow-up (Tier-2).
+
   Attributes:
       config: PulsarSettings instance.
       _client: The pulsar.Client instance (None until connected).
@@ -124,6 +132,9 @@ class PulsarBackend(Backend, QueueBackend):
       _subscribed_topic: Topic the consumer is currently subscribed to.
       _last_msg: The last-popped message, tracked for ack/nack.
   """
+
+  requires_ack = True
+  supports_concurrent_ack = False
 
   def __init__(self, config: PulsarSettings) -> None:
     """Initialize the Pulsar backend.

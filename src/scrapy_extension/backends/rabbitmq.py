@@ -55,11 +55,20 @@ class RabbitMQBackend(Backend, QueueBackend):
   Supports standalone, cluster, and mirrored_queues deployment modes.
   Does NOT implement SetBackend or StorageBackend.
 
+  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
+  Pops carry the RabbitMQ delivery tag, tracked in an in-flight set;
+  :meth:`ack` ``basic_ack``s the specific tag. N pops before any ack no
+  longer overwrite a single slot — ack is correct under
+  ``CONCURRENT_REQUESTS > 1``.
+
   Attributes:
       config: RabbitMQSettings instance with connection parameters.
       _connection: The RabbitMQ connection instance.
       _channel: The RabbitMQ channel instance.
   """
+
+  requires_ack = True
+  supports_concurrent_ack = True
 
   def __init__(self, config: RabbitMQSettings) -> None:
     """Initialize RabbitMQ backend.

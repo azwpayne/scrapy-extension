@@ -118,6 +118,13 @@ class CircuitBreaker:
     self._state = BreakerState.CLOSED
     self._failure_count = 0
     self._last_failure_time: float | None = None
+    # Guards the HALF_OPEN window so only ONE thread issues the probe call.
+    # Set in _allow_call() on the OPEN→HALF_OPEN transition; cleared under the
+    # lock once the probe's outcome is recorded. Without this, the lock is
+    # released between _allow_call() (which flips OPEN→HALF_OPEN) and func(),
+    # so N threads in the reset-timeout window all observe HALF_OPEN and call
+    # the backend concurrently — defeating the "single probe" contract.
+    self._probe_in_flight: bool = False
 
   # --- introspection (lock-protected reads for test determinism) ---
 
@@ -149,6 +156,7 @@ class CircuitBreaker:
       self._state = BreakerState.CLOSED
       self._failure_count = 0
       self._last_failure_time = None
+      self._probe_in_flight = False
 
   def _now(self) -> float:
     """Read the current monotonic time via the injected clock."""
@@ -166,40 +174,53 @@ class CircuitBreaker:
 
     If the breaker is OPEN but ``reset_timeout`` has elapsed, it transitions
     to ``HALF_OPEN`` here (lazy transition on the next call — no background
-    thread required).
+    thread required) and claims the single-probe slot via
+    ``_probe_in_flight``. While a probe is in flight, any other caller that
+    observes HALF_OPEN is rejected as if OPEN, so only ONE thread issues the
+    probe call (the documented contract).
     """
     if self._state is BreakerState.OPEN:
       now = self._now()
       opened_at = self._last_failure_time
       if opened_at is not None and (now - opened_at) >= self.reset_timeout:
-        # Cool-down elapsed — allow a single probe.
+        # Cool-down elapsed — allow a single probe. Claim the probe slot; no
+        # other thread can enter func() in HALF_OPEN until this probe settles.
         self._state = BreakerState.HALF_OPEN
+        self._probe_in_flight = True
       else:
         return BreakerState.OPEN
+    elif self._state is BreakerState.HALF_OPEN and self._probe_in_flight:
+      # A probe is already in flight (another thread claimed the slot in this
+      # HALF_OPEN window). Fail fast without issuing a second concurrent probe.
+      return BreakerState.OPEN
     return self._state
 
   def _record_success(self, prior_state: BreakerState) -> None:
     """Record a successful call, possibly closing the breaker.
 
     On any success the consecutive-failure count resets to zero. If the call
-    was a HALF_OPEN probe, the breaker closes fully.
+    was a HALF_OPEN probe, the breaker closes fully and the probe slot is
+    released.
     """
     self._failure_count = 0
     self._last_failure_time = None
     if prior_state is BreakerState.HALF_OPEN:
       self._state = BreakerState.CLOSED
+      self._probe_in_flight = False
 
   def _record_failure(self, prior_state: BreakerState) -> None:
     """Record a failed call, possibly tripping / re-opening the breaker.
 
     A HALF_OPEN probe failure re-opens immediately (one strike and the
-    backend is considered still-broken). A CLOSED failure increments the
-    consecutive count and trips when the threshold is reached.
+    backend is considered still-broken) and the probe slot is released so the
+    next cool-down window can issue a fresh probe. A CLOSED failure increments
+    the consecutive count and trips when the threshold is reached.
     """
     self._last_failure_time = self._now()
     if prior_state is BreakerState.HALF_OPEN:
       self._state = BreakerState.OPEN
       self._failure_count = 0
+      self._probe_in_flight = False
       return
     self._failure_count += 1
     if self._failure_count >= self.failure_threshold:
@@ -339,10 +360,27 @@ def _wrap_bound(breaker: CircuitBreaker, func: Callable[..., Any]) -> Callable[.
 
 
 class _QueueBackendProxy(_BackendProxyBase, QueueBackend):  # type: ignore[misc]
-  """Wrap a :class:`QueueBackend`'s hot-path ops under a breaker."""
+  """Wrap a :class:`QueueBackend`'s hot-path ops under a breaker.
 
-  _HOT_PATH = ("push", "pop", "queue_len")
-  _FORWARDED = ("clear_queue", "ack", "nack", "connect", "disconnect", "is_connected", "ping")
+  ``queue_len`` is deliberately NOT in the hot path: it is an admin /
+  observability probe (stats queries, ``has_pending_requests`` health checks).
+  A transient failure in the length query (e.g. a momentary ``CLUSTER DOWN``
+  during a stats scrape) must not cascade into a full traffic shutdown by
+  tripping the breaker. Only traffic-bearing ops (``push``/``pop``) are wrapped;
+  ``queue_len`` is forwarded unchanged so its failures never reach the breaker.
+  """
+
+  _HOT_PATH = ("push", "pop")
+  _FORWARDED = (
+    "queue_len",
+    "clear_queue",
+    "ack",
+    "nack",
+    "connect",
+    "disconnect",
+    "is_connected",
+    "ping",
+  )
 
 
 class _SetBackendProxy(_BackendProxyBase, SetBackend):  # type: ignore[misc]
@@ -378,11 +416,14 @@ for _proxy_cls in (_QueueBackendProxy, _SetBackendProxy, _StorageBackendProxy):
 
 
 def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueBackend:
-  """Wrap ``backend``'s push/pop/queue_len under ``breaker``.
+  """Wrap ``backend``'s push/pop under ``breaker``.
 
-  Other attributes (including ``clear_queue``, ``ack``, ``nack``,
-  ``is_connected``) forward to the underlying backend unchanged so an OPEN
-  breaker does not block administrative / non-network operations.
+  ``queue_len`` is forwarded unchanged (NOT wrapped): it is an admin /
+  observability probe, and a transient stats-query failure must not cascade
+  into a full traffic shutdown by tripping the breaker. Other attributes
+  (including ``clear_queue``, ``ack``, ``nack``, ``is_connected``) also forward
+  unchanged so an OPEN breaker does not block administrative / non-network
+  operations.
   """
   return _QueueBackendProxy(backend, breaker)  # type: ignore[abstract]
 
