@@ -295,11 +295,18 @@ class Backend(ABC):
 
   @property
   @abstractmethod
-  def backend_type(self) -> BackendType:
+  def backend_type(self) -> BackendType | str:
     """Return the backend type.
 
+    Round-5 R5-1: widened to ``BackendType | str`` so 3rd-party backends
+    (registered via entry-points) can return a plain registry-key string
+    instead of a bundled ``BackendType`` member. Bundled backends still
+    return their canonical ``BackendType`` member — additive, no behavior
+    change for the 10 bundled backends.
+
     Returns:
-        The BackendType enum value for this backend.
+        The BackendType enum value (bundled) or registry-key string
+        (3rd-party) for this backend.
     """
 
 

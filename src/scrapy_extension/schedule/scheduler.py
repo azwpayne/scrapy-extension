@@ -12,9 +12,8 @@ from typing import TYPE_CHECKING, Any
 from scrapy import signals
 from scrapy.utils.misc import load_object
 
-from scrapy_extension.backends.base import _validate_key_name
+from scrapy_extension.backends.base import BackendType, _validate_key_name
 from scrapy_extension.backends.connectors import (
-  QUEUE_CAPABLE_BACKENDS,
   ConnectionManager,
   resolve_backend_config,
 )
@@ -195,7 +194,7 @@ class BackendScheduler:
       settings,
       type_key="SCRAPY_QUEUE_BACKEND_TYPE",
       settings_key="SCRAPY_QUEUE_BACKEND_SETTINGS",
-      required_capabilities=QUEUE_CAPABLE_BACKENDS,
+      required_capabilities={"queue"},
       component_name="queue",
     )
     manager = ConnectionManager.get_manager(
@@ -256,9 +255,11 @@ class BackendScheduler:
             concurrent ack, ``CONCURRENT_REQUESTS > 1``, and the opt-out
             is not set.
     """
-    from scrapy_extension.backends.connectors import _BACKEND_FACTORIES, _load_object
+    from scrapy_extension.backends.connectors import _load_object
+    from scrapy_extension.backends.registry import get_descriptor
 
-    backend_cls = _load_object(_BACKEND_FACTORIES[backend_type][0])
+    descriptor = get_descriptor(str(backend_type))
+    backend_cls = _load_object(descriptor.backend_cls_path)
     requires_ack = getattr(backend_cls, "requires_ack", False)
     supports_concurrent = getattr(backend_cls, "supports_concurrent_ack", True)
     if not requires_ack or supports_concurrent:
@@ -269,8 +270,14 @@ class BackendScheduler:
     opt_out = bool(settings.get("SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS", False))
     if opt_out:
       return
+    # ``backend_type`` is the registry-key string; format it bare (no repr
+    # quoting) so the message reads naturally for both BackendType members
+    # and plain strings.
+    bt_name = (
+      backend_type.value if isinstance(backend_type, BackendType) else backend_type
+    )
     msg = (
-      f"Backend {backend_type.value!r} requires explicit ack but does NOT "
+      f"Backend {bt_name!r} requires explicit ack but does NOT "
       f"support concurrent ack (single-slot ack). Under "
       f"CONCURRENT_REQUESTS={concurrent} (>1), only the last-popped "
       f"message is ackable and the rest are silently lost (at-least-once "

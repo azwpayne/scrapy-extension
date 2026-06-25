@@ -223,7 +223,15 @@ class BackendSpiderMixin(Spider):
 
     # Add shortcut settings based on backend type (no per-backend branching —
     # dispatch via the _BACKEND_SHORTCUT_BUILDERS table).
-    backend_value = self.backend_type.value if self.backend_type else None
+    # ``backend_type`` may be a ``BackendType`` enum (its ``.value`` is the
+    # registry key) or a plain registry-key string (round-5 R5-1: the public
+    # ``resolve_backend_config`` API now returns strings). Accept both.
+    if not self.backend_type:
+      backend_value = None
+    elif hasattr(self.backend_type, "value"):
+      backend_value = self.backend_type.value
+    else:
+      backend_value = self.backend_type
     builder_name = self._BACKEND_SHORTCUT_BUILDERS.get(backend_value or "")
     if builder_name is not None:
       settings.update(getattr(self, builder_name)())

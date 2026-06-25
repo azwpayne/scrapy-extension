@@ -886,10 +886,14 @@ class _FakeSettings:
 def test_resolve_backend_config_rejects_rocketmq_for_set():
   """Layer-2 guard: configuring RocketMQ for the set component fails at config time.
 
-  RocketMQ is intentionally excluded from SET_CAPABLE_BACKENDS. The factory
-  must raise ConfigurationError before any backend is constructed — surfacing
-  the misconfiguration at startup rather than as a NotImplementedError on
-  the first request_seen() call mid-crawl.
+  RocketMQ's descriptor declares only ``{"queue"}`` (no set/storage). The
+  factory must raise ConfigurationError before any backend is constructed —
+  surfacing the misconfiguration at startup rather than as a
+  NotImplementedError on the first request_seen() call mid-crawl.
+
+  Round-5 R5-1: ``required_capabilities`` is now a set of capability NAMES
+  (``{"set"}``), not a backend allowlist. The capability matrix lives in
+  the registry descriptor table.
   """
   assert BackendType.ROCKETMQ not in SET_CAPABLE_BACKENDS
 
@@ -899,7 +903,7 @@ def test_resolve_backend_config_rejects_rocketmq_for_set():
       settings,
       type_key="SCRAPY_SET_BACKEND_TYPE",
       settings_key="SCRAPY_SET_BACKEND_SETTINGS",
-      required_capabilities=SET_CAPABLE_BACKENDS,
+      required_capabilities={"set"},
       component_name="set",
     )
   msg = str(exc_info.value)
@@ -911,7 +915,7 @@ def test_resolve_backend_config_rejects_rocketmq_for_set():
 def test_resolve_backend_config_rejects_rocketmq_for_storage():
   """Layer-2 guard: configuring RocketMQ for the storage component fails at config time.
 
-  RocketMQ is intentionally excluded from STORAGE_CAPABLE_BACKENDS.
+  RocketMQ's descriptor declares only ``{"queue"}`` (no storage).
   """
   assert BackendType.ROCKETMQ not in STORAGE_CAPABLE_BACKENDS
 
@@ -921,7 +925,7 @@ def test_resolve_backend_config_rejects_rocketmq_for_storage():
       settings,
       type_key="SCRAPY_STORAGE_BACKEND_TYPE",
       settings_key="SCRAPY_STORAGE_BACKEND_SETTINGS",
-      required_capabilities=STORAGE_CAPABLE_BACKENDS,
+      required_capabilities={"storage"},
       component_name="storage",
     )
   msg = str(exc_info.value)
@@ -944,10 +948,11 @@ def test_resolve_backend_config_accepts_rocketmq_for_queue():
     settings,
     type_key="SCRAPY_QUEUE_BACKEND_TYPE",
     settings_key="SCRAPY_QUEUE_BACKEND_SETTINGS",
-    required_capabilities=QUEUE_CAPABLE_BACKENDS,
+    required_capabilities={"queue"},
     component_name="queue",
   )
-  assert backend_type is BackendType.ROCKETMQ
+  # Round-5 R5-1: resolve_backend_config returns the registry-key string.
+  assert backend_type == "rocketmq"
   assert backend_settings == {}
 
 
