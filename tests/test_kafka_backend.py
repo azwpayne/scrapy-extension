@@ -1184,3 +1184,24 @@ class TestKafkaBackendPopWithAckConcurrency:
     backend.ack("testq", token=t0)  # duplicate — no-op (already discarded)
 
     assert mock_consumer.commit.call_count == first_commit_count
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 (round-6): shared _redaction helper parity.
+# ---------------------------------------------------------------------------
+
+
+def test_redaction_module_is_shared_helper():
+  """SEC-1: _RedactedStr is now defined once in backends/_redaction.py and
+  re-imported by kafka. The kafka module re-exports it for backward compat.
+  """
+  from scrapy_extension.backends._redaction import _RedactedStr as SharedRedacted
+  from scrapy_extension.backends.kafka import _RedactedStr as KafkaRedacted
+
+  assert SharedRedacted is KafkaRedacted  # same class object (re-exported)
+  # str-subclass semantics preserved: client libs get the real value.
+  s = SharedRedacted("hunter2")
+  assert str(s) == "hunter2"
+  assert s == "hunter2"  # equality works
+  assert "hunter2" not in repr(s)
+  assert repr(s) == "<redacted>"

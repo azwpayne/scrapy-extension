@@ -324,3 +324,206 @@ class TestBackpressureSettings:
     assert settings.backpressure_resume_at == 5
 
 
+# =============================================================================
+# Round-6 SEC-SET: settings-file security validators (file-disjoint from SEC-BE)
+# =============================================================================
+
+
+class TestSec2MongoTlsModeGuard:
+  """SEC-2: tls_allow_invalid_certificates=True forbidden in production modes.
+
+  Disabling certificate validation breaks the MITM protection TLS provides.
+  In ATLAS / SHARDED_CLUSTER / REPLICA_SET deployments (multi-host, production-
+  tier) this is virtually always a misconfiguration or a developer shortcut
+  that must not ship. STANDALONE stays permissive for local dev (e.g. a
+  self-signed local mongod). Mirrors the Redis ``ssl_check_hostname``
+  guidance and the RabbitMQ guest-guard pattern (raise, not warn).
+  """
+
+  def test_atlas_with_insecure_tls_rejected(self):
+    """ATLAS + tls_allow_invalid_certificates=True → ConfigurationError."""
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import MongoDBSettings
+    from scrapy_extension.settings.mongodb import MongoDBMode
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(mode=MongoDBMode.ATLAS, tls_allow_invalid_certificates=True)
+    assert exc_info.value.setting_name == "tls_allow_invalid_certificates"
+    assert exc_info.value.setting_value is True
+
+  def test_sharded_cluster_with_insecure_tls_rejected(self):
+    """SHARDED_CLUSTER + True → ConfigurationError."""
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import MongoDBSettings
+    from scrapy_extension.settings.mongodb import MongoDBMode
+
+    with pytest.raises(ConfigurationError):
+      MongoDBSettings(
+        mode=MongoDBMode.SHARDED_CLUSTER, tls_allow_invalid_certificates=True
+      )
+
+  def test_replica_set_with_insecure_tls_rejected(self):
+    """REPLICA_SET + True → ConfigurationError."""
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import MongoDBSettings
+    from scrapy_extension.settings.mongodb import MongoDBMode
+
+    with pytest.raises(ConfigurationError):
+      MongoDBSettings(
+        mode=MongoDBMode.REPLICA_SET, tls_allow_invalid_certificates=True
+      )
+
+  def test_standalone_with_insecure_tls_accepted(self):
+    """STANDALONE + True → accepted (local dev with self-signed certs)."""
+    from scrapy_extension.settings import MongoDBSettings
+    from scrapy_extension.settings.mongodb import MongoDBMode
+
+    settings = MongoDBSettings(
+      mode=MongoDBMode.STANDALONE, tls_allow_invalid_certificates=True
+    )
+    assert settings.tls_allow_invalid_certificates is True
+
+  def test_any_mode_with_secure_tls_accepted(self):
+    """tls_allow_invalid_certificates=False (default) accepted in all modes."""
+    from scrapy_extension.settings import MongoDBSettings
+    from scrapy_extension.settings.mongodb import MongoDBMode
+
+    for mode in MongoDBMode:
+      settings = MongoDBSettings(mode=mode, tls_allow_invalid_certificates=False)
+      assert settings.tls_allow_invalid_certificates is False
+
+
+class TestSec3ElasticsearchCleartextCredsGuard:
+  """SEC-3: credentials over http:// (cleartext) forbidden.
+
+  Sending ``api_key`` / ``password`` over an ``http://`` host leaks them on
+  the wire. Reject at config time. ``https://`` + creds is fine; ``http://``
+  with no creds is fine (e.g. a no-auth local dev node).
+  """
+
+  def test_http_host_with_password_rejected(self):
+    """http:// host + password → ConfigurationError."""
+    from pydantic import SecretStr
+
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import ElasticSearchSettings
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(
+        hosts=["http://es:9200"], password=SecretStr("s3cr3t")
+      )
+    assert exc_info.value.setting_name == "hosts"
+
+  def test_http_host_with_api_key_rejected(self):
+    """http:// host + api_key → ConfigurationError."""
+    from pydantic import SecretStr
+
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import ElasticSearchSettings
+
+    with pytest.raises(ConfigurationError):
+      ElasticSearchSettings(
+        hosts=["http://es:9200"], api_key=SecretStr("key-123")
+      )
+
+  def test_https_host_with_password_accepted(self):
+    """https:// host + password → accepted."""
+    from pydantic import SecretStr
+
+    from scrapy_extension.settings import ElasticSearchSettings
+
+    settings = ElasticSearchSettings(
+      hosts=["https://es:9200"], password=SecretStr("s3cr3t")
+    )
+    assert settings.password.get_secret_value() == "s3cr3t"
+
+  def test_http_host_without_creds_accepted(self):
+    """http:// host + no creds → accepted (local no-auth dev node)."""
+    from scrapy_extension.settings import ElasticSearchSettings
+
+    settings = ElasticSearchSettings(hosts=["http://localhost:9200"])
+    assert settings.api_key is None
+    assert settings.password is None
+
+  def test_mixed_scheme_with_creds_rejected(self):
+    """One http:// + one https:// host + creds → ConfigurationError (any http)."""
+    from pydantic import SecretStr
+
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import ElasticSearchSettings
+
+    with pytest.raises(ConfigurationError):
+      ElasticSearchSettings(
+        hosts=["https://es.prod:9200", "http://es.dev:9200"],
+        api_key=SecretStr("key"),
+      )
+
+
+class TestSec4EndpointUrlSchemeGuard:
+  """SEC-4: SQS/DynamoDB endpoint_url must be http:// or https://.
+
+  Catches typos and bare host:port values that would otherwise fall through
+  to boto3's default chain (silent wrong target). ``http://`` is allowed
+  (LocalStack). Unset is allowed (real AWS via default chain).
+  """
+
+  def test_sqs_no_scheme_rejected(self):
+    """SQS endpoint_url without scheme → ConfigurationError."""
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import SqsSettings
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      SqsSettings(endpoint_url="localstack:4566")
+    assert exc_info.value.setting_name == "endpoint_url"
+
+  def test_sqs_http_accepted(self):
+    """SQS endpoint_url=http://localhost:4566 → accepted (LocalStack)."""
+    from scrapy_extension.settings import SqsSettings
+
+    settings = SqsSettings(endpoint_url="http://localhost:4566")
+    assert settings.endpoint_url == "http://localhost:4566"
+
+  def test_sqs_https_accepted(self):
+    """SQS endpoint_url=https://... → accepted."""
+    from scrapy_extension.settings import SqsSettings
+
+    settings = SqsSettings(endpoint_url="https://sqs.example.com")
+    assert settings.endpoint_url == "https://sqs.example.com"
+
+  def test_sqs_unset_accepted(self):
+    """SQS endpoint_url unset → accepted (default chain to AWS)."""
+    from scrapy_extension.settings import SqsSettings
+
+    settings = SqsSettings()
+    assert settings.endpoint_url is None
+
+  def test_dynamodb_no_scheme_rejected(self):
+    """DynamoDB endpoint_url without scheme → ConfigurationError."""
+    from scrapy_extension.exceptions import ConfigurationError
+    from scrapy_extension.settings import DynamoDBSettings
+
+    with pytest.raises(ConfigurationError):
+      DynamoDBSettings(endpoint_url="localstack:8000")
+
+  def test_dynamodb_http_accepted(self):
+    """DynamoDB endpoint_url=http://localhost:8000 → accepted (LocalStack)."""
+    from scrapy_extension.settings import DynamoDBSettings
+
+    settings = DynamoDBSettings(endpoint_url="http://localhost:8000")
+    assert settings.endpoint_url == "http://localhost:8000"
+
+  def test_dynamodb_https_accepted(self):
+    """DynamoDB endpoint_url=https://... → accepted."""
+    from scrapy_extension.settings import DynamoDBSettings
+
+    settings = DynamoDBSettings(endpoint_url="https://dynamodb.example.com")
+    assert settings.endpoint_url == "https://dynamodb.example.com"
+
+  def test_dynamodb_unset_accepted(self):
+    """DynamoDB endpoint_url unset → accepted (default chain to AWS)."""
+    from scrapy_extension.settings import DynamoDBSettings
+
+    settings = DynamoDBSettings()
+    assert settings.endpoint_url is None
+
+

@@ -1190,3 +1190,47 @@ class TestRabbitMQBackendPopWithAckConcurrency:
 
     mock_channel.basic_ack.assert_called_once_with(delivery_tag=99)
     assert backend._last_delivery_tag is None
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 (round-6): RabbitMQ password redaction in PlainCredentials.
+# ---------------------------------------------------------------------------
+
+
+def test_rabbitmq_password_redacted_in_credentials_repr(mocker):
+  """SEC-1: the password handed to pika.PlainCredentials is wrapped in
+  _RedactedStr so ``repr(credentials)`` / Sentry captures of locals don't
+  leak it. The str VALUE is preserved so pika still authenticates.
+  """
+  from scrapy_extension.backends._redaction import _RedactedStr
+  from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+  from scrapy_extension.settings.rabbitmq import RabbitMQSettings
+
+  config = RabbitMQSettings(
+    username="alice",
+    password="top-secret-rmq-pwd",
+  )
+  backend = RabbitMQBackend(config)
+
+  captured: dict[str, object] = {}
+
+  class _FakePlainCredentials:
+    def __init__(self, username: str, password: object) -> None:
+      captured["username"] = username
+      captured["password"] = password
+
+  mocker.patch("scrapy_extension.backends.rabbitmq.pika.PlainCredentials", _FakePlainCredentials)
+  # ConnectionParameters validates the credentials type; patch it to a stub
+  # so we can capture the password before pika's type-check rejects the fake.
+  mocker.patch("scrapy_extension.backends.rabbitmq.pika.ConnectionParameters", dict)
+  # Avoid touching real SSL / connection paths.
+  mocker.patch.object(RabbitMQBackend, "_connect_standalone", lambda self: None)
+
+  backend._build_common_parameters()
+
+  password = captured["password"]
+  # Value still usable as a normal string for pika auth.
+  assert str(password) == "top-secret-rmq-pwd"
+  # But repr of the credential object hides it.
+  assert "top-secret-rmq-pwd" not in repr(password)
+  assert isinstance(password, _RedactedStr)

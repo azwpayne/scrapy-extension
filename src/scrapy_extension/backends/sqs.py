@@ -30,6 +30,7 @@ except ImportError as e:
     "SQS backend requires 'boto3'. Install with: pip install scrapy-extension[sqs]"
   ) from e
 
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
@@ -37,7 +38,11 @@ from scrapy_extension.backends.base import (
   _validate_key_name,
   secret_value,
 )
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 from scrapy_extension.settings import SqsMode
 
 if TYPE_CHECKING:
@@ -142,15 +147,33 @@ class SqsBackend(Backend, QueueBackend):
       raise BackendConnectionError(
         f"Unsupported SQS mode: {self.config.mode}", backend_type="sqs"
       )
+    # SEC-7: AWS credentials must be both-or-neither. If only one of
+    # (access_key_id, secret_access_key) is set, boto3 silently falls through
+    # to its default credential chain (env / IMDS / config files), masking a
+    # misconfiguration that can lead to running under an unintended identity.
+    # XOR-validate: both set → ok; neither set → ok (default chain, intended);
+    # exactly one set → ConfigurationError naming the missing counterpart.
+    key_id = secret_value(self.config.aws_access_key_id)
+    secret = secret_value(self.config.aws_secret_access_key)
+    has_key = bool(key_id)
+    has_secret = bool(secret)
+    if has_key != has_secret:
+      missing = "aws_secret_access_key" if has_key else "aws_access_key_id"
+      present = "aws_access_key_id" if has_key else "aws_secret_access_key"
+      raise ConfigurationError(
+        "AWS credentials must be both-or-neither: "
+        f"{present} is set but {missing} is empty. "
+        "Set both explicitly, or leave both unset to use the boto3 "
+        "default credential chain (env / IMDS / config files).",
+        setting_name=missing,
+      )
     try:
       kwargs: dict[str, Any] = {"region_name": self.config.region_name}
       if self.config.endpoint_url:
         kwargs["endpoint_url"] = self.config.endpoint_url
-      if self.config.aws_access_key_id:
-        kwargs["aws_access_key_id"] = secret_value(self.config.aws_access_key_id)
-        kwargs["aws_secret_access_key"] = secret_value(
-          self.config.aws_secret_access_key
-        )
+      if has_key and has_secret:
+        kwargs["aws_access_key_id"] = _redact(key_id)
+        kwargs["aws_secret_access_key"] = _redact(secret)
       self._client = boto3.client("sqs", **kwargs)
       logger.debug("Connected to SQS (%s, %s)", self.config.mode.value, self.config.region_name)
     except Exception as e:

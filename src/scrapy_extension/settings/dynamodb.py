@@ -8,8 +8,11 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
+
+from scrapy_extension.exceptions.base import ConfigurationError
 
 
 class DynamoDBMode(str, Enum):
@@ -54,3 +57,33 @@ class DynamoDBSettings(BaseSettings):
   aws_secret_access_key: SecretStr | None = Field(
     default=None, description="AWS secret access key"
   )
+
+  @model_validator(mode="after")
+  def _validate_endpoint_url_scheme(self) -> Self:
+    """SEC-4: ``endpoint_url`` (when set) must be ``http://`` or ``https://``.
+
+    Catches typos and bare ``host:port`` values (e.g. ``localstack:8000``)
+    that would otherwise fall through to boto3's default credential/endpoint
+    chain (silent wrong target). ``http://`` is allowed — LocalStack and
+    compatible local emulators serve over plaintext. Unset is allowed (real
+    AWS via the default chain). Mirrors the SQS validator and the RabbitMQ
+    guest-guard pattern (raise, not warn).
+
+    Raises:
+        ConfigurationError: if ``endpoint_url`` is set and does not start
+            with ``http://`` or ``https://``.
+    """
+    if self.endpoint_url is None:
+      return self
+    lowered = self.endpoint_url.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+      raise ConfigurationError(
+        (
+          "endpoint_url must start with 'http://' or 'https://' "
+          "('http://' is LocalStack-only). "
+          f"Got endpoint_url={self.endpoint_url!r}."
+        ),
+        setting_name="endpoint_url",
+        setting_value=self.endpoint_url,
+      )
+    return self

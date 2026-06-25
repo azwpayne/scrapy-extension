@@ -8,9 +8,13 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import ClassVar
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
+
+from scrapy_extension.exceptions.base import ConfigurationError
 
 
 class MongoDBMode(str, Enum):
@@ -191,3 +195,47 @@ class MongoDBSettings(BaseSettings):
     ge=0,
     description="Heartbeat frequency in milliseconds",
   )
+
+  # Production-tier modes where disabling cert validation is virtually always
+  # a misconfiguration / dev shortcut that must not ship. STANDALONE stays
+  # permissive (local dev with a self-signed mongod). ClassVar so pydantic
+  # does not treat it as a setting field.
+  _PRODUCTION_MODES: ClassVar[frozenset[MongoDBMode]] = frozenset(
+    {MongoDBMode.ATLAS, MongoDBMode.SHARDED_CLUSTER, MongoDBMode.REPLICA_SET}
+  )
+
+  @model_validator(mode="after")
+  def _validate_tls_insecure_not_in_production_mode(self) -> Self:
+    """SEC-2: forbid ``tls_allow_invalid_certificates=True`` in production modes.
+
+    Disabling certificate validation strips TLS of its MITM protection. In
+    multi-host, production-tier deployments (ATLAS / SHARDED_CLUSTER /
+    REPLICA_SET) this is virtually always a misconfiguration or a developer
+    shortcut that must not ship — fail-fast at construction rather than
+    silently degrading the connection's security posture. STANDALONE remains
+    permissive for local dev (e.g. a self-signed local mongod).
+
+    Mirrors the Redis ``ssl_check_hostname`` guidance and the RabbitMQ
+    guest-guard pattern (raise, not warn — deterministic + the project's
+    ``error::UserWarning`` filter makes warn-by-default risky).
+
+    Raises:
+        ConfigurationError: if ``tls_allow_invalid_certificates`` is True and
+            ``mode`` is one of the production-tier modes.
+    """
+    if (
+      self.tls_allow_invalid_certificates
+      and self.mode in self._PRODUCTION_MODES
+    ):
+      raise ConfigurationError(
+        (
+          "tls_allow_invalid_certificates=True disables certificate "
+          "validation; not permitted in production-tier MongoDB modes "
+          f"(mode={self.mode.value!r}). Either set "
+          "tls_allow_invalid_certificates=False or use STANDALONE for local "
+          "dev with a self-signed certificate."
+        ),
+        setting_name="tls_allow_invalid_certificates",
+        setting_value=True,
+      )
+    return self

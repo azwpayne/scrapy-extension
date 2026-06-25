@@ -10,6 +10,9 @@ from enum import Enum
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
+
+from scrapy_extension.exceptions.base import ConfigurationError
 
 
 class ElasticSearchMode(str, Enum):
@@ -147,4 +150,36 @@ class ElasticSearchSettings(BaseSettings):
         f"Got cloud_id={self.cloud_id!r}."
       )
       raise ValueError(msg)
+    return self
+
+  @model_validator(mode="after")
+  def _validate_no_cleartext_credentials(self) -> Self:
+    """SEC-3: forbid credentials over ``http://`` (cleartext).
+
+    Sending ``api_key`` or ``password`` over a plaintext ``http://`` host
+    leaks them on the wire. Reject at config time (fail-fast) rather than
+    silently shipping an insecure transport. ``https://`` + creds is fine;
+    ``http://`` with no creds is fine (e.g. a no-auth local dev node).
+
+    Mirrors the RabbitMQ guest-guard pattern (raise, not warn).
+
+    Raises:
+        ConfigurationError: if any host URL scheme is ``http://`` and either
+            ``api_key`` or ``password`` is set.
+    """
+    has_credential = self.api_key is not None or self.password is not None
+    if not has_credential:
+      return self
+    has_http_host = any(
+      host.lower().startswith("http://") for host in self.hosts
+    )
+    if has_http_host:
+      raise ConfigurationError(
+        (
+          "Credentials over http:// (cleartext) are not permitted; use "
+          "https:// for any authenticated host or remove the credentials. "
+          f"Got hosts={self.hosts!r} with api_key/password set."
+        ),
+        setting_name="hosts",
+      )
     return self

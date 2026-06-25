@@ -24,6 +24,7 @@ except ImportError as e:
         "RabbitMQ backend requires 'pika'. Install with: pip install scrapy-extension[rabbitmq]"
     ) from e
 
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -194,7 +195,7 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
     credentials = pika.PlainCredentials(
       self.config.username,
-      secret_value(self.config.password),
+      _redact(secret_value(self.config.password)),
     )
 
     # Build SSL options if enabled

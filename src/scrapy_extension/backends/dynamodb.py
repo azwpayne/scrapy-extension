@@ -27,6 +27,7 @@ except ImportError as e:
     "Install with: pip install scrapy-extension[dynamodb]"
   ) from e
 
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
@@ -34,7 +35,7 @@ from scrapy_extension.backends.base import (
   _validate_key_name,
   secret_value,
 )
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.settings import DynamoDBMode
 
 if TYPE_CHECKING:
@@ -72,15 +73,28 @@ class DynamoDBBackend(Backend, StorageBackend):
         f"Unsupported DynamoDB mode: {self.config.mode}",
         backend_type="dynamodb",
       )
+    # SEC-7: AWS credentials must be both-or-neither (see SqsBackend.connect).
+    key_id = secret_value(self.config.aws_access_key_id)
+    secret = secret_value(self.config.aws_secret_access_key)
+    has_key = bool(key_id)
+    has_secret = bool(secret)
+    if has_key != has_secret:
+      missing = "aws_secret_access_key" if has_key else "aws_access_key_id"
+      present = "aws_access_key_id" if has_key else "aws_secret_access_key"
+      raise ConfigurationError(
+        "AWS credentials must be both-or-neither: "
+        f"{present} is set but {missing} is empty. "
+        "Set both explicitly, or leave both unset to use the boto3 "
+        "default credential chain (env / IMDS / config files).",
+        setting_name=missing,
+      )
     try:
       kwargs: dict[str, Any] = {"region_name": self.config.region_name}
       if self.config.endpoint_url:
         kwargs["endpoint_url"] = self.config.endpoint_url
-      if self.config.aws_access_key_id:
-        kwargs["aws_access_key_id"] = secret_value(self.config.aws_access_key_id)
-        kwargs["aws_secret_access_key"] = secret_value(
-          self.config.aws_secret_access_key
-        )
+      if has_key and has_secret:
+        kwargs["aws_access_key_id"] = _redact(key_id)
+        kwargs["aws_secret_access_key"] = _redact(secret)
       self._resource = boto3.resource("dynamodb", **kwargs)
       self._table = self._resource.Table(self.config.table_name)
       try:

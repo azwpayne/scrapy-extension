@@ -389,3 +389,93 @@ class TestPulsarLenClear:
     b.clear_queue("queue1")
     producer.close.assert_called_once()
     assert "scrapy-queue1" not in b._producers
+
+
+# ---------------------------------------------------------------------------
+# SEC-5 (round-6): Pulsar TLS decouple — allow_insecure_connection is passed
+# for pulsar+ssl:// URLs even when tls_trust_certs_file is unset.
+# SEC-1: auth_token is wrapped in _RedactedStr.
+# ---------------------------------------------------------------------------
+
+
+class TestPulsarTlsDecouple:
+  """SEC-5: ``allow_insecure_connection`` and ``tls_trust_certs_file`` are
+  independent TLS controls. Pre-fix, ``allow_insecure_connection`` was only
+  passed inside ``if tls_trust_certs_file``, silently dropping the user's
+  intent (and reverting ``True`` to Pulsar's stricter default) when no trust
+  certs file was configured.
+  """
+
+  def test_ssl_passes_allow_insecure_without_trust_certs(self, mocker) -> None:
+    """pulsar+ssl:// + allow_insecure_connection=False + no trust_certs:
+    Client kwargs include allow_insecure_connection WITHOUT trust certs."""
+    b = _make_backend(
+      service_url="pulsar+ssl://broker:6651",
+      allow_insecure_connection=False,
+    )
+    mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+    b.connect()
+    _, kwargs = pulsar.Client.call_args.args, pulsar.Client.call_args.kwargs
+    assert "allow_insecure_connection" in kwargs
+    assert kwargs["allow_insecure_connection"] is False
+    # trust_certs is NOT passed when unset (the bug was gating on this).
+    assert "tls_trust_certs_file" not in kwargs
+
+  def test_ssl_passes_allow_insecure_true_without_trust_certs(self, mocker) -> None:
+    """SEC-5 reverse: allow_insecure_connection=True is forwarded (not silently
+    dropped) even when tls_trust_certs_file is unset."""
+    b = _make_backend(
+      service_url="pulsar+ssl://broker:6651",
+      allow_insecure_connection=True,
+    )
+    mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+    b.connect()
+    kwargs = pulsar.Client.call_args.kwargs
+    assert kwargs.get("allow_insecure_connection") is True
+    assert "tls_trust_certs_file" not in kwargs
+
+  def test_ssl_passes_both_when_both_set(self, mocker) -> None:
+    """Both set → both passed (backward compat with the original path)."""
+    b = _make_backend(
+      service_url="pulsar+ssl://broker:6651",
+      allow_insecure_connection=True,
+      tls_trust_certs_file="/etc/ssl/ca.pem",
+    )
+    mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+    b.connect()
+    kwargs = pulsar.Client.call_args.kwargs
+    assert kwargs.get("allow_insecure_connection") is True
+    assert kwargs.get("tls_trust_certs_file") == "/etc/ssl/ca.pem"
+
+  def test_non_ssl_url_omits_tls_kwargs(self, mocker) -> None:
+    """pulsar:// (plaintext) doesn't pass either TLS field."""
+    b = _make_backend(
+      service_url="pulsar://broker:6650",
+      allow_insecure_connection=True,  # ignored — not an ssl url
+    )
+    mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+    b.connect()
+    kwargs = pulsar.Client.call_args.kwargs
+    assert "allow_insecure_connection" not in kwargs
+    assert "tls_trust_certs_file" not in kwargs
+
+
+def test_pulsar_auth_token_is_redacted_str(mocker) -> None:
+  """SEC-1: the auth_token handed to AuthenticationToken is wrapped in
+  _RedactedStr so Sentry / repr captures don't leak it. str value preserved."""
+  from scrapy_extension.backends._redaction import _RedactedStr
+
+  b = _make_backend(
+    service_url="pulsar://broker:6650",
+    auth_token="top-secret-pulsar-token",
+  )
+  mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+  auth_mock = mocker.patch.object(pulsar, "AuthenticationToken")
+  b.connect()
+  auth_mock.assert_called_once()
+  token_arg = auth_mock.call_args.args[0]
+  # Value preserved for the pulsar client (str semantics).
+  assert str(token_arg) == "top-secret-pulsar-token"
+  # But repr is masked.
+  assert "top-secret-pulsar-token" not in repr(token_arg)
+  assert isinstance(token_arg, _RedactedStr)

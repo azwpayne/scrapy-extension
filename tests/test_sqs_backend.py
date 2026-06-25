@@ -521,3 +521,94 @@ class TestSqsLegacyAckCompat:
     b.nack("queue1")  # no token
     client.delete_message.assert_not_called()
     assert b._last_receipt is None
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 (round-6): SQS AWS creds redaction in boto3.client kwargs.
+# SEC-7: AWS credentials must be both-or-neither (XOR validation).
+# ---------------------------------------------------------------------------
+
+
+def test_sqs_credentials_redacted_in_client_kwargs(mocker):
+  """SEC-1: aws_access_key_id / aws_secret_access_key handed to boto3.client
+  are wrapped in _RedactedStr so ``repr(call_args)`` doesn't leak them. The
+  str values are preserved so boto3 still authenticates.
+  """
+  from scrapy_extension.backends._redaction import _RedactedStr
+  from scrapy_extension.settings import SqsSettings
+
+  config = SqsSettings(
+    aws_access_key_id="AKIAEXAMPLEKEY",
+    aws_secret_access_key="top-secret-sqs-secret",
+  )
+  backend = SqsBackend(config)
+
+  captured = {}
+  mocker.patch.object(
+    boto3,
+    "client",
+    side_effect=lambda service, **kw: captured.update(kw) or mocker.MagicMock(),
+  )
+  backend.connect()
+  key = captured["aws_access_key_id"]
+  secret = captured["aws_secret_access_key"]
+  # Values preserved for boto3 auth.
+  assert str(key) == "AKIAEXAMPLEKEY"
+  assert str(secret) == "top-secret-sqs-secret"
+  # But repr of the captured kwargs hides both.
+  assert "AKIAEXAMPLEKEY" not in repr(captured)
+  assert "top-secret-sqs-secret" not in repr(captured)
+  assert isinstance(key, _RedactedStr)
+  assert isinstance(secret, _RedactedStr)
+
+
+class TestSqsHalfCredentialGuard:
+  """SEC-7: AWS credentials must be both-or-neither.
+
+  Exactly one of (aws_access_key_id, aws_secret_access_key) set used to fall
+  through silently to boto3's default credential chain — masking a
+  misconfiguration. Now it raises ConfigurationError naming the missing half.
+  """
+
+  def test_key_without_secret_raises(self):
+    from scrapy_extension.exceptions import ConfigurationError
+
+    backend = _make_backend(
+      aws_access_key_id="AKIAEXAMPLEKEY",
+      aws_secret_access_key=None,
+    )
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+    assert "aws_secret_access_key" in str(exc_info.value)
+    assert exc_info.value.setting_name == "aws_secret_access_key"
+
+  def test_secret_without_key_raises(self):
+    from scrapy_extension.exceptions import ConfigurationError
+
+    backend = _make_backend(
+      aws_access_key_id=None,
+      aws_secret_access_key="orphan-secret",
+    )
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+    assert "aws_access_key_id" in str(exc_info.value)
+    assert exc_info.value.setting_name == "aws_access_key_id"
+
+  def test_both_set_proceeds(self, mocker):
+    """Both set → no ConfigurationError; boto3.client called with both."""
+    backend = _make_backend(
+      aws_access_key_id="AKIAEXAMPLEKEY",
+      aws_secret_access_key="top-secret",
+    )
+    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    backend.connect()  # must not raise
+    boto3.client.assert_called_once()
+
+  def test_neither_set_proceeds(self, mocker):
+    """Neither set → no ConfigurationError; boto3 default credential chain."""
+    backend = _make_backend()  # defaults: both None
+    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    backend.connect()  # must not raise
+    _, kwargs = boto3.client.call_args.args, boto3.client.call_args.kwargs
+    assert "aws_access_key_id" not in kwargs
+    assert "aws_secret_access_key" not in kwargs

@@ -736,3 +736,32 @@ def test_mongodb_backend_disconnect_clears_all_collections(mocker):
   assert backend._queue_collection is None
   assert backend._set_collection is None
   assert backend._storage_collection is None
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 (round-6): MongoDB password redaction in _auth_kwargs.
+# ---------------------------------------------------------------------------
+
+
+def test_mongodb_password_redacted_in_auth_kwargs_repr():
+  """SEC-1: the password plumbed into MongoClient kwargs is wrapped in
+  _RedactedStr so ``repr(kwargs)`` / Sentry captures of locals don't leak it.
+  The str VALUE is preserved so pymongo still authenticates.
+  """
+  from scrapy_extension.backends._redaction import _RedactedStr
+  from scrapy_extension.backends.mongodb import MongoDBBackend
+  from scrapy_extension.settings.mongodb import MongoDBSettings
+
+  config = MongoDBSettings(
+    username="alice",
+    password="top-secret-mongo-pwd",
+  )
+  backend = MongoDBBackend(config)
+  auth_kwargs = backend._auth_kwargs()
+
+  password = auth_kwargs["password"]
+  # Value still usable as a normal string for pymongo auth.
+  assert str(password) == "top-secret-mongo-pwd"
+  # But repr of the kwargs dict hides it.
+  assert "top-secret-mongo-pwd" not in repr(auth_kwargs)
+  assert isinstance(password, _RedactedStr)

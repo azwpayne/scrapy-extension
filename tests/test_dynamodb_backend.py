@@ -163,3 +163,106 @@ class TestDynamoDBStorageOps:
     b, _ = _connected(mocker)
     with pytest.raises(ValueError):
       b.store("bad key!", b"x")
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 (round-6): DynamoDB AWS creds redaction in boto3.resource kwargs.
+# SEC-7: AWS credentials must be both-or-neither (XOR validation).
+# ---------------------------------------------------------------------------
+
+
+def test_dynamodb_credentials_redacted_in_resource_kwargs(mocker):
+  """SEC-1: aws_access_key_id / aws_secret_access_key handed to
+  boto3.resource are wrapped in _RedactedStr so ``repr(call_args)`` doesn't
+  leak them. The str values are preserved so boto3 still authenticates.
+  """
+  from scrapy_extension.backends._redaction import _RedactedStr
+  from scrapy_extension.settings import DynamoDBSettings
+
+  config = DynamoDBSettings(
+    aws_access_key_id="AKIAEXAMPLEKEY",
+    aws_secret_access_key="top-secret-ddb-secret",
+  )
+  backend = DynamoDBBackend(config)
+
+  captured: dict[str, object] = {}
+
+  class _FakeResource:
+    def Table(self, name: str) -> object:
+      table = mocker.MagicMock()
+      table.load.side_effect = RuntimeError("no table")
+      return table
+
+    def create_table(self, **kwargs: object) -> object:
+      created = mocker.MagicMock()
+      created.wait_until_exists.return_value = None
+      return created
+
+  def _fake_resource(service: str, **kwargs: object) -> _FakeResource:
+    captured.update(kwargs)
+    return _FakeResource()
+
+  mocker.patch.object(boto3, "resource", side_effect=_fake_resource)
+  # Table creation path also needs stubbing to avoid real wait_until_exists.
+  backend.connect()
+  key = captured["aws_access_key_id"]
+  secret = captured["aws_secret_access_key"]
+  # Values preserved for boto3 auth.
+  assert str(key) == "AKIAEXAMPLEKEY"
+  assert str(secret) == "top-secret-ddb-secret"
+  # But repr of the captured kwargs hides both.
+  assert "AKIAEXAMPLEKEY" not in repr(captured)
+  assert "top-secret-ddb-secret" not in repr(captured)
+  assert isinstance(key, _RedactedStr)
+  assert isinstance(secret, _RedactedStr)
+
+
+class TestDynamoDBHalfCredentialGuard:
+  """SEC-7: AWS credentials must be both-or-neither (see SqsBackend test)."""
+
+  def test_key_without_secret_raises(self):
+    from scrapy_extension.exceptions import ConfigurationError
+
+    backend = _make_backend(
+      aws_access_key_id="AKIAEXAMPLEKEY",
+      aws_secret_access_key=None,
+    )
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+    assert "aws_secret_access_key" in str(exc_info.value)
+    assert exc_info.value.setting_name == "aws_secret_access_key"
+
+  def test_secret_without_key_raises(self):
+    from scrapy_extension.exceptions import ConfigurationError
+
+    backend = _make_backend(
+      aws_access_key_id=None,
+      aws_secret_access_key="orphan-secret",
+    )
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+    assert "aws_access_key_id" in str(exc_info.value)
+    assert exc_info.value.setting_name == "aws_access_key_id"
+
+  def test_both_set_proceeds(self, mocker):
+    """Both set → no ConfigurationError; boto3.resource called."""
+    backend = _make_backend(
+      aws_access_key_id="AKIAEXAMPLEKEY",
+      aws_secret_access_key="top-secret",
+    )
+    fake_resource = mocker.MagicMock()
+    fake_resource.Table.return_value.load.side_effect = RuntimeError("no table")
+    mocker.patch.object(boto3, "resource", return_value=fake_resource)
+    backend.connect()  # must not raise
+    boto3.resource.assert_called_once()
+
+  def test_neither_set_proceeds(self, mocker):
+    """Neither set → no ConfigurationError; boto3 default credential chain."""
+    backend = _make_backend()  # defaults: both None
+    fake_resource = mocker.MagicMock()
+    fake_resource.Table.return_value.load.side_effect = RuntimeError("no table")
+    mocker.patch.object(boto3, "resource", return_value=fake_resource)
+    backend.connect()  # must not raise
+    _, kwargs = boto3.resource.call_args.args, boto3.resource.call_args.kwargs
+    assert "aws_access_key_id" not in kwargs
+    assert "aws_secret_access_key" not in kwargs

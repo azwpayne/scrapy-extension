@@ -28,6 +28,7 @@ except ImportError as e:
     "Install with: pip install scrapy-extension[pulsar]"
   ) from e
 
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
@@ -229,12 +230,22 @@ class PulsarBackend(Backend, QueueBackend):
       )
     try:
       kwargs: dict[str, Any] = {}
+      # SEC-5: TLS controls are independent. ``allow_insecure_connection``
+      # (default False) must always be honored for ``pulsar+ssl://`` URLs,
+      # not gated behind ``tls_trust_certs_file``. Previously a user who set
+      # ``allow_insecure_connection=True`` without a trust-certs file had
+      # the flag silently dropped (reverted to Pulsar's stricter default),
+      # and a user who set ``allow_insecure_connection=False`` without trust
+      # certs had no way to make that intent explicit. Pass each field on its
+      # own; only pass ``tls_trust_certs_file`` when actually set.
+      is_ssl = self.config.service_url.startswith("pulsar+ssl://")
+      if is_ssl:
+        kwargs["allow_insecure_connection"] = self.config.allow_insecure_connection
       if self.config.tls_trust_certs_file:
         kwargs["tls_trust_certs_file"] = self.config.tls_trust_certs_file
-        kwargs["allow_insecure_connection"] = self.config.allow_insecure_connection
       if self.config.auth_token:
         kwargs["authentication"] = pulsar.AuthenticationToken(
-          secret_value(self.config.auth_token)
+          _redact(secret_value(self.config.auth_token))
         )
       self._client = pulsar.Client(self.config.service_url, **kwargs)
       logger.debug("Connected to Pulsar at %s (%s)", self.config.service_url, self.config.mode.value)
