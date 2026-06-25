@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
 
 from scrapy_extension.backends.base import BackendType
+from scrapy_extension.exceptions.base import ConfigurationError
 
 
 class Settings(BaseSettings):
@@ -118,3 +120,79 @@ class Settings(BaseSettings):
       "Effective only when ``circuit_breaker_enabled`` is True."
     ),
   )
+  backpressure_pause_at: int | None = Field(
+    default=None,
+    description=(
+      "Round-4 BP-1: queue depth at/above which the scheduler pauses "
+      "``next_request`` (returns None — Scrapy's contract-correct \"slow "
+      "down\" signal). ``None`` (default) disables the backpressure gate "
+      "entirely — byte-identical to pre-BP behavior. When set, the engine "
+      "stops pulling new requests once the pending depth reaches this "
+      "threshold, protecting a downstream backend that cannot keep up. "
+      "Must be ``>= 0`` (enforced by ``_validate_backpressure_thresholds``)."
+    ),
+  )
+  backpressure_resume_at: int | None = Field(
+    default=None,
+    description=(
+      "Round-4 BP-1: queue depth at/below which the scheduler resumes "
+      "``next_request`` after a backpressure pause (hysteresis — prevents "
+      "flapping around the pause threshold). ``None`` (default) means the "
+      "scheduler treats ``resume_at`` as equal to ``pause_at`` at consume "
+      "time (no hysteresis). Must be ``<= pause_at`` when both are set, "
+      "else ``ConfigurationError`` (otherwise the resume condition would "
+      "never be reachable)."
+    ),
+  )
+
+  @model_validator(mode="after")
+  def _validate_backpressure_thresholds(self) -> Self:
+    """Round-4 BP-1: cross-validate backpressure pause/resume thresholds.
+
+    - Each value, when set, must be ``>= 0``. Non-negativity is enforced ONLY
+      by this validator — the Field declarations intentionally omit ``ge=0`` so
+      violations raise ``ConfigurationError`` (not pydantic's ValidationError).
+    - When BOTH ``pause_at`` and ``resume_at`` are set, ``resume_at`` must be
+      ``<= pause_at`` — otherwise the resume condition (depth <= resume_at)
+      could never become true once paused (depth >= pause_at > resume_at),
+      deadlocking the scheduler. When only one is set the cross-check is
+      skipped: the scheduler defaults ``resume_at := pause_at`` at consume
+      time, so a single-value config is always self-consistent.
+
+    Raises:
+        ConfigurationError: on negative values or an inverted hysteresis band.
+    """
+    if self.backpressure_pause_at is not None and self.backpressure_pause_at < 0:
+      raise ConfigurationError(
+        (
+          "backpressure_pause_at must be >= 0 "
+          f"(got {self.backpressure_pause_at!r})"
+        ),
+        setting_name="backpressure_pause_at",
+        setting_value=self.backpressure_pause_at,
+      )
+    if self.backpressure_resume_at is not None and self.backpressure_resume_at < 0:
+      raise ConfigurationError(
+        (
+          "backpressure_resume_at must be >= 0 "
+          f"(got {self.backpressure_resume_at!r})"
+        ),
+        setting_name="backpressure_resume_at",
+        setting_value=self.backpressure_resume_at,
+      )
+    if (
+      self.backpressure_pause_at is not None
+      and self.backpressure_resume_at is not None
+      and self.backpressure_resume_at > self.backpressure_pause_at
+    ):
+      raise ConfigurationError(
+        (
+          "backpressure_resume_at must be <= backpressure_pause_at "
+          "(otherwise the resume condition can never be reached once "
+          f"paused): resume_at={self.backpressure_resume_at!r} > "
+          f"pause_at={self.backpressure_pause_at!r}"
+        ),
+        setting_name="backpressure_resume_at",
+        setting_value=self.backpressure_resume_at,
+      )
+    return self

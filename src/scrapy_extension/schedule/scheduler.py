@@ -92,6 +92,20 @@ class BackendScheduler:
      ``BackendError`` from the dedup backend degrades to default-enqueue
      (the URL is not lost) + a ``scheduler/dupefilter_error`` stat bump.
 
+  Backpressure depth gate (round-4, BP-2):
+
+  When ``backpressure_pause_at`` is set (not None), ``next_request`` returns
+  ``None`` once the queue depth reaches ``pause_at`` (depth source:
+  ``len(self._queue)``, fresh — same source ``has_pending_requests`` trusts).
+  Popping resumes only after depth drains to ``resume_at`` (hysteresis,
+  prevents flapping). ``resume_at`` defaults to ``pause_at`` when unset (no
+  hysteresis — single threshold). The gate bumps two additive stats:
+  ``scheduler/backpressure_pause`` and ``scheduler/backpressure_resume``.
+  Default-off (``pause_at is None``) → byte-identical behavior to the pre-fix
+  pop path. A ``QueueError`` / ``NotImplementedError`` from ``len(self._queue)``
+  propagates to the existing ``next_request`` ``except QueueError`` arm and
+  returns ``None`` (degraded safely; the pause flag is never left stuck).
+
   Attributes:
       connection_manager: The connection manager for backend access.
       queue_key: The key for the request queue.
@@ -105,6 +119,9 @@ class BackendScheduler:
     stats: StatsCollector | None = None,
     dupefilter: Any | None = None,
     queue_strategy: QueueStrategy | None = None,
+    *,
+    backpressure_pause_at: int | None = None,
+    backpressure_resume_at: int | None = None,
   ) -> None:
     """Initialize the scheduler.
 
@@ -116,6 +133,14 @@ class BackendScheduler:
         queue_strategy: Optional queue-semantics strategy threaded into the
             BackendQueue. When ``None`` (default), BackendQueue uses
             PassthroughQueueStrategy (current behavior).
+        backpressure_pause_at: Optional depth threshold — at and above this
+            depth, ``next_request`` returns None (depth read fresh from
+            ``len(self._queue)``). ``None`` (default) disables the gate
+            (byte-identical to prior behavior).
+        backpressure_resume_at: Optional resume threshold — depth must drain
+            to this value before popping resumes (hysteresis). When ``None``
+            and ``backpressure_pause_at`` is set, defaults to ``pause_at``
+            (single-threshold, no hysteresis).
     """
     self.connection_manager = connection_manager
     self.queue_key = queue_key
@@ -126,6 +151,16 @@ class BackendScheduler:
     self._spider: Spider | None = None
     self._signals_connected: bool = False
     self._connected_signals = None
+    # Backpressure gate config (round-4 BP-2). resume_at defaults to pause_at
+    # (single-threshold) when unset — computed once here, not per-call.
+    self._pause_at = backpressure_pause_at
+    self._resume_at = (
+      backpressure_resume_at
+      if backpressure_resume_at is not None
+      else backpressure_pause_at
+    )
+    # Per-spider paused state; reset on open(spider).
+    self._backpressure_paused: bool = False
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendScheduler:
@@ -184,10 +219,21 @@ class BackendScheduler:
       default_delay=settings.getfloat("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
       min_interval=settings.getfloat("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
     )
+    # Backpressure gate (round-4 BP-2). Read via settings.get(...) + int() —
+    # NOT getint (some Scrapy versions return 0 on unset, which would collide
+    # with a future 0-meaning config; the codebase pattern for optional ints
+    # here is int(settings.get(...)) — see CONCURRENT_REQUESTS at line ~220).
+    # Unset/0/None → treat as "off" (pause_at=None, gate disabled).
+    pause_raw = settings.get("SCRAPY_BACKPRESSURE_PAUSE_AT")
+    resume_raw = settings.get("SCRAPY_BACKPRESSURE_RESUME_AT")
+    pause_at = int(pause_raw) if pause_raw not in (None, "") else None
+    resume_at = int(resume_raw) if resume_raw not in (None, "") else None
     return cls(
       connection_manager=manager,
       queue_key=settings.get("SCRAPY_QUEUE_KEY", "scheduler:queue"),
       queue_strategy=queue_strategy,
+      backpressure_pause_at=pause_at,
+      backpressure_resume_at=resume_at,
     )
 
   @staticmethod
@@ -294,6 +340,9 @@ class BackendScheduler:
       queue_strategy=self._queue_strategy,
     )
     self._connect_ack_signals(spider)
+    # Reset backpressure gate for a clean per-spider start (round-4 BP-2).
+    # A prior paused state (e.g. re-open without close) should not leak in.
+    self._backpressure_paused = False
     logger.info("Scheduler opened for spider %s", spider.name)
     return None
 
@@ -474,12 +523,43 @@ class BackendScheduler:
     """Get the next request from the queue.
 
     Returns:
-        The next request, or None if the queue is empty.
+        The next request, or None if the queue is empty or paused under the
+        backpressure gate.
     """
     try:
       if self._queue is None:
         msg = "Scheduler not opened"
         raise RuntimeError(msg)
+      # Backpressure depth gate (round-4 BP-2). Depth source is
+      # len(self._queue) — fresh, same source has_pending_requests trusts.
+      # ``len()`` raising QueueError/NotImplementedError propagates to the
+      # ``except QueueError`` arm below (degraded safely, no stuck pause flag).
+      if self._pause_at is not None:
+        # Read depth once. len() can raise QueueError, or NotImplementedError
+        # on backends whose queue_len is unsupported (e.g. RocketMQ). On either,
+        # the gate can't read depth → skip it (degrade to pop) rather than
+        # crash or stall — matches has_pending_requests' error handling.
+        try:
+          depth = len(self._queue)
+        except (QueueError, NotImplementedError):
+          depth = None
+        if depth is not None:
+          # _resume_at defaults to _pause_at in __init__, so it is non-None
+          # whenever _pause_at is non-None; bind a narrowed local for the type
+          # checker (the attribute itself stays int | None).
+          resume_at = self._resume_at
+          assert resume_at is not None
+          if not self._backpressure_paused and depth >= self._pause_at:
+            self._backpressure_paused = True
+            if self.stats:
+              self.stats.inc_value("scheduler/backpressure_pause")
+          if self._backpressure_paused:
+            if depth <= resume_at:
+              self._backpressure_paused = False
+              if self.stats:
+                self.stats.inc_value("scheduler/backpressure_resume")
+            else:
+              return None  # paused — Scrapy engine re-polls after backoff
       request = self._queue.pop(timeout=0)
       if request and self.stats:
         self.stats.inc_value("scheduler/dequeued")
