@@ -48,6 +48,59 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _PulsarAckToken:
+  """Opaque ack token carrying a popped Pulsar message's ``message_id``.
+
+  Stored in ``request.meta["_backend_ack_token"]`` and handed back to
+  :meth:`PulsarBackend.ack` / :meth:`PulsarBackend.nack` so the specific
+  message that was popped is acked — not the last-popped one. Pulsar's
+  Shared subscription is natively per-message: ``consumer.acknowledge(msg_id)``
+  targets exactly one message, so this token is what makes ack correct
+  under ``CONCURRENT_REQUESTS > 1`` (N pops before any ack no longer
+  overwrite a single ``_last_msg`` slot).
+
+  Attributes:
+      message_id: The ``msg.message_id()`` object returned by the pulsar
+          client for the popped message. Passed to
+          ``consumer.acknowledge`` / ``consumer.negative_acknowledge``.
+      topic: The topic the message was consumed from (diagnostics only).
+  """
+
+  __slots__ = ("message_id", "topic")
+
+  def __init__(self, message_id: Any, topic: str) -> None:
+    """Initialize the token.
+
+    Args:
+        message_id: The pulsar ``MessageId`` for the popped message.
+        topic: The topic the message was consumed from.
+    """
+    self.message_id = message_id
+    self.topic = topic
+
+  def __eq__(self, other: object) -> bool:
+    if not isinstance(other, _PulsarAckToken):
+      return NotImplemented
+    return self.message_id is other.message_id and self.topic == other.topic
+
+  def __hash__(self) -> int:
+    # Pulsar ``MessageId`` hashability varies by client version (the C++
+    # binding is not consistently hashable across releases). The in-flight
+    # set is DIAGNOSTIC ONLY (leak detection / monitoring — Pulsar acks
+    # each message independently, unlike Kafka's watermark commit), so
+    # identity-based hashing on the message_id object is sufficient and
+    # robust across all client versions. Equality mirrors this (identity
+    # on message_id) so the token that came out of the set is the one
+    # ``discard`` removes.
+    return hash((id(self.message_id), self.topic))
+
+  def __repr__(self) -> str:
+    return (
+      f"_PulsarAckToken(topic={self.topic!r}, "
+      f"message_id={self.message_id!r})"
+    )
+
+
 def _consumer_type(value: str) -> Any:
   """Map a setting string to a pulsar ConsumerType member.
 
@@ -116,13 +169,17 @@ class PulsarBackend(Backend, QueueBackend):
   ``clear_queue`` is best-effort: it drops the cached consumer/producers and
   relies on topic retention / admin tooling for actual cleanup.
 
-  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=False``.
-  Pulsar ack tracks a SINGLE ``_last_msg`` slot — N pops before any ack
-  overwrite it and only the last-popped message is ackable. Under
-  ``CONCURRENT_REQUESTS > 1`` this silently violates at-least-once. The
-  scheduler gate (round-2) raises ``ConfigurationError`` unless the
-  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set. The real
-  in-flight-set fix is a follow-up (Tier-2).
+  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
+  Pulsar's Shared subscription is natively per-message —
+  ``consumer.acknowledge(msg_id)`` and ``consumer.negative_acknowledge(msg_id)``
+  target one specific message identified by its ``MessageId``. Pops via
+  :meth:`pop_with_ack` carry a :class:`_PulsarAckToken` (wrapping
+  ``msg.message_id()``) tracked in the in-flight set; :meth:`ack` /
+  :meth:`nack` use the token to ack the *specific* message — correct under
+  ``CONCURRENT_REQUESTS > 1`` (N pops before any ack no longer overwrite a
+  single slot). The in-flight set is diagnostic (leak detection / monitoring)
+  since Pulsar acks each message independently. The legacy ``pop()`` /
+  ``ack(token=None)`` path tracks ``_last_msg`` for backward compatibility.
 
   Attributes:
       config: PulsarSettings instance.
@@ -130,11 +187,12 @@ class PulsarBackend(Backend, QueueBackend):
       _producers: Per-topic cached producers.
       _consumer: The current consumer (None until first pop).
       _subscribed_topic: Topic the consumer is currently subscribed to.
-      _last_msg: The last-popped message, tracked for ack/nack.
+      _last_msg: The last-popped message (legacy ``ack(token=None)`` path).
+      _in_flight: Diagnostic set of popped-but-unacked ack tokens.
   """
 
   requires_ack = True
-  supports_concurrent_ack = False
+  supports_concurrent_ack = True
 
   def __init__(self, config: PulsarSettings) -> None:
     """Initialize the Pulsar backend.
@@ -147,7 +205,14 @@ class PulsarBackend(Backend, QueueBackend):
     self._producers: dict[str, Any] = {}
     self._consumer: Any = None
     self._subscribed_topic: str | None = None
+    # Legacy single-slot for the ``ack(token=None)`` fallback path. Kept so
+    # external callers that pop() then ack() without a token still work.
     self._last_msg: Any = None
+    # In-flight ack tokens for correctness under CONCURRENT_REQUESTS>1.
+    # DIAGNOSTIC ONLY: Pulsar acks each message independently (unlike Kafka's
+    # watermark commit), so the set is for leak detection / monitoring —
+    # mirrors RabbitMQ's ``_in_flight_tags``.
+    self._in_flight: set[_PulsarAckToken] = set()
 
   def connect(self) -> None:
     """Connect to Pulsar by creating a client from ``service_url``.
@@ -195,6 +260,7 @@ class PulsarBackend(Backend, QueueBackend):
         self._client.close()
       self._client = None
     self._last_msg = None
+    self._in_flight.clear()
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
@@ -283,6 +349,12 @@ class PulsarBackend(Backend, QueueBackend):
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Receive the next message from the Shared subscription.
 
+    Tracks the popped message in ``_last_msg`` for the legacy
+    ``ack(token=None)`` path. Prefer :meth:`pop_with_ack` under
+    ``CONCURRENT_REQUESTS > 1`` — that path tracks every popped message in
+    the in-flight set so ack(token) acks the *specific* message, not merely
+    the last-popped one.
+
     Args:
         queue_name: Name of the queue.
         timeout: Seconds to wait (0 = a short non-blocking poll).
@@ -294,6 +366,67 @@ class PulsarBackend(Backend, QueueBackend):
         QueueError: If the receive fails for a non-timeout reason.
         ValueError: If queue_name contains invalid characters.
     """
+    msg = self._receive(queue_name, timeout)
+    if msg is None:
+      return None
+    self._last_msg = msg
+    return _message_bytes(msg)
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop an item together with a :class:`_PulsarAckToken`.
+
+    Records the popped message's ``message_id`` in the in-flight set so
+    :meth:`ack` can ``acknowledge`` the *specific* message — correct under
+    ``CONCURRENT_REQUESTS > 1`` (no single-slot overwrite, no message
+    lost/skipped). Pulsar's Shared subscription is natively per-message, so
+    the token carries exactly what ``consumer.acknowledge`` needs.
+
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (0 = a short non-blocking poll).
+
+    Returns:
+        ``(value_bytes, token)`` where ``token`` is a
+        :class:`_PulsarAckToken`, or ``(None, None)`` when the queue is
+        empty.
+
+    Raises:
+        QueueError: If the receive fails for a non-timeout reason.
+        ValueError: If queue_name contains invalid characters.
+    """
+    topic = self._topic_name(queue_name)
+    msg = self._receive(queue_name, timeout)
+    if msg is None:
+      return (None, None)
+    token = _PulsarAckToken(message_id=msg.message_id(), topic=topic)
+    self._in_flight.add(token)
+    # Keep _last_msg in sync so the legacy ack(token=None) path stays
+    # usable for callers that don't thread the token through.
+    self._last_msg = msg
+    return (_message_bytes(msg), token)
+
+  def _receive(self, queue_name: str, timeout: float) -> Any:
+    """Receive one message from ``queue_name``; return None if empty.
+
+    Shared by :meth:`pop` and :meth:`pop_with_ack` so consumer
+    subscription, topic validation, and error wrapping live in one place.
+    Only the receive call maps a no-message result to None; subscribe
+    errors propagate as :class:`QueueError`.
+
+    Args:
+        queue_name: Name of the queue (validated here).
+        timeout: Seconds to wait (0 = a short non-blocking poll).
+
+    Returns:
+        A Pulsar Message, or None if no message arrived in time.
+
+    Raises:
+        QueueError: If the receive fails at the Pulsar layer for a
+            non-timeout reason (subscribe failure).
+        ValueError: If queue_name contains invalid characters.
+    """
     topic = self._topic_name(queue_name)
     # Subscribe errors must propagate (not be masked as "empty"); only the
     # receive call maps a no-message result to None.
@@ -301,34 +434,39 @@ class PulsarBackend(Backend, QueueBackend):
     try:
       # timeout=0 -> a short poll; Pulsar needs a positive timeout_millis.
       timeout_ms = int(timeout * 1000) if timeout > 0 else 100
-      msg = self._consumer.receive(timeout_millis=timeout_ms)
+      return self._consumer.receive(timeout_millis=timeout_ms)
     except Exception as e:
       # No message within the timeout window is the normal "empty" case, not
       # an error. Pulsar raises on timeout; treat any receive failure as empty.
       logger.debug("Pulsar receive returned no message for %s: %s", queue_name, e)
       return None
-    if msg is None:
-      return None
-    self._last_msg = msg
-    return _message_bytes(msg)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
-    """Acknowledge the last-popped message so it isn't re-delivered.
+    """Ack a popped message via ``consumer.acknowledge``.
 
-    ``token`` is accepted for interface compatibility with the concurrency-
-    correct ack path (see QueueBackend.pop_with_ack) but not yet used —
-    Pulsar still tracks a single ``_last_msg`` slot. The full in-flight-set
-    fix for Pulsar is a follow-up; until then pin ``CONCURRENT_REQUESTS=1``
-    for strict at-least-once.
+    With a ``token`` (the scheduler path under ``CONCURRENT_REQUESTS > 1``):
+    ``consumer.acknowledge(token.message_id)`` the specific message and
+    remove the token from the in-flight set. Order-independent — ack the
+    right message regardless of pop/ack interleaving.
+
+    Without a ``token`` (legacy single-pop caller): ``acknowledge`` the
+    tracked ``_last_msg``. Only correct for ``CONCURRENT_REQUESTS=1`` —
+    kept for backward compatibility with external callers that pop() then
+    ack() without threading the token through.
 
     Args:
-        queue_name: The queue name.
-        token: Unused (accepted for signature compatibility).
+        queue_name: Name of the queue (unused; kept for interface symmetry).
+        token: A :class:`_PulsarAckToken` from :meth:`pop_with_ack`, or
+            ``None`` to ack the last-popped message (legacy).
 
     Raises:
-        QueueError: If the acknowledge fails.
+        QueueError: If the underlying acknowledge fails.
     """
-    del queue_name, token
+    del queue_name
+    if isinstance(token, _PulsarAckToken):
+      self._ack_token(token)
+      return
+    # Legacy path: ack the tracked last-popped message.
     if self._consumer is None or self._last_msg is None:
       return
     try:
@@ -338,18 +476,44 @@ class PulsarBackend(Backend, QueueBackend):
     finally:
       self._last_msg = None
 
-  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
-    """Negative-acknowledge the last message for re-delivery.
+  def _ack_token(self, token: _PulsarAckToken) -> None:
+    """Ack the specific message identified by ``token``.
 
-    If the client supports ``negative_acknowledge``, the message is scheduled
-    for immediate re-delivery; otherwise the message is left unacked and
-    redelivered via the unacked-timeout / consumer restart (at-least-once).
+    Pulsar's ack is per-message (not a watermark commit like Kafka), so this
+    is a single ``acknowledge(message_id)`` call. Idempotent at the broker:
+    re-acking an already-acked message_id is a no-op server-side; the
+    in-flight ``discard`` is always safe.
+    """
+    if self._consumer is None:
+      return
+    try:
+      self._consumer.acknowledge(token.message_id)
+    except Exception as e:
+      raise QueueError(f"Failed to ack Pulsar message: {e}", operation="ack") from e
+    finally:
+      self._in_flight.discard(token)
+
+  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Negative-acknowledge a popped message for re-delivery.
+
+    With a ``token``: ``consumer.negative_acknowledge(token.message_id)``
+    if the client supports it, scheduling the specific message for
+    immediate re-delivery; otherwise no-op (the message stays unacked and
+    is redelivered on the unacked-timeout / consumer restart —
+    at-least-once). Either way the token is removed from the in-flight set.
+
+    Without a ``token`` (legacy): nack the tracked ``_last_msg``.
 
     Args:
-        queue_name: The queue name.
-        token: Unused (accepted for signature compatibility).
+        queue_name: Name of the queue (unused; interface symmetry).
+        token: A :class:`_PulsarAckToken` from :meth:`pop_with_ack`, or
+            ``None`` to nack the last-popped message (legacy).
     """
-    del queue_name, token
+    del queue_name
+    if isinstance(token, _PulsarAckToken):
+      self._nack_token(token)
+      return
+    # Legacy path: nack the tracked last-popped message.
     if self._consumer is None or self._last_msg is None:
       return
     try:
@@ -361,6 +525,18 @@ class PulsarBackend(Backend, QueueBackend):
       logger.warning("Pulsar nack failed; message will redeliver on restart: %s", e)
     finally:
       self._last_msg = None
+
+  def _nack_token(self, token: _PulsarAckToken) -> None:
+    """Nack the specific message identified by ``token`` (best-effort)."""
+    try:
+      nack = getattr(self._consumer, "negative_acknowledge", None)
+      if callable(nack):
+        nack(token.message_id)
+      # else: leave unacked -> redelivered on timeout / restart
+    except Exception as e:
+      logger.warning("Pulsar nack failed; message will redeliver on restart: %s", e)
+    finally:
+      self._in_flight.discard(token)
 
   def queue_len(self, queue_name: str) -> int:
     """Return 0 — Pulsar backlog stats need the admin REST API (out of scope).
@@ -401,6 +577,7 @@ class PulsarBackend(Backend, QueueBackend):
       with _suppress_pulsar_errors():
         producer.close()
     self._last_msg = None
+    self._in_flight.clear()
 
   def _ensure_consumer(self, topic: str) -> None:
     """Create or reuse the consumer for ``topic`` (re-subscribes on change).

@@ -19,7 +19,7 @@ from scrapy_extension.backends.base import (  # noqa: E402
   QueueBackend,
   SetBackend,
 )
-from scrapy_extension.backends.sqs import SqsBackend  # noqa: E402
+from scrapy_extension.backends.sqs import SqsBackend, _SqsAckToken  # noqa: E402
 from scrapy_extension.exceptions import BackendConnectionError, QueueError  # noqa: E402
 from scrapy_extension.settings import SqsMode, SqsSettings  # noqa: E402
 
@@ -278,3 +278,246 @@ class TestSqsAckCorrectQueueUrl:
     client.delete_message.assert_called_once_with(
       QueueUrl="https://sqs/qB-url", ReceiptHandle="rh-b"
     )
+
+
+class TestSqsAckToken:
+  """The internal ``_SqsAckToken`` carries both per-message ReceiptHandle and
+  the queue URL it was popped from (preserving the round-2 C3 multi-queue
+  correctness). It is the SQS analog of Kafka's ``_KafkaAckToken``."""
+
+  def test_token_is_hashable_and_equality_compares_fields(self) -> None:
+    t1 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
+    t2 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
+    t3 = _SqsAckToken(queue_url="https://sqs/qB", receipt_handle="rh-1")
+    t4 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-2")
+    assert t1 == t2
+    assert t1 != t3  # different queue_url
+    assert t1 != t4  # different receipt_handle
+    assert hash(t1) == hash(t2)
+    assert {t1, t2, t3, t4} == {t1, t3, t4}  # dedup via __hash__
+
+  def test_token_repr_is_useful(self) -> None:
+    t = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
+    r = repr(t)
+    assert "https://sqs/qA" in r
+    assert "rh-1" in r
+
+  def test_token_uses_slots(self) -> None:
+    t = _SqsAckToken(queue_url="u", receipt_handle="r")
+    with pytest.raises(AttributeError):
+      t.something_else = 1  # type: ignore[attr-defined]  # noqa: PGH003
+
+
+class TestSqsPopWithAck:
+  def test_pop_with_ack_returns_body_and_token(self, mocker) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [
+        {"Body": base64.b64encode(b"payload").decode(), "ReceiptHandle": "rh-1"}
+      ]
+    }
+    body, token = b.pop_with_ack("queue1")
+    assert body == b"payload"
+    assert isinstance(token, _SqsAckToken)
+    assert token.queue_url == "https://sqs/test"
+    assert token.receipt_handle == "rh-1"
+    # Token tracked in the diagnostic in-flight set.
+    assert token in b._in_flight
+
+  def test_pop_with_ack_empty_returns_none_none(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {}
+    body, token = b.pop_with_ack("queue1")
+    assert body is None
+    assert token is None
+    assert b._in_flight == set()
+
+  def test_pop_with_ack_failure_raises_queue_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.side_effect = RuntimeError("receive failed")
+    with pytest.raises(QueueError):
+      b.pop_with_ack("queue1")
+
+
+class TestSqsRealInFlightAck:
+  """The core at-least-once-under-concurrency test: N pops before any ack
+  MUST be able to ack each by its OWN token. Pre-fix (single-slot
+  ``_last_receipt``) this is impossible — the first two acks no-op or hit
+  the wrong handle."""
+
+  def test_three_pops_then_three_distinct_acks(self, mocker) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    # Three sequential pops, each returning a distinct ReceiptHandle.
+    # (SQS receive_message returns one message per call.)
+    client.receive_message.side_effect = [
+      {"Messages": [{"Body": base64.b64encode(b"m1").decode(), "ReceiptHandle": "rh-1"}]},
+      {"Messages": [{"Body": base64.b64encode(b"m2").decode(), "ReceiptHandle": "rh-2"}]},
+      {"Messages": [{"Body": base64.b64encode(b"m3").decode(), "ReceiptHandle": "rh-3"}]},
+    ]
+
+    body1, tok1 = b.pop_with_ack("q")
+    body2, tok2 = b.pop_with_ack("q")
+    body3, tok3 = b.pop_with_ack("q")
+    assert (body1, body2, body3) == (b"m1", b"m2", b"m3")
+    # 3 distinct tokens — the single-slot pre-fix path cannot produce these.
+    assert len({tok1, tok2, tok3}) == 3
+    assert len(b._in_flight) == 3
+
+    # Ack each by its OWN token — 3 DISTINCT delete_message calls, each with
+    # the correct ReceiptHandle for that token.
+    b.ack("q", token=tok1)
+    b.ack("q", token=tok2)
+    b.ack("q", token=tok3)
+
+    calls = client.delete_message.call_args_list
+    assert len(calls) == 3
+    # Each call targets the CORRECT (QueueUrl, ReceiptHandle) for that token.
+    assert calls[0].kwargs == {"QueueUrl": "https://sqs/test", "ReceiptHandle": "rh-1"}
+    assert calls[1].kwargs == {"QueueUrl": "https://sqs/test", "ReceiptHandle": "rh-2"}
+    assert calls[2].kwargs == {"QueueUrl": "https://sqs/test", "ReceiptHandle": "rh-3"}
+    # In-flight set fully drains after all acks.
+    assert b._in_flight == set()
+
+  def test_ack_by_token_is_order_independent(self, mocker) -> None:
+    """Ack in reverse-pop-order to prove it isn't single-slot last-wins."""
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.side_effect = [
+      {"Messages": [{"Body": base64.b64encode(b"a").decode(), "ReceiptHandle": "rh-a"}]},
+      {"Messages": [{"Body": base64.b64encode(b"b").decode(), "ReceiptHandle": "rh-b"}]},
+    ]
+    _, tok_a = b.pop_with_ack("q")
+    _, tok_b = b.pop_with_ack("q")
+    # Ack B FIRST (out of pop order) — single-slot pre-fix would have lost A.
+    b.ack("q", token=tok_b)
+    b.ack("q", token=tok_a)
+    calls = client.delete_message.call_args_list
+    assert {c.kwargs["ReceiptHandle"] for c in calls} == {"rh-a", "rh-b"}
+
+  def test_ack_token_failure_raises_queue_error(self, mocker) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": base64.b64encode(b"x").decode(), "ReceiptHandle": "rh"}]
+    }
+    _, tok = b.pop_with_ack("q")
+    client.delete_message.side_effect = RuntimeError("delete failed")
+    with pytest.raises(QueueError):
+      b.ack("q", token=tok)
+
+
+class TestSqsRealNack:
+  def test_nack_with_token_is_noop_and_discards_from_in_flight(
+    self, mocker
+  ) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": base64.b64encode(b"x").decode(), "ReceiptHandle": "rh-1"}]
+    }
+    _, tok = b.pop_with_ack("q")
+    assert tok in b._in_flight
+    b.nack("q", token=tok)
+    # No delete_message call — SQS re-delivers on visibility timeout.
+    client.delete_message.assert_not_called()
+    # Token removed from the in-flight set.
+    assert tok not in b._in_flight
+
+
+class TestSqsCrashMidAck:
+  """Crash-mid-ack semantics: popped-but-unacked messages stay in
+  ``_in_flight`` so the leak is observable. SQS re-delivers them on
+  visibility-timeout expiry — at-least-once is preserved by SQS itself."""
+
+  def test_pop_without_ack_keeps_tokens_in_flight(self, mocker) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.side_effect = [
+      {"Messages": [{"Body": base64.b64encode(b"m1").decode(), "ReceiptHandle": "rh-1"}]},
+      {"Messages": [{"Body": base64.b64encode(b"m2").decode(), "ReceiptHandle": "rh-2"}]},
+    ]
+    _, tok1 = b.pop_with_ack("q")
+    _, tok2 = b.pop_with_ack("q")
+    # Crash mid-batch — ack NEITHER.
+    assert len(b._in_flight) == 2
+    assert {tok1, tok2} == b._in_flight
+    # No delete_message fired — SQS will re-deliver both after their
+    # visibility timeouts expire (at-least-once).
+    client.delete_message.assert_not_called()
+
+
+class TestSqsMultiQueueRealAck:
+  """C3 multi-queue correctness preserved under the real-ack path: a token
+  popped from qB acks against qB's QueueUrl, never qA's."""
+
+  def test_multi_queue_pop_from_qB_ack_targets_qB(self, mocker) -> None:
+    import base64
+
+    urls = {"qA": "https://sqs/qA-url", "qB": "https://sqs/qB-url"}
+    b, client = _connected_multi_queue(mocker, urls)
+    # Seed the URL cache with qA first so any dict-iteration bug surfaces.
+    b._queue_url("qA")
+    b._queue_url("qB")
+
+    client.receive_message.return_value = {
+      "Messages": [
+        {
+          "Body": base64.b64encode(b"from-b").decode(),
+          "ReceiptHandle": "rh-from-b",
+        }
+      ]
+    }
+    _, tok = b.pop_with_ack("qB")
+    assert tok.queue_url == "https://sqs/qB-url"
+    b.ack("qB", token=tok)
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/qB-url", ReceiptHandle="rh-from-b"
+    )
+
+
+class TestSqsSupportsConcurrentAck:
+  def test_supports_concurrent_ack_is_true(self) -> None:
+    # The round-2 gate reads this flag; flipping it True retires the gate
+    # for SQS (real per-message ack is concurrency-safe).
+    assert SqsBackend.supports_concurrent_ack is True
+    assert SqsBackend.requires_ack is True
+
+
+class TestSqsLegacyAckCompat:
+  """The ``pop()`` + ``ack(token=None)`` legacy path still works via the
+  ``_last_receipt`` single-slot — mirrors Kafka keeping ``_last_record``."""
+
+  def test_legacy_pop_then_ack_no_token(self, mocker) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": base64.b64encode(b"x").decode(), "ReceiptHandle": "rh"}]
+    }
+    assert b.pop("queue1") == b"x"
+    # ack with no token — falls back to _last_receipt.
+    b.ack("queue1")
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/test", ReceiptHandle="rh"
+    )
+    assert b._last_receipt is None
+
+  def test_legacy_nack_then_clears_receipt(self, mocker) -> None:
+    import base64
+
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": base64.b64encode(b"x").decode(), "ReceiptHandle": "rh"}]
+    }
+    b.pop("queue1")
+    b.nack("queue1")  # no token
+    client.delete_message.assert_not_called()
+    assert b._last_receipt is None

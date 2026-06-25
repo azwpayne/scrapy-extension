@@ -49,6 +49,52 @@ logger = logging.getLogger(__name__)
 _MAX_WAIT_SECONDS = 20
 
 
+class _SqsAckToken:
+  """Opaque ack token carrying the (queue_url, receipt_handle) of a popped msg.
+
+  Stored in ``request.meta["_backend_ack_token"]`` and handed back to
+  :meth:`SqsBackend.ack` / :meth:`SqsBackend.nack` so the specific message
+  that was popped is acked — not the last-popped one. SQS ``ReceiptHandle``
+  is natively per-message, and ``delete_message(QueueUrl, ReceiptHandle)``
+  deletes exactly one message, so this token carries everything ack needs
+  with no single-slot state. The ``queue_url`` preserves the round-2 C3
+  multi-queue correctness (a token popped from qB acks against qB's URL).
+
+  Attributes:
+      queue_url: The QueueUrl the message was popped FROM.
+      receipt_handle: The SQS ReceiptHandle of the popped message.
+  """
+
+  __slots__ = ("queue_url", "receipt_handle")
+
+  def __init__(self, queue_url: str, receipt_handle: str) -> None:
+    """Initialize the token.
+
+    Args:
+        queue_url: The QueueUrl the message was popped from.
+        receipt_handle: The SQS ReceiptHandle identifying the message.
+    """
+    self.queue_url = queue_url
+    self.receipt_handle = receipt_handle
+
+  def __eq__(self, other: object) -> bool:
+    if not isinstance(other, _SqsAckToken):
+      return NotImplemented
+    return (
+      self.queue_url == other.queue_url
+      and self.receipt_handle == other.receipt_handle
+    )
+
+  def __hash__(self) -> int:
+    return hash((self.queue_url, self.receipt_handle))
+
+  def __repr__(self) -> str:
+    return (
+      f"_SqsAckToken(queue_url={self.queue_url!r}, "
+      f"receipt_handle={self.receipt_handle!r})"
+    )
+
+
 class SqsBackend(Backend, QueueBackend):
   """SQS backend (queue-only) with Standard-queue work semantics.
 
@@ -57,32 +103,33 @@ class SqsBackend(Backend, QueueBackend):
   handle for ack. queue_len reads ApproximateNumberOfMessages; clear_queue
   purges.
 
-  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=False``.
-  SQS ack tracks a SINGLE ``_last_receipt`` slot — N pops before any ack
-  overwrite it and only the last-popped message is ackable. Under
-  ``CONCURRENT_REQUESTS > 1`` this silently violates at-least-once. The
-  scheduler gate (round-2) raises ``ConfigurationError`` unless the
-  ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set. The real
-  in-flight-set fix is a follow-up (Tier-2).
-
-  Per-pop URL tracking (round-2 C3 fix): ``_last_receipt`` is a
-  ``(queue_url, receipt_handle)`` tuple so :meth:`ack` deletes against the
-  queue the message was popped from, not an arbitrary cached URL.
+  Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
+  SQS ``ReceiptHandle`` is natively per-message —
+  ``delete_message(QueueUrl, ReceiptHandle)`` deletes exactly one message —
+  so :meth:`pop_with_ack` returns a :class:`_SqsAckToken` carrying the
+  handle (and the source queue URL, for C3 multi-queue correctness) and the
+  scheduler can ack each popped message by its OWN token under
+  ``CONCURRENT_REQUESTS > 1``. A diagnostic ``_in_flight`` set mirrors
+  RabbitMQ's ``_in_flight_tags`` for leak detection; the ``_last_receipt``
+  single-slot is kept only for the legacy ``ack(token=None)`` path.
 
   Attributes:
       config: SqsSettings instance.
       _client: The boto3 SQS client (None until connected).
       _queue_urls: Per-queue cached QueueUrl values.
-      _last_receipt: ``(queue_url, receipt_handle)`` of the last-popped msg.
+      _in_flight: Diagnostic set of popped-but-unacked tokens.
+      _last_receipt: ``(queue_url, receipt_handle)`` of the last-popped msg
+          (legacy ``ack(token=None)`` fallback only).
   """
 
   requires_ack = True
-  supports_concurrent_ack = False
+  supports_concurrent_ack = True
 
   def __init__(self, config: SqsSettings) -> None:
     self.config = config
     self._client: Any = None
     self._queue_urls: dict[str, str] = {}
+    self._in_flight: set[_SqsAckToken] = set()
     self._last_receipt: tuple[str, str] | None = None
 
   def connect(self) -> None:
@@ -118,6 +165,7 @@ class SqsBackend(Backend, QueueBackend):
         self._client.close()
       self._client = None
     self._queue_urls.clear()
+    self._in_flight.clear()
     self._last_receipt = None
 
   def is_connected(self) -> bool:
@@ -194,9 +242,11 @@ class SqsBackend(Backend, QueueBackend):
     """Receive one message from the SQS queue.
 
     Records ``(queue_url, receipt_handle)`` in ``_last_receipt`` so the
-    subsequent :meth:`ack` deletes against the queue this message was
-    popped from (round-2 C3 fix — previously ack resolved an arbitrary
-    cached URL and could delete the wrong queue under multi-queue use).
+    subsequent legacy :meth:`ack` (called with ``token=None``) deletes
+    against the queue this message was popped from. Prefer
+    :meth:`pop_with_ack` under ``CONCURRENT_REQUESTS > 1`` — that path
+    returns a per-message :class:`_SqsAckToken` so each popped message is
+    ackable independently, with no single-slot overwrite.
 
     Args:
         queue_name: Name of the queue.
@@ -207,6 +257,69 @@ class SqsBackend(Backend, QueueBackend):
 
     Raises:
         QueueError: If the receive fails.
+        ValueError: If queue_name contains invalid characters.
+    """
+    url, body, receipt = self._receive(queue_name, timeout)
+    if body is None:
+      return None
+    # Track the URL the message arrived FROM, so legacy ack deletes the
+    # right queue (round-2 C3 fix). receipt is non-None when body is non-None.
+    assert receipt is not None  # noqa: S101 — invariant from _receive
+    self._last_receipt = (url, receipt)
+    return body
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, _SqsAckToken | None]:
+    """Pop an item together with a :class:`_SqsAckToken`.
+
+    SQS ``ReceiptHandle`` is natively per-message, so the token carries the
+    handle and the source queue URL — :meth:`ack` then
+    ``delete_message(QueueUrl=token.queue_url, ReceiptHandle=token.receipt_handle)``
+    the specific message, correct under ``CONCURRENT_REQUESTS > 1``. The
+    token is also added to the diagnostic ``_in_flight`` set (mirrors
+    RabbitMQ's ``_in_flight_tags``) so popped-but-unacked messages are
+    observable for leak detection.
+
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to long-poll (capped at 20; 0 = short poll).
+
+    Returns:
+        ``(body, token)`` where ``token`` is a :class:`_SqsAckToken`, or
+        ``(None, None)`` when the queue is empty.
+
+    Raises:
+        QueueError: If the receive fails.
+        ValueError: If queue_name contains invalid characters.
+    """
+    url, body, receipt = self._receive(queue_name, timeout)
+    if body is None or receipt is None:
+      return (None, None)
+    token = _SqsAckToken(queue_url=url, receipt_handle=receipt)
+    self._in_flight.add(token)
+    # Keep _last_receipt in sync so the legacy ack(token=None) path stays
+    # usable for callers that don't thread the token through.
+    self._last_receipt = (url, receipt)
+    return (body, token)
+
+  def _receive(
+    self, queue_name: str, timeout: float
+  ) -> tuple[str, bytes | None, str | None]:
+    """Fetch one message from ``queue_name``; shared by pop and pop_with_ack.
+
+    Args:
+        queue_name: Name of the queue (validated here).
+        timeout: Seconds to long-poll (capped at 20; 0 = short poll).
+
+    Returns:
+        ``(queue_url, body, receipt_handle)``. ``body`` and
+        ``receipt_handle`` are both ``None`` when the queue is empty; when
+        a message arrived both are non-None (invariant relied on by
+        :meth:`pop`).
+
+    Raises:
+        QueueError: If the receive fails at the SQS layer.
         ValueError: If queue_name contains invalid characters.
     """
     try:
@@ -226,36 +339,61 @@ class SqsBackend(Backend, QueueBackend):
       ) from e
     messages = resp.get("Messages") or []
     if not messages:
-      return None
+      return (url, None, None)
     msg = messages[0]
     receipt = msg.get("ReceiptHandle")
-    # Track the URL the message arrived FROM, so ack deletes the right queue.
-    self._last_receipt = (url, receipt) if receipt is not None else None
-    body = msg.get("Body", "")
-    return base64.b64decode(body)
+    if receipt is None:
+      return (url, None, None)
+    body = base64.b64decode(msg.get("Body", ""))
+    return (url, body, receipt)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
-    """Delete the last-popped message so it isn't redelivered.
+    """Delete a popped message so it isn't redelivered.
 
-    Deletes against the queue URL the message was popped FROM (recorded in
-    ``_last_receipt``), not an arbitrary cached URL — correct under
-    multi-queue SQS use (round-2 C3 fix).
+    With a ``token`` (the scheduler path under ``CONCURRENT_REQUESTS > 1``):
+    ``delete_message(QueueUrl=token.queue_url, ReceiptHandle=token.receipt_handle)``
+    the specific message and remove it from the diagnostic in-flight set.
+    Order-independent — ack the right message regardless of pop/ack
+    interleaving. The ``queue_url`` is carried on the token so multi-queue
+    correctness (C3) is preserved without consulting ``queue_name``.
 
-    ``token`` is accepted for interface compatibility with the concurrency-
-    correct ack path (see QueueBackend.pop_with_ack) but not yet used — SQS
-    still tracks a single ``_last_receipt`` slot. The full in-flight-set
-    fix for SQS is a follow-up; until then the scheduler gate pins
-    ``CONCURRENT_REQUESTS=1`` for strict at-least-once (overridable via
-    ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS``).
+    Without a ``token`` (legacy single-pop caller): delete the tracked
+    ``_last_receipt`` (set by :meth:`pop`). Only correct for
+    ``CONCURRENT_REQUESTS=1`` — kept for backward compatibility with
+    external callers that pop() then ack() without threading the token
+    through.
+
+    Stale-handle (visibility-timeout-expired) AWS errors raise
+    :class:`QueueError`; at-least-once is preserved by SQS re-delivery, so
+    the error is NOT swallowed (matches Kafka's raise-on-commit-failure).
 
     Args:
-        queue_name: The queue name.
-        token: Unused (accepted for signature compatibility).
+        queue_name: Name of the queue (unused when ``token`` is provided;
+            kept for interface symmetry).
+        token: A :class:`_SqsAckToken` from :meth:`pop_with_ack`, or
+            ``None`` to ack the last-popped message (legacy).
 
     Raises:
-        QueueError: If the delete fails.
+        QueueError: If the delete fails at the SQS layer.
     """
-    del queue_name, token
+    del queue_name
+    if isinstance(token, _SqsAckToken):
+      if self._client is None:
+        return
+      try:
+        self._client.delete_message(
+          QueueUrl=token.queue_url, ReceiptHandle=token.receipt_handle
+        )
+      except Exception as e:
+        raise QueueError(f"Failed to ack SQS message: {e}", operation="ack") from e
+      finally:
+        self._in_flight.discard(token)
+        # Keep _last_receipt coherent if the legacy slot pointed at the
+        # same handle (single-process sanity; harmless otherwise).
+        if self._last_receipt == (token.queue_url, token.receipt_handle):
+          self._last_receipt = None
+      return
+    # Legacy path: ack the tracked last-popped receipt.
     if self._client is None or self._last_receipt is None:
       return
     url, receipt = self._last_receipt
@@ -269,11 +407,21 @@ class SqsBackend(Backend, QueueBackend):
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """No-op: SQS redelivers an unacked message after the visibility timeout.
 
+    With a ``token``: no SQS call (SQS re-delivers on visibility-timeout
+    expiry — current contract) and remove the token from the diagnostic
+    in-flight set. Without a ``token``: clear the legacy ``_last_receipt``.
+
     Args:
-        queue_name: The queue name.
-        token: Unused (accepted for signature compatibility).
+        queue_name: The queue name (unused; interface symmetry).
+        token: A :class:`_SqsAckToken` from :meth:`pop_with_ack`, or
+            ``None`` to nack the last-popped message (legacy).
     """
-    del queue_name, token
+    del queue_name
+    if isinstance(token, _SqsAckToken):
+      self._in_flight.discard(token)
+      if self._last_receipt == (token.queue_url, token.receipt_handle):
+        self._last_receipt = None
+      return
     self._last_receipt = None
 
   def queue_len(self, queue_name: str) -> int:
