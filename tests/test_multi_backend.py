@@ -504,7 +504,12 @@ class TestResolveBackendConfig:
     assert backend_type == BackendType.REDIS
 
   def test_rejects_backend_without_required_capability(self, mock_settings):
-    """I-1: raises ConfigurationError when backend lacks the required interface."""
+    """I-1: raises ConfigurationError when backend lacks the required interface.
+
+    Round-5 R5-1: ``required_capabilities`` is now a set of capability
+    NAMES (``{"set"}``), not a backend allowlist. Kafka's descriptor
+    declares only ``{"queue"}``, so it lacks ``set`` → fail-fast.
+    """
     settings = mock_settings(gets={"SCRAPY_SET_BACKEND_TYPE": "kafka"})
 
     with pytest.raises(ConfigurationError, match="does not support the set"):
@@ -512,31 +517,28 @@ class TestResolveBackendConfig:
         settings,
         type_key="SCRAPY_SET_BACKEND_TYPE",
         settings_key="SCRAPY_SET_BACKEND_SETTINGS",
-        required_capabilities={
-          BackendType.REDIS,
-          BackendType.MONGODB,
-          BackendType.ELASTICSEARCH,
-        },
+        required_capabilities={"set"},
         component_name="set",
       )
 
   def test_accepts_backend_with_required_capability(self, mock_settings):
-    """I-1: a backend that satisfies the capability passes through cleanly."""
+    """I-1: a backend that satisfies the capability passes through cleanly.
+
+    MongoDB's descriptor declares ``{"queue", "set", "storage"}``, so it
+    satisfies ``required_capabilities={"set"}``. Returns the registry-key
+    string (round-5 R5-1).
+    """
     settings = mock_settings(gets={"SCRAPY_SET_BACKEND_TYPE": "mongodb"})
 
     backend_type, _ = resolve_backend_config(
       settings,
       type_key="SCRAPY_SET_BACKEND_TYPE",
       settings_key="SCRAPY_SET_BACKEND_SETTINGS",
-      required_capabilities={
-        BackendType.REDIS,
-        BackendType.MONGODB,
-        BackendType.ELASTICSEARCH,
-      },
+      required_capabilities={"set"},
       component_name="set",
     )
 
-    assert backend_type == BackendType.MONGODB
+    assert backend_type == "mongodb"
 
   def test_required_capability_not_supplied_skips_validation(self, mock_settings):
     """I-1: required_capabilities=None (default) preserves backward-compatible behavior.

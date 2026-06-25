@@ -140,12 +140,20 @@ class TestConnectionManagerCreateBackend:
     assert backend == mock_backend
 
   def test_create_backend_unsupported_type(self):
-    """Test _create_backend raises ValueError for unsupported backend type."""
+    """Test _create_backend raises ConfigurationError for unregistered type.
+
+    Round-5 R5-1: dispatch now routes through the registry's
+    ``get_descriptor``; an unregistered backend type raises
+    ``ConfigurationError`` (was ``ValueError``) — typed + carries the
+    setting name, surfaceable by ``from_settings`` error handling.
+    """
+    from scrapy_extension.exceptions import ConfigurationError
+
     manager = ConnectionManager(BackendType.REDIS)
     # Deliberately set invalid type to test error handling
     manager.backend_type = "INVALID"  # type: ignore[assignment]
 
-    with pytest.raises(ValueError, match="Unsupported backend type"):
+    with pytest.raises(ConfigurationError, match="not a registered backend"):
       manager._create_backend()
 
   def test_create_backend_rocketmq(self, mocker):
@@ -743,9 +751,13 @@ class TestResolveBackendConfigEnumNormalization:
     return settings
 
   def test_enum_instance_passthrough_per_component(self):
-    """A BackendType instance passed as the per-component value must pass
-    through ``resolve_backend_config`` unchanged (no ValueError, no
-    re-coercion crash)."""
+    """A BackendType instance passed as the per-component value must resolve
+    to its registry-key string (no ValueError, no re-coercion crash).
+
+    Round-5 R5-1: ``resolve_backend_config`` now returns the backend-type
+    STRING (was the ``BackendType`` member). ``BackendType.MONGODB`` →
+    ``"mongodb"`` — the same registry key the descriptor table uses.
+    """
     from scrapy_extension.backends.connectors import resolve_backend_config
 
     settings = self._make_settings(
@@ -754,17 +766,18 @@ class TestResolveBackendConfigEnumNormalization:
     backend_type, _ = resolve_backend_config(
       settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
     )
-    assert backend_type is BackendType.MONGODB
+    assert backend_type == "mongodb"
 
   def test_string_value_resolves_per_component(self):
-    """A plain string (the typical Scrapy settings path) must still resolve."""
+    """A plain string (the typical Scrapy settings path) must still resolve
+    to the registry-key string unchanged."""
     from scrapy_extension.backends.connectors import resolve_backend_config
 
     settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "kafka"})
     backend_type, _ = resolve_backend_config(
       settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
     )
-    assert backend_type is BackendType.KAFKA
+    assert backend_type == "kafka"
 
   def test_invalid_string_raises_configuration_error(self):
     """An invalid backend type string must raise ``ConfigurationError``

@@ -1,0 +1,497 @@
+"""Tests for scrapy_extension/backends/registry.py.
+
+Round-5 Unit R5-1: entry-point plugin registration. These 7 tests are the
+PLAN's TDD acceptance gate. They MUST pass under both Py3.10/3.11
+(``entry_points()[group]`` shape) and Py3.12+ (``entry_points(group=...)``
+shape), and MUST verify that:
+
+- bundled backends still resolve (Test 1);
+- 3rd-party descriptors are discovered via ``importlib.metadata.entry_points``
+  (Test 2);
+- capability mismatches fail fast with a typed error (Test 3);
+- bundled-wins-on-conflict emits ``UserWarning`` (Test 4) — load-bearing
+  because ``pyproject.toml`` sets ``filterwarnings = ["error::UserWarning"]``;
+- a broken plugin callable never breaks the bundled set (Test 5);
+- ``get_registry()`` never imports any backend module — lazy-import preserved
+  (Test 6);
+- both entry-point API shapes work (Test 7).
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from scrapy_extension.backends.registry import (
+  BackendDescriptor,
+  _reset_registry_cache,
+  get_descriptor,
+  get_registry,
+  has_capability,
+)
+
+# ---------------------------------------------------------------------------
+# Module-level registration callables.
+# ---------------------------------------------------------------------------
+# Entry-point ``value`` strings resolve via ``importlib.import_module`` +
+# ``getattr``, so the registration callable MUST be a module-level attribute.
+# Closures defined inside a test method would be invisible to ``getattr``.
+
+def _register_mybackend() -> BackendDescriptor:
+  return _make_descriptor("mybackend", capabilities=frozenset({"queue"}))
+
+
+def _register_legacy() -> BackendDescriptor:
+  return _make_descriptor("legacyep", capabilities=frozenset({"queue"}))
+
+
+def _register_kwarg() -> BackendDescriptor:
+  return _make_descriptor("kwargepp", capabilities=frozenset({"queue"}))
+
+
+def _register_good_plugin() -> BackendDescriptor:
+  return _make_descriptor("goodplugin", capabilities=frozenset({"queue"}))
+
+
+def _register_shadow_redis() -> BackendDescriptor:
+  # Deliberately shadowing a bundled name (Test 4: bundled-wins).
+  return _make_descriptor(
+    "redis",
+    capabilities=frozenset({"queue"}),
+    backend_cls_path="tests.test_registry._StubBackend",
+    settings_cls_path="tests.test_registry._StubSettings",
+  )
+
+
+def _broken_plugin() -> BackendDescriptor:
+  raise ImportError("simulated plugin import failure")
+
+
+# ---------------------------------------------------------------------------
+# Test helpers: fake entry-points + descriptor factory.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _FakeEntryPoint:
+  """Minimal stand-in for ``importlib.metadata.EntryPoint``.
+
+  ``importlib.metadata.EntryPoint`` is a frozen dataclass with ``name``,
+  ``group``, and ``value`` (dotted path to the registration callable).
+  We replicate just enough to drive ``_discover_entry_points``.
+  """
+
+  name: str
+  value: str
+  group: str
+
+  def load(self) -> Any:
+    """Resolve the dotted path to a callable and invoke it.
+
+    Mirrors the real ``EntryPoint.load()``: import the module, fetch the
+    attribute. Uses ``importlib.import_module`` (not bare ``__import__``)
+    so the cached module in ``sys.modules`` is returned unambiguously.
+    """
+    import importlib
+
+    module_path, _, attr = self.value.rpartition(".")
+    if not module_path:
+      msg = f"Invalid fake entry-point value: {self.value!r}"
+      raise ValueError(msg)
+    module = importlib.import_module(module_path)
+    return getattr(module, attr)
+
+
+def _make_descriptor(
+  name: str,
+  *,
+  capabilities: frozenset[str],
+  backend_cls_path: str = "tests.test_registry._StubBackend",
+  settings_cls_path: str = "tests.test_registry._StubSettings",
+) -> BackendDescriptor:
+  """Build a descriptor with sane test defaults."""
+  return BackendDescriptor(
+    backend_type=name,
+    backend_cls_path=backend_cls_path,
+    settings_cls_path=settings_cls_path,
+    capabilities=capabilities,
+  )
+
+
+def _patch_entry_points(monkeypatch: pytest.MonkeyPatch, eps: list[_FakeEntryPoint]) -> None:
+  """Patch ``importlib.metadata.entry_points`` to return ``eps``.
+
+  The patched callable supports BOTH the 3.12+ kwarg form
+  (``entry_points(group=...)``) and the legacy 3.10/3.11 form
+  (``entry_points().get(group, [])``).
+  """
+  import importlib.metadata as importlib_metadata
+
+  def _entry_points(group: str | None = None) -> Any:
+    if group is not None:
+      # 3.12+ shape: returns a list of EntryPoint objects.
+      return [ep for ep in eps if ep.group == group]
+    # Legacy shape: returns a dict-like with .get(group, []).
+    by_group: dict[str, list[_FakeEntryPoint]] = {}
+    for ep in eps:
+      by_group.setdefault(ep.group, []).append(ep)
+
+    class _Selectable:
+      def get(self, key: str, default: Any = None) -> Any:
+        return by_group.get(key, default or [])
+
+    return _Selectable()
+
+  monkeypatch.setattr(importlib_metadata, "entry_points", _entry_points)
+
+
+# ---------------------------------------------------------------------------
+# Stub backend + settings classes for Test 2 (instantiation path).
+# ---------------------------------------------------------------------------
+
+
+class _StubBackend:
+  """Minimal backend stub the descriptor points at.
+
+  Constructed as ``_StubBackend(_StubSettings(**settings))`` — so the
+  descriptor path actually instantiates a real (no-op) class to prove
+  the dispatch table resolves end-to-end.
+  """
+
+  def __init__(self, settings: _StubSettings) -> None:
+    self.settings = settings
+
+
+class _StubSettings:
+  """Settings stub matching ``_StubBackend``'s constructor contract."""
+
+  def __init__(self, **kwargs: Any) -> None:
+    self.kwargs = kwargs
+
+
+# ---------------------------------------------------------------------------
+# The 7 PLAN tests.
+# ---------------------------------------------------------------------------
+
+
+class TestBundledBackendsStillWork:
+  """Test 1: bundled_still_work."""
+
+  def test_bundled_still_work(self):
+    """``SCRAPY_BACKEND_TYPE=redis`` resolves to a bundled descriptor and
+    the descriptor's class path builds ``RedisBackend`` byte-identically.
+
+    Verifies the consolidation: ``_BUNDLED_DESCRIPTORS`` was seeded from
+    the old ``_BACKEND_FACTORIES`` + capability sets, so the redis
+    descriptor's ``backend_cls_path`` is the SAME dotted string the old
+    table held — no behavior change at the dispatch site.
+    """
+    _reset_registry_cache()
+    registry = get_registry()
+
+    assert "redis" in registry
+    redis_desc = get_descriptor("redis")
+    assert redis_desc.backend_cls_path == "scrapy_extension.backends.redis.RedisBackend"
+    assert redis_desc.settings_cls_path == "scrapy_extension.settings.RedisSettings"
+    # Redis supports all three interfaces (per the old QUEUE/SET/STORAGE sets).
+    assert redis_desc.capabilities == frozenset({"queue", "set", "storage"})
+
+    # All 10 bundled backends present.
+    assert len(registry) >= 10
+    for name in (
+      "redis",
+      "mongodb",
+      "kafka",
+      "rabbitmq",
+      "elasticsearch",
+      "rocketmq",
+      "pulsar",
+      "memcached",
+      "sqs",
+      "dynamodb",
+    ):
+      assert name in registry, f"Missing bundled backend: {name}"
+
+
+class TestThirdPartyDiscovered:
+  """Test 2: third_party_discovered."""
+
+  def test_third_party_discovered(self, monkeypatch):
+    """A mock entry-point → registry returns its descriptor → resolves +
+    instantiates the stub backend end-to-end."""
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="mybackend",
+          value="tests.test_registry._register_mybackend",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    registry = get_registry()
+    assert "mybackend" in registry
+    desc = get_descriptor("mybackend")
+    assert desc.capabilities == frozenset({"queue"})
+
+    # End-to-end: the class path actually imports + instantiates.
+    from scrapy_extension.backends.connectors import _load_object
+
+    backend_cls = _load_object(desc.backend_cls_path)
+    settings_cls = _load_object(desc.settings_cls_path)
+    instance = backend_cls(settings_cls(host="local"))
+    assert isinstance(instance, _StubBackend)
+    assert instance.settings.kwargs == {"host": "local"}
+
+
+class TestCapabilityGated:
+  """Test 3: capability_gated."""
+
+  def test_capability_gated_raises_configuration_error(self, monkeypatch):
+    """A 3rd-party descriptor with only ``{"queue"}`` → selecting for set
+    or storage → ``ConfigurationError`` w/ ``setting_name`` + the capable
+    backend list in the message."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+    from scrapy_extension.exceptions import ConfigurationError
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="mybackend",
+          value="tests.test_registry._register_mybackend",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    settings = MagicMock()
+
+    def _get(key, default=None):
+      if key == "SCRAPY_SET_BACKEND_TYPE":
+        return "mybackend"
+      return default
+
+    def _getdict(key, default=None):
+      return {} if default is None else default
+
+    settings.get.side_effect = _get
+    settings.getdict.side_effect = _getdict
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      resolve_backend_config(
+        settings,
+        type_key="SCRAPY_SET_BACKEND_TYPE",
+        settings_key="SCRAPY_SET_BACKEND_SETTINGS",
+        required_capabilities={"set"},
+        component_name="set",
+      )
+
+    assert exc_info.value.setting_name == "SCRAPY_SET_BACKEND_TYPE"
+    msg = str(exc_info.value)
+    # The capable backends list must name at least one set-capable backend
+    # (redis/mongodb/elasticsearch are bundled + set-capable).
+    assert "redis" in msg
+    assert "mybackend" in msg
+
+
+class TestNameConflictBundledWins:
+  """Test 4: name_conflict_bundled_wins."""
+
+  def test_name_conflict_bundled_wins(self, monkeypatch):
+    """An entry-point named ``"redis"`` → bundled descriptor wins AND a
+    ``UserWarning`` is emitted.
+
+    Load-bearing because ``pyproject.toml`` sets
+    ``filterwarnings = ["error::UserWarning"]``: the bundled-wins path
+    MUST emit the warning so a 3rd-party package can't silently shadow a
+    bundled backend (deterministic + observable).
+    """
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="redis",
+          value="tests.test_registry._register_shadow_redis",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    with pytest.warns(UserWarning):
+      registry = get_registry()
+
+    # Bundled descriptor wins — verified by the canonical path string,
+    # not just any descriptor named "redis".
+    desc = get_descriptor("redis")
+    assert desc.backend_cls_path == "scrapy_extension.backends.redis.RedisBackend"
+
+
+class TestImportErrorGracefulSkip:
+  """Test 5: import_error_graceful_skip."""
+
+  def test_import_error_graceful_skip(self, monkeypatch):
+    """An entry-point callable raising ``ImportError`` is SKIPPED + warned;
+    the bundled 10 stay intact.
+
+    A single broken 3rd-party plugin must never break the bundled set —
+    operators rely on bundled backends always being usable regardless of
+    which plugins are installed in the environment.
+    """
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="broken",
+          value="tests.test_registry._broken_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="goodplugin",
+          value="tests.test_registry._register_good_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+      ],
+    )
+    _reset_registry_cache()
+
+    # The broken plugin must not raise; it's skipped with a warning.
+    with pytest.warns(UserWarning):
+      registry = get_registry()
+
+    # Bundled 10 still intact.
+    for name in (
+      "redis",
+      "mongodb",
+      "kafka",
+      "rabbitmq",
+      "elasticsearch",
+      "rocketmq",
+      "pulsar",
+      "memcached",
+      "sqs",
+      "dynamodb",
+    ):
+      assert name in registry
+    # The good plugin was discovered; the broken one was not.
+    assert "goodplugin" in registry
+    assert "broken" not in registry
+
+
+class TestLazyImportPreserved:
+  """Test 6: lazy_import_preserved."""
+
+  def test_get_registry_does_not_import_backend_modules(self, monkeypatch):
+    """``get_registry()`` must NOT import any backend module.
+
+    The lazy-import invariant: ``import scrapy_extension`` works with NO
+    optional dep installed, and the registry build (which happens at first
+    ``get_registry()`` call) must not eager-import e.g. ``redis``.
+    Otherwise a 3rd-party installing scrapy-extension without ``[redis]``
+    would crash on the very first backend lookup.
+    """
+    # Ensure redis isn't already imported (it might be from another test in
+    # the same process; the registry itself must not be what imports it).
+    monkeypatch.delitem(sys.modules, "redis", raising=False)
+    _reset_registry_cache()
+
+    registry = get_registry()
+
+    # 10 bundled descriptors returned.
+    assert len(registry) >= 10
+    # The descriptor table stores PATH STRINGS — the redis module itself
+    # is NOT imported during registry build.
+    assert "redis" not in sys.modules, (
+      "get_registry() imported the redis module — registry must store "
+      "path strings only (lazy-import preservation, round-5 R5-1)."
+    )
+
+
+class TestPyVersionEntryApiBranch:
+  """Test 7: py310_py312_entry_point_api."""
+
+  def test_legacy_dict_shape_works(self, monkeypatch):
+    """Py3.10/3.11 shape: ``entry_points().get(group, [])`` returns the
+    entry-points for the group."""
+    from scrapy_extension.backends import registry as registry_mod
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="legacyep",
+          value="tests.test_registry._register_legacy",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    # Force the legacy branch (Py3.10/3.11 path).
+    monkeypatch.setattr(registry_mod.sys, "version_info", (3, 10, 0, "final", 0))
+    _reset_registry_cache()
+
+    registry = get_registry()
+    assert "legacyep" in registry
+
+  def test_kwarg_shape_works(self, monkeypatch):
+    """Py3.12+ shape: ``entry_points(group=...)`` returns the entry-points.
+
+    Forces the 3.12+ code branch by overriding ``sys.version_info`` (the
+    registry branches on ``sys.version_info >= (3, 12)``). This is honest
+    about WHAT is being tested: the version-branched dispatch path, not
+    whichever branch the running interpreter happens to take.
+    """
+    from scrapy_extension.backends import registry as registry_mod
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="kwargepp",
+          value="tests.test_registry._register_kwarg",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    # Force the 3.12+ branch.
+    monkeypatch.setattr(registry_mod.sys, "version_info", (3, 12, 0, "final", 0))
+    _reset_registry_cache()
+
+    registry = get_registry()
+    assert "kwargepp" in registry
+
+
+# ---------------------------------------------------------------------------
+# has_capability smoke (not part of the 7 PLAN tests but exercises the API).
+# ---------------------------------------------------------------------------
+
+
+class TestHasCapability:
+  def test_has_capability_for_bundled(self):
+    _reset_registry_cache()
+    assert has_capability("redis", "queue") is True
+    assert has_capability("redis", "set") is True
+    assert has_capability("redis", "storage") is True
+    # Kafka is queue-only per the bundled capability matrix.
+    assert has_capability("kafka", "queue") is True
+    assert has_capability("kafka", "set") is False
+
+  def test_has_capability_unknown_backend(self):
+    _reset_registry_cache()
+    assert has_capability("not-a-backend", "queue") is False

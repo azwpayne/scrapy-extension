@@ -236,9 +236,13 @@ class TestAckCapabilityDeclarations:
   )
   def test_atomic_backends_require_no_ack(self, backend_type: BackendType) -> None:
     """Atomic-pop backends (Redis/Mongo/ES/RocketMQ) keep requires_ack=False."""
-    from scrapy_extension.backends.connectors import _BACKEND_FACTORIES, _load_object
+    # Round-5 R5-1: dispatch routes through the registry descriptor table
+    # (was the deleted ``_BACKEND_FACTORIES``).
+    from scrapy_extension.backends.connectors import _load_object
+    from scrapy_extension.backends.registry import get_descriptor
 
-    cls = _load_object(_BACKEND_FACTORIES[backend_type][0])
+    descriptor = get_descriptor(backend_type.value)
+    cls = _load_object(descriptor.backend_cls_path)
     assert getattr(cls, "requires_ack", False) is False, (
       f"{backend_type.value} should be atomic (requires_ack=False); "
       f"got {getattr(cls, 'requires_ack', 'MISSING')}"

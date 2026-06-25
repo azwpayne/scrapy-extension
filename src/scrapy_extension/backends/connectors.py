@@ -2,6 +2,16 @@
 
 This module provides a lazy singleton connection manager with retry logic
 for all backend types.
+
+Round-5 R5-1: the four prior hand-synced registries (``_BACKEND_FACTORIES``
++ ``QUEUE_CAPABLE_BACKENDS`` / ``SET_CAPABLE_BACKENDS`` /
+``STORAGE_CAPABLE_BACKENDS``) have been consolidated into the single
+:class:`~scrapy_extension.backends.registry.BackendDescriptor` table in
+``registry.py``. The capability sets below are THIN BACKWARD-COMPAT
+DELEGATIONS computed from the registry's single source of truth — they
+exist so existing imports (``from scrapy_extension.backends.connectors
+import QUEUE_CAPABLE_BACKENDS``) keep working, NOT as a parallel
+registry to maintain.
 """
 
 from __future__ import annotations
@@ -22,6 +32,12 @@ from scrapy_extension.backends.base import (
   StorageBackend,
 )
 from scrapy_extension.backends.circuit_breaker import CircuitBreaker
+from scrapy_extension.backends.registry import (
+  BackendDescriptor,
+  get_descriptor,
+  get_registry,
+  has_capability,
+)
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 
 if TYPE_CHECKING:
@@ -30,78 +46,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-QUEUE_CAPABLE_BACKENDS: set[BackendType] = {
-  BackendType.REDIS,
-  BackendType.MONGODB,
-  BackendType.KAFKA,
-  BackendType.RABBITMQ,
-  BackendType.ELASTICSEARCH,
-  BackendType.ROCKETMQ,
-  BackendType.PULSAR,
-  BackendType.SQS,
-}
-SET_CAPABLE_BACKENDS: set[BackendType] = {
-  BackendType.REDIS,
-  BackendType.MONGODB,
-  BackendType.ELASTICSEARCH,
-}
-STORAGE_CAPABLE_BACKENDS: set[BackendType] = {
-  BackendType.REDIS,
-  BackendType.MONGODB,
-  BackendType.ELASTICSEARCH,
-  BackendType.MEMCACHED,
-  BackendType.DYNAMODB,
-}
+# ---------------------------------------------------------------------------
+# Backward-compat capability sets (computed from the registry — single source
+# of truth). These are ``frozenset[str]`` so membership tests against both
+# plain strings and ``BackendType`` members (which compare equal to their
+# string ``.value``) work unchanged.
+# ---------------------------------------------------------------------------
+# Kept as module-level constants so existing call sites and tests that import
+# them (e.g. ``tests/test_rocketmq_backend.py``) continue to compile. The
+# underlying data lives in ``registry._BUNDLED_DESCRIPTORS``; if a 3rd-party
+# plugin registers additional capabilities they are picked up here too
+# (the sets are rebuilt from the live registry).
 
-# Dispatch table mapping each BackendType to its lazy import paths
-# (backend_class_path, settings_class_path). Imports happen on demand via
-# importlib.import_module + getattr, which mirrors the original per-arm
-# ``from scrapy_extension.backends.<x> import XBackend`` semantics — keeping
-# the import path stable so tests that patch the canonical module attribute
-# (e.g. ``mocker.patch("scrapy_extension.backends.redis.RedisBackend")``)
-# continue to intercept construction.
-_BACKEND_FACTORIES: dict[BackendType, tuple[str, str]] = {
-  BackendType.REDIS: (
-    "scrapy_extension.backends.redis.RedisBackend",
-    "scrapy_extension.settings.RedisSettings",
-  ),
-  BackendType.MONGODB: (
-    "scrapy_extension.backends.mongodb.MongoDBBackend",
-    "scrapy_extension.settings.MongoDBSettings",
-  ),
-  BackendType.KAFKA: (
-    "scrapy_extension.backends.kafka.KafkaBackend",
-    "scrapy_extension.settings.KafkaSettings",
-  ),
-  BackendType.RABBITMQ: (
-    "scrapy_extension.backends.rabbitmq.RabbitMQBackend",
-    "scrapy_extension.settings.RabbitMQSettings",
-  ),
-  BackendType.ELASTICSEARCH: (
-    "scrapy_extension.backends.elasticsearch.ElasticSearchBackend",
-    "scrapy_extension.settings.ElasticSearchSettings",
-  ),
-  BackendType.ROCKETMQ: (
-    "scrapy_extension.backends.rocketmq.RocketMQBackend",
-    "scrapy_extension.settings.RocketMQSettings",
-  ),
-  BackendType.PULSAR: (
-    "scrapy_extension.backends.pulsar.PulsarBackend",
-    "scrapy_extension.settings.PulsarSettings",
-  ),
-  BackendType.SQS: (
-    "scrapy_extension.backends.sqs.SqsBackend",
-    "scrapy_extension.settings.SqsSettings",
-  ),
-  BackendType.MEMCACHED: (
-    "scrapy_extension.backends.memcached.MemcachedBackend",
-    "scrapy_extension.settings.MemcachedSettings",
-  ),
-  BackendType.DYNAMODB: (
-    "scrapy_extension.backends.dynamodb.DynamoDBBackend",
-    "scrapy_extension.settings.DynamoDBSettings",
-  ),
-}
+def _capable_backends(capability: str) -> frozenset[str]:
+  """Return the set of backend-type strings declaring ``capability``.
+
+  Computed from the registry so the capability matrix has ONE source of
+  truth (round-5 R5-1). Returns a frozen copy so callers can't mutate the
+  cached registry.
+  """
+  return frozenset(
+    name
+    for name, descriptor in get_registry().items()
+    if capability in descriptor.capabilities
+  )
+
+
+#: Backends implementing :class:`~scrapy_extension.backends.base.QueueBackend`.
+#: Computed from the registry; replaces the hand-synced module-level set.
+QUEUE_CAPABLE_BACKENDS: frozenset[str] = _capable_backends("queue")
+#: Backends implementing :class:`~scrapy_extension.backends.base.SetBackend`.
+SET_CAPABLE_BACKENDS: frozenset[str] = _capable_backends("set")
+#: Backends implementing :class:`~scrapy_extension.backends.base.StorageBackend`.
+STORAGE_CAPABLE_BACKENDS: frozenset[str] = _capable_backends("storage")
 
 
 def _load_object(dotted_path: str) -> Any:
@@ -135,9 +112,9 @@ def resolve_backend_config(
   type_key: str,
   settings_key: str,
   *,
-  required_capabilities: set[BackendType] | None = None,
+  required_capabilities: set[str] | None = None,
   component_name: str = "",
-) -> tuple[BackendType, dict[str, Any]]:
+) -> tuple[str, dict[str, Any]]:
   """Resolve a component's backend config, preferring per-component keys.
 
   Multi-backend coexistence: each component (queue / set / storage) can bind
@@ -148,70 +125,90 @@ def resolve_backend_config(
   ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so existing
   single-backend configurations keep working unchanged.
 
-  Capability validation (I-1): when ``required_capabilities`` is supplied,
-  the resolved backend type must be in that set or ``ConfigurationError``
-  is raised at config time (fail-fast). This prevents a late, confusing
-  crash mid-crawl — e.g. configuring Kafka (queue-only) for dedup and only
-  discovering it when ``request_seen()`` fires on the first request.
+  Capability validation (round-5 R5-1): when ``required_capabilities`` is
+  supplied, the resolved backend's descriptor must declare EVERY capability
+  in the set, else :class:`ConfigurationError` is raised at config time
+  (fail-fast). This prevents a late, confusing crash mid-crawl — e.g.
+  configuring Kafka (queue-only) for dedup and only discovering it when
+  ``request_seen()`` fires on the first request.
+
+  Round-5 R5-1 change: ``backend_type`` is now an opaque STRING validated
+  against the descriptor table (was coerced to ``BackendType`` enum). This
+  lets 3rd-party backends (plain strings, registered via entry-points)
+  route through the same code path as bundled backends. ``BackendType``
+  members still work — they're ``str`` subclasses whose ``.value`` is the
+  registry key.
 
   Empty-string normalization (I-3): ``SCRAPY_BACKEND_TYPE=""`` (e.g. from
   an empty env var) is treated as unset and falls back to ``"redis"``,
-  rather than raising ``ValueError`` inside ``BackendType("")``.
+  rather than raising.
 
   Args:
       settings: A Scrapy Settings-like object exposing ``get``/``getdict``.
       type_key: The per-component backend-type setting key.
       settings_key: The per-component backend-settings setting key.
-      required_capabilities: Optional allowlist of backend types that satisfy
-          this component's interface (queue/set/storage). ``None`` skips
-          validation (backward compatible).
+      required_capabilities: Optional set of capability strings
+          (``"queue"`` / ``"set"`` / ``"storage"``) the resolved backend
+          must ALL declare. ``None`` skips validation (backward compatible).
       component_name: Human-readable component name for error messages
           (e.g. ``"queue"``, ``"set"``, ``"storage"``).
 
   Returns:
       A ``(backend_type, settings_dict)`` tuple ready for
-      ``ConnectionManager.get_manager(...)``.
+      ``ConnectionManager.get_manager(...)``. ``backend_type`` is the
+      registry-key string.
 
   Raises:
-      ConfigurationError: If the resolved backend type value cannot be
-          coerced to a valid ``BackendType``, or if ``required_capabilities``
-          is set and the resolved backend type is not in it.
+      ConfigurationError: If the resolved backend type is not registered,
+          or if ``required_capabilities`` is set and the backend does not
+          declare all of them.
   """
   per_component_type = settings.get(type_key)
   if per_component_type:
-    backend_type, source_key = _coerce_backend_type(
-      per_component_type, type_key
-    ), type_key
+    backend_type, source_key = (
+      _normalize_backend_type(per_component_type, type_key),
+      type_key,
+    )
     backend_settings = settings.getdict(settings_key, {})
   else:
-    backend_type = _coerce_backend_type(
+    backend_type = _normalize_backend_type(
       settings.get("SCRAPY_BACKEND_TYPE") or "redis", "SCRAPY_BACKEND_TYPE"
     )
     backend_settings = settings.getdict("SCRAPY_BACKEND_SETTINGS", {})
     source_key = "SCRAPY_BACKEND_TYPE"
 
-  if required_capabilities is not None and backend_type not in required_capabilities:
-    capable = sorted(b.value for b in required_capabilities)
-    msg = (
-      f"Backend {backend_type.value!r} does not support the {component_name} "
-      f"interface required by this component. Capable backends: {capable}."
-    )
-    raise ConfigurationError(msg, setting_name=source_key)
+  if required_capabilities is not None:
+    missing = [
+      cap
+      for cap in required_capabilities
+      if not has_capability(backend_type, cap)
+    ]
+    if missing:
+      capable = sorted(
+        name
+        for name, descriptor in get_registry().items()
+        if all(cap in descriptor.capabilities for cap in required_capabilities)
+      )
+      msg = (
+        f"Backend {backend_type!r} does not support the {component_name} "
+        f"interface required by this component (missing capabilities: "
+        f"{sorted(missing)}). Capable backends: {capable}."
+      )
+      raise ConfigurationError(msg, setting_name=source_key)
 
   return backend_type, backend_settings
 
 
-def _coerce_backend_type(value: object, setting_name: str) -> BackendType:
-  """Normalize a config value into a ``BackendType``.
+def _normalize_backend_type(value: object, setting_name: str) -> str:
+  """Normalize a config value into a backend-type registry string.
 
-  ``BackendType(value)`` raises bare ``ValueError`` for invalid strings and
-  for non-string/non-enum values (e.g. an int from a programmatic caller).
-  That ``ValueError`` surfaces deep inside ``from_settings`` with no setting
-  name attached, so the operator sees an untyped crash instead of a typed
-  ``ConfigurationError`` pointing at the offending setting. This wrapper
-  normalizes first (``BackendType`` instance passes through; anything else
-  is coerced via ``str()`` then ``BackendType``) and converts a coercion
-  failure into a ``ConfigurationError`` carrying the setting name + value.
+  Round-5 R5-1: this replaces the prior ``_coerce_backend_type`` that
+  forced ``BackendType(value)``. The registry now keys on plain strings
+  so 3rd-party backends (registered via entry-points) route through the
+  same path. ``BackendType`` members pass through via their string
+  ``.value``; plain strings pass through unchanged; anything else is
+  stringified then validated against the registry (unknown → typed
+  ``ConfigurationError`` with the setting name + value attached).
 
   Args:
       value: The raw setting value (``BackendType``, ``str``, or other).
@@ -219,23 +216,29 @@ def _coerce_backend_type(value: object, setting_name: str) -> BackendType:
           raised ``ConfigurationError`` for operator triage.
 
   Returns:
-      The resolved ``BackendType`` member.
+      The normalized backend-type registry string.
 
   Raises:
-      ConfigurationError: If ``value`` does not map to a valid member.
+      ConfigurationError: If ``value`` does not map to a registered backend.
   """
   if isinstance(value, BackendType):
-    return value
+    return value.value
+  if isinstance(value, str):
+    candidate = value
+  else:
+    candidate = str(value)
   try:
-    return BackendType(str(value))
-  except ValueError:
+    get_descriptor(candidate)
+  except ConfigurationError:
+    valid = sorted(get_registry().keys())
     msg = (
       f"Invalid backend type {value!r} for setting {setting_name!r}. "
-      f"Valid values: {sorted(b.value for b in BackendType)}."
+      f"Valid values: {valid}."
     )
     raise ConfigurationError(
       msg, setting_name=setting_name, setting_value=value
     ) from None
+  return candidate
 
 
 class ConnectionManager:
@@ -248,7 +251,7 @@ class ConnectionManager:
   - Connection pooling
 
   Attributes:
-      backend_type: The type of backend to manage.
+      backend_type: The type of backend to manage (registry-key string).
       settings: Backend-specific settings.
       _backend: The backend instance (None until connected).
       _lock: Threading lock for thread safety.
@@ -260,13 +263,14 @@ class ConnectionManager:
 
   def __init__(
     self,
-    backend_type: BackendType,
+    backend_type: str,
     settings: dict[str, Any] | None = None,
   ) -> None:
     """Initialize connection manager.
 
     Args:
-        backend_type: The type of backend to manage.
+        backend_type: The backend-type registry string (e.g. ``"redis"``,
+            or a ``BackendType`` member which is a ``str`` subclass).
         settings: Backend-specific settings dictionary.
     """
     self.backend_type = backend_type
@@ -298,7 +302,7 @@ class ConnectionManager:
   @classmethod
   def get_manager(
     cls,
-    backend_type: BackendType,
+    backend_type: str,
     settings: dict[str, Any] | None = None,
   ) -> ConnectionManager:
     """Get or create a connection manager (acquire semantics).
@@ -313,7 +317,8 @@ class ConnectionManager:
     during shutdown.
 
     Args:
-        backend_type: The type of backend.
+        backend_type: The backend-type registry string (or ``BackendType``
+            member, which is a ``str`` subclass).
         settings: Backend-specific settings.
 
     Returns:
@@ -332,10 +337,22 @@ class ConnectionManager:
 
   @staticmethod
   def _registry_key(
-    backend_type: BackendType,
+    backend_type: str,
     settings: dict[str, Any],
   ) -> str:
-    """Compute the registry cache key for a backend type + settings pair."""
+    """Compute the registry cache key for a backend type + settings pair.
+
+    Round-5 R5-1: ``backend_type`` is the registry-key string. When a
+    ``BackendType`` enum member is passed (a ``str`` subclass), its ``str()``
+    is the repr-like ``"BackendType.REDIS"`` — NOT the registry key — so we
+    extract ``.value`` explicitly. Plain strings pass through unchanged.
+    Keys stay byte-identical to the pre-refactor ``f"{bt.value}:..."`` form.
+    """
+    bt_key = (
+      backend_type.value
+      if isinstance(backend_type, BackendType)
+      else backend_type
+    )
     try:
       settings_key = json.dumps(
         settings,
@@ -345,14 +362,14 @@ class ConnectionManager:
       )
     except (TypeError, ValueError):
       settings_key = str(sorted(settings.items()))
-    return f"{backend_type.value}:{settings_key}"
+    return f"{bt_key}:{settings_key}"
 
   def _create_backend(self) -> Backend:
     """Create a backend instance based on type.
 
-    Dispatches via the module-level ``_BACKEND_FACTORIES`` table to keep
+    Dispatches via the registry's :class:`BackendDescriptor` table to keep
     this method's cyclomatic complexity flat regardless of how many backends
-    exist. Each entry's class path is resolved lazily (via
+    exist. The descriptor's class/settings paths are resolved lazily (via
     ``importlib.import_module`` + ``getattr``), preserving the original
     per-arm lazy-import semantics so optional backend dependencies stay
     loaded-on-demand and tests that patch the canonical module attribute
@@ -362,15 +379,15 @@ class ConnectionManager:
         A new backend instance.
 
     Raises:
-        ValueError: If the backend type is not supported.
+        ConfigurationError: If the backend type is not registered.
     """
-    try:
-      backend_path, settings_path = _BACKEND_FACTORIES[self.backend_type]
-    except KeyError:
-      msg = f"Unsupported backend type: {self.backend_type}"
-      raise ValueError(msg) from None
-    backend_cls = _load_object(backend_path)
-    settings_cls = _load_object(settings_path)
+    descriptor: BackendDescriptor = get_descriptor(
+      self.backend_type.value
+      if isinstance(self.backend_type, BackendType)
+      else self.backend_type
+    )
+    backend_cls = _load_object(descriptor.backend_cls_path)
+    settings_cls = _load_object(descriptor.settings_cls_path)
     return backend_cls(settings_cls(**self.settings))
 
   def connect(self) -> None:
@@ -410,14 +427,14 @@ class ConnectionManager:
           # the bounded-range API we rely on without improving security.
           time.sleep(random.uniform(0, delay))  # nosec B311 - jitter, not cryptographic
       else:
-        logger.debug("Connected to %s", self.backend_type.value)
+        logger.debug("Connected to %s", self.backend_type)
         return
 
     if last_exception is not None:
       msg = f"Failed to connect after {retry_attempts} attempts: {last_exception}"
       raise BackendConnectionError(
         msg,
-        backend_type=self.backend_type.value,
+        backend_type=str(self.backend_type),
       ) from last_exception
 
   def _attempt_connection(self) -> None:
@@ -483,7 +500,7 @@ class ConnectionManager:
       if self._backend:
         try:
           self._backend.disconnect()
-          logger.debug("Disconnected from %s", self.backend_type.value)
+          logger.debug("Disconnected from %s", self.backend_type)
         except Exception as e:
           # Broad catch — mirrors R25-A1's connect-path cleanup
           # (contextlib.suppress(Exception)). Disconnecting a possibly-broken
@@ -590,7 +607,7 @@ class ConnectionManager:
       # under ``python -O`` and produces a clear, typed error instead of a
       # bare AssertionError.
       msg = "connect() did not produce a backend"
-      raise BackendConnectionError(msg, backend_type=self.backend_type.value)
+      raise BackendConnectionError(msg, backend_type=str(self.backend_type))
     return self._backend
 
   def is_connected(self) -> bool:
@@ -635,8 +652,13 @@ class ConnectionManager:
 
       settings = Settings()
       if settings.circuit_breaker_enabled:
+        bt_key = (
+          self.backend_type.value
+          if isinstance(self.backend_type, BackendType)
+          else self.backend_type
+        )
         self._breaker = CircuitBreaker(
-          name=f"{self.backend_type.value}-backend",
+          name=f"{bt_key}-backend",
           failure_threshold=settings.circuit_breaker_failure_threshold,
           reset_timeout=settings.circuit_breaker_reset_timeout,
         )
