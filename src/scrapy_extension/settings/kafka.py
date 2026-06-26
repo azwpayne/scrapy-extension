@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -63,13 +64,24 @@ class KafkaSettings(BaseSettings):
   )
 
   # === SASL/SSL Authentication ===
-  security_protocol: str = Field(
-    default="PLAINTEXT",
-    description="Security protocol (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL)",
+  security_protocol: Literal["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"] = (
+    Field(
+      default="PLAINTEXT",
+      description="Security protocol (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL)",
+    )
   )
-  sasl_mechanism: str | None = Field(
+  sasl_mechanism: (
+    Literal[
+      "PLAIN",
+      "SCRAM-SHA-256",
+      "SCRAM-SHA-512",
+      "GSSAPI",
+      "OAUTHBEARER",
+    ]
+    | None
+  ) = Field(
     default=None,
-    description="SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI)",
+    description="SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER)",
   )
   sasl_username: str | None = Field(
     default=None,
@@ -138,7 +150,7 @@ class KafkaSettings(BaseSettings):
     ge=0,
     description="Time to wait for batching",
   )
-  compression_type: str | None = Field(
+  compression_type: Literal["gzip", "snappy", "lz4", "zstd"] | None = Field(
     default=None,
     description="Compression type (gzip, snappy, lz4, zstd)",
   )
@@ -153,9 +165,9 @@ class KafkaSettings(BaseSettings):
     default="scrapy-extension",
     description="Consumer group ID",
   )
-  auto_offset_reset: str = Field(
+  auto_offset_reset: Literal["earliest", "latest", "none"] = Field(
     default="earliest",
-    description="Auto offset reset (earliest, latest)",
+    description="Auto offset reset (earliest, latest, none)",
   )
   enable_auto_commit: bool = Field(
     default=False,

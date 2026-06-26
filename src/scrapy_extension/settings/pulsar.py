@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,11 +53,13 @@ class PulsarSettings(BaseSettings):
     default="scrapy-extension",
     description="Shared subscription name (competing-consumers work queue)",
   )
-  consumer_type: str = Field(
-    default="Shared",
-    description="Subscription type: Shared (work queue), Failover, Exclusive, Key_Shared",
+  consumer_type: Literal["Shared", "Failover", "Exclusive", "Key_Shared"] = (
+    Field(
+      default="Shared",
+      description="Subscription type: Shared (work queue), Failover, Exclusive, Key_Shared",
+    )
   )
-  initial_position: str = Field(
+  initial_position: Literal["Earliest", "Latest"] = Field(
     default="Earliest",
     description="Subscription initial position: Earliest or Latest",
   )

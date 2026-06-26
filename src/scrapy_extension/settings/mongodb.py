@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -91,7 +91,13 @@ class MongoDBSettings(BaseSettings):
     default_factory=list,
     description="List of replica set member host:port",
   )
-  read_preference: str = Field(
+  read_preference: Literal[
+    "primary",
+    "primaryPreferred",
+    "secondary",
+    "secondaryPreferred",
+    "nearest",
+  ] = Field(
     default="primary",
     description="Read preference (primary, secondary, nearest, primaryPreferred, secondaryPreferred)",
   )
@@ -143,9 +149,20 @@ class MongoDBSettings(BaseSettings):
     default="admin",
     description="Authentication database",
   )
-  auth_mechanism: str | None = Field(
+  auth_mechanism: (
+    Literal[
+      "SCRAM-SHA-1",
+      "SCRAM-SHA-256",
+      "MONGODB-CR",
+      "PLAIN",
+      "GSSAPI",
+      "MONGODB-X509",
+      "MONGODB-AWS",
+    ]
+    | None
+  ) = Field(
     default=None,
-    description="Authentication mechanism (SCRAM-SHA-1, SCRAM-SHA-256, etc.)",
+    description="Authentication mechanism (SCRAM-SHA-1, SCRAM-SHA-256, MONGODB-CR, PLAIN, GSSAPI, MONGODB-X509, MONGODB-AWS)",
   )
 
   # === TLS/SSL Settings ===
