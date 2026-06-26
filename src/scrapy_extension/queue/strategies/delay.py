@@ -9,7 +9,7 @@ priority ordering. See the design spec for distributed-scope notes.
 
 from __future__ import annotations
 
-__all__ = ["DelayQueueStrategy"]
+__all__ = ["DEFAULT_DELAY_MAX_HELD", "DelayQueueStrategy"]
 
 import heapq
 import itertools
@@ -21,6 +21,19 @@ from typing import TYPE_CHECKING
 from scrapy_extension.queue.strategies.base import QueueStrategy
 
 logger = logging.getLogger(__name__)
+
+# SPEC-round8-tier1 U5 — OOM prevention default for the in-process holding
+# heap. The heap grows unboundedly when push-rate outpaces ready-rate (e.g. a
+# burst of long-delay items). 100k is a soft cap: warn-once, never refuse —
+# refusing would silently drop delayed items. Distributed-delay (U10) is the
+# long-term fix; until then this surfaces the growth risk to operators.
+DEFAULT_DELAY_MAX_HELD: int = 100_000
+
+# Module-level cache so the over-cap warning fires once per process even when
+# many strategies are constructed. Mirrors dupefilter/filters/factory.py
+# `_warned`. Tests reset this to verify the warn-once contract from a clean
+# slate.
+_over_cap_warned: bool = False
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -42,6 +55,8 @@ class DelayQueueStrategy(QueueStrategy):
       _clock: Monotonic clock callable (injectable for tests).
       _holding: Min-heap of (ready_at, seq, item).
       _seq: Tie-break counter for stable heap ordering.
+      _max_held: Soft cap on ``_holding`` size; non-positive disables the
+          warning. Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000).
   """
 
   def __init__(
@@ -50,6 +65,7 @@ class DelayQueueStrategy(QueueStrategy):
     *,
     default_delay: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
+    max_held: int = DEFAULT_DELAY_MAX_HELD,
   ) -> None:
     """Initialize the delay strategy.
 
@@ -57,6 +73,12 @@ class DelayQueueStrategy(QueueStrategy):
         connection_manager: Connection manager providing the QueueBackend.
         default_delay: Default delay seconds when push omits ``delay``.
         clock: Monotonic clock callable returning seconds (injectable for tests).
+        max_held: Soft cap on the in-process holding heap. When the heap
+            exceeds this size a one-time WARNING fires (warn-only — items are
+            never refused, since dropping a delayed item would silently lose
+            data). Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000) for
+            OOM prevention. Pass ``<= 0`` to disable the warning (advanced
+            opt-out — accepts the unbounded-growth risk).
 
     Raises:
         ValueError: If default_delay is negative.
@@ -68,6 +90,7 @@ class DelayQueueStrategy(QueueStrategy):
     self._clock = clock
     self._holding: list[tuple[float, int, bytes]] = []
     self._seq = itertools.count()
+    self._max_held = max_held
 
   def push(
     self,
@@ -94,6 +117,36 @@ class DelayQueueStrategy(QueueStrategy):
       return
     ready_at = self._clock() + effective
     heapq.heappush(self._holding, (ready_at, next(self._seq), item))
+    self._warn_over_cap_once()
+
+  def _warn_over_cap_once(self) -> None:
+    """Emit a one-time per-process WARNING when the holding heap exceeds cap.
+
+    The holding heap grows unboundedly whenever push-rate outpaces
+    ready-rate (e.g. a burst of long-delay items). The cap is SOFT: this
+    never refuses the push — dropping a delayed item would silently lose
+    data, which is worse than loud memory pressure. Idempotent via the
+    module-level ``_over_cap_warned`` flag so a multi-spider process does
+    not spam the log. Points at the distributed-delay roadmap (U10).
+    """
+    global _over_cap_warned
+    if _over_cap_warned:
+      return
+    if self._max_held <= 0:
+      return
+    if len(self._holding) <= self._max_held:
+      return
+    _over_cap_warned = True
+    logger.warning(
+      "DelayQueueStrategy holding heap exceeded max_held=%d items "
+      "(now=%d). The in-process heap grows unboundedly when push-rate "
+      "outpaces ready-rate; long bursts of long-delay items can exhaust "
+      "memory. This is a SOFT cap — items are NOT dropped. Raise "
+      "max_held, drain sooner, or wait for distributed-delay support "
+      "(roadmap U10).",
+      self._max_held,
+      len(self._holding),
+    )
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Drain due held items, then pop the live queue.

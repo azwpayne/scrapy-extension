@@ -7,11 +7,27 @@ use the ``set`` strategy (SetBackend).
 
 from __future__ import annotations
 
-__all__ = ["MemoryMembershipFilter"]
+__all__ = ["DEFAULT_MEMORY_MAXSIZE", "MemoryMembershipFilter"]
 
+import logging
 from collections import OrderedDict
 
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
+
+logger = logging.getLogger(__name__)
+
+# SPEC-round8-tier1 U5 — OOM prevention default. Measured ~481 B/entry ⇒
+# ~366 MB at 1M entries, ~3.58 GB at 10M. The 1M default bounds a long crawl's
+# memory footprint without an explicit setting; the LRU eviction mechanism
+# already existed, we ship a sane default. Explicit maxsize=None remains the
+# advanced opt-out for users who need unbounded growth and accept the risk.
+DEFAULT_MEMORY_MAXSIZE: int = 1_000_000
+
+# Module-level cache so the eviction warning fires once per process even when
+# many filters are constructed (multi-spider process). Mirrors the
+# dupefilter/filters/factory.py `_warned` pattern. Tests reset this to verify
+# the warn-once contract from a clean slate.
+_evicted_warned: bool = False
 
 
 class MemoryMembershipFilter(MembershipFilter):
@@ -24,17 +40,26 @@ class MemoryMembershipFilter(MembershipFilter):
   State is local to the process — not shared across distributed workers.
   For multi-worker exact dedup, use the ``set`` strategy.
 
+  Eviction tradeoff (SPEC U5): an evicted fingerprint is forgotten, so a
+  re-crawl of that URL becomes possible (false-negative on dedup). This is
+  surfaced via a one-time per-process WARNING at first eviction so operators
+  can choose a higher ``maxsize`` or switch to the backend-backed ``set``
+  strategy for exact cross-process dedup.
+
   Attributes:
-      _maxsize: Optional capacity cap; None = unbounded (grows indefinitely).
+      _maxsize: Capacity cap; None = unbounded (advanced opt-out).
+          Defaults to :data:`DEFAULT_MEMORY_MAXSIZE` (1_000_000).
       _data: Insertion/access-ordered mapping of fingerprints.
   """
 
-  def __init__(self, *, maxsize: int | None = None) -> None:
+  def __init__(self, *, maxsize: int | None = DEFAULT_MEMORY_MAXSIZE) -> None:
     """Initialize the memory filter.
 
     Args:
         maxsize: Maximum items to retain before evicting the
-            least-recently-used. None (default) = unbounded.
+            least-recently-used. Defaults to :data:`DEFAULT_MEMORY_MAXSIZE`
+            (1_000_000) to prevent silent OOM on long crawls. Pass ``None``
+            for unbounded growth (advanced opt-out — accepts the OOM risk).
 
     Raises:
         ValueError: If maxsize is a non-positive integer.
@@ -45,6 +70,28 @@ class MemoryMembershipFilter(MembershipFilter):
       )
     self._maxsize = maxsize
     self._data: OrderedDict[bytes, None] = OrderedDict()
+
+  def _warn_evicted_once(self) -> None:
+    """Emit a one-time per-process warning when LRU eviction first fires.
+
+    Eviction means an already-seen URL can be re-admitted (dedup
+    false-negative → re-crawl). Make that tradeoff non-silent once per
+    process. Idempotent via the module-level ``_evicted_warned`` flag so a
+    multi-spider process does not spam the log.
+    """
+    global _evicted_warned
+    if _evicted_warned:
+      return
+    _evicted_warned = True
+    logger.warning(
+      "MemoryMembershipFilter reached its maxsize cap (%s) and is now "
+      "evicting least-recently-used fingerprints. Evicted entries are "
+      "forgotten, so their URLs may be re-crawled (dedup false-negative). "
+      "Raise maxsize, pass maxsize=None for unbounded growth (OOM risk), "
+      "or switch to the backend-backed 'set' strategy for exact cross-"
+      "process dedup.",
+      f"{self._maxsize:,}" if self._maxsize is not None else "None",
+    )
 
   def add(self, item: bytes) -> bool:
     """Record an item; True if new, False if already present.
@@ -63,6 +110,7 @@ class MemoryMembershipFilter(MembershipFilter):
       return False
     if self._maxsize is not None and len(self._data) >= self._maxsize:
       self._data.popitem(last=False)  # evict least-recently-used
+      self._warn_evicted_once()
     self._data[item] = None
     return True
 

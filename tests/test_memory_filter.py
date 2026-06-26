@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
-from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
+from scrapy_extension.dupefilter.filters.memory_filter import (
+  DEFAULT_MEMORY_MAXSIZE,
+  MemoryMembershipFilter,
+)
 
 
 class TestMemoryMembershipFilter:
@@ -55,11 +60,49 @@ class TestMemoryMembershipFilter:
       MemoryMembershipFilter(maxsize=-1)
 
   def test_unbounded_no_eviction(self) -> None:
-    """maxsize=None grows without bound."""
-    flt = MemoryMembershipFilter()
+    """maxsize=None grows without bound (explicit advanced opt-out)."""
+    flt = MemoryMembershipFilter(maxsize=None)
     for i in range(1000):
       assert flt.add(str(i).encode()) is True
     assert len(flt) == 1000
+
+  def test_default_maxsize_is_bounded(self) -> None:
+    """Default constructor ships a 1M LRU cap (OOM prevention, SPEC U5)."""
+    flt = MemoryMembershipFilter()
+    assert flt._maxsize == DEFAULT_MEMORY_MAXSIZE == 1_000_000
+
+  def test_default_cap_evicts_at_threshold_not_unbounded(self, caplog) -> None:
+    """Past the default cap the filter evicts (LRU) + warns once; no infinite growth."""
+    import scrapy_extension.dupefilter.filters.memory_filter as mod
+    mod._evicted_warned = False  # reset module-level flag for a clean slate
+    flt = MemoryMembershipFilter()  # default cap = 1_000_000
+    # Saturate the cap; the first item is the LRU eviction candidate.
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.dupefilter.filters.memory_filter"):
+      for i in range(DEFAULT_MEMORY_MAXSIZE):
+        flt.add(i.to_bytes(4, "big"))
+      assert len(flt) == DEFAULT_MEMORY_MAXSIZE
+      assert flt.add((DEFAULT_MEMORY_MAXSIZE).to_bytes(4, "big")) is True
+    # Length stays at the cap — no unbounded growth.
+    assert len(flt) == DEFAULT_MEMORY_MAXSIZE
+    # The oldest (first-inserted) fingerprint was evicted → re-admit risk surfaced.
+    assert (0).to_bytes(4, "big") not in flt
+    # Eviction warning fired (non-silent: surfaces re-crawl tradeoff).
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("evict" in r.getMessage().lower() or "LRU" in r.getMessage() for r in warnings)
+
+  def test_default_cap_warn_fires_once(self, caplog) -> None:
+    """The eviction warning is idempotent across many evictions (warn-once)."""
+    import scrapy_extension.dupefilter.filters.memory_filter as mod
+    mod._evicted_warned = False  # reset module-level flag for a clean slate
+    flt = MemoryMembershipFilter(maxsize=2)
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.dupefilter.filters.memory_filter"):
+      flt.add(b"a")
+      flt.add(b"b")
+      flt.add(b"c")  # evict
+      flt.add(b"d")  # evict again
+      flt.add(b"e")  # evict a third time
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # warn-once, not per-eviction
 
   def test_maxsize_evicts_oldest(self) -> None:
     """Inserting past maxsize evicts the least-recently-used item."""
