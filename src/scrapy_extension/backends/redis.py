@@ -612,7 +612,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     try:
-      return cast("int", self.client.zcard(queue_name))
+      # redis-py's shared sync/async stubs type zcard() as ResponseT
+      # (Awaitable[Any] | int); the sync client returns int at runtime.
+      # The cast narrows for Pyright; harmless under mypy.
+      return cast("int", self.client.zcard(queue_name))  # type: ignore[redundant-cast]
     except RedisError:
       return 0
 
@@ -700,7 +703,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return cast("int", self.client.scard(set_name))
+      return cast("int", self.client.scard(set_name))  # type: ignore[redundant-cast]
     except RedisError:
       return 0
 
@@ -805,7 +808,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If key contains invalid characters.
     """
     _validate_key_name(key, "key")
-    result = cast("int", self.client.ttl(key))
+    result = cast("int", self.client.ttl(key))  # type: ignore[redundant-cast]
     # redis-py ttl() returns int: -2 = no key, -1 = no TTL, >= 0 = TTL seconds.
     # Per StorageBackend contract, both "missing key" and "no TTL" return None.
     if result < 0:

@@ -42,9 +42,12 @@ redis = ["redis>=7.3.0,<9"]
 mongodb = ["pymongo>=4.8.0,<5"]
 kafka = ["kafka-python-ng>=2.2.2,<3"]
 rabbitmq = ["pika>=1.3.2,<2"]
-elasticsearch = ["elasticsearch>=8.12.0,<9"]
+elasticsearch = ["elasticsearch>=8.12.0,<10"]
 rocketmq = ["rocketmq-client-python>=2.0.0,<3"]
 pulsar = ["pulsar-client>=2.11.0,<4"]
+# Experimental — supply-chain caveat: pymemcache is unmaintained (last release
+# 2022-10-17, ~1300+ days stale). The `memcached` extra is storage-only (KV+TTL).
+# See STABILITY.md "Memcached" row for status; tracked as U20.
 memcached = ["pymemcache>=4.0,<5"]
 sqs = ["boto3>=1.34,<2"]
 dynamodb = ["boto3>=1.34,<2"]
@@ -53,7 +56,7 @@ all = [
     "pymongo>=4.8.0,<5",
     "kafka-python-ng>=2.2.2,<3",
     "pika>=1.3.2,<2",
-    "elasticsearch>=8.12.0,<9",
+    "elasticsearch>=8.12.0,<10",
     "rocketmq-client-python>=2.0.0,<3",
     "pulsar-client>=2.11.0,<4",
     "pymemcache>=4.0,<5",
@@ -88,7 +91,7 @@ test = [
     "pymongo>=4.8.0,<5",
     "kafka-python-ng>=2.2.2,<3",
     "pika>=1.3.2,<2",
-    "elasticsearch>=8.12.0,<9",
+    "elasticsearch>=8.12.0,<10",
 ]
 
 [tool.uv]
