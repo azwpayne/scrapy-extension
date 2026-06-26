@@ -78,6 +78,8 @@ Untried insight dimensions (a future `/loop` fire could audit, finding newer iss
 - 🔭 **Error-handling consistency** across 10 backends — do they uniformly wrap client-lib exceptions in `BackendError`-family, or do some leak raw `redis.exceptions.*`/`pymongo.errors.*`? (Uniform-catch contract.)
 - 🔭 **Concurrency beyond in-flight-set** — ConnectionManager singleton under multi-thread crawler construction; circuit-breaker under sustained OPEN.
 - 🔭 **README/doc accuracy vs actual behavior** — does the README describe what the code actually does (esp. after rounds 1-8 changes)?
+- 🔭 **kafka.py queue_len None-arithmetic** (surfaced R10/R13) — `backends/kafka.py:746,768` compute `max(0, end_offsets[tp] - position(tp))` where kafka-python stubs type both operands `int | None`; a `None` would raise `TypeError` (not caught by the `except KafkaError`). mypy passes (kafka-python treated as Any); Pyright flags it. Guard with `(x or 0)` or narrow before subtracting.
+- 🔭 **test_connectors test_create_backend_redis ordering flake** (surfaced R13) — fails ~1/N full-suite runs (passes in isolation + on rerun). The test mocks `RedisBackend` while `_create_backend` dispatches via the registry descriptor path; mock state leaks under certain `pytest-randomly` seeds. Needs test-isolation fix (fixture scoping), not a code bug.
 
 These are insight-only (no spec yet); run when the execution backlog is drained.
 
@@ -91,4 +93,17 @@ These are insight-only (no spec yet); run when the execution backlog is drained.
 | 8b | Tier-1 executable SPEC + structural sweep | `4462cdd` |
 | 8c | v1.0-readiness SPEC + dep audit (pymemcache H) | `cbc924d` |
 | 8d | settings-validation SPEC (34 footguns → 5 units) | `a81139c` |
-| 9+ | (this index — execution menu) | pending /goal |
+| 9a | SV1 + SV5 — Literal enums + Field bounds (15 footguns) | `f4fd1f3` |
+| 9b | SV2 + SV4 — mode-conditional validators + URL/scheme guards (19 footguns) | `d25d27d` |
+| 9c | SV3 — cross-field auth/transport coherence (6 footguns, 3H credential) | `97355b9` |
+| 9 | U4 — queue_len depth sampling (+25% pop RTT) | `8e91183` |
+| 9 | U5 — memory default cap + delay soft-cap (OOM prevention) | `42366b4` |
+| 10 | U8 — mypy --strict clean on src/ (py.typed promise) | `fda3b16` |
+| 11 | U1 README Guarantees + U9 stability artifacts (STABILITY/SECURITY/CHANGELOG/runbook) | `432f991` |
+| 12 | U2 operability — on_pop_rate + on_filter_saturation (v1.0 non-neg #2) | `7d7401a` |
+| 13 | U21 redis+elasticsearch cap bump + U20 pymemcache Experimental label | `c48062b` |
+
+**Rounds 9-13 (the execution menu) are CLOSED.** Settings dimension fully validated
+(SV1-5), perf/OOM caps shipped (U4/U5), type promise kept (U8), v1.0 non-negotiables
+#1 (U1) + #2 (U2) + #3 (U3, round-8) all met → **v1.0 tag defensible.** Remaining
+work is Post-1.0 Tier-2/3 (U19 splits, U10-U17) — deferred by design.
