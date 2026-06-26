@@ -8,9 +8,25 @@ duplicate detection to. Concrete strategies live alongside this module
 
 from __future__ import annotations
 
-__all__ = ["MembershipFilter"]
+__all__ = ["FilterFull", "MembershipFilter"]
 
 from abc import ABC, abstractmethod
+
+
+class FilterFull(RuntimeError):
+  """The membership filter is at capacity and cannot accept more items.
+
+  Raised by bounded-capacity probabilistic filters (currently the cuckoo
+  filter, when insertion exhausts its ``_MAX_KICKS`` budget). Callers that
+  can degrade — e.g. :class:`~scrapy_extension.dupefilter.dupefilter.BackendDupeFilter`,
+  which treats an overflow request as not-seen rather than crashing the
+  crawl — catch this; others let it propagate.
+
+  Lives on the abstract interface (not on a concrete filter) so the
+  dupefilter layer catches ``FilterFull`` by type without importing concrete
+  strategy classes — preserving layering and decoupling the catch from any
+  particular filter's error-message wording.
+  """
 
 
 class MembershipFilter(ABC):

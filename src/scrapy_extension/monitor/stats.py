@@ -103,6 +103,16 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value("pipeline/store_count")
 
+  def on_filter_full(self) -> None:
+    """Increment ``dupefilter/filter_full``.
+
+    The dupefilter emits this when a bounded-capacity membership filter
+    (cuckoo) reports it is full and the dupefilter degrades by allowing the
+    overflow request through. Counts every occurrence; the dupefilter
+    additionally warns once per process via its own logger.
+    """
+    self._stats.inc_value("dupefilter/filter_full")
+
   def on_error(self, operation: str, error: BaseException) -> None:
     """Increment ``errors/<operation>``.
 

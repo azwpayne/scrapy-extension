@@ -14,7 +14,7 @@ import hashlib
 import math
 import random
 
-from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 
 
 class CuckooMembershipFilter(MembershipFilter):
@@ -139,7 +139,7 @@ class CuckooMembershipFilter(MembershipFilter):
         True if the fingerprint was newly inserted, False if already present.
 
     Raises:
-        RuntimeError: If the filter is full (exceeded ``_MAX_KICKS`` on
+        FilterFull: If the filter is full (exceeded ``_MAX_KICKS`` on
             insertion). Increase ``capacity`` or switch strategy.
     """
     fp, i1 = self._fingerprint(item)
@@ -150,7 +150,7 @@ class CuckooMembershipFilter(MembershipFilter):
     if self._insert(fp, i1, i2):
       self._count += 1
       return True
-    raise RuntimeError(
+    raise FilterFull(
       f"Cuckoo filter is full (capacity reached, {self._num_buckets} buckets); "
       f"increase capacity or use a different dedup strategy"
     )
