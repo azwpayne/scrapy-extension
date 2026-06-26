@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -53,6 +54,7 @@ class RabbitMQSettings(BaseSettings):
   # === Connection Settings ===
   host: str = Field(
     default="localhost",
+    min_length=1,
     description="RabbitMQ server hostname",
   )
   port: int = Field(
@@ -83,7 +85,7 @@ class RabbitMQSettings(BaseSettings):
     default_factory=list,
     description="List of cluster node host:port (for cluster/mirrored_queues mode)",
   )
-  cluster_node_type: str = Field(
+  cluster_node_type: Literal["disc", "ram"] = Field(
     default="disc",
     description="Node type for cluster (disc or ram)",
   )
@@ -119,9 +121,11 @@ class RabbitMQSettings(BaseSettings):
     default=None,
     description="Path to client private key file",
   )
-  ssl_verify_mode: str = Field(
-    default="CERT_REQUIRED",
-    description="SSL verification mode (CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED)",
+  ssl_verify_mode: Literal["CERT_NONE", "CERT_OPTIONAL", "CERT_REQUIRED"] = (
+    Field(
+      default="CERT_REQUIRED",
+      description="SSL verification mode (CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED)",
+    )
   )
 
   # === Connection Settings ===

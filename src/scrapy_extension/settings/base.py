@@ -46,7 +46,11 @@ class Settings(BaseSettings):
   retry_attempts: int = Field(
     default=3,
     ge=0,
-    description="Number of connection retry attempts",
+    le=20,
+    description=(
+      "Number of connection retry attempts (0 = no retries; capped at 20 to "
+      "prevent runaway retry storms on a misconfigured backend)."
+    ),
   )
   retry_delay: float = Field(
     default=1.0,

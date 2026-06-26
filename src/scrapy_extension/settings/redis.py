@@ -74,6 +74,7 @@ class RedisSettings(BaseSettings):
   # === Standalone / Master-Slave Settings ===
   host: str = Field(
     default="localhost",
+    min_length=1,
     description="Redis server hostname (standalone/master_slave)",
   )
   port: int = Field(

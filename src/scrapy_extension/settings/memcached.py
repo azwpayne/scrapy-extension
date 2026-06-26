@@ -38,5 +38,14 @@ class MemcachedSettings(BaseSettings):
     default=MemcachedMode.STANDALONE,
     description="Memcached deployment mode (standalone)",
   )
-  host: str = Field(default="localhost", description="Memcached host")
-  port: int = Field(default=11211, description="Memcached port")
+  host: str = Field(
+    default="localhost",
+    min_length=1,
+    description="Memcached host",
+  )
+  port: int = Field(
+    default=11211,
+    ge=1,
+    le=65535,
+    description="Memcached port",
+  )
