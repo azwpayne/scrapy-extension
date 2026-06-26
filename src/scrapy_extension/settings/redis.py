@@ -11,6 +11,8 @@ from enum import Enum
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from scrapy_extension.exceptions.base import ConfigurationError
+
 
 class RedisMode(str, Enum):
   """Redis deployment modes.
@@ -207,12 +209,21 @@ class RedisSettings(BaseSettings):
   def validate_mode_requirements(self) -> RedisSettings:
     """Validate that mode-specific settings are present for the chosen mode.
 
-    Sentinel mode requires ``sentinels`` and ``sentinel_master_name``.
-    Cluster mode benefits from ``cluster_startup_nodes`` but falls back
-    to ``host:port`` if not set (warning only).
+    SENTINEL mode requires ``sentinels`` and ``sentinel_master_name`` — both
+    are unambiguous intent signals; without them the sentinel client cannot
+    form a quorum and the error surfaces deep inside ``redis-py`` at connect.
+
+    CLUSTER and MASTER_SLAVE modes are intentionally NOT enforced here: the
+    backend has documented fallback branches for empty ``cluster_startup_nodes``
+    (falls back to ``host:port``) and empty ``replicas`` (operates as a
+    standalone primary). These are tested code paths (``test_cluster_mode_
+    fallback_host_port``, ``test_connect_master_slave_no_replicas``); making
+    them raise would break supported behavior. The spec's SV2 note ("warn if
+    missing is acceptable") reflects this. Upgrade path: a future round could
+    add an opt-in ``strict=True`` flag to promote these to errors.
 
     Raises:
-        ValueError: If a mode-specific required field is missing.
+        ConfigurationError: If a SENTINEL-mode required field is missing.
     """
     if self.mode == RedisMode.SENTINEL:
       missing = []
@@ -222,10 +233,12 @@ class RedisSettings(BaseSettings):
         missing.append("sentinel_master_name")
       if missing:
         fields = " and ".join(missing)
-        msg = (
-          f"Redis SENTINEL mode requires '{fields}' to be set. "
-          f"Got sentinels={self.sentinels!r}, "
-          f"sentinel_master_name={self.sentinel_master_name!r}."
+        raise ConfigurationError(
+          (
+            f"Redis SENTINEL mode requires '{fields}' to be set. "
+            f"Got sentinels={self.sentinels!r}, "
+            f"sentinel_master_name={self.sentinel_master_name!r}."
+          ),
+          setting_name=missing[0],
         )
-        raise ValueError(msg)
     return self

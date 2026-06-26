@@ -177,12 +177,19 @@ class TestKafkaBackendModes:
     mock_kafka_admin,
     mocker,
   ):
-    """Test Confluent mode falls back to configured SASL if no API key."""
+    """SASL config without Confluent API key uses STANDALONE mode (R9-b SV2).
+
+    R9-b SV2: ``KafkaMode.CONFLUENT`` now requires ``confluent_api_key`` +
+    ``confluent_api_secret`` (silent PLAINTEXT-localhost fallback was a HIGH
+    footgun). The legitimate "SASL against a custom broker" path is exercised
+    under STANDALONE — ``_build_client_security_config`` applies SASL settings
+    regardless of mode.
+    """
     from scrapy_extension.backends.kafka import KafkaBackend
     from scrapy_extension.settings import KafkaMode, KafkaSettings
 
     settings = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
+      mode=KafkaMode.STANDALONE,
       bootstrap_servers="kafka.example.com:9092",
       security_protocol="SASL_SSL",
       sasl_mechanism="PLAIN",

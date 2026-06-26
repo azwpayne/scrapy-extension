@@ -1,9 +1,20 @@
 """RocketMQ settings and configuration."""
 
+from __future__ import annotations
+
+import re
 from enum import Enum
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
+
+from scrapy_extension.exceptions.base import ConfigurationError
+
+# host:port — host is any non-colon run of chars (DNS name, IPv4, IPv6-bracketed
+# forms are accepted by the client); port is digits only. Rejects bare host,
+# bare port, and values with a scheme prefix.
+_NAMESRV_PATTERN = re.compile(r"^[^:]+:\d+$")
 
 
 class RocketMQMode(str, Enum):
@@ -43,3 +54,30 @@ class RocketMQSettings(BaseSettings):
     topic_prefix: str = Field(default="scrapy-queue")
     set_topic_prefix: str = Field(default="scrapy-set")
     storage_topic_prefix: str = Field(default="scrapy-storage")
+
+    @model_validator(mode="after")
+    def _validate_namesrv_address_format(self) -> Self:
+        """SV4: ``namesrv_address`` must match ``host:port``.
+
+        The rocketmq-client-python ``NameServerAddress`` resolver accepts a
+        bare ``host:port`` (no scheme). Typos like ``localhost:9876abc`` or
+        scheme-prefixed ``http://namesrv:9876`` otherwise surface as an
+        opaque resolution failure at producer/consumer start. Empty strings
+        are rejected (no resolvable name server).
+
+        Raises:
+            ConfigurationError: if ``namesrv_address`` does not match
+                ``host:port``.
+        """
+        addr = self.namesrv_address.strip()
+        if not _NAMESRV_PATTERN.match(addr):
+            raise ConfigurationError(
+                (
+                    "namesrv_address must match 'host:port' "
+                    "(e.g. 'localhost:9876'). "
+                    f"Got namesrv_address={self.namesrv_address!r}."
+                ),
+                setting_name="namesrv_address",
+                setting_value=self.namesrv_address,
+            )
+        return self

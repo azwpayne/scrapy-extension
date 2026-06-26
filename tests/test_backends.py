@@ -383,32 +383,35 @@ class TestRedisBackendModes:
     """Test sentinel mode requires sentinels configuration (validated at construction).
 
     R1-P2-20 fix: cross-mode validation runs at RedisSettings construction,
-    so misconfiguration fails fast rather than at connect() time.
+    so misconfiguration fails fast rather than at connect() time. R9-b SV2
+    upgrades the raised exception from pydantic ValidationError to the
+    project's ``ConfigurationError`` (with ``setting_name=``) for a named,
+    debuggable failure.
     """
-    from pydantic import ValidationError as PydanticValidationError
-
+    from scrapy_extension.exceptions import ConfigurationError
     from scrapy_extension.settings import RedisMode, RedisSettings
 
-    with pytest.raises(PydanticValidationError) as exc_info:
+    with pytest.raises(ConfigurationError) as exc_info:
       RedisSettings(
         mode=RedisMode.SENTINEL,
         sentinel_master_name="mymaster",
       )
     assert "sentinels" in str(exc_info.value).lower()
+    assert exc_info.value.setting_name == "sentinels"
 
   def test_sentinel_mode_missing_master_name(self):
-    """Sentinel mode with empty master_name fails fast (R1-P2-20)."""
-    from pydantic import ValidationError as PydanticValidationError
-
+    """Sentinel mode with empty master_name fails fast (R1-P2-20 + R9-b SV2)."""
+    from scrapy_extension.exceptions import ConfigurationError
     from scrapy_extension.settings import RedisMode, RedisSettings
 
-    with pytest.raises(PydanticValidationError) as exc_info:
+    with pytest.raises(ConfigurationError) as exc_info:
       RedisSettings(
         mode=RedisMode.SENTINEL,
         sentinels=["redis-sentinel-1:26379"],
         sentinel_master_name="",
       )
     assert "sentinel_master_name" in str(exc_info.value).lower()
+    assert exc_info.value.setting_name == "sentinel_master_name"
 
   def test_standalone_mode_passes_validation(self):
     """Standalone mode requires no mode-specific fields (R1-P2-20 sanity check)."""
@@ -656,19 +659,20 @@ class TestRedisSentinelClusterWiring:
   def test_sentinel_empty_sentinels_raises_configuration_error(self, mocker):
     """Empty sentinels list → ConfigurationError.
 
-    Pydantic's mode-validator rejects empty ``sentinels`` at construction, so we
-    bypass it by constructing with a valid config then mutating ``sentinels`` to
-    [] before connect() — exercising the defensive guard in _connect_sentinel.
+    The R9-b SV2 mode-validator rejects empty ``sentinels`` at construction
+    with the project's ``ConfigurationError`` (upgraded from pydantic's
+    ValidationError so the failure is named/debuggable), so we bypass it by
+    constructing with a valid config then mutating ``sentinels`` to []
+    before connect() — exercising the defensive guard in _connect_sentinel.
     """
-    from pydantic import ValidationError as PydanticValidationError
-
     from scrapy_extension.backends.redis import RedisBackend
     from scrapy_extension.exceptions import ConfigurationError
     from scrapy_extension.settings import RedisMode, RedisSettings
 
-    # Construction with empty sentinels is rejected by the validator
-    with pytest.raises(PydanticValidationError):
+    # Construction with empty sentinels is rejected by the SV2 validator
+    with pytest.raises(ConfigurationError) as construct_exc:
       RedisSettings(mode=RedisMode.SENTINEL, sentinels=[])
+    assert construct_exc.value.setting_name == "sentinels"
 
     # Defensive guard: build valid, then blank out sentinels pre-connect
     settings = RedisSettings(

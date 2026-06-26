@@ -9,8 +9,10 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from scrapy_extension.exceptions.base import ConfigurationError
 
 
 class KafkaMode(str, Enum):
@@ -219,3 +221,41 @@ class KafkaSettings(BaseSettings):
     ge=1,
     description="Minimum in-sync replicas for producer acks",
   )
+
+  @model_validator(mode="after")
+  def _validate_confluent_requirements(self) -> KafkaSettings:
+    """SV2: CONFLUENT mode requires API key + secret.
+
+    Without ``confluent_api_key`` + ``confluent_api_secret``, the connect
+    path silently falls back to ``bootstrap_servers`` (default
+    ``localhost:9092``) with PLAINTEXT — the operator asked for Confluent
+    Cloud but the client never reaches it, surfacing as an opaque connection
+    timeout against localhost. ``confluent_bootstrap_servers`` is NOT
+    required because some operators reuse the global ``bootstrap_servers``
+    for the Confluent broker list; the API key/secret are the unambiguous
+    Confluent intent signal.
+
+    Raises:
+        ConfigurationError: if CONFLUENT mode is selected without the API
+            key/secret pair.
+    """
+    if self.mode != KafkaMode.CONFLUENT:
+      return self
+    missing = []
+    if self.confluent_api_key is None:
+      missing.append("confluent_api_key")
+    if self.confluent_api_secret is None:
+      missing.append("confluent_api_secret")
+    if missing:
+      fields = " and ".join(missing)
+      raise ConfigurationError(
+        (
+          f"Kafka CONFLUENT mode requires '{fields}' to be set. "
+          "Without them the client silently falls back to PLAINTEXT "
+          "localhost (bootstrap_servers default), never reaching Confluent "
+          "Cloud. If you intend SASL/SSL against a non-Confluent broker, "
+          "use STANDALONE or CLUSTER mode with the SASL_* settings."
+        ),
+        setting_name=missing[0],
+      )
+    return self
