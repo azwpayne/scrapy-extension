@@ -77,7 +77,11 @@ class TestPulsarConnect:
     assert b.is_connected() is False
 
   def test_connect_with_auth_token(self, mocker) -> None:
-    b = _make_backend(auth_token="secret-token")
+    # SV3-2: auth_token requires pulsar+ssl:// (cleartext-token guard).
+    b = _make_backend(
+      service_url="pulsar+ssl://localhost:6651",
+      auth_token="secret-token",
+    )
     mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
     auth_mock = mocker.patch.object(pulsar, "AuthenticationToken")
     b.connect()
@@ -466,7 +470,7 @@ def test_pulsar_auth_token_is_redacted_str(mocker) -> None:
   from scrapy_extension.backends._redaction import _RedactedStr
 
   b = _make_backend(
-    service_url="pulsar://broker:6650",
+    service_url="pulsar+ssl://broker:6651",
     auth_token="top-secret-pulsar-token",
   )
   mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())

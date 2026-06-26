@@ -242,3 +242,37 @@ class RedisSettings(BaseSettings):
           setting_name=missing[0],
         )
     return self
+
+  @model_validator(mode="after")
+  def _validate_ssl_enabled_requires_cafile(self) -> RedisSettings:
+    """SV3-3 (M): ``ssl_enabled=True`` → require ``ssl_cafile``.
+
+    Without an explicit CA bundle, ``redis-py`` falls back to OpenSSL's
+    default verification path — which on minimal containers may be empty or
+    missing system roots, causing either an opaque ``SSL`` error at connect
+    or (worse, when ``ssl_check_hostname=False`` is also set) a silent MITM
+    risk. Fail-fast at config time: operators with self-signed certs must
+    provide their own CA file; there is no implicit opt-out.
+
+    Verified safe to raise: no existing repo fixture constructs
+    ``RedisSettings(ssl_enabled=True)`` without ``ssl_cafile`` in a way that
+    is intended to be valid (the lone ``ssl_enabled=True`` fixture in
+    ``tests/test_backend_modes.py`` sets both).
+
+    Raises:
+        ConfigurationError: if ``ssl_enabled`` is True and ``ssl_cafile`` is
+            unset/empty.
+    """
+    if self.ssl_enabled and not self.ssl_cafile:
+      raise ConfigurationError(
+        (
+          "ssl_enabled=True requires 'ssl_cafile' to be set (path to a CA "
+          "certificate bundle). Without it, redis-py may silently skip "
+          "certificate verification (MITM risk) or fail with an opaque SSL "
+          "error when the container has no system roots. Provide your CA "
+          "file (self-signed operators must supply their own)."
+        ),
+        setting_name="ssl_cafile",
+        setting_value=self.ssl_cafile,
+      )
+    return self

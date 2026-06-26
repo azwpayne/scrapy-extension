@@ -223,24 +223,24 @@ class TestDynamoDBHalfCredentialGuard:
   def test_key_without_secret_raises(self):
     from scrapy_extension.exceptions import ConfigurationError
 
-    backend = _make_backend(
-      aws_access_key_id="AKIAEXAMPLEKEY",
-      aws_secret_access_key=None,
-    )
+    # SV3-6: half-cred guard now fires at config (DynamoDBSettings
+    # construction), ahead of the connect-path SEC-7 defense-in-depth guard.
     with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
+      _make_backend(
+        aws_access_key_id="AKIAEXAMPLEKEY",
+        aws_secret_access_key=None,
+      )
     assert "aws_secret_access_key" in str(exc_info.value)
     assert exc_info.value.setting_name == "aws_secret_access_key"
 
   def test_secret_without_key_raises(self):
     from scrapy_extension.exceptions import ConfigurationError
 
-    backend = _make_backend(
-      aws_access_key_id=None,
-      aws_secret_access_key="orphan-secret",
-    )
     with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
+      _make_backend(
+        aws_access_key_id=None,
+        aws_secret_access_key="orphan-secret",
+      )
     assert "aws_access_key_id" in str(exc_info.value)
     assert exc_info.value.setting_name == "aws_access_key_id"
 

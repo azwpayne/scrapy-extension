@@ -214,3 +214,38 @@ class ElasticSearchSettings(BaseSettings):
         setting_name="hosts",
       )
     return self
+
+  @model_validator(mode="after")
+  def _validate_auth_method_exclusivity(self) -> Self:
+    """SV3-5 (L-M): ``api_key`` and (``username``, ``password``) are mutually exclusive.
+
+    ``_build_kwargs`` prefers ``api_key`` when set and silently drops
+    ``basic_auth``. An operator who configures both believes basic_auth is
+    enforced while it never reaches the cluster — a silent auth-bypass
+    footgun. Fail-fast at config time; require the operator to pick one
+    method.
+
+    Verified safe: no existing repo fixture sets both (all ``api_key``
+    fixtures omit ``username``; all ``basic_auth`` fixtures omit ``api_key``).
+
+    Raises:
+        ConfigurationError: if ``api_key`` is set and either ``username`` or
+            ``password`` is also set.
+    """
+    if self.api_key is None:
+      return self
+    if self.username is not None or self.password is not None:
+      raise ConfigurationError(
+        (
+          "api_key and basic-auth (username/password) are mutually "
+          "exclusive — when both are set, api_key is used and basic_auth "
+          "is silently dropped (auth-method ambiguity). Remove one "
+          "authentication method. "
+          f"Got api_key={'<set>' if self.api_key is not None else None}, "
+          f"username={self.username!r}, password="
+          f"{'<set>' if self.password is not None else None}."
+        ),
+        setting_name="api_key",
+        setting_value=self.api_key,
+      )
+    return self

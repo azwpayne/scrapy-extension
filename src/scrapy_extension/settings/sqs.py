@@ -123,3 +123,49 @@ class SqsSettings(BaseSettings):
         setting_value=self.region_name,
       )
     return self
+
+  @model_validator(mode="after")
+  def _validate_aws_credentials_both_or_neither(self) -> Self:
+    """SV3-6a (M): AWS creds must be both-set or both-unset.
+
+    boto3's default credential chain silently ignores a lone
+    ``aws_access_key_id`` without ``aws_secret_access_key`` (and vice versa)
+    — it falls through to IAM role / env / config, masking the
+    half-configured state. The round-6 SEC-7 connect-path XOR catches this
+    at ``connect()`` time; this validator lifts the same check into the
+    settings layer so it fires at config time (fail-fast, closer to the
+    misconfiguration). Mirrors the DynamoDB validator.
+
+    Verified safe: all existing repo fixtures set both creds or neither.
+
+    Raises:
+        ConfigurationError: if exactly one of ``aws_access_key_id`` /
+            ``aws_secret_access_key`` is set.
+    """
+    key_set = self.aws_access_key_id is not None
+    secret_set = self.aws_secret_access_key is not None
+    if key_set and not secret_set:
+      raise ConfigurationError(
+        (
+          "aws_access_key_id is set but aws_secret_access_key is None — "
+          "AWS credentials must be both-set or both-unset. boto3's default "
+          "chain silently falls through to IAM/env/config when only one is "
+          "provided, masking the half-configured state. Either set "
+          "aws_secret_access_key or remove aws_access_key_id (to use the "
+          "default chain)."
+        ),
+        setting_name="aws_secret_access_key",
+        setting_value=self.aws_secret_access_key,
+      )
+    if secret_set and not key_set:
+      raise ConfigurationError(
+        (
+          "aws_secret_access_key is set but aws_access_key_id is None — "
+          "AWS credentials must be both-set or both-unset. Either set "
+          "aws_access_key_id or remove aws_secret_access_key (to use the "
+          "default chain)."
+        ),
+        setting_name="aws_access_key_id",
+        setting_value=self.aws_access_key_id,
+      )
+    return self

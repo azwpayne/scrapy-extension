@@ -22,7 +22,10 @@ project's ``ConfigurationError`` (SV2/SV4) or pydantic ``ValidationError``
 ignore[arg-type]`` is used ONLY where intentionally passing invalid input
 (mirror the SV1 reject-test pattern).
 
-Scope note: SV3 (security cross-field) lands in a separate round.
+Scope note: SV3 (round 9c) — cross-field auth/transport coherence:
+Kafka SASL↔security_protocol, Pulsar auth_token↔pulsar+ssl, Redis
+ssl_enabled↔ssl_cafile, MongoDB pool-size ordering, ElasticSearch
+api_key↔username mutual exclusion, SQS/DynamoDB AWS creds both-or-neither.
 """
 
 from __future__ import annotations
@@ -92,8 +95,17 @@ class TestKafkaLiterals:
     ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "GSSAPI", "OAUTHBEARER"],
   )
   def test_sasl_mechanism_accepts_valid(self, value: str) -> None:
-    """All documented kafka-python SASL mechanisms stay valid."""
-    assert KafkaSettings(sasl_mechanism=value).sasl_mechanism == value
+    """All documented kafka-python SASL mechanisms stay valid.
+
+    ``security_protocol='SASL_SSL'`` is co-supplied so this isolates the
+    Literal type check (SV1) from the cross-field SASL-protocol coherence
+    rule (SV3-1) which would otherwise reject a lone ``sasl_mechanism``.
+    """
+    s = KafkaSettings(
+      security_protocol="SASL_SSL",  # type: ignore[arg-type]
+      sasl_mechanism=value,
+    )
+    assert s.sasl_mechanism == value
 
   def test_compression_type_rejects_typo(self) -> None:
     """`"snapy"` typo must reject (currently surfaces at producer create)."""
@@ -605,3 +617,323 @@ class TestAwsRegionNameFormat:
     assert (
       DynamoDBSettings(region_name=good_region).region_name == good_region
     )
+
+
+# =============================================================================
+# Round 9c — SV3: cross-field auth/transport coherence
+# =============================================================================
+
+
+class TestSV3KafkaSaslRequiresSaslProtocol:
+  """SV3-1 (H): SASL fields set → ``security_protocol`` must start with SASL_.
+
+  Without this guard, SASL credentials are silently ignored by kafka-python
+  (the client only consults ``sasl_*`` when ``security_protocol`` is
+  ``SASL_PLAINTEXT`` or ``SASL_SSL``). The operator believes auth is enforced
+  while the broker never sees an attempt — a silent auth-bypass footgun.
+  """
+
+  def test_sasl_username_without_sasl_protocol_rejected(self) -> None:
+    """``sasl_username`` set with default PLAINTEXT protocol → reject."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(sasl_username="user")  # security_protocol defaults to PLAINTEXT
+    msg = str(exc_info.value)
+    assert "security_protocol" in msg
+    assert "SASL_" in msg
+    assert exc_info.value.setting_name == "security_protocol"
+
+  def test_sasl_password_without_sasl_protocol_rejected(self) -> None:
+    """``sasl_password`` set with PLAINTEXT protocol → reject."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(sasl_password="secret")  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "security_protocol"
+
+  def test_sasl_mechanism_without_sasl_protocol_rejected(self) -> None:
+    """``sasl_mechanism`` set with PLAINTEXT protocol → reject."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(sasl_mechanism="PLAIN")
+    assert exc_info.value.setting_name == "security_protocol"
+
+  def test_sasl_with_ssl_protocol_rejected(self) -> None:
+    """SASL fields + ``SSL`` (not ``SASL_SSL``) → reject."""
+    with pytest.raises(ConfigurationError):
+      KafkaSettings(
+        security_protocol="SSL",  # type: ignore[arg-type]
+        sasl_username="user",
+        sasl_password="p",  # type: ignore[arg-type]
+      )
+
+  def test_sasl_with_sasl_plaintext_accepted(self) -> None:
+    """SASL fields + ``SASL_PLAINTEXT`` → valid."""
+    s = KafkaSettings(
+      security_protocol="SASL_PLAINTEXT",  # type: ignore[arg-type]
+      sasl_mechanism="PLAIN",
+      sasl_username="user",
+      sasl_password="secret",  # type: ignore[arg-type]
+    )
+    assert s.security_protocol == "SASL_PLAINTEXT"
+
+  def test_sasl_with_sasl_ssl_accepted(self) -> None:
+    """SASL fields + ``SASL_SSL`` → valid (the canonical secured path)."""
+    s = KafkaSettings(
+      security_protocol="SASL_SSL",  # type: ignore[arg-type]
+      sasl_mechanism="SCRAM-SHA-512",
+      sasl_username="user",
+      sasl_password="secret",  # type: ignore[arg-type]
+    )
+    assert s.security_protocol == "SASL_SSL"
+
+  def test_no_sasl_with_plaintext_accepted(self) -> None:
+    """No SASL fields + ``PLAINTEXT`` → valid (the default unauthenticated)."""
+    s = KafkaSettings()
+    assert s.security_protocol == "PLAINTEXT"
+    assert s.sasl_username is None
+
+
+class TestSV3PulsarAuthTokenRequiresSsl:
+  """SV3-2 (H): ``auth_token`` set → ``service_url`` must be ``pulsar+ssl://``.
+
+  Pulsar's ``AuthenticationToken`` is sent on every connection. Without TLS,
+  the token traverses the wire in cleartext. This raises at config time
+  (mirrors Redis ``ssl_enabled``→``ssl_cafile`` and Kafka SASL→
+  ``security_protocol``); the connect-path test fixtures
+  (``test_connect_with_auth_token``, ``test_pulsar_auth_token_is_redacted_str``)
+  were updated to ``pulsar+ssl://`` so the raise is safe.
+  """
+
+  def test_auth_token_with_plain_url_raises(self) -> None:
+    """``auth_token`` + ``pulsar://`` → ConfigurationError at config time."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarSettings(
+        service_url="pulsar://broker:6650",
+        auth_token="top-secret",  # type: ignore[arg-type]
+      )
+    msg = str(exc_info.value)
+    assert "pulsar+ssl://" in msg or "cleartext" in msg.lower(), msg
+    assert exc_info.value.setting_name == "service_url"
+
+  def test_auth_token_with_ssl_url_accepted(self) -> None:
+    """``auth_token`` + ``pulsar+ssl://`` → accepted (no raise)."""
+    s = PulsarSettings(
+      service_url="pulsar+ssl://broker:6651",
+      auth_token="top-secret",  # type: ignore[arg-type]
+    )
+    assert s.auth_token is not None
+
+  def test_no_auth_token_with_plain_url_accepted(self) -> None:
+    """No ``auth_token`` + ``pulsar://`` → accepted (validator skips)."""
+    s = PulsarSettings(service_url="pulsar://broker:6650")
+    assert s.auth_token is None
+
+
+class TestSV3RedisSslRequiresCafile:
+  """SV3-3 (M): ``ssl_enabled=True`` → ``ssl_cafile`` should be set.
+
+  Without a CA bundle, the client either refuses to verify (openssl default
+  may have no system roots in some containers) or silently skips validation
+  → MITM risk. Raise rather than warn: no existing test in the repo sets
+  ``ssl_enabled=True`` without ``ssl_cafile`` in a way that is intended to
+  be valid (the lone fixture in ``test_backend_modes.py`` sets both).
+  Operators with self-signed certs must still provide a CA file (their own).
+  """
+
+  def test_ssl_enabled_without_cafile_rejected(self) -> None:
+    """``ssl_enabled=True`` + no ``ssl_cafile`` → reject."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      RedisSettings(ssl_enabled=True)
+    msg = str(exc_info.value)
+    assert "ssl_cafile" in msg
+    assert exc_info.value.setting_name == "ssl_cafile"
+
+  def test_ssl_enabled_with_cafile_accepted(self) -> None:
+    """``ssl_enabled=True`` + ``ssl_cafile`` → valid."""
+    s = RedisSettings(ssl_enabled=True, ssl_cafile="/etc/ssl/ca.pem")
+    assert s.ssl_enabled is True
+    assert s.ssl_cafile == "/etc/ssl/ca.pem"
+
+  def test_ssl_disabled_without_cafile_accepted(self) -> None:
+    """``ssl_enabled=False`` + no ``ssl_cafile`` → valid (the default)."""
+    s = RedisSettings()
+    assert s.ssl_enabled is False
+    assert s.ssl_cafile is None
+
+
+class TestSV3MongoPoolSizeOrdering:
+  """SV3-4 (M): ``min_pool_size <= max_pool_size``.
+
+  Inverted bounds surface as an opaque ``ConnectionFailure`` / deadlock under
+  load once pymongo's pool tries to acquire a slot that can never exist.
+  """
+
+  def test_min_greater_than_max_rejected(self) -> None:
+    """``min_pool_size > max_pool_size`` → reject."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(min_pool_size=20, max_pool_size=10)
+    msg = str(exc_info.value)
+    assert "min_pool_size" in msg
+    assert "max_pool_size" in msg
+
+  def test_equal_sizes_accepted(self) -> None:
+    """``min == max`` → valid (fixed-size pool)."""
+    s = MongoDBSettings(min_pool_size=5, max_pool_size=5)
+    assert s.min_pool_size == s.max_pool_size
+
+  def test_default_sizes_accepted(self) -> None:
+    """Defaults (1, 10) → valid."""
+    s = MongoDBSettings()
+    assert s.min_pool_size <= s.max_pool_size
+
+  def test_zero_min_accepted(self) -> None:
+    """``min_pool_size=0`` (Field allows ge=0) → valid."""
+    s = MongoDBSettings(min_pool_size=0, max_pool_size=1)
+    assert s.min_pool_size <= s.max_pool_size
+
+
+class TestSV3ElasticsearchAuthExclusivity:
+  """SV3-5 (L-M): ``api_key`` and (``username``, ``password``) mutually exclusive.
+
+  When both are set, ``_build_kwargs`` prefers ``api_key`` and silently drops
+  ``basic_auth`` → the operator believes basic_auth is enforced while it never
+  reaches the broker. Fail-fast at config time.
+  """
+
+  def test_api_key_with_username_rejected(self) -> None:
+    """``api_key`` + ``username`` → reject (silent basic_auth drop)."""
+    from pydantic import SecretStr
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(
+        hosts=["https://es:9200"],
+        api_key=SecretStr("key"),
+        username="user",
+      )
+    msg = str(exc_info.value)
+    assert "api_key" in msg
+    assert "username" in msg
+
+  def test_api_key_with_password_rejected(self) -> None:
+    """``api_key`` + ``password`` → reject."""
+    from pydantic import SecretStr
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(
+        hosts=["https://es:9200"],
+        api_key=SecretStr("key"),
+        password=SecretStr("p"),
+      )
+    assert exc_info.value.setting_name in {"api_key", "username"}
+
+  def test_api_key_alone_accepted(self) -> None:
+    """``api_key`` alone → valid."""
+    from pydantic import SecretStr
+
+    s = ElasticSearchSettings(hosts=["https://es:9200"], api_key=SecretStr("k"))
+    assert s.api_key is not None
+    assert s.username is None
+
+  def test_basic_auth_alone_accepted(self) -> None:
+    """``username`` + ``password`` (no api_key) → valid."""
+    from pydantic import SecretStr
+
+    s = ElasticSearchSettings(
+      hosts=["https://es:9200"],
+      username="user",
+      password=SecretStr("p"),
+    )
+    assert s.username == "user"
+    assert s.api_key is None
+
+
+class TestSV3SqsAwsCredsBothOrNeither:
+  """SV3-6a (M): SQS AWS creds must be both-set or both-unset.
+
+  Lifts the round-6 SEC-7 connect-path XOR into the settings validator so it
+  fires at config time, not at first boto3 RPC.
+  """
+
+  def test_key_without_secret_rejected(self) -> None:
+    """``aws_access_key_id`` set, ``aws_secret_access_key`` None → reject."""
+    from pydantic import SecretStr
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      SqsSettings(
+        aws_access_key_id=SecretStr("AKIA..."),
+        aws_secret_access_key=None,
+      )
+    msg = str(exc_info.value)
+    assert "aws_secret_access_key" in msg
+    assert exc_info.value.setting_name == "aws_secret_access_key"
+
+  def test_secret_without_key_rejected(self) -> None:
+    """``aws_secret_access_key`` set, ``aws_access_key_id`` None → reject."""
+    from pydantic import SecretStr
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      SqsSettings(
+        aws_access_key_id=None,
+        aws_secret_access_key=SecretStr("orphan"),
+      )
+    assert "aws_access_key_id" in str(exc_info.value)
+    assert exc_info.value.setting_name == "aws_access_key_id"
+
+  def test_both_set_accepted(self) -> None:
+    """Both creds → valid."""
+    from pydantic import SecretStr
+
+    s = SqsSettings(
+      aws_access_key_id=SecretStr("AKIA..."),
+      aws_secret_access_key=SecretStr("secret"),
+    )
+    assert s.aws_access_key_id is not None
+    assert s.aws_secret_access_key is not None
+
+  def test_neither_set_accepted(self) -> None:
+    """Neither cred (IAM role path) → valid."""
+    s = SqsSettings()
+    assert s.aws_access_key_id is None
+    assert s.aws_secret_access_key is None
+
+
+class TestSV3DynamoDbAwsCredsBothOrNeither:
+  """SV3-6b (M): DynamoDB AWS creds must be both-set or both-unset.
+
+  Mirrors SQS (same boto3 default-chain behavior; same connect-path SEC-7
+  guard lifted to settings).
+  """
+
+  def test_key_without_secret_rejected(self) -> None:
+    """``aws_access_key_id`` set, ``aws_secret_access_key`` None → reject."""
+    from pydantic import SecretStr
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      DynamoDBSettings(
+        aws_access_key_id=SecretStr("AKIA..."),
+        aws_secret_access_key=None,
+      )
+    assert exc_info.value.setting_name == "aws_secret_access_key"
+
+  def test_secret_without_key_rejected(self) -> None:
+    """``aws_secret_access_key`` set, ``aws_access_key_id`` None → reject."""
+    from pydantic import SecretStr
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      DynamoDBSettings(
+        aws_access_key_id=None,
+        aws_secret_access_key=SecretStr("orphan"),
+      )
+    assert exc_info.value.setting_name == "aws_access_key_id"
+
+  def test_both_set_accepted(self) -> None:
+    """Both creds → valid."""
+    from pydantic import SecretStr
+
+    s = DynamoDBSettings(
+      aws_access_key_id=SecretStr("AKIA..."),
+      aws_secret_access_key=SecretStr("secret"),
+    )
+    assert s.aws_access_key_id is not None
+
+  def test_neither_set_accepted(self) -> None:
+    """Neither cred (IAM role path) → valid."""
+    s = DynamoDBSettings()
+    assert s.aws_access_key_id is None

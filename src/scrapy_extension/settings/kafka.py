@@ -223,6 +223,43 @@ class KafkaSettings(BaseSettings):
   )
 
   @model_validator(mode="after")
+  def _validate_sasl_requires_sasl_protocol(self) -> KafkaSettings:
+    """SV3-1 (H): SASL fields set → ``security_protocol`` must start with ``SASL_``.
+
+    kafka-python only consults ``sasl_username`` / ``sasl_password`` /
+    ``sasl_mechanism`` when ``security_protocol`` is ``SASL_PLAINTEXT`` or
+    ``SASL_SSL``. With any other protocol (``PLAINTEXT`` / ``SSL``) the SASL
+    fields are silently ignored — the operator believes auth is enforced
+    while the broker never sees an authentication attempt. This is a silent
+    auth-bypass footgun; fail-fast at config time.
+
+    Mirrors the Confluent-mode validator (raise, not warn — deterministic +
+    the project's ``error::UserWarning`` filter makes warn-by-default risky).
+
+    Raises:
+        ConfigurationError: if any SASL field is set and ``security_protocol``
+            does not start with ``SASL_``.
+    """
+    sasl_fields_set = (
+      self.sasl_username is not None
+      or self.sasl_password is not None
+      or self.sasl_mechanism is not None
+    )
+    if sasl_fields_set and not self.security_protocol.startswith("SASL_"):
+      raise ConfigurationError(
+        (
+          "SASL credentials (sasl_username / sasl_password / sasl_mechanism) "
+          "require a 'SASL_'-prefixed security_protocol "
+          "('SASL_PLAINTEXT' or 'SASL_SSL'); kafka-python silently ignores "
+          "the SASL fields otherwise (auth never attempted). "
+          f"Got security_protocol={self.security_protocol!r}."
+        ),
+        setting_name="security_protocol",
+        setting_value=self.security_protocol,
+      )
+    return self
+
+  @model_validator(mode="after")
   def _validate_confluent_requirements(self) -> KafkaSettings:
     """SV2: CONFLUENT mode requires API key + secret.
 

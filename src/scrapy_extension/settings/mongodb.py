@@ -330,3 +330,30 @@ class MongoDBSettings(BaseSettings):
           setting_value=self.atlas_cluster_name,
         )
     return self
+
+  @model_validator(mode="after")
+  def _validate_pool_size_ordering(self) -> Self:
+    """SV3-4 (M): ``min_pool_size <= max_pool_size``.
+
+    An inverted pair (min > max) makes pymongo's connection pool unable to
+    ever satisfy a checkout → opaque ``ConnectionFailure`` / deadlock under
+    load. Catch at config time. Both bounds are individually constrained by
+    Field-level ``ge`` (min ≥ 0, max ≥ 1); this validator guards their
+    relative ordering.
+
+    Raises:
+        ConfigurationError: if ``min_pool_size > max_pool_size``.
+    """
+    if self.min_pool_size > self.max_pool_size:
+      raise ConfigurationError(
+        (
+          "min_pool_size must be <= max_pool_size — an inverted pair makes "
+          "the connection pool unable to satisfy any checkout (deadlock "
+          "under load). "
+          f"Got min_pool_size={self.min_pool_size}, "
+          f"max_pool_size={self.max_pool_size}."
+        ),
+        setting_name="min_pool_size",
+        setting_value=self.min_pool_size,
+      )
+    return self

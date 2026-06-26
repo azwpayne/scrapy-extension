@@ -113,3 +113,32 @@ class PulsarSettings(BaseSettings):
         setting_value=self.service_url,
       )
     return self
+
+  @model_validator(mode="after")
+  def _validate_auth_token_requires_ssl(self) -> Self:
+    """SV3-2 (H): ``auth_token`` set → ``service_url`` must be ``pulsar+ssl://``.
+
+    Pulsar's ``AuthenticationToken`` is transmitted on every broker
+    connection. Without TLS (``pulsar://`` rather than ``pulsar+ssl://``),
+    the token traverses the wire in cleartext — a credential-leak footgun.
+    This mirrors the Redis ``ssl_enabled``→``ssl_cafile`` and Kafka
+    SASL→``security_protocol`` raise-on-incoherence pattern.
+
+    Raises:
+        ConfigurationError: if ``auth_token`` is set and ``service_url``
+            does not start with ``pulsar+ssl://``.
+    """
+    if self.auth_token is None:
+      return self
+    if not self.service_url.lower().startswith("pulsar+ssl://"):
+      raise ConfigurationError(
+        (
+          "auth_token is set but service_url is not 'pulsar+ssl://' "
+          f"(got service_url={self.service_url!r}). The token would be "
+          "sent in cleartext over a non-TLS connection. Use "
+          "'pulsar+ssl://' to protect the token on the wire."
+        ),
+        setting_name="service_url",
+        setting_value=self.service_url,
+      )
+    return self
