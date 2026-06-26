@@ -63,6 +63,7 @@ all = [
 [dependency-groups]
 dev = [
     "poethepoet",
+    "pytest-benchmark>=5.2.3",
     "ruff",
 ]
 test = [

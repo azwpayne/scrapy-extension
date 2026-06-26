@@ -1101,6 +1101,15 @@ wheels = [
 ]
 
 [[package]]
+name = "py-cpuinfo"
+version = "9.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/a8/d832f7293ebb21690860d2e01d8115e5ff6f2ae8bbdc953f0eb0fa4bd2c7/py-cpuinfo-9.0.0.tar.gz", hash = "sha256:3cdbbf3fac90dc6f118bfd64384f309edeadd902d7c8fb17f02ffa1fc3f49690", size = 104716, upload-time = "2022-10-25T20:38:06.303Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/a9/023730ba63db1e494a271cb018dcd361bd2c917ba7004c3e49d5daf795a2/py_cpuinfo-9.0.0-py3-none-any.whl", hash = "sha256:859625bc251f64e21f077d099d4162689c762b5d6a4c3c97553d56241c9674d5", size = 22335, upload-time = "2022-10-25T20:38:27.636Z" },
+]
+
+[[package]]
 name = "pyasn1"
 version = "0.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1423,6 +1432,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3a/0f/09b4fe2276fc922dbe2ab6970455473b3796336c1afb32c0a8bae73e6f85/pytest-bandit-0.6.1.tar.gz", hash = "sha256:9eee170e4ce4e2fe71b1e14c41f7579daf02db253c863a6093ba64de9f878ab4", size = 6041, upload-time = "2021-02-23T22:31:39.034Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d2/5a/adb256fe1fe7f93c8d54de2ae01a039e57a7b144f52fa168788782a579a6/pytest_bandit-0.6.1-py3-none-any.whl", hash = "sha256:9612d299ff32c6b6c74fd149ea0444fa65cb2da5918cbeb6616adba631505dd3", size = 6601, upload-time = "2021-02-23T22:31:37.372Z" },
+]
+
+[[package]]
+name = "pytest-benchmark"
+version = "5.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "py-cpuinfo" },
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/24/34/9f732b76456d64faffbef6232f1f9dbec7a7c4999ff46282fa418bd1af66/pytest_benchmark-5.2.3.tar.gz", hash = "sha256:deb7317998a23c650fd4ff76e1230066a76cb45dcece0aca5607143c619e7779", size = 341340, upload-time = "2025-11-09T18:48:43.215Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/29/e756e715a48959f1c0045342088d7ca9762a2f509b945f362a316e9412b7/pytest_benchmark-5.2.3-py3-none-any.whl", hash = "sha256:bc839726ad20e99aaa0d11a127445457b4219bdb9e80a1afc4b51da7f96b0803", size = 45255, upload-time = "2025-11-09T18:48:39.765Z" },
 ]
 
 [[package]]
@@ -1830,6 +1852,7 @@ sqs = [
 [package.dev-dependencies]
 dev = [
     { name = "poethepoet" },
+    { name = "pytest-benchmark" },
     { name = "ruff" },
 ]
 test = [
@@ -1883,6 +1906,7 @@ provides-extras = ["redis", "mongodb", "kafka", "rabbitmq", "elasticsearch", "ro
 [package.metadata.requires-dev]
 dev = [
     { name = "poethepoet" },
+    { name = "pytest-benchmark", specifier = ">=5.2.3" },
     { name = "ruff" },
 ]
 test = [

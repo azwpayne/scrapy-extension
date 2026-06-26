@@ -1,0 +1,123 @@
+# Local/CI broker fixtures for scrapy-extension integration tests.
+#
+# Brings up the three live brokers the multi-backend e2e test
+# (tests/integration/test_multi_backend_e2e.py) needs, plus Kafka + RabbitMQ
+# for the per-backend integration suites. Each service exposes the canonical
+# port and ships a healthcheck so `docker compose up --wait` blocks until the
+# brokers are actually ready to accept connections, not just TCP-open.
+#
+# Usage (from repo root):
+#
+#   docker compose -f tests/integration/docker-compose.yml up -d --wait
+#   export SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0
+#   export SCRAPY_TEST_MONGODB_URI=mongodb://localhost:27017
+#   export SCRAPY_TEST_ES_HOSTS=http://localhost:9200
+#   uv run pytest tests/integration -q
+#
+#   docker compose -f tests/integration/docker-compose.yml down -v
+
+services:
+  redis:
+    image: redis:7
+    container_name: scrapy-ext-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  mongo:
+    image: mongo:7
+    container_name: scrapy-ext-mongo
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ""
+      MONGO_INITDB_ROOT_PASSWORD: ""
+      MONGO_INITDB_DATABASE: scrapy_extension
+    # Auth disabled for local/CI integration tests — never use this in prod.
+    command: ["--noauth", "--bind_ip_all"]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -q 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  elasticsearch:
+    # Single-node ES 8 with security disabled — integration-test fixture only.
+    # Heavy image (~1.5GB); if CI bandwidth matters, consider a smaller
+    # ES-compatible (e.g. OpenSearch) but the package's ElasticSearchBackend
+    # uses the official elasticsearch-py client which expects ES APIs.
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
+    container_name: scrapy-ext-es
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s
+          | grep -Eq '"status":"(green|yellow)"'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Future integration tests: Kafka queue backend.
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: scrapy-ext-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      CLUSTER_ID: scrapy-ext-kafka-cluster
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Future integration tests: RabbitMQ queue backend.
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: scrapy-ext-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
