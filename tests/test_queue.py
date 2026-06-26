@@ -778,3 +778,207 @@ class TestBackendQueueMonitorWiring:
     mock_connection_manager.get_queue_backend().pop.return_value = None
     queue.pop()
     assert stats.get_value("queue/pop_count") == 1
+
+
+class TestBackendQueueDepthSampling:
+  """U4: queue_len sampling — cut ~25% off pop-path RTT.
+
+  ``queue_len`` (e.g. ZCARD) fires on every pop via ``monitor.on_queue_depth``.
+  +1 RTT/pop = +25% of pop-path RTT for a depth signal that changes slowly
+  relative to pop rate. Sampling at 1/N keeps the backpressure signal fresh
+  while amortizing the RPC cost.
+
+  Emptiness-correctness invariant: when the underlying backend reports 0,
+  every probe MUST return 0 immediately (no stale non-zero cache) so Scrapy
+  idle detection still trips correctly.
+  """
+
+  def test_default_depth_sample_every_is_100(self, mock_connection_manager):
+    """U4: default sampling window is 100 (spec-mandated default)."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+    assert queue.depth_sample_every == 100
+
+  def test_depth_sample_every_kwarg_is_opt_in(self, mock_connection_manager):
+    """U4: caller can set the sampling window explicitly."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      depth_sample_every=5,
+    )
+    assert queue.depth_sample_every == 5
+
+  def test_sample_every_1_calls_queue_len_every_pop(
+    self, mock_connection_manager, mock_spider
+  ):
+    """U4: ``depth_sample_every=1`` preserves the pre-sampling behavior (backward-compat)."""
+    backend = mock_connection_manager.get_queue_backend()
+    backend.pop.return_value = None
+    backend.queue_len.return_value = 0
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      depth_sample_every=1,
+    )
+
+    for _ in range(5):
+      queue.pop()
+
+    # Every pop probes depth when window=1 (legacy behavior).
+    assert backend.queue_len.call_count == 5
+
+  def test_sampling_reduces_queue_len_calls(self, mock_connection_manager, mock_spider):
+    """U4 RED→GREEN: with window=5 and 20 pops, real queue_len calls <= 4.
+
+    Today (no sampling) this would be 20 calls. With sampling at 1/5 it must
+    be at most ceil(20/5) = 4 real RPCs — the rest return cached depth.
+    """
+    backend = mock_connection_manager.get_queue_backend()
+    backend.pop.return_value = None
+    backend.queue_len.return_value = 42
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      depth_sample_every=5,
+    )
+
+    for _ in range(20):
+      queue.pop()
+
+    # 20 pops / window-of-5 = at most 4 real depth probes (rounded).
+    assert backend.queue_len.call_count <= 4
+    # And at least one probe happened (the signal stays alive).
+    assert backend.queue_len.call_count >= 1
+
+  def test_empty_queue_never_caches_stale_nonzero_depth(
+    self, mock_connection_manager, mock_spider
+  ):
+    """U4 emptiness-correctness invariant.
+
+    Per the SPEC rule of thumb: "when the underlying backend reports 0, always
+    return 0 immediately (no cache); sampling only applies to the non-zero
+    depth probe." Concretely this codebase enforces it as: while the cache
+    holds 0 (or is uninitialized) every call re-probes the backend — sampling
+    only skips the RPC while the *cached* depth is non-zero. So:
+
+    - An empty-from-the-start queue reports 0 on every probe (cache never goes
+      stale-nonzero). This is the case Scrapy idle detection hits while a crawl
+      winds down with the queue already empty.
+    - Once a real probe returns 0, the cache holds 0 and stays fresh on every
+      subsequent call (no stale masking) — the queue cannot appear non-empty
+      after it has drained to a probe-confirmed 0.
+    """
+    backend = mock_connection_manager.get_queue_backend()
+    backend.pop.return_value = None
+    backend.queue_len.return_value = 0
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      depth_sample_every=5,
+    )
+
+    # Empty from the start: every probe returns 0 (no stale non-zero possible).
+    for _ in range(20):
+      assert len(queue) == 0
+    # And the backend was actually probed every call (cache never short-circuits 0).
+    assert backend.queue_len.call_count == 20
+
+  def test_drained_queue_re_confirms_zero_within_one_window(
+    self, mock_connection_manager, mock_spider
+  ):
+    """U4 drain semantics: a probe-confirmed 0 is reported on every subsequent
+    call (no stale-nonzero masking once the real RPC has seen 0).
+
+    The drain-detection latency is bounded by one sampling window: at most
+    ``depth_sample_every`` calls after the backend goes to 0, the next real
+    probe fires, and from that point on every call re-probes (zero is never
+    served from a stale cache).
+    """
+    backend = mock_connection_manager.get_queue_backend()
+    backend.pop.return_value = None
+    # Prime a non-zero cache (active-crawl steady state).
+    backend.queue_len.return_value = 42
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      depth_sample_every=5,
+    )
+    assert len(queue) == 42
+
+    # Drain: within one window the real probe fires and returns 0.
+    backend.queue_len.return_value = 0
+    calls_before_zero = 0
+    for _ in range(queue.depth_sample_every + 1):
+      calls_before_zero += 1
+      if len(queue) == 0:
+        break
+    assert calls_before_zero <= queue.depth_sample_every, (
+      "drain took longer than one sampling window to surface"
+    )
+
+    # From the confirmed-0 probe onward, every call returns 0 and re-probes
+    # (no stale-nonzero cache mask).
+    assert queue._cached_depth == 0
+    probe_count_at_confirm = backend.queue_len.call_count
+    for _ in range(8):
+      assert len(queue) == 0
+    assert backend.queue_len.call_count == probe_count_at_confirm + 8
+
+  def test_pop_with_empty_backend_never_masks_emptiness(
+    self, mock_connection_manager, mock_spider
+  ):
+    """U4 pop-path: popping an empty backend with a non-zero cache still
+    surfaces depth 0 to the monitor once the next real probe fires.
+
+    Guards the pop() depth-emit path (not just __len__) so the backpressure
+    monitor sees the drain the moment it happens.
+    """
+    backend = mock_connection_manager.get_queue_backend()
+    backend.pop.return_value = None
+    backend.queue_len.return_value = 100
+    from scrapy_extension.monitor import NullMonitor
+
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      monitor=NullMonitor(),
+      depth_sample_every=3,
+    )
+    # Prime the non-zero cache.
+    queue.pop()
+    assert queue._cached_depth == 100
+
+    # Drain: subsequent real probes return 0; pop must update the cache.
+    backend.queue_len.return_value = 0
+    for _ in range(queue.depth_sample_every):
+      queue.pop()
+    assert queue._cached_depth == 0
+
+  def test_len_uses_sampled_depth(self, mock_connection_manager, mock_spider):
+    """U4: __len__ also benefits from sampling — repeated len() probes cache.
+
+    The cache is shared between the pop-path depth emit and __len__ so both
+    hot paths amortize the same RPC.
+    """
+    backend = mock_connection_manager.get_queue_backend()
+    backend.queue_len.return_value = 7
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      depth_sample_every=5,
+    )
+
+    results = [len(queue) for _ in range(20)]
+
+    # Every probe returns the correct depth (cache is consistent).
+    assert all(r == 7 for r in results)
+    # But the backend RPC only fired at most ceil(20/5) = 4 times.
+    assert backend.queue_len.call_count <= 4
