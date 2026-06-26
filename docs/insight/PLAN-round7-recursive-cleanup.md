@@ -73,6 +73,8 @@ flag per test for isolation. Central verify: **1353 passed / 27 skipped** (was
 | Theme E HIGH — crash-mid-ack / no-ack-no-commit | HIGH gap | **DONE** — covered for all 3 ack-using MQ backends | `tests/test_sqs_backend.py:434` (TestSqsCrashMidAck), `tests/test_pulsar_backend.py:327`, `tests/test_rabbitmq_backend.py:1095` |
 | Theme C / D3 — per-process dedup strategy factory warning | MEDIUM | **DONE** — `_warn_per_process_scope` warns once per process per strategy | `dupefilter/filters/factory.py:65-87` (idempotent via `_warned` set) |
 | B5 — reconnect-after-close round-trip test | MEDIUM HYPOTHESIS | **DONE (round-trip)** — closing last holder evicts registry; next `get_manager()` reconnects fresh | `tests/test_connectors.py:845`, `tests/test_connection_manager.py:16` |
+| B3 — Circuit-breaker half-open "single probe" not enforced (N threads flip to HALF_OPEN and call the backend concurrently) | HIGH HYPOTHESIS open (INSIGHTS:55) | **DONE** — `_probe_in_flight` flag claims the single-probe slot under the lock; concurrent callers block while a probe is in flight | `backends/circuit_breaker.py:127,186-189`; `tests/test_circuit_breaker.py:588` (`test_concurrent_probes_issue_exactly_one_func_call`, RED reproduced 8 probes → 1 GREEN) — round-2 E-E4 |
+| SEC-6 — Sentinel/Cluster malformed-entry raw `ValueError` from `int(port_str)` (round-1 residual, INSIGHTS:81 "confirmed OPEN") | LOW open | **DONE** — Sentinel + Cluster parse errors (`int(port_str)`, missing `:port`, ping failures) surface as `BackendConnectionError(backend_type="redis")`, not raw `ValueError` | `backends/redis.py:189-195` (Sentinel), `backends/redis.py:260-265` (Cluster) — round-6 SEC-6 |
 
 ### CLOSED-FIX (this round)
 
