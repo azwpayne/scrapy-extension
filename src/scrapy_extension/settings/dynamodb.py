@@ -6,6 +6,7 @@
 # @desc    : Amazon DynamoDB settings (subsystem ③ — new NoSQL backend)
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 from pydantic import Field, SecretStr, model_validator
@@ -13,6 +14,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+
+# AWS region: two lowercase letters, hyphen, lowercase word, hyphen, digits.
+# Rejects typos like "us-eat-1" (the round-6 SPEC motivator).
+_AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
 
 
 class DynamoDBMode(str, Enum):
@@ -85,5 +90,30 @@ class DynamoDBSettings(BaseSettings):
         ),
         setting_name="endpoint_url",
         setting_value=self.endpoint_url,
+      )
+    return self
+
+  @model_validator(mode="after")
+  def _validate_region_name_format(self) -> Self:
+    """SV4: ``region_name`` must match the AWS region pattern.
+
+    Catches typos like ``"us-eat-1"`` (should be ``"us-east-1"``) that would
+    otherwise surface as an opaque ``InvalidLocationConstraint`` / endpoint
+    resolution failure inside boto3 at the first API call. Mirrors the SQS
+    validator.
+
+    Raises:
+        ConfigurationError: if ``region_name`` does not match the AWS region
+            pattern.
+    """
+    if not _AWS_REGION_PATTERN.match(self.region_name):
+      raise ConfigurationError(
+        (
+          "region_name must match the AWS region pattern "
+          "'<aa>-<region>-<n>' (e.g. 'us-east-1', 'ap-southeast-2'). "
+          f"Got region_name={self.region_name!r}."
+        ),
+        setting_name="region_name",
+        setting_value=self.region_name,
       )
     return self

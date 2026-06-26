@@ -9,8 +9,10 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from scrapy_extension.exceptions.base import ConfigurationError
 
 
 class RabbitMQMode(str, Enum):
@@ -187,3 +189,47 @@ class RabbitMQSettings(BaseSettings):
     ge=0,
     description="QoS prefetch size in bytes (0 = unlimited)",
   )
+
+  @model_validator(mode="after")
+  def _validate_mode_requirements(self) -> RabbitMQSettings:
+    """SV2: mode-specific required fields for CLUSTER and MIRRORED_QUEUES.
+
+    - CLUSTER: requires non-empty ``cluster_nodes``. Without it the client
+      connects to a single ``host:port`` — the operator asked for a cluster
+      but only one node is wired.
+    - MIRRORED_QUEUES: requires ``ha_mode``. Without it the connect path
+      silently skips HA policy setup (the queue is non-mirrored despite the
+      mode name). ``cluster_nodes`` is intentionally NOT required for
+      MIRRORED_QUEUES — single-node-mirrored (HA policy on a standalone
+      node) is a valid dev topology and the backend connects via
+      ``host:port`` when ``cluster_nodes`` is empty.
+
+    Raises:
+        ConfigurationError: if a mode-specific required field is missing.
+    """
+    if self.mode == RabbitMQMode.CLUSTER and not self.cluster_nodes:
+      raise ConfigurationError(
+        (
+          "RabbitMQ CLUSTER mode requires 'cluster_nodes' to be set "
+          "(a non-empty list of host:port). Without it the client connects "
+          f"to a single host:port, losing cluster topology. "
+          f"Got cluster_nodes={self.cluster_nodes!r}."
+        ),
+        setting_name="cluster_nodes",
+        setting_value=self.cluster_nodes,
+      )
+    if (
+      self.mode == RabbitMQMode.MIRRORED_QUEUES
+      and not self.ha_mode
+    ):
+      raise ConfigurationError(
+        (
+          "RabbitMQ MIRRORED_QUEUES mode requires 'ha_mode' to be set "
+          "(one of: all, exactly, nodes). Without it the connect path "
+          "silently skips HA policy setup — the queue is non-mirrored "
+          f"despite the mode name. Got ha_mode={self.ha_mode!r}."
+        ),
+        setting_name="ha_mode",
+        setting_value=self.ha_mode,
+      )
+    return self

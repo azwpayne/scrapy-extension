@@ -9,8 +9,13 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing_extensions import Self
+
+from scrapy_extension.exceptions.base import ConfigurationError
+
+_VALID_PULSAR_SCHEMES: tuple[str, ...] = ("pulsar://", "pulsar+ssl://")
 
 
 class PulsarMode(str, Enum):
@@ -82,3 +87,29 @@ class PulsarSettings(BaseSettings):
     default=False,
     description="Allow insecure TLS connections (dev only)",
   )
+
+  @model_validator(mode="after")
+  def _validate_service_url_scheme(self) -> Self:
+    """SV4: ``service_url`` must start with ``pulsar://`` or ``pulsar+ssl://``.
+
+    A bare ``host:port`` or ``http://`` value otherwise surfaces as an
+    opaque ``ValueError`` inside the pulsar client at connect. For a cluster,
+    each comma-separated entry must carry a valid scheme (checked on the
+    first segment for the common single-URL case; cluster URLs follow the
+    same ``pulsar://`` scheme).
+
+    Raises:
+        ConfigurationError: if ``service_url`` does not start with a valid
+            Pulsar scheme.
+    """
+    url = self.service_url.strip()
+    if not url or not url.lower().startswith(_VALID_PULSAR_SCHEMES):
+      raise ConfigurationError(
+        (
+          "service_url must start with 'pulsar://' or 'pulsar+ssl://'. "
+          f"Got service_url={self.service_url!r}."
+        ),
+        setting_name="service_url",
+        setting_value=self.service_url,
+      )
+    return self

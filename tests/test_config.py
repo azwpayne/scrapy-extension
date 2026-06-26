@@ -384,12 +384,27 @@ class TestSec2MongoTlsModeGuard:
     assert settings.tls_allow_invalid_certificates is True
 
   def test_any_mode_with_secure_tls_accepted(self):
-    """tls_allow_invalid_certificates=False (default) accepted in all modes."""
+    """tls_allow_invalid_certificates=False (default) accepted in all modes.
+
+    R9-b SV2: ATLAS requires a ``mongodb+srv://`` URI; REPLICA_SET requires
+    ``replica_set_name`` (or a URI carrying ``?replicaSet=``). The loop now
+    supplies the per-mode required fields so the secure-TLS acceptance check
+    runs across all four modes.
+    """
     from scrapy_extension.settings import MongoDBSettings
     from scrapy_extension.settings.mongodb import MongoDBMode
 
+    def kwargs_for(mode: MongoDBMode) -> dict:
+      if mode == MongoDBMode.ATLAS:
+        return {"uri": "mongodb+srv://cluster0.example.mongodb.net"}
+      if mode == MongoDBMode.REPLICA_SET:
+        return {"replica_set_name": "rs0"}
+      return {}
+
     for mode in MongoDBMode:
-      settings = MongoDBSettings(mode=mode, tls_allow_invalid_certificates=False)
+      settings = MongoDBSettings(
+        mode=mode, tls_allow_invalid_certificates=False, **kwargs_for(mode)
+      )
       assert settings.tls_allow_invalid_certificates is False
 
 

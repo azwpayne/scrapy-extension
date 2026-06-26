@@ -1,4 +1,4 @@
-"""Round 9a — SV1 + SV5 settings-validation tests (RED → GREEN).
+"""Round 9a/9b — settings-validation tests (RED → GREEN).
 
 This file pins parse-time rejection of invalid values for:
 
@@ -9,13 +9,20 @@ This file pins parse-time rejection of invalid values for:
 - SV5 (5 fields): empty-string ``host`` gaps and one unbounded int
   (``MemcachedSettings.port``) get pydantic ``Field`` constraints
   (``min_length``, ``ge``/``le``).
+- SV2 (round 9b): mode-conditional ``model_validator(mode="after")`` rules
+  raise ``ConfigurationError`` when a mode-specific required field is missing
+  (MongoDB REPLICA_SET/ATLAS, Kafka CONFLUENT, RabbitMQ CLUSTER/MIRRORED_QUEUES).
+- SV4 (round 9b): URL/scheme format guards raise ``ConfigurationError`` for
+  bad schemes/patterns (MongoDB URI, Pulsar service_url, RocketMQ namesrv,
+  ElasticSearch hosts, SQS/DynamoDB region_name).
 
-Honest TDD: each test constructs with the INVALID input and asserts
-``ValidationError`` post-fix. No ``xfail`` / ``skip`` / weakening.
+Honest TDD: each test constructs with the INVALID input and asserts the
+project's ``ConfigurationError`` (SV2/SV4) or pydantic ``ValidationError``
+(SV1/SV5) post-fix. No ``xfail`` / ``skip`` / weakening. ``# type:
+ignore[arg-type]`` is used ONLY where intentionally passing invalid input
+(mirror the SV1 reject-test pattern).
 
-Scope note: SV2/SV3/SV4 (mode-conditional, cross-field, URL-scheme validators)
-land in a later round — they raise ``ConfigurationError``, not
-``ValidationError``, so they are out of scope here.
+Scope note: SV3 (security cross-field) lands in a separate round.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.settings import (
   KafkaSettings,
   MemcachedSettings,
@@ -32,6 +40,13 @@ from scrapy_extension.settings import (
   RedisSettings,
 )
 from scrapy_extension.settings.base import Settings
+from scrapy_extension.settings.dynamodb import DynamoDBSettings
+from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
+from scrapy_extension.settings.kafka import KafkaMode
+from scrapy_extension.settings.mongodb import MongoDBMode
+from scrapy_extension.settings.rabbitmq import RabbitMQMode
+from scrapy_extension.settings.rocketmq import RocketMQSettings
+from scrapy_extension.settings.sqs import SqsSettings
 
 # ---------------------------------------------------------------------------
 # SV1 — Literal enum types (10 fields)
@@ -276,3 +291,317 @@ class TestBaseRetryAttemptsCap:
     """`21` is above the cap — must reject."""
     with pytest.raises(ValidationError):
       Settings(retry_attempts=21)
+
+
+# ---------------------------------------------------------------------------
+# SV2 — Mode-conditional required-field validators (round 9b)
+# ---------------------------------------------------------------------------
+# Each validator mirrors the existing Redis SENTINEL pattern (now upgraded to
+# raise the project's ``ConfigurationError`` with ``setting_name=``). Honest
+# TDD: construct with the mode-but-missing-required-field and assert
+# ``ConfigurationError`` naming the missing field.
+
+
+class TestMongoDBModeConditional:
+  """MongoDBSettings SV2 mode-conditional validators."""
+
+  def test_replica_set_requires_replica_set_name(self) -> None:
+    """REPLICA_SET mode without ``replica_set_name`` (and no ``?replicaSet=``
+    in URI) must fail fast — driver otherwise can't find the RS."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(mode=MongoDBMode.REPLICA_SET)
+    assert exc_info.value.setting_name == "replica_set_name"
+    assert "replica_set_name" in str(exc_info.value)
+
+  def test_replica_set_accepts_uri_with_replicaset_query(self) -> None:
+    """REPLICA_SET mode + URI carrying ``?replicaSet=`` is valid (no name)."""
+    s = MongoDBSettings(
+      mode=MongoDBMode.REPLICA_SET,
+      uri="mongodb://fallback-host:27017/?replicaSet=existing",
+    )
+    assert s.replica_set_name is None  # URI hint satisfies the requirement
+
+  def test_replica_set_accepts_explicit_name(self) -> None:
+    """REPLICA_SET mode + explicit ``replica_set_name`` is valid."""
+    s = MongoDBSettings(
+      mode=MongoDBMode.REPLICA_SET, replica_set_name="rs0"
+    )
+    assert s.replica_set_name == "rs0"
+
+  def test_atlas_requires_srv_uri_or_cluster_name(self) -> None:
+    """ATLAS mode with plain ``mongodb://`` URI and no ``atlas_cluster_name``
+    must fail fast — Atlas resolves brokers via DNS SRV (``+srv``)."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(
+        mode=MongoDBMode.ATLAS, uri="mongodb://localhost:27017"
+      )
+    assert exc_info.value.setting_name == "atlas_cluster_name"
+
+  def test_atlas_accepts_srv_uri(self) -> None:
+    """ATLAS mode + ``mongodb+srv://`` URI is valid."""
+    s = MongoDBSettings(
+      mode=MongoDBMode.ATLAS,
+      uri="mongodb+srv://cluster0.example.mongodb.net",
+    )
+    assert s.uri.startswith("mongodb+srv://")
+
+
+class TestKafkaModeConditional:
+  """KafkaSettings SV2 CONFLUENT mode validator."""
+
+  def test_confluent_requires_api_key_and_secret(self) -> None:
+    """CONFLUENT mode without ``confluent_api_key``/``confluent_api_secret``
+    must fail fast — silent PLAINTEXT-localhost fallback today."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(mode=KafkaMode.CONFLUENT)
+    # The first missing field is named.
+    assert exc_info.value.setting_name in {
+      "confluent_api_key",
+      "confluent_api_secret",
+    }
+    msg = str(exc_info.value)
+    assert "confluent_api_key" in msg
+    assert "confluent_api_secret" in msg
+
+  def test_confluent_rejects_key_without_secret(self) -> None:
+    """CONFLUENT + key but no secret must reject (incomplete credentials)."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        mode=KafkaMode.CONFLUENT,
+        confluent_api_key="key",  # type: ignore[arg-type]
+        confluent_api_secret=None,
+      )
+    assert exc_info.value.setting_name == "confluent_api_secret"
+
+  def test_confluent_accepts_key_and_secret(self) -> None:
+    """CONFLUENT + key + secret is valid (the intended Confluent Cloud path)."""
+    s = KafkaSettings(
+      mode=KafkaMode.CONFLUENT,
+      confluent_api_key="key",  # type: ignore[arg-type]
+      confluent_api_secret="secret",  # type: ignore[arg-type]
+    )
+    assert s.confluent_api_key is not None
+
+
+class TestRabbitMQModeConditional:
+  """RabbitMQSettings SV2 CLUSTER/MIRRORED_QUEUES validators."""
+
+  def test_cluster_requires_cluster_nodes(self) -> None:
+    """CLUSTER mode without ``cluster_nodes`` must fail fast — operator asked
+    for a cluster but only one host:port is wired."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      RabbitMQSettings(
+        username="u", password="p", mode=RabbitMQMode.CLUSTER
+      )
+    assert exc_info.value.setting_name == "cluster_nodes"
+
+  def test_cluster_accepts_cluster_nodes(self) -> None:
+    """CLUSTER mode + ``cluster_nodes`` is valid."""
+    s = RabbitMQSettings(
+      username="u",
+      password="p",
+      mode=RabbitMQMode.CLUSTER,
+      cluster_nodes=["node2:5672", "node3:5672"],
+    )
+    assert len(s.cluster_nodes) == 2
+
+  def test_mirrored_queues_requires_ha_mode(self) -> None:
+    """MIRRORED_QUEUES mode without ``ha_mode`` must fail fast — connect path
+    silently skips HA policy setup otherwise."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      RabbitMQSettings(
+        username="u", password="p", mode=RabbitMQMode.MIRRORED_QUEUES
+      )
+    assert exc_info.value.setting_name == "ha_mode"
+
+  def test_mirrored_queues_accepts_ha_mode_without_cluster_nodes(self) -> None:
+    """MIRRORED_QUEUES + ``ha_mode`` is valid even without ``cluster_nodes``
+    (single-node-mirrored is a supported dev topology — backend uses
+    ``host:port``). Pins the no-API-break scope decision."""
+    s = RabbitMQSettings(
+      username="u",
+      password="p",
+      mode=RabbitMQMode.MIRRORED_QUEUES,
+      ha_mode="all",
+    )
+    assert s.ha_mode == "all"
+
+
+# ---------------------------------------------------------------------------
+# SV4 — URL/scheme format guards (round 9b)
+# ---------------------------------------------------------------------------
+
+
+class TestMongoDBUriScheme:
+  """MongoDBSettings.uri SV4 scheme guard."""
+
+  def test_uri_rejects_bare_host_port(self) -> None:
+    """``uri="localhost:27017"`` must reject — opaque InvalidURI today."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(uri="localhost:27017")  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "uri"
+
+  def test_uri_rejects_empty_string(self) -> None:
+    """``uri=""`` must reject (rejected by the field validator)."""
+    with pytest.raises(ConfigurationError):
+      MongoDBSettings(uri="")  # type: ignore[arg-type]
+
+  @pytest.mark.parametrize(
+    "uri",
+    [
+      "mongodb://localhost:27017",
+      "mongodb+srv://cluster0.example.mongodb.net",
+      "mongodb://user:pass@host:27017/?replicaSet=rs0",
+    ],
+  )
+  def test_uri_accepts_valid_schemes(self, uri: str) -> None:
+    """Valid ``mongodb://`` and ``mongodb+srv://`` URIs stay accepted."""
+    assert MongoDBSettings(uri=uri).uri == uri
+
+
+class TestPulsarServiceUrlScheme:
+  """PulsarSettings.service_url SV4 scheme guard."""
+
+  def test_service_url_rejects_bare_host_port(self) -> None:
+    """``service_url="broker:6650"`` must reject — opaque ValueError today."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarSettings(service_url="broker:6650")  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "service_url"
+
+  def test_service_url_rejects_http_scheme(self) -> None:
+    """``http://`` is not a Pulsar scheme — must reject."""
+    with pytest.raises(ConfigurationError):
+      PulsarSettings(service_url="http://broker:6650")  # type: ignore[arg-type]
+
+  def test_service_url_rejects_empty(self) -> None:
+    """Empty string must reject."""
+    with pytest.raises(ConfigurationError):
+      PulsarSettings(service_url="")  # type: ignore[arg-type]
+
+  @pytest.mark.parametrize(
+    "url",
+    ["pulsar://localhost:6650", "pulsar+ssl://broker:6651"],
+  )
+  def test_service_url_accepts_valid_schemes(self, url: str) -> None:
+    """Valid ``pulsar://`` and ``pulsar+ssl://`` URLs stay accepted."""
+    assert PulsarSettings(service_url=url).service_url == url
+
+
+class TestRocketMQNamesrvFormat:
+  """RocketMQSettings.namesrv_address SV4 ``host:port`` guard."""
+
+  def test_namesrv_rejects_scheme_prefix(self) -> None:
+    """``http://namesrv:9876`` must reject — client wants bare ``host:port``."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      RocketMQSettings(namesrv_address="http://namesrv:9876")  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "namesrv_address"
+
+  def test_namesrv_rejects_bare_host(self) -> None:
+    """``localhost`` (no port) must reject."""
+    with pytest.raises(ConfigurationError):
+      RocketMQSettings(namesrv_address="localhost")  # type: ignore[arg-type]
+
+  def test_namesrv_rejects_non_numeric_port(self) -> None:
+    """``host:abc`` must reject (port must be digits)."""
+    with pytest.raises(ConfigurationError):
+      RocketMQSettings(namesrv_address="namesrv:abc")  # type: ignore[arg-type]
+
+  def test_namesrv_rejects_empty(self) -> None:
+    """Empty string must reject."""
+    with pytest.raises(ConfigurationError):
+      RocketMQSettings(namesrv_address="")  # type: ignore[arg-type]
+
+  @pytest.mark.parametrize(
+    "addr",
+    ["localhost:9876", "rocketmq-cluster:9876", "10.0.0.1:9876"],
+  )
+  def test_namesrv_accepts_valid_host_port(self, addr: str) -> None:
+    """Valid ``host:port`` values stay accepted (incl. DNS, IPv4)."""
+    assert RocketMQSettings(namesrv_address=addr).namesrv_address == addr
+
+
+class TestElasticSearchHostsScheme:
+  """ElasticSearchSettings.hosts SV4 scheme guard (no-creds case)."""
+
+  def test_hosts_rejects_bare_host_port(self) -> None:
+    """``hosts=["localhost:9200"]`` must reject — opaque transport error today
+    (elasticsearch-py does not infer a default scheme)."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(hosts=["localhost:9200"])  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "hosts"
+
+  def test_hosts_rejects_empty_entry(self) -> None:
+    """Empty string in ``hosts`` must reject."""
+    with pytest.raises(ConfigurationError):
+      ElasticSearchSettings(hosts=[""])  # type: ignore[arg-type]
+
+  def test_hosts_rejects_any_bad_entry_in_mixed_list(self) -> None:
+    """One bad entry in a mixed list must reject (reports the bad entries)."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(
+        hosts=["https://good:9200", "bad:9200"]  # type: ignore[arg-type]
+      )
+    assert exc_info.value.setting_name == "hosts"
+    assert "bad:9200" in str(exc_info.value)
+
+  @pytest.mark.parametrize(
+    "hosts",
+    [
+      ["http://localhost:9200"],
+      ["https://es.example.com:9200"],
+      ["http://h1:9200", "https://h2:9200"],
+    ],
+  )
+  def test_hosts_accepts_valid_schemes(self, hosts: list[str]) -> None:
+    """All-valid ``http://`` / ``https://`` lists stay accepted."""
+    assert ElasticSearchSettings(hosts=hosts).hosts == hosts
+
+
+class TestAwsRegionNameFormat:
+  """SQS + DynamoDB ``region_name`` SV4 regex guard.
+
+  Catches structural typos (missing parts, wrong casing, extra suffixes,
+  empty). Note: the chosen regex ``^[a-z]{2}-[a-z]+-\\d+$`` cannot catch
+  same-shape word typos like ``us-eat-1`` (intended ``us-east-1``) because
+  ``eat`` is also valid ``[a-z]+`` — that requires a known-region allowlist,
+  which is out of SV4 scope (and would break on new AWS regions). The cases
+  below are the genuine structural catches.
+  """
+
+  @pytest.mark.parametrize(
+    "bad_region",
+    ["US-EAST-1", "us-east", "us-east-1-extra", "region1", "", "us-east-one"],
+  )
+  def test_sqs_region_rejects_invalid(self, bad_region: str) -> None:
+    """Structurally-malformed region names must reject at config time."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      SqsSettings(region_name=bad_region)  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "region_name"
+
+  @pytest.mark.parametrize(
+    "bad_region",
+    ["US-EAST-1", "us-east", ""],
+  )
+  def test_dynamodb_region_rejects_invalid(self, bad_region: str) -> None:
+    """Structurally-malformed region names must reject at config time."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      DynamoDBSettings(region_name=bad_region)  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "region_name"
+
+  @pytest.mark.parametrize(
+    "good_region",
+    ["us-east-1", "us-west-2", "ap-southeast-2", "eu-central-1", "me-central-1"],
+  )
+  def test_sqs_region_accepts_valid(self, good_region: str) -> None:
+    """Valid AWS region names stay accepted (incl. multi-word middle)."""
+    assert SqsSettings(region_name=good_region).region_name == good_region
+
+  @pytest.mark.parametrize(
+    "good_region",
+    ["us-east-1", "ap-southeast-3", "me-central-1"],
+  )
+  def test_dynamodb_region_accepts_valid(self, good_region: str) -> None:
+    """Valid AWS region names stay accepted."""
+    assert (
+      DynamoDBSettings(region_name=good_region).region_name == good_region
+    )

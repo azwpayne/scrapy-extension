@@ -10,11 +10,13 @@ from __future__ import annotations
 from enum import Enum
 from typing import ClassVar, Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+
+_VALID_MONGO_SCHEMES: tuple[str, ...] = ("mongodb://", "mongodb+srv://")
 
 
 class MongoDBMode(str, Enum):
@@ -255,4 +257,76 @@ class MongoDBSettings(BaseSettings):
         setting_name="tls_allow_invalid_certificates",
         setting_value=True,
       )
+    return self
+
+  @field_validator("uri")
+  @classmethod
+  def _validate_uri_scheme(cls, v: str) -> str:
+    """SV4: ``uri`` must start with ``mongodb://`` or ``mongodb+srv://``.
+
+    A bare ``host:port`` or empty string otherwise surfaces as an opaque
+    ``InvalidURI`` / ``ConfigurationError`` at ``MongoClient`` construction.
+    ``min_length=1`` rejects the empty string at the Field level; this
+    validator guards the scheme. ``mongodb+srv://`` is required for Atlas
+    (DNS SRV records).
+
+    Raises:
+        ConfigurationError: if ``uri`` does not start with a valid scheme.
+    """
+    if not v or not v.lower().startswith(_VALID_MONGO_SCHEMES):
+      raise ConfigurationError(
+        (
+          "uri must start with 'mongodb://' or 'mongodb+srv://'. "
+          f"Got uri={v!r}."
+        ),
+        setting_name="uri",
+        setting_value=v,
+      )
+    return v
+
+  @model_validator(mode="after")
+  def _validate_mode_requirements(self) -> Self:
+    """SV2: mode-specific required fields for REPLICA_SET and ATLAS.
+
+    - REPLICA_SET: requires ``replica_set_name`` OR a ``uri`` that already
+      carries a ``?replicaSet=`` query (the driver-recognized way to declare
+      the RS in the URI). This preserves the documented URI-verbatim fallback
+      (mongodb.py:_connect_replica_set) while catching the genuine footgun
+      (REPLICA_SET mode with neither name nor URI hint → opaque driver error).
+    - ATLAS: requires ``mongodb+srv://`` in ``uri`` OR an explicit
+      ``atlas_cluster_name``. Without ``+srv``, Atlas DNS SRV resolution
+      silently fails.
+
+    Mirrors the Redis SENTINEL validator (raise, not warn). STANDALONE and
+    SHARDED_CLUSTER are unaffected (SHARDED_CLUSTER uses mongos routers in
+    the URI; no extra hint needed).
+
+    Raises:
+        ConfigurationError: if a mode-specific required field is missing.
+    """
+    if self.mode == MongoDBMode.REPLICA_SET:
+      uri_has_rs = "replicaSet=" in self.uri
+      if not self.replica_set_name and not uri_has_rs:
+        raise ConfigurationError(
+          (
+            "MongoDB REPLICA_SET mode requires 'replica_set_name' to be set, "
+            "or a uri that already carries a '?replicaSet=...' query. "
+            f"Got replica_set_name={self.replica_set_name!r}, "
+            f"uri={self.uri!r}."
+          ),
+          setting_name="replica_set_name",
+          setting_value=self.replica_set_name,
+        )
+    elif self.mode == MongoDBMode.ATLAS:
+      uri_is_srv = self.uri.lower().startswith("mongodb+srv://")
+      if not uri_is_srv and not self.atlas_cluster_name:
+        raise ConfigurationError(
+          (
+            "MongoDB ATLAS mode requires a 'mongodb+srv://' uri OR "
+            "'atlas_cluster_name' to be set (Atlas resolves brokers via DNS "
+            f"SRV records). Got uri={self.uri!r}, atlas_cluster_name={self.atlas_cluster_name!r}."
+          ),
+          setting_name="atlas_cluster_name",
+          setting_value=self.atlas_cluster_name,
+        )
     return self

@@ -492,10 +492,18 @@ def test_mongodb_backend_replica_set_with_members(mocker):
 
 
 def test_mongodb_backend_replica_set_without_members(mocker):
-  """Test _connect_replica_set falls back to config.uri when no replica_set_members."""
+  """Test _connect_replica_set falls back to config.uri when no replica_set_members.
+
+  R9-b SV2: REPLICA_SET mode requires ``replica_set_name`` (or a URI carrying
+  ``?replicaSet=``). This test pins the no-members URI fallback, so the name
+  is supplied to satisfy the validator without changing the fallback intent.
+  """
   from scrapy_extension.settings import MongoDBMode
 
-  config = MongoDBSettings(mode=MongoDBMode.REPLICA_SET)
+  config = MongoDBSettings(
+    mode=MongoDBMode.REPLICA_SET,
+    replica_set_name="rs0",
+  )
   backend = MongoDBBackend(config)
 
   mock_client = mocker.MagicMock()

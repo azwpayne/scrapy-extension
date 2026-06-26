@@ -14,6 +14,8 @@ from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
 
+_VALID_ES_SCHEMES: tuple[str, ...] = ("http://", "https://")
+
 
 class ElasticSearchMode(str, Enum):
   """ElasticSearch deployment modes.
@@ -128,6 +130,35 @@ class ElasticSearchSettings(BaseSettings):
     default="scrapy_storage",
     description="Index name for storage operations",
   )
+
+  @model_validator(mode="after")
+  def _validate_hosts_scheme(self) -> Self:
+    """SV4: every ``hosts`` entry must start with ``http://`` or ``https://``.
+
+    SEC-3 (round 6) guards ``http://`` + credentials (cleartext leak); this
+    validator guards the scheme itself for the no-creds case. A bare
+    ``localhost:9200`` or ``es-cluster`` otherwise surfaces as an opaque
+    transport error inside the elasticsearch-py client (it does not infer a
+    default scheme). Empty strings are rejected.
+
+    Raises:
+        ConfigurationError: if any host entry lacks a valid scheme.
+    """
+    bad = [
+      host
+      for host in self.hosts
+      if not host or not host.lower().startswith(_VALID_ES_SCHEMES)
+    ]
+    if bad:
+      raise ConfigurationError(
+        (
+          "each hosts entry must start with 'http://' or 'https://'. "
+          f"Got invalid entries={bad!r} (full hosts={self.hosts!r})."
+        ),
+        setting_name="hosts",
+        setting_value=self.hosts,
+      )
+    return self
 
   @model_validator(mode="after")
   def validate_mode_requirements(self) -> ElasticSearchSettings:

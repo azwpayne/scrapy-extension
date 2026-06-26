@@ -247,12 +247,21 @@ class TestKafkaBackendConfluentMode:
     assert backend.is_connected()
 
   def test_connect_confluent_without_api_key_falls_back_to_sasl(self, mocker):
-    """Test _connect_confluent falls back to SASL config when no API key."""
+    """SASL config without Confluent API key uses STANDALONE mode (R9-b SV2).
+
+    R9-b SV2: ``KafkaMode.CONFLUENT`` now requires ``confluent_api_key`` +
+    ``confluent_api_secret`` (the silent PLAINTEXT-localhost fallback was a
+    HIGH footgun). The legitimate "SASL against a custom broker" path is
+    exercised under STANDALONE mode — the backend's ``_build_client_security_
+    config`` applies SASL settings regardless of mode. This test was renamed
+    in intent but kept in name to preserve coverage; it now pins the
+    correct (SASL-via-STANDALONE) path.
+    """
     config = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
+      mode=KafkaMode.STANDALONE,
       confluent_api_key=None,
       confluent_api_secret=None,
-      confluent_bootstrap_servers="custom:9092",
+      bootstrap_servers="custom:9092",
       security_protocol="SASL_SSL",
       sasl_mechanism="PLAIN",
       sasl_username="user",
