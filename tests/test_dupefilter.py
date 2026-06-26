@@ -1,9 +1,12 @@
 """Tests for BackendDupeFilter component."""
 
+import logging
+
 import pytest
 from scrapy.http import Request
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 
 
 class TestBackendDupeFilterInit:
@@ -691,3 +694,162 @@ class TestBackendDupeFilterSpiderKeyTemplating:
 
     call_args = mock_set_backend.add.call_args
     assert call_args[0][0] == "static:dupefilter"
+
+
+class TestBackendDupeFilterCuckooFilterFullDegradation:
+  """R7-A (Theme C HIGH): cuckoo filter full → graceful degradation, no crash.
+
+  Pre-fix (RED): ``CuckooMembershipFilter.add`` raises ``RuntimeError`` once
+  the filter exhausts ``_MAX_KICKS`` (filter full). The dupefilter layer only
+  caught ``NotImplementedError``, so the ``RuntimeError`` propagated through
+  ``scheduler.enqueue_request``'s hot path and crashed the spider the first
+  time the filter filled past capacity. Post-fix (GREEN): the dupefilter
+  catches ``RuntimeError`` in a separate arm, logs a warn-once, bumps
+  ``dupefilter/filter_full``, and treats the item as NOT-seen (degrade by
+  allowing the enqueue — dedup stays effective within capacity, overflow
+  items pass through).
+  """
+
+  @pytest.fixture(autouse=True)
+  def _reset_filter_full_warned(self):
+    """Reset the module-level warn-once flag before each test (isolation).
+
+    ``_filter_full_warned`` is process-global (mirrors factory.py ``_warned``);
+    without a reset, the first test to trip it would pre-arm the rest and
+    hide a broken warn-once contract.
+    """
+    from scrapy_extension.dupefilter import dupefilter as dupefilter_module
+
+    original = dupefilter_module._filter_full_warned
+    dupefilter_module._filter_full_warned = False
+    yield
+    dupefilter_module._filter_full_warned = original
+
+  def _make_tiny_cuckoo_dupefilter(self, mock_connection_manager, mocker):
+    """Build a dupefilter wrapping a TINY cuckoo filter (capacity=4).
+
+    Tuned so ``_MAX_KICKS`` exhausts after a handful of distinct inserts past
+    capacity — reproduces the filter-full ``FilterFull`` signal reliably
+    without a huge insert loop. Returns ``(dupefilter, monitor)``; the monitor
+    is a Mock so ``monitor.on_filter_full`` is assertable.
+    """
+    cuckoo = CuckooMembershipFilter(capacity=4, error_rate=0.01)
+    monitor = mocker.Mock(name="monitor")
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      key="cuckoo:full",
+      membership_filter=cuckoo,
+      monitor=monitor,
+    )
+    return dupefilter, monitor
+
+  def test_filter_full_does_not_crash(self, mock_connection_manager, mocker):
+    """RED/GREEN: distinct inserts past capacity must not raise.
+
+    Pre-fix: the cuckoo ``RuntimeError`` propagates → test fails RED.
+    Post-fix: dupefilter swallows it and treats the request as not-seen.
+    """
+    dupefilter, _monitor = self._make_tiny_cuckoo_dupefilter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+
+    # Insert well past capacity (capacity=4, bucket=4, ~85% load target →
+    # _MAX_KICKS exhausts after a modest number of distinct items).
+    for i in range(50):
+      request = Request(url=f"https://example.com/page/{i}")
+      # Must not raise — degradation treats overflow as not-seen.
+      result = dupefilter.request_seen(request)
+      assert isinstance(result, bool)
+
+  def test_filter_full_increments_stat(self, mock_connection_manager, mocker):
+    """The monitor's ``on_filter_full`` hook fires when degradation triggers.
+
+    The dupefilter emits ``monitor.on_filter_full()`` (the monitor contract),
+    not a private-attribute stat bump — ``ScrapyStatsMonitor`` translates it
+    to ``dupefilter/filter_full`` (covered in ``test_monitor.py``).
+    """
+    dupefilter, monitor = self._make_tiny_cuckoo_dupefilter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+
+    # Force the filter past capacity so the FilterFull signal fires.
+    for i in range(50):
+      dupefilter.request_seen(Request(url=f"https://example.com/page/{i}"))
+
+    # The monitor hook fired at least once — proving the degradation path ran.
+    monitor.on_filter_full.assert_called()
+
+  def test_filter_full_warns_once(self, mock_connection_manager, mocker, caplog):
+    """Warn-once contract: filter-full triggered twice logs exactly once.
+
+    Mirrors the factory ``_warned`` pattern — a long-running crawl must not
+    have its log spammed by per-request filter-full signals.
+    """
+    dupefilter, _monitor = self._make_tiny_cuckoo_dupefilter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+      for i in range(100):
+        dupefilter.request_seen(Request(url=f"https://example.com/p/{i}"))
+
+    warning_records = [
+      r for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    filter_full_warnings = [
+      r for r in warning_records if "filter_full" in r.getMessage()
+    ]
+    assert len(filter_full_warnings) == 1, (
+      f"expected exactly one filter_full warning, got {len(filter_full_warnings)}"
+    )
+
+  def test_no_false_negative_within_capacity(self, mock_connection_manager, mocker):
+    """Green-path sanity: within capacity, dedup still works (seen=True on repeat).
+
+    Ensures the degradation does not accidentally fire early — cuckoo's
+    never-false-negative-within-capacity contract is preserved.
+    """
+    cuckoo = CuckooMembershipFilter(capacity=200, error_rate=0.01)
+    monitor = mocker.Mock(name="monitor")
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      key="cuckoo:green",
+      membership_filter=cuckoo,
+      monitor=monitor,
+    )
+    dupefilter.open()
+
+    # Within capacity — first sight is not-seen, second is seen.
+    request = Request(url="https://example.com/within-cap")
+    assert dupefilter.request_seen(request) is False
+    assert dupefilter.request_seen(request) is True
+    # filter_full hook must NOT have fired in the green path.
+    monitor.on_filter_full.assert_not_called()
+
+  def test_filter_full_treats_item_as_not_seen(self, mock_connection_manager, mocker):
+    """On filter-full, the overflowing request is treated as NOT-seen.
+
+    Dedup stays effective within capacity; overflow items are allowed
+    through (may re-fetch) — strictly better than crashing the crawl.
+    """
+    dupefilter, monitor = self._make_tiny_cuckoo_dupefilter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+
+    # Drive the filter decisively past capacity so the FilterFull arm fires.
+    for i in range(50):
+      req = Request(url=f"https://example.com/seed/{i}")
+      dupefilter.request_seen(req)
+
+    # An overflow request must be reported as NOT-seen (allowed through) —
+    # AND monitor.on_filter_full must have fired at least once along the way,
+    # proving the degradation path actually fired before we got here.
+    overflow_req = Request(url="https://example.com/overflow/unique")
+    result = dupefilter.request_seen(overflow_req)
+    assert result is False
+    monitor.on_filter_full.assert_called()

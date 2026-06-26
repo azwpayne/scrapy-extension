@@ -53,6 +53,7 @@ class Monitor:
   - ``on_dedup_miss(key)`` — request fingerprint was newly recorded.
   - ``on_queue_depth(queue_name, depth)`` — current pending depth (gauge).
   - ``on_store(key)`` — after a successful storage write (pipeline lane).
+  - ``on_filter_full()`` — membership filter at capacity; caller degrades.
   - ``on_error(operation, error)`` — an operation raised; record per-op.
   """
 
@@ -101,6 +102,17 @@ class Monitor:
 
     Args:
         key: The storage key that was written.
+    """
+
+  def on_filter_full(self) -> None:
+    """Record that the membership filter reported it is at capacity.
+
+    Emitted by the dupefilter when a bounded-capacity filter (cuckoo)
+    raises :class:`~scrapy_extension.dupefilter.filters.base.FilterFull` and
+    the dupefilter degrades by treating the overflow request as not-seen.
+    Lets a stats monitor count ``dupefilter/filter_full`` occurrences via the
+    monitor contract — without the dupefilter reaching into its private
+    stats attribute.
     """
 
   def on_error(self, operation: str, error: BaseException) -> None:

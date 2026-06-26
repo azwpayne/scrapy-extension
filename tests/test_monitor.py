@@ -55,6 +55,7 @@ class TestNullMonitor:
       ("on_dedup_miss", {"key": "fp"}),
       ("on_queue_depth", {"queue_name": "q", "depth": 5}),
       ("on_store", {"key": "k"}),
+      ("on_filter_full", {}),
       ("on_error", {"operation": "push", "error": RuntimeError("x")}),
     ],
   )
@@ -74,6 +75,7 @@ class TestNullMonitor:
       "on_dedup_miss",
       "on_queue_depth",
       "on_store",
+      "on_filter_full",
       "on_error",
     ):
       assert callable(getattr(monitor, hook))
@@ -126,6 +128,14 @@ class TestScrapyStatsMonitor:
     monitor, stats = self._monitor()
     monitor.on_store("k")
     assert stats.get_value("pipeline/store_count") == 1
+
+  def test_on_filter_full_increments_filter_full_stat(self):
+    """Dupefilter emits on_filter_full when a cuckoo filter hits capacity."""
+    monitor, stats = self._monitor()
+    monitor.on_filter_full()
+    assert stats.get_value("dupefilter/filter_full") == 1
+    monitor.on_filter_full()
+    assert stats.get_value("dupefilter/filter_full") == 2
 
   def test_on_error_increments_per_operation_stat(self):
     monitor, stats = self._monitor()

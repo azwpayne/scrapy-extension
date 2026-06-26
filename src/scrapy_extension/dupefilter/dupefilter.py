@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Protocol
 
-from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import Monitor
@@ -34,6 +34,14 @@ if TYPE_CHECKING:
     def fingerprint(self, request: Request) -> bytes: ...
 
 logger = logging.getLogger(__name__)
+
+# Module-level warn-once flag for the cuckoo-filter-full degradation (Theme C,
+# R7-A). Mirrors the factory.py:31 ``_warned`` pattern so a long-running crawl
+# doesn't have its log spammed by per-request filter-full signals: the first
+# time the cuckoo filter exhausts ``_MAX_KICKS`` we warn once per process,
+# bump ``dupefilter/filter_full`` on every occurrence, and treat the overflow
+# item as NOT-seen (allow enqueue). Tests reset this for isolation.
+_filter_full_warned: bool = False
 
 
 class BackendDupeFilter:
@@ -292,6 +300,27 @@ class BackendDupeFilter:
         "Configured backend does not support set/duplicate filtering; "
         "use a backend with SetBackend or disable BackendDupeFilter."
       ) from exc
+    except FilterFull:
+      # Membership-filter-full graceful degradation (Theme C, R7-A).
+      #
+      # ``CuckooMembershipFilter.add`` raises ``FilterFull`` once it exhausts
+      # ``_MAX_KICKS`` (filter past capacity) — a correct low-level signal.
+      # For a crawler, a dead spider is worse than a duplicate fetch: Scrapy
+      # and the downstream pipeline handle occasional duplicates, but a crashed
+      # long-running crawl loses all in-flight progress. So at this layer we
+      # degrade gracefully: warn once per process (module-level
+      # ``_filter_full_warned``, mirrors factory.py:31 ``_warned``), emit
+      # ``monitor.on_filter_full()`` so a wired stats collector increments
+      # ``dupefilter/filter_full`` via the monitor contract (no private-attr
+      # reach), and treat the overflow item as NOT-seen (allow enqueue). Dedup
+      # stays effective within capacity; overflow items may re-fetch — strictly
+      # better than crashing. This arm is intentionally separate from the
+      # ``NotImplementedError`` arm above (different meaning: unsupported vs.
+      # full). ``FilterFull`` is caught by TYPE (not by string-matching the
+      # message), so the cuckoo layer is free to reword its message without
+      # silently disabling this guard.
+      self._handle_filter_full(fingerprint)
+      return False
 
     # add() returns True when the item was newly added; a duplicate maps to False.
     seen = not added
@@ -300,6 +329,36 @@ class BackendDupeFilter:
     else:
       self._monitor.on_dedup_miss(fingerprint)
     return seen
+
+  def _handle_filter_full(self, fingerprint: str) -> None:
+    """Degrade gracefully when the membership filter reports it is full.
+
+    Warn once per process (module-level ``_filter_full_warned``), emit
+    ``monitor.on_filter_full()`` so a wired stats collector increments
+    ``dupefilter/filter_full``, and emit a dedup-miss hook so observability
+    stays consistent with the not-seen outcome the caller returns.
+
+    Args:
+        fingerprint: The request fingerprint that triggered the overflow.
+    """
+    global _filter_full_warned
+    if not _filter_full_warned:
+      _filter_full_warned = True
+      logger.warning(
+        "Dedup membership filter is full (filter_full); degrading — overflow "
+        "requests will be treated as not-seen and may re-fetch. Increase the "
+        "filter capacity or switch to an exact dedup strategy "
+        "(SCRAPY_DEDUP_STRATEGY=set). This filter_full warning fires once per "
+        "process; subsequent overflows are counted via the "
+        "dupefilter/filter_full stat only."
+      )
+    # Count the degradation via the monitor contract — ScrapyStatsMonitor
+    # increments ``dupefilter/filter_full``; NullMonitor is a no-op. Replaces
+    # an earlier reach into ``self._monitor._stats`` (private attribute).
+    self._monitor.on_filter_full()
+    # Keep the monitor's dedup-miss accounting consistent with the not-seen
+    # outcome the caller returns for the overflow item.
+    self._monitor.on_dedup_miss(fingerprint)
 
   def request_fingerprint(self, request: Request) -> str:
     """Generate a fingerprint for a request.
