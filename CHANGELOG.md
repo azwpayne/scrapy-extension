@@ -153,3 +153,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 29 unused test dependencies (see Changed: test group trimmed).
 - Orphaned `[tool.pyrefly]` and `[tool.mutmut]` config sections (those
   tools were removed in the test-dep trim).
+
+### Round 8 — forward insight, testing infrastructure, v1.0 SPECs
+
+- **Added:** 4-tier test infrastructure (unit / mock-backend / integration /
+  load-scale), with skip-by-default real-broker suites gated on
+  `SCRAPY_TEST_*` env vars. Multi-backend e2e integration test landed
+  (`tests/integration/test_multi_backend_e2e.py` + `docker-compose.yml`,
+  commit `3cef50c`) — closes v1.0 non-negotiable #3.
+- **Added:** entry-point plugin registration — 3rd-party backends register
+  via `[project.entry-points."scrapy_extension.backends"]`; the bundled 10
+  are statically seeded in `backends/registry.py` as dotted-path strings
+  (lazy-import preserved). See [`docs/backend-plugins.md`](docs/backend-plugins.md).
+- **Added:** backend-plugin author contract documentation.
+- **Added:** `BackendSpiderMixin` shortcut attributes for ElasticSearch +
+  RocketMQ (cloud_id / api_key / namesrv_address / access_key / secret_key).
+- **Added:** `pipeline/storage_skipped` stat counter (distinguishes "no
+  items scraped" from "items silently dropped" on storage-unsupported
+  backends).
+- **Added:** three v1.0-readiness SPECs (`docs/insight/SPEC-round8-tier1.md`,
+  `SPEC-round8-testing.md`, `SPEC-round8-v1readiness.md`,
+  `SPEC-round8-settings-validation.md`) + consolidated execution menu
+  (`docs/insight/EXECUTION-INDEX.md`).
+- **Security (round 6, landed in this arc):** TLS/scheme guards SEC-1..7
+  across `settings/*.py` — `_RedactedStr`, SEC-2 MongoDB insecure-TLS-in-prod
+  rejection, SEC-3 ES cleartext-credentials-over-http rejection, SEC-4
+  LocalStack/AWS `endpoint_url` scheme validation, SEC-7 AWS credential XOR
+  at connect path. See [`SECURITY.md`](SECURITY.md).
+
+### Round 9 — settings validation (SV1–SV5), perf (U4), OOM cap (U5)
+
+- **Added (SV1):** `Literal` enum types for all mode/scheme fields across
+  `settings/{kafka,pulsar,rabbitmq,mongodb}.py` — typos now raise
+  `ConfigurationError` with valid-value enumeration at config time instead
+  of an opaque runtime stack trace.
+- **Added (SV2):** mode-conditional `model_validator`s across
+  `settings/{mongodb,redis,kafka,rabbitmq}.py` — mode-specific required
+  fields (e.g. Redis SENTINEL needs `sentinel_master_name`, MongoDB
+  REPLICA_SET needs `replica_set`) enforced at construction.
+- **Added (SV3, security):** cross-field auth/transport coherence
+  validators across
+  `settings/{kafka,pulsar,redis,mongodb,elasticsearch,sqs,dynamodb}.py` —
+  closes 3 high-severity credential bugs (SASL username without password,
+  TLS cert without key, mismatched auth mode).
+- **Added (SV4):** URL/scheme format guards across
+  `settings/{mongodb,pulsar,rocketmq,elasticsearch,sqs,dynamodb}.py` —
+  malformed host URLs and missing schemes rejected before connect.
+- **Added (SV5):** empty-string + unbounded-int gaps closed across
+  `settings/{memcached,redis,rabbitmq,base}.py` — `Field(ge=…)`,
+  `Field(gt=…)`, and `min_length=1` bounds on user-supplied values.
+- **Added (U4, perf):** `BackendQueue(depth_sample_every=100)` — probes
+  real backend queue depth at most once per 100 pops, reclaiming ~25% of
+  the pop-path RTT budget at default config. Backpressure gates still trip
+  at the right depth; `depth_sample_every=1` restores per-pop behavior.
+  `monitor.on_queue_depth` now emits from the cached sample.
+- **Added (U5, OOM):** `MemoryMembershipFilter(maxsize=1_000_000)` default
+  (was `None` = unbounded; ~366 MB @ 1M entries, ~3.58 GB @ 10M). Explicit
+  `maxsize=None` remains as advanced opt-out. `DelayQueueStrategy(max_held=100_000)`
+  soft-cap warn-once on the in-process holding heap. Configurable via
+  `SCRAPY_DEDUP_MEMORY_MAXSIZE`.
+- **Added:** `_filter_full_warned` warn-once path on `FilterFull` (Cuckoo at
+  capacity) — degrades to passthrough + `dupefilter/filter_full` stat bump
+  via `monitor.on_filter_full()`.
+
+### Round 8d — settings validation SPEC
+
+- **Added:** `docs/insight/SPEC-round8-settings-validation.md` — 34-footgun
+  settings-validation hunt resolved into 5 executable units (SV1–SV5).

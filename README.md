@@ -175,6 +175,49 @@ See [`examples/`](examples) for all deployment modes (Sentinel, Cluster, Atlas, 
 
 **Memcached, DynamoDB**: Storage-only (key-value with TTL). Pair with a queue-capable backend for request distribution.
 
+## Guarantees
+
+What the library contractually promises — and just as importantly, what it does **not**. Read this before relying on any feature in production. Every claim below is backed by code in `src/scrapy_extension/`; follow the linked file anchors to verify.
+
+### Per-feature cross-worker behavior
+
+| Layer | Strategy | Cross-worker safe? | Notes |
+|---|---|---|---|
+| Queue | `passthrough` (default) | Yes | Items live in the backend queue; atomic pop on every backend (`backends/base.py:359`). |
+| Queue | `delay` | Per-process | In-process `heapq`; **lost on crash**. `DelayQueueStrategy.close()` warns; soft-cap `max_held` warns once when exceeded (`queue/strategies/delay.py`). |
+| Queue | `round_robin` | Per-process | Fair dispatch across `request.meta['source']` using a per-worker index. |
+| Queue | `throttle` | Per-process | Effective rate under N workers = `N × (1 / min_interval)`. |
+| Dedup | `set` (default) | Yes — exact | Backend `SADD`/`SISMEMBER` semantics; byte-identical to pre-strategy behavior (`dupefilter/filters/set_filter.py`). |
+| Dedup | `memory` | Per-process | In-process; optional LRU cap via `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000; round-9 U5). |
+| Dedup | `bloom` | Per-process | Pure-stdlib bit-vector; **never produces false negatives** (a seen URL is always reported seen); false-positive rate is configurable. |
+| Dedup | `cuckoo` | Per-process | Pure-stdlib; **never produces false negatives**; supports deletion; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
+| Storage | all storage-capable backends | Yes | Via backend KV+TTL (`backends/base.py:525`). |
+
+**Defaults are distributed-exact.** `set` dedup + `passthrough` queue are safe for multi-worker crawls out of the box. `delay` / `throttle` / `round_robin` / `memory` / `bloom` / `cuckoo` are **per-process opt-in** — safe for single-worker politeness/dedup; for multi-worker politeness or shared probabilistic dedup, run one process per backend or wait for the distributed-strategies roadmap.
+
+### Contractual promises
+
+| Promise | Where enforced |
+|---|---|
+| **Config-time validation.** Invalid settings (bad mode, bad scheme, half-configured AWS creds, insecure-TLS-in-prod, negative backpressure thresholds) raise `ConfigurationError` at startup, not an opaque runtime stack trace. | `settings/base.py`, `settings/{kafka,pulsar,redis,mongodb,elasticsearch,sqs,dynamodb,rocketmq}.py` (round-6 SEC-1..7 + round-9 SV1..SV5) |
+| **Credentials are never logged.** Passwords / SASL tokens / API keys flow through `_RedactedStr`, whose `__repr__` / `__str__` return `***` rather than the raw value. | `backends/_redaction.py:22`, wired into Kafka/RabbitMQ config builders |
+| **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends/base.py:34` (`_json_default`), `backends/base.py:131` (`JSONSerializer`) |
+| **Input names are validated.** Queue / set / index / topic names match `^[a-zA-Z0-9._:-]+$` (topic names a stricter subset); injection-shaped inputs are rejected before use. | `backends/base.py:170` (`KEY_NAME_PATTERN`, `_validate_key_name`) |
+| **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Message-queue backends (Kafka, RabbitMQ) carry a per-message ack token so the *specific* popped message is acked; the scheduler's `from_settings` gate refuses unsafe configs unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py:313` (`QueueBackend` ack contract), `schedule/scheduler.py` |
+| **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | `__init__.py`, `backends/__init__.py`, every `backends/*.py` |
+| **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
+| **Backend capability honesty.** A backend that does not implement `QueueBackend` / `SetBackend` / `StorageBackend` raises `NotImplementedError` on first call — never silently no-ops. The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
+| **`py.typed` marker shipped.** Full type annotations on the public surface; downstream type-checkers consume the shipped typing. | `src/scrapy_extension/py.typed` |
+
+### What is **not** promised
+
+- **Cross-worker behavior of `delay` / `throttle` / `round_robin` / `memory` / `bloom` / `cuckoo` strategies** — they are per-process by design (see table above).
+- **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [`STABILITY.md`](STABILITY.md).
+- **Stability of fresh hooks** — `on_filter_full` (round-7) and `backpressure_pause_at` / `backpressure_resume_at` (round-4) are new; the hook signatures and setting semantics may evolve in a minor bump.
+- **Wire compatibility for the SQS / Memcached / DynamoDB LocalStack paths** — exercised via LocalStack in CI; not certified against every AWS region or Memcached server version.
+
+For the full stability/maturity tiering per backend, see [`STABILITY.md`](STABILITY.md). To report a security issue, see [`SECURITY.md`](SECURITY.md). For what changed in each release, see [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Multi-Backend Coexistence
 
 The three components — **Scheduler** (queue), **DupeFilter** (set), **Pipeline** (storage) — can each bind to a *different* backend. This unlocks hybrid topologies that play to each backend's strengths: a high-throughput queue in Kafka, exact cross-worker dedup in Redis, durable item storage in MongoDB.
