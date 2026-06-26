@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 try:
     from pymongo import ASCENDING, MongoClient
@@ -82,11 +82,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         config: Configuration for MongoDB connection.
     """
     self.config = config
-    self._client: MongoClient | None = None
-    self._db: Database | None = None
-    self._queue_collection: Collection | None = None
-    self._set_collection: Collection | None = None
-    self._storage_collection: Collection | None = None
+    # U8: parameterize pymongo generics — the document shape is backend-defined
+    # (queue docs / set docs / storage docs all carry their own keys), so
+    # ``dict[str, Any]`` is the honest element type rather than a leak.
+    self._client: MongoClient[dict[str, Any]] | None = None
+    self._db: Database[dict[str, Any]] | None = None
+    self._queue_collection: Collection[dict[str, Any]] | None = None
+    self._set_collection: Collection[dict[str, Any]] | None = None
+    self._storage_collection: Collection[dict[str, Any]] | None = None
     # Cache client kwargs to avoid rebuilding on reconnection
     self._client_kwargs: dict[str, Any] | None = None
     # Cache read preference to avoid string manipulation on every call
@@ -455,7 +458,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="pop") from e
     if result:
-      return result["item"]
+      # find_one_and_delete returns Any; the queue doc stores ``item`` as bytes.
+      return cast(bytes, result["item"])
     return None
 
   def queue_len(self, queue_name: str) -> int:
@@ -637,7 +641,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise BackendConnectionError(msg, backend_type="mongodb")
     result = self._storage_collection.find_one({"key": key})
     if result:
-      return result.get("data")
+      # storage doc stores ``data`` as bytes; cast narrows the Any from pymongo.
+      return cast(bytes, result.get("data"))
     return None
 
   def delete(self, key: str) -> bool:

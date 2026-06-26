@@ -23,7 +23,7 @@ import logging
 import random
 import threading
 import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from scrapy_extension.backends.base import (
   BackendType,
@@ -388,7 +388,9 @@ class ConnectionManager:
     )
     backend_cls = _load_object(descriptor.backend_cls_path)
     settings_cls = _load_object(descriptor.settings_cls_path)
-    return backend_cls(settings_cls(**self.settings))
+    # Both loaded objects are dynamically-discovered plugin classes (typed as
+    # ``Any``); cast narrows to the concrete ``Backend`` instance we construct.
+    return cast("Backend", backend_cls(settings_cls(**self.settings)))
 
   def connect(self) -> None:
     """Establish connection with retry logic.

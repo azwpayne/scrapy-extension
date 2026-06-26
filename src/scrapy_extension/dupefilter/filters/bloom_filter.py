@@ -12,6 +12,7 @@ __all__ = ["BloomMembershipFilter"]
 
 import hashlib
 import math
+from collections.abc import Iterator
 
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
 
@@ -64,7 +65,7 @@ class BloomMembershipFilter(MembershipFilter):
     """Number of hash functions (k)."""
     return self._num_hashes
 
-  def _indices(self, item: bytes):
+  def _indices(self, item: bytes) -> Iterator[int]:
     """Yield the k bit positions for ``item`` via double hashing.
 
     Two 64-bit seeds come from a single ``sha256``; the k indices are

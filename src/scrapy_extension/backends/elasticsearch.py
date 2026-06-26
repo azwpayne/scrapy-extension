@@ -6,7 +6,7 @@ import base64
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 try:
     from elasticsearch import (
@@ -490,7 +490,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except TransportError:
       return 0
     else:
-      return resp.get("count", 0)
+      return cast(int, resp.get("count", 0))
 
   def _delete_by_id(self, index: str, doc_id: str) -> bool:
     """Delete document by ID.
@@ -518,7 +518,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     self._delete_by_query(index, {"term": {field: value}})
 
-  def _delete_by_query(self, index: str, query: dict) -> None:
+  def _delete_by_query(self, index: str, query: dict[str, Any]) -> None:
     """Delete all documents matching a query.
 
     Args:

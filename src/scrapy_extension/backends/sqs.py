@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import base64
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 try:
   import boto3
@@ -234,7 +234,7 @@ class SqsBackend(Backend, QueueBackend):
         operation="push",
       ) from e
     self._queue_urls[queue_name] = url
-    return url
+    return cast(str, url)
 
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:

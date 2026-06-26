@@ -34,7 +34,7 @@ class _RedactedStr(str):
 
   __slots__ = ()
 
-  def __repr__(self) -> str:  # type: ignore[override]
+  def __repr__(self) -> str:
     return "<redacted>"
 
 

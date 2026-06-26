@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 try:
     from kafka import KafkaConsumer, KafkaProducer, TopicPartition
@@ -488,7 +488,7 @@ class KafkaBackend(Backend, QueueBackend):
     if record is None:
       return None
     self._last_record = record
-    return record.value
+    return cast(bytes, record.value)
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
@@ -748,7 +748,7 @@ class KafkaBackend(Backend, QueueBackend):
         )
       except KafkaError:
         return 0
-      return total
+      return cast(int, total)
 
     topic_name = f"scrapy-{queue_name}"
     temp_consumer = KafkaConsumer(
@@ -772,7 +772,7 @@ class KafkaBackend(Backend, QueueBackend):
       return 0
     finally:
       temp_consumer.close()
-    return total
+    return cast(int, total)
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.

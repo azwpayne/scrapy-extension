@@ -18,7 +18,7 @@ pymemcache API used (stable):
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 try:
   from pymemcache.client.base import Client as MemcachedClient
@@ -148,7 +148,7 @@ class MemcachedBackend(Backend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      return self._client.get(key)
+      return cast("bytes | None", self._client.get(key))
     except Exception as e:
       logger.warning("Failed to retrieve key %s: %s", key, e)
       return None

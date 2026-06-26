@@ -14,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import ssl
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 try:
     import pika
@@ -660,7 +660,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     except AMQPError as e:
       msg = f"Failed to get queue length for {queue_name}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="queue_len") from e
-    return result.method.message_count
+    return cast(int, result.method.message_count)
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.

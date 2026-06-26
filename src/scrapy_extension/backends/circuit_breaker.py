@@ -359,7 +359,7 @@ def _wrap_bound(breaker: CircuitBreaker, func: Callable[..., Any]) -> Callable[.
   return _wrapped
 
 
-class _QueueBackendProxy(_BackendProxyBase, QueueBackend):  # type: ignore[misc]
+class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
   """Wrap a :class:`QueueBackend`'s hot-path ops under a breaker.
 
   ``queue_len`` is deliberately NOT in the hot path: it is an admin /
@@ -383,14 +383,14 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):  # type: ignore[misc]
   )
 
 
-class _SetBackendProxy(_BackendProxyBase, SetBackend):  # type: ignore[misc]
+class _SetBackendProxy(_BackendProxyBase, SetBackend):
   """Wrap a :class:`SetBackend`'s hot-path ops under a breaker."""
 
   _HOT_PATH = ("add", "contains", "remove")
   _FORWARDED = ("set_len", "clear_set", "connect", "disconnect", "is_connected", "ping")
 
 
-class _StorageBackendProxy(_BackendProxyBase, StorageBackend):  # type: ignore[misc]
+class _StorageBackendProxy(_BackendProxyBase, StorageBackend):
   """Wrap a :class:`StorageBackend`'s hot-path ops under a breaker."""
 
   _HOT_PATH = ("store", "retrieve", "delete")
@@ -412,7 +412,7 @@ class _StorageBackendProxy(_BackendProxyBase, StorageBackend):  # type: ignore[m
 # — so this does not weaken the type contract, it only satisfies ABCMeta's
 # static, class-body-only check.
 for _proxy_cls in (_QueueBackendProxy, _SetBackendProxy, _StorageBackendProxy):
-  _proxy_cls.__abstractmethods__ = frozenset()  # type: ignore[misc,assignment]
+  _proxy_cls.__abstractmethods__ = frozenset()
 
 
 def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueBackend:

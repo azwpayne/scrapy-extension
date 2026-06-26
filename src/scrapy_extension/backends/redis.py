@@ -201,7 +201,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       if self.config.sentinel_username:
         sentinel_kwargs["username"] = self.config.sentinel_username
 
-      self._sentinel = Sentinel(
+      # redis.sentinel.Sentinel ships py.typed but no inline annotations on
+      # __init__/master_for/ClusterNode — these are genuine untyped-third-party
+      # call sites (verified: Sentinel.__init__ has no signature annotations).
+      self._sentinel = Sentinel(  # type: ignore[no-untyped-call]
         sentinel_tuples,
         socket_timeout=self.config.socket_timeout,
         socket_connect_timeout=self.config.socket_connect_timeout,
@@ -211,7 +214,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
 
       # Get master connection through sentinel
-      self._master_client = self._sentinel.master_for(
+      self._master_client = self._sentinel.master_for(  # type: ignore[no-untyped-call]
         self.config.sentinel_master_name,
         db=self.config.db,
         password=secret_value(self.config.password),
@@ -262,7 +265,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     try:
       for node_str in startup_nodes:
         host, port_str = node_str.rsplit(":", 1)
-        nodes.append(ClusterNode(host=host, port=int(port_str)))
+        nodes.append(ClusterNode(host=host, port=int(port_str)))  # type: ignore[no-untyped-call]
 
       self._client = RedisCluster(
         startup_nodes=nodes,
