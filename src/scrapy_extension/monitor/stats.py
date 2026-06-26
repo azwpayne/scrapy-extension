@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from scrapy_extension.monitor.base import (
   DEFAULT_BACKPRESSURE_THRESHOLD,
+  DEFAULT_POP_RATE_WINDOW_S,
   Monitor,
 )
 
@@ -37,6 +38,13 @@ class ScrapyStatsMonitor(Monitor):
   - ``queue/backpressure`` (gauge) — current depth when it last exceeded
     ``backpressure_threshold``; reset to ``0`` once depth drops back under.
     ``None`` until the threshold has ever been crossed.
+  - ``queue/pop_rate_1m`` (gauge) — rolling pops/sec over the trailing 60s
+    window (U2 operability). Sampled on the same cadence as the pop-path
+    depth probe; falling-edge to ~0 = stalled consumer.
+  - ``dupefilter/filter_saturation`` (gauge, 0.0-1.0) — cuckoo filter fill
+    ratio (U2 operability). Rises through 0.9 before ``dupefilter/filter_full``
+    ever fires; leading indicator for raising filter capacity. ``0.0`` when
+    the filter is unbounded or reports no capacity.
 
   Attributes:
       _stats: The wrapped Scrapy StatsCollector.
@@ -112,6 +120,42 @@ class ScrapyStatsMonitor(Monitor):
     additionally warns once per process via its own logger.
     """
     self._stats.inc_value("dupefilter/filter_full")
+
+  def on_pop_rate(self, window_s: float, rate: float) -> None:
+    """Set the ``queue/pop_rate_1m`` gauge.
+
+    The window tag is fixed at ``1m`` because :data:`DEFAULT_POP_RATE_WINDOW_S`
+    is 60s and ``BackendQueue`` always passes that window; the stat key name
+    documents the window an operator is looking at on the stats dump. ``rate``
+    is pops per second over that trailing window.
+
+    Args:
+        window_s: Trailing window the rate was computed over (seconds).
+            Recorded in the stat key (``1m`` for the default 60s).
+        rate: Pops per second over ``window_s``.
+    """
+    tag = "1m" if window_s == DEFAULT_POP_RATE_WINDOW_S else f"{window_s:g}s"
+    self._stats.set_value(f"queue/pop_rate_{tag}", rate)
+
+  def on_filter_saturation(self, used: int, capacity: int | None) -> None:
+    """Set the ``dupefilter/filter_saturation`` gauge (0.0-1.0).
+
+    Saturation is ``used / capacity`` clamped to ``[0.0, 1.0]``. An unbounded
+    filter (``capacity is None``) reports ``0.0`` — it cannot be saturated, so
+    the gauge stays at the floor and operators are not misled by a stale
+    nonzero reading. The dupefilter emits this after each add when the
+    underlying filter exposes a ``saturation`` property (cuckoo only); other
+    filters never emit, leaving the gauge at ``None`` (untouched).
+
+    Args:
+        used: Items currently recorded in the filter.
+        capacity: Filter capacity in items, or ``None`` if unbounded.
+    """
+    if capacity is None or capacity <= 0:
+      ratio = 0.0
+    else:
+      ratio = min(1.0, max(0.0, used / capacity))
+    self._stats.set_value("dupefilter/filter_saturation", ratio)
 
   def on_error(self, operation: str, error: BaseException) -> None:
     """Increment ``errors/<operation>``.

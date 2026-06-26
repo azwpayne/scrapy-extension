@@ -16,6 +16,7 @@ from __future__ import annotations
 
 __all__ = [
   "DEFAULT_BACKPRESSURE_THRESHOLD",
+  "DEFAULT_POP_RATE_WINDOW_S",
   "Monitor",
   "NullMonitor",
 ]
@@ -28,6 +29,16 @@ __all__ = [
 #: architect's #1 operability gap was "no backpressure signal" — this default
 #: makes the signal default-on without throttling (action is a later tier).
 DEFAULT_BACKPRESSURE_THRESHOLD = 1_000
+
+#: Default rolling window (seconds) over which ``on_pop_rate`` reports rate.
+#:
+#: 60s matches the architect's "calls/sec over a 1m window" contract (U2):
+#: long enough to smooth per-second jitter, short enough that a stalled
+#: consumer surfaces as a falling-edge within a minute. ``BackendQueue``
+#: evicts timestamps older than this from its rolling counter on every pop;
+#: the value is also passed as ``window_s`` to ``on_pop_rate`` so a monitor
+#: can record it under a window-tagged stat key (``queue/pop_rate_1m``).
+DEFAULT_POP_RATE_WINDOW_S = 60.0
 
 
 class Monitor:
@@ -54,6 +65,14 @@ class Monitor:
   - ``on_queue_depth(queue_name, depth)`` — current pending depth (gauge).
   - ``on_store(key)`` — after a successful storage write (pipeline lane).
   - ``on_filter_full()`` — membership filter at capacity; caller degrades.
+  - ``on_pop_rate(window_s, rate)`` — rolling pop rate (U2 operability).
+    Emitted by ``BackendQueue.pop`` on a sampling cadence (NOT every pop);
+    ``rate`` is pops per second over the trailing ``window_s`` window.
+  - ``on_filter_saturation(used, capacity)`` — membership-filter fill ratio
+    (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` when the
+    underlying filter exposes a ``saturation`` property (cuckoo only); lets
+    operators see a cuckoo filter APPROACHING full (e.g. >0.9) before the
+    ``on_filter_full`` overflow signal fires.
   - ``on_error(operation, error)`` — an operation raised; record per-op.
   """
 
@@ -113,6 +132,45 @@ class Monitor:
     Lets a stats monitor count ``dupefilter/filter_full`` occurrences via the
     monitor contract — without the dupefilter reaching into its private
     stats attribute.
+    """
+
+  def on_pop_rate(self, window_s: float, rate: float) -> None:
+    """Record the rolling queue pop rate (U2 operability signal).
+
+    Emitted by :meth:`BackendQueue.pop
+    <scrapy_extension.queue.queue.BackendQueue.pop>` on a sampling cadence
+    (NOT every pop — derived alongside the depth sample to keep the hot path
+    cheap). ``rate`` is pops per second over the trailing ``window_s``
+    seconds. The default window is :data:`DEFAULT_POP_RATE_WINDOW_S` (60s).
+
+    Why a rate, not a counter: ``queue/pop_count`` already counts pops; the
+    operability question is "is the consumer alive *lately*?" — a rolling
+    rate answers that without forcing the operator to do wall-clock math
+    against a monotonic counter. A stalled crawler shows up as a falling-edge
+    to ~0 within one window.
+
+    Args:
+        window_s: The trailing window the rate was computed over (seconds).
+        rate: Pops per second over that window.
+    """
+
+  def on_filter_saturation(self, used: int, capacity: int | None) -> None:
+    """Record membership-filter saturation (U2 operability signal).
+
+    Emitted by :meth:`BackendDupeFilter.request_seen
+    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
+    after each add when the underlying filter exposes a ``saturation``
+    property (currently only the cuckoo filter — set/memory/bloom do not
+    surface capacity and stay silent). This is the APPROACHING-full signal:
+    it rises through 0.9 before :meth:`on_filter_full` ever fires, giving
+    operators a leading indicator to raise ``SCRAPY_DEDUP_CUCKOO_CAPACITY``
+    before the filter overflows and degrades to passthrough.
+
+    Args:
+        used: Number of items currently recorded in the filter.
+        capacity: Filter capacity in items, or ``None`` if the filter is
+            unbounded (in which case saturation is reported as ``0.0`` —
+            an unbounded filter cannot be saturated).
     """
 
   def on_error(self, operation: str, error: BaseException) -> None:

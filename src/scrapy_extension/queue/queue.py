@@ -8,7 +8,9 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import time
 import warnings
+from collections import deque
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,7 +19,7 @@ from scrapy.utils.request import request_from_dict
 from scrapy_extension.backends.base import JSONSerializer, QueueBackend
 from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
-from scrapy_extension.monitor.base import Monitor
+from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
 from scrapy_extension.queue.strategies.base import QueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 
@@ -113,6 +115,24 @@ class BackendQueue:
     # emptiness is never masked by a stale non-zero value.
     self._cached_depth: int | None = None
     self._depth_probe_counter = 0
+    # U2 rolling pop-rate state. A deque of ``time.monotonic()`` timestamps,
+    # one per pop, evicted from the left on every pop to drop entries older
+    # than ``_pop_rate_window_s``. Cheap: each pop is an append + amortized
+    # popleft (older entries batch-evict only when the window advances). The
+    # rate itself is only computed + emitted on the same sampling cadence as
+    # the depth probe (``depth_sample_every``) — keeps the hot path O(1) and
+    # avoids per-pop stat RPCs, mirroring the U4 perf discipline. ``deque``
+    # is thread-safe for append/popleft at the CPython level (GIL-protected),
+    # matching the existing single-thread-per-worker Scrapy engine model; the
+    # scheduler drives pop serially per worker.
+    self._pop_rate_window_s: float = DEFAULT_POP_RATE_WINDOW_S
+    self._pop_timestamps: deque[float] = deque()
+    # U2 pop-rate sampling counter — independent of ``_depth_probe_counter``
+    # (which resets on every real probe, so it can't be reused to gate the
+    # rate emission). Counts pops since the last rate emission; emits once
+    # per ``depth_sample_every`` pops, aligned to the same perf cadence as
+    # the depth probe so both operability signals ride the same sampling.
+    self._pop_rate_counter = 0
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -215,6 +235,18 @@ class BackendQueue:
     # signal (pop attempts per second), independent of whether an item was
     # returned. A worker popping an empty queue is itself operability signal.
     self._monitor.on_pop(self.queue_name)
+    # U2 operability: record this pop into the rolling window, then emit the
+    # derived rate on the same sampling cadence as the depth probe below —
+    # keeps the hot path O(1) amortized and avoids per-pop stat RPCs. A
+    # monotonic clock is used so wall-clock skew can't corrupt the window.
+    self._record_pop_timestamp()
+    self._pop_rate_counter += 1
+    if self._pop_rate_counter >= self.depth_sample_every:
+      self._pop_rate_counter = 0
+      try:
+        self._emit_pop_rate()
+      except Exception:  # noqa: BLE001
+        logger.debug("monitor.on_pop_rate raised; ignored", exc_info=True)
     # Sample depth after each pop — this is the backpressure signal (architect's
     # #1 operability gap). Cheaper than a periodic timer and aligns the sample
     # with an event that already touched the backend. U4: routed through
@@ -377,6 +409,41 @@ class BackendQueue:
     real_depth = self._strategy.queue_len(self.queue_name)
     self._cached_depth = real_depth
     return real_depth
+
+  def _record_pop_timestamp(self) -> None:
+    """U2 — append a monotonic timestamp for this pop to the rolling window.
+
+    Evicts entries older than :attr:`_pop_rate_window_s` from the left so the
+    deque holds only timestamps inside the trailing window. Older entries
+    batch-evict only when the window has actually advanced (a tight inner
+    loop in the same second hits zero poplefts), keeping the amortized cost
+    O(1) per pop. Called on every pop; the rate is derived on the sampling
+    cadence in :meth:`_emit_pop_rate`.
+    """
+    now = time.monotonic()
+    cutoff = now - self._pop_rate_window_s
+    ts = self._pop_timestamps
+    ts.append(now)
+    # Evict everything strictly older than the cutoff. ``while`` (not ``if``)
+    # because the window can advance by more than one entry between pops when
+    # the consumer pauses; popleft is O(1).
+    while ts and ts[0] < cutoff:
+      ts.popleft()
+
+  def _emit_pop_rate(self) -> None:
+    """U2 — compute + emit the rolling pop rate (pops/sec over the window).
+
+    Rate = (timestamps in the trailing window) / window_s. On a fresh window
+    (no timestamps yet — e.g. the very first pop, or the consumer stalled so
+    long the deque emptied between samples) the rate is ``0.0`` so a stalled
+    consumer surfaces as a clean falling-edge rather than a stale nonzero
+    reading. The window length itself is the divisor: a half-aged window is
+    not the denominator (the operator's contract is "rate over 60s", not
+    "rate since the last pop").
+    """
+    count = len(self._pop_timestamps)
+    rate = count / self._pop_rate_window_s if count else 0.0
+    self._monitor.on_pop_rate(self._pop_rate_window_s, rate)
 
   def __len__(self) -> int:
     """Get the number of requests in the queue.

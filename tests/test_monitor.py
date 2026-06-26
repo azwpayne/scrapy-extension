@@ -20,12 +20,18 @@ from scrapy.http import Request
 from scrapy.statscollectors import MemoryStatsCollector
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.cuckoo_filter import (
+  CuckooMembershipFilter,
+)
 from scrapy_extension.monitor import (
   Monitor,
   NullMonitor,
   ScrapyStatsMonitor,
 )
-from scrapy_extension.monitor.base import DEFAULT_BACKPRESSURE_THRESHOLD
+from scrapy_extension.monitor.base import (
+  DEFAULT_BACKPRESSURE_THRESHOLD,
+  DEFAULT_POP_RATE_WINDOW_S,
+)
 from scrapy_extension.queue.queue import BackendQueue
 
 
@@ -56,6 +62,8 @@ class TestNullMonitor:
       ("on_queue_depth", {"queue_name": "q", "depth": 5}),
       ("on_store", {"key": "k"}),
       ("on_filter_full", {}),
+      ("on_pop_rate", {"window_s": DEFAULT_POP_RATE_WINDOW_S, "rate": 1.5}),
+      ("on_filter_saturation", {"used": 100, "capacity": 200}),
       ("on_error", {"operation": "push", "error": RuntimeError("x")}),
     ],
   )
@@ -76,6 +84,8 @@ class TestNullMonitor:
       "on_queue_depth",
       "on_store",
       "on_filter_full",
+      "on_pop_rate",
+      "on_filter_saturation",
       "on_error",
     ):
       assert callable(getattr(monitor, hook))
@@ -136,6 +146,46 @@ class TestScrapyStatsMonitor:
     assert stats.get_value("dupefilter/filter_full") == 1
     monitor.on_filter_full()
     assert stats.get_value("dupefilter/filter_full") == 2
+
+  def test_on_pop_rate_sets_1m_gauge(self):
+    """on_pop_rate is a gauge (set), tagged ``1m`` for the default 60s window."""
+    monitor, stats = self._monitor()
+    monitor.on_pop_rate(DEFAULT_POP_RATE_WINDOW_S, 12.5)
+    assert stats.get_value("queue/pop_rate_1m") == 12.5
+    monitor.on_pop_rate(DEFAULT_POP_RATE_WINDOW_S, 3.0)
+    assert stats.get_value("queue/pop_rate_1m") == 3.0  # set, not incremented
+
+  def test_on_pop_rate_non_default_window_tags_value(self):
+    """A non-default window length is reflected in the stat tag, not the key."""
+    monitor, stats = self._monitor()
+    monitor.on_pop_rate(30.0, 5.0)
+    assert stats.get_value("queue/pop_rate_30s") == 5.0
+    # default-window key must NOT be touched when a different window is passed
+    assert stats.get_value("queue/pop_rate_1m") is None
+
+  def test_on_filter_saturation_sets_ratio_gauge(self):
+    """on_filter_saturation stores used/capacity clamped to [0, 1]."""
+    monitor, stats = self._monitor()
+    monitor.on_filter_saturation(used=90, capacity=100)
+    assert stats.get_value("dupefilter/filter_saturation") == pytest.approx(0.9)
+
+  def test_on_filter_saturation_clamps_above_one(self):
+    """used > capacity (overflow before FilterFull) clamps to 1.0, not >1."""
+    monitor, stats = self._monitor()
+    monitor.on_filter_saturation(used=150, capacity=100)
+    assert stats.get_value("dupefilter/filter_saturation") == 1.0
+
+  def test_on_filter_saturation_zero_when_capacity_none(self):
+    """Unbounded filter (capacity is None) reports 0.0 — it cannot saturate."""
+    monitor, stats = self._monitor()
+    monitor.on_filter_saturation(used=1_000_000, capacity=None)
+    assert stats.get_value("dupefilter/filter_saturation") == 0.0
+
+  def test_on_filter_saturation_zero_when_capacity_zero(self):
+    """Defensive: capacity <= 0 reports 0.0 (no division-by-zero)."""
+    monitor, stats = self._monitor()
+    monitor.on_filter_saturation(used=5, capacity=0)
+    assert stats.get_value("dupefilter/filter_saturation") == 0.0
 
   def test_on_error_increments_per_operation_stat(self):
     monitor, stats = self._monitor()
@@ -375,3 +425,205 @@ class TestFromCrawlerWiring:
 
     df = BackendDupeFilter.from_crawler(crawler)
     assert isinstance(df._monitor, ScrapyStatsMonitor)
+
+
+# ---------------------------------------------------------------------------
+# U2 — Operability signals (rolling pop rate + filter saturation)
+# ---------------------------------------------------------------------------
+
+
+class TestPopRateEmission:
+  """BackendQueue.pop emits on_pop_rate on the depth-sample cadence (U2)."""
+
+  def test_pop_rate_set_after_sampling_window(self, mock_connection_manager):
+    """After ``depth_sample_every`` pops, the rolling rate is emitted once.
+
+    Drives 100 pops (default ``depth_sample_every=100``) within a mocked
+    sub-second window and asserts ``queue/pop_rate_1m`` is set to ~N/60.
+    The rate reflects pop ATTEMPTS per second (matches ``on_pop`` semantics),
+    independent of whether an item was returned.
+    """
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+    for _ in range(100):
+      queue.pop()
+    rate = monitor._stats.get_value("queue/pop_rate_1m")  # type: ignore[attr-defined]
+    # 100 pops over a 60s window → ~1.667 pops/sec; allow a wide tolerance
+    # since the window is monotonic and the test runs in well under 60s
+    # (so all 100 timestamps are inside the window).
+    assert rate is not None
+    assert 1.0 <= rate <= 2.5
+
+  def test_pop_rate_not_emitted_before_sampling_window(
+    self, mock_connection_manager
+  ):
+    """Before the sampling cadence elapses, the rate gauge stays untouched.
+
+    Guards against per-pop stat RPCs (the perf discipline from U4). With
+    ``depth_sample_every=100`` and only 50 pops, no rate emission fires.
+    """
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+      depth_sample_every=100,
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+    for _ in range(50):
+      queue.pop()
+    assert monitor._stats.get_value("queue/pop_rate_1m") is None  # type: ignore[attr-defined]
+
+  def test_pop_rate_emits_on_custom_cadence(self, mock_connection_manager):
+    """A small ``depth_sample_every`` emits the rate on every pop (smoke)."""
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+      depth_sample_every=1,
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+    queue.pop()
+    rate = monitor._stats.get_value("queue/pop_rate_1m")  # type: ignore[attr-defined]
+    assert rate is not None
+    assert rate > 0.0
+
+  def test_pop_rate_window_evicts_old_timestamps(
+    self, mock_connection_manager, mocker
+  ):
+    """Aged timestamps leave the window so a stalled consumer falls to ~0.
+
+    Uses a controllable monotonic clock: drive pops at t=0, then advance the
+    clock past the window. After the next pop, only timestamps inside the
+    trailing window remain in the deque — the stale t=0 entries are evicted.
+    With only the current pop inside the window, the rate drops to ~1/60
+    (one pop in 60s), demonstrating the falling-edge operability signal a
+    stalled consumer produces once it resumes.
+    """
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+      depth_sample_every=1,
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+
+    fixed = [0.0]
+
+    def fake_monotonic() -> float:
+      return fixed[0]
+
+    mocker.patch(
+      "scrapy_extension.queue.queue.time.monotonic", side_effect=fake_monotonic
+    )
+    for _ in range(100):
+      queue.pop()
+    # Sanity: 100 timestamps accumulated at t=0.
+    assert len(queue._pop_timestamps) == 100
+    # Advance past the 60s window and pop once more — eviction runs on the
+    # next record_pop_timestamp; only the new (t=70) entry survives.
+    fixed[0] = DEFAULT_POP_RATE_WINDOW_S + 10.0
+    queue.pop()
+    assert len(queue._pop_timestamps) == 1
+    # Rate reflects exactly one pop inside the trailing 60s window.
+    assert monitor._stats.get_value("queue/pop_rate_1m") == pytest.approx(  # type: ignore[attr-defined]
+      1.0 / DEFAULT_POP_RATE_WINDOW_S
+    )
+
+
+class TestFilterSaturationEmission:
+  """BackendDupeFilter emits on_filter_saturation for cuckoo filters (U2)."""
+
+  def test_cuckoo_saturation_property_rises_with_load(self):
+    """CuckooMembershipFilter.saturation = len / capacity, in [0, ~1]."""
+    cuckoo = CuckooMembershipFilter(capacity=1_000, error_rate=0.01)
+    assert cuckoo.saturation == 0.0
+    # Add a batch of distinct items; saturation must rise monotonically.
+    prev = 0.0
+    for i in range(500):
+      cuckoo.add(f"item-{i}".encode())
+      s = cuckoo.saturation
+      assert s >= prev
+      prev = s
+    # ~500 items inserted; saturation should be nonzero and < 1.0
+    assert 0.0 < cuckoo.saturation < 1.0
+
+  def test_request_seen_emits_saturation_for_cuckoo(
+    self, mock_connection_manager
+  ):
+    """request_seen on a cuckoo-backed dupefilter emits on_filter_saturation."""
+    monitor = ScrapyStatsMonitor(_stats())
+    cuckoo = CuckooMembershipFilter(capacity=1_000, error_rate=0.01)
+    df = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+      membership_filter=cuckoo,
+    )
+    df.request_seen(Request(url="https://example.com/a"))
+    sat = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
+    assert sat is not None
+    assert sat > 0.0
+    # Saturation rises as more distinct items are added.
+    df.request_seen(Request(url="https://example.com/b"))
+    sat2 = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
+    assert sat2 > sat
+
+  def test_request_seen_silent_when_filter_has_no_saturation(
+    self, mock_connection_manager
+  ):
+    """Non-cuckoo filters (set/memory/bloom) do not emit on_filter_saturation.
+
+    The gauge stays at ``None`` (untouched), not misleadingly at 0.0 —
+    a set filter cannot be saturated, so operators don't get a noisy
+    flat-zero gauge alongside the cuckoo signal.
+    """
+    monitor = ScrapyStatsMonitor(_stats())
+    df = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    mock_connection_manager.get_set_backend().add.return_value = True
+    df.request_seen(Request(url="https://example.com"))
+    assert monitor._stats.get_value("dupefilter/filter_saturation") is None  # type: ignore[attr-defined]
+
+  def test_saturation_leading_indicator_before_filter_full(
+    self, mock_connection_manager
+  ):
+    """Saturation rises toward 1.0 BEFORE the FilterFull overflow fires.
+
+    Builds a TINY cuckoo (capacity sized for ~85% load at n=4 → 4 buckets),
+    drives it decisively past capacity, and asserts that
+    ``dupefilter/filter_saturation`` was set to a high value (>0.9) before
+    ``dupefilter/filter_full`` was first incremented. This is the U2
+    leading-indicator contract: the gauge is the early warning, the counter
+    is the overflow alarm.
+    """
+    monitor = ScrapyStatsMonitor(_stats())
+    cuckoo = CuckooMembershipFilter(capacity=4, error_rate=0.01)
+    df = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+      membership_filter=cuckoo,
+    )
+    seen_high_saturation_before_full = False
+    saw_filter_full = False
+    for i in range(200):
+      df.request_seen(Request(url=f"https://example.com/prefix-{i}"))
+      sat = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
+      full = monitor._stats.get_value("dupefilter/filter_full")  # type: ignore[attr-defined]
+      if (sat or 0.0) > 0.9 and not full:
+        seen_high_saturation_before_full = True
+      if full:
+        saw_filter_full = True
+        break
+    assert seen_high_saturation_before_full, (
+      "saturation should cross 0.9 before the FilterFull overflow fires"
+    )
+    assert saw_filter_full, "the FilterFull arm should eventually fire"

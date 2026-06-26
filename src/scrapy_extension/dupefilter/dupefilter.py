@@ -328,6 +328,16 @@ class BackendDupeFilter:
       self._monitor.on_dedup_hit(fingerprint)
     else:
       self._monitor.on_dedup_miss(fingerprint)
+    # U2 operability: if the filter exposes saturation (cuckoo only), emit
+    # the leading fill-ratio signal after each add. Cheap (one property read
+    # + one monitor hook), and lets operators see the filter APPROACHING full
+    # (e.g. >0.9) before the FilterFull overflow path fires. Other filters
+    # (set/memory/bloom) don't expose ``saturation`` and stay silent here —
+    # their gauge stays at ``None`` (untouched), not misleadingly at 0.0.
+    sat = getattr(self._filter, "saturation", None)
+    if sat is not None:
+      cap = getattr(self._filter, "capacity", None)
+      self._monitor.on_filter_saturation(len(self._filter), cap)
     return seen
 
   def _handle_filter_full(self, fingerprint: str) -> None:

@@ -88,6 +88,34 @@ class CuckooMembershipFilter(MembershipFilter):
     """Fingerprint length in bytes."""
     return self._fp_len
 
+  @property
+  def capacity(self) -> int:
+    """Hard capacity in items (``m * _BUCKET_SIZE``).
+
+    The filter is sized for ~85% load (see :meth:`__init__`), so steady-state
+    saturation hovers near 0.85 and :meth:`add` raises
+    :class:`~scrapy_extension.dupefilter.filters.base.FilterFull` once kicks
+    exhaust ``_MAX_KICKS`` (effectively at/above capacity). Exposed so the
+    dupefilter can emit a leading saturation signal (U2 operability) as the
+    filter APPROACHES full — ``used / capacity`` rises through ~0.9 before
+    the overflow signal ever fires.
+    """
+    return self._num_buckets * self._BUCKET_SIZE
+
+  @property
+  def saturation(self) -> float:
+    """Current fill ratio (``used / capacity``), in ``[0.0, ~1.0]``.
+
+    Used by :meth:`BackendDupeFilter.request_seen
+    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
+    to emit ``on_filter_saturation`` after each add. ``used`` is the count of
+    inserted fingerprints still present (``len(self)``); ``capacity`` is the
+    hard bucket-slot count. The target load is 0.85 by design, so a healthy
+    filter reads ~0.85 at its configured capacity — operators should alert
+    on a rising edge past ~0.90, not on reaching 0.85.
+    """
+    return len(self) / self.capacity
+
   def _fingerprint(self, item: bytes) -> tuple[bytes, int]:
     """Derive the fingerprint and primary index for ``item``.
 
