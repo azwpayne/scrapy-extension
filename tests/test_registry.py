@@ -495,3 +495,134 @@ class TestHasCapability:
   def test_has_capability_unknown_backend(self):
     _reset_registry_cache()
     assert has_capability("not-a-backend", "queue") is False
+
+
+# ---------------------------------------------------------------------------
+# Module-level broken-plugin callables for TestPluginDiscoveryErrors.
+# Entry-point ``value`` strings resolve via importlib + getattr, so the
+# callable must be a module-level attribute (closures won't survive the
+# dotted-path lookup).
+# ---------------------------------------------------------------------------
+
+
+def _register_wrong_return_type() -> str:
+  """Returns a non-BackendDescriptor — _load_plugin_descriptor raises TypeError."""
+  return "not-a-descriptor"
+
+
+def _register_unknown_capabilities() -> BackendDescriptor:
+  """Declares an unsupported capability — _load_plugin_descriptor raises ValueError."""
+  return _make_descriptor(
+    "badcap",
+    capabilities=frozenset({"queue", "streaming"}),  # 'streaming' is invalid
+  )
+
+
+def _register_invalid_backend_type_name() -> BackendDescriptor:
+  """backend_type fails the ^[a-z][a-z0-9_]*$ pattern — raises ValueError."""
+  return _make_descriptor(
+    "Bad-Name",  # uppercase + hyphen violate the contract
+    capabilities=frozenset({"queue"}),
+  )
+
+
+def _register_generic_exception() -> BackendDescriptor:
+  """Callable raises a non-ImportError exception — must still skip-with-warn."""
+  raise RuntimeError("plugin blew up at registration")
+
+
+class TestPluginDiscoveryErrors:
+  """R14-G: broken 3rd-party plugins must WARN+SKIP, never crash discovery.
+
+  The load-bearing contract: a single misbehaving plugin must NEVER prevent
+  the bundled 10 from being discovered. Every failure mode of
+  ``_load_plugin_descriptor`` is caught by ``_discover_entry_points``'s broad
+  ``except Exception`` and converted to a ``UserWarning`` + ``continue``.
+
+  Covers:
+    - callable returns the wrong type (TypeError path);
+    - descriptor declares unknown capabilities (ValueError path);
+    - descriptor backend_type fails the name regex (ValueError path);
+    - callable raises a generic non-ImportError exception.
+  """
+
+  def _expect_skip(
+    self,
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_name: str,
+    registration_value: str,
+  ) -> None:
+    """Patch one broken entry-point; assert the bundled 10 survive + warn fires."""
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name=plugin_name,
+          value=registration_value,
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="goodplugin",
+          value="tests.test_registry._register_good_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+      ],
+    )
+    _reset_registry_cache()
+
+    with pytest.warns(UserWarning):
+      registry = get_registry()
+
+    # Bundled 10 always intact regardless of plugin breakage.
+    for bundled in (
+      "redis",
+      "mongodb",
+      "kafka",
+      "rabbitmq",
+      "elasticsearch",
+      "rocketmq",
+      "pulsar",
+      "memcached",
+      "sqs",
+      "dynamodb",
+    ):
+      assert bundled in registry, (
+        f"bundled backend {bundled!r} missing — broken plugin crashed discovery"
+      )
+    # The good peer plugin was discovered; the broken one was skipped.
+    assert "goodplugin" in registry
+    assert plugin_name not in registry
+
+  def test_wrong_return_type_skips_with_warning(self, monkeypatch):
+    """A callable returning a non-BackendDescriptor raises TypeError → skip+warn."""
+    self._expect_skip(
+      monkeypatch,
+      plugin_name="wrongtype",
+      registration_value="tests.test_registry._register_wrong_return_type",
+    )
+
+  def test_unknown_capabilities_skips_with_warning(self, monkeypatch):
+    """A descriptor with unsupported capabilities raises ValueError → skip+warn."""
+    self._expect_skip(
+      monkeypatch,
+      plugin_name="badcap",
+      registration_value="tests.test_registry._register_unknown_capabilities",
+    )
+
+  def test_invalid_backend_type_name_skips_with_warning(self, monkeypatch):
+    """A descriptor whose backend_type fails the name regex → skip+warn."""
+    self._expect_skip(
+      monkeypatch,
+      plugin_name="badname",
+      registration_value="tests.test_registry._register_invalid_backend_type_name",
+    )
+
+  def test_generic_exception_skips_with_warning(self, monkeypatch):
+    """A callable raising a non-ImportError exception → skip+warn (broad catch)."""
+    self._expect_skip(
+      monkeypatch,
+      plugin_name="boom",
+      registration_value="tests.test_registry._register_generic_exception",
+    )

@@ -52,3 +52,23 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
   for item in items:
     if "benchmark" in item.keywords:
       item.add_marker(skip_bench)
+
+  # R14-G: integration-tier gate. ``tests/integration/*`` e2e tests require a
+  # real backend (Redis/Mongo/Kafka/RabbitMQ/ES/RocketMQ) and bit-rot silently
+  # — they already self-skip on their per-backend ``SCRAPY_TEST_<BACKEND>_URL``
+  # env var, but a single top-level opt-in gate makes the intent explicit and
+  # keeps the tier discoverable. Skip unless ``SCRAPY_TEST_INTEGRATION=1`` is
+  # set. Mirror the benchmark opt-in shape so the two slow tiers share a
+  # consistent contract.
+  import os
+
+  if not os.environ.get("SCRAPY_TEST_INTEGRATION"):
+    skip_integration = pytest.mark.skip(
+      reason=(
+        "integration opt-in: set SCRAPY_TEST_INTEGRATION=1 (and the "
+        "per-backend SCRAPY_TEST_<BACKEND>_URL) to run tests/integration/*"
+      ),
+    )
+    for item in items:
+      if "integration" in item.keywords:
+        item.add_marker(skip_integration)

@@ -14,6 +14,20 @@ import pytest
 sys.modules.setdefault("boto3", MagicMock())
 import boto3  # noqa: E402 — the mocked module actually in sys.modules
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_sys_modules_mock_boto3():
+  """Pop the module-level ``boto3`` mock after this module's tests finish.
+
+  R14-G flake fix: the module-top-level ``sys.modules.setdefault`` runs at
+  collection time and persists for the whole session, polluting later test
+  modules that import the real ``boto3`` (or assert on its absence). Popping
+  the injected key at module teardown restores a clean ``sys.modules`` for
+  subsequent modules.
+  """
+  yield
+  sys.modules.pop("boto3", None)
+
 from scrapy_extension.backends.base import (  # noqa: E402
   BackendType,
   QueueBackend,

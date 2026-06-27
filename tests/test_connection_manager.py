@@ -4,6 +4,7 @@ import pytest
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.exceptions import BackendConnectionError
 
 
 def test_connection_manager_get_manager_singleton():
@@ -443,3 +444,123 @@ def test_close_resets_circuit_breaker(mocker):
   ConnectionManager.clear_registry()
   mocker.stopall()
 
+
+
+# ---------------------------------------------------------------------------
+# R14-G: A2 single-connect-owner error-signal threading test.
+#
+# ``_get_backend`` splits fast/slow paths: the first thread to enter the slow
+# path takes ownership of connecting; peers wait on ``_connected_event``
+# (released by the owner in a ``finally``). The load-bearing invariant: if the
+# owner's ``connect()`` raises, ALL peer waiters must (a) receive the same
+# exception and (b) NOT hang — ``_connected_event.set()`` must run in the
+# ``finally`` block so peers wake up.
+# ---------------------------------------------------------------------------
+
+
+def test_owner_connect_failure_signals_all_peer_waiters(mocker):
+  """Owner's ``connect()`` raises → every peer waiter re-raises + event is set.
+
+  Constructs a manager whose backend ``connect()`` always raises, then calls
+  ``get_queue_backend()`` from multiple threads simultaneously. Without the
+  A2 finally-set, peers would block on ``_connected_event.wait()`` forever
+  (the test would hang). With it, every peer re-raises the owner's exception.
+  """
+  import threading
+
+  # Unique settings so this manager is isolated in the class-level registry.
+  settings = {"retry_attempts": 1, "retry_delay": 0, "host": "owner-fail-test"}
+  manager = ConnectionManager.get_manager(BackendType.REDIS, settings)
+  ConnectionManager.clear_registry()  # evict the just-created empty shell
+
+  # Re-create so we control it directly, then patch its backend factory.
+  manager = ConnectionManager.get_manager(BackendType.REDIS, settings)
+
+  connect_error = BackendConnectionError(
+    "simulated owner connect failure", backend_type="redis"
+  )
+
+  class _FailingBackend:
+    def __init__(self, *_args, **_kwargs) -> None:
+      self.backend_type = "redis"
+
+    def connect(self) -> None:
+      raise connect_error
+
+    def disconnect(self) -> None:
+      pass
+
+    def is_connected(self) -> bool:
+      return False
+
+    def ping(self) -> bool:
+      return False
+
+  mocker.patch.object(manager, "_create_backend", return_value=_FailingBackend())
+
+  results: dict[str, object] = {}
+  start_gate = threading.Event()
+  errors: list[BaseException] = []
+  errors_lock = threading.Lock()
+
+  def _worker(worker_id: str) -> None:
+    # Wait for the green light so all workers race into _get_backend together.
+    start_gate.wait(timeout=5.0)
+    try:
+      manager.get_queue_backend()
+      results[worker_id] = "no-error"
+    except BaseException as exc:  # noqa: BLE001 — capture every peer's outcome
+      with errors_lock:
+        errors.append(exc)
+      results[worker_id] = type(exc).__name__
+
+  threads = [threading.Thread(target=_worker, args=(f"w{i}",)) for i in range(4)]
+  for t in threads:
+    t.start()
+  # Release all workers at once to maximize owner/peer contention.
+  start_gate.set()
+  for t in threads:
+    t.join(timeout=10.0)
+
+  # No thread may still be alive (would mean _connected_event was never set).
+  assert not any(t.is_alive() for t in threads), (
+    f"a peer waiter hung — _connected_event.set() did not fire in the owner "
+    f"finally block. results={results}"
+  )
+
+  # Every worker must have received a BackendConnectionError (re-raised by
+  # the owner path) — never a silent success and never a different exception
+  # type. ``connect()``'s retry loop wraps the raw ``connect_error`` as
+  # "Failed to connect after N attempts: ...", so we assert TYPE equality +
+  # chain identity (the original ``connect_error`` is preserved in ``__cause__``
+  # or the wrapped message) rather than instance identity.
+  assert len(errors) == 4, (
+    f"expected 4 errors (one per worker), got {len(errors)}; results={results}"
+  )
+  for exc in errors:
+    assert isinstance(exc, BackendConnectionError), (
+      f"peer received a non-BackendConnectionError: got {exc!r}"
+    )
+    # The owner's raw connect_error must be visible somewhere in the chain
+    # (it is the __cause__ of the wrapped retry-loop exception, or the
+    # exception message itself).
+    chain_text = ""
+    cur: BaseException | None = exc
+    while cur is not None:
+      chain_text += f"{cur}\n"
+      cur = cur.__cause__
+    assert "simulated owner connect failure" in chain_text, (
+      f"owner's original error not preserved in peer's exception chain: "
+      f"{chain_text}"
+    )
+
+  # The event must be set (the finally ran) — otherwise a later waiter would
+  # hang on the next ``get_queue_backend()`` call.
+  assert manager._connected_event.is_set(), (
+    "_connected_event not set after owner failure — peers on the next call "
+    "would hang (permanent stall after one connect failure)"
+  )
+
+  manager.close()
+  ConnectionManager.clear_registry()
+  mocker.stopall()

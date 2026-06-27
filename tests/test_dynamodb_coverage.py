@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 
 sys.modules.setdefault("boto3", MagicMock())
 import boto3  # noqa: E402
-
 import pytest  # noqa: E402
+
 from scrapy_extension.backends.dynamodb import DynamoDBBackend  # noqa: E402
 from scrapy_extension.exceptions.base import StorageError  # noqa: E402
 from scrapy_extension.settings import DynamoDBSettings  # noqa: E402

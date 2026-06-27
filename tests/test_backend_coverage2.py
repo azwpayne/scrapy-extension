@@ -21,6 +21,26 @@ if "pymemcache" not in sys.modules:
 import pulsar  # noqa: E402
 import pytest  # noqa: E402
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_sys_modules_mocks():
+  """Pop the module-level mocks after this module's tests finish.
+
+  R14-G flake fix: this module injects ``pulsar``, ``boto3``, and the
+  ``pymemcache`` mock tree at module top-level (runs at collection, persists
+  for the whole session). Popping all injected keys at module teardown
+  restores a clean ``sys.modules`` for subsequent modules.
+  """
+  yield
+  for key in (
+    "pulsar",
+    "boto3",
+    "pymemcache",
+    "pymemcache.client",
+    "pymemcache.client.base",
+  ):
+    sys.modules.pop(key, None)
+
 from scrapy_extension.backends.dynamodb import DynamoDBBackend  # noqa: E402
 from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
 from scrapy_extension.backends.pulsar import PulsarBackend  # noqa: E402

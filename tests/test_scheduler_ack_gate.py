@@ -35,6 +35,18 @@ import pytest
 sys.modules.setdefault("pulsar", MagicMock())
 sys.modules.setdefault("boto3", MagicMock())
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_sys_modules_mocks():
+  """Pop the module-level ``pulsar``/``boto3`` mocks after this module's tests.
+
+  R14-G flake fix: module-top-level ``sys.modules.setdefault`` pollutes the
+  session for later modules; pop at module teardown.
+  """
+  yield
+  for key in ("pulsar", "boto3"):
+    sys.modules.pop(key, None)
+
 from scrapy_extension.backends.base import BackendType  # noqa: E402
 from scrapy_extension.backends.connectors import ConnectionManager  # noqa: E402
 from scrapy_extension.exceptions import ConfigurationError  # noqa: E402

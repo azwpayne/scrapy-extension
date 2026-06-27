@@ -642,23 +642,32 @@ class TestLazyImportRealBugSurfacesChain:
     import sys
 
     # Ensure the backend module isn't cached so importlib.import_module runs.
-    sys.modules.pop(module_path, None)
+    # R14-G flake fix: RESTORE the popped module in finally — leaving it absent
+    # from sys.modules breaks later tests that ``mocker.patch`` the backend
+    # module's client class (the patch re-imports a FRESH module object while
+    # the ``MongoDBBackend``/``KafkaBackend`` classes bound at those tests'
+    # import time still reference the OLD module's client, so the patch never
+    # applies and the real backend connects — the order-dependent flake).
+    cached = sys.modules.pop(module_path, None)
+    try:
+      real_bug = self._force_non_dep_import_error(mocker, module_path)
 
-    real_bug = self._force_non_dep_import_error(mocker, module_path)
+      import scrapy_extension
 
-    import scrapy_extension
+      with pytest.raises(ImportError) as exc_info:
+        getattr(scrapy_extension, attr_name)
 
-    with pytest.raises(ImportError) as exc_info:
-      getattr(scrapy_extension, attr_name)
-
-    # The surfaced error must be the ORIGINAL ImportError, not the install hint.
-    assert exc_info.value is real_bug, (
-      f"Expected the original ImportError to surface (chain preserved), "
-      f"but got: {exc_info.value!r}"
-    )
-    assert "pip install scrapy-extension" not in str(exc_info.value), (
-      f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
-    )
+      # The surfaced error must be the ORIGINAL ImportError, not the install hint.
+      assert exc_info.value is real_bug, (
+        f"Expected the original ImportError to surface (chain preserved), "
+        f"but got: {exc_info.value!r}"
+      )
+      assert "pip install scrapy-extension" not in str(exc_info.value), (
+        f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
+      )
+    finally:
+      if cached is not None:
+        sys.modules[module_path] = cached
 
   @pytest.mark.parametrize(
     "attr_name,module_path",
@@ -674,20 +683,26 @@ class TestLazyImportRealBugSurfacesChain:
     """Same invariant for scrapy_extension.backends.__getattr__."""
     import sys
 
-    sys.modules.pop(module_path, None)
-    real_bug = self._force_non_dep_import_error(mocker, module_path)
+    # R14-G flake fix: restore the popped module in finally (see
+    # test_top_level_real_bug_surfaces_not_install_hint for the rationale).
+    cached = sys.modules.pop(module_path, None)
+    try:
+      real_bug = self._force_non_dep_import_error(mocker, module_path)
 
-    import scrapy_extension.backends as backends_pkg
+      import scrapy_extension.backends as backends_pkg
 
-    with pytest.raises(ImportError) as exc_info:
-      getattr(backends_pkg, attr_name)
+      with pytest.raises(ImportError) as exc_info:
+        getattr(backends_pkg, attr_name)
 
-    assert exc_info.value is real_bug, (
-      f"Expected original ImportError to surface, got: {exc_info.value!r}"
-    )
-    assert "pip install scrapy-extension" not in str(exc_info.value), (
-      f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
-    )
+      assert exc_info.value is real_bug, (
+        f"Expected original ImportError to surface, got: {exc_info.value!r}"
+      )
+      assert "pip install scrapy-extension" not in str(exc_info.value), (
+        f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
+      )
+    finally:
+      if cached is not None:
+        sys.modules[module_path] = cached
 
   def test_missing_optional_dep_still_gives_install_hint_top_level(
     self, mocker
@@ -699,26 +714,31 @@ class TestLazyImportRealBugSurfacesChain:
     import sys
 
     module_path = "scrapy_extension.backends.redis"
-    sys.modules.pop(module_path, None)
+    # R14-G flake fix: restore the popped module in finally (see
+    # test_top_level_real_bug_surfaces_not_install_hint for the rationale).
+    cached = sys.modules.pop(module_path, None)
+    try:
+      real_import = importlib.import_module
+      missing = ModuleNotFoundError("No module named 'redis'", name="redis")
 
-    real_import = importlib.import_module
-    missing = ModuleNotFoundError("No module named 'redis'", name="redis")
+      def fake_import(name, package=None):
+        if name == module_path:
+          raise missing
+        return real_import(name, package)
 
-    def fake_import(name, package=None):
-      if name == module_path:
-        raise missing
-      return real_import(name, package)
+      mocker.patch.object(importlib, "import_module", side_effect=fake_import)
 
-    mocker.patch.object(importlib, "import_module", side_effect=fake_import)
+      import scrapy_extension
 
-    import scrapy_extension
+      with pytest.raises(ImportError) as exc_info:
+        getattr(scrapy_extension, "RedisBackend")
 
-    with pytest.raises(ImportError) as exc_info:
-      getattr(scrapy_extension, "RedisBackend")
-
-    assert "pip install scrapy-extension[redis]" in str(exc_info.value)
-    # And the original is preserved in the chain.
-    assert exc_info.value.__cause__ is missing or exc_info.value.__cause__ is None
+      assert "pip install scrapy-extension[redis]" in str(exc_info.value)
+      # And the original is preserved in the chain.
+      assert exc_info.value.__cause__ is missing or exc_info.value.__cause__ is None
+    finally:
+      if cached is not None:
+        sys.modules[module_path] = cached
 
 
 class TestAllModulesInvariants:

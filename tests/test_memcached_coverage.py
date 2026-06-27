@@ -16,6 +16,19 @@ if "pymemcache" not in sys.modules:
   sys.modules["pymemcache.client.base"] = _pkg_base
 
 import pytest  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_sys_modules_mock_pymemcache():
+  """Pop the module-level ``pymemcache`` mock tree after this module's tests.
+
+  R14-G flake fix: module-top-level ``sys.modules`` injection pollutes the
+  session for later modules; pop all three injected keys at module teardown.
+  """
+  yield
+  for key in ("pymemcache", "pymemcache.client", "pymemcache.client.base"):
+    sys.modules.pop(key, None)
+
 import scrapy_extension.backends.memcached as memcached_mod  # noqa: E402
 from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
 from scrapy_extension.exceptions.base import StorageError  # noqa: E402

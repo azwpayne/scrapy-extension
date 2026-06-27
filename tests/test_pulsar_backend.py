@@ -16,6 +16,17 @@ import pytest
 sys.modules.setdefault("pulsar", MagicMock())
 import pulsar  # noqa: E402 — the mocked module actually in sys.modules
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_sys_modules_mock_pulsar():
+  """Pop the module-level ``pulsar`` mock after this module's tests finish.
+
+  R14-G flake fix: module-top-level ``sys.modules.setdefault`` pollutes the
+  session for later modules; pop at module teardown.
+  """
+  yield
+  sys.modules.pop("pulsar", None)
+
 from scrapy_extension.backends.base import (  # noqa: E402
   BackendType,
   SetBackend,

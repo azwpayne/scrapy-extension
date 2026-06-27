@@ -872,3 +872,257 @@ class TestMongoDBStorageErrorContract:
     backend, mock_collection = _storage_backend(mocker)
     mock_collection.find_one.return_value = None
     assert backend.retrieve("missing_key") is None
+
+
+# ---------------------------------------------------------------------------
+# R14-G: not-connected guards across all 3 collections.
+#
+# ``MongoDBBackend`` enforces a connect-before-use contract two ways:
+#   1. ``_assert_connected()`` — raises if ANY of the 3 collections is None;
+#   2. per-collection ``if self._<x>_collection is None: raise`` guards that
+#      run AFTER ``_assert_connected()`` on every public op (defensive belt-
+#      and-suspenders against a race that nulled a collection between the
+#      assertion and the call).
+#
+# Both layers are the primary corruption-prevention contract and were entirely
+# untested. These tests pin both:
+#   - ``test_*_raises_when_disconnected`` — the natural disconnect path
+#     (``disconnect()`` nulls all collections) → ``_assert_connected`` raises.
+#   - ``test_*_per_collection_guard_fires`` — null ONLY the relevant collection
+#     and stub ``_assert_connected`` so the per-collection guard is reached.
+# ---------------------------------------------------------------------------
+
+
+class TestMongoDBNotConnectedGuards:
+  """Every public op must raise ``BackendConnectionError`` when disconnected."""
+
+  def _connected(self, mocker):
+    """Return a connected backend (MongoClient mocked)."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+    mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+    backend.connect()
+    return backend
+
+  # -- natural disconnect path: _assert_connected raises -------------------
+
+  def test_push_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.push("q", b"x")
+
+  def test_pop_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.pop("q")
+
+  def test_queue_len_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.queue_len("q")
+
+  def test_clear_queue_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.clear_queue("q")
+
+  def test_add_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.add("s", b"x")
+
+  def test_remove_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.remove("s", b"x")
+
+  def test_contains_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.contains("s", b"x")
+
+  def test_set_len_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.set_len("s")
+
+  def test_clear_set_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.clear_set("s")
+
+  def test_store_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.store("k", b"v")
+
+  def test_retrieve_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.retrieve("k")
+
+  def test_delete_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.delete("k")
+
+  def test_exists_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.exists("k")
+
+  def test_ttl_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.ttl("k")
+
+  def test_clear_storage_raises_when_disconnected(self, mocker):
+    backend = self._connected(mocker)
+    backend.disconnect()
+    with pytest.raises(BackendConnectionError):
+      backend.clear_storage()
+
+  # -- per-collection defensive guards (bypass _assert_connected) ----------
+  # These pin the ``if self._<x>_collection is None`` branches that sit AFTER
+  # ``_assert_connected()``. To reach them we null ONLY the relevant collection
+  # (so ``_assert_connected`` would raise first) and stub the assertion to a
+  # no-op so the per-collection guard is the one that fires.
+
+  def test_push_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._queue_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.push("q", b"x")
+    assert "queue collection is None" in str(exc.value)
+
+  def test_pop_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._queue_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.pop("q")
+    assert "queue collection is None" in str(exc.value)
+
+  def test_add_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._set_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.add("s", b"x")
+    assert "set collection is None" in str(exc.value)
+
+  def test_contains_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._set_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.contains("s", b"x")
+    assert "set collection is None" in str(exc.value)
+
+  def test_store_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._storage_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.store("k", b"v")
+    assert "storage collection is None" in str(exc.value)
+
+  def test_retrieve_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._storage_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.retrieve("k")
+    assert "storage collection is None" in str(exc.value)
+
+  # -- remaining per-collection guards (queue_len / clear_queue / set_remove /
+  #    set_len / clear_set / delete / exists / ttl / clear_storage) -----------
+  # Each pins the ``if self._<x>_collection is None`` branch that sits AFTER
+  # ``_assert_connected()``; reached by stubbing the assertion to a no-op.
+
+  def test_queue_len_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._queue_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.queue_len("q")
+    assert "queue collection is None" in str(exc.value)
+
+  def test_clear_queue_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._queue_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.clear_queue("q")
+    assert "queue collection is None" in str(exc.value)
+
+  def test_set_remove_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._set_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.remove("s", b"x")
+    assert "set collection is None" in str(exc.value)
+
+  def test_set_len_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._set_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.set_len("s")
+    assert "set collection is None" in str(exc.value)
+
+  def test_clear_set_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._set_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.clear_set("s")
+    assert "set collection is None" in str(exc.value)
+
+  def test_delete_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._storage_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.delete("k")
+    assert "storage collection is None" in str(exc.value)
+
+  def test_exists_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._storage_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.exists("k")
+    assert "storage collection is None" in str(exc.value)
+
+  def test_ttl_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._storage_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.ttl("k")
+    assert "storage collection is None" in str(exc.value)
+
+  def test_clear_storage_per_collection_guard_fires(self, mocker):
+    backend = self._connected(mocker)
+    backend._storage_collection = None
+    mocker.patch.object(backend, "_assert_connected", lambda: None)
+    with pytest.raises(BackendConnectionError) as exc:
+      backend.clear_storage()
+    assert "storage collection is None" in str(exc.value)
