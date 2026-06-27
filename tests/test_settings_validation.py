@@ -30,6 +30,8 @@ api_key↔username mutual exclusion, SQS/DynamoDB AWS creds both-or-neither.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -937,3 +939,103 @@ class TestSV3DynamoDbAwsCredsBothOrNeither:
     """Neither cred (IAM role path) → valid."""
     s = DynamoDBSettings()
     assert s.aws_access_key_id is None
+    assert s.aws_secret_access_key is None
+
+
+# ---------------------------------------------------------------------------
+# R14-B — v1.0 breaking-change disclosure + public-contract freeze.
+# ---------------------------------------------------------------------------
+# Two TDD gates:
+# 1. ``Settings.backend_type`` MUST accept any registry-known 3rd-party string
+#    (round-5 R5-1 promised this; round-9 regressed it — ``BackendType`` enum
+#    coercion rejects unknown strings with pydantic ValidationError before the
+#    registry can accept them).
+# 2. Unknown backend types MUST raise ``ConfigurationError`` (the project's
+#    config-error family), NOT pydantic ``ValidationError`` — so operators get
+#    a consistent exception family + a ``setting_name`` attribute for logging.
+class TestR14BBackendTypeThirdPartyString:
+  """R14-B: ``SCRAPY_BACKEND_TYPE`` accepts registered 3rd-party strings."""
+
+  def test_backend_type_accepts_registered_third_party_string(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """A registered 3rd-party backend string is accepted at the Settings layer.
+
+    RED today: ``Settings.backend_type: BackendType`` uses pydantic enum
+    coercion → ``ValidationError`` for any non-member string, contradicting
+    round-5 R5-1 (3rd-party backends route through the same path).
+    GREEN after R14-B: the field_validator accepts any ``BackendType`` OR
+    any string present in ``get_registry()``.
+    """
+    from dataclasses import dataclass
+
+    from scrapy_extension.backends.registry import (
+      _ENTRY_POINT_GROUP,
+      BackendDescriptor,
+      _reset_registry_cache,
+    )
+
+    @dataclass(frozen=True)
+    class _FakeEP:
+      name: str
+      value: str
+      group: str
+
+      def load(self) -> Any:
+        # Backenddescriptor for a fake 3rd-party backend.
+        return lambda: BackendDescriptor(
+          backend_type="fakebackend",
+          backend_cls_path="tests.test_settings_validation._FakeBackend",
+          settings_cls_path="tests.test_settings_validation._FakeBackendSettings",
+          capabilities=frozenset({"queue"}),
+        )
+
+    import importlib.metadata as importlib_metadata
+
+    def _eps(group: str | None = None) -> Any:
+      fake = _FakeEP("fakebackend", "x.y.z", _ENTRY_POINT_GROUP)
+      if group is not None:
+        return [fake] if fake.group == group else []
+      return {"scrapy_extension.backends": [fake]}
+
+    monkeypatch.setattr(importlib_metadata, "entry_points", _eps)
+    _reset_registry_cache()
+
+    # Must NOT raise — fakebackend is registered.
+    settings = Settings(backend_type="fakebackend")  # type: ignore[arg-type]
+    assert settings.backend_type == "fakebackend"
+
+  def test_unknown_backend_type_raises_configuration_error_not_validation_error(
+    self,
+  ) -> None:
+    """Unknown backend string → ``ConfigurationError``, NOT pydantic
+    ``ValidationError``.
+
+    RED today: raises ``ValidationError`` (enum coercion via
+    ``BackendType._missing_`` → ``ValueError``).
+    GREEN after R14-B: the field_validator routes unknown values through
+    ``ConfigurationError(setting_name="SCRAPY_BACKEND_TYPE", ...)`` so the
+    exception family is consistent with all other settings-validation paths
+    and the ``setting_name`` attribute is preserved for downstream log
+    handlers (frozen in STABILITY.md).
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+      Settings(backend_type="totally-not-a-real-backend")  # type: ignore[arg-type]
+    # pydantic ValidationError must NOT leak through.
+    assert not isinstance(exc_info.value, ValidationError)
+    # setting_name must be populated for downstream log handlers.
+    assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
+
+
+class _FakeBackend:
+  """Stub backend pointed at by the fake 3rd-party entry-point above."""
+
+  def __init__(self, settings: _FakeBackendSettings) -> None:
+    self.settings = settings
+
+
+class _FakeBackendSettings:
+  """Stub settings matching ``_FakeBackend``'s constructor."""
+
+  def __init__(self, **kwargs: Any) -> None:
+    self.kwargs = kwargs

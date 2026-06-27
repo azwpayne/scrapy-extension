@@ -27,6 +27,8 @@ The tiers follow [Semantic Versioning 2.0.0](https://semver.org/):
 | `resolve_backend_config()` | Stable | Used by all three component factories for multi-backend coexistence. |
 | `Monitor` ABC + `ScrapyStatsMonitor` (`monitor/`) | Stable | The hook *set* is additive; see Experimental for fresh hooks. |
 | All `SCRAPY_*` settings shipped in `settings/base.py` | Stable | Including `SCRAPY_BACKEND_TYPE`, `SCRAPY_{QUEUE,SET,STORAGE}_BACKEND_TYPE`, `SCRAPY_DEDUP_STRATEGY`, `SCRAPY_QUEUE_STRATEGY`. |
+| `ConfigurationError.setting_name` / `.setting_value` attributes | Stable | Round-14 R14-B freeze. Operators catch + log these (README:386 names them in prose); a rename would silently break downstream log handlers. The `_SENSITIVE_NAME_FRAGMENTS` redaction heuristic (password/secret/api_key/apikey/token/credential → `***REDACTED***`) is part of the contract — never log raw `setting_value` for sensitive names. |
+| `StorageError(BackendError)` exception | Stable | Round-14 R14-A. Storage ops raise this instead of returning a silent sentinel; `except BackendError` catches every storage-path failure uniformly. `operation` + `key` kwargs are part of the contract. |
 
 ### Strategy tiers
 
@@ -97,5 +99,28 @@ know about:
   default + `DelayQueueStrategy(max_held=100_000)` soft-cap warn-once
   prevent silent OOM on long high-cardinality crawls. Explicit
   `maxsize=None` / non-positive `max_held` remain as advanced opt-outs.
+
+## Round-9/14 hardening (breaking)
+
+The round-9c SV3 security cluster + the round-14 R14-A/R14-B/R14-F units
+introduced **breaking** config-time validators. Each item is security- or
+correctness-motivated; none are revertible without re-opening the footgun.
+
+- **Pulsar `auth_token` requires `pulsar+ssl://`** (round-9c SV3-2). Token
+  over plaintext leaks on the wire.
+- **Redis `ssl_enabled=True` requires `ssl_cafile`** (round-9c SV3-3). TLS
+  without a pinned CA is MITM-vulnerable.
+- **`BackendQueue.push` pops `delay`/`source` from `request.meta`**
+  (round-14 R14-F). Re-pushes no longer re-delay / re-source.
+- **Memcached / DynamoDB / MongoDB storage ops RAISE `StorageError`**
+  instead of returning a silent sentinel (round-14 R14-A). Fixes a
+  data-loss contract bug — `store()` returning `None` was treated as success.
+- **`SCRAPY_BACKEND_TYPE` raises `ConfigurationError`** (not pydantic
+  `ValidationError`) for unknown values (round-14 R14-B). Additive:
+  registered 3rd-party backend strings are now ACCEPTED at the Settings
+  layer (restores round-5 R5-1).
+
+See the **Breaking** section of [`CHANGELOG.md`](CHANGELOG.md) `[Unreleased]`
+for migration guidance.
 
 For the full change history, see [`CHANGELOG.md`](CHANGELOG.md).

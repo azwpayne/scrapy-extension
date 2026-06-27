@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
@@ -35,10 +35,81 @@ class Settings(BaseSettings):
     extra="ignore",
   )
 
-  backend_type: BackendType = Field(
+  backend_type: BackendType | str = Field(
     default=BackendType.REDIS,
-    description="Backend type for distributed crawling",
+    description=(
+      "Backend type for distributed crawling. Accepts any bundled "
+      "``BackendType`` member (e.g. ``'redis'``) OR any 3rd-party backend "
+      "string registered via the ``scrapy_extension.backends`` entry-point "
+      "group (round-5 R5-1). Unknown values raise ``ConfigurationError`` "
+      "(not pydantic ``ValidationError``) so the exception family is "
+      "consistent with every other settings-validation path (round-14 R14-B)."
+    ),
   )
+
+  @field_validator("backend_type", mode="before")
+  @classmethod
+  def _validate_backend_type(cls, value: object) -> BackendType | str:
+    """Accept any ``BackendType`` member OR any registry-known string.
+
+    Round-14 R14-B: round-9 regressed round-5 R5-1 — the ``BackendType`` enum
+    field rejected 3rd-party strings with pydantic ``ValidationError`` before
+    the registry-aware ``resolve_backend_config`` could accept them. This
+    validator restores the registry-aware contract AND routes unknown values
+    through ``ConfigurationError`` (the project's config-error family) so the
+    exception family is uniform across every settings-validation path and the
+    ``setting_name`` attribute is preserved for downstream log handlers
+    (frozen Stable in STABILITY.md).
+
+    Resolution order:
+      1. ``BackendType`` member → returned as-is (bundled-backend fast path).
+      2. Bundled ``BackendType`` value string (``'redis'``) → coerced to the
+         member (preserves the byte-identical default-behavior invariant).
+      3. Registry-known 3rd-party string (``'myplugin'``) → returned as-is so
+         ``resolve_backend_config`` can dispatch via the entry-point path.
+      4. Anything else → ``ConfigurationError(setting_name='SCRAPY_BACKEND_TYPE')``.
+
+    Args:
+        value: The raw input (``BackendType``, ``str``, or invalid).
+
+    Returns:
+        A ``BackendType`` member (bundled) or registry-known ``str`` (3rd-party).
+
+    Raises:
+        ConfigurationError: If ``value`` is not a ``BackendType`` and not a
+            registry-known string.
+    """
+    # (1) Already a BackendType member — bundled-backend fast path.
+    if isinstance(value, BackendType):
+      return value
+    # (2) & (3) String — try bundled-member coercion, then registry lookup.
+    if isinstance(value, str):
+      try:
+        return BackendType(value)
+      except ValueError:
+        pass
+      # Not a bundled member — is it a registered 3rd-party backend?
+      # Imported lazily to avoid an import cycle at module-load time
+      # (registry imports exceptions, which is fine, but settings is imported
+      # extremely early — keep the registry import inside the validator).
+      from scrapy_extension.backends.registry import get_registry
+
+      if value in get_registry():
+        return value
+      valid = ", ".join(repr(k) for k in sorted(get_registry()))
+      msg = (
+        f"{value!r} is not a registered backend type. "
+        f"Valid values: {valid}."
+      )
+      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
+    # Non-str, non-BackendType input (e.g. int) → ConfigurationError, NOT
+    # pydantic ValidationError (consistent exception family).
+    raise ConfigurationError(
+      f"backend_type must be a string or BackendType, got {type(value).__name__}: "
+      f"{value!r}",
+      setting_name="SCRAPY_BACKEND_TYPE",
+      setting_value=value,
+    )
   serializer: Literal["json"] = Field(
     default="json",
     description="Serializer to use for data encoding",

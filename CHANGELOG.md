@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+Round-9/14 hardening introduced config-time validators that **refuse to start**
+crawlers carrying unsafe or incoherent config. Each item is security-motivated
+and was previously a silent footgun, but they ARE behavior breaks — read before
+upgrading.
+
+- **Pulsar `auth_token` now requires `pulsar+ssl://`.** `PulsarSettings(
+  auth_token=…)` rejects `service_url` values that do not start with
+  `pulsar+ssl://` (round-9c SV3-2). Sending a token over plaintext `pulsar://`
+  leaks it on the wire; operators who intentionally run token-auth over a
+  private plaintext broker must switch to `pulsar+ssl://` (or drop the token).
+  Fix: change `SCRAPY_PULSAR_SERVICE_URL` to `pulsar+ssl://broker:6651`.
+- **Redis `ssl_enabled=True` now requires `ssl_cafile`.** `RedisSettings(
+  ssl_enabled=True)` rejects a missing `ssl_cafile` (round-9c SV3-3). TLS
+  without a pinned CA is vulnerable to MITM; operators who previously relied
+  on the system CA store must now pass an explicit `SCRAPY_REDIS_SSL_CAFILE`.
+- **`BackendQueue.push` pops `delay` / `source` from `request.meta`.** A delayed
+  request that is re-pushed (e.g. by a retry) no longer re-applies the original
+  delay (round-14 R14-F). Code that re-reads `request.meta['delay']` /
+  `request.meta['source']` downstream of a push will now see them absent;
+  re-push semantics changed from "re-delay every time" to "delay once".
+- **Memcached / DynamoDB / MongoDB storage ops now RAISE `StorageError`
+  instead of returning a silent sentinel.** A failed `store()` previously
+  returned `None` (memcached/dynamodb) — the item pipeline believed the item
+  was stored (data-loss contract bug). Failed ops now raise
+  `StorageError(BackendError)` so `except BackendError` catches them
+  uniformly (round-14 R14-A). Code that swallowed the sentinel must now
+  handle the exception; the prior behavior was a silent data-loss bug.
+- **`SCRAPY_BACKEND_TYPE` validation now raises `ConfigurationError`, not
+  pydantic `ValidationError`.** Unknown backend-type values (and 3rd-party
+  strings not present in the registry) raise the project's `ConfigurationError`
+  with `setting_name='SCRAPY_BACKEND_TYPE'` (round-14 R14-B). Operators with
+  `except ValidationError` handlers for bad backend types must switch to
+  `except ConfigurationError` (or the broader `except BackendError`).
+  **Additive:** registered 3rd-party backend strings (entry-point group
+  `scrapy_extension.backends`) are now ACCEPTED at the Settings layer — they
+  were previously rejected as `ValidationError`, contradicting round-5 R5-1.
+
 ### Added
 
 - `QueueBackend.ack()` / `nack()` API for message-queue backends (Kafka,
