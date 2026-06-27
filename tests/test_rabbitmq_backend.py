@@ -1234,3 +1234,78 @@ def test_rabbitmq_password_redacted_in_credentials_repr(mocker):
   # But repr of the credential object hides it.
   assert "top-secret-rmq-pwd" not in repr(password)
   assert isinstance(password, _RedactedStr)
+
+
+# ===========================================================================
+# R14-E — Lifecycle bounds: RabbitMQ QoS null-on-failure
+# ===========================================================================
+
+
+def test_rabbitmq_qos_failure_nulls_connection(mocker):
+  """R14-E HIGH: a QoS failure during connect must null ``_connection``/``_channel``.
+
+  Before R14-E, ``_setup_qos`` ran AFTER ``self._connection``/``self._channel``
+  were assigned. An ``AMQPError`` from ``basic_qos`` left the half-init state
+  in place, so ``is_connected()`` returned True on a broken channel. The fix
+  runs QoS on a local channel before committing to instance state and nulls
+  both attrs on failure (mirrors R25-A1's connect-path cleanup).
+  """
+  # prefetch_count > 0 so _apply_qos actually invokes basic_qos.
+  config = RabbitMQSettings(prefetch_count=10)
+  backend = RabbitMQBackend(config)
+
+  mock_instance = mocker.MagicMock()
+  mock_instance.is_open = True
+  mock_channel = mocker.MagicMock()
+  mock_instance.channel.return_value = mock_channel
+  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+  # basic_qos raises AMQPError — the half-init bug.
+  mock_channel.basic_qos.side_effect = pika.exceptions.AMQPError("QoS failed")
+
+  # connect() wraps the AMQPError as BackendConnectionError.
+  with pytest.raises(BackendConnectionError):
+    backend.connect()
+
+  # The load-bearing assertion: is_connected() must be False, not True.
+  assert backend.is_connected() is False, (
+    "is_connected() returned True on a half-init channel — the QoS "
+    "failure did not null _connection/_channel"
+  )
+  assert backend._connection is None
+  assert backend._channel is None
+
+
+def test_rabbitmq_in_flight_set_bounded(mocker, caplog):
+  """R14-E MED: the diagnostic ``_in_flight_tags`` set is capped.
+
+  A long-running process with slow acks would grow the set unbounded; we
+  cap at ``_MAX_IN_FLIGHT`` and warn-once on overflow. The pop itself is
+  never dropped — the message is still returned to the caller.
+  """
+  from scrapy_extension.backends.rabbitmq import _MAX_IN_FLIGHT
+
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+  # Simulate an already-saturated set.
+  backend._in_flight_tags = set(range(_MAX_IN_FLIGHT))
+  assert not backend._in_flight_overflow_warned
+
+  # Pop a fresh message — the new tag must NOT grow the set past the cap.
+  mock_channel = mocker.MagicMock()
+  backend._channel = mock_channel
+  mock_method = mocker.MagicMock(delivery_tag=999_999)
+  mock_channel.basic_get.return_value = (mock_method, mocker.MagicMock(), b"body")
+
+  import logging
+
+  with caplog.at_level(logging.WARNING):
+    body, _tag = backend.pop_with_ack("q")
+
+  # The pop succeeded — message returned, not dropped.
+  assert body == b"body"
+  # The set stayed at the cap (the new tag was not added).
+  assert len(backend._in_flight_tags) == _MAX_IN_FLIGHT
+  # The one-shot warning fired.
+  assert backend._in_flight_overflow_warned is True
+  assert any("at cap" in r.message for r in caplog.records)

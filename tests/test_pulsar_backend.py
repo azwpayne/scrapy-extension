@@ -483,3 +483,44 @@ def test_pulsar_auth_token_is_redacted_str(mocker) -> None:
   # But repr is masked.
   assert "top-secret-pulsar-token" not in repr(token_arg)
   assert isinstance(token_arg, _RedactedStr)
+
+
+# ===========================================================================
+# R14-E — Lifecycle bounds: Pulsar diagnostic in-flight set cap
+# ===========================================================================
+
+
+class TestPulsarInFlightCap:
+  """R14-E MED: the diagnostic ``_in_flight`` set is capped at ``_MAX_IN_FLIGHT``."""
+
+  def test_pop_with_ack_caps_in_flight_set(self, mocker, caplog) -> None:
+    """When the set is saturated, the pop still succeeds but the set stops growing."""
+    import logging
+
+    from scrapy_extension.backends.pulsar import _MAX_IN_FLIGHT
+
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"hello"
+    msg_id = mocker.MagicMock(name="msg_id_overflow")
+    msg.message_id.return_value = msg_id
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _client = _connected(mocker, subscribe=consumer)
+
+    # Pre-saturate the set so the next pop trips the cap.
+    b._in_flight = {
+      _PulsarAckToken(message_id=object(), topic=f"t{i}") for i in range(_MAX_IN_FLIGHT)
+    }
+    assert not b._in_flight_overflow_warned
+
+    with caplog.at_level(logging.WARNING):
+      value, token = b.pop_with_ack("queue1", timeout=1.0)
+
+    # The pop succeeded — message returned, NOT dropped.
+    assert value == b"hello"
+    assert isinstance(token, _PulsarAckToken)
+    # The set stayed at the cap (the new token was not added).
+    assert len(b._in_flight) == _MAX_IN_FLIGHT
+    # The one-shot warning fired.
+    assert b._in_flight_overflow_warned is True
+    assert any("at cap" in r.message for r in caplog.records)

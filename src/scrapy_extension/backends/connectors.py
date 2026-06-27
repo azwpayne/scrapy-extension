@@ -23,6 +23,7 @@ import logging
 import random
 import threading
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from scrapy_extension.backends.base import (
@@ -257,9 +258,24 @@ class ConnectionManager:
       _lock: Threading lock for thread safety.
   """
 
-  # Class-level registry of managers
-  _managers: ClassVar[dict[str, ConnectionManager]] = {}
+  # Class-level registry of managers. R14-E: this is an LRU-bounded
+  # ``OrderedDict`` (``MAX_MANAGERS``) so settings churn — per-spider creds,
+  # unique ``group_id``, rotating endpoints — cannot leak live ``Backend``
+  # instances + their open sockets forever. On overflow the oldest
+  # genuinely-orphaned entry (``_users <= 0``) is evicted and disconnected;
+  # actively-used managers (``_users > 0``) are never evicted.
+  _managers: ClassVar[OrderedDict[str, ConnectionManager]] = OrderedDict()
   _registry_lock: ClassVar[threading.Lock] = threading.Lock()
+  # One-shot guard for the "registry over cap with all entries live" warning
+  # so we don't spam logs on every get_manager() once the cap is saturated.
+  _over_cap_warned: ClassVar[bool] = False
+  #: Cap on the registry size. 32 is comfortably above any realistic
+  #: single-process multi-backend coexistence (10 bundled backends x 3
+  #: components) while bounding the worst-case leak from settings churn to
+  #: ~32 live sockets. Exceeding this with ALL entries actively held
+  #: (``_users > 0``) is a real leak elsewhere — we log a warning and
+  #: stop evicting rather than tearing down a live manager.
+  MAX_MANAGERS: ClassVar[int] = 32
 
   def __init__(
     self,
@@ -330,10 +346,76 @@ class ConnectionManager:
     with cls._registry_lock:
       manager = cls._managers.get(key)
       if manager is None:
+        # R14-E: before inserting a brand-new entry, evict from the FRONT
+        # of the LRU until we're under the cap. Only genuinely-orphaned
+        # entries (``_users <= 0``) are evicted — an actively-held manager
+        # is skipped (it will be evicted later when its last holder
+        # releases). If every entry is actively held we stop evicting and
+        # log a one-shot warning rather than tear down a live connection
+        # (a real leak, but not one ``get_manager`` should fix by force).
+        cls._evict_orphans_under_lock()
         manager = cls(backend_type, normalized_settings)
         cls._managers[key] = manager
+      else:
+        # LRU touch — recently-used entries move to the back (newest).
+        cls._managers.move_to_end(key)
       manager._users += 1
       return manager
+
+  @classmethod
+  def _evict_orphans_under_lock(cls) -> None:
+    """Evict orphaned managers from the front of the LRU until under cap.
+
+    R14-E: called under ``_registry_lock`` whenever a NEW entry is about to
+    be inserted. Walks the front (oldest) of the ``OrderedDict`` and evicts
+    any entry with ``_users <= 0`` — those are genuinely orphaned (no
+    outstanding ``get_manager()`` acquire holds them; their last holder
+    already called ``close()`` but the entry lingered because nothing
+    pushed it out). Each evicted victim's backend is disconnected so its
+    sockets are released, mirroring the teardown path in :meth:`close`.
+
+    Entries with ``_users > 0`` are NEVER evicted — they're actively held
+    by a component and force-eviction would corrupt that component's
+    connection. If the cap can't be reached by evicting orphans alone, we
+    stop and log a warning (one per process) so operators know the
+    registry is over budget with all entries live.
+
+    Must be called UNDER ``_registry_lock`` — it mutates ``_managers`` and
+    reads ``_users`` without per-instance locking.
+    """
+    while len(cls._managers) >= cls.MAX_MANAGERS:
+      # Find the front-most orphan. Can't ``popitem(last=False)`` blindly
+      # because the oldest entry may be actively held (``_users > 0``) and
+      # force-eviction would corrupt its holder.
+      orphan_key: str | None = None
+      for candidate_key, candidate in cls._managers.items():
+        if candidate._users <= 0:
+          orphan_key = candidate_key
+          break
+      if orphan_key is None:
+        # Every entry is actively held — registry is genuinely over budget.
+        # Warn once per process; do not force-evict a live manager.
+        if not cls._over_cap_warned:
+          cls._over_cap_warned = True
+          logger.warning(
+            "ConnectionManager registry at cap (%d) with all entries "
+            "actively held; not force-evicting live managers. This "
+            "indicates genuine unbounded backend coexistence — investigate "
+            "the source of distinct backend settings.",
+            cls.MAX_MANAGERS,
+          )
+        return
+      victim = cls._managers.pop(orphan_key)
+      # Disconnect the victim outside the registry lock to avoid
+      # serializing new get_manager() calls on a slow disconnect. The
+      # victim is already evicted from the registry so peers can't see it.
+      # Use a background-free inline disconnect under the victim's own
+      # instance lock (mirrors ``close()``'s teardown arm).
+      with victim._lock:
+        if victim._backend is not None:
+          with contextlib.suppress(Exception):
+            victim._backend.disconnect()
+          victim._backend = None
 
   @staticmethod
   def _registry_key(
@@ -513,6 +595,13 @@ class ConnectionManager:
           logger.warning("Error during disconnect: %s", e)
         finally:
           self._backend = None
+      # R14-E: reset the circuit breaker so a manager that reconnects after
+      # teardown (or an orphan-evicted manager re-created from the same
+      # settings) does not inherit a stale OPEN state from the prior
+      # incarnation's failure run. ``reset()`` is a no-op when the breaker
+      # was never constructed (disabled).
+      if self._breaker is not None:
+        self._breaker.reset()
 
   @classmethod
   def clear_registry(cls) -> None:
@@ -529,12 +618,19 @@ class ConnectionManager:
     with cls._registry_lock:
       managers = list(cls._managers.values())
       cls._managers.clear()
+      # Reset the one-shot over-cap warning so a fresh test suite run
+      # re-warns if it overflows the cap (otherwise the warning is
+      # permanently suppressed after the first overflow across tests).
+      cls._over_cap_warned = False
     for manager in managers:
       with manager._lock:
         if manager._backend:
           with contextlib.suppress(Exception):
             manager._backend.disconnect()
           manager._backend = None
+        # Reset any breaker state too (mirrors close()).
+        if manager._breaker is not None:
+          manager._breaker.reset()
 
   @property
   def backend(self) -> Backend:

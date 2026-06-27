@@ -295,3 +295,151 @@ def test_backend_property_concurrent_first_connect_single_connect(mocker):
   # Exactly one _create_backend call (single connect).
   assert ConnectionManager._create_backend.call_count == 1
 
+
+# ===========================================================================
+# R14-E — Lifecycle bounds (long-run leak prevention)
+# ===========================================================================
+
+
+def test_managers_registry_capped_under_settings_churn(mocker):
+  """R14-E HIGH: settings churn must not grow ``_managers`` unbounded.
+
+  A crawler with rotating per-spider credentials / unique ``group_id``
+  produces a fresh registry entry per distinct settings dict. Without a
+  cap, prior entries (each holding a live ``Backend`` + open sockets)
+  linger forever. The registry is now an LRU ``OrderedDict`` capped at
+  ``MAX_MANAGERS``; on overflow the oldest *genuinely-orphaned* entry
+  (``_users <= 0``) is evicted and its backend disconnected.
+  """
+  ConnectionManager.clear_registry()
+  cap = ConnectionManager.MAX_MANAGERS
+  # Patch _create_backend so we don't touch the network; track disconnect
+  # calls so we can assert the victim was torn down.
+  mock_backends: list = []
+  disconnected: list = []
+
+  class _FakeBackend:
+    def __init__(self) -> None:
+      mock_backends.append(self)
+
+    def connect(self) -> None:
+      pass
+
+    def disconnect(self) -> None:
+      disconnected.append(self)
+
+    def is_connected(self) -> bool:
+      return True
+
+  mocker.patch.object(
+    ConnectionManager, "_create_backend", side_effect=lambda: _FakeBackend()
+  )
+
+  n = 64  # double the cap
+  try:
+    for i in range(n):
+      # Each iteration: acquire a manager with distinct settings, force
+      # its backend to materialize (so disconnect has something to tear
+      # down), then release. The entry becomes orphaned (``_users <= 0``)
+      # and is eligible for LRU eviction on the NEXT insert.
+      mgr = ConnectionManager.get_manager(
+        BackendType.REDIS, {"host": f"churn-{i}"}
+      )
+      _ = mgr.backend  # materialize the backend
+      mgr.close()
+    # Registry must be at-or-under the cap after the churn.
+    assert len(ConnectionManager._managers) <= cap, (
+      f"registry grew to {len(ConnectionManager._managers)} > cap {cap} "
+      "under settings churn — LRU eviction did not fire"
+    )
+    # At least one victim's backend was disconnected (many more, in fact).
+    assert len(disconnected) > 0, "no orphaned manager was disconnected"
+  finally:
+    ConnectionManager.clear_registry()
+    mocker.stopall()
+
+
+def test_managers_registry_does_not_evict_actively_held_manager(mocker):
+  """R14-E CRITICAL: an actively-held manager (``_users > 0``) is never evicted.
+
+  Force-eviction would corrupt the holder's connection. When the cap is
+  reached with ALL entries live, we stop evicting and warn-once instead.
+  """
+  ConnectionManager.clear_registry()
+  cap = ConnectionManager.MAX_MANAGERS
+  mocker.patch.object(
+    ConnectionManager,
+    "_create_backend",
+    return_value=mocker.MagicMock(),
+  )
+  held_managers: list = []
+  try:
+    # Acquire ``cap`` distinct managers WITHOUT closing them — all live.
+    for i in range(cap):
+      held_managers.append(
+        ConnectionManager.get_manager(BackendType.REDIS, {"host": f"live-{i}"})
+      )
+    assert len(ConnectionManager._managers) == cap
+    # All are actively held.
+    assert all(m._users > 0 for m in ConnectionManager._managers.values())
+
+    # Acquire one MORE — would normally trigger eviction, but every entry
+    # is live, so the new one is added without evicting any holder.
+    extra = ConnectionManager.get_manager(
+      BackendType.REDIS, {"host": "extra-live"}
+    )
+    held_managers.append(extra)
+    # Registry is now over cap (cap + 1) — but NO held manager was evicted.
+    assert len(ConnectionManager._managers) == cap + 1
+    # Every originally-held manager is still in the registry.
+    for m in held_managers[:-1]:
+      assert m._users > 0
+      assert m in ConnectionManager._managers.values()
+  finally:
+    # Release every holder so teardown is clean.
+    for m in held_managers:
+      m.close()
+    ConnectionManager.clear_registry()
+    mocker.stopall()
+
+
+def test_close_resets_circuit_breaker(mocker):
+  """R14-E MED: ``close()`` resets the breaker so a reconnect doesn't inherit stale OPEN state.
+
+  Without reset, an orphan-evicted or torn-down manager whose breaker had
+  tripped OPEN would leave the breaker stuck OPEN — and since the breaker
+  is per-manager, a fresh manager created from the same settings inherits
+  nothing (good), but a manager that reconnects after teardown (kept alive
+  by an external ref) would stay OPEN forever.
+  """
+  ConnectionManager.clear_registry()
+  mock_backend = mocker.MagicMock()
+  mocker.patch.object(ConnectionManager, "_create_backend", return_value=mock_backend)
+
+  mgr = ConnectionManager.get_manager(BackendType.REDIS, {"host": "breaker-test"})
+  _ = mgr.backend  # materialize
+  # Manually construct + trip the breaker to simulate a failure run.
+  from scrapy_extension.backends.circuit_breaker import (
+    BreakerState,
+    CircuitBreaker,
+  )
+
+  breaker = CircuitBreaker(name="test", failure_threshold=1)
+  # Trip it: one failure crosses the threshold.
+  try:
+    breaker.call(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+  except RuntimeError:
+    pass
+  assert breaker.state is BreakerState.OPEN
+  mgr._breaker = breaker
+  mgr._breaker_configured = True
+
+  mgr.close()
+
+  assert breaker.state is BreakerState.CLOSED, (
+    "close() did not reset the circuit breaker — a reconnecting manager "
+    "would inherit a stale OPEN state"
+  )
+  ConnectionManager.clear_registry()
+  mocker.stopall()
+

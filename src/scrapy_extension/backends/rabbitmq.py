@@ -48,6 +48,15 @@ logger = logging.getLogger(__name__)
 # Used to detect the insecure default guest/guest login in non-standalone modes.
 _DEFAULT_GUEST_CREDENTIAL = "guest"  # nosec B105
 
+# R14-E: cap on the diagnostic in-flight delivery-tag set. Each unacked pop
+# adds one entry; without a cap a long-running process with slow acks (or a
+# bug that never acks) grows the set unbounded. We warn-once on overflow and
+# STOP adding (the set is diagnostic — ack correctness lives in the broker's
+# delivery-tag state, not in this set; dropping the entry loses only the leak
+# signal, never the ack state). 10k is generous for normal CONCURRENT_REQUESTS
+# backpressure and tight enough to flag a real leak.
+_MAX_IN_FLIGHT = 10_000
+
 
 class RabbitMQBackend(Backend, QueueBackend):
   """RabbitMQ backend implementation with multi-mode support.
@@ -91,6 +100,8 @@ class RabbitMQBackend(Backend, QueueBackend):
     # ackable — silent at-least-once violation.
     self._in_flight_tags: set[int] = set()
     self._ssl_warning_emitted: bool = False
+    # R14-E: one-shot guard for the in-flight-set-overflow warning.
+    self._in_flight_overflow_warned: bool = False
 
   def connect(self) -> None:
     """Establish connection to RabbitMQ based on deployment mode.
@@ -227,11 +238,33 @@ class RabbitMQBackend(Backend, QueueBackend):
     )
 
   def _connect_standalone(self) -> None:
-    """Connect to standalone RabbitMQ node."""
+    """Connect to standalone RabbitMQ node.
+
+    R14-E: ``_setup_qos`` runs BEFORE the connection/channel are committed
+    to instance state. On QoS failure the freshly-opened channel/connection
+    are closed and ``_channel``/``_connection`` are nulled, so
+    :meth:`is_connected` reports False truthfully instead of True-on-half-
+    init (mirrors the R25-A1 connect-path cleanup pattern in
+    ``connectors.py``).
+    """
     parameters = self._build_common_parameters()
-    self._connection = pika.BlockingConnection(parameters)
-    self._channel = self._connection.channel()
-    self._setup_qos()
+    connection = pika.BlockingConnection(parameters)
+    channel = connection.channel()
+    try:
+      self._apply_qos(channel)
+    except AMQPError:
+      # QoS failed on a half-init channel — close the freshly-opened
+      # handles and null both instance attrs so is_connected() stays
+      # truthful. Re-raise so connect()'s retry loop sees the failure.
+      with contextlib.suppress(AMQPError):
+        channel.close()
+      with contextlib.suppress(AMQPError):
+        connection.close()
+      self._channel = None
+      self._connection = None
+      raise
+    self._connection = connection
+    self._channel = channel
     logger.debug(
       "Connected to standalone RabbitMQ at %s:%s", self.config.host, self.config.port
     )
@@ -240,6 +273,9 @@ class RabbitMQBackend(Backend, QueueBackend):
     """Connect to RabbitMQ cluster.
 
     Uses cluster_nodes for failover if primary node is unavailable.
+
+    R14-E: QoS runs before ``_connection``/``_channel`` are committed, with
+    null-on-failure cleanup so :meth:`is_connected` stays truthful.
     """
     if self.config.cluster_nodes:
       parameters = [self._build_common_parameters()]
@@ -261,9 +297,20 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
       connection_parameters = self._build_common_parameters()
 
-    self._connection = pika.BlockingConnection(connection_parameters)
-    self._channel = self._connection.channel()
-    self._setup_qos()
+    connection = pika.BlockingConnection(connection_parameters)
+    channel = connection.channel()
+    try:
+      self._apply_qos(channel)
+    except AMQPError:
+      with contextlib.suppress(AMQPError):
+        channel.close()
+      with contextlib.suppress(AMQPError):
+        connection.close()
+      self._channel = None
+      self._connection = None
+      raise
+    self._connection = connection
+    self._channel = channel
     logger.debug("Connected to RabbitMQ cluster")
 
   def _connect_mirrored_queues(self) -> None:
@@ -296,11 +343,34 @@ class RabbitMQBackend(Backend, QueueBackend):
         logger.warning("Failed to configure mirrored queues HA policy: %s", e)
 
   def _setup_qos(self) -> None:
-    """Set up QoS (Quality of Service) settings on the channel."""
-    if self._channel and (
-      self.config.prefetch_count > 0 or self.config.prefetch_size > 0
-    ):
-      self._channel.basic_qos(
+    """Set up QoS (Quality of Service) settings on the current channel.
+
+    Kept for backward-compat with external callers / tests that invoke the
+    instance method directly. Internal connect paths use
+    :meth:`_apply_qos` on a local channel so QoS runs BEFORE the channel
+    is committed to ``self._channel`` (R14-E null-on-failure cleanup).
+    """
+    if self._channel is not None:
+      self._apply_qos(self._channel)
+
+  def _apply_qos(self, channel: pika.channel.Channel) -> None:
+    """Apply QoS (prefetch) settings to ``channel``.
+
+    R14-E: extracted from :meth:`_setup_qos` so the connect paths can call
+    it on a freshly-opened LOCAL channel (not yet committed to
+    ``self._channel``). On :class:`AMQPError` the caller is responsible
+    for closing the channel/connection and nulling instance state — this
+    method re-raises unchanged so the cleanup arm in each connect path
+    fires.
+
+    Args:
+        channel: The freshly-opened channel to apply QoS to.
+
+    Raises:
+        AMQPError: If ``basic_qos`` fails at the AMQP layer.
+    """
+    if self.config.prefetch_count > 0 or self.config.prefetch_size > 0:
+      channel.basic_qos(
         prefetch_count=self.config.prefetch_count,
         prefetch_size=self.config.prefetch_size,
       )
@@ -492,6 +562,33 @@ class RabbitMQBackend(Backend, QueueBackend):
     body, tag = self._basic_get(queue_name, track_in_flight=True)
     return (body, tag)
 
+  def _track_in_flight(self, delivery_tag: int) -> None:
+    """Add ``delivery_tag`` to the diagnostic in-flight set, bounded.
+
+    R14-E: the in-flight set is diagnostic (the broker tracks delivery
+    tags — ack correctness does not depend on this set). It grows one
+    entry per unacked pop, so a long-running process with slow acks (or a
+    bug that never acks) would grow it unbounded. We cap it at
+    :data:`_MAX_IN_FLIGHT` and warn-once on overflow. The POP ITSELF is
+    never dropped — the caller still receives the message and the broker
+    still tracks its delivery tag for ack.
+
+    Args:
+        delivery_tag: The AMQP delivery tag to track.
+    """
+    if len(self._in_flight_tags) < _MAX_IN_FLIGHT:
+      self._in_flight_tags.add(delivery_tag)
+      return
+    if not self._in_flight_overflow_warned:
+      self._in_flight_overflow_warned = True
+      logger.warning(
+        "RabbitMQ in-flight ack set at cap (%d) — further unacked pops "
+        "will not be tracked in the diagnostic set. This indicates slow "
+        "acks or an ack leak; the broker still tracks delivery tags so "
+        "ack correctness is unaffected.",
+        _MAX_IN_FLIGHT,
+      )
+
   def _basic_get(
     self, queue_name: str, *, track_in_flight: bool = False
   ) -> tuple[bytes | None, int | None]:
@@ -532,7 +629,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         delivery_tag = method_frame.delivery_tag
         self._last_delivery_tag = delivery_tag
         if track_in_flight:
-          self._in_flight_tags.add(delivery_tag)
+          self._track_in_flight(delivery_tag)
         return (body, delivery_tag)
     except AMQPError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"

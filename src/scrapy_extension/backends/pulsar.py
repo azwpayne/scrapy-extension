@@ -48,6 +48,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
+# adds one entry; without a cap a long-running process with slow acks (or a
+# bug that never acks) grows the set unbounded. We warn-once on overflow and
+# STOP adding — the set is diagnostic (Pulsar acks each message independently
+# via ``consumer.acknowledge(msg_id)``, so ack correctness lives in the
+# broker, not in this set). The POP itself is never dropped. 10k is generous
+# for normal CONCURRENT_REQUESTS backpressure and tight enough to flag a leak.
+_MAX_IN_FLIGHT = 10_000
+
 
 class _PulsarAckToken:
   """Opaque ack token carrying a popped Pulsar message's ``message_id``.
@@ -214,6 +223,8 @@ class PulsarBackend(Backend, QueueBackend):
     # watermark commit), so the set is for leak detection / monitoring —
     # mirrors RabbitMQ's ``_in_flight_tags``.
     self._in_flight: set[_PulsarAckToken] = set()
+    # R14-E: one-shot guard for the in-flight-set-overflow warning.
+    self._in_flight_overflow_warned: bool = False
 
   def connect(self) -> None:
     """Connect to Pulsar by creating a client from ``service_url``.
@@ -412,11 +423,38 @@ class PulsarBackend(Backend, QueueBackend):
     if msg is None:
       return (None, None)
     token = _PulsarAckToken(message_id=msg.message_id(), topic=topic)
-    self._in_flight.add(token)
+    self._track_in_flight(token)
     # Keep _last_msg in sync so the legacy ack(token=None) path stays
     # usable for callers that don't thread the token through.
     self._last_msg = msg
     return (_message_bytes(msg), token)
+
+  def _track_in_flight(self, token: _PulsarAckToken) -> None:
+    """Add ``token`` to the diagnostic in-flight set, bounded.
+
+    R14-E: the in-flight set is diagnostic (Pulsar acks each message
+    independently via ``consumer.acknowledge(msg_id)``; ack correctness
+    lives in the broker). It grows one entry per unacked pop, so a
+    long-running process with slow acks would grow it unbounded. We cap
+    at :data:`_MAX_IN_FLIGHT` and warn-once on overflow. The POP itself
+    is never dropped — the caller still receives the message and the
+    broker still tracks the message_id for ack.
+
+    Args:
+        token: The :class:`_PulsarAckToken` to track.
+    """
+    if len(self._in_flight) < _MAX_IN_FLIGHT:
+      self._in_flight.add(token)
+      return
+    if not self._in_flight_overflow_warned:
+      self._in_flight_overflow_warned = True
+      logger.warning(
+        "Pulsar in-flight ack-token set at cap (%d) — further unacked "
+        "pops will not be tracked in the diagnostic set. This indicates "
+        "slow acks or an ack leak; the broker still tracks message_ids "
+        "so ack correctness is unaffected.",
+        _MAX_IN_FLIGHT,
+      )
 
   def _receive(self, queue_name: str, timeout: float) -> Any:
     """Receive one message from ``queue_name``; return None if empty.

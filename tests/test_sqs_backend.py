@@ -612,3 +612,47 @@ class TestSqsHalfCredentialGuard:
     _, kwargs = boto3.client.call_args.args, boto3.client.call_args.kwargs
     assert "aws_access_key_id" not in kwargs
     assert "aws_secret_access_key" not in kwargs
+
+
+# ===========================================================================
+# R14-E — Lifecycle bounds: SQS diagnostic in-flight set cap
+# ===========================================================================
+
+
+class TestSqsInFlightCap:
+  """R14-E MED: the diagnostic ``_in_flight`` set is capped at ``_MAX_IN_FLIGHT``."""
+
+  def test_pop_with_ack_caps_in_flight_set(self, mocker, caplog) -> None:
+    """When the set is saturated, the pop still succeeds but the set stops growing."""
+    import base64
+    import logging
+
+    from scrapy_extension.backends.sqs import _MAX_IN_FLIGHT
+
+    body = b"hello-sqs"
+    client = mocker.MagicMock()
+    client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
+    client.receive_message.return_value = {
+      "Messages": [{"Body": base64.b64encode(body).decode("ascii"), "ReceiptHandle": "rh-new"}]
+    }
+    b, _ = _connected(mocker)
+    b._client = client
+
+    # Pre-saturate the set so the next pop trips the cap.
+    b._in_flight = {
+      _SqsAckToken(queue_url=f"https://sqs/t{i}", receipt_handle=f"rh{i}")
+      for i in range(_MAX_IN_FLIGHT)
+    }
+    assert not b._in_flight_overflow_warned
+
+    with caplog.at_level(logging.WARNING):
+      value, token = b.pop_with_ack("queue1")
+
+    # The pop succeeded — message returned, NOT dropped.
+    assert value == body
+    assert isinstance(token, _SqsAckToken)
+    # The set stayed at the cap (the new token was not added).
+    assert len(b._in_flight) == _MAX_IN_FLIGHT
+    # The one-shot warning fired.
+    assert b._in_flight_overflow_warned is True
+    assert any("at cap" in r.message for r in caplog.records)

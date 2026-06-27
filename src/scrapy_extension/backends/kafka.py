@@ -678,16 +678,30 @@ class KafkaBackend(Backend, QueueBackend):
     while watermark < high and watermark not in in_flight:
       watermark += 1
     # Commit only if the watermark advanced past the base.
-    if watermark <= base:
-      return
-    try:
-      tp = TopicPartition(token.topic, partition)
-      self._consumer.commit({tp: OffsetAndMetadata(watermark, "")})
-    except KafkaError as e:
-      msg = f"Failed to ack Kafka message: {e}"
-      raise QueueError(msg, operation="ack") from e
-    else:
-      self._watermarks[partition] = watermark
+    if watermark > base:
+      try:
+        tp = TopicPartition(token.topic, partition)
+        self._consumer.commit({tp: OffsetAndMetadata(watermark, "")})
+      except KafkaError as e:
+        msg = f"Failed to ack Kafka message: {e}"
+        raise QueueError(msg, operation="ack") from e
+      else:
+        self._watermarks[partition] = watermark
+    # R14-E: prune the per-partition bookkeeping when a partition drains.
+    # ``_in_flight``/``_watermarks``/``_high_water`` grow one key per
+    # partition ever popped; without pruning, partition churn (topics with
+    # transient partitions, or long-running multi-topic crawls) grows the
+    # dicts unbounded. When the in-flight set for a partition empties, the
+    # watermark has caught up to the popped frontier (no gaps), so the
+    # seed/watermark/high-water entries are stale and safe to drop — a
+    # fresh pop on the same partition re-seeds them lazily.
+    if not in_flight:
+      # ``defaultdict`` re-creates the key on access, so use ``del`` (or
+      # ``pop``) to genuinely remove it; ``in_flight`` is a reference into
+      # the defaultdict, so mutating it does not touch the dict key.
+      self._in_flight.pop(partition, None)
+      self._watermarks.pop(partition, None)
+      self._high_water.pop(partition, None)
 
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Nack a popped message — do NOT commit its offset (at-least-once retry).

@@ -1214,3 +1214,93 @@ def test_redaction_module_is_shared_helper():
   assert s == "hunter2"  # equality works
   assert "hunter2" not in repr(s)
   assert repr(s) == "<redacted>"
+
+
+# ===========================================================================
+# R14-E — Lifecycle bounds: Kafka partition-dict pruning
+# ===========================================================================
+
+
+class TestKafkaBackendPartitionPruning:
+  """R14-E MED: ``_in_flight``/``_watermarks``/``_high_water`` prune per-partition keys.
+
+  These dicts grow one key per partition ever popped; without pruning,
+  partition churn (topics with transient partitions, or long-running
+  multi-topic crawls) grows them unbounded. When a partition's in-flight
+  set empties (its watermark has caught up to the popped frontier), the
+  per-partition keys are stale and safe to drop — a fresh pop on the
+  same partition re-seeds them lazily.
+  """
+
+  @staticmethod
+  def _make_backend(mocker):
+    from scrapy_extension.settings import KafkaSettings
+
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    mock_consumer = mocker.MagicMock()
+    mock_consumer.position.return_value = 0
+    backend._consumer = mock_consumer
+    return backend, mock_consumer
+
+  def test_prunes_empty_partition_keys_on_ack(self, mocker):
+    """When the last in-flight offset for a partition is acked, its keys are pruned."""
+    backend, mock_consumer = self._make_backend(mocker)
+    # Simulate one pop on partition 5 (a non-default partition to prove the
+    # key is genuinely removed, not just the default 0).
+    backend._in_flight[5].add(100)
+    backend._high_water[5] = 101
+    backend._watermarks[5] = 100  # base == popped offset
+
+    from scrapy_extension.backends.kafka import _KafkaAckToken
+
+    token = _KafkaAckToken(partition=5, offset=100, topic="scrapy-testq")
+    backend.ack("testq", token=token)
+
+    # The watermark advanced to 101 (high_water), so commit fired.
+    mock_consumer.commit.assert_called_once()
+    # All three per-partition keys for partition 5 are now pruned.
+    assert 5 not in backend._in_flight, (
+      "_in_flight[5] not pruned after drain — partition-churn leak"
+    )
+    assert 5 not in backend._watermarks
+    assert 5 not in backend._high_water
+
+  def test_keeps_keys_when_partition_still_has_in_flight(self, mocker):
+    """If a partition still has unacked offsets, its keys are retained."""
+    backend, _mock_consumer = self._make_backend(mocker)
+    backend._in_flight[5].update({100, 101})
+    backend._high_water[5] = 102
+    backend._watermarks[5] = 100
+
+    from scrapy_extension.backends.kafka import _KafkaAckToken
+
+    token = _KafkaAckToken(partition=5, offset=100, topic="scrapy-testq")
+    backend.ack("testq", token=token)
+
+    # Partition 5 still has offset 101 in-flight → keys retained.
+    assert 5 in backend._in_flight
+    assert 101 in backend._in_flight[5]
+    assert 5 in backend._watermarks
+    assert 5 in backend._high_water
+
+  def test_multiple_partitions_prune_independently(self, mocker):
+    """Partition churn across many partitions prunes each independently."""
+    from scrapy_extension.backends.kafka import _KafkaAckToken
+
+    backend, _mock_consumer = self._make_backend(mocker)
+    # Seed 8 partitions, each with one in-flight offset, all at the same base.
+    for p in range(8):
+      backend._in_flight[p].add(10)
+      backend._high_water[p] = 11
+      backend._watermarks[p] = 10
+
+    # Ack each — each partition drains and prunes.
+    for p in range(8):
+      token = _KafkaAckToken(partition=p, offset=10, topic="scrapy-testq")
+      backend.ack("testq", token=token)
+
+    # All 8 partitions pruned — no unbounded growth under partition churn.
+    assert len(backend._in_flight) == 0
+    assert len(backend._watermarks) == 0
+    assert len(backend._high_water) == 0

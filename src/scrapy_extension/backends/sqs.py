@@ -53,6 +53,15 @@ logger = logging.getLogger(__name__)
 # SQS caps WaitTimeSeconds at 20.
 _MAX_WAIT_SECONDS = 20
 
+# R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
+# adds one entry; without a cap a long-running process with slow acks (or a
+# bug that never acks) grows the set unbounded. We warn-once on overflow and
+# STOP adding — the set is diagnostic (SQS acks each message independently
+# via ``delete_message(ReceiptHandle)``, so ack correctness lives in the
+# broker, not in this set). The POP itself is never dropped. 10k is generous
+# for normal CONCURRENT_REQUESTS backpressure and tight enough to flag a leak.
+_MAX_IN_FLIGHT = 10_000
+
 
 class _SqsAckToken:
   """Opaque ack token carrying the (queue_url, receipt_handle) of a popped msg.
@@ -135,6 +144,8 @@ class SqsBackend(Backend, QueueBackend):
     self._client: Any = None
     self._queue_urls: dict[str, str] = {}
     self._in_flight: set[_SqsAckToken] = set()
+    # R14-E: one-shot guard for the in-flight-set-overflow warning.
+    self._in_flight_overflow_warned: bool = False
     self._last_receipt: tuple[str, str] | None = None
 
   def connect(self) -> None:
@@ -320,11 +331,38 @@ class SqsBackend(Backend, QueueBackend):
     if body is None or receipt is None:
       return (None, None)
     token = _SqsAckToken(queue_url=url, receipt_handle=receipt)
-    self._in_flight.add(token)
+    self._track_in_flight(token)
     # Keep _last_receipt in sync so the legacy ack(token=None) path stays
     # usable for callers that don't thread the token through.
     self._last_receipt = (url, receipt)
     return (body, token)
+
+  def _track_in_flight(self, token: _SqsAckToken) -> None:
+    """Add ``token`` to the diagnostic in-flight set, bounded.
+
+    R14-E: the in-flight set is diagnostic (SQS acks each message
+    independently via ``delete_message(ReceiptHandle)``; ack correctness
+    lives in the broker). It grows one entry per unacked pop, so a
+    long-running process with slow acks would grow it unbounded. We cap
+    at :data:`_MAX_IN_FLIGHT` and warn-once on overflow. The POP itself
+    is never dropped — the caller still receives the message and the
+    broker still tracks the receipt handle for ack.
+
+    Args:
+        token: The :class:`_SqsAckToken` to track.
+    """
+    if len(self._in_flight) < _MAX_IN_FLIGHT:
+      self._in_flight.add(token)
+      return
+    if not self._in_flight_overflow_warned:
+      self._in_flight_overflow_warned = True
+      logger.warning(
+        "SQS in-flight ack-token set at cap (%d) — further unacked pops "
+        "will not be tracked in the diagnostic set. This indicates slow "
+        "acks or an ack leak; the broker still tracks receipt handles "
+        "so ack correctness is unaffected.",
+        _MAX_IN_FLIGHT,
+      )
 
   def _receive(
     self, queue_name: str, timeout: float
