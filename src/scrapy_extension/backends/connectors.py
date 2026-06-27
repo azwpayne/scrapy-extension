@@ -40,6 +40,7 @@ from scrapy_extension.backends.registry import (
   has_capability,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.monitor.base import Monitor, NullMonitor
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import Backend
@@ -314,6 +315,14 @@ class ConnectionManager:
     # overhead and byte-identical behavior.
     self._breaker: CircuitBreaker | None = None
     self._breaker_configured: bool = False
+    # R14-D: observability monitor for connection-lifecycle hooks
+    # (on_connect / on_disconnect / on_retry). Defaults to NullMonitor so the
+    # hooks are no-ops unless a caller (scheduler / dupefilter factory) threads
+    # a real monitor via :meth:`set_monitor`. Threading into the scheduler
+    # factory is a follow-up (scheduler.py is out of R14-D scope); the hooks
+    # + their stat keys (backend/connect_count, etc.) are wired here so the
+    # observability contract is in place the moment a monitor is attached.
+    self._monitor: Monitor = NullMonitor()
 
   @classmethod
   def get_manager(
@@ -501,6 +510,12 @@ class ConnectionManager:
           "Connection attempt %d/%d failed: %s", attempt + 1, retry_attempts, e
         )
         if attempt < retry_attempts - 1:
+          # R14-D: emit on_retry before each exponential-backoff sleep so a
+          # flapping backend surfaces as ``backend/retry_count``. ``attempt``
+          # here is the 0-based just-failed index; the retry is 1-based
+          # (attempt+1 = first retry = second overall attempt). No-op on the
+          # default NullMonitor.
+          self._monitor.on_retry(str(self.backend_type), attempt + 1)
           # Full jitter: random.uniform(0, delay). Prevents thundering herd
           # when many workers retry simultaneously after a coordinated
           # outage (e.g., Redis failover). See AWS Architecture Blog:
@@ -512,6 +527,9 @@ class ConnectionManager:
           time.sleep(random.uniform(0, delay))  # nosec B311 - jitter, not cryptographic
       else:
         logger.debug("Connected to %s", self.backend_type)
+        # R14-D: emit on_connect on the success path so ``backend/connect_count``
+        # reflects successful connections. No-op on the default NullMonitor.
+        self._monitor.on_connect(str(self.backend_type))
         return
 
     if last_exception is not None:
@@ -595,6 +613,14 @@ class ConnectionManager:
           logger.warning("Error during disconnect: %s", e)
         finally:
           self._backend = None
+        # R14-D: emit on_disconnect so ``backend/disconnect_count`` reflects
+        # teardowns. ``reason`` is not available at this layer (the Scrapy
+        # engine close reason lives in the scheduler/pipeline that owns the
+        # manager), so ``None`` is passed — the lifecycle hook fires
+        # regardless. No-op on the default NullMonitor. Inside the ``if
+        # self._backend`` block so a no-op close (already disconnected) does
+        # not double-count.
+        self._monitor.on_disconnect(str(self.backend_type), None)
       # R14-E: reset the circuit breaker so a manager that reconnects after
       # teardown (or an orphan-evicted manager re-created from the same
       # settings) does not inherit a stale OPEN state from the prior
@@ -631,6 +657,25 @@ class ConnectionManager:
         # Reset any breaker state too (mirrors close()).
         if manager._breaker is not None:
           manager._breaker.reset()
+
+  def set_monitor(self, monitor: Monitor) -> None:
+    """Attach an observability monitor for connection-lifecycle hooks (R14-D).
+
+    Wired hooks: ``on_connect`` (connect success), ``on_disconnect`` (last
+    holder releases), ``on_retry`` (before each exponential-backoff sleep).
+    Idempotent — calling it again replaces the prior monitor. The default
+    (:class:`~scrapy_extension.monitor.base.NullMonitor`) makes every hook a
+    no-op until a real monitor is attached.
+
+    Intended for use by the scheduler / dupefilter factories that construct
+    a ``ConnectionManager`` and want connection-lifecycle stats. The bundled
+    factories resolve their own monitor for queue/dupefilter use; threading
+    it into the manager is a follow-up (scheduler.py is out of R14-D scope).
+
+    Args:
+        monitor: The monitor to emit connection-lifecycle hooks through.
+    """
+    self._monitor = monitor
 
   @property
   def backend(self) -> Backend:

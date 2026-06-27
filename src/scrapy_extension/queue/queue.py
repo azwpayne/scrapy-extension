@@ -210,6 +210,11 @@ class BackendQueue:
       request_dict = self._request_to_dict(request)
       data = self._serializer.serialize(request_dict)
     except Exception as e:
+      # R14-D: emit on_error so serialization failures surface as
+      # ``errors/push`` instead of being dead observability (the hook
+      # previously had zero call sites). Raised below — emit BEFORE the
+      # raise so the counter is incremented even though we re-raise.
+      self._monitor.on_error("push", e)
       msg = f"Failed to serialize request: {e}"
       raise SerializationError(
         msg,
@@ -261,9 +266,10 @@ class BackendQueue:
         SerializationError: If the request cannot be deserialized.
     """
     data, ack_token = self._pop_with_ack(timeout)
-    # Emit on every pop call — ``queue/pop_count`` is the consumer-liveness
-    # signal (pop attempts per second), independent of whether an item was
-    # returned. A worker popping an empty queue is itself operability signal.
+    # Emit on every pop call — ``queue/pop_attempt_count`` (R14-D rename) is
+    # the consumer-liveness signal (pop attempts per second), independent of
+    # whether an item was returned. A worker popping an empty queue is itself
+    # operability signal.
     self._monitor.on_pop(self.queue_name)
     # U2 operability: record this pop into the rolling window, then emit the
     # derived rate on the same sampling cadence as the depth probe below —
@@ -296,6 +302,10 @@ class BackendQueue:
       self._decode_body(request_dict)
       request = request_from_dict(request_dict, spider=self._spider)
     except Exception as e:
+      # R14-D: emit on_error so deserialize failures surface as ``errors/pop``
+      # instead of being dead observability. Emitted BEFORE the raise so the
+      # counter is incremented even though we re-raise.
+      self._monitor.on_error("pop", e)
       msg = f"Failed to deserialize request: {e}"
       raise SerializationError(
         msg,

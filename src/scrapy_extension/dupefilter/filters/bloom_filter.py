@@ -54,6 +54,12 @@ class BloomMembershipFilter(MembershipFilter):
     self._num_hashes = k
     self._bits = bytearray((m + 7) >> 3)
     self._count = 0
+    # R14-D: store the configured item-capacity so :attr:`capacity` +
+    # :attr:`saturation` mirror the cuckoo filter and let
+    # ``BackendDupeFilter.request_seen`` emit the leading saturation signal
+    # for Bloom filters (was cuckoo-only). ``_num_bits`` is the bit-vector
+    # length, NOT an item-capacity, so a separate field is required.
+    self._capacity = capacity
 
   @property
   def num_bits(self) -> int:
@@ -64,6 +70,36 @@ class BloomMembershipFilter(MembershipFilter):
   def num_hashes(self) -> int:
     """Number of hash functions (k)."""
     return self._num_hashes
+
+  @property
+  def capacity(self) -> int:
+    """Configured item-capacity ``n`` used to size the filter (R14-D).
+
+    The Bloom filter never hard-refuses an insert (unlike the cuckoo filter,
+    which raises :class:`FilterFull`), so ``capacity`` is the SIZING target —
+    the false-positive rate is bounded by ``error_rate`` AT ``capacity``
+    items. Exposed so :meth:`BackendDupeFilter.request_seen
+    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
+    can emit a leading ``on_filter_saturation`` signal as the count
+    approaches the configured capacity (mirror of the cuckoo property).
+    """
+    return self._capacity
+
+  @property
+  def saturation(self) -> float:
+    """Current fill ratio (``len / capacity``), in ``[0.0, ~1.0+]`` (R14-D).
+
+    Used by :meth:`BackendDupeFilter.request_seen
+    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
+    to emit ``on_filter_saturation`` after each add. ``used`` is the
+    approximate count of inserted items (``len(self)``); ``capacity`` is the
+    configured sizing target. A healthy filter reads ~0.85 at its configured
+    capacity — operators should alert on a rising edge past ~0.90. May
+    exceed ``1.0`` if more items than ``capacity`` are inserted (the Bloom
+    filter has no hard cap, but false-positive rate degrades past it);
+    ``ScrapyStatsMonitor.on_filter_saturation`` clamps the gauge to 1.0.
+    """
+    return len(self) / self._capacity
 
   def _indices(self, item: bytes) -> Iterator[int]:
     """Yield the k bit positions for ``item`` via double hashing.

@@ -29,22 +29,35 @@ class ScrapyStatsMonitor(Monitor):
   Stat keys (all additive — existing component stats are untouched):
 
   - ``queue/push_count`` (counter) — per successful push.
-  - ``queue/pop_count`` (counter) — per successful pop.
+  - ``queue/pop_attempt_count`` (counter) — per pop ATTEMPT (R14-D rename of
+    ``queue/pop_count``). ``BackendQueue.pop`` fires :meth:`on_pop` on every
+    call — including empty pops — because the consumer-liveness signal is
+    "is the worker popping at all?", independent of whether an item was
+    returned. The stat name now matches the per-attempt behavior.
   - ``dupefilter/hit_count`` (counter) — per duplicate request.
   - ``dupefilter/miss_count`` (counter) — per newly-seen request.
   - ``queue/depth`` (gauge) — last-sampled pending depth.
   - ``pipeline/store_count`` (counter) — per successful store.
-  - ``errors/<operation>`` (counter) — per operation error.
+  - ``errors/<operation>`` (counter) — per operation error. Wired (R14-D) at
+    the ``BackendQueue`` push-except and deserialize-fail arms.
   - ``queue/backpressure`` (gauge) — current depth when it last exceeded
     ``backpressure_threshold``; reset to ``0`` once depth drops back under.
     ``None`` until the threshold has ever been crossed.
   - ``queue/pop_rate_1m`` (gauge) — rolling pops/sec over the trailing 60s
     window (U2 operability). Sampled on the same cadence as the pop-path
     depth probe; falling-edge to ~0 = stalled consumer.
-  - ``dupefilter/filter_saturation`` (gauge, 0.0-1.0) — cuckoo filter fill
-    ratio (U2 operability). Rises through 0.9 before ``dupefilter/filter_full``
+  - ``dupefilter/filter_saturation`` (gauge, 0.0-1.0) — filter fill ratio
+    (U2 operability). Rises through 0.9 before ``dupefilter/filter_full``
     ever fires; leading indicator for raising filter capacity. ``0.0`` when
-    the filter is unbounded or reports no capacity.
+    the filter is unbounded or reports no capacity. Emitted by cuckoo and
+    bloom filters (via :meth:`BackendDupeFilter.request_seen`) and by the
+    memory filter at LRU-eviction time.
+  - ``backend/connect_count`` (counter) — per successful backend connect
+    (R14-D connection-lifecycle). Wired from ``ConnectionManager.connect``.
+  - ``backend/disconnect_count`` (counter) — per backend disconnect
+    (R14-D connection-lifecycle). Wired from ``ConnectionManager.close``.
+  - ``backend/retry_count`` (counter) — per connection retry
+    (R14-D connection-lifecycle). Wired from ``ConnectionManager.connect``.
 
   Attributes:
       _stats: The wrapped Scrapy StatsCollector.
@@ -80,7 +93,22 @@ class ScrapyStatsMonitor(Monitor):
     self._stats.inc_value("queue/push_count")
 
   def on_pop(self, queue_name: str) -> None:
-    """Increment ``queue/pop_count``."""
+    """Increment ``queue/pop_attempt_count`` (R14-D rename — per attempt).
+
+    ``BackendQueue.pop`` fires this on every call — including empty pops —
+    because the consumer-liveness signal is "is the worker popping at all?",
+    independent of whether an item was returned. The stat key was renamed
+    from ``queue/pop_count`` so the name matches the per-attempt behavior.
+
+    Backward-compat: the legacy ``queue/pop_count`` key is ALSO incremented
+    so existing dashboards and the out-of-scope test suite keep working
+    during the rename window. The legacy key is documented as deprecated in
+    favor of ``queue/pop_attempt_count`` and may be dropped at the next
+    major.
+    """
+    self._stats.inc_value("queue/pop_attempt_count")
+    # Legacy alias — preserved for backward compat with existing dashboards
+    # and the pre-rename test suite. Deprecated in favor of the renamed key.
     self._stats.inc_value("queue/pop_count")
 
   def on_dedup_hit(self, key: str) -> None:
@@ -173,3 +201,29 @@ class ScrapyStatsMonitor(Monitor):
             emitted to stats — log it separately if needed).
     """
     self._stats.inc_value(f"errors/{operation}")
+
+  def on_connect(self, backend_type: str) -> None:
+    """Increment ``backend/connect_count`` (R14-D connection-lifecycle).
+
+    Args:
+        backend_type: The backend-type registry string that connected.
+    """
+    self._stats.inc_value("backend/connect_count")
+
+  def on_disconnect(self, backend_type: str, reason: str | None) -> None:
+    """Increment ``backend/disconnect_count`` (R14-D connection-lifecycle).
+
+    Args:
+        backend_type: The backend-type registry string that disconnected.
+        reason: Scrapy engine close reason (or ``None``).
+    """
+    self._stats.inc_value("backend/disconnect_count")
+
+  def on_retry(self, backend_type: str, attempt: int) -> None:
+    """Increment ``backend/retry_count`` (R14-D connection-lifecycle).
+
+    Args:
+        backend_type: The backend-type registry string being retried.
+        attempt: 1-based retry index (1 = first retry).
+    """
+    self._stats.inc_value("backend/retry_count")

@@ -11,8 +11,12 @@ __all__ = ["DEFAULT_MEMORY_MAXSIZE", "MemoryMembershipFilter"]
 
 import logging
 from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
+
+if TYPE_CHECKING:
+  from scrapy_extension.monitor.base import Monitor
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,10 @@ class MemoryMembershipFilter(MembershipFilter):
       _maxsize: Capacity cap; None = unbounded (advanced opt-out).
           Defaults to :data:`DEFAULT_MEMORY_MAXSIZE` (1_000_000).
       _data: Insertion/access-ordered mapping of fingerprints.
+      _monitor: Optional observability monitor threaded in by
+          :class:`~scrapy_extension.dupefilter.dupefilter.BackendDupeFilter`
+          so LRU eviction can emit ``on_filter_saturation`` (R14-D).
+          ``None`` (default) → eviction stays silent (logs only).
   """
 
   def __init__(self, *, maxsize: int | None = DEFAULT_MEMORY_MAXSIZE) -> None:
@@ -70,6 +78,25 @@ class MemoryMembershipFilter(MembershipFilter):
       )
     self._maxsize = maxsize
     self._data: OrderedDict[bytes, None] = OrderedDict()
+    # R14-D: monitor is threaded in AFTER construction by the dupefilter
+    # (which owns the monitor). Stays ``None`` when the filter is used
+    # standalone → eviction is silent (warn-only), preserving prior
+    # behavior outside the dupefilter context.
+    self._monitor: Monitor | None = None
+
+  def set_monitor(self, monitor: Monitor) -> None:
+    """Thread the dupefilter's monitor so eviction can emit saturation (R14-D).
+
+    Called by :meth:`BackendDupeFilter.__init__
+    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.__init__>` once
+    it has resolved its own monitor. Idempotent; safe to call before or after
+    the first eviction. No-op effect on a NullMonitor (the no-op default) —
+    the eviction warning log is independent of this hook.
+
+    Args:
+        monitor: The monitor to emit ``on_filter_saturation`` through.
+    """
+    self._monitor = monitor
 
   def _warn_evicted_once(self) -> None:
     """Emit a one-time per-process warning when LRU eviction first fires.
@@ -112,6 +139,19 @@ class MemoryMembershipFilter(MembershipFilter):
       self._data.popitem(last=False)  # evict least-recently-used
       self._warn_evicted_once()
     self._data[item] = None
+    # R14-D: emit ``on_filter_saturation`` when the filter is at cap (after
+    # the eviction + insert, len == maxsize). This is the saturation ceiling
+    # the operator cares about — "the filter is full and evicting". Emitted
+    # unconditionally when a maxsize is set AND the filter is at cap, so a
+    # sustained eviction storm keeps the gauge pinned at 1.0 (matching the
+    # cuckoo/bloom ``used/capacity`` contract). No-op when no monitor was
+    # threaded (standalone filter use).
+    if (
+      self._monitor is not None
+      and self._maxsize is not None
+      and len(self._data) >= self._maxsize
+    ):
+      self._monitor.on_filter_saturation(len(self._data), self._maxsize)
     return True
 
   def __contains__(self, item: bytes) -> bool:

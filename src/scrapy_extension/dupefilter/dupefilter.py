@@ -114,6 +114,15 @@ class BackendDupeFilter:
       if membership_filter is not None
       else SetMembershipFilter(connection_manager, key)
     )
+    # R14-D: thread the monitor into MemoryMembershipFilter so its LRU
+    # eviction can emit ``on_filter_saturation`` (was log-warning only).
+    # ``set_monitor`` exists only on the memory filter; guard via hasattr so
+    # set/bloom/cuckoo filters are unaffected. The dupefilter owns the
+    # monitor, so the filter emits through the same channel as cuckoo
+    # saturation (which the dupefilter emits directly via getattr).
+    set_monitor = getattr(self._filter, "set_monitor", None)
+    if callable(set_monitor):
+      set_monitor(self._monitor)
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendDupeFilter:
@@ -328,12 +337,15 @@ class BackendDupeFilter:
       self._monitor.on_dedup_hit(fingerprint)
     else:
       self._monitor.on_dedup_miss(fingerprint)
-    # U2 operability: if the filter exposes saturation (cuckoo only), emit
-    # the leading fill-ratio signal after each add. Cheap (one property read
-    # + one monitor hook), and lets operators see the filter APPROACHING full
-    # (e.g. >0.9) before the FilterFull overflow path fires. Other filters
-    # (set/memory/bloom) don't expose ``saturation`` and stay silent here —
-    # their gauge stays at ``None`` (untouched), not misleadingly at 0.0.
+    # U2 operability: if the filter exposes saturation (cuckoo + bloom as of
+    # R14-D), emit the leading fill-ratio signal after each add. Cheap (one
+    # property read + one monitor hook), and lets operators see the filter
+    # APPROACHING full (e.g. >0.9) before the FilterFull overflow path fires.
+    # Set/memory filters don't expose ``saturation`` here — memory instead
+    # emits ``on_filter_saturation`` directly at LRU-eviction time (R14-D),
+    # threaded via its own monitor ref. Filters with no ``saturation``
+    # property stay silent on this path; their gauge stays at ``None``
+    # (untouched), not misleadingly at 0.0.
     sat = getattr(self._filter, "saturation", None)
     if sat is not None:
       cap = getattr(self._filter, "capacity", None)

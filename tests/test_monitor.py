@@ -23,6 +23,7 @@ from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import (
   CuckooMembershipFilter,
 )
+from scrapy_extension.exceptions import BackendConnectionError, SerializationError
 from scrapy_extension.monitor import (
   Monitor,
   NullMonitor,
@@ -65,6 +66,9 @@ class TestNullMonitor:
       ("on_pop_rate", {"window_s": DEFAULT_POP_RATE_WINDOW_S, "rate": 1.5}),
       ("on_filter_saturation", {"used": 100, "capacity": 200}),
       ("on_error", {"operation": "push", "error": RuntimeError("x")}),
+      ("on_connect", {"backend_type": "redis"}),
+      ("on_disconnect", {"backend_type": "redis", "reason": "shutdown"}),
+      ("on_retry", {"backend_type": "redis", "attempt": 1}),
     ],
   )
   def test_hook_is_noop(self, hook, kwargs):
@@ -113,6 +117,9 @@ class TestScrapyStatsMonitor:
   def test_on_pop_increments_pop_count(self):
     monitor, stats = self._monitor()
     monitor.on_pop("q")
+    # R14-D: renamed key (behavior-matching — per attempt).
+    assert stats.get_value("queue/pop_attempt_count") == 1
+    # Legacy alias preserved for backward compat (deprecated next major).
     assert stats.get_value("queue/pop_count") == 1
 
   def test_on_dedup_hit_increments_hit_count(self):
@@ -627,3 +634,221 @@ class TestFilterSaturationEmission:
       "saturation should cross 0.9 before the FilterFull overflow fires"
     )
     assert saw_filter_full, "the FilterFull arm should eventually fire"
+
+
+# ---------------------------------------------------------------------------
+# R14-D — Observability completeness
+# ---------------------------------------------------------------------------
+
+
+class TestR14DObservability:
+  """R14-D: on_error wiring, Bloom saturation, Memory eviction saturation,
+  connection-lifecycle hooks, on_pop stat rename.
+
+  These tests pin the gaps the round-14 observability audit surfaced:
+  ``on_error`` was dead (zero call sites), Bloom/Memory saturation was
+  unobservable, and connection lifecycle was log-only.
+  """
+
+  def test_on_error_emitted_on_push_failure(self, mock_connection_manager):
+    """queue.push serialize-fail emits on_error('push', e) → errors/push."""
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+    )
+    # A non-serializable callback makes _request_to_dict raise (.__name__ on a
+    # lambda-like object); pushing must emit on_error then re-raise.
+    request = Request(url="https://example.com")
+    request.callback = object()  # type: ignore[assignment]  # no __name__
+    with pytest.raises(SerializationError):
+      queue.push(request)
+    assert monitor._stats.get_value("errors/push") == 1  # type: ignore[attr-defined]
+    assert monitor._stats.get_value("errors/pop") is None  # type: ignore[attr-defined]
+
+  def test_on_error_emitted_on_pop_deserialize_failure(
+    self, mock_connection_manager
+  ):
+    """queue.pop deserialize-fail emits on_error('pop', e) → errors/pop."""
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+    )
+    # Return bytes that fail JSON deserialization → deserialize-fail arm.
+    mock_connection_manager.get_queue_backend().pop.return_value = b"not-json{"
+    with pytest.raises(SerializationError):
+      queue.pop()
+    assert monitor._stats.get_value("errors/pop") == 1  # type: ignore[attr-defined]
+    assert monitor._stats.get_value("errors/push") is None  # type: ignore[attr-defined]
+
+  def test_bloom_saturation_property_rises_with_load(self):
+    """BloomMembershipFilter.saturation = len / capacity (R14-D mirror of cuckoo)."""
+    from scrapy_extension.dupefilter.filters.bloom_filter import (
+      BloomMembershipFilter,
+    )
+
+    bloom = BloomMembershipFilter(capacity=1_000, error_rate=0.01)
+    assert bloom.saturation == 0.0
+    assert bloom.capacity == 1_000
+    prev = 0.0
+    for i in range(500):
+      bloom.add(f"item-{i}".encode())
+      s = bloom.saturation
+      assert s >= prev
+      prev = s
+    assert 0.0 < bloom.saturation < 1.0
+
+  def test_request_seen_emits_saturation_for_bloom(
+    self, mock_connection_manager
+  ):
+    """request_seen on a bloom-backed dupefilter emits on_filter_saturation."""
+    from scrapy_extension.dupefilter.filters.bloom_filter import (
+      BloomMembershipFilter,
+    )
+
+    monitor = ScrapyStatsMonitor(_stats())
+    bloom = BloomMembershipFilter(capacity=1_000, error_rate=0.01)
+    df = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+      membership_filter=bloom,
+    )
+    df.request_seen(Request(url="https://example.com/a"))
+    sat = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
+    assert sat is not None
+    assert sat > 0.0
+
+  def test_memory_filter_eviction_emits_saturation(
+    self, mock_connection_manager
+  ):
+    """MemoryMembershipFilter LRU eviction emits on_filter_saturation (R14-D).
+
+    Builds a tiny-cap memory filter, threads the dupefilter's monitor into
+    it (the dupefilter does this in __init__), and drives it past cap. The
+    eviction must fire ``on_filter_saturation(len, maxsize)`` → the gauge is
+    set. Before R14-D eviction was log-warning only.
+    """
+    from scrapy_extension.dupefilter.filters.memory_filter import (
+      MemoryMembershipFilter,
+    )
+
+    monitor = ScrapyStatsMonitor(_stats())
+    memory = MemoryMembershipFilter(maxsize=3)
+    df = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+      membership_filter=memory,
+    )
+    # Fill toward cap. The gauge is set once the filter reaches maxsize after
+    # an add (the saturation ceiling the operator cares about) — so the 3rd
+    # distinct add (len → 3 == maxsize) already emits.
+    df.request_seen(Request(url="https://example.com/a"))
+    df.request_seen(Request(url="https://example.com/b"))
+    assert monitor._stats.get_value("dupefilter/filter_saturation") is None  # type: ignore[attr-defined]
+    df.request_seen(Request(url="https://example.com/c"))
+    # 3rd add fills to cap → first saturation emit at 1.0.
+    assert monitor._stats.get_value("dupefilter/filter_saturation") == 1.0  # type: ignore[attr-defined]
+    # 4th distinct request → eviction; gauge stays pinned at cap (1.0).
+    df.request_seen(Request(url="https://example.com/d"))
+    sat = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
+    assert sat == 1.0
+
+  def test_memory_filter_eviction_silent_without_monitor(self):
+    """A standalone MemoryMembershipFilter (no monitor threaded) evicts
+    without crashing — the saturation hook is a no-op when _monitor is None.
+    """
+    from scrapy_extension.dupefilter.filters.memory_filter import (
+      MemoryMembershipFilter,
+    )
+
+    memory = MemoryMembershipFilter(maxsize=2)
+    memory.add(b"a")
+    memory.add(b"b")
+    # Third add triggers eviction; no monitor threaded → must not raise.
+    assert memory.add(b"c") is True
+
+  def test_on_connect_emitted_on_successful_connect(self, mocker):
+    """ConnectionManager.connect emits on_connect → backend/connect_count."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager("redis")
+    # Stub _attempt_connection so connect() succeeds on first try.
+    mocker.patch.object(manager, "_attempt_connection")
+    stats = _stats()
+    manager.set_monitor(ScrapyStatsMonitor(stats))
+    manager.connect()
+    assert stats.get_value("backend/connect_count") == 1
+    assert stats.get_value("backend/disconnect_count") is None
+
+  def test_on_retry_emitted_on_connect_failure(self, mocker):
+    """ConnectionManager.connect emits on_retry before each backoff sleep."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager("redis", {"retry_attempts": 3, "retry_delay": 0})
+    # _attempt_connection always raises → 2 retries fire (attempts 0 and 1).
+    mocker.patch.object(
+      manager, "_attempt_connection", side_effect=RuntimeError("boom")
+    )
+    mocker.patch("scrapy_extension.backends.connectors.time.sleep")  # skip backoff
+    stats = _stats()
+    manager.set_monitor(ScrapyStatsMonitor(stats))
+    with pytest.raises(BackendConnectionError):
+      manager.connect()
+    # 3 attempts → 2 retries (between them) → on_retry fires twice.
+    assert stats.get_value("backend/retry_count") == 2
+    # on_connect must NOT fire (never succeeded).
+    assert stats.get_value("backend/connect_count") is None
+
+  def test_on_disconnect_emitted_on_close(self, mocker):
+    """ConnectionManager.close emits on_disconnect when the backend tears down."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager.get_manager("redis", {"host": "disc-test"})
+    # Simulate a connected backend so the disconnect arm runs.
+    mock_backend = mocker.MagicMock()
+    manager._backend = mock_backend
+    stats = _stats()
+    manager.set_monitor(ScrapyStatsMonitor(stats))
+    manager.close()
+    assert stats.get_value("backend/disconnect_count") == 1
+    mock_backend.disconnect.assert_called_once()
+
+  def test_connection_hooks_noop_on_default_null_monitor(self, mocker):
+    """A ConnectionManager with no monitor attached still connects/closes
+    without crashing — the default NullMonitor hooks are no-ops (R14-D
+    non-regression: existing subclasses must stay green)."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager("redis", {"retry_attempts": 1, "retry_delay": 0})
+    mocker.patch.object(manager, "_attempt_connection")
+    # No set_monitor call → default NullMonitor; must not raise.
+    manager.connect()
+    manager._backend = mocker.MagicMock()
+    manager.close()
+
+  def test_on_pop_attempt_stat_name_matches_behavior(
+    self, mock_connection_manager
+  ):
+    """R14-D: queue/pop_attempt_count is the renamed per-attempt key."""
+    monitor = ScrapyStatsMonitor(_stats())
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="q",
+      monitor=monitor,
+    )
+    mock_connection_manager.get_queue_backend().pop.return_value = None
+    queue.pop()  # empty pop still counts as an attempt
+    queue.pop()  # second attempt
+    assert monitor._stats.get_value("queue/pop_attempt_count") == 2  # type: ignore[attr-defined]
+
+  def test_connection_lifecycle_hooks_on_base_monitor_are_noop(self):
+    """on_connect/on_disconnect/on_retry exist on Monitor base + NullMonitor
+    as no-ops (R14-D: new hooks must not break existing subclasses)."""
+    null_monitor: Monitor = NullMonitor()
+    # All three new hooks must be callable + return None.
+    assert null_monitor.on_connect("redis") is None
+    assert null_monitor.on_disconnect("redis", "shutdown") is None
+    assert null_monitor.on_retry("redis", 1) is None

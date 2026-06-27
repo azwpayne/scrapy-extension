@@ -59,7 +59,12 @@ class Monitor:
   Hooks (all no-ops by default):
 
   - ``on_push(queue_name, priority)`` — after a successful queue push.
-  - ``on_pop(queue_name)`` — after a successful queue pop.
+  - ``on_pop(queue_name)`` — per pop ATTEMPT (R14-D semantics fix).
+    Emitted by ``BackendQueue.pop`` on every call — including empty pops —
+    because the consumer-liveness signal ("is the worker popping at all?")
+    is independent of whether an item was returned. The matching stat is
+    ``queue/pop_attempt_count`` (renamed from ``queue/pop_count`` in R14-D so
+    the key matches behavior).
   - ``on_dedup_hit(key)`` — request fingerprint was already seen.
   - ``on_dedup_miss(key)`` — request fingerprint was newly recorded.
   - ``on_queue_depth(queue_name, depth)`` — current pending depth (gauge).
@@ -70,10 +75,22 @@ class Monitor:
     ``rate`` is pops per second over the trailing ``window_s`` window.
   - ``on_filter_saturation(used, capacity)`` — membership-filter fill ratio
     (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` when the
-    underlying filter exposes a ``saturation`` property (cuckoo only); lets
-    operators see a cuckoo filter APPROACHING full (e.g. >0.9) before the
-    ``on_filter_full`` overflow signal fires.
+    underlying filter exposes a ``saturation`` property (cuckoo + bloom), and
+    by ``MemoryMembershipFilter`` directly at LRU-eviction time. Lets operators
+    see a filter APPROACHING full (e.g. >0.9) before the ``on_filter_full``
+    overflow signal fires.
   - ``on_error(operation, error)`` — an operation raised; record per-op.
+    Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
+    arms so serialization failures surface as ``errors/push`` /
+    ``errors/pop`` instead of being dead observability.
+  - ``on_connect(backend_type)`` — a backend connection was established.
+    Wired (R14-D) from ``ConnectionManager.connect`` on the success path.
+  - ``on_disconnect(backend_type, reason)`` — a backend was disconnected.
+    Wired (R14-D) from ``ConnectionManager.close``; ``reason`` is the Scrapy
+    close reason (may be ``None`` in non-engine teardown paths).
+  - ``on_retry(backend_type, attempt)`` — a connection retry fired.
+    Wired (R14-D) from ``ConnectionManager.connect`` before each backoff
+    sleep; ``attempt`` is 1-based (1 = first retry).
   """
 
   def on_push(self, queue_name: str, priority: float) -> None:
@@ -85,7 +102,15 @@ class Monitor:
     """
 
   def on_pop(self, queue_name: str) -> None:
-    """Record a successful queue pop.
+    """Record a pop ATTEMPT (R14-D semantics fix — per attempt, not per success).
+
+    Emitted by :meth:`BackendQueue.pop
+    <scrapy_extension.queue.queue.BackendQueue.pop>` on EVERY pop call —
+    including empty pops. The consumer-liveness signal ("is the worker
+    popping at all?") is independent of whether an item was returned, so the
+    matching stat is ``queue/pop_attempt_count`` (renamed from
+    ``queue/pop_count`` in R14-D so the key matches the per-attempt
+    behavior). For per-success push accounting see :meth:`on_push`.
 
     Args:
         queue_name: The queue the item was popped from.
@@ -176,9 +201,56 @@ class Monitor:
   def on_error(self, operation: str, error: BaseException) -> None:
     """Record an operation error.
 
+    Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
+    arms so serialization failures surface as ``errors/push`` /
+    ``errors/pop`` instead of being dead observability (the hook previously
+    had zero call sites).
+
     Args:
         operation: The operation name (e.g. ``"push"``, ``"pop"``).
         error: The exception that was raised.
+    """
+
+  def on_connect(self, backend_type: str) -> None:
+    """Record a successful backend connection (R14-D connection-lifecycle hook).
+
+    Wired from :meth:`ConnectionManager.connect
+    <scrapy_extension.backends.connectors.ConnectionManager.connect>` on the
+    success path. ``backend_type`` is the registry-key string (e.g.
+    ``"redis"``, ``"mongodb"``). Default no-op so existing subclasses and
+    :class:`NullMonitor` keep working unchanged.
+
+    Args:
+        backend_type: The backend-type registry string that connected.
+    """
+
+  def on_disconnect(self, backend_type: str, reason: str | None) -> None:
+    """Record a backend disconnect (R14-D connection-lifecycle hook).
+
+    Wired from :meth:`ConnectionManager.close
+    <scrapy_extension.backends.connectors.ConnectionManager.close>` when the
+    last holder releases the shared manager. ``reason`` is the Scrapy
+    engine close reason (may be ``None`` in non-engine teardown paths — e.g.
+    orphan-eviction under registry pressure). Default no-op so existing
+    subclasses and :class:`NullMonitor` keep working unchanged.
+
+    Args:
+        backend_type: The backend-type registry string that disconnected.
+        reason: Scrapy engine close reason (or ``None``).
+    """
+
+  def on_retry(self, backend_type: str, attempt: int) -> None:
+    """Record a connection retry (R14-D connection-lifecycle hook).
+
+    Wired from :meth:`ConnectionManager.connect
+    <scrapy_extension.backends.connectors.ConnectionManager.connect>` before
+    each exponential-backoff sleep. ``attempt`` is 1-based (1 = first retry,
+    i.e. the second overall attempt). Default no-op so existing subclasses
+    and :class:`NullMonitor` keep working unchanged.
+
+    Args:
+        backend_type: The backend-type registry string being retried.
+        attempt: 1-based retry index (1 = first retry).
     """
 
 
