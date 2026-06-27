@@ -452,6 +452,12 @@ class BackendScheduler:
       backpressure_threshold=self._monitor_backpressure_threshold,
       pop_rate_window_s=self._monitor_pop_rate_window_s,
     )
+    # R14-D follow-up: thread the resolved monitor into the ConnectionManager
+    # so the connection-lifecycle hooks (on_connect/on_disconnect/on_retry →
+    # backend/{connect,disconnect,retry}_count) actually fire in production.
+    # Without this, ConnectionManager defaults to NullMonitor and the hooks
+    # R14-D wired are dead observability outside the queue path.
+    self.connection_manager.set_monitor(monitor)
     self._queue = BackendQueue(
       connection_manager=self.connection_manager,
       queue_name=self.queue_key,
