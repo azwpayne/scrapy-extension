@@ -11,6 +11,36 @@ unit discovered across rounds 1-8. Supersedes cross-reading 5 docs. Source SPECs
 
 ---
 
+## ⚡ Round 14 menu — six-dimension hardening (NEW — the active `/goal` target)
+
+Rounds 9-13 closed the round-8 execution menu (✅). A fresh **full-coverage**
+six-dimension insight fan-out (error-handling / lifecycle / strategy / test /
+observability / API-stability) surfaced **~40 new findings → 8 units (R14-A…H)**.
+
+👉 **SPEC:** [`SPEC-round14-six-dimension-hardening.md`](./SPEC-round14-six-dimension-hardening.md)
+👉 **PLAN:** [`PLAN-round14-six-dimension-hardening.md`](./PLAN-round14-six-dimension-hardening.md)
+
+| ID | Title | Sev | Effort | Files (owner scope) |
+|---|---|:-:|:-:|---|
+| **R14-A** | StorageBackend error-contract uniformity (3 data-loss/leak bugs) | 3×H | M | exceptions/base.py, backends/{memcached,dynamodb,mongodb}.py |
+| **R14-B** | v1.0 breaking-change disclosure + ConfigurationError contract freeze | CRIT+H | S-M | CHANGELOG/STABILITY/README, settings/base.py, backends/base.py |
+| **R14-C** | Operability configurability (thread U4/U5/U2 knobs via Scrapy settings) | CRIT | M | settings/base.py, schedule/scheduler.py, queue/strategies/factory.py, monitor/stats.py, queue/queue.py |
+| **R14-D** | Observability completeness (dead `on_error`, Bloom/Memory saturation, connection hooks) | CRIT+H | M | monitor/{base,stats}.py, queue/queue.py, dupefilter/**, backends/connectors.py |
+| **R14-E** | Lifecycle bounds (cap `_managers` registry, Kafka partition pruning, RabbitMQ partial-state) | 2×H+M | M | backends/connectors.py, backends/{kafka,rabbitmq,pulsar,sqs}.py, circuit_breaker.py |
+| **R14-F** | Queue-strategy correctness (delay priority, RR cleanup, retry+delay storm) | 3×H | M | queue/strategies/{delay,round_robin,throttle}.py, queue/queue.py |
+| **R14-G** | Test-coverage hardening (backend layer → 95%+, property tests, integration-tier gate) | 3×H+M | M-L | tests/**, conftest.py |
+| **R14-H** | Lazy-import hygiene + polish (misleading install hint, rocketmq dead branch) | H+L | S | __init__.py, backends/__init__.py, backends/rocketmq.py |
+
+**Execution waves (file-disjoint):** Wave 1 = R14-A ∥ R14-F ∥ R14-H · Wave 2 = R14-B ∥ R14-E · Wave 3 = R14-C → R14-D → R14-G. One `/goal` per wave.
+
+> ⚠️ **v1.0 re-assessment:** the prior "v1.0 tag defensible" claim is **re-opened**.
+> R14-B (undocumented breaking change) and R14-C (knobs the runbook promises but
+> that don't exist) are genuine pre-tag blockers. **Tag v1.0 after R14-B + R14-C land.**
+
+The round-8 menu below is retained for history (all ✅ DONE).
+
+---
+
 ## Master unit table (sorted by leverage ÷ effort)
 
 | ID | Title | Leverage | Effort | Files (owner scope) | Source | Depends on |
