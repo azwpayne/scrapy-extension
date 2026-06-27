@@ -4,6 +4,14 @@ A task-queue type "beyond queue/stack/priority": caps the consumption rate by
 enforcing a minimum interval between successful pops. Useful for polite
 crawling. Unlike Delay/RoundRobin, items persist in the backend (this wraps
 ``pop`` with a rate gate rather than holding items in-process).
+
+Rate semantics (R14-F): the rate budget is **per-instance**. Two
+:class:`ThrottleQueueStrategy` instances in the same process each enforce
+their own ``min_interval`` — running two spiders (each with its own queue
+strategy) in one process silently doubles the aggregate pop rate from the
+backend's perspective. For a process-wide rate ceiling, share a single
+strategy instance across queues or enforce the cap upstream (e.g. at the
+backend connection).
 """
 
 from __future__ import annotations
@@ -14,10 +22,20 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.queue.strategies.base import QueueStrategy
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
+
+
+# R14-F: ceiling on `min_interval` (seconds). A pathologically large value
+# (e.g. ``1e9``) makes the queue look permanently empty for the process
+# lifetime — a soft DoS via misconfig. 3600s = 1 hour is the documented
+# upper bound; values above are rejected as ConfigurationError. Callers
+# needing longer effective backoff should chain a delay strategy, not push
+# the throttle ceiling into "queue never serves" territory.
+THROTTLE_MAX_MIN_INTERVAL_S: float = 3600.0
 
 
 class ThrottleQueueStrategy(QueueStrategy):
@@ -27,6 +45,9 @@ class ThrottleQueueStrategy(QueueStrategy):
   within ``min_interval`` of the last successful pop. A throttled pop looks
   like an empty queue to the scheduler (it retries next tick), so the
   effective pop rate is at most ``1 / min_interval``.
+
+  Per-instance rate (R14-F): see module docstring — two instances in one
+  process each enforce their own budget.
 
   Attributes:
       _min_interval: Minimum seconds between successful pops.
@@ -45,15 +66,33 @@ class ThrottleQueueStrategy(QueueStrategy):
 
     Args:
         connection_manager: Connection manager providing the QueueBackend.
-        min_interval: Minimum seconds between successful pops.
+        min_interval: Minimum seconds between successful pops. Must be in
+            ``[0, THROTTLE_MAX_MIN_INTERVAL_S]`` (3600s = 1h). Values above
+            the ceiling are rejected as ``ConfigurationError`` — a
+            pathologically large value (e.g. ``1e9``) would make the queue
+            look permanently empty for the process lifetime (R14-F: soft
+            DoS via misconfig). Negative values raise ``ValueError``.
         clock: Monotonic clock callable returning seconds (injectable for tests).
 
     Raises:
         ValueError: If min_interval is negative.
+        ConfigurationError: If min_interval exceeds the documented ceiling.
     """
     super().__init__(connection_manager)
     if min_interval < 0:
       raise ValueError(f"min_interval must be >= 0, got {min_interval}")
+    # R14-F MED: bound min_interval — a value of e.g. 1e9 makes the queue
+    # look permanently empty for the process lifetime (soft DoS via
+    # misconfig). Reject loudly with the stable setting_name so operators
+    # grep their way to the fix.
+    if min_interval > THROTTLE_MAX_MIN_INTERVAL_S:
+      raise ConfigurationError(
+        f"min_interval must be <= {THROTTLE_MAX_MIN_INTERVAL_S}s "
+        f"(got {min_interval}s). A pathologically large min_interval makes "
+        "the queue look permanently empty for the process lifetime.",
+        setting_name="min_interval",
+        setting_value=min_interval,
+      )
     self._min_interval = min_interval
     self._clock = clock
     self._last_pop: float | None = None

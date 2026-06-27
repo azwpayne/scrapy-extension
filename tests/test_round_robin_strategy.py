@@ -93,6 +93,81 @@ class TestRoundRobinQueueStrategy:
     # Instance A still owns its own items.
     assert instance_a.queue_len("q") == 2
 
+  # ----- R14-F: drained sources must be evicted, not leaked -----
+
+  def test_drained_source_is_evicted_from_sources(self) -> None:
+    """R14-F HIGH: a fully-drained source key MUST be removed from
+    ``_sources`` (not left as an empty deque).
+
+    Regression guard for the empty-source leak: pre-fix the strategy kept
+    drained-source keys around forever (``_idx`` rotated through empty
+    slots), making ``_sources`` unbounded on a long crawl with transient
+    sources AND making every pop O(n) in the total number of sources ever
+    seen. Eviction on drain caps the state at the live source set.
+    """
+    s = RoundRobinQueueStrategy(object())
+    s.push("q", b"a", source="ephemeral")
+    assert "ephemeral" in s._sources
+    assert s.pop("q") == b"a"
+    # Drain complete → key must be evicted, not left as an empty deque.
+    assert "ephemeral" not in s._sources, (
+      "drained source 'ephemeral' leaked into _sources "
+      "(R14-F HIGH regression — unbounded growth under source churn)"
+    )
+
+  def test_drain_then_repush_recreates_source(self) -> None:
+    """R14-F: after eviction, a new push to the same source name recreates
+    it cleanly (no stale state, rotation index still sound)."""
+    s = RoundRobinQueueStrategy(object())
+    s.push("q", b"a", source="A")
+    assert s.pop("q") == b"a"
+    assert "A" not in s._sources  # evicted on drain
+    # Repush recreates the source — must work without any stale-residue bug.
+    s.push("q", b"a2", source="A")
+    assert "A" in s._sources
+    assert s.pop("q") == b"a2"
+
+  def test_sources_bounded_under_source_churn(self) -> None:
+    """R14-F HIGH: under sustained source churn (new source, push, drain,
+    repeat), ``_sources`` must stay bounded at the *live* source count —
+    not accumulate one entry per source name ever seen.
+
+    This is the operational form of the leak: a long crawl with transient
+    per-batch sources would otherwise grow ``_sources`` without limit and
+    slow every pop to O(n) in historical-source count.
+    """
+    s = RoundRobinQueueStrategy(object())
+    for i in range(1000):
+      src = f"batch-{i}"
+      s.push("q", b"x", source=src)
+      s.pop("q")  # drain immediately → source should evict
+    # All 1000 sources drained → none should remain.
+    assert len(s._sources) == 0, (
+      f"_sources leaked {len(s._sources)} drained entries under churn "
+      "(R14-F HIGH — unbounded growth under transient sources)"
+    )
+
+  def test_rotation_continues_after_mid_rotation_drain(
+    self, mock_connection_manager
+  ) -> None:
+    """R14-F: when a source drains mid-rotation, the next pop serves the
+    next source in rotation (not the same one twice, not a KeyError).
+
+    Drains an "A" entry while B and C still have items, then verifies B
+    and C are both served before any further A would be (A is empty now).
+    """
+    s = RoundRobinQueueStrategy(mock_connection_manager)
+    s.push("q", b"a1", source="A")
+    s.push("q", b"b1", source="B")
+    s.push("q", b"c1", source="C")
+    first = s.pop("q")  # serves A → A drains + evicts
+    assert first == b"a1"
+    # Next two pops must serve B and C (in rotation order), not error.
+    second = s.pop("q")
+    third = s.pop("q")
+    assert {second, third} == {b"b1", b"c1"}
+    assert s.pop("q") is None  # all drained
+
 
 class TestFactoryRoundRobin:
   def test_build_round_robin(self, mock_connection_manager) -> None:

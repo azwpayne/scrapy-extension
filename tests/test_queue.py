@@ -483,6 +483,107 @@ class TestBackendQueuePush:
 
     assert exc_info.value is backend_error
 
+  # ----- R14-F HIGH: retry + delay/source storm prevention -----
+
+  def test_push_pops_delay_from_meta_so_retry_does_not_re_delay(
+    self, mock_connection_manager, mock_spider
+  ):
+    """R14-F HIGH: ``push`` must consume ``delay`` from ``request.meta`` so a
+    re-pushed retry does NOT re-apply the original delay indefinitely.
+
+    Regression guard for the retry+delay storm: pre-fix ``push`` read
+    ``request.meta['delay']`` and forwarded it to the strategy but never
+    removed it, so when Scrapy's retry middleware re-queued the request
+    (carrying the same meta), the delay re-applied — potentially forever.
+
+    Breaking behavior change (documented in the push docstring): callers
+    that push the same request object more than once and want the delay to
+    apply each time must re-set ``request.meta['delay']`` between pushes.
+    """
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+    request = Request(url="https://example.com", meta={"delay": 30.0})
+    queue.push(request, priority=0.0)
+    # The first push must have consumed `delay` from meta.
+    assert "delay" not in request.meta, (
+      "push did not pop 'delay' from request.meta — a retry re-push would "
+      "re-apply the same delay (R14-F HIGH retry+delay storm)"
+    )
+
+  def test_push_pops_source_from_meta_so_retry_does_not_pin_source(
+    self, mock_connection_manager, mock_spider
+  ):
+    """R14-F HIGH: ``push`` consumes ``source`` from meta alongside ``delay``,
+    so a re-pushed retry is not pinned to its original source tag (which
+    would defeat round-robin fairness on the retry path)."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+    request = Request(url="https://example.com", meta={"source": "feed-A"})
+    queue.push(request, priority=0.0)
+    assert "source" not in request.meta
+
+  def test_push_passes_delay_and_source_to_strategy_before_popping(
+    self, mock_connection_manager, mock_spider, mocker
+  ):
+    """R14-F: the delay/source values ARE forwarded to the strategy on the
+    first push (the pop-from-meta happens AFTER the read, so the strategy
+    still observes the original values). Pins the read-then-pop order so a
+    refactor doesn't accidentally drop the values before forwarding."""
+    # Inject a mock strategy to observe the kwargs BackendQueue forwards.
+    mock_strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      queue_strategy=mock_strategy,
+    )
+    request = Request(url="https://example.com", meta={"delay": 5.0, "source": "X"})
+    queue.push(request, priority=2.0)
+
+    mock_strategy.push.assert_called_once()
+    call = mock_strategy.push.call_args
+    assert call.args[0] == "test_queue"
+    assert isinstance(call.args[1], bytes)
+    assert call.kwargs["priority"] == 2.0
+    assert call.kwargs["delay"] == 5.0  # forwarded on first push
+    assert call.kwargs["source"] == "X"
+    # And the meta was still consumed for the retry path.
+    assert "delay" not in request.meta
+    assert "source" not in request.meta
+
+  def test_push_re_push_after_delay_pop_does_not_re_apply_delay(
+    self, mock_connection_manager, mock_spider, mocker
+  ):
+    """R14-F HIGH end-to-end: simulate the retry path — push a delayed
+    request (meta consumed); re-push the SAME request object (as Scrapy
+    retry middleware would); the second push forwards delay=0.0 because
+    the meta was popped on the first push. This is the storm-prevention
+    contract: retries do not re-delay."""
+    mock_strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      queue_strategy=mock_strategy,
+    )
+    request = Request(url="https://example.com", meta={"delay": 10.0})
+    queue.push(request, priority=0.0)
+    first_call = mock_strategy.push.call_args
+    assert first_call.kwargs["delay"] == 10.0  # first push forwards it
+
+    # Second push of the SAME request object — as if retried.
+    queue.push(request, priority=0.0)
+    second_call = mock_strategy.push.call_args
+    assert second_call.kwargs["delay"] == 0.0, (
+      "retry re-push forwarded delay again — retry+delay storm not prevented"
+    )
+
 
 class TestBackendQueuePop:
   """Test pop method."""

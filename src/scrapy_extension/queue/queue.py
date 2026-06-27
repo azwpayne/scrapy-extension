@@ -176,6 +176,21 @@ class BackendQueue:
   def push(self, request: Request, priority: float = 0.0) -> None:
     """Push a request to the queue.
 
+    .. breaking:: R14-F (retry + delay/source storm prevention)
+        The ``delay`` and ``source`` keys are read from ``request.meta`` and
+        then **popped** (consumed) before forwarding to the queue strategy.
+        Pre-fix they were read but left in place, so when Scrapy's retry
+        middleware re-queued the *same* request object (carrying the same
+        meta), the original delay was re-applied — potentially forever
+        (retry + delay storm), and the source tag was pinned to the retry
+        (defeating round-robin fairness on the retry path).
+
+        **Migration:** callers that push the same request object more than
+        once AND want ``delay`` / ``source`` to apply on each push must
+        re-set ``request.meta['delay']`` / ``request.meta['source']``
+        between pushes. The common case (push once, retry middleware owns
+        the re-push) is fixed for free by this consumption.
+
     Args:
         request: The Scrapy request to push.
         priority: Priority of the request (higher = more urgent).
@@ -203,8 +218,15 @@ class BackendQueue:
       )
       raise SerializationError(msg, data=request, serializer="json")
 
-    delay = float(request.meta.get("delay") or 0.0)
-    source = str(request.meta.get("source") or "default")
+    # R14-F: read delay/source from meta, then POP them so a re-pushed
+    # retry (Scrapy retry middleware re-queues the same request object with
+    # the same meta) does NOT re-apply the original delay indefinitely
+    # (retry + delay storm) and is not pinned to the original source tag
+    # (which would defeat round-robin fairness on the retry path). Callers
+    # that want delay/source on every push must re-set them between pushes
+    # — see the breaking-change note in the docstring.
+    delay = float(request.meta.pop("delay", 0.0) or 0.0)
+    source = str(request.meta.pop("source", "default") or "default")
     self._strategy.push(
       self.queue_name, data, priority=priority, delay=delay, source=source
     )

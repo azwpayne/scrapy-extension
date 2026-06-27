@@ -83,6 +83,34 @@ class TestThrottleQueueStrategy:
     with pytest.raises(ValueError, match="min_interval"):
       ThrottleQueueStrategy(mock_connection_manager, min_interval=-1.0)
 
+  # ----- R14-F MED: min_interval must be bounded -----
+
+  def test_min_interval_upper_bound_rejects_misconfig(
+    self, mock_connection_manager
+  ) -> None:
+    """R14-F MED: ``min_interval`` above the documented ceiling (3600s = 1h)
+    is rejected as a ConfigurationError. A pathologically large value
+    (e.g. ``1e9``) would make the queue look permanently empty for the
+    process lifetime — a soft DoS via misconfig. Reject loudly instead.
+    """
+    from scrapy_extension.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="min_interval"):
+      ThrottleQueueStrategy(mock_connection_manager, min_interval=3600.1)
+    # Exactly at the ceiling is accepted (inclusive bound).
+    strat = ThrottleQueueStrategy(mock_connection_manager, min_interval=3600.0)
+    assert strat._min_interval == 3600.0
+
+  def test_min_interval_upper_bound_rejects_extreme(
+    self, mock_connection_manager
+  ) -> None:
+    """R14-F MED: extreme misconfig (``1e9``) is rejected, not silently
+    accepted as a permanently-empty-looking queue."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError):
+      ThrottleQueueStrategy(mock_connection_manager, min_interval=1e9)
+
 
 class TestFactoryThrottle:
   def test_build_throttle(self, mock_connection_manager) -> None:

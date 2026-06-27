@@ -20,7 +20,11 @@ class RoundRobinQueueStrategy(QueueStrategy):
 
   Each distinct ``source`` gets its own deque; ``pop`` cycles through sources
   in rotation, skipping empty ones, so every non-empty source is served before
-  any source is served twice. ``priority`` and ``delay`` are ignored.
+  any source is served twice. Drained-source keys are evicted from
+  ``_sources`` (R14-F) so the rotation state stays bounded at the live source
+  set — pre-fix the strategy leaked every source key ever seen, making
+  ``_sources`` unbounded and every pop O(n) in historical-source count on a
+  long crawl with transient sources. ``priority`` and ``delay`` are ignored.
 
   Items are held in-process — not shared across workers. For distributed
   fairness, use a backend with native fairness; this strategy gives
@@ -28,6 +32,7 @@ class RoundRobinQueueStrategy(QueueStrategy):
 
   Attributes:
       _sources: OrderedDict source -> deque (insertion-ordered for stable rotation).
+      _idx: Rotation cursor into the live ``_sources`` key order.
   """
 
   def __init__(self, connection_manager: object) -> None:
@@ -68,6 +73,15 @@ class RoundRobinQueueStrategy(QueueStrategy):
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop the next item, cycling through non-empty sources.
 
+    Drained-source keys are evicted from ``_sources`` (R14-F): once a
+    source's deque empties, its key is removed so the rotation state stays
+    bounded at the live source set. The cursor (``_idx``) is re-pointed at
+    the next source in rotation *by identity* (not by index) so fairness
+    ordering survives the eviction — index-based positioning would break
+    because eviction shifts the rotation list. Without eviction, a long
+    crawl with transient sources would leak every source key ever seen
+    into ``_sources`` and make every pop O(n) in historical-source count.
+
     Args:
         queue_name: The queue name (unused).
         timeout: Ignored (non-blocking rotation).
@@ -76,14 +90,39 @@ class RoundRobinQueueStrategy(QueueStrategy):
         The next item in round-robin order, or None if all sources are empty.
     """
     del queue_name, timeout
-    rotation = list(self._sources)
-    n = len(rotation)
-    for offset in range(n):
-      source = rotation[(self._idx + offset) % n]
+    while self._sources:
+      rotation = list(self._sources)
+      n = len(rotation)
+      if n == 0:
+        return None
+      idx = self._idx % n
+      source = rotation[idx]
       dq = self._sources[source]
       if dq:
-        self._idx = (self._idx + offset + 1) % n
-        return dq.popleft()
+        item = dq.popleft()
+        # Remember the NEXT source in rotation (by identity) BEFORE any
+        # eviction shifts the rotation list. The cursor must land on this
+        # source so the fairness order survives the deletion.
+        next_source = rotation[(idx + 1) % n]
+        # R14-F: evict drained sources to keep _sources bounded at the
+        # live set. Empty sources left behind would (a) leak unboundedly
+        # under source churn and (b) make every pop O(n) in the historical
+        # source count as the rotation walks past empty slots.
+        if not dq:
+          del self._sources[source]
+        # Re-point the cursor at the remembered next source. If it was
+        # evicted too (or the dict is now empty), clamp by size.
+        if next_source in self._sources:
+          new_rotation = list(self._sources)
+          self._idx = new_rotation.index(next_source) % len(new_rotation)
+        else:
+          self._idx = 0
+        return item
+      # Defensive: an empty deque at the cursor (shouldn't normally happen
+      # since we evict on drain) — evict it and let the loop retry from a
+      # fresh rotation rather than spin on an empty slot.
+      del self._sources[source]
+      self._idx = 0
     return None
 
   def queue_len(self, queue_name: str) -> int:

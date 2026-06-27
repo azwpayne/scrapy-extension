@@ -91,7 +91,8 @@ class TestDelayQueueStrategy:
     now[0] = 111.0  # past ready
     mock_connection_manager.get_queue_backend().pop.return_value = b"next"
     strat.pop("q")
-    mock_connection_manager.get_queue_backend().push.assert_called_once_with("q", b"x")
+    # R14-F: drained items are re-pushed with their priority (default 0.0).
+    mock_connection_manager.get_queue_backend().push.assert_called_once_with("q", b"x", 0.0)
     assert len(strat._holding) == 0
 
   def test_default_delay_used_when_omitted(self, mock_connection_manager) -> None:

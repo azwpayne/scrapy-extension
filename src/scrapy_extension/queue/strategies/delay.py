@@ -42,10 +42,15 @@ if TYPE_CHECKING:
 class DelayQueueStrategy(QueueStrategy):
   """Holds items for a per-item delay, then enqueues them to the live queue.
 
-  Single-process holding (v1): a ``heapq`` of ``(ready_at, seq, item)``.
+  Single-process holding (v1): a ``heapq`` of ``(ready_at, seq, item, priority)``.
   ``push`` with ``delay > 0`` parks the item until ready; ``pop`` drains all
   due held items into the live queue first, then pops the live queue.
   ``delay == 0`` (or unset) goes straight to the live queue.
+
+  The heap tuple stores the caller's ``priority`` so :meth:`_drain_ready`
+  can re-pass it to the live queue on drain — without it, every delayed
+  item would silently land at priority 0 (priority inversion for any user
+  mixing ``delay`` + ``priority``). R14-F.
 
   Cross-worker holding is not supported in v1 — each process holds its own
   delayed items. See ``docs/superpowers/specs/2026-06-19-queue-semantics-design.md``.
@@ -53,7 +58,7 @@ class DelayQueueStrategy(QueueStrategy):
   Attributes:
       _default_delay: Default delay when push omits an explicit delay.
       _clock: Monotonic clock callable (injectable for tests).
-      _holding: Min-heap of (ready_at, seq, item).
+      _holding: Min-heap of ``(ready_at, seq, item, priority)``.
       _seq: Tie-break counter for stable heap ordering.
       _max_held: Soft cap on ``_holding`` size; non-positive disables the
           warning. Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000).
@@ -88,7 +93,13 @@ class DelayQueueStrategy(QueueStrategy):
       raise ValueError(f"default_delay must be >= 0, got {default_delay}")
     self._default_delay = default_delay
     self._clock = clock
-    self._holding: list[tuple[float, int, bytes]] = []
+    # R14-F: heap tuple gains a `priority` slot so the drain path can re-pass
+    # the caller's priority to the live queue. Without it every delayed item
+    # would silently land at priority 0 (priority inversion for callers
+    # mixing delay + priority). Tuple order is (ready_at, seq, item, priority)
+    # — `ready_at` is still the heap key; `seq` is the FIFO tie-breaker; the
+    # trailing two slots are payload that never participate in ordering.
+    self._holding: list[tuple[float, int, bytes, float]] = []
     self._seq = itertools.count()
     self._max_held = max_held
 
@@ -116,7 +127,9 @@ class DelayQueueStrategy(QueueStrategy):
       self._connection_manager.get_queue_backend().push(queue_name, item, priority)
       return
     ready_at = self._clock() + effective
-    heapq.heappush(self._holding, (ready_at, next(self._seq), item))
+    # R14-F: stash priority in the heap tuple so _drain_ready re-passes it
+    # to the live queue (preserves caller priority across the delay hop).
+    heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
     self._warn_over_cap_once()
 
   def _warn_over_cap_once(self) -> None:
@@ -164,14 +177,21 @@ class DelayQueueStrategy(QueueStrategy):
   def _drain_ready(self, queue_name: str) -> None:
     """Move all due held items into the live queue.
 
+    Each drained item is re-pushed with the priority the caller originally
+    passed to :meth:`push` (R14-F). Pre-fix this dropped priority on drain,
+    silently landing every delayed item at priority 0 — a priority inversion
+    for any user mixing ``delay`` + ``priority``. Priority is the 4th slot
+    of the heap tuple; the live push uses the keyword form so backend
+    ``push(queue_name, item, priority)`` signatures are honored either way.
+
     Args:
         queue_name: The queue name to drain into.
     """
     qb = self._connection_manager.get_queue_backend()
     now = self._clock()
     while self._holding and self._holding[0][0] <= now:
-      _, _, item = heapq.heappop(self._holding)
-      qb.push(queue_name, item)
+      _, _, item, priority = heapq.heappop(self._holding)
+      qb.push(queue_name, item, priority)
 
   def queue_len(self, queue_name: str) -> int:
     """Return live-queue length plus held-item count.

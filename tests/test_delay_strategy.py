@@ -146,3 +146,67 @@ class TestDelayQueueStrategy:
     """Non-positive max_held is accepted (= disabled), per opt-out contract."""
     strat = DelayQueueStrategy(mock_connection_manager, max_held=max_held)
     assert strat._max_held == max_held
+
+  # ----- R14-F: priority must survive the delay drain -----
+
+  def test_drain_retains_explicit_priority(self, mock_connection_manager) -> None:
+    """R14-F HIGH: a delayed item pushed with ``priority=`` must re-enter the
+    live queue at that priority when drained — not silently land at 0.
+
+    Regression guard for the dropped-on-drain priority-inversion bug: the
+    holding heap tuple gains a priority slot, and ``_drain_ready`` re-passes
+    it to ``qb.push``. Before the fix, ``qb.push(queue_name, item)`` was
+    called with no ``priority=`` so every delayed item drained at priority 0.
+    """
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager, default_delay=10.0, clock=_clock(now)
+    )
+    strat.push("q", b"x", priority=10.0)
+    assert len(strat._holding) == 1
+    # Advance clock past ready_at and pop → triggers _drain_ready.
+    now[0] = 111.0
+    strat.pop("q")
+    # Backend push must carry the original priority, not the default 0.
+    mock_connection_manager.get_queue_backend().push.assert_called_once()
+    call = mock_connection_manager.get_queue_backend().push.call_args
+    assert call.args[0] == "q"
+    assert call.args[1] == b"x"
+    # Either positional (priority as 3rd arg) or keyword — assert it's 10.0.
+    priority_arg = call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
+    assert priority_arg == 10.0, (
+      f"delayed item drained at priority {priority_arg} instead of 10.0 "
+      "(silent priority inversion — R14-F HIGH regression)"
+    )
+
+  def test_drain_retains_priority_kwarg_form(self, mock_connection_manager) -> None:
+    """R14-F: priority is re-passed as a keyword to the backend push (robust
+    to either positional or kwarg call shape; pins the explicit ``priority=``
+    pass-through so a future refactor doesn't silently drop it again)."""
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager, default_delay=5.0, clock=_clock(now)
+    )
+    strat.push("q", b"y", priority=7.5)
+    now[0] = 200.0  # well past ready_at
+    strat.pop("q")
+    call = mock_connection_manager.get_queue_backend().push.call_args
+    # Keyword form preferred (matches the existing live-push call shape).
+    assert call.kwargs.get("priority", call.args[2] if len(call.args) > 2 else 0.0) == 7.5
+
+  def test_drain_priority_defaults_to_zero_when_unspecified(
+    self, mock_connection_manager
+  ) -> None:
+    """R14-F backward-compat: a delayed item pushed with no explicit priority
+    still drains at priority 0 (the pre-fix default). Existing delay callers
+    that never set ``priority=`` must not observe any behavior change."""
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager, default_delay=1.0, clock=_clock(now)
+    )
+    strat.push("q", b"z")  # no priority= → default 0.0
+    now[0] = 102.0
+    strat.pop("q")
+    call = mock_connection_manager.get_queue_backend().push.call_args
+    priority_arg = call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
+    assert priority_arg == 0.0
