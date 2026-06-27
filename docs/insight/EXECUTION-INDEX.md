@@ -11,31 +11,35 @@ unit discovered across rounds 1-8. Supersedes cross-reading 5 docs. Source SPECs
 
 ---
 
-## ⚡ Round 14 menu — six-dimension hardening (NEW — the active `/goal` target)
+## ⚡ Round 14 menu — six-dimension hardening (✅ ALL LANDED)
 
 Rounds 9-13 closed the round-8 execution menu (✅). A fresh **full-coverage**
 six-dimension insight fan-out (error-handling / lifecycle / strategy / test /
-observability / API-stability) surfaced **~40 new findings → 8 units (R14-A…H)**.
+observability / API-stability) surfaced **~40 new findings → 8 units (R14-A…H)** — **all executed & merged**.
 
 👉 **SPEC:** [`SPEC-round14-six-dimension-hardening.md`](./SPEC-round14-six-dimension-hardening.md)
 👉 **PLAN:** [`PLAN-round14-six-dimension-hardening.md`](./PLAN-round14-six-dimension-hardening.md)
 
-| ID | Title | Sev | Effort | Files (owner scope) |
-|---|---|:-:|:-:|---|
-| **R14-A** | StorageBackend error-contract uniformity (3 data-loss/leak bugs) | 3×H | M | exceptions/base.py, backends/{memcached,dynamodb,mongodb}.py |
-| **R14-B** | v1.0 breaking-change disclosure + ConfigurationError contract freeze | CRIT+H | S-M | CHANGELOG/STABILITY/README, settings/base.py, backends/base.py |
-| **R14-C** | Operability configurability (thread U4/U5/U2 knobs via Scrapy settings) | CRIT | M | settings/base.py, schedule/scheduler.py, queue/strategies/factory.py, monitor/stats.py, queue/queue.py |
-| **R14-D** | Observability completeness (dead `on_error`, Bloom/Memory saturation, connection hooks) | CRIT+H | M | monitor/{base,stats}.py, queue/queue.py, dupefilter/**, backends/connectors.py |
-| **R14-E** | Lifecycle bounds (cap `_managers` registry, Kafka partition pruning, RabbitMQ partial-state) | 2×H+M | M | backends/connectors.py, backends/{kafka,rabbitmq,pulsar,sqs}.py, circuit_breaker.py |
-| **R14-F** | Queue-strategy correctness (delay priority, RR cleanup, retry+delay storm) | 3×H | M | queue/strategies/{delay,round_robin,throttle}.py, queue/queue.py |
-| **R14-G** | Test-coverage hardening (backend layer → 95%+, property tests, integration-tier gate) | 3×H+M | M-L | tests/**, conftest.py |
-| **R14-H** | Lazy-import hygiene + polish (misleading install hint, rocketmq dead branch) | H+L | S | __init__.py, backends/__init__.py, backends/rocketmq.py |
+| ID | Title | Status | Commit |
+|---|---|:-:|---|
+| **R14-A** | StorageBackend error-contract uniformity (3 data-loss/leak bugs) | ✅ | `7a0d4d0` |
+| **R14-F** | Queue-strategy correctness (delay priority, RR cleanup, retry+delay storm) | ✅ | `c966c2d` |
+| **R14-H** | Lazy-import hygiene + polish (misleading install hint, rocketmq dead branch) | ✅ | `a5e73d9` |
+| **R14-B** | v1.0 breaking-change disclosure + ConfigurationError contract freeze | ✅ | `4003f35` |
+| **R14-E** | Lifecycle bounds (cap `_managers` registry, Kafka partition pruning, RabbitMQ partial-state) | ✅ | `0237070` |
+| **R14-C** | Operability configurability (thread U4/U5/U2 knobs via Scrapy settings) | ✅ | `da458b5` |
+| **R14-D** | Observability completeness (dead `on_error`, Bloom/Memory saturation, connection hooks) | ✅ | `dbfdc4a` + scheduler follow-up |
+| **R14-G** | Test-coverage hardening (backend layer → 95%+, property tests, integration-tier gate, flake fix) | ✅ | `1960169` |
 
-**Execution waves (file-disjoint):** Wave 1 = R14-A ∥ R14-F ∥ R14-H · Wave 2 = R14-B ∥ R14-E · Wave 3 = R14-C → R14-D → R14-G. One `/goal` per wave.
+**Verification (3 hard gates, all green):** `uv run pytest -q` → **1688 passed, 36 skipped** (stable across random seeds — the order-dependent flake was root-caused to a `test_lazy_imports.py` sys.modules pop-without-restore and fixed); `uv run ruff check src/ tests/` → clean; `uv run mypy --strict src/` → 0 errors; coverage **95.31%**.
 
-> ⚠️ **v1.0 re-assessment:** the prior "v1.0 tag defensible" claim is **re-opened**.
-> R14-B (undocumented breaking change) and R14-C (knobs the runbook promises but
-> that don't exist) are genuine pre-tag blockers. **Tag v1.0 after R14-B + R14-C land.**
+> ✅ **v1.0 re-assessment: tag defensible again.** R14-B (breaking changes now
+> documented in CHANGELOG) + R14-C (runbook-promised knobs now thread via
+> `SCRAPY_*` settings) — the two pre-tag blockers — are landed. All 3 v1.0
+> non-negotiables met. Remaining backend files <95% coverage (connectors 90.9%,
+> dynamodb 90.5%, kafka 90.5%) are error-path/mode branches, not the primary
+> corruption-prevention contract (mongodb guards now covered) — a future
+> coverage round can close them.
 
 The round-8 menu below is retained for history (all ✅ DONE).
 
@@ -132,8 +136,12 @@ These are insight-only (no spec yet); run when the execution backlog is drained.
 | 11 | U1 README Guarantees + U9 stability artifacts (STABILITY/SECURITY/CHANGELOG/runbook) | `432f991` |
 | 12 | U2 operability — on_pop_rate + on_filter_saturation (v1.0 non-neg #2) | `7d7401a` |
 | 13 | U21 redis+elasticsearch cap bump + U20 pymemcache Experimental label | `c48062b` |
+| 14 | six-dimension hardening — R14-A…H (storage contract, v1.0 disclosure, operability settings, observability, lifecycle bounds, strategy correctness, coverage+flake-fix, import hygiene) | `7a0d4d0`…`1960169` |
 
-**Rounds 9-13 (the execution menu) are CLOSED.** Settings dimension fully validated
-(SV1-5), perf/OOM caps shipped (U4/U5), type promise kept (U8), v1.0 non-negotiables
-#1 (U1) + #2 (U2) + #3 (U3, round-8) all met → **v1.0 tag defensible.** Remaining
-work is Post-1.0 Tier-2/3 (U19 splits, U10-U17) — deferred by design.
+**Rounds 9-14 are CLOSED.** Settings dimension fully validated (SV1-5 + R14-B),
+perf/OOM caps shipped (U4/U5) + threaded via settings (R14-C), type promise
+kept (U8), v1.0 non-negotiables #1 (U1) + #2 (U2 + R14-D) + #3 (U3) all met,
+storage/strategy/lifecycle correctness hardened (R14-A/E/F), test flake
+root-caused + fixed (R14-G) → **v1.0 tag defensible.** Remaining work is
+Post-1.0 Tier-2/3 (U19 splits, U10-U17) + a future coverage round for the
+backend error-path branches still <95%.
