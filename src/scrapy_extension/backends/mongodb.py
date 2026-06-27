@@ -39,6 +39,7 @@ from scrapy_extension.exceptions import (
     ConfigurationError,
     QueueError,
 )
+from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
 
 if TYPE_CHECKING:
@@ -608,6 +609,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
         data: Data to store (bytes).
         ttl: Optional time-to-live in seconds.
+
+    Raises:
+        BackendConnectionError: If not connected.
+        StorageError: On PyMongoError (was previously unwrapped, leaking
+            ``pymongo.errors.PyMongoError`` to callers expecting
+            ``except BackendError``).
     """
     self._assert_connected()
     if self._storage_collection is None:
@@ -620,11 +627,15 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if ttl is not None:
       doc["expireAt"] = datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
 
-    self._storage_collection.replace_one(
-      {"key": key},
-      doc,
-      upsert=True,
-    )
+    try:
+      self._storage_collection.replace_one(
+        {"key": key},
+        doc,
+        upsert=True,
+      )
+    except PyMongoError as e:
+      msg = f"Failed to store key {key!r} in MongoDB: {e}"
+      raise StorageError(msg, operation="store", key=key) from e
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
@@ -634,12 +645,20 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Stored data, or None if not found.
+
+    Raises:
+        BackendConnectionError: If not connected.
+        StorageError: On PyMongoError (was previously unwrapped).
     """
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    result = self._storage_collection.find_one({"key": key})
+    try:
+      result = self._storage_collection.find_one({"key": key})
+    except PyMongoError as e:
+      msg = f"Failed to retrieve key {key!r} from MongoDB: {e}"
+      raise StorageError(msg, operation="retrieve", key=key) from e
     if result:
       # storage doc stores ``data`` as bytes; cast narrows the Any from pymongo.
       return cast(bytes, result.get("data"))
@@ -653,12 +672,20 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if deleted, False if didn't exist.
+
+    Raises:
+        BackendConnectionError: If not connected.
+        StorageError: On PyMongoError (was previously unwrapped).
     """
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    result = self._storage_collection.delete_one({"key": key})
+    try:
+      result = self._storage_collection.delete_one({"key": key})
+    except PyMongoError as e:
+      msg = f"Failed to delete key {key!r} in MongoDB: {e}"
+      raise StorageError(msg, operation="delete", key=key) from e
     return result.deleted_count > 0
 
   def exists(self, key: str) -> bool:
@@ -669,12 +696,20 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if key exists.
+
+    Raises:
+        BackendConnectionError: If not connected.
+        StorageError: On PyMongoError (was previously unwrapped).
     """
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    result = self._storage_collection.find_one({"key": key}, {"_id": 1})
+    try:
+      result = self._storage_collection.find_one({"key": key}, {"_id": 1})
+    except PyMongoError as e:
+      msg = f"Failed to check existence of key {key!r} in MongoDB: {e}"
+      raise StorageError(msg, operation="exists", key=key) from e
     return result is not None
 
   def ttl(self, key: str) -> int | None:
@@ -686,12 +721,20 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Seconds remaining, None if no TTL or key doesn't exist,
         -1 if expired (rare since MongoDB TTL index auto-deletes).
+
+    Raises:
+        BackendConnectionError: If not connected.
+        StorageError: On PyMongoError (was previously unwrapped).
     """
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
+    try:
+      result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
+    except PyMongoError as e:
+      msg = f"Failed to read TTL of key {key!r} in MongoDB: {e}"
+      raise StorageError(msg, operation="ttl", key=key) from e
     if result is None:
       return None
     if "expireAt" not in result:
@@ -707,6 +750,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         prefix: If provided, only clear keys starting with this prefix.
                If None, clear all storage data.
+
+    Raises:
+        BackendConnectionError: If not connected.
+        StorageError: On PyMongoError (was previously unwrapped).
     """
     self._assert_connected()
     if self._storage_collection is None:
@@ -714,6 +761,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise BackendConnectionError(msg, backend_type="mongodb")
     if prefix:
       pattern = re.escape(prefix)
-      self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
+      try:
+        self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
+      except PyMongoError as e:
+        msg = f"Failed to clear MongoDB storage (prefix={prefix!r}): {e}"
+        raise StorageError(msg, operation="clear_storage", key=None) from e
     else:
-      self._storage_collection.delete_many({})
+      try:
+        self._storage_collection.delete_many({})
+      except PyMongoError as e:
+        msg = f"Failed to clear MongoDB storage: {e}"
+        raise StorageError(msg, operation="clear_storage", key=None) from e

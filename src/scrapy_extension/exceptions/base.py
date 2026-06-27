@@ -70,6 +70,36 @@ class QueueError(BackendError):
     self.operation = operation
 
 
+class StorageError(BackendError):
+  """Exception raised for storage operation errors.
+
+  This covers failures in StorageBackend operations (``store`` / ``retrieve``
+  / ``delete`` / ``exists`` / ``ttl`` / ``clear_storage``). Raising
+  ``StorageError`` instead of returning a silent sentinel (``None`` / ``False``)
+  prevents the item pipeline from treating a failed write as a success.
+
+  ``except BackendError`` catches every storage-path failure uniformly
+  across memcached / dynamodb / mongodb (mirrors the queue-op ``QueueError``
+  contract).
+
+  Attributes:
+      operation: The storage operation that failed (``store``, ``retrieve``,
+          ``delete``, ``exists``, ``ttl``, ``clear_storage``).
+      key: The storage key the operation was performed on, or ``None`` for
+          keyless operations (``clear_storage``).
+  """
+
+  def __init__(
+    self,
+    message: str,
+    operation: str | None = None,
+    key: str | None = None,
+  ) -> None:
+    super().__init__(message)
+    self.operation = operation
+    self.key = key
+
+
 class SerializationError(BackendError):
   """Exception raised for serialization/deserialization errors.
 

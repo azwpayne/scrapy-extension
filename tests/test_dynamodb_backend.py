@@ -23,6 +23,7 @@ from scrapy_extension.backends.base import (  # noqa: E402
 )
 from scrapy_extension.backends.dynamodb import DynamoDBBackend  # noqa: E402
 from scrapy_extension.exceptions import BackendConnectionError  # noqa: E402
+from scrapy_extension.exceptions.base import StorageError  # noqa: E402
 from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings  # noqa: E402
 
 
@@ -163,6 +164,84 @@ class TestDynamoDBStorageOps:
     b, _ = _connected(mocker)
     with pytest.raises(ValueError):
       b.store("bad key!", b"x")
+
+
+# ---------------------------------------------------------------------------
+# R14-A: StorageBackend error-contract uniformity.
+# DynamoDB storage ops must raise StorageError on operational failures
+# (throttling / throughput / limit). Only ResourceNotFoundException is a
+# genuine "missing" signal and may be swallowed (returns None/False).
+# ---------------------------------------------------------------------------
+
+
+def _make_client_error(code: str):
+  """Build a minimal stand-in for botocore.exceptions.ClientError."""
+  err = {"Error": {"Code": code, "Message": f"{code} hit"}}
+  e = Exception(f"An error occurred ({code})")
+  e.response = err  # type: ignore[attr-defined]
+  return e
+
+
+class TestDynamoDBStorageErrorContract:
+  def test_delete_throttling_raises_storage_error(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.delete_item.side_effect = _make_client_error("ThrottlingException")
+    with pytest.raises(StorageError) as exc_info:
+      b.delete("key1")
+    assert exc_info.value.operation == "delete"
+    assert exc_info.value.key == "key1"
+
+  def test_store_provisioned_throughput_raises_storage_error(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.put_item.side_effect = _make_client_error(
+      "ProvisionedThroughputExceededException"
+    )
+    with pytest.raises(StorageError) as exc_info:
+      b.store("key1", b"value")
+    assert exc_info.value.operation == "store"
+
+  def test_retrieve_limit_exceeded_raises_storage_error(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.side_effect = _make_client_error("LimitExceededException")
+    with pytest.raises(StorageError):
+      b.retrieve("key1")
+
+  def test_exists_client_error_raises_storage_error(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.side_effect = _make_client_error("ThrottlingException")
+    with pytest.raises(StorageError):
+      b.exists("key1")
+
+  def test_ttl_client_error_raises_storage_error(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.side_effect = _make_client_error("LimitExceededException")
+    with pytest.raises(StorageError):
+      b.ttl("key1")
+
+  def test_clear_storage_client_error_raises_storage_error(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.scan.side_effect = _make_client_error("ThrottlingException")
+    with pytest.raises(StorageError):
+      b.clear_storage()
+
+  def test_delete_resource_not_found_returns_false(self, mocker) -> None:
+    """ResourceNotFoundException is a genuine 'missing' signal — keep swallowing."""
+    b, table = _connected(mocker)
+    table.delete_item.side_effect = _make_client_error("ResourceNotFoundException")
+    assert b.delete("key1") is False
+
+  def test_retrieve_resource_not_found_returns_none(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.side_effect = _make_client_error("ResourceNotFoundException")
+    assert b.retrieve("key1") is None
+
+  def test_storage_error_is_backend_error_subclass(self, mocker) -> None:
+    from scrapy_extension.exceptions.base import BackendError
+
+    b, table = _connected(mocker)
+    table.put_item.side_effect = _make_client_error("ThrottlingException")
+    with pytest.raises(BackendError):
+      b.store("key1", b"value")
 
 
 # ---------------------------------------------------------------------------

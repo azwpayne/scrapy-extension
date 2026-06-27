@@ -4,6 +4,7 @@ import pytest
 
 from scrapy_extension.backends.mongodb import MongoDBBackend
 from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBSettings
 
 
@@ -773,3 +774,101 @@ def test_mongodb_password_redacted_in_auth_kwargs_repr():
   # But repr of the kwargs dict hides it.
   assert "top-secret-mongo-pwd" not in repr(auth_kwargs)
   assert isinstance(password, _RedactedStr)
+
+
+# ---------------------------------------------------------------------------
+# R14-A: StorageBackend error-contract uniformity.
+# MongoDB storage ops must wrap PyMongoError → StorageError (mirroring the
+# existing queue-op wrap at mongodb.py push/pop). The raw PyMongoError must
+# never leak to a caller expecting ``except BackendError``.
+# ---------------------------------------------------------------------------
+
+
+def _storage_backend(mocker):
+  """Return a connected MongoDBBackend with a mocked storage collection."""
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._storage_collection = mock_collection
+  return backend, mock_collection
+
+
+class TestMongoDBStorageErrorContract:
+  def test_retrieve_connection_error_raises_storage_error(self, mocker):
+    from pymongo.errors import AutoReconnect, PyMongoError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.find_one.side_effect = AutoReconnect("connection lost")
+
+    with pytest.raises(StorageError) as exc_info:
+      backend.retrieve("key1")
+    assert exc_info.value.operation == "retrieve"
+    assert exc_info.value.key == "key1"
+    assert isinstance(exc_info.value.__cause__, PyMongoError)
+
+  def test_store_pymongo_error_raises_storage_error(self, mocker):
+    from pymongo.errors import PyMongoError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.replace_one.side_effect = PyMongoError("write failed")
+
+    with pytest.raises(StorageError) as exc_info:
+      backend.store("key1", b"data")
+    assert exc_info.value.operation == "store"
+    assert exc_info.value.key == "key1"
+
+  def test_delete_pymongo_error_raises_storage_error(self, mocker):
+    from pymongo.errors import PyMongoError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.delete_one.side_effect = PyMongoError("delete failed")
+
+    with pytest.raises(StorageError):
+      backend.delete("key1")
+
+  def test_exists_pymongo_error_raises_storage_error(self, mocker):
+    from pymongo.errors import PyMongoError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.find_one.side_effect = PyMongoError("exists failed")
+
+    with pytest.raises(StorageError):
+      backend.exists("key1")
+
+  def test_ttl_pymongo_error_raises_storage_error(self, mocker):
+    from pymongo.errors import PyMongoError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.find_one.side_effect = PyMongoError("ttl failed")
+
+    with pytest.raises(StorageError):
+      backend.ttl("key1")
+
+  def test_clear_storage_pymongo_error_raises_storage_error(self, mocker):
+    from pymongo.errors import PyMongoError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.delete_many.side_effect = PyMongoError("clear failed")
+
+    with pytest.raises(StorageError):
+      backend.clear_storage()
+
+  def test_storage_error_is_backend_error_subclass(self, mocker):
+    """``except BackendError`` must catch storage-path failures."""
+    from pymongo.errors import PyMongoError
+
+    from scrapy_extension.exceptions.base import BackendError
+
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.replace_one.side_effect = PyMongoError("write failed")
+
+    with pytest.raises(BackendError):
+      backend.store("key1", b"data")
+
+  def test_retrieve_missing_still_returns_none(self, mocker):
+    """Retrieve-missing is NOT an error — find_one returns None → return None."""
+    backend, mock_collection = _storage_backend(mocker)
+    mock_collection.find_one.return_value = None
+    assert backend.retrieve("missing_key") is None

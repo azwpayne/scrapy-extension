@@ -35,6 +35,7 @@ from scrapy_extension.backends.base import (
   _validate_key_name,
 )
 from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MemcachedMode
 
 if TYPE_CHECKING:
@@ -127,12 +128,15 @@ class MemcachedBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the underlying client raises (was previously
+            silently swallowed to ``return None``, masking data loss).
     """
     _validate_key_name(key, "key")
     try:
       self._client.set(key, data, expire=ttl)
     except Exception as e:
-      logger.warning("Failed to store key %s: %s", key, e)
+      msg = f"Failed to store key {key!r} in Memcached: {e}"
+      raise StorageError(msg, operation="store", key=key) from e
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
@@ -145,13 +149,15 @@ class MemcachedBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the underlying client raises (was previously
+            silently swallowed to ``return None``).
     """
     _validate_key_name(key, "key")
     try:
       return cast("bytes | None", self._client.get(key))
     except Exception as e:
-      logger.warning("Failed to retrieve key %s: %s", key, e)
-      return None
+      msg = f"Failed to retrieve key {key!r} from Memcached: {e}"
+      raise StorageError(msg, operation="retrieve", key=key) from e
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -164,12 +170,15 @@ class MemcachedBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the underlying client raises (was previously
+            silently swallowed to ``return False``).
     """
     _validate_key_name(key, "key")
     try:
       return bool(self._client.delete(key))
-    except Exception:
-      return False
+    except Exception as e:
+      msg = f"Failed to delete key {key!r} in Memcached: {e}"
+      raise StorageError(msg, operation="delete", key=key) from e
 
   def exists(self, key: str) -> bool:
     """Check if a key exists.
@@ -182,12 +191,15 @@ class MemcachedBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the underlying client raises (was previously
+            silently swallowed to ``return False``).
     """
     _validate_key_name(key, "key")
     try:
       return self._client.get(key) is not None
-    except Exception:
-      return False
+    except Exception as e:
+      msg = f"Failed to check existence of key {key!r} in Memcached: {e}"
+      raise StorageError(msg, operation="exists", key=key) from e
 
   def ttl(self, key: str) -> int | None:
     """Return None — Memcached does not expose remaining TTL.
@@ -212,13 +224,16 @@ class MemcachedBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If prefix contains invalid characters.
+        StorageError: If the underlying client raises (was previously
+            silently swallowed).
     """
     if prefix:
       _validate_key_name(prefix, "prefix")
     try:
       self._client.flush_all()
     except Exception as e:
-      logger.warning("Failed to flush Memcached: %s", e)
+      msg = f"Failed to flush Memcached: {e}"
+      raise StorageError(msg, operation="clear_storage", key=None) from e
 
 
 class _swallow:

@@ -33,6 +33,7 @@ from scrapy_extension.backends.base import (  # noqa: E402
 )
 from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
 from scrapy_extension.exceptions import BackendConnectionError  # noqa: E402
+from scrapy_extension.exceptions.base import StorageError  # noqa: E402
 from scrapy_extension.settings import MemcachedMode, MemcachedSettings  # noqa: E402
 
 
@@ -146,3 +147,63 @@ class TestMemcachedStorageOps:
     b, _ = _connected(mocker)
     with pytest.raises(ValueError):
       b.store("bad key!", b"x")
+
+
+# ---------------------------------------------------------------------------
+# R14-A: StorageBackend error-contract uniformity.
+# Storage ops must raise StorageError on failure (not silently swallow to
+# None/False — that masked data loss in the item pipeline).
+# ---------------------------------------------------------------------------
+
+
+class TestMemcachedStorageErrorContract:
+  """R14-A: each storage op raises StorageError on client-lib failure."""
+
+  def test_store_failure_raises_storage_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.set.side_effect = RuntimeError("memcached unreachable")
+    with pytest.raises(StorageError) as exc_info:
+      b.store("key1", b"value")
+    assert exc_info.value.operation == "store"
+    assert exc_info.value.key == "key1"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+  def test_retrieve_failure_raises_storage_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get.side_effect = RuntimeError("memcached unreachable")
+    with pytest.raises(StorageError) as exc_info:
+      b.retrieve("key1")
+    assert exc_info.value.operation == "retrieve"
+    assert exc_info.value.key == "key1"
+
+  def test_delete_failure_raises_storage_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.delete.side_effect = RuntimeError("memcached unreachable")
+    with pytest.raises(StorageError) as exc_info:
+      b.delete("key1")
+    assert exc_info.value.operation == "delete"
+    assert exc_info.value.key == "key1"
+
+  def test_exists_failure_raises_storage_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get.side_effect = RuntimeError("memcached unreachable")
+    with pytest.raises(StorageError) as exc_info:
+      b.exists("key1")
+    assert exc_info.value.operation == "exists"
+    assert exc_info.value.key == "key1"
+
+  def test_clear_storage_failure_raises_storage_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.flush_all.side_effect = RuntimeError("memcached unreachable")
+    with pytest.raises(StorageError) as exc_info:
+      b.clear_storage()
+    assert exc_info.value.operation == "clear_storage"
+
+  def test_storage_error_is_backend_error_subclass(self, mocker) -> None:
+    """``except BackendError`` must catch storage-path failures."""
+    from scrapy_extension.exceptions.base import BackendError
+
+    b, client = _connected(mocker)
+    client.set.side_effect = RuntimeError("boom")
+    with pytest.raises(BackendError):
+      b.store("key1", b"value")

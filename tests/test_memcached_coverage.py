@@ -15,8 +15,10 @@ if "pymemcache" not in sys.modules:
   sys.modules["pymemcache.client"] = _pkg_client
   sys.modules["pymemcache.client.base"] = _pkg_base
 
+import pytest  # noqa: E402
 import scrapy_extension.backends.memcached as memcached_mod  # noqa: E402
 from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
+from scrapy_extension.exceptions.base import StorageError  # noqa: E402
 from scrapy_extension.settings import MemcachedSettings  # noqa: E402
 
 
@@ -44,32 +46,42 @@ class TestMemcachedErrorPaths:
     client.close.side_effect = RuntimeError("close failed")
     b.disconnect()  # _swallow catches; must not raise
 
-  def test_store_swallows_exception(self, mocker) -> None:
+  def test_store_raises_storage_error(self, mocker) -> None:
+    # R14-A: storage ops raise StorageError instead of silently swallowing.
     b, client = _connected(mocker)
     client.set.side_effect = RuntimeError("boom")
-    b.store("k", b"v")
+    with pytest.raises(StorageError) as exc_info:
+      b.store("k", b"v")
+    assert exc_info.value.operation == "store"
+    assert exc_info.value.key == "k"
 
-  def test_retrieve_swallows_exception(self, mocker) -> None:
+  def test_retrieve_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
     client.get.side_effect = RuntimeError("boom")
-    assert b.retrieve("k") is None
+    with pytest.raises(StorageError) as exc_info:
+      b.retrieve("k")
+    assert exc_info.value.operation == "retrieve"
 
-  def test_delete_swallows_exception(self, mocker) -> None:
+  def test_delete_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
     client.delete.side_effect = RuntimeError("boom")
-    assert b.delete("k") is False
+    with pytest.raises(StorageError):
+      b.delete("k")
 
-  def test_exists_swallows_exception(self, mocker) -> None:
+  def test_exists_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
     client.get.side_effect = RuntimeError("boom")
-    assert b.exists("k") is False
+    with pytest.raises(StorageError):
+      b.exists("k")
 
-  def test_clear_swallows_exception(self, mocker) -> None:
+  def test_clear_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
     client.flush_all.side_effect = RuntimeError("boom")
-    b.clear_storage()
+    with pytest.raises(StorageError):
+      b.clear_storage()
 
-  def test_retrieve_returns_none_without_client(self, mocker) -> None:
-    """is_connected False path: ops without connect return safely."""
+  def test_retrieve_without_client_raises_storage_error(self, mocker) -> None:
+    """Disconnected storage ops raise StorageError (no silent None)."""
     b = MemcachedBackend(MemcachedSettings())
-    assert b.retrieve("k") is None
+    with pytest.raises(StorageError):
+      b.retrieve("k")

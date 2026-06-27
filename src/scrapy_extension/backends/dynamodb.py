@@ -36,12 +36,36 @@ from scrapy_extension.backends.base import (
   secret_value,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import DynamoDBMode
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import DynamoDBSettings
 
 logger = logging.getLogger(__name__)
+
+# DynamoDB ClientError codes that represent genuine "missing" semantics —
+# callers expect ``retrieve``/``delete`` to signal "not found" via None/False
+# rather than raising. All other ClientError codes (throttling, throughput,
+# limit, validation, etc.) are operational failures and MUST raise
+# StorageError so the item pipeline does not treat them as success.
+_DDB_NOT_FOUND_CODES = frozenset({"ResourceNotFoundException"})
+
+
+def _is_resource_not_found(exc: BaseException) -> bool:
+  """Return True if ``exc`` is a DynamoDB ClientError for a missing resource.
+
+  Works against both ``botocore.exceptions.ClientError`` and the test-suite's
+  plain ``Exception`` carrying a ``response`` dict (the ``boto3`` module is
+  mocked in tests, so importing ``botocore.exceptions`` is not reliable).
+  """
+  response = getattr(exc, "response", None)
+  if not isinstance(response, dict):
+    return False
+  err = response.get("Error")
+  if not isinstance(err, dict):
+    return False
+  return err.get("Code") in _DDB_NOT_FOUND_CODES
 
 
 class DynamoDBBackend(Backend, StorageBackend):
@@ -155,6 +179,9 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: On DynamoDB operational failures (throttling /
+            throughput / limit / etc.). Was previously silently swallowed,
+            masking data loss in the item pipeline.
     """
     _validate_key_name(key, "key")
     item: dict[str, Any] = {"pk": key, "value": data}
@@ -163,7 +190,13 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       self._table.put_item(Item=item)
     except Exception as e:
-      logger.warning("Failed to store key %s: %s", key, e)
+      if _is_resource_not_found(e):
+        # Table vanished mid-operation — treat as storage failure too, but
+        # callers checking existence after will see the table gone.
+        msg = f"DynamoDB table not found while storing key {key!r}: {e}"
+      else:
+        msg = f"Failed to store key {key!r} in DynamoDB: {e}"
+      raise StorageError(msg, operation="store", key=key) from e
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key (None if missing or expired).
@@ -176,13 +209,18 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: On operational failures (was previously silently
+            swallowed to ``return None``).
     """
     _validate_key_name(key, "key")
     try:
       resp = self._table.get_item(Key={"pk": key})
     except Exception as e:
-      logger.warning("Failed to retrieve key %s: %s", key, e)
-      return None
+      if _is_resource_not_found(e):
+        # Genuine "missing" signal — preserve None sentinel.
+        return None
+      msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
+      raise StorageError(msg, operation="retrieve", key=key) from e
     item = resp.get("Item")
     if not item:
       return None
@@ -204,13 +242,20 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: On operational failures (was previously silently
+            swallowed to ``return False`` — masked ``ThrottlingException`` as
+            "didn't exist", causing dedup re-emission).
     """
     _validate_key_name(key, "key")
     try:
       resp = self._table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
-      return "Attributes" in resp
-    except Exception:
-      return False
+    except Exception as e:
+      if _is_resource_not_found(e):
+        # Genuine "missing" signal — preserve False sentinel.
+        return False
+      msg = f"Failed to delete key {key!r} in DynamoDB: {e}"
+      raise StorageError(msg, operation="delete", key=key) from e
+    return "Attributes" in resp
 
   def exists(self, key: str) -> bool:
     """Check if a key exists and is not expired.
@@ -223,12 +268,18 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: On operational failures (was previously silently
+            swallowed to ``return False``).
     """
     _validate_key_name(key, "key")
     try:
       resp = self._table.get_item(Key={"pk": key})
-    except Exception:
-      return False
+    except Exception as e:
+      if _is_resource_not_found(e):
+        # Genuine "missing" signal — preserve False sentinel.
+        return False
+      msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
+      raise StorageError(msg, operation="exists", key=key) from e
     item = resp.get("Item")
     if not item:
       return False
@@ -245,12 +296,18 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: On operational failures (was previously silently
+            swallowed to ``return None``).
     """
     _validate_key_name(key, "key")
     try:
       resp = self._table.get_item(Key={"pk": key})
-    except Exception:
-      return None
+    except Exception as e:
+      if _is_resource_not_found(e):
+        # Genuine "missing" signal — preserve None sentinel.
+        return None
+      msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
+      raise StorageError(msg, operation="ttl", key=key) from e
     item = resp.get("Item")
     if not item or "expire_at" not in item:
       return None
@@ -264,6 +321,8 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If prefix contains invalid characters.
+        StorageError: On operational failures (was previously silently
+            swallowed).
     """
     if prefix:
       _validate_key_name(prefix, "prefix")
@@ -273,7 +332,8 @@ class DynamoDBBackend(Backend, StorageBackend):
         for item in scan.get("Items", []):
           batch.delete_item(Key={"pk": item["pk"]})
     except Exception as e:
-      logger.warning("Failed to clear DynamoDB table: %s", e)
+      msg = f"Failed to clear DynamoDB table: {e}"
+      raise StorageError(msg, operation="clear_storage", key=None) from e
 
 
 class _swallow:
