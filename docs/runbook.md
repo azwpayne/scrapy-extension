@@ -105,15 +105,28 @@ By default, `BackendQueue` probes real backend queue depth at most once per
 100 pops (`depth_sample_every=100`), keeping the depth signal fresh for
 backpressure gates while reclaiming ~25% of the pop-path RTT budget.
 
+- **Tune:** set `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY=<N>` (default `100`).
+  Raise for faster backpressure response (more RTT), lower for higher
+  throughput. `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY=1` restores per-pop behavior.
+  (Round-14 R14-C: this setting was deferred in round-9 — the constructor
+  default was the only path; the setting now exists and is threaded by
+  `BackendScheduler.from_settings` → `BackendQueue(depth_sample_every=…)`.)
 - **Inspect:** the probe counter and cached depth are private (`_depth_probe_counter`,
   `_cached_depth`); the externally visible signal is `monitor.on_queue_depth`
   emitting from the cached sample.
-- **Tune:** raise for faster backpressure response (more RTT), lower for
-  higher throughput. `depth_sample_every=1` restores per-pop behavior.
 - **Backpressure interaction:** `backpressure_pause_at` /
   `backpressure_resume_at` compare against the sampled depth; sampling
   keeps the comparison within ~1% variance of the real depth at default
   config.
+
+## The per-item byte cap (round-9 D2)
+
+`SCRAPY_QUEUE_MAX_ITEM_BYTES=<bytes>` (default `1048576` — 1 MiB, matches
+the Memcached 1 MB ceiling). Requests exceeding this are rejected with
+`SerializationError` at push time, preventing silent drops by capped storage
+backends. (Round-14 R14-C: this setting was deferred in round-9 — the
+constructor default was the only path; the setting now exists and is
+threaded by `BackendScheduler.from_settings` → `BackendQueue(max_item_bytes=…)`.)
 
 ## The memory-cap knobs (round-9 U5)
 
@@ -122,12 +135,27 @@ Two unbounded-growth paths are now capped by default:
 | Surface | Default cap | Setting | Behavior on overflow |
 |---|---|---|---|
 | `MemoryMembershipFilter` | 1,000,000 entries | `SCRAPY_DEDUP_MEMORY_MAXSIZE` | LRU eviction (oldest entry dropped); warn-once at threshold |
-| `DelayQueueStrategy` holding heap | 100,000 items | constructor `max_held` (soft cap) | Warn-once; non-positive disables |
+| `DelayQueueStrategy` holding heap | 100,000 items | `SCRAPY_QUEUE_DELAY_MAX_HELD` (soft cap; round-14 R14-C) | Warn-once; non-positive disables |
 
 **Advanced opt-out:** pass `maxsize=None` to `MemoryMembershipFilter` (or set
 `SCRAPY_DEDUP_MEMORY_MAXSIZE=None`) for unbounded growth — only do this if
 you have an external memory budget; the unbounded default was the round-9
 finding (~366 MB @ 1M entries, ~3.58 GB @ 10M).
+
+## The operability-monitor knobs (round-12 U2)
+
+`ScrapyStatsMonitor` surfaces two operability gauges whose thresholds are
+now operator-tunable (round-14 R14-C — round-12 shipped the gauges with
+constructor defaults only; the settings now exist):
+
+| Setting | Default | Surface |
+|---|---|---|
+| `SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD` | `1000` | Depth above which `queue/backpressure` flips on |
+| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate` gauge |
+
+Both are threaded by `BackendScheduler.from_settings` → the resolved
+`ScrapyStatsMonitor` (and `pop_rate_window_s` is also forwarded to
+`BackendQueue`, which computes the rolling rate).
 
 ## Diagnose a stuck crawl (page on zero pop rate)
 

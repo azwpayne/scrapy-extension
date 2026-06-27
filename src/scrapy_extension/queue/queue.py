@@ -68,6 +68,7 @@ class BackendQueue:
     max_item_bytes: int = DEFAULT_QUEUE_MAX_ITEM_BYTES,
     monitor: Monitor | None = None,
     depth_sample_every: int = DEFAULT_DEPTH_SAMPLE_EVERY,
+    pop_rate_window_s: float = DEFAULT_POP_RATE_WINDOW_S,
   ) -> None:
     """Initialize the backend queue.
 
@@ -98,12 +99,19 @@ class BackendQueue:
             drain surfaces on the very next call and Scrapy idle detection
             stays correct — sampling only amortizes the RPC while the queue is
             observably non-empty (the active-crawl steady state).
+        pop_rate_window_s: U2 operability — rolling window (seconds) over
+            which the ``queue/pop_rate`` gauge is computed. Default
+            :data:`~scrapy_extension.monitor.base.DEFAULT_POP_RATE_WINDOW_S`
+            (60.0). Round-14 R14-C: threaded via
+            ``BackendScheduler.from_settings`` so the window is tunable
+            without code changes (round-12 U2 left it stuck at the default).
     """
     self.connection_manager = connection_manager
     self.queue_name = queue_name
     self._spider = spider
     self.max_item_bytes = max_item_bytes
     self.depth_sample_every = max(1, int(depth_sample_every))
+    self._pop_rate_window_s = pop_rate_window_s
     self._strategy: QueueStrategy = (
       queue_strategy
       if queue_strategy is not None
@@ -125,7 +133,7 @@ class BackendQueue:
     # is thread-safe for append/popleft at the CPython level (GIL-protected),
     # matching the existing single-thread-per-worker Scrapy engine model; the
     # scheduler drives pop serially per worker.
-    self._pop_rate_window_s: float = DEFAULT_POP_RATE_WINDOW_S
+    # ``_pop_rate_window_s`` is set from the constructor kwarg (R14-C thread).
     self._pop_timestamps: deque[float] = deque()
     # U2 pop-rate sampling counter — independent of ``_depth_probe_counter``
     # (which resets on every real probe, so it can't be reused to gate the

@@ -542,3 +542,76 @@ class TestSec4EndpointUrlSchemeGuard:
     assert settings.endpoint_url is None
 
 
+# =============================================================================
+# Round-14 R14-C: operability configurability (deferred settings-wiring)
+# =============================================================================
+
+
+class TestR14COperabilitySettings:
+  """R14-C: the U4/U5/U2 knobs the runbook promises are now real SCRAPY_* settings.
+
+  Round-9 (U4/U5) + round-12 (U2) shipped depth-sampling, max-item-bytes,
+  delay-max-held, backpressure-threshold, and the pop-rate window as
+  constructor defaults ONLY — ``BackendScheduler.from_settings`` never
+  threaded them, so they were stuck at defaults. R14-C adds the 5 settings
+  fields and threads them through. These tests pin the settings-layer half
+  of the contract (defaults + env-var loading); the threading half lives in
+  ``test_scheduler_settings_threading``.
+  """
+
+  def test_queue_depth_sample_every_default(self):
+    """Default ``depth_sample_every`` is 100 (U4 default)."""
+    settings = Settings()
+    assert settings.queue_depth_sample_every == 100
+
+  def test_queue_depth_sample_every_from_env(self, monkeypatch):
+    """Loads from SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY env var."""
+    monkeypatch.setenv("SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY", "5")
+    settings = Settings()
+    assert settings.queue_depth_sample_every == 5
+
+  def test_queue_max_item_bytes_default(self):
+    """Default ``queue_max_item_bytes`` is 1 MiB (matches Memcached ceiling)."""
+    settings = Settings()
+    assert settings.queue_max_item_bytes == 1_048_576
+
+  def test_queue_max_item_bytes_from_env(self, monkeypatch):
+    """Loads from SCRAPY_QUEUE_MAX_ITEM_BYTES env var."""
+    monkeypatch.setenv("SCRAPY_QUEUE_MAX_ITEM_BYTES", "2048")
+    settings = Settings()
+    assert settings.queue_max_item_bytes == 2048
+
+  def test_queue_delay_max_held_default(self):
+    """Default ``queue_delay_max_held`` is 100_000 (U5 default)."""
+    settings = Settings()
+    assert settings.queue_delay_max_held == 100_000
+
+  def test_queue_delay_max_held_from_env(self, monkeypatch):
+    """Loads from SCRAPY_QUEUE_DELAY_MAX_HELD env var."""
+    monkeypatch.setenv("SCRAPY_QUEUE_DELAY_MAX_HELD", "5000")
+    settings = Settings()
+    assert settings.queue_delay_max_held == 5000
+
+  def test_monitor_backpressure_threshold_default(self):
+    """Default ``monitor_backpressure_threshold`` is 1000 (U2 default)."""
+    settings = Settings()
+    assert settings.monitor_backpressure_threshold == 1000
+
+  def test_monitor_backpressure_threshold_from_env(self, monkeypatch):
+    """Loads from SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD env var."""
+    monkeypatch.setenv("SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD", "2500")
+    settings = Settings()
+    assert settings.monitor_backpressure_threshold == 2500
+
+  def test_monitor_pop_rate_window_s_default(self):
+    """Default ``monitor_pop_rate_window_s`` is 60.0 (U2 default)."""
+    settings = Settings()
+    assert settings.monitor_pop_rate_window_s == 60.0
+
+  def test_monitor_pop_rate_window_s_from_env(self, monkeypatch):
+    """Loads from SCRAPY_MONITOR_POP_RATE_WINDOW_S env var."""
+    monkeypatch.setenv("SCRAPY_MONITOR_POP_RATE_WINDOW_S", "30.0")
+    settings = Settings()
+    assert settings.monitor_pop_rate_window_s == 30.0
+
+

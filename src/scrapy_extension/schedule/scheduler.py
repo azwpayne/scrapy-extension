@@ -121,6 +121,10 @@ class BackendScheduler:
     *,
     backpressure_pause_at: int | None = None,
     backpressure_resume_at: int | None = None,
+    queue_depth_sample_every: int = 100,
+    queue_max_item_bytes: int = 1_048_576,
+    monitor_backpressure_threshold: int = 1_000,
+    monitor_pop_rate_window_s: float = 60.0,
   ) -> None:
     """Initialize the scheduler.
 
@@ -140,6 +144,19 @@ class BackendScheduler:
             to this value before popping resumes (hysteresis). When ``None``
             and ``backpressure_pause_at`` is set, defaults to ``pause_at``
             (single-threshold, no hysteresis).
+        queue_depth_sample_every: Round-14 R14-C — U4 depth-probe sampling
+            window forwarded to ``BackendQueue(depth_sample_every=…)`` in
+            ``open()``. Default ``100`` (U4 default).
+        queue_max_item_bytes: Round-14 R14-C — D2 per-item serialized-byte cap
+            forwarded to ``BackendQueue(max_item_bytes=…)`` in ``open()``.
+            Default 1 MiB (matches Memcached ceiling).
+        monitor_backpressure_threshold: Round-14 R14-C — U2 depth above which
+            ``queue/backpressure`` flips on. Forwarded to the resolved
+            ``ScrapyStatsMonitor`` in ``open()``. Default ``1_000`` (U2).
+        monitor_pop_rate_window_s: Round-14 R14-C — U2 trailing window
+            (seconds) for the ``queue/pop_rate`` gauge. Forwarded to both
+            ``BackendQueue(pop_rate_window_s=…)`` and the resolved monitor
+            in ``open()``. Default ``60.0`` (U2).
     """
     self.connection_manager = connection_manager
     self.queue_key = queue_key
@@ -160,6 +177,15 @@ class BackendScheduler:
     )
     # Per-spider paused state; reset on open(spider).
     self._backpressure_paused: bool = False
+    # R14-C operability knobs — carried from from_settings → open() so the
+    # BackendQueue / strategy / monitor constructors receive them. Pre-R14-C
+    # these were stuck at constructor defaults (the settings existed only in
+    # the runbook's "tune via settings" hand-wave). See ``open()`` for the
+    # threading site.
+    self._queue_depth_sample_every = queue_depth_sample_every
+    self._queue_max_item_bytes = queue_max_item_bytes
+    self._monitor_backpressure_threshold = monitor_backpressure_threshold
+    self._monitor_pop_rate_window_s = monitor_pop_rate_window_s
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendScheduler:
@@ -212,11 +238,21 @@ class BackendScheduler:
     strategy_type = QueueStrategyType(
       settings.get("SCRAPY_QUEUE_STRATEGY", QueueStrategyType.PASSTHROUGH.value)
     )
+    # R14-C: read the delay-strategy max_held knob (round-9 U5). Unset → None
+    # → build_queue_strategy falls back to the DelayQueueStrategy constructor
+    # default (100_000). Read via get(...) + int() to mirror the
+    # backpressure-threshold pattern (some Scrapy versions return 0 on unset
+    # via getint, colliding with a future 0-meaning config).
+    delay_max_held_raw = settings.get("SCRAPY_QUEUE_DELAY_MAX_HELD")
+    delay_max_held = (
+      int(delay_max_held_raw) if delay_max_held_raw not in (None, "") else None
+    )
     queue_strategy = build_queue_strategy(
       strategy_type,
       manager,
       default_delay=settings.getfloat("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
       min_interval=settings.getfloat("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
+      max_held=delay_max_held,
     )
     # Backpressure gate (round-4 BP-2). Read via settings.get(...) + int() —
     # NOT getint (some Scrapy versions return 0 on unset, which would collide
@@ -227,12 +263,77 @@ class BackendScheduler:
     resume_raw = settings.get("SCRAPY_BACKPRESSURE_RESUME_AT")
     pause_at = int(pause_raw) if pause_raw not in (None, "") else None
     resume_at = int(resume_raw) if resume_raw not in (None, "") else None
+    # R14-C operability knobs (round-9 U4 depth-sample + D2 max-item-bytes +
+    # round-12 U2 backpressure-threshold + pop-rate-window). Read via get(...)
+    # + int()/float() — same optional-with-default pattern as the BP knobs.
+    # These are non-optional in the constructor (they always have a default),
+    # so unset → falls through to the constructor default via the explicit
+    # default arg here.
+    depth_sample_every = int(
+      settings.get("SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY", 100)
+    )
+    queue_max_item_bytes = int(
+      settings.get("SCRAPY_QUEUE_MAX_ITEM_BYTES", 1_048_576)
+    )
+    monitor_backpressure_threshold = int(
+      settings.get("SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD", 1_000)
+    )
+    monitor_pop_rate_window_s = float(
+      settings.get("SCRAPY_MONITOR_POP_RATE_WINDOW_S", 60.0)
+    )
     return cls(
       connection_manager=manager,
       queue_key=settings.get("SCRAPY_QUEUE_KEY", "scheduler:queue"),
       queue_strategy=queue_strategy,
       backpressure_pause_at=pause_at,
       backpressure_resume_at=resume_at,
+      queue_depth_sample_every=depth_sample_every,
+      queue_max_item_bytes=queue_max_item_bytes,
+      monitor_backpressure_threshold=monitor_backpressure_threshold,
+      monitor_pop_rate_window_s=monitor_pop_rate_window_s,
+    )
+
+  @staticmethod
+  def _resolve_monitor_for_spider(
+    spider: Spider,
+    *,
+    backpressure_threshold: int,
+    pop_rate_window_s: float,
+  ) -> Any:
+    """Resolve a ScrapyStatsMonitor threaded with the R14-C U2 knobs.
+
+    Pre-R14-C the ``BackendQueue`` resolved its own monitor internally with
+    constructor defaults, so the operator-tuned ``SCRAPY_MONITOR_*`` settings
+    could never reach it. R14-C moves monitor resolution to the scheduler
+    (which holds the threaded values) and forwards the monitor into
+    ``BackendQueue`` explicitly, so the U2 ``backpressure_threshold`` +
+    ``pop_rate_window_s`` knobs take effect.
+
+    Falls back to ``NullMonitor`` when ``spider.crawler.stats`` is unreachable
+    (no spider, no crawler, or no stats — e.g. unit-test spiders), mirroring
+    ``BackendQueue._resolve_monitor``.
+
+    Args:
+        spider: The spider to resolve a stats collector from.
+        backpressure_threshold: Depth above which ``queue/backpressure``
+            flips on (forwarded to ``ScrapyStatsMonitor``).
+        pop_rate_window_s: Trailing window for ``queue/pop_rate`` (forwarded
+            to ``ScrapyStatsMonitor``).
+
+    Returns:
+        A ``ScrapyStatsMonitor`` if ``spider.crawler.stats`` is reachable,
+        else a ``NullMonitor``.
+    """
+    from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
+
+    crawler = getattr(spider, "crawler", None)
+    stats = getattr(crawler, "stats", None) if crawler is not None else None
+    if stats is None:
+      return NullMonitor()
+    return ScrapyStatsMonitor(
+      stats,
+      backpressure_threshold=backpressure_threshold,
+      pop_rate_window_s=pop_rate_window_s,
     )
 
   @staticmethod
@@ -340,11 +441,26 @@ class BackendScheduler:
     # matches the dupefilter path's .replace() substitution.
     if "{spider}" in self.queue_key:
       self.queue_key = self.queue_key.replace("{spider}", spider.name)
+    # R14-C: resolve the monitor FIRST so it can be threaded into BackendQueue
+    # with the operator-tuned backpressure_threshold + pop_rate_window_s.
+    # Pre-R14-C the BackendQueue resolved its own monitor internally (default
+    # ScrapyStatsMonitor with constructor defaults) — but that path could not
+    # see the SCRAPY_MONITOR_* settings, so the U2 knobs were stuck at
+    # defaults. Resolving here + passing explicitly closes the loop.
+    monitor = BackendScheduler._resolve_monitor_for_spider(
+      spider,
+      backpressure_threshold=self._monitor_backpressure_threshold,
+      pop_rate_window_s=self._monitor_pop_rate_window_s,
+    )
     self._queue = BackendQueue(
       connection_manager=self.connection_manager,
       queue_name=self.queue_key,
       spider=spider,
       queue_strategy=self._queue_strategy,
+      max_item_bytes=self._queue_max_item_bytes,
+      monitor=monitor,
+      depth_sample_every=self._queue_depth_sample_every,
+      pop_rate_window_s=self._monitor_pop_rate_window_s,
     )
     self._connect_ack_signals(spider)
     # Reset backpressure gate for a clean per-spider start (round-4 BP-2).

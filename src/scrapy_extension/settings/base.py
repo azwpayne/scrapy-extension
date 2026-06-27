@@ -135,7 +135,9 @@ class Settings(BaseSettings):
       "Maximum serialized bytes allowed for a single queued request. "
       "Requests exceeding this are rejected with SerializationError at push "
       "time (preventing silent drops by capped storage backends). Default "
-      "1 MiB matches the Memcached 1 MB ceiling."
+      "1 MiB matches the Memcached 1 MB ceiling. Round-14 R14-C: this field "
+      "is now read by ``BackendScheduler.from_settings`` (round-9 D2 left "
+      "it orphaned — the constructor default was the only path)."
     ),
   )
   pipeline_max_item_bytes: int = Field(
@@ -217,6 +219,53 @@ class Settings(BaseSettings):
       "time (no hysteresis). Must be ``<= pause_at`` when both are set, "
       "else ``ConfigurationError`` (otherwise the resume condition would "
       "never be reachable)."
+    ),
+  )
+  queue_depth_sample_every: int = Field(
+    default=100,
+    ge=1,
+    description=(
+      "Round-14 R14-C: depth-probe sampling window for ``BackendQueue`` "
+      "(round-9 U4). The pop-path depth RPC (e.g. ZCARD) fires at most once "
+      "per ``N`` pops while the cached depth is non-zero, reclaiming ~25% "
+      "of pop-path RTT. ``100`` (default) keeps depth-signal variance ~1%; "
+      "``1`` restores per-pop probing (pre-U4 behavior). Emptiness is always "
+      "fresh — sampling only amortizes the RPC while the queue is observably "
+      "non-empty. Threaded by ``BackendScheduler.from_settings``."
+    ),
+  )
+  queue_delay_max_held: int = Field(
+    default=100_000,
+    description=(
+      "Round-14 R14-C: soft cap on the ``DelayQueueStrategy`` in-process "
+      "holding heap (round-9 U5 — OOM prevention). When the heap exceeds "
+      "this size a one-time WARNING fires (warn-only — items are NEVER "
+      "refused, since dropping a delayed item would silently lose data). "
+      "Default ``100_000``. Pass ``<= 0`` to disable the warning (advanced "
+      "opt-out — accepts the unbounded-growth risk). Threaded by "
+      "``BackendScheduler.from_settings`` → ``build_queue_strategy(max_held=…)``."
+    ),
+  )
+  monitor_backpressure_threshold: int = Field(
+    default=1_000,
+    ge=0,
+    description=(
+      "Round-14 R14-C: depth above which ``queue/backpressure`` flips on "
+      "(round-12 U2 operability). The default ``1_000`` makes the "
+      "backpressure signal default-on without throttling (action is a later "
+      "tier). Threaded by ``BackendScheduler.from_settings`` → "
+      "``ScrapyStatsMonitor(backpressure_threshold=…)``."
+    ),
+  )
+  monitor_pop_rate_window_s: float = Field(
+    default=60.0,
+    gt=0,
+    description=(
+      "Round-14 R14-C: rolling window (seconds) over which ``queue/pop_rate`` "
+      "is computed (round-12 U2 operability). Default ``60.0`` matches the "
+      "architect's 'calls/sec over a 1m window' contract. Threaded by "
+      "``BackendScheduler.from_settings`` → ``BackendQueue(pop_rate_window_s=…)`` "
+      "+ ``ScrapyStatsMonitor(pop_rate_window_s=…)``."
     ),
   )
 

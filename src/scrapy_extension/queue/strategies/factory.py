@@ -48,6 +48,7 @@ def build_queue_strategy(
   *,
   default_delay: float = 0.0,
   min_interval: float = 0.0,
+  max_held: int | None = None,
 ) -> QueueStrategy:
   """Build the queue strategy for ``strategy_type``.
 
@@ -55,6 +56,13 @@ def build_queue_strategy(
       strategy_type: Which queue strategy to instantiate.
       connection_manager: Connection manager for backend access.
       default_delay: Default delay seconds for the ``delay`` strategy.
+      min_interval: Min seconds between pops for the ``throttle`` strategy.
+      max_held: Round-14 R14-C — soft cap on the ``delay`` strategy's
+          in-process holding heap (round-9 U5). When ``None`` (default) the
+          ``DelayQueueStrategy`` constructor default applies (``100_000``);
+          otherwise the value is forwarded verbatim. Ignored for non-delay
+          strategies. Non-positive disables the over-cap warning (advanced
+          opt-out — accepts unbounded-growth risk).
 
   Returns:
       A concrete QueueStrategy instance.
@@ -65,7 +73,13 @@ def build_queue_strategy(
   if strategy_type is QueueStrategyType.PASSTHROUGH:
     return PassthroughQueueStrategy(connection_manager)
   if strategy_type is QueueStrategyType.DELAY:
-    return DelayQueueStrategy(connection_manager, default_delay=default_delay)
+    if max_held is None:
+      return DelayQueueStrategy(connection_manager, default_delay=default_delay)
+    return DelayQueueStrategy(
+      connection_manager,
+      default_delay=default_delay,
+      max_held=max_held,
+    )
   if strategy_type is QueueStrategyType.ROUND_ROBIN:
     return RoundRobinQueueStrategy(connection_manager)
   if strategy_type is QueueStrategyType.THROTTLE:

@@ -57,6 +57,7 @@ class ScrapyStatsMonitor(Monitor):
     stats: StatsCollector,
     *,
     backpressure_threshold: int = DEFAULT_BACKPRESSURE_THRESHOLD,
+    pop_rate_window_s: float = DEFAULT_POP_RATE_WINDOW_S,
   ) -> None:
     """Initialize the monitor.
 
@@ -64,9 +65,15 @@ class ScrapyStatsMonitor(Monitor):
         stats: Scrapy StatsCollector (e.g. ``crawler.stats``).
         backpressure_threshold: Depth above which ``queue/backpressure``
             is set. See :data:`DEFAULT_BACKPRESSURE_THRESHOLD`.
+        pop_rate_window_s: Trailing window (seconds) the ``queue/pop_rate``
+            gauge is computed over. See :data:`DEFAULT_POP_RATE_WINDOW_S`.
+            Round-14 R14-C: threaded via ``BackendScheduler.from_settings``
+            so operators can tune the window without code changes (round-12
+            U2 left it stuck at the constructor default).
     """
     self._stats = stats
     self.backpressure_threshold = backpressure_threshold
+    self.pop_rate_window_s = pop_rate_window_s
 
   def on_push(self, queue_name: str, priority: float) -> None:
     """Increment ``queue/push_count``."""

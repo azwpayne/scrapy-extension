@@ -545,12 +545,15 @@ class TestBackendScheduler:
 
     scheduler.open(spider)
 
-    queue_ctor.assert_called_once_with(
-      connection_manager=mock_connection_manager,
-      queue_name="configured:queue",
-      spider=spider,
-      queue_strategy=ANY,
-    )
+    # R14-C: ``open()`` now threads 4 more kwargs into BackendQueue
+    # (max_item_bytes, monitor, depth_sample_every, pop_rate_window_s).
+    # Assert the queue_name intent of THIS test without pinning the full
+    # call — the threading contract is pinned in test_scheduler_settings_threading.
+    assert queue_ctor.call_count == 1
+    _, kwargs = queue_ctor.call_args
+    assert kwargs["connection_manager"] is mock_connection_manager
+    assert kwargs["queue_name"] == "configured:queue"
+    assert kwargs["spider"] is spider
 
   def test_close_calls_connection_manager_close(self, mock_connection_manager, mock_spider):
     """Test close shuts down the connection manager."""
