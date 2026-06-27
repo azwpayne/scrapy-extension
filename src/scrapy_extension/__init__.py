@@ -122,6 +122,64 @@ _BACKEND_EXTRAS: dict[str, str] = {
     "SqsSettings": "sqs",
 }
 
+# Backend module path -> the set of top-level optional-dep module names that
+# backend declares at module level. Used by __getattr__ to decide whether an
+# ImportError is "genuine missing optional dep" (→ wrap as the install hint)
+# vs. a real bug inside the backend module (→ re-raise the original so the
+# user sees the real traceback). R14-H.
+#
+# Settings modules pull no optional dep at module level, so only backend
+# module paths are listed; a settings-class path that fails for a non-dep
+# reason correctly falls through to "re-raise original".
+_OPTIONAL_DEP_MODULES: dict[str, frozenset[str]] = {
+    "scrapy_extension.backends.dynamodb": frozenset({"boto3"}),
+    "scrapy_extension.backends.elasticsearch": frozenset({"elasticsearch"}),
+    "scrapy_extension.backends.kafka": frozenset({"kafka"}),
+    "scrapy_extension.backends.memcached": frozenset({"pymemcache"}),
+    "scrapy_extension.backends.mongodb": frozenset({"pymongo"}),
+    "scrapy_extension.backends.pulsar": frozenset({"pulsar"}),
+    "scrapy_extension.backends.rabbitmq": frozenset({"pika"}),
+    "scrapy_extension.backends.redis": frozenset({"redis"}),
+    # RocketMQ imports its dep inside connect(), not at module level, so a
+    # module-level ImportError there is never a "missing dep" signal.
+    "scrapy_extension.backends.rocketmq": frozenset(),
+    "scrapy_extension.backends.sqs": frozenset({"boto3"}),
+}
+
+
+def _is_missing_optional_dep(exc: ImportError, module_path: str) -> bool:
+    """Decide whether an ``ImportError`` from ``module_path`` is a genuine
+    missing-optional-dep signal (→ wrap as the install hint) or a real bug
+    inside the backend module (→ re-raise to surface the real chain).
+
+    R14-H. Rule:
+
+    * The error must be a ``ModuleNotFoundError`` (the CPython subclass set
+      when the failure is "no module named X").
+    * Its ``name`` attribute (the missing top-level module) must be one of
+      the documented optional-dep modules for this backend (looked up in
+      ``_OPTIONAL_DEP_MODULES``); the import may also be a submodule
+      ``"<dep>.foo"`` of one of those names.
+
+    Any other ``ImportError`` — including a non-ModuleNotFoundError raised
+    mid-import by the backend module's own code, or a ModuleNotFoundError
+    whose ``name`` is *not* the backend's optional dep (e.g. the backend
+    imports some third-party helper that itself went missing) — is treated
+    as a real bug and surfaced as-is.
+    """
+    if not isinstance(exc, ModuleNotFoundError):
+        return False
+    missing_name = getattr(exc, "name", None)
+    if not missing_name:
+        return False
+    dep_modules = _OPTIONAL_DEP_MODULES.get(module_path, frozenset())
+    if not dep_modules:
+        return False
+    return (
+        missing_name in dep_modules
+        or missing_name.split(".", 1)[0] in dep_modules
+    )
+
 
 def __getattr__(name: str) -> object:
     """Lazily import optional backend classes and settings (PEP 562).
@@ -136,11 +194,21 @@ def __getattr__(name: str) -> object:
             module = importlib.import_module(module_path)
             return getattr(module, attr_name)
         except ImportError as e:
-            extra = _BACKEND_EXTRAS.get(name, name)
-            raise ImportError(
-                f"{name} requires additional dependencies. "
-                f"Install with: pip install scrapy-extension[{extra}]"
-            ) from e
+            # R14-H: only re-wrap as the install hint when this is a *genuine*
+            # missing optional dep. A bare ``except ImportError`` would mask a
+            # real bug inside the backend module (whose dep IS installed) as
+            # "install scrapy-extension[X]", hiding the actual traceback.
+            # ``ModuleNotFoundError.name`` is set by CPython precisely when the
+            # failure is "no module named X"; we check it against this
+            # backend's documented optional-dep module set.
+            if _is_missing_optional_dep(e, module_path):
+                extra = _BACKEND_EXTRAS.get(name, name)
+                raise ImportError(
+                    f"{name} requires additional dependencies. "
+                    f"Install with: pip install scrapy-extension[{extra}]"
+                ) from e
+            # Real bug (or a non-dep ImportError) — surface the original chain.
+            raise
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

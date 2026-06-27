@@ -112,12 +112,11 @@ class RocketMQBackend(Backend, QueueBackend):
       logger.debug(
         "Connected to RocketMQ at %s", self.config.namesrv_address
       )
-    except OSError as e:
-      # Network-level connection failures
-      msg = f"Failed to connect to RocketMQ: {e}"
-      raise BackendConnectionError(msg, backend_type="rocketmq") from e
     except Exception as e:
-      # Unexpected errors during producer/consumer initialization
+      # Connection / producer / consumer init failures (network-level
+      # ``OSError`` included). R14-H: dropped the redundant ``except OSError``
+      # arm — its message was identical to this one and ``Exception`` already
+      # covers it.
       msg = f"Failed to connect to RocketMQ: {e}"
       raise BackendConnectionError(msg, backend_type="rocketmq") from e
 
@@ -225,12 +224,10 @@ class RocketMQBackend(Backend, QueueBackend):
         error = "RocketMQBackend not connected: producer is None"
         raise QueueError(error)
       self._producer.send(msg)
-    except OSError as e:
-      # Network-level send failures
-      msg = f"Failed to push to queue: {e}"
-      raise QueueError(msg) from e
     except Exception as e:
-      # Unexpected errors during message send
+      # Send failures (network-level ``OSError`` included). R14-H: dropped the
+      # redundant ``except OSError`` arm — its message was identical and
+      # ``Exception`` already covers it.
       msg = f"Failed to push to queue: {e}"
       raise QueueError(msg) from e
 
@@ -263,12 +260,10 @@ class RocketMQBackend(Backend, QueueBackend):
       msg = messages[0]
       self._consumer.ack(msg)
       return msg.body
-    except OSError as e:
-      # Network-level receive failures
-      msg = f"Failed to pop from queue: {e}"
-      raise QueueError(msg) from e
     except Exception as e:
-      # Unexpected errors during message receive
+      # Receive failures (network-level ``OSError`` included). R14-H: dropped
+      # the redundant ``except OSError`` arm — its message was identical and
+      # ``Exception`` already covers it.
       msg = f"Failed to pop from queue: {e}"
       raise QueueError(msg) from e
 
