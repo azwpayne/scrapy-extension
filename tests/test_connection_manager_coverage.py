@@ -222,3 +222,47 @@ def test_T4_attempt_connection_disconnects_half_built_backend_on_failure():
     m._attempt_connection()
   assert fake.disconnect_calls == 1
   assert m._backend is None
+
+
+def test_T6_evict_warns_once_when_all_entries_live(monkeypatch, caplog):
+  """T6: registry at cap with ALL entries _users>0 -> one-shot warning, no force-evict."""
+  import logging
+
+  ConnectionManager.clear_registry()
+  monkeypatch.setattr(ConnectionManager, "MAX_MANAGERS", 2)
+  ConnectionManager.get_manager("redis", {"k": 1})  # live
+  ConnectionManager.get_manager("redis", {"k": 2})  # live
+  assert len(ConnectionManager._managers) == 2
+  with caplog.at_level(
+    logging.WARNING, logger="scrapy_extension.backends.connectors"
+  ):
+    ConnectionManager.get_manager("redis", {"k": 3})  # over cap, all live
+  assert ConnectionManager._over_cap_warned is True
+  assert any("actively held" in r.message for r in caplog.records)
+
+
+def test_T7_close_last_holder_disconnects_and_evicts():
+  """T7: last holder's close() disconnects the backend + pops the registry entry."""
+  fake = FakeBackend()
+  m = ConnectionManager.get_manager("redis", {"k": 7})
+  m._backend = fake
+  key = ConnectionManager._registry_key(m.backend_type, m.settings)
+  assert key in ConnectionManager._managers
+  m.close()  # _users 1 -> 0 -> last holder
+  assert fake.disconnect_calls == 1
+  assert key not in ConnectionManager._managers
+
+
+def test_T8_close_non_last_holder_is_noop_on_backend():
+  """T8: non-last holder's close() does NOT disconnect; entry stays for the remaining holder."""
+  fake = FakeBackend()
+  a = ConnectionManager.get_manager("redis", {"k": 8})  # _users=1
+  b = ConnectionManager.get_manager("redis", {"k": 8})  # same key -> _users=2, same mgr
+  assert a is b
+  a._backend = fake
+  a.close()  # _users 2 -> 1, not last
+  assert fake.disconnect_calls == 0
+  key = ConnectionManager._registry_key(a.backend_type, a.settings)
+  assert key in ConnectionManager._managers
+  b.close()  # last -> disconnect + evict
+  assert fake.disconnect_calls == 1
