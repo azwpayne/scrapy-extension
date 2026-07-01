@@ -9,6 +9,7 @@ See docs/superpowers/specs/2026-07-01-connection-manager-suite-lock-fix-design.m
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -266,3 +267,62 @@ def test_T8_close_non_last_holder_is_noop_on_backend():
   assert key in ConnectionManager._managers
   b.close()  # last -> disconnect + evict
   assert fake.disconnect_calls == 1
+
+
+def test_T9_backend_property_single_connect_owner_among_peers():
+  """T9: N threads racing on .backend -> exactly ONE connect(); all see the same backend."""
+  connect_block = threading.Event()
+  fake = FakeBackend(connect_block=connect_block)
+  m = ConnectionManager("redis", {"k": 9})
+  m._create_backend = lambda: fake  # type: ignore[method-assign]
+
+  barrier = threading.Barrier(4)
+  results: list[object] = []
+  results_lock = threading.Lock()
+
+  def worker():
+    barrier.wait(timeout=5)
+    b = m.backend
+    with results_lock:
+      results.append(b)
+
+  threads = [threading.Thread(target=worker) for _ in range(4)]
+  for t in threads:
+    t.start()
+  # Wait until the owner entered connect() and is blocked; peers wait on _connected_event.
+  deadline = time.monotonic() + 5
+  while fake.connect_calls < 1 and time.monotonic() < deadline:
+    time.sleep(0.01)
+  assert fake.connect_calls == 1, "owner did not take the connect slow path"
+  connect_block.set()  # release owner -> all peers unblock
+  for t in threads:
+    t.join(timeout=5)
+  assert len(results) == 4
+  assert all(r is fake for r in results)
+
+
+def test_T10_backend_property_owner_error_propagates_to_all_waiters():
+  """T10: owner's connect() raises -> all peer waiters re-raise; _connecting reset."""
+  fake = FakeBackend(connect_failures=99)
+  m = ConnectionManager("redis", {"k": 10, "retry_attempts": 1, "retry_delay": 0.0})
+  m._create_backend = lambda: fake  # type: ignore[method-assign]
+
+  barrier = threading.Barrier(3)
+  errors: list[BaseException] = []
+  errors_lock = threading.Lock()
+
+  def worker():
+    barrier.wait(timeout=5)
+    try:
+      m.backend
+    except BaseException as e:  # noqa: BLE001
+      with errors_lock:
+        errors.append(e)
+
+  threads = [threading.Thread(target=worker) for _ in range(3)]
+  for t in threads:
+    t.start()
+  for t in threads:
+    t.join(timeout=5)
+  assert len(errors) == 3  # every waiter re-raised
+  assert m._connecting is False  # owner cleared the flag
