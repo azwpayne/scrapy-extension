@@ -375,7 +375,7 @@ def test_T10_backend_property_owner_error_propagates_to_all_waiters():
   def worker():
     barrier.wait(timeout=5)
     try:
-      m.backend
+      _ = m.backend  # property access triggers connect (raises); assign silences ruff B018
     except BaseException as e:  # noqa: BLE001
       with errors_lock:
         errors.append(e)
@@ -432,3 +432,11 @@ def test_T14_breaker_disabled_returns_raw_backend_byte_identical(monkeypatch):
   assert m.get_queue_backend() is m._backend
   assert m.get_set_backend() is m._backend
   assert m.get_storage_backend() is m._backend
+
+
+def test_load_object_invalid_path_raises_value_error():
+  """Cover the empty-dotted-path guard in _load_object (connectors.py)."""
+  from scrapy_extension.backends.connectors import _load_object
+
+  with pytest.raises(ValueError, match="Invalid dotted path"):
+    _load_object("no_separator")
