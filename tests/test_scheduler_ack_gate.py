@@ -183,6 +183,30 @@ class TestAckCapabilityGate:
     scheduler = BackendScheduler.from_settings(settings)  # must not raise
     assert scheduler.queue_key == "scheduler:queue"
 
+  def test_G11_synthetic_single_slot_with_concurrency_1_skips_gate(self, mocker) -> None:
+    """G11: single-slot stub + CONCURRENT_REQUESTS=1 → early return, no raise.
+
+    This is the ONLY combination reaching the ``if concurrent <= 1: return``
+    arm (line 368-370): every real backend sets ``supports_concurrent_ack=True``
+    (round-3 hardening) so they return at line 367 before the concurrency
+    check. The synthetic stub (requires_ack=True, supports_concurrent_ack=False)
+    + concurrent=1 reaches and exercises the early-return arm.
+    """
+
+    class _SingleSlotStub:
+      requires_ack = True
+      supports_concurrent_ack = False
+
+    mocker.patch(
+      "scrapy_extension.backends.connectors._load_object",
+      return_value=_SingleSlotStub,
+    )
+    settings = _make_settings("sqs", concurrent=1)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+
+    scheduler = BackendScheduler.from_settings(settings)  # must not raise
+    assert scheduler.queue_key == "scheduler:queue"
+
 
 class TestAckCapabilityDefaults:
   """A1: capability contract defaults on the QueueBackend ABC."""
