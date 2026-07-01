@@ -223,6 +223,12 @@ def test_evict_disconnects_victim_OUTSIDE_registry_lock(monkeypatch):
   ta.join(timeout=5)
   tb.join(timeout=5)
   assert peer_a_done.is_set()
+  # Victim was actually disconnected + evicted — covers the eviction path's
+  # correctness, not just its concurrency behavior. [Sourcery review feedback]
+  assert slow.disconnect_calls == 1
+  assert not slow.is_connected()
+  m1_key = ConnectionManager._registry_key("redis", {"k": 1})
+  assert m1_key not in ConnectionManager._managers
 
 
 def _manager_with_backend(fake: FakeBackend) -> ConnectionManager:
@@ -402,7 +408,9 @@ def test_T11_get_queue_backend_wraps_when_breaker_enabled(monkeypatch):
   m = ConnectionManager("redis", {"k": 11})
   m._backend = FakeFullBackend()
   m._breaker_configured = False  # force re-resolution with env on
-  assert m.get_queue_backend() is not m._backend
+  wrapped = m.get_queue_backend()
+  assert wrapped is not m._backend
+  assert m._breaker_configured is True  # wrapping actually fired [Sourcery]
 
 
 def test_T12_get_set_backend_wraps_when_breaker_enabled(monkeypatch):
@@ -411,7 +419,9 @@ def test_T12_get_set_backend_wraps_when_breaker_enabled(monkeypatch):
   m = ConnectionManager("redis", {"k": 12})
   m._backend = FakeFullBackend()
   m._breaker_configured = False
-  assert m.get_set_backend() is not m._backend
+  wrapped = m.get_set_backend()
+  assert wrapped is not m._backend
+  assert m._breaker_configured is True  # wrapping actually fired [Sourcery]
 
 
 def test_T13_get_storage_backend_wraps_when_breaker_enabled(monkeypatch):
@@ -420,7 +430,9 @@ def test_T13_get_storage_backend_wraps_when_breaker_enabled(monkeypatch):
   m = ConnectionManager("redis", {"k": 13})
   m._backend = FakeFullBackend()
   m._breaker_configured = False
-  assert m.get_storage_backend() is not m._backend
+  wrapped = m.get_storage_backend()
+  assert wrapped is not m._backend
+  assert m._breaker_configured is True  # wrapping actually fired [Sourcery]
 
 
 def test_T14_breaker_disabled_returns_raw_backend_byte_identical(monkeypatch):

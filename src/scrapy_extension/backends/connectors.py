@@ -375,17 +375,14 @@ class ConnectionManager:
         cls._managers.move_to_end(key)
       manager._users += 1
 
-    # Disconnect evicted victims OUTSIDE _registry_lock. Victims are already
-    # popped (peers can't see them) and have _users <= 0 (no outstanding
-    # acquire) — same invariant close() relies on (L587-615). Disconnecting
-    # here rather than under the lock avoids serializing every get_manager()
-    # on the slowest backend disconnect during overflow.
+    # Disconnect evicted victims OUTSIDE _registry_lock via the shared
+    # teardown primitive. Victims are already popped (peers can't see them)
+    # and have _users <= 0 (no outstanding acquire) — same invariant close()
+    # relies on (L587-615). Disconnecting here rather than under the lock
+    # avoids serializing every get_manager() on the slowest backend
+    # disconnect during overflow.
     for victim in victims:
-      with victim._lock:
-        if victim._backend is not None:
-          with contextlib.suppress(Exception):
-            victim._backend.disconnect()
-          victim._backend = None
+      cls._disconnect_backend_safely(victim)
 
     return manager
 
@@ -439,6 +436,21 @@ class ConnectionManager:
         return victims
       victims.append(cls._managers.pop(orphan_key))
     return victims
+
+  @staticmethod
+  def _disconnect_backend_safely(manager: ConnectionManager) -> None:
+    """Disconnect ``manager._backend`` under its lock, suppressing errors.
+
+    Shared teardown primitive for evicted victims (:meth:`get_manager`) and
+    force-teardown (:meth:`clear_registry`). :meth:`close` does NOT use this
+    — it logs disconnect errors and emits ``on_disconnect`` / breaker-reset
+    hooks that ``suppress()`` would skip, so its teardown stays inline.
+    """
+    with manager._lock:
+      if manager._backend is not None:
+        with contextlib.suppress(Exception):
+          manager._backend.disconnect()
+        manager._backend = None
 
   @staticmethod
   def _registry_key(
@@ -663,12 +675,9 @@ class ConnectionManager:
       # permanently suppressed after the first overflow across tests).
       cls._over_cap_warned = False
     for manager in managers:
+      cls._disconnect_backend_safely(manager)
+      # Reset any breaker state too (mirrors close()).
       with manager._lock:
-        if manager._backend:
-          with contextlib.suppress(Exception):
-            manager._backend.disconnect()
-          manager._backend = None
-        # Reset any breaker state too (mirrors close()).
         if manager._breaker is not None:
           manager._breaker.reset()
 
