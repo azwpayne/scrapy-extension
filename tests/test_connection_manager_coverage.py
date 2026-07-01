@@ -13,7 +13,12 @@ import time
 
 import pytest
 
-from scrapy_extension.backends.base import Backend
+from scrapy_extension.backends.base import (
+  Backend,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
+)
 from scrapy_extension.backends.connectors import ConnectionManager
 
 
@@ -63,6 +68,62 @@ class FakeBackend(Backend):
 
   def ping(self) -> bool:
     return self._connected
+
+
+class FakeFullBackend(FakeBackend, QueueBackend, SetBackend, StorageBackend):
+  """FakeBackend that satisfies all three interface isinstance checks.
+
+  Interface methods are stubs returning defaults — the breaker-wiring tests
+  only exercise isinstance() gating + wrap_*_backend dispatch, never the ops.
+  """
+
+  # --- QueueBackend ---
+  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    return None
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    return None
+
+  def queue_len(self, queue_name: str) -> int:
+    return 0
+
+  def clear_queue(self, queue_name: str) -> None:
+    return None
+
+  # --- SetBackend ---
+  def add(self, set_name: str, item: bytes) -> bool:
+    return False
+
+  def remove(self, set_name: str, item: bytes) -> bool:
+    return False
+
+  def contains(self, set_name: str, item: bytes) -> bool:
+    return False
+
+  def set_len(self, set_name: str) -> int:
+    return 0
+
+  def clear_set(self, set_name: str) -> None:
+    return None
+
+  # --- StorageBackend ---
+  def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
+    return None
+
+  def retrieve(self, key: str) -> bytes | None:
+    return None
+
+  def delete(self, key: str) -> bool:
+    return False
+
+  def exists(self, key: str) -> bool:
+    return False
+
+  def ttl(self, key: str) -> int | None:
+    return None
+
+  def clear_storage(self, prefix: str | None = None) -> None:
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -326,3 +387,48 @@ def test_T10_backend_property_owner_error_propagates_to_all_waiters():
     t.join(timeout=5)
   assert len(errors) == 3  # every waiter re-raised
   assert m._connecting is False  # owner cleared the flag
+
+
+def _enable_breaker(monkeypatch):
+  """Flip the breaker ON via env (lazy Settings() in _get_breaker reads it)."""
+  monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+  monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3")
+  monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT", "30")
+
+
+def test_T11_get_queue_backend_wraps_when_breaker_enabled(monkeypatch):
+  """T11: breaker ON -> get_queue_backend returns a wrapped proxy, not the raw backend."""
+  _enable_breaker(monkeypatch)
+  m = ConnectionManager("redis", {"k": 11})
+  m._backend = FakeFullBackend()
+  m._breaker_configured = False  # force re-resolution with env on
+  assert m.get_queue_backend() is not m._backend
+
+
+def test_T12_get_set_backend_wraps_when_breaker_enabled(monkeypatch):
+  """T12: breaker ON -> get_set_backend returns a wrapped proxy."""
+  _enable_breaker(monkeypatch)
+  m = ConnectionManager("redis", {"k": 12})
+  m._backend = FakeFullBackend()
+  m._breaker_configured = False
+  assert m.get_set_backend() is not m._backend
+
+
+def test_T13_get_storage_backend_wraps_when_breaker_enabled(monkeypatch):
+  """T13: breaker ON -> get_storage_backend returns a wrapped proxy."""
+  _enable_breaker(monkeypatch)
+  m = ConnectionManager("redis", {"k": 13})
+  m._backend = FakeFullBackend()
+  m._breaker_configured = False
+  assert m.get_storage_backend() is not m._backend
+
+
+def test_T14_breaker_disabled_returns_raw_backend_byte_identical(monkeypatch):
+  """T14: breaker OFF (default) -> the raw backend is returned unchanged."""
+  monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+  m = ConnectionManager("redis", {"k": 14})
+  m._backend = FakeFullBackend()
+  m._breaker_configured = False
+  assert m.get_queue_backend() is m._backend
+  assert m.get_set_backend() is m._backend
+  assert m.get_storage_backend() is m._backend
