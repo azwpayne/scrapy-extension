@@ -101,3 +101,63 @@ def test_harness_smoke():
   assert not b.is_connected()
   assert b.connect_calls == 2
   assert b.disconnect_calls == 1
+
+
+def test_evict_disconnects_victim_OUTSIDE_registry_lock(monkeypatch):
+  """T5 REGRESSION: a slow victim disconnect must NOT serialize get_manager().
+
+  Pre-fix: _evict_orphans_under_lock disconnected under _registry_lock, so a
+  second get_manager() on a different key blocked on the slow disconnect.
+  Post-fix: disconnect happens after the registry lock is released.
+  """
+  ConnectionManager.clear_registry()
+  monkeypatch.setattr(ConnectionManager, "MAX_MANAGERS", 2)
+
+  disconnect_entered = threading.Event()
+  disconnect_release = threading.Event()
+
+  # Fill registry to cap (MAX_MANAGERS=2): two live managers.
+  m1 = ConnectionManager.get_manager("redis", {"k": 1})
+  ConnectionManager.get_manager("redis", {"k": 2})
+  assert len(ConnectionManager._managers) == 2
+
+  # Orphan m1 in-registry (simulate the state eviction defends): connect a
+  # slow backend, then drop its refcount to 0 WITHOUT popping it.
+  slow = FakeBackend(
+    disconnect_entered=disconnect_entered,
+    disconnect_block=disconnect_release,
+  )
+  m1._backend = slow
+  with ConnectionManager._registry_lock:
+    m1._users = 0
+
+  # Peer A: get_manager on a 3rd distinct key triggers eviction of orphan m1.
+  peer_a_done = threading.Event()
+
+  def peer_a():
+    ConnectionManager.get_manager("redis", {"k": 3})
+    peer_a_done.set()
+
+  ta = threading.Thread(target=peer_a)
+  ta.start()
+  # Eviction reached the slow disconnect:
+  assert disconnect_entered.wait(timeout=5), "orphan was not evicted/disconnected"
+
+  # Peer B: a 4th distinct key must NOT block on m1's slow disconnect.
+  peer_b_done = threading.Event()
+
+  def peer_b():
+    ConnectionManager.get_manager("redis", {"k": 4})
+    peer_b_done.set()
+
+  tb = threading.Thread(target=peer_b)
+  tb.start()
+  assert peer_b_done.wait(timeout=2), (
+    "get_manager serialized behind a slow disconnect — registry lock NOT released"
+  )
+
+  # Tear down: release the slow disconnect, join threads.
+  disconnect_release.set()
+  ta.join(timeout=5)
+  tb.join(timeout=5)
+  assert peer_a_done.is_set()

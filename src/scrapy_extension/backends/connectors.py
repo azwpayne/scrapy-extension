@@ -352,6 +352,7 @@ class ConnectionManager:
     normalized_settings = settings or {}
     key = cls._registry_key(backend_type, normalized_settings)
 
+    victims: list[ConnectionManager] = []
     with cls._registry_lock:
       manager = cls._managers.get(key)
       if manager is None:
@@ -362,36 +363,58 @@ class ConnectionManager:
         # releases). If every entry is actively held we stop evicting and
         # log a one-shot warning rather than tear down a live connection
         # (a real leak, but not one ``get_manager`` should fix by force).
-        cls._evict_orphans_under_lock()
+        #
+        # Victims are collected (popped) UNDER the lock but disconnected
+        # AFTER release (see the loop below) so a slow victim disconnect
+        # does not serialize peer get_manager() calls.
+        victims = cls._collect_orphans_under_lock()
         manager = cls(backend_type, normalized_settings)
         cls._managers[key] = manager
       else:
         # LRU touch — recently-used entries move to the back (newest).
         cls._managers.move_to_end(key)
       manager._users += 1
-      return manager
+
+    # Disconnect evicted victims OUTSIDE _registry_lock. Victims are already
+    # popped (peers can't see them) and have _users <= 0 (no outstanding
+    # acquire) — same invariant close() relies on (L587-615). Disconnecting
+    # here rather than under the lock avoids serializing every get_manager()
+    # on the slowest backend disconnect during overflow.
+    for victim in victims:
+      with victim._lock:
+        if victim._backend is not None:
+          with contextlib.suppress(Exception):
+            victim._backend.disconnect()
+          victim._backend = None
+
+    return manager
 
   @classmethod
-  def _evict_orphans_under_lock(cls) -> None:
-    """Evict orphaned managers from the front of the LRU until under cap.
+  def _collect_orphans_under_lock(cls) -> list[ConnectionManager]:
+    """Pop orphaned managers from the front of the LRU until under cap.
 
-    R14-E: called under ``_registry_lock`` whenever a NEW entry is about to
-    be inserted. Walks the front (oldest) of the ``OrderedDict`` and evicts
-    any entry with ``_users <= 0`` — those are genuinely orphaned (no
-    outstanding ``get_manager()`` acquire holds them; their last holder
-    already called ``close()`` but the entry lingered because nothing
-    pushed it out). Each evicted victim's backend is disconnected so its
-    sockets are released, mirroring the teardown path in :meth:`close`.
+    R14-E evolution: victims are collected (popped) here under
+    ``_registry_lock`` but RETURNED to the caller, which disconnects them
+    AFTER releasing the registry lock (see the disconnect loop in
+    :meth:`get_manager`). This mirrors :meth:`close`'s teardown pattern
+    (pop under lock at L587-596, disconnect after release at L601-615) so a
+    slow victim disconnect does not serialize peer ``get_manager()``
+    calls — the load-bearing fix guarded by regression test
+    ``test_evict_disconnects_victim_OUTSIDE_registry_lock``.
 
-    Entries with ``_users > 0`` are NEVER evicted — they're actively held
-    by a component and force-eviction would corrupt that component's
-    connection. If the cap can't be reached by evicting orphans alone, we
-    stop and log a warning (one per process) so operators know the
-    registry is over budget with all entries live.
+    Entries with ``_users > 0`` are NEVER collected — they're actively held
+    and force-eviction would corrupt the holder's connection. If the cap
+    can't be reached by collecting orphans alone, stop and warn once per
+    process so operators know the registry is over budget with all entries
+    live.
 
     Must be called UNDER ``_registry_lock`` — it mutates ``_managers`` and
     reads ``_users`` without per-instance locking.
+
+    Returns:
+        Victims the caller MUST disconnect outside the registry lock.
     """
+    victims: list[ConnectionManager] = []
     while len(cls._managers) >= cls.MAX_MANAGERS:
       # Find the front-most orphan. Can't ``popitem(last=False)`` blindly
       # because the oldest entry may be actively held (``_users > 0``) and
@@ -413,18 +436,9 @@ class ConnectionManager:
             "the source of distinct backend settings.",
             cls.MAX_MANAGERS,
           )
-        return
-      victim = cls._managers.pop(orphan_key)
-      # Disconnect the victim outside the registry lock to avoid
-      # serializing new get_manager() calls on a slow disconnect. The
-      # victim is already evicted from the registry so peers can't see it.
-      # Use a background-free inline disconnect under the victim's own
-      # instance lock (mirrors ``close()``'s teardown arm).
-      with victim._lock:
-        if victim._backend is not None:
-          with contextlib.suppress(Exception):
-            victim._backend.disconnect()
-          victim._backend = None
+        return victims
+      victims.append(cls._managers.pop(orphan_key))
+    return victims
 
   @staticmethod
   def _registry_key(
