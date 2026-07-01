@@ -161,3 +161,64 @@ def test_evict_disconnects_victim_OUTSIDE_registry_lock(monkeypatch):
   ta.join(timeout=5)
   tb.join(timeout=5)
   assert peer_a_done.is_set()
+
+
+def _manager_with_backend(fake: FakeBackend) -> ConnectionManager:
+  """Build a ConnectionManager whose _create_backend returns ``fake``."""
+  m = ConnectionManager("redis", {"retry_attempts": 3, "retry_delay": 1.0})
+  m._create_backend = lambda: fake  # type: ignore[method-assign]
+  return m
+
+
+def test_T1_connect_retry_backoff_full_jitter_bounds(patch_sleep_random):
+  """T1: full-jitter backoff — random.uniform(0, retry_delay*2**attempt), no real sleep."""
+  fake = FakeBackend(connect_failures=2)  # fails twice, succeeds on 3rd
+  m = _manager_with_backend(fake)
+  m.connect()
+  assert fake.connect_calls == 3
+  # attempt 0 -> uniform(0, 1*2**0)=(0,1); attempt 1 -> uniform(0, 1*2**1)=(0,2)
+  assert patch_sleep_random == [(0.0, 1.0), (0.0, 2.0)]
+
+
+def test_T2_connect_all_attempts_fail_raises(patch_sleep_random):
+  """T2: all retries exhausted -> BackendConnectionError with attempt count."""
+  from scrapy_extension.exceptions import BackendConnectionError
+
+  fake = FakeBackend(connect_failures=99)
+  m = _manager_with_backend(fake)
+  with pytest.raises(
+    BackendConnectionError, match="Failed to connect after 3 attempts"
+  ):
+    m.connect()
+  assert fake.connect_calls == 3
+
+
+def test_T3_connect_emits_on_retry_monitor(patch_sleep_random):
+  """T3: on_retry monitor hook fires before each backoff sleep (1-based retry index)."""
+  retries: list[tuple[str, int]] = []
+
+  class Recorder:
+    def on_connect(self, bt: str) -> None:
+      pass
+
+    def on_disconnect(self, bt: str, reason: object) -> None:
+      pass
+
+    def on_retry(self, bt: str, attempt: int) -> None:
+      retries.append((bt, attempt))
+
+  fake = FakeBackend(connect_failures=2)
+  m = _manager_with_backend(fake)
+  m.set_monitor(Recorder())  # type: ignore[arg-type]
+  m.connect()
+  assert retries == [("redis", 1), ("redis", 2)]
+
+
+def test_T4_attempt_connection_disconnects_half_built_backend_on_failure():
+  """T4: connect() that raises after _create_backend must disconnect the half-built backend."""
+  fake = FakeBackend(connect_failures=1)
+  m = _manager_with_backend(fake)
+  with pytest.raises(RuntimeError):
+    m._attempt_connection()
+  assert fake.disconnect_calls == 1
+  assert m._backend is None
