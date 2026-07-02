@@ -772,5 +772,106 @@ class TestAllModulesInvariants:
       )
 
 
+class TestBackendsGetattrInstallHint:
+  """#7: backends/__init__.py __getattr__ install-hint path (lines 109-114).
+
+  The existing suite covers the real-bug path (a non-ModuleNotFoundError
+  surfaces the original via ``backends_pkg.__getattr__``) but NOT the
+  genuine-missing-dep path through the BACKENDS package __getattr__ — only
+  the top-level package path
+  (``test_missing_optional_dep_still_gives_install_hint_top_level``) exercises
+  the install hint. This closes that gap and lifts ``backends/__init__.py``
+  off 61.54% (the repo's lowest-coverage file).
+  """
+
+  def test_backends_getattr_missing_dep_gives_install_hint(self, mocker):
+    """Accessing ``backends.RedisBackend`` with redis missing -> install hint.
+
+    Covers ``__getattr__`` lines 109-114 (the install-hint construction) and
+    the True branch of ``_is_missing_optional_dep`` for a direct name match
+    (lines 87, 90, 93-94).
+    """
+    import importlib
+    import sys
+
+    module_path = "scrapy_extension.backends.redis"
+    # R14-G flake fix: restore the popped module in finally so later tests
+    # that patch the backend module's client class still find the right
+    # module object (see TestLazyImportRealBugSurfacesChain rationale).
+    cached = sys.modules.pop(module_path, None)
+    try:
+      real_import = importlib.import_module
+      missing = ModuleNotFoundError("No module named 'redis'", name="redis")
+
+      def fake_import(name, package=None):
+        if name == module_path:
+          raise missing
+        return real_import(name, package)
+
+      mocker.patch.object(importlib, "import_module", side_effect=fake_import)
+      import scrapy_extension.backends as backends_pkg
+
+      with pytest.raises(ImportError) as exc_info:
+        getattr(backends_pkg, "RedisBackend")
+
+      assert "pip install scrapy-extension[redis]" in str(exc_info.value)
+    finally:
+      if cached is not None:
+        sys.modules[module_path] = cached
+
+
+class TestIsMissingOptionalDepBranches:
+  """#7: direct unit tests for ``_is_missing_optional_dep`` branch coverage.
+
+  Closes the 87-93 line gap the backends-package __getattr__ tests don't
+  reach: falsy ``.name``, empty ``dep_modules`` (RocketMQ), submodule name
+  match, and non-matching name.
+  """
+
+  def test_name_falsy_returns_false(self):
+    """A ModuleNotFoundError with no ``.name`` -> can't classify -> False (88-89)."""
+    from scrapy_extension.backends import _is_missing_optional_dep
+
+    exc = ModuleNotFoundError()  # no args -> .name is None
+    assert (
+      _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is False
+    )
+
+  def test_empty_dep_modules_returns_false(self):
+    """RocketMQ declares no module-level dep (frozenset()) -> always False (91-92).
+
+    RocketMQ's optional dep (rocketmq-client-python) is imported inside
+    ``connect()``, not at module level, so a module-level
+    ModuleNotFoundError is never a "missing dep" signal for it.
+    """
+    from scrapy_extension.backends import _is_missing_optional_dep
+
+    exc = ModuleNotFoundError("No module named 'rocketmq'", name="rocketmq")
+    assert (
+      _is_missing_optional_dep(exc, "scrapy_extension.backends.rocketmq")
+      is False
+    )
+
+  def test_submodule_name_returns_true(self):
+    """Submodule match: name 'redis.connection' -> split[0]='redis' in {redis} (95)."""
+    from scrapy_extension.backends import _is_missing_optional_dep
+
+    exc = ModuleNotFoundError(
+      "No module named 'redis.connection'", name="redis.connection"
+    )
+    assert (
+      _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is True
+    )
+
+  def test_unrelated_name_returns_false(self):
+    """Name not in dep_modules -> False (real-bug-not-missing-dep case at 93-95)."""
+    from scrapy_extension.backends import _is_missing_optional_dep
+
+    exc = ModuleNotFoundError("No module named 'typo'", name="typo")
+    assert (
+      _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is False
+    )
+
+
 
 
