@@ -276,5 +276,90 @@ class TestBackpressureLenErrorDegradesToPop:
     assert scheduler._backpressure_paused is False
 
 
+class TestBackpressureStatsNoneAndFallthrough:
+  """G8-G10: close stat-None + armed-but-below-threshold branches.
+
+  Characterization tests — pin that the gate works without a stats collector
+  and that an armed gate below threshold falls through to pop.
+  See docs/superpowers/specs/2026-07-02-scheduler-branch-closure-design.md.
+  """
+
+  def test_G8_pause_without_stats(self) -> None:
+    """G8: pause_at=10, depth=10, stats=None → return None, paused flag set.
+
+    Covers the stats-None sub-branch of the pause arm (683->685) — the
+    ``if self.stats:`` guard before the pause-stat bump must skip cleanly.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      stats=None,
+      backpressure_pause_at=10,
+      backpressure_resume_at=5,
+    )
+    queue = _LenControllableQueue(depth=10)
+    scheduler._queue = queue  # type: ignore[assignment]
+
+    result = scheduler.next_request()
+
+    assert result is None
+    queue.pop.assert_not_called()
+    assert scheduler._backpressure_paused is True  # paused despite no stats
+
+  def test_G9_resume_without_stats(self) -> None:
+    """G9: stats=None; pause then drain-to-resume → second call pops, flag cleared.
+
+    Covers the stats-None sub-branch of the resume arm (688->692).
+    """
+    manager = MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      stats=None,
+      backpressure_pause_at=10,
+      backpressure_resume_at=5,
+    )
+    req = Request("https://example.com/a")
+    queue = _LenControllableQueue(depth=10, pop_value=req)
+    scheduler._queue = queue  # type: ignore[assignment]
+
+    # 1. depth=10 → pause (no stat, stats=None), return None.
+    assert scheduler.next_request() is None
+    assert scheduler._backpressure_paused is True
+
+    # 2. depth=5 (== resume_at) → resume, pop returns req (no stat, stats=None).
+    queue.set_depth(5)
+    result = scheduler.next_request()
+    assert result is req
+    assert scheduler._backpressure_paused is False
+
+  def test_G10_gate_armed_below_threshold_pops(self) -> None:
+    """G10: pause_at set, depth below threshold, never paused → pop proceeds.
+
+    Covers the fall-through branch (685->692): gate is armed (pause_at is not
+    None) but depth never reached pause_at, so ``_backpressure_paused`` stays
+    False and control flows straight to pop.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      stats=stats,
+      backpressure_pause_at=10,
+      backpressure_resume_at=5,
+    )
+    req = Request("https://example.com/a")
+    queue = _LenControllableQueue(depth=5, pop_value=req)  # below pause_at
+    scheduler._queue = queue  # type: ignore[assignment]
+
+    result = scheduler.next_request()
+
+    assert result is req
+    queue.pop.assert_called_once_with(timeout=0)
+    assert scheduler._backpressure_paused is False  # never paused
+    # No pause/resume stat bumped — gate didn't trigger.
+    assert "scheduler/backpressure_pause" not in counts
+    assert "scheduler/backpressure_resume" not in counts
+
+
 if __name__ == "__main__":
   pytest.main([__file__, "-q", "--tb=short", "-p", "no:randomly"])

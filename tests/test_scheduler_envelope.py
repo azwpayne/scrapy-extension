@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 from scrapy import Request, Spider
 
-from scrapy_extension.exceptions import BackendError, QueueError
+from scrapy_extension.exceptions import BackendError, QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
@@ -174,3 +174,189 @@ class TestQueueKeySpiderTemplating:
 
 # Keep an explicit Any alias so type-checkers don't gripe about the mock spider.
 _FakeSpiderType: Any = _FakeSpider
+
+
+class TestEnqueueBranchClosure:
+  """G1-G7: close the uncovered enqueue_request resilience branches.
+
+  Characterization tests — every branch is correct on static read; these pin
+  the behavior so a future refactor can't silently drop a degrade-path.
+  See docs/superpowers/specs/2026-07-02-scheduler-branch-closure-design.md.
+  """
+
+  def test_G1_dedup_hit_with_no_spider_skips_log_returns_false(self) -> None:
+    """G1: request_seen=True + _spider=None → skip dupefilter.log, return False.
+
+    Covers the ``_spider is None`` arm of the dedup-hit block (616->618) — the
+    existing envelope tests always set ``_spider``, so the skip-log branch
+    was unreached.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    dupefilter = MagicMock(name="DupeFilter")
+    dupefilter.request_seen.return_value = True
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue  # _spider intentionally left None (never opened)
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is False
+    queue.push.assert_not_called()  # dedup-hit short-circuits before push
+    dupefilter.log.assert_not_called()  # _spider None → log skipped
+    assert not counts, f"dedup-hit should bump no stats, got {counts}"
+
+  def test_G2_dont_filter_skips_dedup_and_pushes(self) -> None:
+    """G2: request.dont_filter=True → dedup NOT consulted, push proceeds."""
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    dupefilter = MagicMock(name="DupeFilter")
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(
+      Request("https://example.com/a", dont_filter=True)
+    )
+
+    assert result is True
+    dupefilter.request_seen.assert_not_called()  # dont_filter short-circuit
+    queue.push.assert_called_once()
+    assert counts.get("scheduler/enqueued") == 1
+
+  def test_G3_no_dupefilter_pushes_straight(self) -> None:
+    """G3: dupefilter=None → dedup skipped, push proceeds, returns True."""
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=None,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is True
+    queue.push.assert_called_once()
+    assert counts.get("scheduler/enqueued") == 1
+
+  def test_G4_serialization_error_returns_false_and_bumps_stat(self) -> None:
+    """G4: push raises SerializationError → except arm + stat, return False."""
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=None,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = SerializationError("too big")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is False
+    assert counts.get("scheduler/serialization_errors") == 1
+
+  def test_G5_dedup_outage_without_stats_still_enqueues(self) -> None:
+    """G5: request_seen→QueueError + stats=None → fallback push succeeds, True.
+
+    Covers the stats-None sub-branch inside the dedup-outage arm — the
+    ``if self.stats:`` guard at 632 must skip the stat bump without crashing.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    dupefilter = MagicMock(name="DupeFilter")
+    dupefilter.request_seen.side_effect = QueueError("dedup down")
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=None, dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is True
+    queue.push.assert_called_once()  # fallback push fired (degrade-to-enqueue)
+
+  def test_G6_dedup_outage_then_fallback_push_fails_returns_false(self) -> None:
+    """G6: request_seen→QueueError AND fallback push→QueueError → return False.
+
+    Covers the inner ``except (QueueError, SerializationError, BackendError)``
+    at 638-640 — the rare double-failure where BOTH the dedup check and the
+    fallback enqueue raise.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    dupefilter = MagicMock(name="DupeFilter")
+    dupefilter.request_seen.side_effect = QueueError("dedup down")
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("queue also down")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is False
+    assert queue.push.call_count == 1  # only the fallback push (initial never reached)
+    # Outage stat WAS bumped (entered dedup-outage arm) before the fallback failed.
+    assert counts.get("scheduler/dupefilter_error") == 1
+
+  def test_G7_push_phase_failure_bumps_queue_error(self) -> None:
+    """G7: dupefilter=None (phase=push), push→QueueError → queue_error stat.
+
+    Covers the ``phase == "push"`` arm (643-646) — distinct from the
+    dedup-outage arm because the failure is on the actual enqueue push.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=None,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("push failed")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is False
+    assert counts.get("scheduler/queue_error") == 1
+
+  def test_G4b_serialization_error_without_stats(self) -> None:
+    """G4b: SerializationError + stats=None → return False, no crash.
+
+    Covers the stats-None sub-branch of the SerializationError arm (625->627)
+    — mirrors G5's stats-None characterization for the dedup-outage arm.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=None, dupefilter=None,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = SerializationError("too big")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is False
+
+  def test_G7b_push_phase_failure_without_stats(self) -> None:
+    """G7b: push-phase failure + stats=None → return False, no crash.
+
+    Covers the stats-None sub-branch of the push-phase arm (644->646) —
+    mirrors G4b/G5 for the third except-arm.
+    """
+    manager = MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=None, dupefilter=None,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("push failed")
+    scheduler._queue = queue
+
+    result = scheduler.enqueue_request(Request("https://example.com/a"))
+
+    assert result is False
