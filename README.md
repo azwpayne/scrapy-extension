@@ -159,19 +159,19 @@ See [`examples/`](examples) for all deployment modes (Sentinel, Cluster, Atlas, 
 | ElasticSearch | Yes   | Yes | Yes     | standalone, cloud                            |
 | Kafka         | Yes   | No  | No      | standalone, cluster, confluent               |
 | RabbitMQ      | Yes   | No  | No      | standalone, cluster, mirrored_queues         |
-| RocketMQ      | Yes   | Stub | Stub   | standalone, cluster, cloud                   |
+| RocketMQ      | Yes   | Guard | Guard  | standalone, cluster, cloud                   |
 | Pulsar        | Yes   | No  | No      | standalone, cluster                          |
 | SQS           | Yes   | No  | No      | standalone (LocalStack), cloud (AWS)         |
 | Memcached     | No    | No  | Yes     | standalone                                   |
 | DynamoDB      | No    | No  | Yes     | standalone (LocalStack), cloud (AWS)         |
 
 - **Yes** — fully implemented
-- **No** — not available (raises `NotImplementedError`)
-- **Stub** — method signatures exist but raise `NotImplementedError` at runtime
+- **No** — not implemented (this backend doesn't expose the interface)
+- **Guard** — rejected at config time (`ConfigurationError`); a guard class fails-fast if the capability gate is bypassed (RocketMQ set/storage)
 
 **Kafka, RabbitMQ, Pulsar, SQS**: Queue-only. For deduplication and storage, use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB.
 
-**RocketMQ**: Queue is functional. Set and Storage methods exist but raise `NotImplementedError` at runtime. Pair with a full-featured backend for dedup/storage.
+**RocketMQ**: Queue is functional. Set/Storage are rejected at config time (`ConfigurationError`) — pair with a full-featured backend (Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB) for dedup/storage.
 
 **Memcached, DynamoDB**: Storage-only (key-value with TTL). Pair with a queue-capable backend for request distribution.
 
@@ -206,7 +206,7 @@ What the library contractually promises — and just as importantly, what it doe
 | **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Message-queue backends (Kafka, RabbitMQ) carry a per-message ack token so the *specific* popped message is acked; the scheduler's `from_settings` gate refuses unsafe configs unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py:313` (`QueueBackend` ack contract), `schedule/scheduler.py` |
 | **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | `__init__.py`, `backends/__init__.py`, every `backends/*.py` |
 | **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
-| **Backend capability honesty.** A backend that does not implement `QueueBackend` / `SetBackend` / `StorageBackend` raises `NotImplementedError` on first call — never silently no-ops. The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
+| **Backend capability honesty.** A backend never silently no-ops on an unsupported interface: queue-only backends omit `SetBackend`/`StorageBackend` entirely; RocketMQ set/storage are rejected at config time (`ConfigurationError` guard). The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
 | **`py.typed` marker shipped.** Full type annotations on the public surface; downstream type-checkers consume the shipped typing. | `src/scrapy_extension/py.typed` |
 
 ### What is **not** promised
