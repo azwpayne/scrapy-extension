@@ -575,7 +575,7 @@ def test_pop_not_connected():
 
 
 def test_pop_returns_message(mocker):
-    """Test pop returns message body when available."""
+    """Test pop returns message body when available (no inline ack — initiative #4)."""
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
 
     mock_msg = mocker.MagicMock()
@@ -586,7 +586,9 @@ def test_pop_returns_message(mocker):
 
     assert result == b"hello-world"
     mock_consumer.receive.assert_called_once_with(3000)
-    mock_consumer.ack.assert_called_once_with(mock_msg)
+    # Initiative #4: pop no longer acks inline — deferred to ack(). See
+    # test_pop_no_longer_inline_acks for the at-least-once regression proof.
+    mock_consumer.ack.assert_not_called()
 
 
 def test_pop_returns_none_when_empty(mocker):
@@ -705,6 +707,139 @@ def test_disconnect_clears_subscribed_topics(mocker):
 
     backend.disconnect()
     assert len(backend._subscribed_topics) == 0
+
+
+# ---------------------------------------------------------------------------
+# pop/ack decouple (initiative #4 — at-least-once fix)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix pop() acked inline (self._consumer.ack(msg) before returning the
+# body), so a crash between pop and processing silently consumed the message
+# (at-most-once). Post-fix pop/pop_with_ack do NOT ack; ack fires explicitly
+# via ack(token=msg) — a crash before ack → visibility-timeout redelivers
+# (at-least-once, same model as SQS).
+
+
+def test_pop_no_longer_inline_acks(mocker):
+    """R2/regression: pop returns the body and does NOT ack inline.
+
+    Pre-fix pop() called ``self._consumer.ack(msg)`` BEFORE returning the
+    body, so an ack failure (broker down mid-ack) raised QueueError and the
+    caller never got the data — at-most-once. Post-fix pop never acks, so
+    the body always reaches the caller even when ack would fail; ack is the
+    caller's explicit later responsibility.
+    """
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    mock_msg = mocker.MagicMock()
+    mock_msg.body = b"payload"
+    mock_consumer.receive.return_value = [mock_msg]
+    # Sabotage ack so the OLD inline-ack path would have raised & lost the msg:
+    mock_consumer.ack.side_effect = OSError("broker down")
+
+    result = backend.pop("my_queue")
+
+    assert result == b"payload"  # body delivered — not lost to an ack failure
+    mock_consumer.ack.assert_not_called()  # no inline ack attempted
+    assert backend._last_msg is mock_msg  # tracked for legacy ack(token=None)
+
+
+def test_pop_with_ack_returns_body_and_token_no_ack(mocker):
+    """R1: pop_with_ack returns (body, msg_token) and does NOT ack."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    mock_msg = mocker.MagicMock()
+    mock_msg.body = b"hello"
+    mock_consumer.receive.return_value = [mock_msg]
+
+    body, token = backend.pop_with_ack("my_queue")
+
+    assert body == b"hello"
+    assert token is mock_msg
+    mock_consumer.ack.assert_not_called()
+
+
+def test_pop_with_ack_empty_returns_none_none(mocker):
+    """pop_with_ack on an empty queue returns (None, None)."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    mock_consumer.receive.return_value = []
+
+    body, token = backend.pop_with_ack("my_queue")
+
+    assert body is None
+    assert token is None
+
+
+def test_ack_with_token_acks_specific_message(mocker):
+    """R3: ack(token=msg) acks the specific message (concurrent-ack correct)."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    msg_b = mocker.MagicMock(name="b")
+
+    backend.ack("q", token=msg_b)
+
+    mock_consumer.ack.assert_called_once_with(msg_b)
+
+
+def test_ack_token_none_acks_last_msg_then_clears(mocker):
+    """R4: legacy ack(token=None) acks the tracked _last_msg, then clears it."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    mock_msg = mocker.MagicMock()
+    mock_msg.body = b"x"
+    mock_consumer.receive.return_value = [mock_msg]
+    backend.pop("my_queue")  # pop tracks _last_msg
+    assert backend._last_msg is mock_msg
+
+    backend.ack("my_queue", token=None)
+
+    mock_consumer.ack.assert_called_once_with(mock_msg)
+    assert backend._last_msg is None  # cleared after ack
+
+
+def test_ack_token_none_with_no_last_msg_is_noop(mocker):
+    """ack(token=None) with no tracked message is a safe no-op (no raise)."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+
+    backend.ack("my_queue", token=None)
+
+    mock_consumer.ack.assert_not_called()
+
+
+def test_nack_does_not_ack(mocker):
+    """R5: nack is a no-op — RocketMQ redelivers via visibility timeout."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    msg = mocker.MagicMock()
+
+    backend.nack("my_queue", token=msg)
+
+    mock_consumer.ack.assert_not_called()
+
+
+def test_rocketmq_requires_ack_class_attrs():
+    """R6: RocketMQ declares the deferred-ack capability contract.
+
+    ``requires_ack=True`` routes it through BackendScheduler's ack wiring
+    (response_received → ack(token)). ``supports_concurrent_ack=True``
+    because ack is per-message (no single-slot overwrite) — safe under
+    CONCURRENT_REQUESTS>1. Pre-fix it inherited ``requires_ack=False``,
+    mis-classifying it as atomic (Redis/Mongo/ES) and bypassing the
+    ack-concurrency gate entirely.
+    """
+    assert RocketMQBackend.requires_ack is True
+    assert RocketMQBackend.supports_concurrent_ack is True
+
+
+def test_ack_failure_raises_queue_error(mocker):
+    """ack wraps a broker-side ack failure in QueueError(operation='ack').
+
+    Covers the ``except`` arm of ``ack`` — if the broker rejects the ack
+    (network blip, broker down), the error is typed and attributable, not a
+    bare OSError. The message stays unacked → redelivered (at-least-once).
+    """
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    msg = mocker.MagicMock()
+    mock_consumer.ack.side_effect = OSError("broker gone")
+
+    with pytest.raises(QueueError, match="Failed to ack RocketMQ message") as exc_info:
+        backend.ack("q", token=msg)
+    assert exc_info.value.operation == "ack"
 
 
 # ---------------------------------------------------------------------------

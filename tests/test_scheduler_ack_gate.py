@@ -243,11 +243,14 @@ class TestAckCapabilityDeclarations:
       BackendType.REDIS,
       BackendType.MONGODB,
       BackendType.ELASTICSEARCH,
-      BackendType.ROCKETMQ,
     ],
   )
   def test_atomic_backends_require_no_ack(self, backend_type: BackendType) -> None:
-    """Atomic-pop backends (Redis/Mongo/ES/RocketMQ) keep requires_ack=False."""
+    """Atomic-pop backends (Redis/Mongo/ES) keep requires_ack=False.
+
+    RocketMQ was removed from this list in initiative #4 — it now uses a
+    deferred-ack model (requires_ack=True). See test_rocketmq_now_requires_ack.
+    """
     # Round-5 R5-1: dispatch routes through the registry descriptor table
     # (was the deleted ``_BACKEND_FACTORIES``).
     from scrapy_extension.backends.connectors import _load_object
@@ -259,3 +262,17 @@ class TestAckCapabilityDeclarations:
       f"{backend_type.value} should be atomic (requires_ack=False); "
       f"got {getattr(cls, 'requires_ack', 'MISSING')}"
     )
+
+  def test_rocketmq_now_requires_ack(self) -> None:
+    """Initiative #4: RocketMQ uses a deferred-ack model (requires_ack=True).
+
+    Pre-fix RocketMQ inherited ``requires_ack=False`` (atomic class) while
+    actually acking inline at pop time — at-most-once on crash. Post-fix it
+    declares the deferred-ack contract so BackendScheduler wires
+    response_received → ack(token=msg) and the ack-concurrency gate treats
+    it as a real in-flight-set backend.
+    """
+    from scrapy_extension.backends.rocketmq import RocketMQBackend
+
+    assert RocketMQBackend.requires_ack is True
+    assert RocketMQBackend.supports_concurrent_ack is True

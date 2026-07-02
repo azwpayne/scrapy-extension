@@ -335,8 +335,8 @@ class BackendQueue:
     target of this fix).
 
     Only backends that genuinely override ``pop_with_ack`` (Kafka,
-    RabbitMQ) take the token-correlated path. Atomic-pop backends (Redis,
-    MongoDB, ElasticSearch, RocketMQ) inherit the default
+    RabbitMQ, RocketMQ) take the token-correlated path. Atomic-pop backends
+    (Redis, MongoDB, ElasticSearch) inherit the default
     ``pop_with_ack → (pop(), None)``, and legacy test mocks that stub only
     ``pop`` are detected and routed through ``pop()`` with token ``None``
     so their existing assertions stay valid.

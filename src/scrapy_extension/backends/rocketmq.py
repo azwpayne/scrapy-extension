@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.backends.base import (
   Backend,
@@ -34,6 +34,17 @@ class RocketMQBackend(Backend, QueueBackend):
   ``NotImplementedError`` stubs.
   """
 
+  # Ack capability (initiative #4 — at-least-once fix): RocketMQ uses a
+  # deferred-ack model. ``pop`` / ``pop_with_ack`` yield a message WITHOUT
+  # acking; the caller acks via ``ack(token=msg)`` after processing. A crash
+  # before ack → the broker's visibility timeout redelivers the message
+  # (at-least-once). Pre-fix ``pop`` acked inline, which made a crash after
+  # pop silently lose the message (at-most-once).
+  # ``supports_concurrent_ack=True`` because ack is per-message (no
+  # single-slot overwrite) — correct under ``CONCURRENT_REQUESTS > 1``.
+  requires_ack = True
+  supports_concurrent_ack = True
+
   def __init__(self, config: RocketMQSettings) -> None:
     """Initialize RocketMQ backend.
 
@@ -44,6 +55,11 @@ class RocketMQBackend(Backend, QueueBackend):
     self._producer = None
     self._consumer = None
     self._subscribed_topics: set[str] = set()
+    # Legacy single-slot for the ``ack(token=None)`` fallback path (mirrors
+    # Kafka's ``_last_record``). Set by ``pop`` / ``pop_with_ack``; cleared
+    # when ``ack`` acks the tracked message. The token path (preferred under
+    # ``CONCURRENT_REQUESTS > 1``) does not depend on this slot.
+    self._last_msg: Any = None
 
   def connect(self) -> None:
     """Establish connection to RocketMQ.
@@ -231,15 +247,24 @@ class RocketMQBackend(Backend, QueueBackend):
       msg = f"Failed to push to queue: {e}"
       raise QueueError(msg) from e
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-    """Pop item from queue.
+  def _receive_message(self, queue_name: str, timeout: float) -> Any | None:
+    """Receive a single message from ``queue_name`` WITHOUT acking.
+
+    Shared by :meth:`pop` and :meth:`pop_with_ack` so subscription caching,
+    timeout math, and error wrapping live in one place. Deliberately does
+    NOT ack — RocketMQ's visibility-timeout model redelivers unacked
+    messages, which is what makes at-least-once work (crash before ack →
+    redelivery, not silent loss).
 
     Args:
         queue_name: Name of the queue.
         timeout: Seconds to wait (0 = non-blocking).
 
     Returns:
-        Popped item, or None if queue is empty.
+        The received message object, or None if no message was available.
+
+    Raises:
+        QueueError: If not connected or the receive fails.
     """
     from scrapy_extension.exceptions import QueueError
 
@@ -257,15 +282,123 @@ class RocketMQBackend(Backend, QueueBackend):
       messages = self._consumer.receive(timeout_ms)
       if not messages:
         return None
-      msg = messages[0]
-      self._consumer.ack(msg)
-      return msg.body
+      return messages[0]
     except Exception as e:
       # Receive failures (network-level ``OSError`` included). R14-H: dropped
       # the redundant ``except OSError`` arm — its message was identical and
       # ``Exception`` already covers it.
       msg = f"Failed to pop from queue: {e}"
       raise QueueError(msg) from e
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    """Pop item from queue WITHOUT acking (deferred-ack model).
+
+    Returns the message body; the message itself is tracked in
+    ``_last_msg`` for the legacy :meth:`ack` (``token=None``) path. Ack
+    fires only when the caller explicitly invokes :meth:`ack` — a crash
+    before ack leaves the message unacked → RocketMQ's visibility timeout
+    redelivers it (at-least-once).
+
+    Pre-fix (initiative #4) this method acked inline at line 261, which
+    made a crash between pop and processing silently consume the message
+    (at-most-once) — the bug this method now closes.
+
+    Under :class:`BackendScheduler`, :meth:`pop_with_ack` is the preferred
+    path (per-message token, correct under ``CONCURRENT_REQUESTS > 1``);
+    this method remains for direct callers and the atomic-fallback path.
+
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (0 = non-blocking).
+
+    Returns:
+        Popped item, or None if queue is empty.
+    """
+    msg = self._receive_message(queue_name, timeout)
+    if msg is None:
+      return None
+    self._last_msg = msg
+    return msg.body
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop an item together with an ack token (the message object itself).
+
+    Does NOT ack — the caller acks via :meth:`ack` (``token=msg``) after
+    processing. :class:`BackendScheduler` threads the token through
+    ``request.meta["_backend_ack_token"]`` and acks on
+    ``signals.response_received``. The token stays in-process (never
+    serialized across the queue), matching Kafka's ``_last_record``
+    precedent for holding a client-library object across the download window.
+
+    Args:
+        queue_name: Name of the queue.
+        timeout: Seconds to wait (0 = non-blocking).
+
+    Returns:
+        ``(body_bytes, msg_token)`` or ``(None, None)`` when empty.
+
+    Raises:
+        QueueError: If not connected or the receive fails.
+    """
+    msg = self._receive_message(queue_name, timeout)
+    if msg is None:
+      return (None, None)
+    self._last_msg = msg
+    return (msg.body, msg)
+
+  def ack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Ack a popped message (deferred from :meth:`pop` / :meth:`pop_with_ack`).
+
+    With a ``token`` (the path :class:`BackendScheduler` uses under
+    ``CONCURRENT_REQUESTS > 1``): ack the specific message the token
+    identifies. With ``token=None`` (legacy single-pop caller): ack the
+    tracked ``_last_msg``.
+
+    Args:
+        queue_name: Name of the queue (unused; kept for interface symmetry).
+        token: The message object returned by :meth:`pop_with_ack`, or
+            ``None`` to ack the last-popped message.
+
+    Raises:
+        QueueError: If the underlying ack call fails.
+    """
+    from scrapy_extension.exceptions import QueueError
+
+    del queue_name
+    target = token if token is not None else self._last_msg
+    if target is None or self._consumer is None:
+      return
+    try:
+      self._consumer.ack(target)
+    except Exception as e:
+      msg = f"Failed to ack RocketMQ message: {e}"
+      raise QueueError(msg, operation="ack") from e
+    finally:
+      # Clear the legacy slot when we acked the tracked message (token path
+      # or last-msg path) so a later ack(token=None) is a no-op, not a re-ack.
+      if self._last_msg is target:
+        self._last_msg = None
+
+  def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+    """Nack a popped message — deliberate no-op (visibility-timeout redelivery).
+
+    RocketMQ's ``SimpleConsumer`` exposes no explicit nack API: an unacked
+    message is automatically redelivered after the broker's visibility
+    timeout (same model as SQS). So nack deliberately does NOT ack — the
+    message re-enters the delivery pool on its own. Logged at debug so the
+    retry path is observable without pretending work was done.
+
+    Args:
+        queue_name: Name of the queue (unused; interface symmetry).
+        token: The message object (unused; interface symmetry).
+    """
+    del queue_name, token
+    logger.debug(
+      "RocketMQ nack: no explicit nack API — message will redeliver "
+      "after the broker visibility timeout (at-least-once)."
+    )
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
