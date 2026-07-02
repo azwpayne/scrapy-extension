@@ -463,22 +463,47 @@ class ConnectionManager:
     ``BackendType`` enum member is passed (a ``str`` subclass), its ``str()``
     is the repr-like ``"BackendType.REDIS"`` — NOT the registry key — so we
     extract ``.value`` explicitly. Plain strings pass through unchanged.
-    Keys stay byte-identical to the pre-refactor ``f"{bt.value}:..."`` form.
+
+    Initiative #14: ``default=str`` was lossy — ``str(datetime(2024,1,1))``
+    and the string ``"2024-01-01 00:00:00"`` both rendered as
+    ``2024-01-01 00:00:00``, so two workers whose settings differed only in
+    a non-JSON-typed value silently shared one connection manager (wrong
+    backend conn / wrong DB index — the prime victim is multi-backend
+    coexistence via ``resolve_backend_config``). The ``_tag`` default emits
+    ``{"__type__": <qualname>, "__value__": <str>}`` so distinct types render
+    distinctly, while pure-JSON settings stay byte-identical to the pre-#14
+    form (``default`` is only invoked for values JSON can't natively encode).
     """
     bt_key = (
       backend_type.value
       if isinstance(backend_type, BackendType)
       else backend_type
     )
+
+    def _tag(obj: Any) -> Any:
+      # Type-tagged fallback for values JSON can't natively encode — distinct
+      # types now render distinctly (the str()-only form collapsed them).
+      return {"__type__": type(obj).__qualname__, "__value__": str(obj)}
+
     try:
       settings_key = json.dumps(
         settings,
         sort_keys=True,
         separators=(",", ":"),
-        default=str,
+        default=_tag,
       )
     except (TypeError, ValueError):
-      settings_key = str(sorted(settings.items()))
+      # Pathological settings json can't traverse even with the type-tagging
+      # default (e.g. circular references, non-string dict keys). Fall back to
+      # a type-tagged repr so even here distinct values cannot collide — the
+      # old ``str(sorted(settings.items()))`` had the same lossy ``str()``
+      # collision risk as ``default=str``. ``sorted`` over strings is total
+      # (always comparable), so it never raises on mixed-type keys.
+      tagged = sorted(
+        f"{type(k).__qualname__}:{k!r}={type(v).__qualname__}:{v!r}"
+        for k, v in settings.items()
+      )
+      settings_key = "[" + ",".join(tagged) + "]"
     return f"{bt_key}:{settings_key}"
 
   def _create_backend(self) -> Backend:
