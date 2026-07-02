@@ -93,3 +93,35 @@ class QueueStrategy(ABC):
 
   def close(self) -> None:  # noqa: B027
     """Lifecycle hook — release resources. Default no-op."""
+
+  def snapshot(self) -> bytes | None:
+    """Serialize in-process state for crash/restart recovery (initiative #3).
+
+    Returns a versioned, storage-storable bytes blob, or ``None`` when the
+    strategy holds no persistable state (the default). Override to enable
+    snapshot/restore for strategies with in-process held state (e.g.
+    :class:`~scrapy_extension.queue.strategies.delay.DelayQueueStrategy`'s
+    held-item heap — without this, delayed items are lost on close/restart).
+
+    :class:`~scrapy_extension.queue.queue.BackendQueue` calls this on
+    :meth:`close` and persists the result via the connection manager's
+    storage backend (when storage-capable); ``None`` means "nothing to
+    persist" and skips the store.
+
+    Returns:
+        Bytes blob consumed by :meth:`restore`, or ``None``.
+    """
+    return None
+
+  def restore(self, state: bytes | None) -> None:
+    """Re-populate in-process state from a prior :meth:`snapshot` (initiative #3).
+
+    Default no-op. Called once on startup by
+    :class:`~scrapy_extension.queue.queue.BackendQueue`. A ``None`` state
+    (no prior snapshot) is a no-op. Corrupt / unknown-format state MUST be
+    logged + skipped — restore never crashes the spider.
+
+    Args:
+        state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
+    """
+    del state

@@ -141,6 +141,11 @@ class BackendQueue:
     # per ``depth_sample_every`` pops, aligned to the same perf cadence as
     # the depth probe so both operability signals ride the same sampling.
     self._pop_rate_counter = 0
+    # Initiative #3: restore in-process strategy state (e.g. Delay's held
+    # heap) from a prior-shutdown snapshot. Best-effort — storage-incapable
+    # backends and missing snapshots are silent no-ops; failures log + start
+    # clean rather than crash startup.
+    self._restore_snapshot()
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -590,10 +595,110 @@ class BackendQueue:
 
     Forwards to ``self._strategy.close()`` so strategies that hold in-process
     state (e.g. ``DelayQueueStrategy``'s held-item heap) can emit shutdown
-    warnings / release resources. The backend connection itself is owned by
-    the ``ConnectionManager`` and closed separately by the scheduler.
+    warnings / release resources. Then persists the strategy's snapshot
+    (initiative #3) so in-process held state survives restart. The backend
+    connection itself is owned by the ``ConnectionManager`` and closed
+    separately by the scheduler.
 
     Safe to call when no strategy lifecycle work is needed — the default
-    ``QueueStrategy.close()`` is a no-op.
+    ``QueueStrategy.close()`` is a no-op and ``snapshot()`` returns ``None``.
+
+    Order matters: :meth:`_persist_snapshot` runs BEFORE
+    ``strategy.close()`` so the snapshot captures the held state before the
+    strategy clears it (e.g. ``DelayQueueStrategy.close()`` clears its heap).
     """
+    self._persist_snapshot()
     self._strategy.close()
+
+  #: Storage-key prefix for strategy snapshots (initiative #3). Full key is
+  #: ``<prefix><queue_name>`` — one snapshot per queue, overwritten on each
+  #: clean close, loaded once on startup. No TTL: the snapshot is cheap to
+  #: overwrite and represents last-shutdown state.
+  _SNAPSHOT_KEY_PREFIX = "queue:snapshot:"
+
+  def _snapshot_key(self) -> str:
+    """Build the storage key for this queue's strategy snapshot."""
+    return f"{self._SNAPSHOT_KEY_PREFIX}{self.queue_name}"
+
+  def _persist_snapshot(self) -> None:
+    """Persist the strategy's in-process state on close (initiative #3).
+
+    Calls ``strategy.snapshot()``; if it returns non-None bytes, stores them
+    via the connection manager's storage backend. Storage-incapable backends
+    (queue-only: Kafka/RabbitMQ/Pulsar/SQS/RocketMQ) raise
+    ``NotImplementedError`` from ``get_storage_backend()`` — the snapshot is
+    skipped (no KV store to persist to). Connection managers without a
+    ``get_storage_backend`` attribute (e.g. test stubs) also skip. Best-effort:
+    any failure is logged, never crashes :meth:`close`.
+    """
+    try:
+      state = self._strategy.snapshot()
+    except Exception:  # noqa: BLE001 — snapshot must not crash close
+      logger.exception("strategy.snapshot() raised; skipping persist")
+      return
+    if state is None:
+      return  # nothing to persist (passthrough / empty held heap)
+    get_storage = getattr(self.connection_manager, "get_storage_backend", None)
+    if get_storage is None:
+      return  # connection manager exposes no storage interface
+    try:
+      storage = get_storage()
+    except NotImplementedError:
+      logger.info(
+        "Queue backend is not storage-capable; cannot persist strategy "
+        "snapshot for queue %r — in-process held state (e.g. delayed items) "
+        "will not survive restart. Pair with a storage-capable backend "
+        "(Redis/MongoDB/ElasticSearch) to enable snapshot/restore.",
+        self.queue_name,
+      )
+      return
+    except Exception:  # noqa: BLE001 — resolver must not crash close
+      logger.exception(
+        "Failed to resolve storage backend for queue %r; skipping snapshot persist.",
+        self.queue_name,
+      )
+      return
+    try:
+      storage.store(self._snapshot_key(), state)
+    except Exception:  # noqa: BLE001 — store must not crash close
+      logger.exception(
+        "Failed to persist strategy snapshot for queue %r; continuing.",
+        self.queue_name,
+      )
+
+  def _restore_snapshot(self) -> None:
+    """Restore the strategy's in-process state on startup (initiative #3).
+
+    Loads the snapshot bytes from the storage backend (when storage-capable)
+    and passes them to ``strategy.restore()``. Storage-incapable backends
+    (queue-only) and connection managers without ``get_storage_backend`` skip
+    silently. Only real ``bytes``/``bytearray`` are restored — a non-bytes
+    retrieve result (e.g. a mock in tests) is skipped. Best-effort: any
+    failure is logged, never crashes startup.
+    """
+    get_storage = getattr(self.connection_manager, "get_storage_backend", None)
+    if get_storage is None:
+      return  # connection manager exposes no storage interface
+    try:
+      storage = get_storage()
+    except NotImplementedError:
+      return  # storage-incapable backend — no prior snapshot to restore
+    except Exception:  # noqa: BLE001 — resolver must not crash startup
+      logger.exception(
+        "Failed to resolve storage backend for queue %r; starting clean.",
+        self.queue_name,
+      )
+      return
+    try:
+      state = storage.retrieve(self._snapshot_key())
+    except Exception:  # noqa: BLE001 — retrieve must not crash startup
+      logger.exception(
+        "Failed to retrieve strategy snapshot for queue %r; starting clean.",
+        self.queue_name,
+      )
+      return
+    # Only restore real bytes — None (no prior snapshot) or any non-bytes
+    # value (unexpected type / mock) is a no-op, never passed to restore().
+    if not isinstance(state, (bytes, bytearray)):
+      return
+    self._strategy.restore(bytes(state))
