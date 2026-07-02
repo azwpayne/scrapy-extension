@@ -611,13 +611,28 @@ class BackendQueue:
     self._strategy.close()
 
   #: Storage-key prefix for strategy snapshots (initiative #3). Full key is
-  #: ``<prefix><queue_name>`` — one snapshot per queue, overwritten on each
-  #: clean close, loaded once on startup. No TTL: the snapshot is cheap to
-  #: overwrite and represents last-shutdown state.
+  #: ``<prefix><spider.name>:<queue_name>`` when a named spider is attached
+  #: (initiative #16 — one snapshot per spider+queue, so two spiders sharing
+  #: a storage backend with the same ``queue_name`` cannot overwrite each
+  #: other's snapshot), or ``<prefix><queue_name>`` when no named spider is
+  #: present (test stubs, no-spider construction — pre-#16 shape). No TTL:
+  #: the snapshot is cheap to overwrite and represents last-shutdown state.
   _SNAPSHOT_KEY_PREFIX = "queue:snapshot:"
 
   def _snapshot_key(self) -> str:
-    """Build the storage key for this queue's strategy snapshot."""
+    """Build the storage key for this queue's strategy snapshot.
+
+    Includes the spider name when available so that two spiders sharing a
+    storage backend with the same ``queue_name`` (multi-spider in one
+    process, or multi-worker with shared Redis/Mongo/ES) cannot overwrite
+    each other's strategy snapshot on close — and on restart cannot restore
+    the wrong spider's Delay heap (initiative #16). When ``spider`` is
+    ``None`` or exposes no ``name`` attribute, falls back to
+    ``<prefix><queue_name>`` to preserve the pre-#16 key shape.
+    """
+    spider_name = getattr(self._spider, "name", None)
+    if spider_name:
+      return f"{self._SNAPSHOT_KEY_PREFIX}{spider_name}:{self.queue_name}"
     return f"{self._SNAPSHOT_KEY_PREFIX}{self.queue_name}"
 
   def _persist_snapshot(self) -> None:

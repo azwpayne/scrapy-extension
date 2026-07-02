@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from scrapy_extension.queue.queue import BackendQueue
@@ -290,3 +291,65 @@ def test_backends_queue_restore_skips_non_bytes_state():
   )
   # No crash, and strategy.restore was never handed the non-bytes value (held heap empty):
   assert strategy._holding == []
+
+
+# ---------------------------------------------------------------------------
+# Spider-scoped snapshot key (initiative #16)
+# ---------------------------------------------------------------------------
+
+
+def _make_queue_for_key(spider=None, queue_name="jobs"):
+  """Minimal BackendQueue for snapshot-key unit tests.
+
+  ``connection_manager`` is a spec-empty Mock so the queue can be constructed
+  without touching a real backend; only ``_snapshot_key()`` is exercised (a
+  pure derivation over ``self._spider`` / ``self.queue_name``).
+  """
+  return BackendQueue(
+    connection_manager=MagicMock(spec=[]),
+    queue_name=queue_name,
+    spider=spider,
+  )
+
+
+def test_snapshot_key_includes_spider_name():
+  """Two queues with the same queue_name but different spiders MUST produce
+  different snapshot keys (initiative #16: cross-spider snapshot isolation).
+
+  Regression: prior to #16 the key was ``<prefix><queue_name>`` only, so two
+  spiders sharing a storage backend (multi-spider in one process, or
+  multi-worker with shared Redis/Mongo/ES) overwrote each other's strategy
+  snapshot on close — and on restart the survivor restored the wrong spider's
+  Delay heap.
+  """
+  spider_a = SimpleNamespace(name="spiderA")
+  spider_b = SimpleNamespace(name="spiderB")
+
+  key_a = _make_queue_for_key(spider=spider_a, queue_name="jobs")._snapshot_key()
+  key_b = _make_queue_for_key(spider=spider_b, queue_name="jobs")._snapshot_key()
+
+  assert key_a != key_b
+  assert "spiderA" in key_a
+  assert "spiderB" in key_b
+  assert key_a.endswith(":jobs")
+  assert key_b.endswith(":jobs")
+
+
+def test_snapshot_key_without_spider_preserves_legacy_shape():
+  """A queue constructed without a spider keeps the pre-#16 key
+  ``queue:snapshot:<queue_name>`` — backward-compat for the no-spider
+  construction path used by the rest of this test module and by test stubs.
+  """
+  key = _make_queue_for_key(spider=None, queue_name="jobs")._snapshot_key()
+  assert key == "queue:snapshot:jobs"
+
+
+def test_snapshot_key_spider_without_name_attr_falls_back():
+  """A spider-like object without a ``name`` attribute falls back to the
+  queue_name-only key rather than raising ``AttributeError``.
+
+  Mirrors the defensive ``getattr`` chaining already used at
+  ``queue.py:561`` (``getattr(self._spider, "crawler", None)``).
+  """
+  key = _make_queue_for_key(spider=SimpleNamespace(), queue_name="jobs")._snapshot_key()
+  assert key == "queue:snapshot:jobs"

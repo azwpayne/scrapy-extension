@@ -184,7 +184,7 @@ What the library contractually promises — and just as importantly, what it doe
 | Layer | Strategy | Cross-worker safe? | Notes |
 |---|---|---|---|
 | Queue | `passthrough` (default) | Yes | Items live in the backend queue; atomic pop on every backend (`backends/base.py:359`). |
-| Queue | `delay` | Per-process | In-process `heapq`; **lost on crash**. `DelayQueueStrategy.close()` warns; soft-cap `max_held` warns once when exceeded (`queue/strategies/delay.py`). |
+| Queue | `delay` | Per-process | In-process `heapq`; **survives clean restart** via snapshot/restore persisted to the storage backend on `close()` (initiatives #3 / #13) — **lost on hard crash** (no `close()` runs). Snapshots are **spider-scoped** — key `queue:snapshot:<spider.name>:<queue_name>` (initiative #16) — so two spiders sharing a storage backend with the same `queue_name` cannot clobber each other's snapshot. Soft-cap `max_held` warns once when exceeded (`queue/strategies/delay.py`). |
 | Queue | `round_robin` | Per-process | Fair dispatch across `request.meta['source']` using a per-worker index. |
 | Queue | `throttle` | Per-process | Effective rate under N workers = `N × (1 / min_interval)`. |
 | Dedup | `set` (default) | Yes — exact | Backend `SADD`/`SISMEMBER` semantics; byte-identical to pre-strategy behavior (`dupefilter/filters/set_filter.py`). |
