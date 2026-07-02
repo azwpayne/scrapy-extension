@@ -11,8 +11,10 @@ from __future__ import annotations
 
 __all__ = ["DEFAULT_DELAY_MAX_HELD", "DelayQueueStrategy"]
 
+import base64
 import heapq
 import itertools
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -239,3 +241,88 @@ class DelayQueueStrategy(QueueStrategy):
         held,
       )
     self._holding.clear()
+
+  def snapshot(self) -> bytes | None:
+    """Serialize the holding heap for restart recovery (initiative #3).
+
+    Returns ``None`` when the heap is empty (nothing to persist). Otherwise
+    a versioned JSON blob: ``{"version":1,"strategy":"delay","items":[
+    {"ready_at":..,"item_b64":..,"priority":..},...]}``.
+
+    The ``seq`` tie-breaker is deliberately NOT persisted — it's a monotonic
+    process-local counter; :meth:`restore` re-sequences with a fresh ``_seq``,
+    preserving heap order (seq only breaks ``ready_at`` ties, and the
+    serialized list order preserves relative order among equal-``ready_at``
+    items, so the rebuilt heap is equivalent).
+    """
+    if not self._holding:
+      return None
+    items = [
+      {
+        "ready_at": ready_at,
+        "item_b64": base64.b64encode(item).decode("ascii"),
+        "priority": priority,
+      }
+      for ready_at, _seq, item, priority in self._holding
+    ]
+    return json.dumps(
+      {"version": 1, "strategy": "delay", "items": items}
+    ).encode("utf-8")
+
+  def restore(self, state: bytes | None) -> None:
+    """Re-populate the holding heap from a prior :meth:`snapshot` (initiative #3).
+
+    Past-ready items (``ready_at <= now``) stay in the heap and drain
+    naturally on the next :meth:`pop`. Corrupt or unknown-format state is
+    logged + skipped — restore never crashes the spider.
+
+    Args:
+        state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
+    """
+    if not state:
+      return
+    try:
+      data = json.loads(state.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+      logger.warning(
+        "DelayQueueStrategy restore: corrupt snapshot (%s); starting clean.", e
+      )
+      return
+    if (
+      not isinstance(data, dict)
+      or data.get("strategy") != "delay"
+      or data.get("version") != 1
+    ):
+      logger.warning(
+        "DelayQueueStrategy restore: unknown snapshot format "
+        "(strategy=%r, version=%r); starting clean.",
+        data.get("strategy") if isinstance(data, dict) else None,
+        data.get("version") if isinstance(data, dict) else None,
+      )
+      return
+    items = data.get("items")
+    if not isinstance(items, list):
+      logger.warning(
+        "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
+      )
+      return
+    recovered = 0
+    for entry in items:
+      if not isinstance(entry, dict):
+        continue
+      try:
+        ready_at = float(entry["ready_at"])
+        item = base64.b64decode(entry["item_b64"])
+        priority = float(entry["priority"])
+      except (KeyError, TypeError, ValueError) as e:
+        logger.warning(
+          "DelayQueueStrategy restore: skipping malformed entry (%s).", e
+        )
+        continue
+      heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
+      recovered += 1
+    if recovered:
+      logger.info(
+        "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",
+        recovered,
+      )
