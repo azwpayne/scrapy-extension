@@ -824,34 +824,44 @@ class ConnectionManager:
       shared by every wrapped interface returned from this manager, so a
       queue+set+storage on the same backend share one failure signal.
 
-    The Settings object is constructed lazily inside the lock so import-time
-    side effects (pydantic env scan) are deferred to first use — important
-    because this module is imported eagerly via ``backends/__init__`` and the
-    env may not be fully populated at import time.
+    The Settings object is constructed lazily (deferred to first use so the
+    pydantic env scan does not run at import time — important because this
+    module is imported eagerly via ``backends/__init__`` and the env may not
+    be fully populated at import time). The config read runs OUTSIDE
+    ``self._lock`` (initiative #15): the env scan is process-global
+    idempotent state, not connection-manager state, and this lock is shared
+    with ``get_manager()`` / ``close()`` / the A2 slow-path owner gate —
+    holding it across the scan serialized peer threads' warm-up. A lost race
+    constructs a second transient ``Settings()`` (GC'd); correct, and cheaper
+    than blocking every peer on the lock.
 
     Returns:
         The manager's breaker, or ``None`` when the feature is disabled.
     """
     if self._breaker_configured:
       return self._breaker
+    # Read the breaker config OUTSIDE self._lock (#15). Imported lazily to
+    # avoid a settings-module import cycle at module load time and to keep
+    # the breaker config read deferred to first use.
+    from scrapy_extension.settings import Settings
+
+    settings = Settings()
+    enabled = settings.circuit_breaker_enabled
+    failure_threshold = settings.circuit_breaker_failure_threshold
+    reset_timeout = settings.circuit_breaker_reset_timeout
     with self._lock:
       if self._breaker_configured:
         return self._breaker
-      # Imported lazily to avoid a settings-module import cycle at module
-      # load time and to keep the breaker config read deferred to first use.
-      from scrapy_extension.settings import Settings
-
-      settings = Settings()
-      if settings.circuit_breaker_enabled:
-        bt_key = (
-          self.backend_type.value
-          if isinstance(self.backend_type, BackendType)
-          else self.backend_type
-        )
+      bt_key = (
+        self.backend_type.value
+        if isinstance(self.backend_type, BackendType)
+        else self.backend_type
+      )
+      if enabled:
         self._breaker = CircuitBreaker(
           name=f"{bt_key}-backend",
-          failure_threshold=settings.circuit_breaker_failure_threshold,
-          reset_timeout=settings.circuit_breaker_reset_timeout,
+          failure_threshold=failure_threshold,
+          reset_timeout=reset_timeout,
         )
       else:
         self._breaker = None
