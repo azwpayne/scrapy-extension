@@ -193,3 +193,31 @@ def test_nack_with_token_keeps_nonmatching_last_delivery_tag() -> None:
   backend._last_delivery_tag = 99  # different from the token below
   backend.nack("q", token=5)
   assert backend._last_delivery_tag == 99  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Niche edge case (initiative #33 — extending #30)
+# ---------------------------------------------------------------------------
+
+
+def test_connect_mirrored_queues_omits_ha_sync_mode_when_unset(mocker) -> None:
+  """Line 334->337: when ``ha_mode`` is set but ``ha_sync_mode`` is unset,
+  the ha-sync-mode key is omitted from the HA-policy definition (the
+  ``if ha_sync_mode:`` false branch falls past line 335 to the debug log).
+  Uses the same pika-mock pattern as the _connect_cluster cleanup test."""
+  mock_conn = MagicMock(name="connection")
+  mock_channel = MagicMock(name="channel")
+  mock_conn.channel.return_value = mock_channel
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=mock_conn,
+  )
+  mocker.patch.object(
+    RabbitMQBackend, "_build_common_parameters", return_value=MagicMock(name="params")
+  )
+  mocker.patch.object(RabbitMQBackend, "_apply_qos")  # succeeds -> no cleanup path
+  backend = _backend()
+  backend.config.ha_mode = "all"
+  backend.config.ha_sync_mode = None  # force the false branch at line 334
+  backend._connect_mirrored_queues()  # builds definition; omits ha_sync_mode (334 false)
+  assert backend._channel is mock_channel  # connect committed, no exception
