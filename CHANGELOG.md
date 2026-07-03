@@ -45,6 +45,15 @@ upgrading.
   **Additive:** registered 3rd-party backend strings (entry-point group
   `scrapy_extension.backends`) are now ACCEPTED at the Settings layer — they
   were previously rejected as `ValidationError`, contradicting round-5 R5-1.
+- **`BackendQueue` strategy snapshots are now scoped by `(spider.name, queue_name)`** (#16).
+  The snapshot storage key changed from `queue:snapshot:<queue_name>` to
+  `queue:snapshot:<spider.name>:<queue_name>`. Two spiders sharing a storage
+  backend with the same `queue_name` previously overwrote each other's
+  `Delay`-strategy snapshot on close (and on restart one restored the wrong
+  spider's held heap). **BREAKING for multi-spider deployments**: legacy
+  snapshots under the old key are orphaned on upgrade (ignored, not restored);
+  no migration is provided because the prior format (#13) shipped immediately
+  before this fix. Single-spider deployments are unaffected.
 
 ### Added
 
@@ -143,6 +152,13 @@ upgrading.
   removed). Distributions now bundle the license text.
 - `uv_build` build-system pin widened to `<0.12` (was `<0.11.0`, which
   excluded uv 0.11 and could break builds in uv-0.11-only environments).
+- **`ConnectionManager` breaker-config read hoisted out of the instance lock** (#15,
+  performance). The per-manager circuit-breaker config read (`Settings()` — a
+  pydantic env scan) ran inside `self._lock`, serializing peer
+  `get_manager` / `close` warm-up. The read now runs above the lock;
+  double-checked-lock construction stays lock-protected. Behavior is
+  byte-identical — no observable change beyond reduced lock contention under
+  concurrent manager resolution.
 
 ### Fixed
 
@@ -184,6 +200,16 @@ upgrading.
   local-state check, not a broker round-trip.
 - Kafka `pop()` re-subscribed the consumer on every call (even for the
   same queue); now caches the subscription, mirroring RocketMQ's pattern.
+- **Multi-backend isolation: hardened `ConnectionManager` registry key** (#14).
+  The registry key used `json.dumps(settings, default=str)`, whose lossy
+  `str()` could collapse two semantically-different settings to one key (e.g.
+  `datetime(2024,1,1)` and the string `"2024-01-01 00:00:00"`), silently
+  sharing one connection manager (wrong backend conn / wrong DB index). The
+  `default` now type-tags non-JSON values so distinct types render distinctly;
+  pure-JSON settings keys are byte-identical to the prior form (backward
+  compatible). The `except` fallback was also hardened — the old
+  `str(sorted(settings.items()))` raised on mixed-type dict keys, masking the
+  real settings behind a `TypeError`.
 
 ### Removed
 
