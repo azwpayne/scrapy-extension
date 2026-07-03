@@ -196,15 +196,17 @@ def test_nack_with_token_keeps_nonmatching_last_delivery_tag() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Niche edge case (initiative #33 — extending #30)
+# _connect_mirrored_queues HA-policy honesty (initiative #34 — functional fix)
 # ---------------------------------------------------------------------------
 
 
-def test_connect_mirrored_queues_omits_ha_sync_mode_when_unset(mocker) -> None:
-  """Line 334->337: when ``ha_mode`` is set but ``ha_sync_mode`` is unset,
-  the ha-sync-mode key is omitted from the HA-policy definition (the
-  ``if ha_sync_mode:`` false branch falls past line 335 to the debug log).
-  Uses the same pika-mock pattern as the _connect_cluster cleanup test."""
+def test_connect_mirrored_queues_warns_ha_policy_not_applied(mocker, caplog) -> None:
+  """#34: when ``ha_mode`` is configured, connect emits a WARNING that the
+  HA policy is NOT applied via AMQP (must be set out-of-band via
+  rabbitmqctl/management) — so an operator doesn't operate under the false
+  impression this client applied it. Previously the dict was built into a
+  local ``definition`` and only logged at DEBUG as 'Configured', which was
+  misleading and left the policy silently unset."""
   mock_conn = MagicMock(name="connection")
   mock_channel = MagicMock(name="channel")
   mock_conn.channel.return_value = mock_channel
@@ -218,6 +220,26 @@ def test_connect_mirrored_queues_omits_ha_sync_mode_when_unset(mocker) -> None:
   mocker.patch.object(RabbitMQBackend, "_apply_qos")  # succeeds -> no cleanup path
   backend = _backend()
   backend.config.ha_mode = "all"
-  backend.config.ha_sync_mode = None  # force the false branch at line 334
-  backend._connect_mirrored_queues()  # builds definition; omits ha_sync_mode (334 false)
-  assert backend._channel is mock_channel  # connect committed, no exception
+  with caplog.at_level(logging.WARNING):
+    backend._connect_mirrored_queues()
+  assert any("NOT applied via AMQP" in r.message for r in caplog.records)
+  assert backend._channel is mock_channel  # connect committed
+
+
+def test_connect_mirrored_queues_no_warning_when_ha_mode_unset(mocker, caplog) -> None:
+  """Early-return branch: when ``ha_mode`` is unset (default), the HA block
+  is skipped cleanly after ``_connect_cluster`` — no warning emitted."""
+  mock_conn = MagicMock(name="connection")
+  mock_conn.channel.return_value = MagicMock(name="channel")
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=mock_conn,
+  )
+  mocker.patch.object(
+    RabbitMQBackend, "_build_common_parameters", return_value=MagicMock(name="params")
+  )
+  mocker.patch.object(RabbitMQBackend, "_apply_qos")
+  backend = _backend()  # ha_mode stays unset (default)
+  with caplog.at_level(logging.WARNING):
+    backend._connect_mirrored_queues()
+  assert not any("NOT applied via AMQP" in r.message for r in caplog.records)
