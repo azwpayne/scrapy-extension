@@ -170,6 +170,13 @@ upgrading.
   interface is deprecated`` on every 3.10/3.11 run and was removed in 3.12.
   Collapsed to keyword-only; the version branch, ``import sys``, and the
   dual-shape Test 7 contract were removed.
+- **Removed unreachable ``isinstance(e, (KeyboardInterrupt, SystemExit))`` re-raise inside
+  ``ConnectionManager.connect()``'s ``except Exception`` block** (#39). The check was dead
+  code — ``KeyboardInterrupt``/``SystemExit`` inherit from ``BaseException`` (not ``Exception``),
+  so ``except Exception`` never catches them and the inner ``isinstance`` could never match.
+  Behavior is unchanged (KI/SystemExit still propagate via not being caught); 4 surrounding
+  coverage gaps on the hot-path module closed (96.28% → 98.55% reliable; remaining gap is
+  non-deterministic concurrency-path coverage on ``get_backend()``, behaviorally tested by T9).
 - Redis ZSET member collision silently dropping identical payloads.
 - `BackendQueue.pop` losing callback/errback on deserialization (spider
   passthrough).
