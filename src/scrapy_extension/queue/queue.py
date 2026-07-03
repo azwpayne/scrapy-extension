@@ -305,6 +305,12 @@ class BackendQueue:
     try:
       request_dict = cast("dict[str, Any]", self._serializer.deserialize(data))
       self._decode_body(request_dict)
+      # Coerce priority to int: newer Scrapy rejects float priority at Request
+      # __init__ (``TypeError: Request priority not an integer: 0.0``). JSON
+      # round-trip and some backends (ES stores priority as a float field) can
+      # hand back 0.0 even when the original request.priority was int 0.
+      if "priority" in request_dict and request_dict["priority"] is not None:
+        request_dict["priority"] = int(request_dict["priority"])
       request = request_from_dict(request_dict, spider=self._spider)
     except Exception as e:
       # R14-D: emit on_error so deserialize failures surface as ``errors/pop``
