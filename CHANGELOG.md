@@ -162,6 +162,14 @@ upgrading.
 
 ### Fixed
 
+- **Registry entry-point discovery no longer emits 5 ``SelectableGroups`` deprecation warnings** (#38).
+  ``_discover_entry_points`` branched on ``sys.version_info`` to use the legacy
+  ``entry_points().get(group, [])`` dict form on Python 3.10/3.11 — based on the
+  false premise that ``entry_points(group=...)`` was unavailable before 3.12 (it
+  has been available since 3.10). The dict form emitted ``SelectableGroups dict
+  interface is deprecated`` on every 3.10/3.11 run and was removed in 3.12.
+  Collapsed to keyword-only; the version branch, ``import sys``, and the
+  dual-shape Test 7 contract were removed.
 - Redis ZSET member collision silently dropping identical payloads.
 - `BackendQueue.pop` losing callback/errback on deserialization (spider
   passthrough).
