@@ -69,7 +69,7 @@ services:
       test:
         - "CMD-SHELL"
         - >-
-          curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s
+          curl -fsS "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s"
           | grep -Eq '"status":"(green|yellow)"'
       interval: 10s
       timeout: 5s
@@ -94,7 +94,10 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      CLUSTER_ID: scrapy-ext-kafka-cluster
+      # Must be a base64-encoded 16-byte UUID (Confluent KRaft requirement);
+      # a bare string like 'scrapy-ext-kafka-cluster' fails preflight with
+      # 'decoded as 18 bytes, which is not equal to the expected 16 bytes'.
+      CLUSTER_ID: oM04yXP7QHCNVaw5CeHcwA==
     healthcheck:
       test:
         - "CMD-SHELL"

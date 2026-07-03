@@ -158,6 +158,7 @@ class TestQueue:
       id="1",
       if_seq_no=42,
       if_primary_term=1,
+      refresh="wait_for",
     )
 
   def test_pop_retries_on_conflict(self, mocker):
