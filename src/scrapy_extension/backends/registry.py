@@ -37,7 +37,6 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import re
-import sys
 import warnings
 from dataclasses import dataclass
 from typing import Final
@@ -170,12 +169,14 @@ _registry_cache: dict[str, BackendDescriptor] | None = None
 def _discover_entry_points() -> dict[str, BackendDescriptor]:
   """Discover 3rd-party backend descriptors via ``importlib.metadata``.
 
-  Handles BOTH the Python 3.12+ entry-points API
-  (``entry_points(group=...)``) and the legacy 3.10/3.11 shape
-  (``entry_points().get(group, [])``). The ``sys.version_info`` branch is
-  purely defensive — modern interpreters support the kwarg form — but
-  keeps the call robust on older minor versions that this project supports
-  (``requires-python = ">=3.10"``).
+  Uses the modern ``entry_points(group=...)`` keyword API, available on
+  every supported Python (>=3.10). The former ``sys.version_info < (3, 12)``
+  branch — which used the legacy dict shape ``entry_points().get(group, [])``
+  — was based on the false premise that the keyword form was unavailable
+  before 3.12; it has been available since 3.10. The dict fallback emitted
+  ``SelectableGroups dict interface is deprecated`` on every 3.10/3.11 run
+  (5 warnings in the suite) and the dict interface was removed in 3.12.
+  Keyword-only is correct, universal, and warning-free.
 
   Each entry-point's registration callable is invoked via ``ep.load()``.
   A broken callable (any ``Exception`` — typically ``ImportError`` when a
@@ -192,14 +193,17 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
       bundled-wins precedence.
   """
   try:
-    if sys.version_info >= (3, 12):
-      eps: list[importlib.metadata.EntryPoint] = list(
-        importlib.metadata.entry_points(group=_ENTRY_POINT_GROUP)
-      )
-    else:
-      eps = list(
-        importlib.metadata.entry_points().get(_ENTRY_POINT_GROUP, [])
-      )
+    # ``entry_points(group=...)`` is the modern select-by-group API,
+    # available on every supported Python (>=3.10). The legacy dict form
+    # ``entry_points().get(group, [])`` was formerly used on a
+    # ``sys.version_info < (3, 12)`` branch, but the keyword form has been
+    # available since 3.10 — the branch was based on a false premise and
+    # emitted ``SelectableGroups dict interface is deprecated`` on every
+    # 3.10/3.11 run (5 warnings in the suite). Keyword-only removes both
+    # the version branch and the deprecation noise.
+    eps: list[importlib.metadata.EntryPoint] = list(
+      importlib.metadata.entry_points(group=_ENTRY_POINT_GROUP)
+    )
   except Exception:  # noqa: BLE001 - registry discovery must never crash callers
     logger.warning(
       "Failed to enumerate entry-points for group %r; skipping 3rd-party "
