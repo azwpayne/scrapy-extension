@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends.base import (
   Backend,
@@ -318,7 +318,10 @@ class RocketMQBackend(Backend, QueueBackend):
     if msg is None:
       return None
     self._last_msg = msg
-    return msg.body
+    # rocketmq-client-python ships no inline stubs -> ``msg.body`` is ``Any``;
+    # cast to the documented ``bytes`` contract so the ``-> bytes | None``
+    # declaration holds under mypy --strict (U8) without an Any-leak.
+    return cast("bytes", msg.body)
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
