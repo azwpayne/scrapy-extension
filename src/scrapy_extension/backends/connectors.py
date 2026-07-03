@@ -553,9 +553,11 @@ class ConnectionManager:
       except Exception as e:
         # Intentional broad catch: any backend connection error should trigger retry.
         # Backend-specific exceptions (RedisError, PyMongoError, KafkaError, AMQPError)
-        # all inherit from Exception. Explicitly re-raise KeyboardInterrupt/SystemExit.
-        if isinstance(e, (KeyboardInterrupt, SystemExit)):
-          raise
+        # all inherit from Exception. KeyboardInterrupt/SystemExit inherit from
+        # BaseException (not Exception), so ``except Exception`` does NOT catch them
+        # — they propagate out of the retry loop naturally. (A prior ``isinstance(e,
+        # (KeyboardInterrupt, SystemExit)): raise`` here was unreachable dead code:
+        # nothing caught by ``except Exception`` can be an instance of either.)
         last_exception = e
         logger.warning(
           "Connection attempt %d/%d failed: %s", attempt + 1, retry_attempts, e
