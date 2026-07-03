@@ -54,6 +54,7 @@ import uuid
 
 import pytest
 
+
 def _rocketmq_client_loads() -> bool:
   """Probe whether the rocketmq client + native lib are usable.
 

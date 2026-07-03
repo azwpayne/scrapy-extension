@@ -208,17 +208,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "created_at": datetime.now(tz=timezone.utc).isoformat(),
     }
     try:
-      # ``refresh="wait_for"`` blocks until the next natural refresh (within
-      # ES's ~1s interval) so the doc is searchable by the immediately
-      # following ``pop`` / ``queue_len``. Without this, ES 8.x's default
-      # refresh interval makes pushed items invisible to search-based reads
-      # for up to a second — breaking the queue's push→pop consistency
-      # contract. ``wait_for`` is cheaper than ``refresh=True`` (no forced
-      # refresh, just waits for the scheduled one) and is ES's recommended
-      # read-your-writes pattern.
-      self.client.index(
-        index=self.config.queue_index, document=doc, refresh="wait_for"
-      )
+      # No ``refresh`` on write — read-your-writes is enforced at the READ
+      # side (pop/count call ``indices.refresh`` first), which amortizes one
+      # forced refresh per read instead of ~1s per push. The per-push
+      # ``refresh="wait_for"`` was a ~250x perf regression (1010ms/push vs
+      # 4ms without — see bench_es_push_refresh.py); ES does not batch
+      # ``wait_for`` across consecutive pushes, so each one pays the full
+      # refresh-interval wait.
+      self.client.index(index=self.config.queue_index, document=doc)
     except TransportError as e:
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
@@ -248,6 +245,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     max_attempts = 3
     for _attempt in range(max_attempts):
       try:
+        # Force one refresh before searching so recent pushes AND deletes
+        # from prior pops are visible. Forced ``indices.refresh`` is ms-scale
+        # (just flushes the indexing buffer to a segment) — far cheaper than
+        # the per-push ``refresh="wait_for"`` it replaces (which blocked ~1s
+        # per push). Amortized: N fast pushes + 1 refresh per read.
+        self.client.indices.refresh(index=self.config.queue_index)
         resp = self.client.search(
           index=self.config.queue_index,
           # ``.keyword`` subfield for exact match: the dynamic mapping makes
@@ -269,19 +272,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           return None
         doc = hits[0]
         try:
+          # No ``refresh`` on delete — the NEXT pop's pre-search refresh
+          # (above) flushes this delete, so the search won't re-find the doc.
           self.client.delete(
             index=self.config.queue_index,
             id=doc["_id"],
             if_seq_no=doc["_seq_no"],
             if_primary_term=doc["_primary_term"],
-            # ``refresh="wait_for"`` so the NEXT pop's search doesn't return
-            # this just-deleted doc. Without it, ES's ~1s refresh interval
-            # leaves the deleted doc in the search index; the retry loop
-            # re-finds it, the delete conflicts (already gone), and after
-            # ``max_attempts`` the pop returns None even though items remain
-            # — the exact ``[None, None, None]`` failure the integration
-            # suite caught. Pairs with push's ``refresh="wait_for"``.
-            refresh="wait_for",
           )
         except ConflictError:
           # Lost the race to another worker — retry to find the next item.
@@ -356,15 +353,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "created_at": datetime.now(tz=timezone.utc).isoformat(),
     }
     try:
-      # ``refresh="wait_for"`` so a subsequent ``contains`` / ``set_len``
-      # (search-based) sees the just-added member — same read-your-writes
-      # rationale as ``push``.
+      # No ``refresh`` on write — ``contains`` is by-id (immediately
+      # consistent); ``set_len`` refreshes in ``_count``. Same amortized
+      # read-refresh rationale as push.
       self.client.index(
         index=self.config.set_index,
         id=doc_id,
         document=doc,
         op_type="create",
-        refresh="wait_for",
       )
     except ConflictError:
       return False
@@ -537,6 +533,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Number of matching documents.
     """
     try:
+      # Forced refresh so just-written docs (push/add don't refresh) are
+      # searchable — same amortized-read-refresh rationale as pop.
+      self.client.indices.refresh(index=index)
       # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
       # ``set_name`` are dynamically mapped as ``text``; count must match the
       # exact (unanalyzed) value via the keyword subfield.
