@@ -20,7 +20,7 @@ from scrapy_extension.backends.kafka import (
   _validate_topic_name,
 )
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
-from scrapy_extension.settings import KafkaSettings
+from scrapy_extension.settings import KafkaMode, KafkaSettings
 
 
 def _backend() -> KafkaBackend:
@@ -219,3 +219,45 @@ def test_queue_len_returns_zero_on_temp_consumer_kafka_error(mocker) -> None:
   mock_temp.end_offsets.side_effect = KafkaError("end_offsets boom")
   mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer", return_value=mock_temp)
   assert backend.queue_len("q") == 0
+
+
+# ---------------------------------------------------------------------------
+# Niche edge cases (initiative #33 — completing kafka to 100%)
+# ---------------------------------------------------------------------------
+
+
+def test_build_client_security_config_confluent_without_keys_falls_through(mocker) -> None:
+  """Line 268->280: CONFLUENT mode WITHOUT both confluent_api_key +
+  confluent_api_secret falls through the SASL_SSL branch to the
+  common-config subset (a half-configured CONFLUENT backend must not
+  hand the consumer a partial SASL dict)."""
+  backend = _backend()
+  backend.config.mode = KafkaMode.CONFLUENT  # confluent keys stay None (default)
+  mocker.patch.object(
+    backend, "_build_common_config", return_value={"security_protocol": "PLAINTEXT"}
+  )
+  result = backend._build_client_security_config()
+  # Fell through to the common-config subset, NOT the SASL_SSL dict:
+  assert result == {"security_protocol": "PLAINTEXT"}
+  assert "sasl_plain_password" not in result
+
+
+def test_pop_with_ack_returns_none_tuple_when_queue_empty(mocker) -> None:
+  """Line 517: pop_with_ack on an empty queue (``_poll_record`` returned
+  None) returns ``(None, None)`` — the empty-queue sentinel before any
+  token / in-flight bookkeeping."""
+  backend = _backend()
+  mocker.patch.object(backend, "_poll_record", return_value=None)
+  assert backend.pop_with_ack("q", 0.0) == (None, None)
+
+
+def test_poll_record_returns_none_when_poll_yields_empty_records(mocker) -> None:
+  """Line 584->583: when ``consumer.poll`` returns a non-empty messages
+  dict whose record list IS empty (a TP key with no records — common
+  during long-poll idle), the inner loop doesn't iterate and _poll_record
+  falls through to return None rather than mishandling the empty batch."""
+  backend = _backend()
+  backend._consumer = mocker.MagicMock()
+  # Non-empty dict (one TopicPartition) but an EMPTY record list:
+  backend._consumer.poll.return_value = {mocker.MagicMock(name="tp"): []}
+  assert backend._poll_record("q", 0.0) is None
