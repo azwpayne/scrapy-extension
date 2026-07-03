@@ -92,9 +92,11 @@ class RoundRobinQueueStrategy(QueueStrategy):
     del queue_name, timeout
     while self._sources:
       rotation = list(self._sources)
+      # n >= 1 is an invariant of the ``while self._sources`` condition (a
+      # truthy OrderedDict has at least one key), so the rotation is always
+      # non-empty here — the dead ``if n == 0: return None`` guard that lived
+      # here was removed as provably unreachable (initiative #23).
       n = len(rotation)
-      if n == 0:
-        return None
       idx = self._idx % n
       source = rotation[idx]
       dq = self._sources[source]
