@@ -285,3 +285,29 @@ upgrading.
 
 - **Added:** `docs/insight/SPEC-round8-settings-validation.md` — 34-footgun
   settings-validation hunt resolved into 5 executable units (SV1–SV5).
+
+### Round 10 — backlog merge sweep (2026-07-04)
+
+Twelve previously-stalled feature branches — verified conflict-free (zero
+source-file overlap) — merged to `main` in one gate-green sweep. **`mypy --strict`
+is now clean across all 67 source files** (was 1 error on `rocketmq.py:321`);
+pytest +84 cases (1762 → 1846); ruff and bandit both clean.
+
+- **Security (#35):** `bandit` reports 0 active findings. Three LOW-severity
+  items accepted with `# nosec` annotations matching the existing pattern
+  (`BACKEND_ACK_TOKEN_META_KEY` B105 — a `request.meta` key name, not a
+  credential; two type-narrowing `assert`s B101).
+- **Changed (#34):** RabbitMQ `MIRRORED_QUEUES` mode now emits a `WARNING`
+  that the HA policy is NOT applied via AMQP — operators must set it
+  out-of-band (`rabbitmqctl set_policy`). The prior `DEBUG` log + dead
+  policy dict falsely implied mirroring was active.
+- **Fixed — type safety (#36):** `mypy --strict` is clean. The last internal
+  `Any`-leak (`rocketmq` `msg.body`, declared `-> bytes | None`) is closed
+  with a typed `cast`; the `py.typed` strict-mode promise (U8) now fully holds.
+- **Internal — coverage to 100% per module (#23–#32):** every backend module
+  now at 100% statement + branch coverage. `_redact` contract (#24),
+  `BackendQueue` resilience (#25), RocketMQ connect + TOCTOU race guards
+  (#26), SQS contract + resilience (#27), DynamoDB contract + resilience
+  (#28), Kafka resilience (#29), ElasticSearch contract + resilience (#31),
+  Pulsar resilience + contract (#32). Round-robin dead-code removal +
+  safety-net characterization (#23).
