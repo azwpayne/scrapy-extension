@@ -677,7 +677,10 @@ class BackendScheduler:
           # whenever _pause_at is non-None; bind a narrowed local for the type
           # checker (the attribute itself stays int | None).
           resume_at = self._resume_at
-          assert resume_at is not None
+          # bandit B101 accepted — type-checker narrowing (_resume_at
+          # defaults to _pause_at in __init__, so non-None here), not a
+          # security control.
+          assert resume_at is not None  # nosec B101
           if not self._backpressure_paused and depth >= self._pause_at:
             self._backpressure_paused = True
             if self.stats:

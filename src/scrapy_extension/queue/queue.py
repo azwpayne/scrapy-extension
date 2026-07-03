@@ -39,7 +39,7 @@ DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
 #: (Kafka, RabbitMQ) set it to a backend-specific token so the scheduler can
 #: ack the *specific* message that produced this request — correct under
 #: ``CONCURRENT_REQUESTS > 1``.
-BACKEND_ACK_TOKEN_META_KEY = "_backend_ack_token"
+BACKEND_ACK_TOKEN_META_KEY = "_backend_ack_token"  # nosec B105
 
 
 class BackendQueue:
