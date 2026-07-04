@@ -1026,6 +1026,18 @@ class TestR14BBackendTypeThirdPartyString:
     # setting_name must be populated for downstream log handlers.
     assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
 
+  def test_non_string_backend_type_raises_configuration_error(self) -> None:
+    """Non-str, non-BackendType input (e.g. int) → ``ConfigurationError``,
+    NOT pydantic ``ValidationError`` — consistent exception family.
+
+    Covers the validator's final ``raise`` (the non-str/non-BackendType branch).
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+      Settings(backend_type=42)  # type: ignore[arg-type]
+    assert not isinstance(exc_info.value, ValidationError)
+    assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
+    assert exc_info.value.setting_value == 42
+
 
 class _FakeBackend:
   """Stub backend pointed at by the fake 3rd-party entry-point above."""

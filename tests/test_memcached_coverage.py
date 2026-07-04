@@ -49,6 +49,30 @@ class TestMemcachedErrorPaths:
     client.stats.side_effect = RuntimeError("down")
     assert b.ping() is False
 
+  def test_ping_false_when_not_connected(self) -> None:
+    """ping() returns False before connect() (client is None)."""
+    from scrapy_extension.settings.memcached import MemcachedSettings
+
+    b = memcached_mod.MemcachedBackend(MemcachedSettings())
+    assert b.ping() is False
+
+  def test_ping_true_when_stats_succeeds(self, mocker) -> None:
+    """ping() returns True when stats() succeeds (the happy path)."""
+    b, client = _connected(mocker)
+    client.stats.return_value = {"stat_key": "stat_val"}
+    assert b.ping() is True
+
+  def test_disconnect_before_connect_is_noop(self) -> None:
+    """disconnect() before connect() (client is None) is a safe no-op.
+
+    Covers the False branch of ``disconnect``'s ``if self._client is not None``.
+    """
+    from scrapy_extension.settings.memcached import MemcachedSettings
+
+    b = memcached_mod.MemcachedBackend(MemcachedSettings())
+    b.disconnect()  # client is None — must not raise
+    assert b._client is None
+
   def test_disconnect(self, mocker) -> None:
     b, client = _connected(mocker)
     b.disconnect()
