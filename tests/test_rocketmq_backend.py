@@ -671,10 +671,24 @@ def test_extract_body_str_encodes() -> None:
 
 
 def test_is_connected_false_when_is_running_raises(mocker) -> None:
-  """is_connected swallows a client is_running() failure and returns False
-  (defensive — is_connected must never raise)."""
-  backend, mock_producer, _, _ = _make_connected_backend(mocker)
-  mock_producer.is_running.side_effect = RuntimeError("client closed")
+  """is_connected swallows a client is_running access failure and returns
+  False (defensive — is_connected must never raise).
+
+  ``is_running`` is a bool PROPERTY on the apache client; we swap in a tiny
+  stand-in whose property raises (MagicMock's auto-child protocol defeats
+  PropertyMock, so a real object is the clean way to exercise the branch).
+  """
+
+  class _RaisingProducer:
+    @property
+    def is_running(self) -> bool:
+      raise RuntimeError("client closed")
+
+    def shutdown(self) -> None:
+      pass
+
+  backend, _, _, _ = _make_connected_backend(mocker)
+  backend._producer = _RaisingProducer()
 
   assert backend.is_connected() is False
 

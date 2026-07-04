@@ -186,11 +186,10 @@ class RocketMQBackend(Backend, QueueBackend):
     """
     if self._producer is None or self._consumer is None:
       return False
-    # apache clients expose ``is_running()`` after startup.
+    # apache clients expose ``is_running`` as a BOOL PROPERTY (not a method)
+    # — True after startup(), False after shutdown().
     try:
-      return bool(
-        self._producer.is_running() and self._consumer.is_running()
-      )
+      return bool(self._producer.is_running and self._consumer.is_running)
     except Exception:  # noqa: BLE001 - is_connected must not raise
       return False
 
