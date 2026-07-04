@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
@@ -210,3 +211,119 @@ class TestDelayQueueStrategy:
     call = mock_connection_manager.get_queue_backend().push.call_args
     priority_arg = call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
     assert priority_arg == 0.0
+
+
+class TestSnapshotRestore:
+  """Snapshot/restore (initiative #3): restore must be robust to every
+  corrupt/malformed snapshot shape — it logs + skips, never crashes the spider.
+
+  Covers the full ``restore()`` defensive surface (delay.py lines 272-325):
+  empty state, corrupt JSON, unknown format, items-not-a-list, non-dict entry,
+  malformed entry fields, zero-recovered.
+  """
+
+  def test_snapshot_empty_returns_none(self, mock_connection_manager) -> None:
+    """An empty holding heap snapshots to None (no state to persist)."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    assert strat.snapshot() is None
+
+  def test_snapshot_roundtrip_restores_held_items(
+    self, mock_connection_manager
+  ) -> None:
+    """Happy path: snapshot a strategy with held items, restore into a fresh
+    strategy → the held items are recovered (covers the ``if recovered`` info
+    branch + the well-formed-entry path)."""
+    strat = DelayQueueStrategy(mock_connection_manager, default_delay=10.0)
+    strat.push("q", b"item-a", priority=1.0)
+    strat.push("q", b"item-b", priority=2.0)
+    assert len(strat._holding) == 2
+    state = strat.snapshot()
+    assert state is not None
+
+    fresh = DelayQueueStrategy(mock_connection_manager)
+    fresh.restore(state)
+    assert len(fresh._holding) == 2
+    recovered_items = {entry[2] for entry in fresh._holding}
+    assert recovered_items == {b"item-a", b"item-b"}
+
+  def test_restore_none_is_noop(self, mock_connection_manager) -> None:
+    """restore(None) and restore(b'') return without touching the heap."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    strat.restore(None)
+    strat.restore(b"")
+    assert len(strat._holding) == 0
+
+  def test_restore_corrupt_json_warns_and_starts_clean(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    """Non-JSON / non-UTF-8 bytes → warning + clean start (no crash)."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+      strat.restore(b"\xff\xfe not valid json")
+    assert any("corrupt snapshot" in r.message for r in caplog.records)
+    assert len(strat._holding) == 0
+
+  def test_restore_unknown_format_warns(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    """Valid JSON but wrong strategy/version → unknown-format warning."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    bogus = json.dumps({"version": 99, "strategy": "other", "items": []}).encode()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+      strat.restore(bogus)
+    assert any("unknown snapshot format" in r.message for r in caplog.records)
+
+  def test_restore_items_not_a_list_warns(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    """``items`` present but not a list → warning + clean start."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    bogus = json.dumps(
+      {"version": 1, "strategy": "delay", "items": "not-a-list"}
+    ).encode()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+      strat.restore(bogus)
+    assert any("'items' not a list" in r.message for r in caplog.records)
+
+  def test_restore_non_dict_entry_skipped(
+    self, mock_connection_manager
+  ) -> None:
+    """A non-dict entry in ``items`` is silently skipped (the ``continue``)."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    items = ["not-a-dict", 42, None]  # all non-dict → all skipped
+    bogus = json.dumps(
+      {"version": 1, "strategy": "delay", "items": items}
+    ).encode()
+    strat.restore(bogus)
+    assert len(strat._holding) == 0
+
+  def test_restore_malformed_entry_skipped_with_warning(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    """An entry missing required keys / wrong types → warning + skip."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    items = [
+      {"ready_at": 1.0},  # missing item_b64 + priority
+      {"ready_at": "not-a-float", "item_b64": "Yg==", "priority": 1.0},
+    ]
+    bogus = json.dumps(
+      {"version": 1, "strategy": "delay", "items": items}
+    ).encode()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+      strat.restore(bogus)
+    assert any("malformed entry" in r.message for r in caplog.records)
+    assert len(strat._holding) == 0  # both entries malformed → none recovered
+
+  def test_restore_zero_recovered_no_info_log(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    """When 0 items recover (all entries skipped), the recovery info-log is
+    NOT emitted (covers the ``if recovered`` False branch)."""
+    strat = DelayQueueStrategy(mock_connection_manager)
+    items = ["non-dict-entry"]  # skipped → recovered stays 0
+    bogus = json.dumps(
+      {"version": 1, "strategy": "delay", "items": items}
+    ).encode()
+    with caplog.at_level(logging.INFO, logger="scrapy_extension.queue.strategies.delay"):
+      strat.restore(bogus)
+    assert not any("recovered" in r.message for r in caplog.records)
