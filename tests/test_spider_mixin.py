@@ -455,6 +455,94 @@ class TestBuildBackendSettings:
     assert result["access_key"] == "AK"
     assert result["secret_key"] == "SK"
 
+  def test_rocketmq_namesrv_address_only(self):
+    """namesrv set, access/secret unset → only namesrv shortcut present.
+
+    Covers the False branches of the access_key/secret_key ``is not None``
+    guards (the all-set case is exercised by ``test_rocketmq_shortcuts``).
+    """
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ROCKETMQ
+      rocketmq_namesrv_address = "rmq:9876"
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result == {"namesrv_address": "rmq:9876"}
+
+  def test_rocketmq_access_key_without_secret(self):
+    """access_key set, secret unset → secret_key guard takes the False branch."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ROCKETMQ
+      rocketmq_namesrv_address = "rmq:9876"
+      rocketmq_access_key = "AK"
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result == {"namesrv_address": "rmq:9876", "access_key": "AK"}
+
+  def test_rocketmq_all_attrs_unset_yields_empty(self):
+    """No rocketmq shortcut attrs set → empty dict (all three guards False)."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ROCKETMQ
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result == {}
+
+  def test_dispatch_accepts_backend_type_as_plain_string(self):
+    """``backend_type`` may be a registry-key string (round-5 R5-1:
+    resolve_backend_config returns strings), not just a BackendType enum.
+    The dispatch must resolve "redis" the same as BackendType.REDIS.
+    """
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      # plain string, not the enum — runtime dispatch accepts both (the
+      # class attr is typed BackendType | None, but _build_backend_settings
+      # deliberately handles plain strings per round-5 R5-1).
+      backend_type = "redis"  # type: ignore[assignment]
+      redis_host = "redis.example.com"
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result["host"] == "redis.example.com"
+
+  def test_dispatch_unknown_backend_contributes_no_shortcuts(self):
+    """A backend with no shortcut-builder entry (e.g. Pulsar/SQS/Memcached/
+    DynamoDB) contributes nothing — explicit backend_settings still flow
+    through. Covers the ``builder_name is None`` branch."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.PULSAR
+      backend_settings = {"service_url": "pulsar://localhost:6650"}
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    # Explicit settings survive; no shortcut builder fires for Pulsar.
+    assert result == {"service_url": "pulsar://localhost:6650"}
+
+  def test_dispatch_none_backend_type_yields_only_explicit_settings(self):
+    """``_build_backend_settings`` with ``backend_type=None`` returns only the
+    explicit ``backend_settings`` (no shortcut builder fires). Unlike
+    ``setup_backend`` (which raises on None), the builder is safe to call
+    directly with a missing backend_type."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = None
+      backend_settings = {"foo": "bar"}
+
+    spider = TestSpider()
+    result = spider._build_backend_settings()
+    assert result == {"foo": "bar"}
+
 
 class TestConnectSignals:
   """Test _connect_signals method."""
