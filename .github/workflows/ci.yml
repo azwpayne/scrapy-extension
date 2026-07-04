@@ -129,6 +129,12 @@ jobs:
           exit 1
       - name: Run integration tests
         env:
+          # Global opt-in gate (root conftest.py): without SCRAPY_TEST_INTEGRATION=1,
+          # every integration test SKIPS via the conftest-level guard and this job
+          # validates nothing (false green — the per-backend URLs alone are not
+          # enough; this flag is what actually enables the suite). Verified:
+          # unset → 26 skipped / 0 passed in 0.07s; set → 26 passed.
+          SCRAPY_TEST_INTEGRATION: "1"
           SCRAPY_TEST_REDIS_URL: redis://localhost:6379/0
           SCRAPY_TEST_MONGODB_URI: mongodb://localhost:27017
           SCRAPY_TEST_ES_HOSTS: http://localhost:9200
