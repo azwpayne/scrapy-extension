@@ -624,3 +624,27 @@ class TestPluginDiscoveryErrors:
       plugin_name="boom",
       registration_value="tests.test_registry._register_generic_exception",
     )
+
+  def test_entry_points_enumeration_failure_returns_empty(
+    self, monkeypatch: pytest.MonkeyPatch
+  ):
+    """If ``importlib.metadata.entry_points()`` ITSELF raises (corrupted
+    dist-info, broken environment), ``_discover_entry_points`` must return
+    ``{}`` and never crash the caller.
+
+    Covers the OUTER ``except Exception`` (registry.py) — distinct from the
+    per-plugin load failures above: this is the enumeration call failing
+    before any plugin is even inspected.
+    """
+    import importlib.metadata as importlib_metadata
+
+    from scrapy_extension.backends.registry import _discover_entry_points
+
+    def _boom(group: str | None = None) -> Any:
+      raise OSError("corrupted dist-info")
+
+    monkeypatch.setattr(importlib_metadata, "entry_points", _boom)
+    _reset_registry_cache()
+
+    # Must not raise; returns empty (no 3rd-party plugins discoverable).
+    assert _discover_entry_points() == {}
