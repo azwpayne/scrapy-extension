@@ -42,12 +42,12 @@ jobs:
   # a real healthcheck command. Kafka has no trivial CLI healthcheck in the
   # bitnami image, so we fall back to a TCP port probe in a wait step.
   #
-  # RocketMQ is intentionally EXCLUDED (continue-on-error + --ignore in the
-  # pytest invocation): its backend imports `rocketmq-client-python`, which
-  # requires the native `librocketmq` shared library that isn't installable
-  # on the stock GitHub runner. The test file's own skip guard fires only
-  # when SCRAPY_TEST_ROCKETMQ_NAMESRV is *unset* — so we deliberately leave
-  # it unset and also --ignore the file to keep collection clean. R58.
+  # RocketMQ runs via docker-compose (tests/integration/docker-compose.yml),
+  # not the services block, because its broker needs --enable-proxy + a
+  # mounted rmq-proxy.json (enableAutoTopicCreation) + broker.conf, and the
+  # apache 5.x client speaks gRPC to the proxy (8081). The pure-Python client
+  # (rocketmq-python-client 5.1.1) needs no native lib, so the suite runs on
+  # the stock GitHub runner. See #44.
   integration-tests:
     runs-on: ubuntu-latest
     services:
@@ -127,6 +127,25 @@ jobs:
           done
           echo "Kafka did not become ready in time" >&2
           exit 1
+      - name: Bring up RocketMQ (namesrv + broker with --enable-proxy)
+        # The broker needs --enable-proxy (gRPC on 8081) + a mounted
+        # rmq-proxy.json (enableAutoTopicCreation) + broker.conf, which the
+        # GitHub Actions `services` block can't express cleanly. docker-compose
+        # reuses the validated fixture (same networking the _ensure_topic
+        # helper's defaults assume: rocketmq-namesrv / scrapy-ext-rocketmq-broker).
+        run: |
+          docker compose -f tests/integration/docker-compose.yml up -d --wait rocketmq-namesrv rocketmq-broker
+          # Extra warmup: the proxy port opens before topic-service is fully
+          # registered. Poll a route fetch via the python client.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/8081) >/dev/null 2>&1; then
+              echo "RocketMQ gRPC proxy accepting connections on 8081"
+              exit 0
+            fi
+            echo "rocketmq-proxy not ready ($i/30)"; sleep 5
+          done
+          echo "RocketMQ proxy did not become ready in time" >&2
+          exit 1
       - name: Run integration tests
         env:
           # Global opt-in gate (root conftest.py): without SCRAPY_TEST_INTEGRATION=1,
@@ -140,8 +159,9 @@ jobs:
           SCRAPY_TEST_ES_HOSTS: http://localhost:9200
           SCRAPY_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
           SCRAPY_TEST_KAFKA_BOOTSTRAP: localhost:9092
-          # SCRAPY_TEST_ROCKETMQ_NAMESRV deliberately UNSET — see job header.
+          # gRPC PROXY endpoint (host:8081), NOT the NameServer. The broker
+          # runs with --enable-proxy via the compose step above.
+          SCRAPY_TEST_ROCKETMQ_NAMESRV: localhost:8081
         run: >
           uv run pytest tests/integration
-          --ignore=tests/integration/test_rocketmq_integration.py
           -m integration --tb=short -q

@@ -1,0 +1,8 @@
+{
+  "rocketMQClusterName": "DefaultCluster",
+  "enableAutoTopicCreation": true,
+  "topicQueueConfig": {
+    "defaultReadQueueNum": 8,
+    "defaultWriteQueueNum": 8
+  }
+}
