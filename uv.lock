@@ -2149,6 +2149,7 @@ test = [
     { name = "pytest-timeout" },
     { name = "pytest-xdist", extra = ["psutil"] },
     { name = "redis" },
+    { name = "rocketmq-python-client" },
 ]
 
 [package.metadata]
@@ -2203,6 +2204,7 @@ test = [
     { name = "pytest-timeout" },
     { name = "pytest-xdist", extras = ["psutil"] },
     { name = "redis", specifier = ">=7.3.0,<9" },
+    { name = "rocketmq-python-client", specifier = ">=5.1.1,<6" },
 ]
 
 [[package]]

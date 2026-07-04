@@ -45,9 +45,10 @@ _ensure_sdk_stub("boto3")
 _ensure_sdk_stub("pymemcache")
 _ensure_sdk_stub("pymemcache.client")
 _ensure_sdk_stub("pymemcache.client.base", {"Client": MagicMock(name="MemcachedClient")})
-# rocketmq-client-python is also absent in the test env.
-_ensure_sdk_stub("rocketmq")
-_ensure_sdk_stub("rocketmq.client", {"Producer": MagicMock, "PushConsumer": MagicMock})
+# NOTE: rocketmq-python-client (apache 5.1.1, pure-Python gRPC) is in the test
+# dependency group, so no stub is needed — and stubbing it would shadow the
+# real top-level surface (Producer / SimpleConsumer / Message /
+# ClientConfiguration / Credentials) that backends/rocketmq.py imports.
 
 
 # Expected concrete class name per BackendType. Asserting ``type(backend).__name__``
