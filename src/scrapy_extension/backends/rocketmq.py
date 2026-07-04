@@ -312,10 +312,12 @@ class RocketMQBackend(Backend, QueueBackend):
         error = "RocketMQBackend not connected: consumer is None"
         raise QueueError(error)
       # ``receive(max_message_num, invisible_duration)`` — invisible_duration
-      # is how long the message stays invisible to peers (redelivery window
-      # for at-least-once). Use the timeout (or 15s default) as the
-      # invisible-duration; receive itself long-polls up to await_duration.
-      invisible_duration = int(timeout) if timeout > 0 else 15
+      # (SECONDS) is how long the message stays invisible to peers (the
+      # redelivery window for at-least-once). The apache broker enforces a
+      # 10s floor (error 40011 "the invisibleTime is too small. min is 10000"
+      # below it), so clamp small/polling-style timeouts up to the floor;
+      # ``receive`` itself long-polls up to the consumer's await_duration.
+      invisible_duration = max(int(timeout), 10) if timeout > 0 else 15
       messages = self._consumer.receive(1, invisible_duration)
       if not messages:
         return None

@@ -438,13 +438,25 @@ def test_pop_returns_none_when_empty(mocker) -> None:
 
 
 def test_pop_timeout_used_as_invisible_duration(mocker) -> None:
-  """pop passes the timeout (seconds) as the invisible_duration arg."""
+  """pop passes the timeout (seconds) as the invisible_duration arg, clamped
+  to the apache broker's 10s floor (error 40011 below it)."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_consumer.receive.return_value = []
 
-  backend.pop("my_queue", timeout=5.0)
+  backend.pop("my_queue", timeout=20.0)  # above the floor → passed through
 
-  mock_consumer.receive.assert_called_once_with(1, 5)
+  mock_consumer.receive.assert_called_once_with(1, 20)
+
+
+def test_pop_invisible_duration_clamped_to_broker_floor(mocker) -> None:
+  """A sub-floor timeout (the broker rejects <10s with error 40011) is clamped
+  to 10s so a 1s polling-style receive window still satisfies the broker."""
+  backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+  mock_consumer.receive.return_value = []
+
+  backend.pop("my_queue", timeout=1.0)  # below floor
+
+  mock_consumer.receive.assert_called_once_with(1, 10)
 
 
 def test_pop_zero_timeout_uses_default_invisible(mocker) -> None:

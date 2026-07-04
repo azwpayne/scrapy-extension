@@ -134,7 +134,7 @@ services:
   # broker, so the test points SCRAPY_TEST_ROCKETMQ_NAMESRV at localhost:8081.
   # No native lib is needed (the client is pure-Python gRPC + protobuf).
   rocketmq-namesrv:
-    image: apache/rocketmq:5.3.1
+    image: apache/rocketmq:5.3.3
     container_name: scrapy-ext-rocketmq-namesrv
     ports:
       - "9876:9876"
@@ -149,7 +149,7 @@ services:
       start_period: 20s
 
   rocketmq-broker:
-    image: apache/rocketmq:5.3.1
+    image: apache/rocketmq:5.3.3
     container_name: scrapy-ext-rocketmq-broker
     ports:
       # 8081 = gRPC proxy (what the apache python client connects to)
@@ -164,12 +164,20 @@ services:
     environment:
       NAMESRV_ADDR: "rocketmq-namesrv:9876"
     volumes:
-      # brokerIP1=127.0.0.1 (host-reachable) + autoCreateTopicEnable=true.
-      # See rocketmq-broker.conf for the full rationale.
-      - ./rocketmq-broker.conf:/home/rocketmq/rocketmq-5.3.1/conf/broker.conf
+      # Mount to a version-independent path — $ROCKETMQ_HOME/conf differs per
+      # image tag (rocketmq-5.3.1 vs 5.3.3), so mounting there silently misses
+      # on a bump. /rocketmq-conf/ is stable; -c/-pc point at it below.
+      # broker.conf: brokerIP1=127.0.0.1 (host-reachable) + autoCreateTopicEnable.
+      - ./rocketmq-broker.conf:/rocketmq-conf/broker.conf
+      # Proxy-mode auto-create: broker.conf autoCreateTopicEnable covers ONLY
+      # the Remoting path; the gRPC QueryRoute handler reads the PROXY config
+      # (rmq-proxy.json). enableAutoTopicCreation must be true there or pushes
+      # to fresh topics fail with "failed to fetch topic route". See
+      # apache/rocketmq issue #8088.
+      - ./rmq-proxy.json:/rocketmq-conf/rmq-proxy.json
     # --enable-proxy runs the embedded gRPC proxy on 8081 alongside the
-    # remoting broker. The apache python client connects to this proxy.
-    command: sh mqbroker -n rocketmq-namesrv:9876 -c /home/rocketmq/rocketmq-5.3.1/conf/broker.conf --enable-proxy
+    # remoting broker. -c/-pc load broker/proxy config from the stable mount.
+    command: sh mqbroker -n rocketmq-namesrv:9876 -c /rocketmq-conf/broker.conf --enable-proxy -pc /rocketmq-conf/rmq-proxy.json
     healthcheck:
       # Process liveness (apache/rocketmq ships no nc/curl). The broker JVM
       # is the service; once up it registers with the nameserver and the
