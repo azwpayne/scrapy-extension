@@ -54,6 +54,27 @@ upgrading.
   snapshots under the old key are orphaned on upgrade (ignored, not restored);
   no migration is provided because the prior format (#13) shipped immediately
   before this fix. Single-spider deployments are unaffected.
+- **RocketMQ backend rewritten against apache `rocketmq-python-client` 5.1.1 gRPC** (#15/#44).
+  The prior backend's `connect()` imported fictional API paths
+  (`rocketmq.consumer.SimpleConsumer`, `rocketmq.endpoint.Endpoint`, …) matching
+  no released client — lazy-import hid this since inception; it had never
+  connected to any broker. The rewrite targets the apache pure-Python gRPC
+  client. **BREAKING supply-chain change**: the `[rocketmq]` extra now installs
+  `rocketmq-python-client>=5.1.1` (was `rocketmq-client-python`, the unmaintained
+  ctypes wrapper). The two install to the same `site-packages/rocketmq/`
+  namespace and **cannot coexist** — existing installs require a clean reinstall
+  (`uv sync --reinstall` / fresh venv). The broker must run with
+  `--enable-proxy` and `SCRAPY_ROCKETMQ_NAMESRV_ADDRESS` now means the gRPC
+  PROXY endpoint (`host:8081`), not the legacy NameServer (9876). Topics are
+  **not** auto-created via the gRPC path by default — see the README "Topic
+  creation" subsection (`enableAutoTopicCreation` in `rmq-proxy.json` or
+  `mqadmin updateTopic`). Two real production bugs fixed in the rewrite:
+  `is_connected()` was calling `is_running()` (a bool **property**, not a
+  method) → every push/pop raised "Not connected"; and `invisible_duration`
+  is now clamped to the broker's 10s floor (was error 40011 on any
+  polling-style timeout < 10s). Deferred-ack semantics preserved (initiative
+  #4): `pop` returns the body without acking; the caller acks via
+  `ack(token=msg)` for at-least-once delivery.
 
 ### Added
 
