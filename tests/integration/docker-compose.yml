@@ -125,15 +125,14 @@ services:
       retries: 12
       start_period: 20s
 
-  # RocketMQ queue backend (sextet completion). Two containers: NameServer
-  # (service discovery, port 9876) + Broker (remoting port 10911).
+  # RocketMQ queue backend. Two containers: NameServer (service discovery,
+  # port 9876) + Broker running with --enable-proxy (gRPC proxy on 8081).
   #
-  # NOTE: running test_rocketmq_integration.py requires the native librocketmq
-  # shared library on the HOST — rocketmq-client-python is a C++ wrapper, not
-  # pure Python, and the pip package does NOT bundle the lib. On Linux install
-  # librocketmq from apache/rocketmq-client-cpp; on macOS the build is
-  # non-trivial, so the suite skips gracefully (import guard) where the lib is
-  # absent. The brokers here are ready for any CI runner that has the lib.
+  # The apache rocketmq-python-client 5.1.1 client speaks gRPC to the PROXY
+  # (port 8081), NOT the legacy remoting broker port (10911). The broker's
+  # embedded proxy (--enable-proxy) bridges gRPC clients to the remoting
+  # broker, so the test points SCRAPY_TEST_ROCKETMQ_NAMESRV at localhost:8081.
+  # No native lib is needed (the client is pure-Python gRPC + protobuf).
   rocketmq-namesrv:
     image: apache/rocketmq:5.3.1
     container_name: scrapy-ext-rocketmq-namesrv
@@ -153,6 +152,9 @@ services:
     image: apache/rocketmq:5.3.1
     container_name: scrapy-ext-rocketmq-broker
     ports:
+      # 8081 = gRPC proxy (what the apache python client connects to)
+      # 10909/10911/10912 = remoting broker ports (kept for completeness)
+      - "8081:8081"
       - "10909:10909"
       - "10911:10911"
       - "10912:10912"
@@ -165,12 +167,14 @@ services:
       # brokerIP1=127.0.0.1 (host-reachable) + autoCreateTopicEnable=true.
       # See rocketmq-broker.conf for the full rationale.
       - ./rocketmq-broker.conf:/home/rocketmq/rocketmq-5.3.1/conf/broker.conf
-    command: sh mqbroker -n rocketmq-namesrv:9876 -c /home/rocketmq/rocketmq-5.3.1/conf/broker.conf
+    # --enable-proxy runs the embedded gRPC proxy on 8081 alongside the
+    # remoting broker. The apache python client connects to this proxy.
+    command: sh mqbroker -n rocketmq-namesrv:9876 -c /home/rocketmq/rocketmq-5.3.1/conf/broker.conf --enable-proxy
     healthcheck:
       # Process liveness (apache/rocketmq ships no nc/curl). The broker JVM
-      # is the service; once up it registers with the nameserver and serves
-      # remoting on 10911. Full registration verification is the test's job
-      # (it can't run where librocketmq is absent — see the suite's skip guard).
+      # is the service; once up it registers with the nameserver and the
+      # embedded proxy serves gRPC on 8081. Full registration verification
+      # is the test's job.
       test: ["CMD-SHELL", "ps aux | grep -q '[m]qbroker'"]
       interval: 15s
       timeout: 10s

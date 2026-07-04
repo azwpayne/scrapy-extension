@@ -113,7 +113,9 @@ SCRAPY_ELASTICSEARCH_HOSTS = ["http://localhost:9200"]
 
 ```python
 SCRAPY_BACKEND_TYPE = "rocketmq"
-SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
+# Point at the broker's gRPC PROXY (port 8081), not the legacy NameServer.
+# The broker must run with --enable-proxy (apache rocketmq-python-client 5.1.1).
+SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
 ```
 
 ### Pulsar (standalone, cluster)
