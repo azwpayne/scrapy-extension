@@ -18,6 +18,7 @@ from scrapy_extension.backends.circuit_breaker import (
   BreakerState,
   CircuitBreaker,
   CircuitBreakerOpenError,
+  _BackendProxyBase,
   wrap_queue_backend,
   wrap_set_backend,
   wrap_storage_backend,
@@ -648,3 +649,65 @@ class TestHalfOpenSingleProbe:
       f"expected exactly one probe call, got {call_count[0]} — "
       "multiple threads observed HALF_OPEN concurrently"
     )
+
+
+class TestBackendProxyBaseConstructionSkips:
+  """Cover the ``hasattr`` skip branches in ``_BackendProxyBase.__init__``
+  (circuit_breaker.py lines 330 + 335) and the ``__getattr__`` forward
+  (line 343).
+
+  The ABC-typed proxies (_QueueBackendProxy etc.) instantiate the FULL
+  fake backends in every other test, so the skip branches never fire.
+  Here we subclass _BackendProxyBase directly (no ABC constraint) and wrap
+  a backend missing some declared HOT_PATH / FORWARDED methods.
+  """
+
+  def test_skips_hot_path_and_forwarded_methods_backend_lacks(self) -> None:
+    """A backend that lacks a declared HOT_PATH or FORWARDED method is
+    wrapped without crash — the missing methods are simply not bound as
+    instance attributes (the ``continue`` branches at lines 330 + 335)."""
+
+    class _PartialProxy(_BackendProxyBase):
+      _HOT_PATH = ("push", "pop")
+      _FORWARDED = ("clear_queue", "ack")
+
+    class _MinimalBackend:
+      """Has ``push`` + a custom attr, but lacks pop/clear_queue/ack."""
+
+      def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+        pass
+
+      custom_attr = "backend-value"
+
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    proxy = _PartialProxy(_MinimalBackend(), breaker)
+
+    # push (declared HOT_PATH + present) IS bound as an instance attribute.
+    assert "push" in vars(proxy)
+    # pop (declared HOT_PATH but ABSENT on the backend) is NOT bound —
+    # the ``if not hasattr(backend, method_name): continue`` fired.
+    assert "pop" not in vars(proxy)
+    # clear_queue + ack (declared FORWARDED but absent) are NOT bound.
+    assert "clear_queue" not in vars(proxy)
+    assert "ack" not in vars(proxy)
+
+  def test_getattr_forwards_non_method_attribute(self) -> None:
+    """``__getattr__`` fires for attributes NOT bound in __init__ and NOT on
+    the class MRO — e.g. a backend-specific custom attribute. It forwards to
+    the wrapped backend (line 343)."""
+
+    class _PlainProxy(_BackendProxyBase):
+      _HOT_PATH = ()
+      _FORWARDED = ()
+
+    class _BackendWithAttr:
+      custom_attr = "forwarded-value"
+
+      def connect(self) -> None:
+        pass
+
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    proxy = _PlainProxy(_BackendWithAttr(), breaker)
+
+    # custom_attr is not a method bound in __init__ → __getattr__ forwards it.
+    assert proxy.custom_attr == "forwarded-value"
