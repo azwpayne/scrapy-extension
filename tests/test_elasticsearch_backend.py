@@ -153,12 +153,15 @@ class TestQueue:
     }
 
     assert b.pop("q") == b"item"
+    # delete no longer passes refresh= — read-your-writes moved to a pre-search
+    # indices.refresh (see #42 perf fix). The mock's indices.refresh auto-creates.
     b._client.delete.assert_called_once_with(
       index="scrapy_queue",
       id="1",
       if_seq_no=42,
       if_primary_term=1,
     )
+    b._client.indices.refresh.assert_called_once_with(index="scrapy_queue")
 
   def test_pop_retries_on_conflict(self, mocker):
     """R1-P1-13: pop must retry the search-delete cycle on ConflictError.

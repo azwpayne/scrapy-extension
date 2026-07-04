@@ -316,31 +316,30 @@ class RabbitMQBackend(Backend, QueueBackend):
   def _connect_mirrored_queues(self) -> None:
     """Connect to RabbitMQ with mirrored queues (HA).
 
-    Sets up HA policy for queues if configured.
+    Classic mirrored-queue HA policy (``ha-mode`` / ``ha-params`` /
+    ``ha-sync-mode``) is NOT applied via AMQP by this client — setting it
+    requires the RabbitMQ management API or ``rabbitmqctl set_policy``
+    (out-of-band), and classic mirroring itself is deprecated in modern
+    RabbitMQ (prefer quorum queues). An operator who configured these
+    values is warned so they don't operate under the false impression
+    that this client applied the policy (#34 — previously the dict was
+    built into a local ``definition`` and only logged at DEBUG as
+    "Configured", which was misleading and left the policy unset).
     """
-    # First connect like cluster mode
+    # First connect like cluster mode.
     self._connect_cluster()
-
-    # Setup HA policy for queues if configured
-    if self._channel and self.config.ha_mode:
-      try:
-        definition: dict[str, Any] = {"ha-mode": self.config.ha_mode}
-        if self.config.ha_params:
-          definition["ha-params"] = (
-            int(self.config.ha_params)
-            if self.config.ha_params.isdigit()
-            else self.config.ha_params
-          )
-        if self.config.ha_sync_mode:
-          definition["ha-sync-mode"] = self.config.ha_sync_mode
-
-        logger.debug(
-          "Configured mirrored queues with HA mode: %s, params: %s",
-          self.config.ha_mode,
-          self.config.ha_params,
-        )
-      except AMQPError as e:
-        logger.warning("Failed to configure mirrored queues HA policy: %s", e)
+    if not (self._channel and self.config.ha_mode):
+      return
+    logger.warning(
+      "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
+      "ha-sync-mode=%s) is configured but NOT applied via AMQP by this "
+      "client — set it out-of-band via `rabbitmqctl set_policy` or the "
+      "management API. Classic mirroring is deprecated in modern RabbitMQ; "
+      "consider quorum queues for HA.",
+      self.config.ha_mode,
+      self.config.ha_params,
+      self.config.ha_sync_mode,
+    )
 
   def _setup_qos(self) -> None:
     """Set up QoS (Quality of Service) settings on the current channel.

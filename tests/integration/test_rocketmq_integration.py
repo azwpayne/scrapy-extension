@@ -54,6 +54,26 @@ import uuid
 
 import pytest
 
+
+def _rocketmq_client_loads() -> bool:
+  """Probe whether the rocketmq client + native lib are usable.
+
+  ``rocketmq-client-python`` is a C++ wrapper; without the native ``librocketmq``
+  shared library (not bundled in the pip package; on macOS it must be built
+  from apache/rocketmq-client-cpp), submodules raise ``ModuleNotFoundError`` or
+  "dynamic library not found" at import. Skip the suite gracefully in that case
+  rather than erroring at fixture setup — the brokers may be up but the HOST
+  can't talk to them without the lib.
+  """
+  try:
+    import rocketmq.auth.credentials  # noqa: F401
+    import rocketmq.client  # noqa: F401
+    import rocketmq.consumer  # noqa: F401
+  except Exception:
+    return False
+  return True
+
+
 pytestmark = [
   pytest.mark.integration,
   pytest.mark.skipif(
@@ -61,6 +81,15 @@ pytestmark = [
     reason=(
       "Set SCRAPY_TEST_ROCKETMQ_NAMESRV (e.g. localhost:9876) to run RocketMQ "
       "integration tests against a live nameserver."
+    ),
+  ),
+  pytest.mark.skipif(
+    not _rocketmq_client_loads(),
+    reason=(
+      "rocketmq-client-python + native librocketmq not usable on this host. "
+      "The pip package does not bundle the native lib; install librocketmq "
+      "(apache/rocketmq-client-cpp) — non-trivial on macOS, default on the "
+      "Linux CI runner."
     ),
   ),
 ]

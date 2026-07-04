@@ -298,7 +298,9 @@ class SqsBackend(Backend, QueueBackend):
       return None
     # Track the URL the message arrived FROM, so legacy ack deletes the
     # right queue (round-2 C3 fix). receipt is non-None when body is non-None.
-    assert receipt is not None  # noqa: S101 — invariant from _receive
+    # receipt is non-None when body is non-None (invariant from _receive);
+    # bandit B101 accepted — invariant check, not a security control.
+    assert receipt is not None  # noqa: S101  # nosec B101
     self._last_receipt = (url, receipt)
     return body
 

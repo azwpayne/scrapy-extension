@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -254,3 +256,25 @@ class TestRoundRobinFairnessProperty:
     # Sanity: every source was served exactly its allotted count.
     for src_idx in range(n_sources):
       assert served[src_idx] == counts[src_idx]
+
+
+def test_pop_evicts_lingering_empty_deque_defensive(mock_connection_manager):
+  """Safety-net characterization: the ``pop`` loop's defensive branch
+  evicts a deque that is empty at the cursor — a state the
+  eviction-on-drain invariant says should never exist, but the branch
+  guards against a regression in that invariant (so ``pop`` terminates
+  instead of spinning on an empty slot).
+
+  Tested by directly injecting the invariant-violating state (an empty
+  deque placed at the cursor ahead of a live source). This is the
+  standard way to exercise defensive code: simulate the failure it
+  guards against and assert the net catches it. Not a normal-path test."""
+  s = RoundRobinQueueStrategy(mock_connection_manager)
+  # Insert the impossible state FIRST so the cursor (idx=0) lands on it.
+  s._sources["ghost"] = deque()
+  s.push("q", b"alive", source="alive")
+  # pop: rotation = ["ghost", "alive"], idx=0 -> "ghost" is empty ->
+  #   defensive branch evicts "ghost", retries -> "alive" -> returns b"alive".
+  assert s.pop("q") == b"alive"
+  assert "ghost" not in s._sources
+  assert "alive" not in s._sources  # drained on pop -> evicted by invariant

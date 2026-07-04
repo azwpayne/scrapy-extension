@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import TracebackType
 
 import pytest
 
@@ -452,3 +453,119 @@ def test_load_object_invalid_path_raises_value_error():
 
   with pytest.raises(ValueError, match="Invalid dotted path"):
     _load_object("no_separator")
+
+
+# ---------------------------------------------------------------------------
+# Initiative #39 — close the last 5 connectors.py coverage gaps
+# (427->436, 558, 586->exit, 707, 854). Each test pins ONE branch the prior
+# T1-T14 suite reaches only partially or not at all.
+# ---------------------------------------------------------------------------
+
+
+def test_T6b_over_cap_second_trigger_skips_rewarning(monkeypatch, caplog):
+  """427->436: a SECOND over-cap trigger (``_over_cap_warned`` already True)
+  takes the ``if not _over_cap_warned`` FALSE branch and skips re-warning.
+  T6 covers only the first trigger (the TRUE branch)."""
+  import logging
+
+  ConnectionManager.clear_registry()
+  monkeypatch.setattr(ConnectionManager, "MAX_MANAGERS", 2)
+  ConnectionManager.get_manager("redis", {"k": 1})  # live (_users=1)
+  ConnectionManager.get_manager("redis", {"k": 2})  # live (_users=1)
+
+  with caplog.at_level(
+    logging.WARNING, logger="scrapy_extension.backends.connectors"
+  ):
+    ConnectionManager.get_manager("redis", {"k": 3})  # first over-cap -> warns
+  assert any("actively held" in r.message for r in caplog.records)
+
+  caplog.clear()
+  with caplog.at_level(
+    logging.WARNING, logger="scrapy_extension.backends.connectors"
+  ):
+    ConnectionManager.get_manager("redis", {"k": 4})  # second -> skip re-warn
+  assert not any("actively held" in r.message for r in caplog.records)
+
+
+def test_connect_re_raises_keyboard_interrupt_not_swallowed_by_retry(
+  monkeypatch,
+):
+  """KeyboardInterrupt (and SystemExit) propagate out of connect() instead of
+  being treated as a retryable connection error. The mechanism: KI/SystemExit
+  inherit from BaseException (not Exception), so ``except Exception`` does not
+  catch them — they bypass the retry loop entirely. (The prior ``isinstance``
+  re-raise inside the except block was unreachable dead code, removed in #39.)"""
+  m = ConnectionManager("redis", {"retry_attempts": 3, "retry_delay": 0.0})
+
+  def _boom() -> None:
+    raise KeyboardInterrupt("user interrupt")
+
+  monkeypatch.setattr(m, "_attempt_connection", _boom)
+  with pytest.raises(KeyboardInterrupt):
+    m.connect()
+
+
+def test_connect_zero_retry_attempts_is_a_silent_noop(patch_sleep_random):
+  """586->exit: ``retry_attempts=0`` -> the for-loop body never runs,
+  ``last_exception`` stays None, and connect() falls through the trailing
+  ``if last_exception is not None`` guard (FALSE branch) to an implicit
+  return. Characterizes the current behavior; the success-path ``else``
+  (line 580) is unreachable when there are no attempts."""
+  fake = FakeBackend(connect_failures=99)
+  m = ConnectionManager("redis", {"retry_attempts": 0, "retry_delay": 1.0})
+  m._create_backend = lambda: fake  # type: ignore[method-assign]
+  m.connect()  # no attempts -> no raise, silent return
+  assert fake.connect_calls == 0
+
+
+def test_clear_registry_resets_each_configured_breaker(monkeypatch):
+  """707: clear_registry resets every manager's CircuitBreaker when one is
+  configured (``manager._breaker is not None``). Exercises the reset path the
+  breaker-disabled default never reaches."""
+  _enable_breaker(monkeypatch)
+  fake = FakeBackend()
+  m = ConnectionManager.get_manager("redis", {"k": "breaker-reset"})
+  m._create_backend = lambda: fake  # type: ignore[method-assign]
+  breaker = m._get_breaker()  # configures lazily (enabled via env)
+  assert breaker is not None, "breaker should be configured when enabled"
+  resets: list[int] = []
+  monkeypatch.setattr(breaker, "reset", lambda: resets.append(1))
+  ConnectionManager.clear_registry()
+  assert len(resets) == 1, "clear_registry did not reset the configured breaker"
+
+
+def test_get_breaker_dcl_inner_recheck_under_lock(monkeypatch):
+  """854: the double-checked-locking inner re-check fires when
+  ``_breaker_configured`` flips to True BETWEEN the outer check (no lock) and
+  the lock acquisition — i.e. a peer thread configured the breaker while we
+  waited. Simulated deterministically by side-effecting on lock ``__enter__``;
+  the contract under test is the re-check itself (single-threaded logic once
+  the lock is held), not the scheduler timing of a real two-thread race."""
+  fake = FakeBackend()
+  m = ConnectionManager.get_manager("redis", {"k": "dcl"})
+  m._backend = fake
+  assert m._breaker_configured is False  # outer check (842) will be False
+
+  original_lock = m._lock
+  side_effect_ran = {"v": False}
+
+  class _RacyLock:
+    def __enter__(self) -> None:
+      original_lock.__enter__()
+      # Simulate a peer thread having configured the breaker while we waited.
+      m._breaker_configured = True
+      m._breaker = None  # valid: the disabled case
+      side_effect_ran["v"] = True
+
+    def __exit__(  # type: ignore[override]
+      self,
+      exc_type: type[BaseException] | None,
+      exc_value: BaseException | None,
+      traceback: TracebackType | None,
+    ) -> None:
+      original_lock.__exit__(exc_type, exc_value, traceback)
+
+  monkeypatch.setattr(m, "_lock", _RacyLock())  # type: ignore[assignment]
+  result = m._get_breaker()
+  assert side_effect_ran["v"] is True
+  assert result is None  # inner return at 854 fires; _breaker set to None by "peer"

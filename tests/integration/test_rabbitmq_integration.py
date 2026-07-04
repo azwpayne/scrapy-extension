@@ -101,6 +101,29 @@ def unique_prefix() -> str:
   return f"inttest:{uuid.uuid4().hex}"
 
 
+def _wait_for_queue_len(backend, queue: str, expected: int, timeout: float = 5.0) -> int:
+  """Poll ``queue_len`` until it reaches ``expected`` or ``timeout`` elapses.
+
+  AMQP ``basic_publish`` is asynchronous at the broker level even on pika's
+  ``BlockingConnection`` (the client flushes its send buffer, but the broker
+  enqueues the frames on its own schedule — slower on priority queues with
+  ``x-max-priority``, which is why a strict ``queue_len == n`` immediately
+  after N publishes sees only the settled subset). The queue contract under
+  test is "N in → N out, no loss"; that is verified by the pop round-trip
+  below. This helper lets the intermediate count check wait for broker
+  settle so the test is deterministic without weakening the no-loss claim.
+  """
+  import time
+
+  deadline = time.monotonic() + timeout
+  while time.monotonic() < deadline:
+    n = backend.queue_len(queue)
+    if n >= expected:
+      return n
+    time.sleep(0.02)
+  return backend.queue_len(queue)
+
+
 def test_push_pop_round_trip_with_ack(rabbitmq_backend, unique_prefix):
   """N in → N out, no loss. pop uses auto_ack=False (R12), so each pop is acked."""
   queue = f"{unique_prefix}:rt"
@@ -108,7 +131,10 @@ def test_push_pop_round_trip_with_ack(rabbitmq_backend, unique_prefix):
   for i in range(n):
     rabbitmq_backend.push(queue, f"item-{i:03d}".encode(), priority=1.0)
 
-  assert rabbitmq_backend.queue_len(queue) == n
+  # AMQP publish-settle is broker-async (see _wait_for_queue_len); the strict
+  # immediate count is non-deterministic on priority queues. The no-loss
+  # contract is proven by the pop round-trip below — this just waits for settle.
+  assert _wait_for_queue_len(rabbitmq_backend, queue, n) == n
 
   popped = []
   for _ in range(n):

@@ -741,6 +741,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return None
 
     expire_at = result["expireAt"]
+    # PyMongo returns naive UTC datetimes by default (``tz_aware=False`` on the
+    # client). ``store()`` writes an aware datetime, but BSON stores UTC without
+    # tzinfo and PyMongo strips it on read-back — so a naive ``expire_at``
+    # subtracted from an aware ``datetime.now(tz=timezone.utc)`` raises
+    # ``TypeError: can't subtract offset-naive and offset-aware datetimes``.
+    # Normalize the read-back to aware UTC (the value IS UTC per BSON spec).
+    if expire_at.tzinfo is None:
+      expire_at = expire_at.replace(tzinfo=timezone.utc)
     remaining = (expire_at - datetime.now(tz=timezone.utc)).total_seconds()
     return max(0, int(remaining))
 

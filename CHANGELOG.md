@@ -45,6 +45,15 @@ upgrading.
   **Additive:** registered 3rd-party backend strings (entry-point group
   `scrapy_extension.backends`) are now ACCEPTED at the Settings layer — they
   were previously rejected as `ValidationError`, contradicting round-5 R5-1.
+- **`BackendQueue` strategy snapshots are now scoped by `(spider.name, queue_name)`** (#16).
+  The snapshot storage key changed from `queue:snapshot:<queue_name>` to
+  `queue:snapshot:<spider.name>:<queue_name>`. Two spiders sharing a storage
+  backend with the same `queue_name` previously overwrote each other's
+  `Delay`-strategy snapshot on close (and on restart one restored the wrong
+  spider's held heap). **BREAKING for multi-spider deployments**: legacy
+  snapshots under the old key are orphaned on upgrade (ignored, not restored);
+  no migration is provided because the prior format (#13) shipped immediately
+  before this fix. Single-spider deployments are unaffected.
 
 ### Added
 
@@ -143,9 +152,31 @@ upgrading.
   removed). Distributions now bundle the license text.
 - `uv_build` build-system pin widened to `<0.12` (was `<0.11.0`, which
   excluded uv 0.11 and could break builds in uv-0.11-only environments).
+- **`ConnectionManager` breaker-config read hoisted out of the instance lock** (#15,
+  performance). The per-manager circuit-breaker config read (`Settings()` — a
+  pydantic env scan) ran inside `self._lock`, serializing peer
+  `get_manager` / `close` warm-up. The read now runs above the lock;
+  double-checked-lock construction stays lock-protected. Behavior is
+  byte-identical — no observable change beyond reduced lock contention under
+  concurrent manager resolution.
 
 ### Fixed
 
+- **Registry entry-point discovery no longer emits 5 ``SelectableGroups`` deprecation warnings** (#38).
+  ``_discover_entry_points`` branched on ``sys.version_info`` to use the legacy
+  ``entry_points().get(group, [])`` dict form on Python 3.10/3.11 — based on the
+  false premise that ``entry_points(group=...)`` was unavailable before 3.12 (it
+  has been available since 3.10). The dict form emitted ``SelectableGroups dict
+  interface is deprecated`` on every 3.10/3.11 run and was removed in 3.12.
+  Collapsed to keyword-only; the version branch, ``import sys``, and the
+  dual-shape Test 7 contract were removed.
+- **Removed unreachable ``isinstance(e, (KeyboardInterrupt, SystemExit))`` re-raise inside
+  ``ConnectionManager.connect()``'s ``except Exception`` block** (#39). The check was dead
+  code — ``KeyboardInterrupt``/``SystemExit`` inherit from ``BaseException`` (not ``Exception``),
+  so ``except Exception`` never catches them and the inner ``isinstance`` could never match.
+  Behavior is unchanged (KI/SystemExit still propagate via not being caught); 4 surrounding
+  coverage gaps on the hot-path module closed (96.28% → 98.55% reliable; remaining gap is
+  non-deterministic concurrency-path coverage on ``get_backend()``, behaviorally tested by T9).
 - Redis ZSET member collision silently dropping identical payloads.
 - `BackendQueue.pop` losing callback/errback on deserialization (spider
   passthrough).
@@ -184,6 +215,16 @@ upgrading.
   local-state check, not a broker round-trip.
 - Kafka `pop()` re-subscribed the consumer on every call (even for the
   same queue); now caches the subscription, mirroring RocketMQ's pattern.
+- **Multi-backend isolation: hardened `ConnectionManager` registry key** (#14).
+  The registry key used `json.dumps(settings, default=str)`, whose lossy
+  `str()` could collapse two semantically-different settings to one key (e.g.
+  `datetime(2024,1,1)` and the string `"2024-01-01 00:00:00"`), silently
+  sharing one connection manager (wrong backend conn / wrong DB index). The
+  `default` now type-tags non-JSON values so distinct types render distinctly;
+  pure-JSON settings keys are byte-identical to the prior form (backward
+  compatible). The `except` fallback was also hardened — the old
+  `str(sorted(settings.items()))` raised on mixed-type dict keys, masking the
+  real settings behind a `TypeError`.
 
 ### Removed
 
@@ -259,3 +300,29 @@ upgrading.
 
 - **Added:** `docs/insight/SPEC-round8-settings-validation.md` — 34-footgun
   settings-validation hunt resolved into 5 executable units (SV1–SV5).
+
+### Round 10 — backlog merge sweep (2026-07-04)
+
+Twelve previously-stalled feature branches — verified conflict-free (zero
+source-file overlap) — merged to `main` in one gate-green sweep. **`mypy --strict`
+is now clean across all 67 source files** (was 1 error on `rocketmq.py:321`);
+pytest +84 cases (1762 → 1846); ruff and bandit both clean.
+
+- **Security (#35):** `bandit` reports 0 active findings. Three LOW-severity
+  items accepted with `# nosec` annotations matching the existing pattern
+  (`BACKEND_ACK_TOKEN_META_KEY` B105 — a `request.meta` key name, not a
+  credential; two type-narrowing `assert`s B101).
+- **Changed (#34):** RabbitMQ `MIRRORED_QUEUES` mode now emits a `WARNING`
+  that the HA policy is NOT applied via AMQP — operators must set it
+  out-of-band (`rabbitmqctl set_policy`). The prior `DEBUG` log + dead
+  policy dict falsely implied mirroring was active.
+- **Fixed — type safety (#36):** `mypy --strict` is clean. The last internal
+  `Any`-leak (`rocketmq` `msg.body`, declared `-> bytes | None`) is closed
+  with a typed `cast`; the `py.typed` strict-mode promise (U8) now fully holds.
+- **Internal — coverage to 100% per module (#23–#32):** every backend module
+  now at 100% statement + branch coverage. `_redact` contract (#24),
+  `BackendQueue` resilience (#25), RocketMQ connect + TOCTOU race guards
+  (#26), SQS contract + resilience (#27), DynamoDB contract + resilience
+  (#28), Kafka resilience (#29), ElasticSearch contract + resilience (#31),
+  Pulsar resilience + contract (#32). Round-robin dead-code removal +
+  safety-net characterization (#23).

@@ -1,9 +1,7 @@
 """Tests for scrapy_extension/backends/registry.py.
 
 Round-5 Unit R5-1: entry-point plugin registration. These 7 tests are the
-PLAN's TDD acceptance gate. They MUST pass under both Py3.10/3.11
-(``entry_points()[group]`` shape) and Py3.12+ (``entry_points(group=...)``
-shape), and MUST verify that:
+PLAN's TDD acceptance gate. They MUST verify that:
 
 - bundled backends still resolve (Test 1);
 - 3rd-party descriptors are discovered via ``importlib.metadata.entry_points``
@@ -14,7 +12,7 @@ shape), and MUST verify that:
 - a broken plugin callable never breaks the bundled set (Test 5);
 - ``get_registry()`` never imports any backend module — lazy-import preserved
   (Test 6);
-- both entry-point API shapes work (Test 7).
+- entry-point discovery uses the modern ``entry_points(group=...)`` keyword API with no ``SelectableGroups`` deprecation warning (Test 7).
 """
 
 from __future__ import annotations
@@ -43,10 +41,6 @@ from scrapy_extension.backends.registry import (
 
 def _register_mybackend() -> BackendDescriptor:
   return _make_descriptor("mybackend", capabilities=frozenset({"queue"}))
-
-
-def _register_legacy() -> BackendDescriptor:
-  return _make_descriptor("legacyep", capabilities=frozenset({"queue"}))
 
 
 def _register_kwarg() -> BackendDescriptor:
@@ -422,41 +416,47 @@ class TestLazyImportPreserved:
     )
 
 
-class TestPyVersionEntryApiBranch:
-  """Test 7: py310_py312_entry_point_api."""
+class TestEntryPointApiIsModern:
+  """Regression for the ``SelectableGroups dict interface is deprecated``
+  warning.
 
-  def test_legacy_dict_shape_works(self, monkeypatch):
-    """Py3.10/3.11 shape: ``entry_points().get(group, [])`` returns the
-    entry-points for the group."""
-    from scrapy_extension.backends import registry as registry_mod
-    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+  Formerly ``_discover_entry_points`` branched on ``sys.version_info`` to
+  use the legacy dict shape (``entry_points().get(group, [])``) on 3.10/3.11.
+  The branch rested on the false premise that ``entry_points(group=...)``
+  was unavailable before 3.12 — the keyword form has been available since
+  3.10. The dict fallback emitted a ``DeprecationWarning`` on every 3.10/3.11
+  run and the dict interface was removed in 3.12; the keyword form works on
+  every supported version, so the branch is gone. These tests lock in the
+  modern single-shape API.
+  """
 
-    _patch_entry_points(
-      monkeypatch,
-      [
-        _FakeEntryPoint(
-          name="legacyep",
-          value="tests.test_registry._register_legacy",
-          group=_ENTRY_POINT_GROUP,
-        )
-      ],
-    )
-    # Force the legacy branch (Py3.10/3.11 path).
-    monkeypatch.setattr(registry_mod.sys, "version_info", (3, 10, 0, "final", 0))
-    _reset_registry_cache()
+  def test_discovery_emits_no_selectablegroups_deprecation(self):
+    """The unmocked ``_discover_entry_points`` call must not emit the
+    ``SelectableGroups`` deprecation warning.
 
-    registry = get_registry()
-    assert "legacyep" in registry
-
-  def test_kwarg_shape_works(self, monkeypatch):
-    """Py3.12+ shape: ``entry_points(group=...)`` returns the entry-points.
-
-    Forces the 3.12+ code branch by overriding ``sys.version_info`` (the
-    registry branches on ``sys.version_info >= (3, 12)``). This is honest
-    about WHAT is being tested: the version-branched dispatch path, not
-    whichever branch the running interpreter happens to take.
+    Runs against the REAL ``importlib.metadata.entry_points`` (no
+    ``_patch_entry_points``) so the genuine SelectableGroups object — the
+    source of the warning — is in the path. A mock would mask the bug.
     """
+    import warnings
+
     from scrapy_extension.backends import registry as registry_mod
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      registry_mod._discover_entry_points()
+
+    selectable = [w for w in caught if "SelectableGroups" in str(w.message)]
+    assert not selectable, (
+      "registry uses the deprecated entry_points() dict API; "
+      f"SelectableGroups warnings leaked: {selectable}"
+    )
+
+  def test_third_party_plugin_discovered_via_group_keyword(self, monkeypatch):
+    """Discovery via ``entry_points(group=...)`` resolves a 3rd-party
+    plugin's registration callable (replaces the former dual-shape pair —
+    only the keyword shape is used now).
+    """
     from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
 
     _patch_entry_points(
@@ -469,8 +469,6 @@ class TestPyVersionEntryApiBranch:
         )
       ],
     )
-    # Force the 3.12+ branch.
-    monkeypatch.setattr(registry_mod.sys, "version_info", (3, 12, 0, "final", 0))
     _reset_registry_cache()
 
     registry = get_registry()

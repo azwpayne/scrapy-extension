@@ -107,7 +107,17 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise BackendConnectionError(msg, backend_type="elasticsearch") from e
 
   def _ensure_indices(self) -> None:
-    """Create indices if they don't exist."""
+    """Create the queue/set/storage indices if absent.
+
+    Uses try-create-and-ignore-``resource_already_exists`` rather than the
+    prior ``if not indices.exists()`` guard. The guard's HEAD request
+    (``indices.exists``) returns HTTP 400 under elasticsearch-py 9.x against
+    an ES 8.x server — client/server API drift on the index-exists endpoint —
+    so the existence-check path raised ``BadRequestError`` on every connect.
+    Try-create is version-robust: ES replies ``resource_already_exists_exception``
+    (HTTP 400) when the index is already there, which is the idempotent
+    success path; any other 400 (invalid name, mapping error) is re-raised.
+    """
     if self._client is None:
       msg = "ElasticSearchBackend not connected: client is None"
       raise BackendConnectionError(msg, backend_type="elasticsearch")
@@ -116,8 +126,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self.config.set_index,
       self.config.storage_index,
     ):
-      if not self._client.indices.exists(index=name):
+      try:
         self._client.indices.create(index=name)
+      except RequestError as e:
+        # HTTP 400 resource_already_exists_exception = idempotent success
+        # (index created by a prior connect or a peer worker). Anything else
+        # is a real config error — re-raise so it surfaces.
+        if "resource_already_exists" not in str(e).lower():
+          raise
 
   def disconnect(self) -> None:
     """Close ElasticSearch connection."""
@@ -192,6 +208,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "created_at": datetime.now(tz=timezone.utc).isoformat(),
     }
     try:
+      # No ``refresh`` on write — read-your-writes is enforced at the READ
+      # side (pop/count call ``indices.refresh`` first), which amortizes one
+      # forced refresh per read instead of ~1s per push. The per-push
+      # ``refresh="wait_for"`` was a ~250x perf regression (1010ms/push vs
+      # 4ms without — see bench_es_push_refresh.py); ES does not batch
+      # ``wait_for`` across consecutive pushes, so each one pays the full
+      # refresh-interval wait.
       self.client.index(index=self.config.queue_index, document=doc)
     except TransportError as e:
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
@@ -222,17 +245,35 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     max_attempts = 3
     for _attempt in range(max_attempts):
       try:
+        # Force one refresh before searching so recent pushes AND deletes
+        # from prior pops are visible. Forced ``indices.refresh`` is ms-scale
+        # (just flushes the indexing buffer to a segment) — far cheaper than
+        # the per-push ``refresh="wait_for"`` it replaces (which blocked ~1s
+        # per push). Amortized: N fast pushes + 1 refresh per read.
+        self.client.indices.refresh(index=self.config.queue_index)
         resp = self.client.search(
           index=self.config.queue_index,
-          query={"term": {"queue_name": queue_name}},
+          # ``.keyword`` subfield for exact match: the dynamic mapping makes
+          # ``queue_name`` a ``text`` field (standard analyzer), so a name
+          # with colons (e.g. ``inttest:<uuid>:queue``) gets tokenized and a
+          # ``term`` on the analyzed field never matches. Keyword subfield is
+          # not analyzed → exact term match regardless of punctuation.
+          query={"term": {"queue_name.keyword": queue_name}},
           sort=[{"priority": "asc"}, {"created_at": "asc"}],
           size=1,
+          # ES 8.x omits ``_seq_no`` / ``_primary_term`` from search hits by
+          # default (7.x included them). The optimistic-locking delete below
+          # requires both, so request them explicitly — without this the pop
+          # raises ``KeyError: '_seq_no'`` on every call under ES 8.x.
+          seq_no_primary_term=True,
         )
         hits = resp.get("hits", {}).get("hits", [])
         if not hits:
           return None
         doc = hits[0]
         try:
+          # No ``refresh`` on delete — the NEXT pop's pre-search refresh
+          # (above) flushes this delete, so the search won't re-find the doc.
           self.client.delete(
             index=self.config.queue_index,
             id=doc["_id"],
@@ -312,8 +353,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "created_at": datetime.now(tz=timezone.utc).isoformat(),
     }
     try:
+      # No ``refresh`` on write — ``contains`` is by-id (immediately
+      # consistent); ``set_len`` refreshes in ``_count``. Same amortized
+      # read-refresh rationale as push.
       self.client.index(
-        index=self.config.set_index, id=doc_id, document=doc, op_type="create"
+        index=self.config.set_index,
+        id=doc_id,
+        document=doc,
+        op_type="create",
       )
     except ConflictError:
       return False
@@ -486,7 +533,15 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Number of matching documents.
     """
     try:
-      resp = self.client.count(index=index, query={"term": {field: value}})
+      # Forced refresh so just-written docs (push/add don't refresh) are
+      # searchable — same amortized-read-refresh rationale as pop.
+      self.client.indices.refresh(index=index)
+      # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
+      # ``set_name`` are dynamically mapped as ``text``; count must match the
+      # exact (unanalyzed) value via the keyword subfield.
+      resp = self.client.count(
+        index=index, query={"term": {f"{field}.keyword": value}}
+      )
     except TransportError:
       return 0
     else:
@@ -516,7 +571,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         field: Field to match.
         value: Value to match.
     """
-    self._delete_by_query(index, {"term": {field: value}})
+    # ``.keyword`` subfield — same exact-match rationale as ``_count``.
+    self._delete_by_query(index, {"term": {f"{field}.keyword": value}})
 
   def _delete_by_query(self, index: str, query: dict[str, Any]) -> None:
     """Delete all documents matching a query.
