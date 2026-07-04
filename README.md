@@ -118,6 +118,45 @@ SCRAPY_BACKEND_TYPE = "rocketmq"
 SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
 ```
 
+<details><summary><b>Topic creation — required setup</b> (the first push otherwise fails)</summary>
+
+The apache rocketmq 5.x gRPC proxy does **not** auto-create topics via the
+`QueryRoute` path by default — a first push to a fresh topic fails with
+`failed to fetch topic route`. `broker.conf`'s `autoCreateTopicEnable=true`
+covers only the legacy remoting path, not the gRPC path the python client
+speaks. Pick **one** of:
+
+**Option A — enable proxy-side auto-create (recommended for dev):**
+
+Mount an `rmq-proxy.json` and point the broker at it via `-pc`:
+```json
+{
+  "rocketMQClusterName": "DefaultCluster",
+  "enableAutoTopicCreation": true,
+  "topicQueueConfig": { "defaultReadQueueNum": 8, "defaultWriteQueueNum": 8 }
+}
+```
+```bash
+sh mqbroker -n namesrv:9876 -c /path/broker.conf --enable-proxy -pc /path/rmq-proxy.json
+```
+
+**Option B — pre-create topics (production / locked-down brokers):**
+```bash
+mqadmin updateTopic -n namesrv:9876 -b broker:10911 -t scrapy-queue_<your-queue>
+```
+
+Also set `brokerIP1` in `broker.conf` to an address your client can resolve
+(`127.0.0.1` for single-host docker; the broker's real IP for remote clients)
+— the proxy returns this to clients, and the default container hostname is
+usually unreachable from the host.
+
+</details>
+
+> **At-least-once delivery:** RocketMQ uses a deferred-ack model — `pop`
+> returns a message body **without** acking; the scheduler acks via
+> `ack(token=msg)` after the request completes. A crash before ack → the
+> broker's invisible-duration window redelivers (at-least-once, not exactly-once).
+
 ### Pulsar (standalone, cluster)
 
 ```python

@@ -70,13 +70,14 @@ in any release.
 | RabbitMQ | Yes | No | No | Stable — queue-only | Priority queues (`x-max-priority`); HA policy; per-message ack. |
 | Pulsar | Yes | No | No | Stable — queue-only | Shared subscription; single-slot ack (`supports_concurrent_ack=False`). |
 | SQS | Yes | No | No | Stable — queue-only | Standard queues; LocalStack + AWS; single-slot ack. |
-| RocketMQ | Yes | Stub | Stub | Experimental | Queue functional; Set/Storage raise `NotImplementedError`. **Supply-chain caveat:** depends on `rocketmq-client-python` (round-7 accepted unmaintained dep). |
+| RocketMQ | Yes | Guard | Guard | Stable — queue-only | gRPC proxy (`--enable-proxy`, port 8081); deferred-ack (at-least-once) via per-message token; Set/Storage rejected at config time (`ConfigurationError` guard). Apache `rocketmq-python-client` 5.1.1 (pure-Python, maintained). |
 | DynamoDB | No | No | Yes | Stable — storage-only | KV+TTL; LocalStack + AWS. |
 | Memcached | No | No | Yes | **Experimental** | KV+TTL (storage-only). **Supply-chain caveat:** depends on `pymemcache==4.0.0` — unmaintained (last release 2022-10-17, ~1300+ days stale at the time of writing); tracked as U20. The label is applied to `pyproject.toml` separately; this document records the status. |
 
-A "Stub" Set/Storage column means the method signatures exist but raise
-`NotImplementedError` at runtime — pair RocketMQ with a full backend for
-dedup/storage.
+A "Guard" Set/Storage column means configuring that backend for the set/storage
+component is rejected at config time (`ConfigurationError`) — the backend has
+no native set/KV semantics. Pair it with a full backend (Redis, MongoDB,
+ElasticSearch, Memcached, or DynamoDB) for dedup/storage.
 
 ## Round-9 hardening (this release)
 
