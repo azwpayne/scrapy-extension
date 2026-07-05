@@ -219,7 +219,7 @@ Components accept `monitor: Monitor = NullMonitor()` and call hooks: `on_queue_d
 
 ---
 
-## 8. Configuration Surface — `settings/base.py` (323 LOC)
+## 8. Configuration Surface — `settings/base.py` (322 LOC)
 
 `Settings(BaseSettings)` — pydantic-settings, `env_prefix="SCRAPY_"`, `case_sensitive=False`, `extra="ignore"`.
 
@@ -251,7 +251,7 @@ Per-backend settings modules: `redis.py` (4 modes), `mongodb.py` (4 modes), `kaf
 | `circuit_breaker.py` | **100%** (137/137 stmts, 30/30 branches) — full state machine |
 | `monitor/` (base + stats) | **100%** |
 | `storage/strategies/` | 99-100% (batched.py 98.36% — 1 empty-flush branch) |
-| `connectors.py` | 97.67% (post connection-manager-suite-lock-fix) |
+| `connectors.py` | 100% (post connection-manager-suite-lock-fix + subsequent coverage work) |
 | Integration suites | 26/26 green (skip-by-default; two-layer gate `SCRAPY_TEST_INTEGRATION=1` + per-backend URL) |
 | Ruff | clean |
 | Type hints | full; `py.typed` marker |
