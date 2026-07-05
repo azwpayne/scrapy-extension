@@ -125,14 +125,20 @@ All three follow the same shape: ABC + concrete strategies + factory, selected v
 
 ### 4.2 ② Queue semantics — `QueueStrategy` (`queue/strategies/`)
 
-| Strategy | `SCRAPY_QUEUE_STRATEGY` | Behavior |
-|----------|-------------------------|----------|
-| `PassthroughQueueStrategy` | `passthrough` (default) | Direct delegate to QueueBackend |
-| `DelayQueueStrategy` | `delay` | In-process holding heap; pop blocks until ready |
-| `RoundRobinQueueStrategy` | `round_robin` | Fairness across `source` tags |
-| `ThrottleQueueStrategy` | `throttle` | Rate-limited pop |
+Eight strategies — the original four (default / delay / fairness / rate-limit) plus four added in round-15 for backend-agnostic priority, high-throughput short-delay scheduling, pop-side load balancing, and bounded-memory streaming:
 
-Each strategy receives a `ConnectionManager` and drives the underlying QueueBackend (and StorageBackend where needed). **Snapshot/restore** (`snapshot()` / `restore()`, initiative #3) lets strategies with in-process held state (e.g. Delay's heap) persist state for crash/restart recovery — `BackendQueue` calls `snapshot()` on `close()` and `restore()` on startup. Default is `None` (nothing to persist).
+| Strategy | `SCRAPY_QUEUE_STRATEGY` | Behavior | Snapshot/restore |
+|----------|-------------------------|----------|------------------|
+| `PassthroughQueueStrategy` | `passthrough` (default) | Direct delegate to QueueBackend | — (state backend-side) |
+| `DelayQueueStrategy` | `delay` | In-process binary heap (`O(log n)`); pop blocks until ready | ✅ versioned JSON heap |
+| `RoundRobinQueueStrategy` | `round_robin` | Push-side fairness across `source` tags | — |
+| `ThrottleQueueStrategy` | `throttle` | Rate-limited pop (min seconds between pops) | — |
+| `PriorityQueueStrategy` | `priority` | N-level physical buckets `<name>:p<level>` — strategy-layer priority that works on backends WITHOUT native priority (SQS Standard, Kafka). Higher caller priority → lower level index → popped first. | — (state backend-side) |
+| `TimeWheelQueueStrategy` | `time_wheel` | `O(1)` hashed timing wheel + overflow heap for long delays. Faster than `delay`'s heap on workloads with many short-delay items. | ✅ versioned JSON (wheel + overflow) |
+| `WorkStealingQueueStrategy` | `work_stealing` | Pop-side load balancing — own queue `<name>:<worker_id>` first, steal from peer queues round-robin when idle. Composes with `round_robin` (push-side). | — (state backend-side) |
+| `RingBufferQueueStrategy` | `ring_buffer` | Bounded in-process circular buffer with overflow policy (`reject` / `drop_oldest` / `block`). Buffer IS the storage (backend QueueBackend ignored). Items lost on crash (documented). | ✅ versioned JSON (buffer + dropped count) |
+
+Each strategy receives a `ConnectionManager` and drives the underlying QueueBackend (and StorageBackend where needed) — except `RingBufferQueueStrategy`, which ignores the backend entirely (the buffer is the storage). **Snapshot/restore** (`snapshot()` / `restore()`, initiative #3) lets strategies with in-process held state (`Delay` / `TimeWheel` / `RingBuffer`) persist state for crash/restart recovery — `BackendQueue` calls `snapshot()` on `close()` and `restore()` on startup. Default is `None` (nothing to persist). `Priority` and `WorkStealing` carry no in-process state (all state lives in backend-side physical queues).
 
 ### 4.3 ③ Storage — `StorageStrategy` (`storage/strategies/`)
 
