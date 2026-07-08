@@ -1,7 +1,6 @@
 # Scrapy Extension Examples
 
-Working examples demonstrating all features of [scrapy-extension](../README.md) —
-distributed crawling with pluggable backends (Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ).
+Representative examples for [scrapy-extension](../README.md) — distributed crawling with pluggable backends. Runnable spiders cover the common full and queue-only paths; newer/partial backends (Pulsar, SQS, Memcached, DynamoDB) are documented as settings recipes in the root README and runbook rather than dedicated spiders.
 
 ## Prerequisites
 
@@ -62,14 +61,18 @@ examples/
 | Kafka         | Yes   | No          | No      | standalone, cluster, confluent                  |
 | RabbitMQ      | Yes   | No          | No      | standalone, cluster, mirrored_queues           |
 | ElasticSearch | Yes   | Yes         | Yes     | standalone, cloud                               |
-| RocketMQ      | Yes   | Stub        | Stub    | standalone, cluster, cloud                      |
+| RocketMQ      | Yes   | Guard       | Guard   | standalone, cluster, cloud                      |
+| Pulsar        | Yes   | No          | No      | standalone, cluster                             |
+| SQS           | Yes   | No          | No      | standalone (LocalStack), cloud (AWS)            |
+| Memcached     | No    | No          | Yes     | standalone                                      |
+| DynamoDB      | No    | No          | Yes     | standalone (LocalStack), cloud (AWS)            |
 
 - **Yes** — fully implemented
-- **No** — not available (raises `NotImplementedError`)
-- **Stub** — method signatures exist but raise `NotImplementedError` at runtime
+- **No** — not available; selecting the backend for that component fails capability validation
+- **Guard** — rejected at config time (`ConfigurationError`); guard classes fail fast if bypassed
 
-**Kafka, RabbitMQ**: Queue-only. For dedup/storage, use Redis, MongoDB, or ElasticSearch.
-**RocketMQ**: Queue functional. Set/Storage are stubs — pair with a full-featured backend.
+**Kafka, RabbitMQ, Pulsar, SQS**: Queue-only. For dedup/storage, use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB.
+**RocketMQ**: Queue functional via the Apache gRPC client. Set/Storage are guarded — pair with a full-featured backend.
 
 ---
 
@@ -337,27 +340,23 @@ docker logs rabbitmq
 
 ```python
 SCRAPY_BACKEND_TYPE = "rocketmq"
-SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
+SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
 ```
 
 **Queue-only** — no Set or Storage support.
 
 ```bash
-# Start RocketMQ nameserver
-docker run -d --name rocketmq-namesrv -p 9876:9876 apache/rocketmq:5.0 namesrv
-
-# Start RocketMQ broker
-docker run -d --name rocketmq-broker -p 10911:10911 -p 10909:10909 \
-  --link rocketmq-namesrv \
-  -e NAMESRV_ADDR=rocketmq-namesrv:9876 \
-  apache/rocketmq:5.0 broker
+# Start a RocketMQ broker with the gRPC proxy enabled.
+# The extension connects to the proxy endpoint (default localhost:8081),
+# not the legacy NameServer-only port (9876).
+docker run -d --name rocketmq -p 8081:8081 apache/rocketmq:5.3.2 sh mqbroker --enable-proxy
 ```
 
 ### Configuration Options
 
 | Setting | Env Variable | Default | Description |
 |---------|-------------|---------|-------------|
-| `namesrv_address` | `SCRAPY_ROCKETMQ_NAMESRV_ADDRESS` | `localhost:9876` | RocketMQ nameserver address |
+| `namesrv_address` | `SCRAPY_ROCKETMQ_NAMESRV_ADDRESS` | `localhost:8081` | RocketMQ gRPC proxy endpoint (`host:port`) |
 | `access_key` | `SCRAPY_ROCKETMQ_ACCESS_KEY` | — | Alibaba Cloud access key |
 | `secret_key` | `SCRAPY_ROCKETMQ_SECRET_KEY` | — | Alibaba Cloud secret key |
 | `consumer_group` | `SCRAPY_ROCKETMQ_CONSUMER_GROUP` | `scrapy-extension-consumer` | Consumer group |
@@ -370,28 +369,23 @@ docker run -d --name rocketmq-broker -p 10911:10911 -p 10909:10909 \
 
 ```python
 SCRAPY_BACKEND_TYPE = "rocketmq"
-SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
+SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
 ```
 
 **Alibaba Cloud RocketMQ:**
 
 ```python
 SCRAPY_ROCKETMQ_MODE = "cloud"
-SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "your-namesrv.addr.aliyun.com:8080"
+SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "your-rocketmq-proxy.example.com:8081"
 SCRAPY_ROCKETMQ_ACCESS_KEY = "your_access_key"
 SCRAPY_ROCKETMQ_SECRET_KEY = "your_secret_key"
 ```
 
 ### Important Limitations
 
-RocketMQ implements `QueueBackend` fully. `SetBackend` and `StorageBackend` method **signatures exist but raise `NotImplementedError`** at runtime:
-- `SetBackend.add()` — RocketMQ does not support atomic add-or-skip set operations
-- `SetBackend.contains()` — RocketMQ does not support set membership queries
-- `SetBackend.set_len()` — RocketMQ does not support set size queries
-- `StorageBackend.retrieve()` — RocketMQ does not support point-in-time key retrieval
-- `StorageBackend.delete()` / `exists()` / `ttl()` / `clear_storage()` — same limitation
+RocketMQ implements `QueueBackend` fully. `SetBackend` and `StorageBackend` are **guarded**: selecting RocketMQ for dedup or storage is rejected at config time with `ConfigurationError`, and guard classes fail fast if the capability gate is bypassed.
 
-For deduplication and storage, pair with Redis, MongoDB, or ElasticSearch.
+For deduplication and storage, pair RocketMQ queueing with Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB via the per-component backend settings.
 
 ### Common Errors
 
@@ -399,7 +393,7 @@ For deduplication and storage, pair with Redis, MongoDB, or ElasticSearch.
 
 ```bash
 docker ps | grep rocketmq
-nc -zv localhost 9876
+nc -zv localhost 8081
 ```
 
 **Authentication failed** — check access_key and secret_key for cloud mode:
@@ -627,12 +621,12 @@ set_backend = self._manager.get_set_backend()       # add, contains, remove
 storage_backend = self._manager.get_storage_backend() # store, retrieve, delete
 ```
 
-**NotImplementedError guard (Kafka/RabbitMQ don't support Set/Storage, RocketMQ raises NotImplementedError at runtime):**
+**Capability guard (queue-only backends do not support Set/Storage; RocketMQ set/storage fail fast at config time):**
 
 ```python
 try:
     set_backend = self._manager.get_set_backend()
-except NotImplementedError:
+except (NotImplementedError, ConfigurationError):
     set_backend = None
 ```
 

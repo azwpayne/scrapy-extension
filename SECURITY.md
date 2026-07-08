@@ -30,7 +30,7 @@ component integration.
 
 It does **not** cover the underlying backend client libraries
 (`redis`, `pymongo`, `kafka-python`, `pika`, `elasticsearch`,
-`rocketmq-client-python`, `pulsar-client`, `boto3`, `pymemcache`) or Scrapy
+`rocketmq-python-client`, `pulsar-client`, `boto3`, `pymemcache`) or Scrapy
 itself — report those to their respective projects. `scrapy-extension`
 handles secrets via pydantic `SecretStr` and redacts them in exceptions (see
 `docs/code-review-2026-06-15.md`, Rounds 13, 26–28); credential-handling
@@ -111,11 +111,14 @@ unacked.
 
 ## Supply-chain notes
 
-Two bundled backends depend on libraries with supply-chain risk:
+One bundled backend currently carries a known supply-chain caveat:
 
-- **RocketMQ** — depends on `rocketmq-client-python`, which is unmaintained.
-  Accepted in round-7 (queue is functional; Set/Storage are stubs). Tracked
-  as a known risk.
+- **RocketMQ** — uses Apache `rocketmq-python-client>=5.1.1,<6`, the
+  maintained pure-Python gRPC client. The old unmaintained
+  `rocketmq-client-python`/native-client risk is no longer part of the
+  supported dependency path. RocketMQ is still queue-only: Set/Storage are
+  rejected at config time (`ConfigurationError`) and guard classes fail fast if
+  the capability gate is bypassed.
 - **Memcached** — depends on `pymemcache==4.0.0`, unmaintained (last release
   2022-10-17). Marked Experimental in [`STABILITY.md`](STABILITY.md);
   tracked as U20.

@@ -8,9 +8,7 @@ fork the package to add another — any installed distribution can register a ba
 through the `scrapy_extension.backends` entry-point group, and it is then selectable
 via `SCRAPY_BACKEND_TYPE` exactly like a bundled one.
 
-This document is the contract for 3rd-party plugin authors. It covers the entry-point
-shape, the `BackendDescriptor` dataclass, the lazy-import rule, bundled-wins
-precedence, and a worked end-to-end example.
+This document is the authoring contract for 3rd-party plugin authors. `BackendDescriptor` entry-point registration is currently **Experimental** (see [`STABILITY.md`](../STABILITY.md)): usable, tested, and intended for plugin authors, but still allowed to evolve in a minor `0.x` release until a third-party ecosystem validates the surface. The guide covers the entry-point shape, the descriptor dataclass, the lazy-import rule, bundled-wins precedence, and a worked end-to-end example.
 
 ## How Registration Works
 
@@ -215,52 +213,67 @@ class MyBackend(QueueBackend, SetBackend, StorageBackend):
         return True
 
     # -- QueueBackend --------------------------------------------------------
-    def push(self, item: bytes, priority: int = 0) -> None:
-        self._queue.append((f"{priority:010d}", item))
+    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+        self._queue.append((f"{priority:010.3f}", item))
 
-    def pop(self) -> bytes | None:
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
         if not self._queue:
             return None
         self._queue.sort(key=lambda pair: pair[0])
         return self._queue.pop(0)[1]
 
-    def queue_len(self) -> int:
+    def queue_len(self, queue_name: str) -> int:
         return len(self._queue)
 
-    def clear_queue(self) -> None:
+    def clear_queue(self, queue_name: str) -> None:
         self._queue.clear()
 
     # -- SetBackend ----------------------------------------------------------
-    def add(self, key: str) -> None:
+    def add(self, set_name: str, item: bytes) -> bool:
+        key = f"{set_name}:{item.hex()}"
+        if key in self._seen:
+            return False
         self._seen.add(key)
+        return True
 
-    def contains(self, key: str) -> bool:
-        return key in self._seen
+    def contains(self, set_name: str, item: bytes) -> bool:
+        return f"{set_name}:{item.hex()}" in self._seen
 
-    def remove(self, key: str) -> None:
-        self._seen.discard(key)
+    def remove(self, set_name: str, item: bytes) -> None:
+        self._seen.discard(f"{set_name}:{item.hex()}")
 
-    def set_len(self) -> int:
-        return len(self._seen)
+    def set_len(self, set_name: str) -> int:
+        prefix = f"{set_name}:"
+        return sum(1 for key in self._seen if key.startswith(prefix))
 
-    def clear_set(self) -> None:
-        self._seen.clear()
+    def clear_set(self, set_name: str) -> None:
+        prefix = f"{set_name}:"
+        self._seen = {key for key in self._seen if not key.startswith(prefix)}
 
     # -- StorageBackend ------------------------------------------------------
-    def store(self, key: str, value: bytes, ttl: int | None = None) -> None:
-        self._store[key] = value
+    def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
+        self._store[key] = data
 
     def retrieve(self, key: str) -> bytes | None:
         return self._store.get(key)
 
-    def delete(self, key: str) -> None:
+    def delete(self, key: str) -> bool:
         self._store.pop(key, None)
+        return True
 
     def exists(self, key: str) -> bool:
         return key in self._store
 
     def ttl(self, key: str) -> int | None:
         return None  # demo only — real backends honour the TTL
+
+    def clear_storage(self, prefix: str | None = None) -> None:
+        if prefix is None:
+            self._store.clear()
+            return
+        for key in list(self._store):
+            if key.startswith(prefix):
+                del self._store[key]
 ```
 
 ### Selecting it
@@ -291,6 +304,57 @@ eligible for any of the three roles. If it declared only `{"queue"}`, selecting
 it for dedup or storage would raise `ConfigurationError` with the list of
 backends that *do* support the requested capability.
 
+
+## Compatibility Smoke Tests
+
+Before publishing a plugin, run these checks in a fresh environment with your wheel installed. They make the prose contract executable.
+
+```python
+from scrapy.settings import Settings
+from scrapy_extension.backends.connectors import resolve_backend_config
+from scrapy_extension.backends.registry import get_descriptor, get_registry
+
+
+def test_plugin_registry_discovery():
+    registry = get_registry()
+    assert "mybackend" in registry
+    descriptor = get_descriptor("mybackend")
+    assert descriptor.backend_cls_path == "mybackend_plugin.backends.MyBackend"
+    assert descriptor.settings_cls_path == "mybackend_plugin.settings.MySettings"
+
+
+def test_plugin_queue_capability_selected():
+    settings = Settings({"SCRAPY_QUEUE_BACKEND_TYPE": "mybackend"})
+    backend_type, backend_settings = resolve_backend_config(
+        settings,
+        type_key="SCRAPY_QUEUE_BACKEND_TYPE",
+        settings_key="SCRAPY_QUEUE_BACKEND_SETTINGS",
+        required_capabilities={"queue"},
+        component_name="queue",
+    )
+    assert backend_type == "mybackend"
+    assert backend_settings == {}
+
+
+def test_queue_only_plugin_rejects_storage():
+    # Change the plugin descriptor in this test fixture to capabilities=frozenset({"queue"}).
+    settings = Settings({"SCRAPY_STORAGE_BACKEND_TYPE": "mybackend"})
+    try:
+        resolve_backend_config(
+            settings,
+            type_key="SCRAPY_STORAGE_BACKEND_TYPE",
+            settings_key="SCRAPY_STORAGE_BACKEND_SETTINGS",
+            required_capabilities={"storage"},
+            component_name="storage",
+        )
+    except Exception as exc:
+        assert exc.__class__.__name__ == "ConfigurationError"
+    else:
+        raise AssertionError("queue-only plugin must be rejected for storage")
+```
+
+Also verify the lazy-import rule manually: importing `scrapy_extension.backends.registry` and calling `get_registry()` must not import your backend driver module until the selected backend is actually constructed.
+
 ## Checklist for Plugin Authors
 
 - [ ] Entry-point group is exactly `scrapy_extension.backends`.
@@ -299,6 +363,8 @@ backends that *do* support the requested capability.
 - [ ] Callable imports **only** `BackendDescriptor` from core — never the backend
       or settings module.
 - [ ] `capabilities` is a subset of `{"queue", "set", "storage"}`.
+- [ ] Compatibility smoke tests pass for registry discovery, capability selection, and unsupported-capability rejection.
+- [ ] Lazy-import smoke test confirms registry discovery does not import the backend driver module.
 - [ ] No name collision with a bundled backend (or accept the `UserWarning` and
       that the bundled descriptor wins).
 

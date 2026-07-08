@@ -41,6 +41,10 @@ required.
 | `delay` | Per-request polite delay (e.g. rate-limit per domain). In-process; lost on crash. | `SCRAPY_QUEUE_DELAY_DEFAULT` |
 | `round_robin` | Fair dispatch across `request.meta['source']`; no starvation. In-process. | — |
 | `throttle` | Rate-limited pops. Effective rate under N workers = `N × (1 / min_interval)`. | `SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL` |
+| `priority` | Strategy-layer priority buckets for backends without native priority. | `SCRAPY_QUEUE_PRIORITY_LEVELS` |
+| `time_wheel` | Hashed timing wheel for many short delays. In-process. | `SCRAPY_QUEUE_TIME_WHEEL_SIZE`, `SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND` |
+| `work_stealing` | Own queue first, then peer queues when idle. | `SCRAPY_QUEUE_WORKER_ID`, `SCRAPY_QUEUE_PEER_IDS`, `SCRAPY_QUEUE_STEAL_TIMEOUT` |
+| `ring_buffer` | Bounded circular buffer with explicit overflow behavior. | `SCRAPY_QUEUE_RING_BUFFER_CAPACITY`, `SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY` |
 
 ```python
 # settings.py
@@ -48,8 +52,35 @@ SCRAPY_QUEUE_STRATEGY = "delay"
 SCRAPY_QUEUE_DELAY_DEFAULT = 2.0  # seconds
 ```
 
-**Caveat:** `delay`, `round_robin`, and `throttle` are per-process. Only
-`passthrough` is distributed-exact.
+**Caveat:** every non-`passthrough` queue strategy keeps at least some state in-process. Only `passthrough` is distributed-exact. Treat delay heaps, timing wheels, rate limiters, work-stealing cursors, and ring buffers as performance/fairness tools rather than durable scheduling logs.
+
+## Switch storage strategy
+
+Select a `StorageStrategy` via `SCRAPY_STORAGE_STRATEGY` — no code change required.
+
+| Strategy | When to use | Durability boundary |
+|---|---|---|
+| `passthrough` (default) | Item loss is unacceptable; backend round trips are acceptable. | Each item is written directly to the selected `StorageBackend`. |
+| `batched` | Higher throughput is more important than immediate persistence. | Items sit in an in-process buffer until threshold / spider close; hard crash before flush loses the buffer. Store exceptions re-enqueue the unwritten tail. |
+
+```python
+# settings.py
+SCRAPY_STORAGE_STRATEGY = "batched"
+```
+
+Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance.
+
+## Ack and durability matrix
+
+| Surface | Ack / state boundary | Crash behavior | Operator action |
+|---|---|---|---|
+| Redis / MongoDB / ElasticSearch queue pop | Atomic pop removes the item from the backend queue. | A worker crash after pop can lose the request unless the spider re-enqueues or the backend implementation provides its own recovery. | Use idempotent callbacks and durable item storage for critical crawls. |
+| Kafka / RabbitMQ queue pop | `pop_with_ack()` returns a per-message token; scheduler acks on Scrapy `response_received`. | Crash before ack redelivers. Crash after response but before callback/pipeline completion can lose downstream work. | Treat ack as downloader-level, not end-to-end completion. |
+| RocketMQ queue pop | Deferred-ack queue support via the Apache gRPC client; set/storage are guarded. | Queue is at-least-once around ack, but callback/pipeline completion is still outside the ack boundary. | Pair with storage/dedup backends via per-component settings. |
+| SQS / Pulsar queue pop | Per-message ack token (`pop_with_ack`) in a bounded in-flight set; acked on `response_received`. | Same download-level semantics as Kafka/RabbitMQ; crash before ack redelivers. | Safe under `CONCURRENT_REQUESTS > 1` — these backends ship a real in-flight ack set, not a single slot. |
+| Backend/plugin declaring `supports_concurrent_ack=False` | Single ack slot only. | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` is set. | Keep concurrency at 1, or pick a backend with a real in-flight ack set. |
+| Stateful queue strategies | In-process scheduling/fairness/rate state. | Hard crash can lose held strategy state; snapshot/restore is best-effort where implemented. | Prefer `passthrough` when distributed durability beats scheduling policy. |
+| `batched` storage | In-process write buffer. | Hard crash before flush loses buffered items. | Prefer `passthrough` when persistence must happen before item acknowledgement. |
 
 ## Multi-backend coexistence
 
@@ -196,7 +227,8 @@ exist; this is the canonical procedure until it lands):
    into a new `## [X.Y.Z] — YYYY-MM-DD` section.
 4. **Tag:** `git tag vX.Y.Z` and push the tag.
 5. **Publish:** `uv build && uv publish`.
-6. **Verify:** in a fresh venv, `pip install scrapy-extension==X.Y.Z` and
+6. **Verify gates:** `uv run ruff check`, `uv run pytest -m "not integration"`, and `uv run pytest --cov=scrapy_extension --cov-report=term-missing` (fails below 95%). For live backends, set the relevant `SCRAPY_TEST_*` variables and pass `--force-enable-socket`.
+7. **Verify install:** in a fresh venv, `pip install scrapy-extension==X.Y.Z` and
    import the package + one backend; confirm `__version__` matches.
 
 For the stability commitment each release makes, see

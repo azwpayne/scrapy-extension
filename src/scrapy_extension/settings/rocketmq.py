@@ -38,7 +38,11 @@ class RocketMQSettings(BaseSettings):
     mode: RocketMQMode = Field(default=RocketMQMode.STANDALONE)
 
     # === Connection ===
-    namesrv_address: str = Field(default="localhost:9876")
+    # gRPC PROXY endpoint (apache rocketmq-python-client 5.1.1) — the broker
+    # must run with ``--enable-proxy``. Legacy NameServer port was 9876; the
+    # gRPC client cannot speak the legacy namesrv protocol, so the default
+    # follows the documented proxy port.
+    namesrv_address: str = Field(default="localhost:8081")
     access_key: SecretStr | None = Field(default=None)
     secret_key: SecretStr | None = Field(default=None)
 
@@ -74,7 +78,7 @@ class RocketMQSettings(BaseSettings):
             raise ConfigurationError(
                 (
                     "namesrv_address must match 'host:port' "
-                    "(e.g. 'localhost:9876'). "
+                    "(e.g. 'localhost:8081'). "
                     f"Got namesrv_address={self.namesrv_address!r}."
                 ),
                 setting_name="namesrv_address",

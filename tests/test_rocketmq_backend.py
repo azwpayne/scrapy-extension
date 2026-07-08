@@ -808,7 +808,7 @@ def test_rocketmq_settings_defaults() -> None:
   """Test RocketMQSettings default values."""
   settings = RocketMQSettings()
   assert settings.mode == RocketMQMode.STANDALONE
-  assert settings.namesrv_address == "localhost:9876"
+  assert settings.namesrv_address == "localhost:8081"
   assert settings.consumer_group == "scrapy-extension-consumer"
   assert settings.producer_group == "scrapy-extension-producer"
   assert settings.topic_prefix == "scrapy-queue"

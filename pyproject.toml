@@ -173,6 +173,7 @@ testpaths = ["tests", "src"]
 addopts = [
     "-v",
     "--tb=short",
+    "--disable-socket",
 ]
 filterwarnings = [
     #    "ignore::pytest_benchmark.logger.PytestBenchmarkWarning",
@@ -206,6 +207,7 @@ concurrency = ["thread", "multiprocessing"]
 
 [tool.coverage.report]
 precision = 2
+fail_under = 95
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",

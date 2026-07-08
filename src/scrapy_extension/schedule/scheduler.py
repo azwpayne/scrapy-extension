@@ -247,12 +247,34 @@ class BackendScheduler:
     delay_max_held = (
       int(delay_max_held_raw) if delay_max_held_raw not in (None, "") else None
     )
+    # peer_ids is read via .get + an isinstance guard (not .getlist) so that a
+    # Mock settings object — whose .getlist is unconfigured in several scheduler
+    # tests — yields () instead of raising ``TypeError: 'Mock' object is not
+    # iterable``. Real Scrapy settings return a comma-separated string here.
+    peer_ids_raw = settings.get("SCRAPY_QUEUE_PEER_IDS")
+    peer_ids = (
+      tuple(s for s in peer_ids_raw.split(",") if s)
+      if isinstance(peer_ids_raw, str)
+      else ()
+    )
     queue_strategy = build_queue_strategy(
       strategy_type,
       manager,
       default_delay=settings.getfloat("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
       min_interval=settings.getfloat("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
       max_held=delay_max_held,
+      # Round-15: wire the strategy-specific knobs documented in docs/runbook.md.
+      # Each key falls back to the build_queue_strategy default, so existing
+      # behavior is unchanged unless the operator overrides it. Previously these
+      # eight settings were documented but never read (silent no-op).
+      priority_levels=settings.getint("SCRAPY_QUEUE_PRIORITY_LEVELS", 3),
+      wheel_size=settings.getint("SCRAPY_QUEUE_TIME_WHEEL_SIZE", 60),
+      ticks_per_second=settings.getfloat("SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND", 1.0),
+      worker_id=settings.get("SCRAPY_QUEUE_WORKER_ID") or None,
+      peer_ids=peer_ids,
+      steal_timeout=settings.getfloat("SCRAPY_QUEUE_STEAL_TIMEOUT", 0.05),
+      capacity=settings.getint("SCRAPY_QUEUE_RING_BUFFER_CAPACITY", 1024),
+      full_policy=settings.get("SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY", "reject"),
     )
     # Backpressure gate (round-4 BP-2). Read via settings.get(...) + int() —
     # NOT getint (some Scrapy versions return 0 on unset, which would collide

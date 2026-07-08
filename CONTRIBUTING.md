@@ -26,7 +26,7 @@ uv run pytest tests/test_backends.py            # one file
 uv run pytest tests/test_backends.py::TestRedisBackend::test_connect_success -v  # one test
 ```
 
-The unit suite is mock-based (no live backends needed).
+The unit suite is mock-based (no live backends needed). Pytest runs with `--disable-socket` by default so unit tests cannot accidentally open real network connections; integration tests must opt back in with `--force-enable-socket`.
 
 ### Integration tests (require live backends)
 
@@ -42,13 +42,13 @@ skips; set → it runs against that service.
 | ElasticSearch | `SCRAPY_TEST_ES_HOSTS` | `http://localhost:9200` (comma-separated) |
 | RabbitMQ | `SCRAPY_TEST_RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` |
 | Kafka | `SCRAPY_TEST_KAFKA_BOOTSTRAP` | `localhost:9092` |
-| RocketMQ | `SCRAPY_TEST_ROCKETMQ_NAMESRV` | `localhost:9876` |
+| RocketMQ | `SCRAPY_TEST_ROCKETMQ_NAMESRV` | `localhost:8081` (gRPC proxy, broker started with `--enable-proxy`) |
 
 Run any subset by setting the relevant vars:
 
 ```bash
 SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 \
-  uv run pytest tests/integration -m integration -q
+  uv run pytest tests/integration -m integration -q --force-enable-socket
 ```
 
 Each suite uses UUID-prefixed keys/topics so concurrent runs and leftover data
@@ -81,7 +81,7 @@ uv run ruff check --fix  # auto-fix safe issues
 uv run pytest --cov=scrapy_extension --cov-report=term-missing
 ```
 
-Target: **≥95%**. Currently ~97%; every module is ≥95%, most ≥97%.
+Target: **≥95%**. This is enforced by `tool.coverage.report.fail_under = 95`; coverage commands fail below that floor.
 
 ## Build
 
@@ -95,8 +95,7 @@ uv build                 # sdist + wheel → dist/
 push/PR (`ruff check` + `pytest -m "not integration"`). The integration job is
 included as a commented stub — to enable it, uncomment the `integration-tests`
 job, add service containers for the backends you want, and wire the
-`SCRAPY_TEST_*` env vars to them. (RocketMQ additionally needs the native
-`librocketmq` library, which isn't in standard images.)
+`SCRAPY_TEST_*` env vars to them and pass `--force-enable-socket` for live-service tests. RocketMQ uses the pure-Python Apache gRPC client and requires the broker proxy endpoint (usually `localhost:8081`), not the legacy NameServer-only port.
 
 ## Architecture & rationale
 

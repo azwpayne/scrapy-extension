@@ -6,12 +6,23 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://pypi.org/project/scrapy-extension/)
 
+## Contents
+
+- [Features](#features) · [Installation](#installation) · [Quick Start](#quick-start)
+- [Backend Configuration](#backend-configuration) · [Backend Capabilities](#backend-capabilities)
+- [Guarantees](#guarantees) · [Multi-Backend Coexistence](#multi-backend-coexistence)
+- [Pluggable Strategy Layers](#pluggable-strategy-layers) — incl. the [Ack & durability matrix](#ack-and-durability-matrix)
+- [Architecture](#architecture) · [Scrapy Components](#scrapy-components) · [Exceptions](#exceptions)
+- [Examples](#examples) · [Security](#security) · [Testing](#testing) · [License](#license)
+
+> **Deeper docs:** operations → [`docs/runbook.md`](docs/runbook.md) · plugin authors → [`docs/backend-plugins.md`](docs/backend-plugins.md) · API/maturity → [`STABILITY.md`](STABILITY.md) · runnable spiders → [`examples/README.md`](examples/README.md)
+
 ## Features
 
 - **10 Backends**: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ, Pulsar, SQS, Memcached, DynamoDB
 - **Multi-Mode**: Standalone, cluster, cloud deployments per backend
 - **Pluggable Dedup**: Set / Memory / **Bloom** / **Cuckoo** filters via `SCRAPY_DEDUP_STRATEGY`
-- **Pluggable Queue Semantics**: Passthrough / **Delay** / **RoundRobin** / **Throttle** via `SCRAPY_QUEUE_STRATEGY`
+- **Pluggable Queue Semantics**: 8 strategies — Passthrough / **Delay** / **RoundRobin** / **Throttle** / **Priority** / **TimeWheel** / **WorkStealing** / **RingBuffer** via `SCRAPY_QUEUE_STRATEGY`
 - **Multi-Backend Coexistence**: bind queue / dedup / storage to *different* backends via `SCRAPY_{QUEUE,SET,STORAGE}_BACKEND_TYPE` (e.g. queue in Redis, dedup + data in MongoDB)
 - **Distributed Queue**: Priority-based request queue across spiders
 - **Duplicate Filtering**: Cross-instance URL deduplication (default: `SetBackend`)
@@ -189,7 +200,7 @@ SCRAPY_DYNAMODB_REGION_NAME = "us-east-1"
 SCRAPY_DYNAMODB_ENDPOINT_URL = "http://localhost:4566"  # LocalStack
 ```
 
-See [`examples/`](examples) for all deployment modes (Sentinel, Cluster, Atlas, Confluent, etc).
+See [`examples/`](examples) for representative runnable spiders and deployment-mode recipes (Sentinel, Cluster, Atlas, Confluent, etc).
 
 ## Backend Capabilities
 
@@ -296,7 +307,7 @@ SCRAPY_STORAGE_BACKEND_SETTINGS = {"uri": "mongodb://mongo:27017", "database": "
 
 ## Pluggable Strategy Layers
 
-Two strategy layers sit above the backend interfaces, selected via Scrapy settings — no code change required. Defaults preserve prior behavior exactly.
+Three strategy layers sit above the backend interfaces, selected via Scrapy settings — no code change required. Defaults preserve prior behavior exactly.
 
 ### Dedup strategy — `SCRAPY_DEDUP_STRATEGY`
 
@@ -320,9 +331,38 @@ Probabilistic filters never produce false negatives; in-memory filters are per-p
 | `passthrough` (default) | delegates to `QueueBackend` unchanged (prior behavior) |
 | `delay` | holds items until `now + delay`; per-request via `request.meta['delay']` or `SCRAPY_QUEUE_DELAY_DEFAULT` |
 | `round_robin` | fair dispatch across `request.meta['source']` (no starvation) |
-| `throttle` | rate-limited pops (`SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL`) |
+| `throttle` | rate-limited pops (`SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL`); limiter state is per-process |
+| `priority` | strategy-layer priority buckets for backends without native priority |
+| `time_wheel` | hashed timing wheel for many short delays; in-process timing state |
+| `work_stealing` | own queue first, then steal from peer queues when idle |
+| `ring_buffer` | bounded in-process circular buffer with explicit overflow policy |
 
-`delay` / `round_robin` hold state in-process (single-worker v1); `passthrough` / `throttle` use the backend queue.
+`delay`, `round_robin`, `throttle`, `time_wheel`, `work_stealing`, and `ring_buffer` keep some state in-process. `passthrough` is the distributed-exact default. See [Ack and durability matrix](#ack-and-durability-matrix) before using a stateful strategy in production.
+
+### Storage strategy — `SCRAPY_STORAGE_STRATEGY`
+
+`BackendPipeline` delegates item writes to a `StorageStrategy`:
+
+| Strategy | Behavior | Durability note |
+|----------|----------|-----------------|
+| `passthrough` (default) | writes each serialized item directly to the selected `StorageBackend` | backend durability applies immediately after `store()` returns |
+| `batched` | buffers `(key, value, ttl)` triples and flushes at threshold / spider close | improves throughput, but a hard crash before flush loses the in-process batch; store exceptions re-enqueue the unwritten tail |
+
+Use `passthrough` when item loss is unacceptable. Use `batched` only when throughput is worth the crash-before-flush trade-off and duplicate writes are acceptable after partial flush retry.
+
+### Ack and durability matrix
+
+| Surface | Ack / state boundary | Crash behavior | Operational guidance |
+|---|---|---|---|
+| Redis / MongoDB / ElasticSearch / RocketMQ queue pop | atomic-pop or deferred-ack handled by the backend implementation; scheduler ack is inert or token-specific | item is removed/owned once popped; callback/pipeline crash after downloader response can still lose downstream item work | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters |
+| Kafka / RabbitMQ queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | understand this is download-level ack, not pipeline-completion ack |
+| SQS / Pulsar queue pop | per-message ack token (`pop_with_ack`) tracked in a bounded in-flight set; acked on `response_received` | same download-level semantics as Kafka/RabbitMQ — crash before ack redelivers | safe under `CONCURRENT_REQUESTS > 1` (a real in-flight ack set, not a single slot) |
+| Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |
+| Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives | prefer `passthrough` for strongest distributed durability |
+| `batched` storage | in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the unwritten tail | prefer `passthrough` when persistence must happen before item acknowledgement |
+
+Ack is tied to Scrapy downloader response delivery, not spider callback or item pipeline completion. If a crawl must tolerate process death after response download but before item persistence, make item processing idempotent and use a durable storage strategy/topology.
+
 
 ## Architecture
 
@@ -354,7 +394,7 @@ Backend (ABC)
     └── clear_storage(prefix)
 ```
 
-All backends implement `Backend` + `QueueBackend`. Redis, MongoDB, and ElasticSearch also implement `SetBackend` + `StorageBackend`.
+All backends implement `Backend` plus the capability interfaces declared in the [Backend Capabilities](#backend-capabilities) matrix. Redis, MongoDB, and ElasticSearch implement all three capability interfaces; queue-only and storage-only backends are rejected at config time when selected for an unsupported component.
 
 ### Connection Management
 
@@ -431,7 +471,7 @@ All exceptions carry context attributes for debugging.
 
 ## Examples
 
-See [`examples/`](examples) — working spiders covering all backends:
+See [`examples/`](examples) — representative runnable spiders and recipes. Some shipped backends are documented as settings recipes rather than dedicated spiders:
 
 | Spider | Backend | Features Demonstrated |
 |--------|---------|----------------------|
@@ -443,7 +483,8 @@ See [`examples/`](examples) — working spiders covering all backends:
 | `quotes_multi_mode` | All | Multi-mode configurations |
 | `quotes_connection_manager` | All | Direct `ConnectionManager` API |
 | `quotes_programmatic` | Redis | Per-spider `backend_settings` dict |
-| `quotes_crawl` | Redis | CrawlSpider variant |
+| `quotes_crawl` | None | CrawlSpider variant |
+| RocketMQ / Pulsar / SQS / Memcached / DynamoDB | recipes | Backend-specific settings; pair partial-capability backends with queue/set/storage-capable partners as needed |
 | `quotes` | None | Basic Scrapy spider (no backend) |
 
 ## Security
@@ -463,13 +504,13 @@ uv run pytest
 uv run pytest tests/test_mongodb_backend.py
 
 # Run with coverage report
-uv run pytest --cov=src/scrapy_extension --cov-report=term-missing
+uv run pytest --cov=scrapy_extension --cov-report=term-missing
 
 # Run full matrix (all Python versions)
 uv run poe test
 ```
 
-Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage), pytest-ruff (lint), pytest-socket (network isolation), and more.
+Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage with `fail_under = 95`), pytest-ruff (lint), pytest-socket (unit tests run with sockets disabled by default), and more. Live integration tests require explicit backend env vars plus `--force-enable-socket`.
 
 ## License
 
