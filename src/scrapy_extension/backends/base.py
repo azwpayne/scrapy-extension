@@ -30,13 +30,20 @@ from typing import Any, Protocol
 
 from pydantic import SecretStr
 
+#: Sentinel marker emitted for ``bytes`` / ``bytearray`` on serialize so
+#: ``deserialize`` can reverse it unambiguously (see ``_decode_bytes_tag``).
+#: A bare base64 ``str`` would be indistinguishable from a caller's plain ASCII
+#: string that happens to be valid base64. ``"__b64__"`` is a reserved meta key.
+_BYTES_TAG = "__b64__"
+
 
 def _json_default(obj: object) -> object:
   """JSON default handler for types Scrapy request dicts commonly contain.
 
   Handles the types that appear in real-world ``request.meta``:
   - ``datetime`` / ``date`` → ISO 8601 string (round-trips via ``datetime.fromisoformat``)
-  - ``bytes`` / ``bytearray`` → base64-encoded ASCII string
+  - ``bytes`` / ``bytearray`` → tagged ``{"__b64__": "<ascii>"}`` marker
+    (reversed on deserialize by ``_decode_bytes_tag`` so ``bytes`` round-trips)
   - ``Decimal`` → ``str`` (preserves exact decimal representation, avoids float drift)
   - ``UUID`` → ``str`` (canonical hex form)
   - ``set`` / ``frozenset`` → ``list`` (JSON has no set type; order undefined)
@@ -59,7 +66,9 @@ def _json_default(obj: object) -> object:
   if isinstance(obj, (datetime, date)):
     return obj.isoformat()
   if isinstance(obj, (bytes, bytearray)):
-    return base64.b64encode(bytes(obj)).decode("ascii")
+    # Tagged marker (not a bare base64 str) so deserialize can reverse it
+    # without ambiguity — see _decode_bytes_tag and _BYTES_TAG.
+    return {_BYTES_TAG: base64.b64encode(bytes(obj)).decode("ascii")}
   if isinstance(obj, Decimal):
     return str(obj)
   if isinstance(obj, uuid.UUID):
@@ -76,6 +85,35 @@ def _json_default(obj: object) -> object:
     f"Pre-serialize {type_name} instances before pushing to the queue, "
     f"or extend scrapy_extension.backends.base._json_default."
   )
+
+
+def _decode_bytes_tag(obj: object) -> object:
+  """``json.loads`` ``object_hook`` reversing the ``{"__b64__": ...}`` marker.
+
+  Pairs with ``_json_default``'s bytes branch so ``bytes`` round-trips through
+  serialize → deserialize (previously one-way: bytes were base64-encoded to a
+  ``str`` on serialize and never decoded back, silently corrupting any
+  ``bytes`` value nested in ``request.meta`` / ``cookies`` / ``cb_kwargs``).
+  A dict that is *exactly* ``{"__b64__": <str>}`` decodes to ``bytes``; every
+  other dict passes through untouched, so ordinary ASCII strings (even valid
+  base64) are never decoded.
+
+  ``"__b64__"`` is a reserved ``request.meta`` key: a caller dict that is
+  exactly ``{"__b64__": "..."}`` would also decode. This trade is deliberate
+  — a marker is the only unambiguous way to reverse bytes-without-repr, and
+  the reserved-key surface is negligible for crawl meta.
+
+  Args:
+      obj: Each dict encountered during deserialization (bottom-up).
+
+  Returns:
+      ``bytes`` for a tagged marker dict; the original dict otherwise.
+  """
+  if isinstance(obj, dict) and len(obj) == 1:
+    value = obj.get(_BYTES_TAG)
+    if isinstance(value, str):
+      return base64.b64decode(value)
+  return obj
 
 
 def secret_value(s: SecretStr | str | None) -> str | None:
@@ -139,8 +177,9 @@ class JSONSerializer:
     """Serialize an object to JSON bytes.
 
     Uses ``_json_default`` to handle common non-JSON-native types found in
-    Scrapy request dicts (datetime → ISO, bytes → base64). Truly unexpected
-    types raise TypeError with a clear message — no silent ``str()`` coercion.
+    Scrapy request dicts (datetime → ISO, bytes → tagged base64 marker).
+    Truly unexpected types raise TypeError with a clear message — no silent
+    ``str()`` coercion.
 
     Args:
         obj: The object to serialize.
@@ -156,13 +195,16 @@ class JSONSerializer:
   def deserialize(self, data: bytes) -> object:
     """Deserialize JSON bytes to an object.
 
+    Reverses the ``{"__b64__": ...}`` marker emitted for ``bytes`` on serialize
+    (via ``_decode_bytes_tag``) so ``bytes`` round-trips losslessly.
+
     Args:
         data: The JSON bytes to deserialize.
 
     Returns:
         The deserialized object.
     """
-    return json.loads(data.decode("utf-8"))
+    return json.loads(data.decode("utf-8"), object_hook=_decode_bytes_tag)
 
 
 # Shared utilities for backends
@@ -341,8 +383,12 @@ class QueueBackend(ABC):
   - ``requires_ack``: True when ``pop`` yields a message that the caller
     MUST subsequently acknowledge via :meth:`ack` (else the message is
     redelivered). False for atomic-pop backends (Redis, MongoDB,
-    ElasticSearch, RocketMQ) — their pop removes the item in one step, so
-    ack/nack are no-ops and the scheduler's ack wiring is inert.
+    ElasticSearch) — their pop removes the item in one step, so ack/nack
+    are no-ops and the scheduler's ack wiring is inert. RocketMQ is
+    deferred-ack (``requires_ack=True``): its gRPC ``receive`` yields a
+    message the caller must ``ack`` before the invisible-duration window
+    elapses (at-least-once redelivery), so it overrides ``pop_with_ack``
+    / ``ack`` rather than inheriting the atomic defaults.
   - ``supports_concurrent_ack``: True when ack is safe under
     ``CONCURRENT_REQUESTS > 1`` (i.e. the backend tracks per-message ack
     state — Kafka/RabbitMQ via an in-flight set). False for single-slot
@@ -415,9 +461,9 @@ class QueueBackend(ABC):
   ) -> tuple[bytes | None, Any | None]:
     """Pop an item together with an opaque ack token.
 
-    For atomic-pop backends (Redis, MongoDB, ElasticSearch, RocketMQ) the
-    default implementation returns ``(self.pop(queue_name, timeout), None)`` —
-    there is no separate ack step, so the token is ``None``.
+    For atomic-pop backends (Redis, MongoDB, ElasticSearch) the default
+    implementation returns ``(self.pop(queue_name, timeout), None)`` — there
+    is no separate ack step, so the token is ``None``.
 
     Message-queue backends (Kafka, RabbitMQ) override to return a
     backend-specific token that the scheduler carries in
@@ -444,10 +490,11 @@ class QueueBackend(ABC):
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Acknowledge a popped message for ``queue_name``.
 
-    Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) implement
-    this as a no-op: their pop is already atomic, so there is no
-    "unacked" state to transition. Message-queue backends (Kafka,
-    RabbitMQ) override to commit the offset / basic_ack the delivery.
+    Atomic backends (Redis, MongoDB, ElasticSearch) implement this as a
+    no-op: their pop is already atomic, so there is no "unacked" state to
+    transition. Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar,
+    SQS) override to commit the offset / basic_ack / consumer-ack the
+    delivery.
 
     When ``token`` is provided (the scheduler always provides it for
     message-queue backends), the override acks the *specific* message

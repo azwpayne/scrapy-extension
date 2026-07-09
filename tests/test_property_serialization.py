@@ -94,11 +94,16 @@ _cookies = st.dictionaries(_cookie_keys, _cookie_vals, min_size=0, max_size=3)
 
 #: Meta values: JSON-serializable scalars / small lists / small dicts.
 #: Avoids objects Scrapy's request_from_dict cannot rebuild.
+#: ``st.binary`` is included so the property also pins the symmetric-bytes
+#: contract end-to-end: a ``bytes`` value in ``meta`` / ``cb_kwargs`` must
+#: survive ``_request_to_dict`` → JSON → deserialize → ``request_from_dict``
+#: as ``bytes`` (the serializer encodes bytes via a tagged marker).
 _scalars = st.one_of(
   st.none(),
   st.booleans(),
   st.integers(min_value=-(1 << 40), max_value=1 << 40),
   st.text(alphabet=st.characters(whitelist_categories=("Ll", "Nd", "Pc")), min_size=0, max_size=10),
+  st.binary(min_size=0, max_size=64),
 )
 _meta_values = st.recursive(
   _scalars,

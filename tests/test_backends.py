@@ -98,15 +98,51 @@ class TestJSONSerializer:
     deserialized = serializer.deserialize(serialized)
     assert deserialized["scraped_at"] == "2026-06-16T12:30:00+00:00"
 
-  def test_bytes_serializes_to_base64(self):
-    """R17-followup: bytes in request.meta survives as base64, not repr."""
-    import base64
+  def test_bytes_round_trips_to_bytes(self):
+    """bytes in request.meta round-trips back to bytes (symmetric serializer).
 
+    Previously (R17) the serializer was asymmetric: ``serialize`` base64-
+    encoded ``bytes`` to a ``str`` via ``_json_default``, but ``deserialize``
+    never decoded it — so a ``bytes`` value in ``meta`` / ``cookies`` /
+    ``cb_kwargs`` came back as a base64 ``str``. R17 accepted that as "survives
+    (not repr)" to avoid the worse ``b'\\x00'`` → ``"b'\\x00'"`` repr corruption.
+    The serializer is now symmetric: ``bytes`` round-trips to ``bytes``, so a
+    spider reading ``request.meta[key]`` after a queue cycle gets back exactly
+    what it pushed — no manual ``base64.b64decode`` workaround.
+
+    Note: ``bytearray`` also round-trips, narrowing to ``bytes`` (JSON cannot
+    distinguish the two without a second marker; ``bytes`` is the superset
+    callers expect).
+    """
     serializer = JSONSerializer()
     data = {"raw": b"\x00\xff\x42"}
     serialized = serializer.serialize(data)
     deserialized = serializer.deserialize(serialized)
-    assert deserialized["raw"] == base64.b64encode(b"\x00\xff\x42").decode("ascii")
+    assert deserialized["raw"] == b"\x00\xff\x42"
+    assert isinstance(deserialized["raw"], bytes)
+
+  def test_string_looking_like_base64_stays_str(self):
+    """Guard: a plain string that happens to be valid base64 is NOT decoded.
+
+    Only genuine ``bytes`` — encoded as a tagged ``{"__b64__": ...}`` marker on
+    serialize — decode back to bytes. ASCII strings pass through untouched. A
+    naive "decode every base64-looking string" fix would corrupt this case and
+    every ordinary string token in ``meta``.
+    """
+    serializer = JSONSerializer()
+    data = {"token": "AAEC"}  # valid base64, but it's a str the caller owns
+    serialized = serializer.serialize(data)
+    deserialized = serializer.deserialize(serialized)
+    assert deserialized["token"] == "AAEC"
+    assert isinstance(deserialized["token"], str)
+
+  def test_nested_bytes_round_trip(self):
+    """Bytes nested in lists/dicts (e.g. ``meta['blobs']``) round-trip."""
+    serializer = JSONSerializer()
+    data = {"meta": {"blobs": [b"a", b"b", {"deep": b"c"}]}}
+    serialized = serializer.serialize(data)
+    deserialized = serializer.deserialize(serialized)
+    assert deserialized["meta"]["blobs"] == [b"a", b"b", {"deep": b"c"}]
 
   def test_unsupported_type_raises_with_clear_message(self):
     """R17-followup: truly unexpected types raise TypeError, not silent str()."""
