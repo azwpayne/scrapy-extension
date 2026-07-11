@@ -1,6 +1,7 @@
 """Tests for BackendSpiderMixin."""
 
 import os
+from unittest.mock import Mock
 
 import pytest
 from scrapy import Spider, signals
@@ -1014,6 +1015,76 @@ class TestConnectionManagerProperty:
 
     with pytest.raises(RuntimeError, match="MySpider"):
       _ = spider.connection_manager
+
+
+class TestSpiderMixinHonorsSettings:
+  """#29: the convenience getters honor SCRAPY_QUEUE_STRATEGY /
+  SCRAPY_DEDUP_STRATEGY from crawler.settings when a crawler is attached,
+  falling back to the defaults (passthrough / set) when crawler-less.
+  """
+
+  def test_get_queue_honors_queue_strategy_setting(self, mocker) -> None:
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+    settings = Mock()
+    settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_QUEUE_STRATEGY": "delay"
+    }.get(key, default)
+    mock_crawler = mocker.MagicMock()
+    mock_crawler.settings = settings
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "s"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    spider._connection_manager = mock_manager
+    spider.crawler = mock_crawler
+
+    q = spider.get_queue()
+    from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+
+    assert isinstance(q._strategy, DelayQueueStrategy)
+
+  def test_get_queue_defaults_to_passthrough_without_crawler(self, mocker) -> None:
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "s"
+
+    spider = TestSpider()
+    spider._connection_manager = mock_manager
+    object.__setattr__(spider, "crawler", None)
+
+    q = spider.get_queue()
+    from scrapy_extension.queue.strategies.passthrough import (
+      PassthroughQueueStrategy,
+    )
+
+    assert isinstance(q._strategy, PassthroughQueueStrategy)
+
+  def test_get_dupefilter_honors_dedup_strategy_setting(self, mocker) -> None:
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+    settings = Mock()
+    settings.get.side_effect = lambda key, default=None: {
+      "SCRAPY_DEDUP_STRATEGY": "memory"
+    }.get(key, default)
+    mock_crawler = mocker.MagicMock()
+    mock_crawler.settings = settings
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "s"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    spider._connection_manager = mock_manager
+    spider.crawler = mock_crawler
+
+    df = spider.get_dupefilter()
+    from scrapy_extension.dupefilter.filters.memory_filter import (
+      MemoryMembershipFilter,
+    )
+
+    assert isinstance(df._filter, MemoryMembershipFilter)
 
 
 class TestIntegration:
