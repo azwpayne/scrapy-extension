@@ -359,9 +359,19 @@ class BackendQueue:
     if isinstance(self._strategy, PassthroughQueueStrategy):
       backend = self.connection_manager.get_queue_backend()
       # Only use the token-correlated path when the backend's class
-      # actually overrides pop_with_ack (Kafka/RabbitMQ). Atomic-pop
-      # backends inherit the base default and keep the plain pop() path.
-      backend_cls = getattr(backend, "__class__", None)
+      # actually overrides pop_with_ack (Kafka/RabbitMQ/RocketMQ/SQS/Pulsar).
+      # Atomic-pop backends inherit the base default and keep the plain pop().
+      #
+      # 2026-07-11 fix: unwrap a circuit-breaker proxy before the class-level
+      # check. ``_QueueBackendProxy`` binds pop_with_ack as an INSTANCE
+      # attribute, so the proxy CLASS resolves pop_with_ack to the
+      # QueueBackend ABC default via MRO — without unwrapping, the detection
+      # would report "no override" and silently drop MQ tokens under
+      # SCRAPY_CIRCUIT_BREAKER_ENABLED. The proxy exposes the wrapped backend
+      # as ``_backend``; the CALL below still goes through the (breaker-wrapped)
+      # proxy, so ack-pop stays breaker-protected.
+      unwrapped = getattr(backend, "_backend", backend)
+      backend_cls = getattr(unwrapped, "__class__", None)
       override = (
         backend_cls is not None
         and getattr(backend_cls, "pop_with_ack", None) is not None

@@ -366,11 +366,20 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
   observability probe (stats queries, ``has_pending_requests`` health checks).
   A transient failure in the length query (e.g. a momentary ``CLUSTER DOWN``
   during a stats scrape) must not cascade into a full traffic shutdown by
-  tripping the breaker. Only traffic-bearing ops (``push``/``pop``) are wrapped;
-  ``queue_len`` is forwarded unchanged so its failures never reach the breaker.
+  tripping the breaker. Traffic-bearing ops (``push``/``pop``/
+  ``pop_with_ack``) are wrapped; ``queue_len`` is forwarded unchanged so its
+  failures never reach the breaker.
+
+  ``pop_with_ack`` (2026-07-10 fix) must be in the hot path so that (a) a
+  broker degradation on the MQ ack-pop path trips the breaker, and (b) the
+  proxy dispatches to the backend's ``pop_with_ack`` *override* (the
+  per-message token path) rather than the ``QueueBackend`` ABC default. Without
+  this the override is shadowed by the ABC default ``pop_with_ack → (self.pop,
+  None)`` and MQ tokens silently become ``None`` under
+  ``SCRAPY_CIRCUIT_BREAKER_ENABLED``.
   """
 
-  _HOT_PATH = ("push", "pop")
+  _HOT_PATH = ("push", "pop", "pop_with_ack")
   _FORWARDED = (
     "queue_len",
     "clear_queue",
@@ -416,14 +425,16 @@ for _proxy_cls in (_QueueBackendProxy, _SetBackendProxy, _StorageBackendProxy):
 
 
 def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueBackend:
-  """Wrap ``backend``'s push/pop under ``breaker``.
+  """Wrap ``backend``'s push/pop/pop_with_ack under ``breaker``.
 
   ``queue_len`` is forwarded unchanged (NOT wrapped): it is an admin /
   observability probe, and a transient stats-query failure must not cascade
   into a full traffic shutdown by tripping the breaker. Other attributes
   (including ``clear_queue``, ``ack``, ``nack``, ``is_connected``) also forward
   unchanged so an OPEN breaker does not block administrative / non-network
-  operations.
+  operations. ``pop_with_ack`` IS wrapped (2026-07-10) so MQ ack-pop failures
+  trip the breaker and the backend's per-message override is not shadowed by
+  the ABC default.
   """
   return _QueueBackendProxy(backend, breaker)  # type: ignore[abstract]
 
