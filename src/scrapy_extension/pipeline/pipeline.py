@@ -34,6 +34,16 @@ logger = logging.getLogger(__name__)
 #: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
 DEFAULT_PIPELINE_MAX_ITEM_BYTES = 1_048_576
 
+#: Risk 5 — default ceiling on consecutive storage errors before the pipeline
+#: re-raises (wrapped as BackendError) instead of swallowing forever. The
+#: pre-Risk-5 from_settings default was ``None`` (infinite swallow), which meant
+#: a persistent storage outage was silently absorbed as success-shaped item
+#: returns — silent data loss at fleet scale. ``10`` surfaces a sustained
+#: outage loudly after 11 consecutive failures while tolerating transient
+#: blips. Operators who want the old infinite-swallow behavior can pass
+#: ``max_storage_errors=None`` to the constructor directly.
+DEFAULT_MAX_STORAGE_ERRORS = 10
+
 
 class BackendPipeline:
   """Scrapy item pipeline using backend storage interface.
@@ -145,9 +155,24 @@ class BackendPipeline:
       settings=backend_settings,
     )
     storage_strategy_name = settings.get("SCRAPY_STORAGE_STRATEGY", "passthrough")
-    storage_strategy = create_storage_strategy(storage_strategy_name)
+    # Risk 2: thread the crash-before-flush loss-window cap through to the
+    # batched strategy (None = disabled = pre-Risk-2 behavior; passthrough
+    # ignores it).
+    raw_age = settings.get("SCRAPY_STORAGE_BUFFER_MAX_AGE_S")
+    buffer_max_age_s = float(raw_age) if raw_age is not None else None
+    storage_strategy = create_storage_strategy(
+      storage_strategy_name, max_buffer_age_s=buffer_max_age_s
+    )
     raw_max_errors = settings.get("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS")
-    max_storage_errors = int(raw_max_errors) if raw_max_errors is not None else None
+    # Risk 5: default to a sane ceiling (DEFAULT_MAX_STORAGE_ERRORS) when unset
+    # so a persistent outage surfaces instead of being silently swallowed. An
+    # explicit int from settings still wins; ``None`` (infinite swallow) is
+    # reachable only via the constructor kwarg, not via the env var.
+    max_storage_errors = (
+      int(raw_max_errors)
+      if raw_max_errors is not None
+      else DEFAULT_MAX_STORAGE_ERRORS
+    )
     return cls(
       connection_manager=manager,
       key_prefix=settings.get("SCRAPY_PIPELINE_KEY_PREFIX", "items"),
@@ -184,6 +209,12 @@ class BackendPipeline:
       from scrapy_extension.monitor import ScrapyStatsMonitor
 
       pipeline._monitor = ScrapyStatsMonitor(stats)
+    # Risk 2: share the pipeline's monitor with the storage strategy so
+    # ``on_buffer_depth`` (batched) emits through the same collector. No-op
+    # for strategies without a ``set_monitor`` hook (passthrough).
+    set_monitor = getattr(pipeline.storage_strategy, "set_monitor", None)
+    if callable(set_monitor):
+      set_monitor(pipeline._monitor)
     return pipeline
 
   def open_spider(self, spider: Spider) -> None:
@@ -249,7 +280,12 @@ class BackendPipeline:
     # drop that capped storage backends (Memcached 1 MB, DynamoDB 400 KB)
     # would otherwise cause.
     if len(data) > self.max_item_bytes:
+      # Risk 5: renamed ``oversize_dropped`` → ``oversize_rejected`` (the item
+      # is rejected+raised, not silently dropped — the old name misled). The
+      # legacy key is still incremented for one release so existing dashboards
+      # keep working (mirrors monitor/stats.py ``queue/pop_count`` aliasing).
       self._inc_stat(spider, "pipeline/oversize_dropped")
+      self._inc_stat(spider, "pipeline/oversize_rejected")
       msg = (
         f"Serialized item ({len(data)} bytes) exceeds max_item_bytes "
         f"({self.max_item_bytes}). Rejecting store to avoid silent drop by "

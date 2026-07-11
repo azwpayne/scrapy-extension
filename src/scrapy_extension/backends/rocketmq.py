@@ -43,6 +43,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Module-level warn-once flag for the unsupported-depth signal (Risk 1).
+# RocketMQ's deferred-ack model has no broker-side depth RPC, so queue_len
+# returns 0 (standardized with Kafka/Pulsar/SQS). The first call warns once
+# per process so operators know idle-detection / depth-backpressure cannot
+# rely on this value for RocketMQ. Tests reset this for isolation.
+_queue_len_warned: bool = False
+
 
 class RocketMQBackend(Backend, QueueBackend):
   """RocketMQ backend implementation (apache 5.1.1 gRPC client).
@@ -450,19 +457,36 @@ class RocketMQBackend(Backend, QueueBackend):
     )
 
   def queue_len(self, queue_name: str) -> int:
-    """Get queue length.
+    """Get queue length (Risk 1: standardized — always 0, depth unsupported).
+
+    RocketMQ's deferred-ack model has no broker-side depth RPC. Previously
+    this raised ``NotImplementedError``, which propagated uncaught through
+    ``BackendQueue._probe_depth`` and could crash the pop /
+    ``has_pending_requests`` loop. Standardized to return 0 (matching the
+    Kafka/Pulsar/SQS contract) so the depth-query contract is uniform across
+    MQ backends. A one-time per-process WARNING surfaces the limitation so
+    operators know Scrapy idle detection and depth-based backpressure cannot
+    rely on this value for RocketMQ — monitor via pop-rate / consumer-liveness
+    instead.
 
     Args:
       queue_name: Name of the queue.
 
     Returns:
-      Number of items in queue.
-
-    Raises:
-      NotImplementedError: RocketMQ does not support queue length queries.
+      Always 0 (depth unsupported — see the one-time WARNING).
     """
-    msg = "RocketMQ does not support queue_len(). Use pop() to consume messages."
-    raise NotImplementedError(msg)
+    global _queue_len_warned
+    del queue_name
+    if not _queue_len_warned:
+      _queue_len_warned = True
+      logger.warning(
+        "RocketMQ queue_len() is unsupported (deferred-ack model has no "
+        "broker-side depth RPC); returning 0. Scrapy idle detection and "
+        "depth-based backpressure cannot rely on this value for RocketMQ — "
+        "monitor via pop-rate / consumer-liveness instead. This warning "
+        "fires once per process."
+      )
+    return 0
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.

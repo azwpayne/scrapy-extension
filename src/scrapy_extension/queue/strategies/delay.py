@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.queue.strategies.base import QueueStrategy
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ class DelayQueueStrategy(QueueStrategy):
     default_delay: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
     max_held: int = DEFAULT_DELAY_MAX_HELD,
+    monitor: Monitor | None = None,
   ) -> None:
     """Initialize the delay strategy.
 
@@ -86,6 +88,11 @@ class DelayQueueStrategy(QueueStrategy):
             data). Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000) for
             OOM prevention. Pass ``<= 0`` to disable the warning (advanced
             opt-out — accepts the unbounded-growth risk).
+        monitor: Risk 3 — optional observability monitor. When ``None``
+            (default) :class:`~scrapy_extension.monitor.base.NullMonitor`.
+            Emits ``on_delay_depth(len(holding))`` after each held item so a
+            wired collector can alert before the in-process delay heap grows
+            unbounded (the held-delay state is in-process and lost on crash).
 
     Raises:
         ValueError: If default_delay is negative.
@@ -104,6 +111,7 @@ class DelayQueueStrategy(QueueStrategy):
     self._holding: list[tuple[float, int, bytes, float]] = []
     self._seq = itertools.count()
     self._max_held = max_held
+    self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
 
   def push(
     self,
@@ -132,6 +140,14 @@ class DelayQueueStrategy(QueueStrategy):
     # R14-F: stash priority in the heap tuple so _drain_ready re-passes it
     # to the live queue (preserves caller priority across the delay hop).
     heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
+    # Risk 3: emit the held-depth gauge so operators can alert before the
+    # in-process delay heap grows unbounded (held-delay state is lost on
+    # crash). No-op under NullMonitor; BLE001-guarded so a misbehaving
+    # monitor cannot crash the push path.
+    try:
+      self._monitor.on_delay_depth(len(self._holding))
+    except Exception:  # noqa: BLE001 — monitor must never crash push
+      logger.debug("on_delay_depth hook raised", exc_info=True)
     self._warn_over_cap_once()
 
   def _warn_over_cap_once(self) -> None:

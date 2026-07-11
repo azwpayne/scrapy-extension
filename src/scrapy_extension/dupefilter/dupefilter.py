@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
+from scrapy_extension.exceptions.base import BackendConnectionError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.utils.request import request_fingerprint
@@ -42,6 +43,15 @@ logger = logging.getLogger(__name__)
 # bump ``dupefilter/filter_full`` on every occurrence, and treat the overflow
 # item as NOT-seen (allow enqueue). Tests reset this for isolation.
 _filter_full_warned: bool = False
+
+# Module-level warn-once flag for the transient-backend-error degradation (Risk 4).
+# Mirrors ``_filter_full_warned``: a long-running crawl shouldn't have its log
+# spammed by per-request transient-outage signals. The first time the SetBackend
+# raises BackendConnectionError we warn once per process, bump ``errors/dedup``
+# on every occurrence via the monitor, and treat the item as NOT-seen (allow
+# enqueue — a duplicate fetch during a transient outage is strictly better than
+# a crashed crawl). Tests reset this for isolation.
+_backend_error_warned: bool = False
 
 
 class BackendDupeFilter:
@@ -173,6 +183,7 @@ class BackendDupeFilter:
       bloom_error_rate=settings.get("SCRAPY_DEDUP_BLOOM_ERROR_RATE", 0.001),
       cuckoo_capacity=settings.get("SCRAPY_DEDUP_CUCKOO_CAPACITY", 1_000_000),
       cuckoo_error_rate=settings.get("SCRAPY_DEDUP_CUCKOO_ERROR_RATE", 0.001),
+      strict=settings.getbool("SCRAPY_DEDUP_STRICT", default=False),
     )
     return cls(
       connection_manager=manager,
@@ -330,6 +341,23 @@ class BackendDupeFilter:
       # silently disabling this guard.
       self._handle_filter_full(fingerprint)
       return False
+    except BackendConnectionError as exc:
+      # Transient-backend-error graceful degradation (Risk 4).
+      #
+      # A transient Redis/MongoDB/ES outage during dedup raises
+      # BackendConnectionError from the SetBackend. Left uncaught it propagates
+      # to the Scrapy engine and crashes the crawl — contradicting the
+      # codebase's documented "a dead spider is worse than a duplicate fetch"
+      # philosophy (applied for FilterFull above and in the BLE001-guarded
+      # monitor hooks). Mirror the FilterFull arm: warn once per process, emit
+      # ``monitor.on_error("dedup", exc)`` so a wired collector increments
+      # ``errors/dedup``, and degrade to not-seen (allow the request through).
+      # The tradeoff is possible duplicate fetches during the outage window —
+      # strictly better than crawl death. Distinct from the NotImplementedError
+      # arm (unsupported backend, still raises RuntimeError) and the FilterFull
+      # arm (filter at capacity).
+      self._handle_backend_error(fingerprint, exc)
+      return False
 
     # add() returns True when the item was newly added; a duplicate maps to False.
     seen = not added
@@ -380,6 +408,35 @@ class BackendDupeFilter:
     self._monitor.on_filter_full()
     # Keep the monitor's dedup-miss accounting consistent with the not-seen
     # outcome the caller returns for the overflow item.
+    self._monitor.on_dedup_miss(fingerprint)
+
+  def _handle_backend_error(self, fingerprint: str, exc: BaseException) -> None:
+    """Degrade gracefully when the membership-filter backend is transiently down.
+
+    Risk 4: a transient :class:`BackendConnectionError` from the SetBackend
+    (Redis/MongoDB/ES outage during dedup) must not crash the crawl. Mirror
+    :meth:`_handle_filter_full`: warn once per process (module-level
+    ``_backend_error_warned``), emit ``monitor.on_error("dedup", exc)`` so a
+    wired stats collector increments ``errors/dedup``, and emit a dedup-miss
+    hook so observability stays consistent with the not-seen outcome the
+    caller returns. The tradeoff is possible duplicate fetches until the
+    backend recovers — strictly better than crawl death.
+
+    Args:
+        fingerprint: The request fingerprint being checked when the error fired.
+        exc: The transient ``BackendConnectionError`` from the SetBackend.
+    """
+    global _backend_error_warned
+    if not _backend_error_warned:
+      _backend_error_warned = True
+      logger.warning(
+        "Dedup backend transiently unavailable (%s); degrading — requests "
+        "will be treated as not-seen and may re-fetch until the backend "
+        "recovers. This warning fires once per process; subsequent "
+        "transient backend errors are counted via the errors/dedup stat only.",
+        type(exc).__name__,
+      )
+    self._monitor.on_error("dedup", exc)
     self._monitor.on_dedup_miss(fingerprint)
 
   def request_fingerprint(self, request: Request) -> str:

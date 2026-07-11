@@ -733,19 +733,39 @@ def test_ack_failure_raises_queue_error(mocker) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_queue_len_not_connected() -> None:
-  """queue_len raises NotImplementedError when not connected."""
-  backend = RocketMQBackend(RocketMQSettings())
-  with pytest.raises(NotImplementedError):
-    backend.queue_len("test_queue")
+def _reset_queue_len_warned() -> None:
+  """Reset the module-level warn-once flag (Risk 1) for test isolation."""
+  from scrapy_extension.backends import rocketmq as rocketmq_module
+
+  rocketmq_module._queue_len_warned = False
 
 
-def test_queue_len_message() -> None:
-  """queue_len error message."""
+def test_queue_len_returns_zero_risk1() -> None:
+  """Risk 1: queue_len returns 0 (standardized) instead of raising.
+
+  Pre-fix: queue_len raised NotImplementedError — propagated uncaught through
+  ``BackendQueue._probe_depth`` and could crash the pop / has_pending_requests
+  loop. Post-fix: returns 0 uniformly with Kafka/Pulsar/SQS + warns once.
+  """
+  _reset_queue_len_warned()
   backend = RocketMQBackend(RocketMQSettings())
-  with pytest.raises(NotImplementedError) as exc_info:
-    backend.queue_len("test_queue")
-  assert "does not support queue_len" in str(exc_info.value)
+  assert backend.queue_len("test_queue") == 0
+
+
+def test_queue_len_warns_once_risk1(caplog) -> None:
+  """Risk 1: queue_len emits a one-time WARNING explaining depth unsupported."""
+  import logging
+
+  _reset_queue_len_warned()
+  backend = RocketMQBackend(RocketMQSettings())
+  with caplog.at_level(
+    logging.WARNING, logger="scrapy_extension.backends.rocketmq"
+  ):
+    backend.queue_len("test_queue")  # 1st call -> warns
+    backend.queue_len("test_queue")  # 2nd call -> suppressed (warn-once)
+  warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+  assert len(warnings) == 1
+  assert "unsupported" in warnings[0].message
 
 
 # ---------------------------------------------------------------------------

@@ -227,3 +227,26 @@ class ScrapyStatsMonitor(Monitor):
         attempt: 1-based retry index (1 = first retry).
     """
     self._stats.inc_value("backend/retry_count")
+
+  def on_buffer_depth(self, depth: int) -> None:
+    """Set the ``pipeline/buffer_depth`` gauge (batched-storage operability).
+
+    Lets operators alert before the crash-before-flush loss window grows.
+    ``depth`` is the number of items currently buffered in the
+    :class:`BatchedStorageStrategy`, pending flush.
+
+    Args:
+        depth: Number of items currently buffered, pending flush.
+    """
+    self._stats.set_value("pipeline/buffer_depth", depth)
+
+  def on_delay_depth(self, depth: int) -> None:
+    """Set the ``queue/delay_depth`` gauge (delay-strategy operability).
+
+    Lets operators alert before the in-process delay heap grows unbounded
+    (the held-delay state is in-process and lost on crash).
+
+    Args:
+        depth: Number of items currently held in the delay heap.
+    """
+    self._stats.set_value("queue/delay_depth", depth)

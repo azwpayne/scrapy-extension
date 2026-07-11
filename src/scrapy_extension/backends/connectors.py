@@ -20,12 +20,12 @@ import contextlib
 import importlib
 import json
 import logging
-import random
 import threading
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from scrapy_extension.backends._retry import compute_full_jitter_backoff
 from scrapy_extension.backends.base import (
   BackendType,
   QueueBackend,
@@ -257,6 +257,15 @@ class ConnectionManager:
       settings: Backend-specific settings.
       _backend: The backend instance (None until connected).
       _lock: Threading lock for thread safety.
+
+  Lock-order invariant (Risk 6 documentation): when a code path needs BOTH
+  locks, acquire ``_registry_lock`` (class-level) BEFORE the instance ``_lock``.
+  Reversing the order risks deadlock — ``get_manager`` takes ``_registry_lock``
+  and then (via ``connect``) may take ``_lock``, while peer code holding
+  ``_lock`` must never reach back for ``_registry_lock``. The A2 owner-gate
+  runs ``connect`` + backoff OUTSIDE ``_lock`` so a slow backend cannot block
+  peer threads sharing the manager. Do not narrow without verifying these
+  two orderings hold.
   """
 
   # Class-level registry of managers. R14-E: this is an LRU-bounded
@@ -569,15 +578,7 @@ class ConnectionManager:
           # (attempt+1 = first retry = second overall attempt). No-op on the
           # default NullMonitor.
           self._monitor.on_retry(str(self.backend_type), attempt + 1)
-          # Full jitter: random.uniform(0, delay). Prevents thundering herd
-          # when many workers retry simultaneously after a coordinated
-          # outage (e.g., Redis failover). See AWS Architecture Blog:
-          # "Exponential Backoff and Jitter".
-          delay = retry_delay * (2**attempt)
-          # nosec B311: random.uniform is intentional full-jitter backoff,
-          # not a cryptographic primitive. Switching to secrets would remove
-          # the bounded-range API we rely on without improving security.
-          time.sleep(random.uniform(0, delay))  # nosec B311 - jitter, not cryptographic
+          time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
       else:
         logger.debug("Connected to %s", self.backend_type)
         # R14-D: emit on_connect on the success path so ``backend/connect_count``

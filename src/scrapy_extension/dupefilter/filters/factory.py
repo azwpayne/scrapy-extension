@@ -97,6 +97,7 @@ def build_membership_filter(
   bloom_error_rate: float = 0.001,
   cuckoo_capacity: int = 1_000_000,
   cuckoo_error_rate: float = 0.001,
+  strict: bool = False,
 ) -> MembershipFilter:
   """Build the membership filter for ``strategy``.
 
@@ -110,13 +111,32 @@ def build_membership_filter(
       bloom_error_rate: Target false-positive rate for ``bloom``.
       cuckoo_capacity: Expected item count for the ``cuckoo`` strategy.
       cuckoo_error_rate: Target false-positive rate for ``cuckoo``.
+      strict: Risk 3 — fail-loud at factory time when a per-process strategy
+          (``memory``/``bloom``/``cuckoo``) is selected. Per-process filters
+          lose ALL state on crash and cannot prevent cross-worker duplicates
+          in a distributed fleet. The default (``False``) preserves the
+          warn-once behavior; ``True`` (set via ``SCRAPY_DEDUP_STRICT=1``)
+          upgrades the warning to a :class:`ConfigurationError` so a
+          multi-worker misconfig is caught at startup. No effect on the
+          ``set`` strategy (distributed-exact).
 
   Returns:
       A concrete MembershipFilter instance.
 
   Raises:
-      ConfigurationError: If ``strategy`` is not a known DedupeStrategy.
+      ConfigurationError: If ``strategy`` is not a known DedupeStrategy, or
+          if ``strict`` is True and ``strategy`` is per-process.
   """
+  if strict and strategy in _PER_PROCESS_STRATEGIES:
+    raise ConfigurationError(
+      f"Dedup strategy {strategy.value!r} is per-process — its state is not "
+      f"shared across workers, so cross-worker duplicate requests will pass "
+      f"undetected in a distributed fleet. SCRAPY_DEDUP_STRICT=1 rejects "
+      f"this at config time. For cross-worker dedup use "
+      f"SCRAPY_DEDUP_STRATEGY=set (distributed-exact).",
+      setting_name="SCRAPY_DEDUP_STRATEGY",
+      setting_value=strategy.value,
+    )
   _warn_per_process_scope(strategy)
   if strategy is DedupeStrategy.SET:
     return SetMembershipFilter(connection_manager, key)

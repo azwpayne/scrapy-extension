@@ -255,3 +255,51 @@ class TestStorageStrategyFactory:
     with pytest.raises(ConfigurationError) as exc_info:
       create_storage_strategy("bogus")
     assert exc_info.value.setting_name == "storage_strategy"
+
+
+class TestBatchedStorageRisk2:
+  """Risk 2: monitor hook + age-based flusher + set_monitor wiring."""
+
+  def test_on_buffer_depth_emits_after_store(self, mocker) -> None:
+    """store() emits on_buffer_depth(depth) so operators can alert pre-flush."""
+    from scrapy_extension.monitor.base import Monitor
+
+    monitor = mocker.Mock(spec=Monitor)
+    backend = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=10, monitor=monitor)
+    strat.store(backend, "k", b"v")
+    monitor.on_buffer_depth.assert_called_once_with(1)
+
+  def test_set_monitor_injects_after_construction(self, mocker) -> None:
+    """from_crawler wires the monitor post-construction via set_monitor."""
+    from scrapy_extension.monitor.base import Monitor, NullMonitor
+
+    backend = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=10)  # NullMonitor default
+    assert isinstance(strat._monitor, NullMonitor)
+    monitor = mocker.Mock(spec=Monitor)
+    strat.set_monitor(monitor)
+    strat.store(backend, "k", b"v")
+    monitor.on_buffer_depth.assert_called_once_with(1)
+
+  def test_max_buffer_age_s_none_starts_no_flusher(self, mocker) -> None:
+    """Disabled (None) → no background flusher thread (byte-identical to old)."""
+    backend = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=10)  # max_buffer_age_s=None
+    strat.store(backend, "k", b"v")
+    assert strat._flusher is None
+
+  def test_max_buffer_age_s_starts_and_flushes(self, mocker) -> None:
+    """Enabled → daemon thread flushes once the oldest item exceeds the age cap."""
+    import time
+
+    backend = mocker.Mock()
+    # threshold high so only the age-flusher can fire; tiny age so the test
+    # is fast. The daemon thread flushes once the oldest item exceeds age.
+    strat = BatchedStorageStrategy(threshold=1000, max_buffer_age_s=0.01)
+    strat.store(backend, "k", b"v")
+    assert strat._flusher is not None  # age-flusher started
+    # Give the daemon thread a window to wake + flush (15x the age cap).
+    time.sleep(0.15)
+    backend.store.assert_called_with("k", b"v", ttl=None)
+    strat.close()  # stops the flusher cleanly

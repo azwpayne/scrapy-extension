@@ -416,9 +416,13 @@ class TestBackendPipelineMaxItemBytes:
     with pytest.raises(SerializationError, match="exceeds.*max"):
       pipeline.process_item(big_item, mock_spider)
 
-    mock_spider.crawler.stats.inc_value.assert_called_with(
-      "pipeline/oversize_dropped"
-    )
+    # Risk 5: renamed ``oversize_dropped`` → ``oversize_rejected`` (canonical);
+    # the legacy key is still incremented for one release as a backward-compat
+    # alias (mirrors monitor/stats.py ``queue/pop_count`` aliasing). Assert
+    # BOTH fire so the rename + alias contract is pinned.
+    stats_inc = mock_spider.crawler.stats.inc_value
+    stats_inc.assert_any_call("pipeline/oversize_rejected")
+    stats_inc.assert_any_call("pipeline/oversize_dropped")
     mock_connection_manager.get_storage_backend().store.assert_not_called()
 
   def test_process_item_normal_size_succeeds(

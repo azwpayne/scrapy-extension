@@ -327,3 +327,21 @@ class TestSnapshotRestore:
     with caplog.at_level(logging.INFO, logger="scrapy_extension.queue.strategies.delay"):
       strat.restore(bogus)
     assert not any("recovered" in r.message for r in caplog.records)
+
+  def test_push_with_delay_emits_on_delay_depth(
+    self, mock_connection_manager, mocker
+  ) -> None:
+    """Risk 3: a held item emits on_delay_depth(held_count) for operability."""
+    from scrapy_extension.monitor.base import Monitor
+
+    monitor = mocker.Mock(spec=Monitor)
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=10.0,
+      clock=_clock(now),
+      monitor=monitor,
+    )
+    strat.push("q", b"x")
+    # Held item → on_delay_depth fires with the held count.
+    monitor.on_delay_depth.assert_called_once_with(1)

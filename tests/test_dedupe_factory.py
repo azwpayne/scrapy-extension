@@ -281,3 +281,42 @@ class TestPerProcessStrategyWarning:
       if r.levelno == logging.WARNING and r.name == factory_module.__name__
     ]
     assert len(warnings) == 1
+
+
+class TestStrictDedupFailLoud:
+  """Risk 3: SCRAPY_DEDUP_STRICT fails loud on per-process strategies."""
+
+  def test_strict_rejects_memory(self, mocker) -> None:
+    """strict=True + memory → ConfigurationError at factory time."""
+    from scrapy_extension.exceptions import ConfigurationError
+
+    mock_manager = mocker.Mock()
+    with pytest.raises(ConfigurationError) as exc_info:
+      build_membership_filter(DedupeStrategy.MEMORY, mock_manager, strict=True)
+    assert exc_info.value.setting_name == "SCRAPY_DEDUP_STRATEGY"
+
+  def test_strict_rejects_bloom(self, mocker) -> None:
+    from scrapy_extension.exceptions import ConfigurationError
+
+    mock_manager = mocker.Mock()
+    with pytest.raises(ConfigurationError):
+      build_membership_filter(DedupeStrategy.BLOOM, mock_manager, strict=True)
+
+  def test_strict_rejects_cuckoo(self, mocker) -> None:
+    from scrapy_extension.exceptions import ConfigurationError
+
+    mock_manager = mocker.Mock()
+    with pytest.raises(ConfigurationError):
+      build_membership_filter(DedupeStrategy.CUCKOO, mock_manager, strict=True)
+
+  def test_strict_allows_set(self, mocker) -> None:
+    """set is distributed-exact → strict must NOT reject it."""
+    mock_manager = mocker.Mock()
+    result = build_membership_filter(DedupeStrategy.SET, mock_manager, strict=True)
+    assert isinstance(result, MembershipFilter)
+
+  def test_default_non_strict_memory_does_not_raise(self, mocker) -> None:
+    """Default (strict=False) preserves the warn-once behavior — no raise."""
+    mock_manager = mocker.Mock()
+    result = build_membership_filter(DedupeStrategy.MEMORY, mock_manager)
+    assert isinstance(result, MembershipFilter)

@@ -159,6 +159,34 @@ class Settings(BaseSettings):
       "a threshold / on spider close."
     ),
   )
+  storage_buffer_max_age_s: float | None = Field(
+    default=None,
+    ge=0,
+    description=(
+      "Caps the BatchedStorageStrategy crash-before-flush loss window by "
+      "spawning a background flush once the oldest buffered item is older "
+      "than this many seconds. ``None`` (default) disables the age-based "
+      "flush — byte-identical to the pre-fix behavior (flush only on "
+      "threshold or spider close), so the documented crash-before-flush loss "
+      "of the in-flight batch remains. When set, the loss window is bounded "
+      "to roughly this value. Effective only when "
+      "``storage_strategy == 'batched'``. Threaded by "
+      "``BackendPipeline.from_settings`` → ``BatchedStorageStrategy(max_buffer_age_s=…)``."
+    ),
+  )
+  dedup_strict: bool = Field(
+    default=False,
+    description=(
+      "Fail-loud at factory time when a per-process dedup strategy "
+      "(``memory`` / ``bloom`` / ``cuckoo``) is selected. Per-process filters "
+      "lose ALL state on crash and cannot prevent cross-worker duplicates in "
+      "a distributed fleet — the factory emits a one-time WARNING by default "
+      "(easy to miss at fleet scale). Set ``True`` to upgrade that WARNING to "
+      "a ``ConfigurationError`` so a multi-worker misconfig is caught at "
+      "startup instead of silently producing duplicates. No effect on the "
+      "``set`` strategy (distributed-exact)."
+    ),
+  )
   pipeline_max_storage_errors: int | None = Field(
     default=None,
     description=(

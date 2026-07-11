@@ -429,6 +429,15 @@ class BackendQueue:
     # Window elapsed (or empty/uninitialized) — hit the backend once, reset
     # the counter, cache result.
     self._depth_probe_counter = 0
+    # Risk 1: let depth-query errors propagate. The pop-path monitor call to
+    # ``_probe_depth`` (the ``on_queue_depth`` emit) is already BLE001-guarded
+    # so a raising ``queue_len`` cannot crash the pop loop; and the scheduler's
+    # ``has_pending_requests`` catches a raising ``__len__`` and returns True
+    # (conservative — a depth-query error must NOT make the scheduler idle /
+    # shut down prematurely). Swallowing here would break that conservative
+    # contract. The backend-side contract is standardized separately (RocketMQ
+    # ``queue_len`` returns 0 instead of raising) so real backends no longer
+    # raise; these exceptions now surface only from direct mock injection.
     real_depth = self._strategy.queue_len(self.queue_name)
     self._cached_depth = real_depth
     return real_depth

@@ -853,3 +853,97 @@ class TestBackendDupeFilterCuckooFilterFullDegradation:
     result = dupefilter.request_seen(overflow_req)
     assert result is False
     monitor.on_filter_full.assert_called()
+
+
+class TestBackendDupeFilterTransientBackendError:
+  """Risk 4: a transient BackendConnectionError from the SetBackend degrades.
+
+  Pre-fix (RED): ``request_seen`` caught only ``NotImplementedError`` and
+  ``FilterFull`` — a transient ``BackendConnectionError`` (Redis/MongoDB/ES
+  outage during dedup) propagated to the Scrapy engine and crashed the crawl,
+  contradicting the codebase's "a dead spider is worse than a duplicate fetch"
+  philosophy. Post-fix (GREEN): a dedicated arm catches it, warns once per
+  process, emits ``monitor.on_error("dedup", exc)``, and degrades to not-seen.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _reset_backend_error_warned(self):
+    """Reset the module-level warn-once flag (Risk 4) before each test."""
+    from scrapy_extension.dupefilter import dupefilter as dupefilter_module
+
+    original = dupefilter_module._backend_error_warned
+    dupefilter_module._backend_error_warned = False
+    yield
+    dupefilter_module._backend_error_warned = original
+
+  def _make_dupefilter_with_raising_filter(self, mock_connection_manager, mocker):
+    """Build a dupefilter whose membership filter raises BackendConnectionError.
+
+    Returns ``(dupefilter, monitor)``; the monitor is a Mock so
+    ``monitor.on_error`` is assertable. The membership filter's ``add`` raises
+    a transient ``BackendConnectionError`` on every call (simulating a
+    sustained backend outage).
+    """
+    from scrapy_extension.exceptions.base import BackendConnectionError
+
+    membership_filter = mocker.Mock(name="membership_filter")
+    membership_filter.add.side_effect = BackendConnectionError(
+      "transient redis outage"
+    )
+    # saturation is read via getattr in request_seen — set to None so the
+    # saturation hook is skipped (keeps the test focused on the error arm).
+    membership_filter.saturation = None
+    monitor = mocker.Mock(name="monitor")
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      key="transient",
+      membership_filter=membership_filter,
+      monitor=monitor,
+    )
+    return dupefilter, monitor
+
+  def test_transient_error_does_not_crash(self, mock_connection_manager, mocker):
+    """RED/GREEN: a transient backend error must not propagate.
+
+    Pre-fix: the BackendConnectionError propagated and crashed the crawl.
+    Post-fix: the dupefilter degrades and treats the request as not-seen.
+    """
+    dupefilter, _monitor = self._make_dupefilter_with_raising_filter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+    result = dupefilter.request_seen(Request(url="https://example.com/x"))
+    assert result is False  # degrade to not-seen (allow the request through)
+
+  def test_transient_error_emits_on_error(self, mock_connection_manager, mocker):
+    """The monitor's ``on_error("dedup", exc)`` hook fires on degradation.
+
+    A wired ScrapyStatsMonitor translates this to ``errors/dedup`` — the
+    operability signal that distinguishes a transient outage from silence.
+    """
+    dupefilter, monitor = self._make_dupefilter_with_raising_filter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+    dupefilter.request_seen(Request(url="https://example.com/x"))
+    monitor.on_error.assert_called_once()
+    assert monitor.on_error.call_args[0][0] == "dedup"
+
+  def test_transient_error_warns_once(self, mock_connection_manager, mocker, caplog):
+    """Warn-once contract: two transient errors log exactly one WARNING.
+
+    Mirrors the FilterFull warn-once — a long-running crawl must not have its
+    log spammed by per-request outage signals.
+    """
+    dupefilter, _monitor = self._make_dupefilter_with_raising_filter(
+      mock_connection_manager, mocker
+    )
+    dupefilter.open()
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.dupefilter.dupefilter"
+    ):
+      dupefilter.request_seen(Request(url="https://example.com/x"))
+      dupefilter.request_seen(Request(url="https://example.com/y"))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "transiently unavailable" in warnings[0].message

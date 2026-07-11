@@ -73,7 +73,16 @@ def create_storage_strategy(name: str, **opts: Any) -> StorageStrategy:
   if strategy_type is StorageStrategyType.BATCHED:
     threshold_raw = opts.get("threshold", DEFAULT_BATCH_THRESHOLD)
     threshold = threshold_raw if isinstance(threshold_raw, int) else int(threshold_raw)
-    return BatchedStorageStrategy(threshold=threshold)
+    # Risk 2: thread max_buffer_age_s + monitor through to the strategy so
+    # the crash-before-flush loss window can be bounded from settings.
+    kwargs: dict[str, Any] = {"threshold": threshold}
+    max_buffer_age_s = opts.get("max_buffer_age_s")
+    if max_buffer_age_s is not None:
+      kwargs["max_buffer_age_s"] = max_buffer_age_s
+    monitor = opts.get("monitor")
+    if monitor is not None:
+      kwargs["monitor"] = monitor
+    return BatchedStorageStrategy(**kwargs)
   raise ConfigurationError(  # pragma: no cover
     f"Unknown storage strategy: {strategy_type!r}"
   )

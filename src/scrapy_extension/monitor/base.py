@@ -253,6 +253,38 @@ class Monitor:
         attempt: 1-based retry index (1 = first retry).
     """
 
+  def on_buffer_depth(self, depth: int) -> None:
+    """Record the BatchedStorageStrategy buffer fill (gauge).
+
+    Emitted by :meth:`BatchedStorageStrategy.store
+    <scrapy_extension.storage.strategies.batched.BatchedStorageStrategy.store>`
+    after each buffered item so operators can alert before the crash-before-
+    flush loss window grows (the batch is at-least-once on store *exceptions*
+    but a crash mid-batch loses the in-flight buffer — a documented failure
+    mode). ``depth`` is the number of items currently buffered (not yet
+    flushed). Default no-op so existing subclasses and :class:`NullMonitor`
+    keep working unchanged.
+
+    Args:
+        depth: Number of items currently buffered, pending flush.
+    """
+
+  def on_delay_depth(self, depth: int) -> None:
+    """Record the DelayQueueStrategy held-item count (gauge).
+
+    Emitted by :meth:`DelayQueueStrategy.push
+    <scrapy_extension.queue.strategies.delay.DelayQueueStrategy.push>` after
+    each held item so operators can alert before the in-process delay heap
+    grows unbounded (the held-delay state is in-process — a crash loses it
+    and re-delivers items with delay semantics reset; the snapshot path
+    silently no-ops when the backend is storage-incapable). ``depth`` is the
+    number of items currently held in the delay heap. Default no-op so
+    existing subclasses and :class:`NullMonitor` keep working unchanged.
+
+    Args:
+        depth: Number of items currently held in the delay heap.
+    """
+
 
 class NullMonitor(Monitor):
   """No-op monitor — the safe default.
