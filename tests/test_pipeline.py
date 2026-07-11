@@ -216,6 +216,20 @@ class TestBackendPipelineOpenSpider:
     assert pipeline._storage_supported is None
     assert "not reachable at spider open" in caplog.text
 
+  def test_open_spider_programming_error_propagates(
+    self, mock_connection_manager, mocker
+  ):
+    """A non-connection exception (real bug) must still fail fast at open, not be swallowed as transient."""
+    mock_connection_manager.get_storage_backend.side_effect = TypeError("bad config")
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    with pytest.raises(TypeError):
+      pipeline.open_spider(mock_spider)
+    # And storage is NOT marked supported (the bug never confirmed it).
+    assert pipeline._storage_supported is None
+
 
 class TestBackendPipelineCloseSpider:
   """Test BackendPipeline.close_spider method."""

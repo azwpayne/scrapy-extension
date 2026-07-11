@@ -107,6 +107,21 @@ class TestDynamoDBConnect:
     reattached.wait_until_exists.assert_called_once()
     assert b.is_connected() is True
 
+  def test_connect_non_resource_in_use_create_error_propagates(self, mocker) -> None:
+    # Negative test (review feedback): a non-ResourceInUse create_table error
+    # (e.g. LimitExceededException) must NOT be misread as a race — it
+    # propagates as BackendConnectionError so real failures surface.
+    b = _make_backend()
+    resource = mocker.MagicMock()
+    existing = mocker.MagicMock()
+    existing.load.side_effect = _make_client_error("ResourceNotFoundException")
+    resource.Table.return_value = existing
+    resource.create_table.side_effect = _make_client_error("LimitExceededException")
+    mocker.patch.object(boto3, "resource", return_value=resource)
+    with pytest.raises(BackendConnectionError):
+      b.connect()
+    resource.create_table.assert_called_once()
+
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
     mocker.patch.object(boto3, "resource", side_effect=RuntimeError("boom"))

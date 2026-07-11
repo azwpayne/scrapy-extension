@@ -12,7 +12,11 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import JSONSerializer
-from scrapy_extension.exceptions import BackendError, SerializationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  BackendError,
+  SerializationError,
+)
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
   StorageStrategy,
@@ -241,12 +245,13 @@ class BackendPipeline:
         "Pipeline will be a no-op — items will not be persisted.",
         self.connection_manager.backend_type,
       )
-    except Exception as exc:
-      # Transient startup blip (connection not yet up, momentary network
-      # error). Do NOT abort the crawl and do NOT permanently disable
-      # storage — leave _storage_supported as None so process_item retries
-      # lazily per item. The naive widening (set False) would turn a 1s blip
-      # into a whole-crawl persistence outage.
+    except BackendConnectionError as exc:
+      # Transient startup blip — ``ConnectionManager.backend`` lazy-connects
+      # on first access (connectors.py), so a backend that is briefly
+      # unreachable raises here. Do NOT abort the crawl and do NOT permanently
+      # disable storage — leave _storage_supported as None so process_item
+      # retries lazily per item. Narrowed to BackendConnectionError (per review)
+      # so genuine programming/config errors still fail fast at startup.
       logger.warning(
         "Storage backend %s not reachable at spider open: %s. Pipeline "
         "will retry storage lazily on each item.",
