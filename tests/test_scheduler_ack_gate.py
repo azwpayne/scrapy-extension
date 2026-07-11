@@ -300,3 +300,132 @@ class TestAckCapabilityDeclarations:
 
     assert RocketMQBackend.requires_ack is True
     assert RocketMQBackend.supports_concurrent_ack is True
+
+
+def _strategy_settings(backend_type: str, strategy: str, *, concurrent: int = 16) -> Mock:
+  """Build a Settings-like mock that resolves a chosen queue STRATEGY.
+
+  Unlike ``_make_settings`` (which hardcodes passthrough), this lets the
+  strategy+MQ ack-bypass tests vary ``SCRAPY_QUEUE_STRATEGY``.
+  """
+  s = Mock()
+  table = {
+    "SCRAPY_BACKEND_TYPE": backend_type,
+    "SCRAPY_QUEUE_KEY": "scheduler:queue",
+    "SCRAPY_QUEUE_STRATEGY": strategy,
+    "SCRAPY_QUEUE_DELAY_MAX_HELD": None,
+    "SCRAPY_QUEUE_PEER_IDS": None,
+    "SCRAPY_QUEUE_WORKER_ID": None,
+    "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY": "reject",
+  }
+  int_table = {
+    "SCRAPY_QUEUE_PRIORITY_LEVELS": 3,
+    "SCRAPY_QUEUE_TIME_WHEEL_SIZE": 60,
+    "SCRAPY_QUEUE_RING_BUFFER_CAPACITY": 1024,
+    "SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY": 100,
+    "SCRAPY_QUEUE_MAX_ITEM_BYTES": 1_048_576,
+    "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 1_000,
+  }
+
+  def get(key, default=None):
+    if key == "CONCURRENT_REQUESTS":
+      return concurrent
+    if key == "SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS":
+      return False
+    return table.get(key, default)
+
+  def getint(key, default=0):
+    if key == "CONCURRENT_REQUESTS":
+      return concurrent
+    return int_table.get(key, default)
+
+  float_table = {
+    "SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND": 1.0,
+    "SCRAPY_QUEUE_STEAL_TIMEOUT": 0.05,
+  }
+  s.get.side_effect = get
+  s.getint.side_effect = getint
+  s.getfloat.side_effect = lambda key, default=0.0: float_table.get(key, default)
+  s.getdict.return_value = {}
+  return s
+
+
+class TestStrategyMqAckBypassWarning:
+  """2026-07-10 (DEEP-INSIGHT-2026-07-10 §B): ``BackendQueue._pop_with_ack``
+  returns ``token=None`` for every non-passthrough strategy, silently dropping
+  MQ per-message ack (7 strategies x 5 MQ backends = 35 misconfig combos).
+  The scheduler emits a WARNING so operators notice. RED-first.
+  """
+
+  def test_warns_when_delay_strategy_pairs_with_kafka(self, mocker, caplog) -> None:
+    import logging
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = _strategy_settings("kafka", "delay")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+      BackendScheduler.from_settings(settings)  # must not raise
+    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("pop_with_ack" in m and "kafka" in m.lower() for m in msgs), (
+      f"expected strategy+MQ ack-bypass warning for delay+kafka; got: {msgs}"
+    )
+
+  def test_no_warn_when_passthrough_strategy_pairs_with_kafka(self, mocker, caplog) -> None:
+    import logging
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = _strategy_settings("kafka", "passthrough")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+      BackendScheduler.from_settings(settings)
+    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("pop_with_ack" in m for m in msgs), (
+      f"passthrough+kafka must NOT warn (token path is honored); got: {msgs}"
+    )
+
+  def test_no_warn_when_delay_strategy_pairs_with_atomic_redis(self, mocker, caplog) -> None:
+    import logging
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = _strategy_settings("redis", "delay")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+      BackendScheduler.from_settings(settings)
+    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("pop_with_ack" in m for m in msgs), (
+      f"delay+redis (atomic, requires_ack=False) must NOT warn; got: {msgs}"
+    )
+
+  @pytest.mark.parametrize(
+    ("strategy", "backend"),
+    [
+      ("delay", "kafka"),
+      ("round_robin", "kafka"),
+      ("throttle", "kafka"),
+      ("priority", "kafka"),
+      ("time_wheel", "kafka"),
+      ("work_stealing", "kafka"),
+      ("ring_buffer", "kafka"),
+      ("delay", "sqs"),
+      ("delay", "rabbitmq"),
+    ],
+  )
+  def test_warns_for_non_passthrough_strategy_x_mq_backend(
+    self, mocker, caplog, strategy, backend
+  ) -> None:
+    """Breadth: each of the 7 non-passthrough strategies x an MQ backend warns,
+    and a second/third MQ backend (sqs, rabbitmq) also resolves + warns. Locks
+    in the '7 strategies x 5 MQ backends = 35 combinations' claim from the
+    2026-07-10 risk register.
+    """
+    import logging
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = _strategy_settings(backend, strategy)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+      BackendScheduler.from_settings(settings)  # must not raise
+    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("pop_with_ack" in m and backend in m.lower() for m in msgs), (
+      f"expected strategy+MQ ack-bypass warning for {strategy}+{backend}; got: {msgs}"
+    )

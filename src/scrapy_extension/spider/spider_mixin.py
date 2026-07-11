@@ -123,7 +123,14 @@ class BackendSpiderMixin(Spider):
     # Import here to avoid circular imports
     from scrapy_extension.backends.connectors import ConnectionManager
 
-    self._connection_manager = ConnectionManager(
+    # 2026-07-10 (DEEP-INSIGHT-2026-07-10 §C): acquire via the refcounted
+    # singleton registry rather than constructing directly. Direct
+    # construction bypasses the registry, defeating refcounting + LRU
+    # eviction and the co-located-sharing model (two components that should
+    # share one Redis would each build their own). ``close_backend()``'s
+    # ``close()`` is the paired release — it decrements ``_users``; only the
+    # last holder disconnects.
+    self._connection_manager = ConnectionManager.get_manager(
       backend_type=self.backend_type,
       settings=settings,
     )

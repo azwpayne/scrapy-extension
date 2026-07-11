@@ -364,6 +364,22 @@ class _FakeQueueBackend(QueueBackend):
     self.ack_calls += 1
 
 
+class _FakeMQBackend(_FakeQueueBackend):
+  """MQ-style queue backend that overrides ``pop_with_ack`` (per-message token).
+
+  Distinct return values on ``pop()`` vs ``pop_with_ack()`` let tests
+  discriminate which dispatch path ``BackendQueue._pop_with_ack`` took.
+  """
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    return b"POP-PATH"
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    return (b"ACK-PATH", "REAL-TOKEN")
+
+
 class _FakeSetBackend(SetBackend):
   def __init__(self) -> None:
     self.added: list[bytes] = []
@@ -494,6 +510,90 @@ class TestQueueBackendProxy:
     assert backend.pushed == [("q1", b"a", 5.0)]
     assert breaker.state is BreakerState.CLOSED
     assert breaker.failure_count == 0
+
+  def test_pop_with_ack_success_dispatches_to_override_and_preserves_token(self):
+    """GREEN-side companion to the failure test: a SUCCESSFUL pop_with_ack
+    through the proxy must dispatch to the backend override AND return its
+    per-message token (not the ABC default's (pop(), None)). Locks in that
+    wrapping does not silently downgrade MQ ack semantics on the happy path.
+    """
+    backend = _FakeMQBackend()
+    breaker = CircuitBreaker("q", failure_threshold=3)
+    wrapped = wrap_queue_backend(backend, breaker)
+    data, token = wrapped.pop_with_ack("q", 0.0)
+    assert data == b"ACK-PATH"
+    assert token == "REAL-TOKEN"
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+
+  def test_backend_queue_pop_with_ack_token_survives_breaker_proxy(self, mocker):
+    """2026-07-11: the PRODUCTION path BackendQueue._pop_with_ack must carry
+    the MQ per-message ack token even when the backend is breaker-wrapped.
+
+    The class-level override detection in queue.py (backend.__class__
+    .pop_with_ack is not QueueBackend.pop_with_ack) inspects the PROXY class
+    when the backend is wrapped — the proxy resolves pop_with_ack to the ABC
+    default via MRO, so pre-fix the detection reports no override → backend
+    .pop() → token=None (the reviewer-reproduced hazard under
+    SCRAPY_CIRCUIT_BREAKER_ENABLED). Post-fix the detection unwraps the proxy
+    (._backend) and the token survives end-to-end.
+    """
+    from scrapy_extension.queue.queue import BackendQueue
+    from scrapy_extension.queue.strategies.passthrough import (
+      PassthroughQueueStrategy,
+    )
+
+    raw = _FakeMQBackend()
+    breaker = CircuitBreaker("q", failure_threshold=5)
+    wrapped = wrap_queue_backend(raw, breaker)
+    cm = mocker.MagicMock()
+    cm.get_queue_backend.return_value = wrapped
+    storage_mock = mocker.MagicMock()
+    storage_mock.retrieve.return_value = None
+    cm.get_storage_backend.return_value = storage_mock
+
+    bq = BackendQueue(
+      connection_manager=cm,
+      queue_name="q",
+      spider=None,
+      queue_strategy=PassthroughQueueStrategy(cm),
+    )
+    data, token = bq._pop_with_ack(0.0)
+    assert data == b"ACK-PATH"
+    assert token == "REAL-TOKEN"
+
+
+  def test_pop_with_ack_is_hot_path_and_dispatches_to_override(self):
+    """pop_with_ack is MQ traffic — it must be breaker-wrapped AND dispatch to
+    the backend's override (the per-message token path), not the ABC default.
+
+    Pre-fix: ``pop_with_ack`` is in neither ``_HOT_PATH`` nor ``_FORWARDED``,
+    so ``wrapped.pop_with_ack`` resolves via normal class lookup to the
+    ``QueueBackend`` ABC default ``(self.pop(), None)``. The MQ backend's
+    override is shadowed (token silently None under breaker+MQ) AND a
+    ``pop_with_ack`` failure never reaches the breaker → RED on both counts.
+    Post-fix: ``pop_with_ack`` in ``_HOT_PATH`` → the backend override is
+    captured + breaker-wrapped → GREEN.
+    """
+    backend = _FakeQueueBackend()
+    calls: list[tuple] = []
+
+    def _mq_pop_with_ack(queue_name: str, timeout: float = 0.0) -> tuple[bytes | None, Any | None]:
+      calls.append((queue_name, timeout))
+      msg = "broker down"
+      raise RuntimeError(msg)
+
+    backend.pop_with_ack = _mq_pop_with_ack  # type: ignore[method-assign]
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    wrapped = wrap_queue_backend(backend, breaker)
+
+    with pytest.raises(RuntimeError):
+      wrapped.pop_with_ack("q", 0.0)
+    # The backend override WAS called (not the ABC default that calls self.pop).
+    assert calls == [("q", 0.0)]
+    # And the breaker recorded the failure (pop_with_ack is hot-path).
+    assert breaker.state is BreakerState.OPEN
+    assert breaker.failure_count == 1
 
 
 class TestSetBackendProxy:

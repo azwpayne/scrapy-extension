@@ -1,6 +1,9 @@
 # scrapy-extension — Codebase Deep Insight
 
 > **Generated:** 2026-07-05 (incremental from `/loop` + author deep-read of core ABCs)
+> **Updated:** 2026-07-09 — §3.2 RocketMQ ack model corrected (it is **deferred-ack**, not atomic-pop; matches `rocketmq.py:66 requires_ack=True`); §3.3 serialization is now **symmetric** (P0 landed, `{"__b64__":...}` marker); test counts refreshed (1,972 passed). For the verified implementation-level risk register, see [`docs/insight/DEEP-INSIGHT-2026-07-09-parallel-verified.md`](insight/DEEP-INSIGHT-2026-07-09-parallel-verified.md).
+> **Updated:** 2026-07-11 — in-session follow-up landed three TDD fixes (adversarially reviewed): (1) circuit breaker now wraps `pop_with_ack` AND `queue.py:_pop_with_ack` unwraps the breaker proxy so MQ per-message ack tokens survive under `SCRAPY_CIRCUIT_BREAKER_ENABLED`; (2) `BackendScheduler.from_settings` warns on strategy+MQ ack bypass; (3) `BackendSpiderMixin.setup_backend` acquires via the `ConnectionManager.get_manager` singleton. Suite re-synced: **2,026 collected / 1,989 passed / 37 skipped; coverage 99.42%; ruff + mypy --strict clean**. Remaining open: spider_mixin `from_settings` routing (issue), ES `StorageError`/`ttl()` (issue).
+> **Updated:** 2026-07-10 — §3.2/§3.4 ack model collapsed from **three buckets to two**: SQS + Pulsar reclassified from "single-slot ack" to per-message-ack (both set `supports_concurrent_ack=True` at `sqs.py:140` / `pulsar.py:205`); the `_enforce_ack_concurrency_gate` is now documented as unreachable for bundled backends; added the strategy×MQ ack-bypass caveat (the largest risk the prior doc missed). Metrics re-synced to a 14-agent parallel verification run (**2,009 collected / 1,972 passed / 37 skipped; coverage 99.34%; ruff + mypy --strict clean**). Verified register: [`docs/insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md`](insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md).
 > **Scope:** systematic, structured deep-dive. Covers all subsystems at architectural depth.
 > **Sources:** `backends/base.py`, `exceptions/base.py`, the 3 strategy ABCs, `settings/base.py` (full reads); `connectors.py` / `scheduler.py` / `queue.py` (structural + prior agent findings); CLAUDE.md; coverage data; `.omc/plans/backlog-2026-07-03.md`.
 
@@ -24,7 +27,7 @@
 - Proxy rotation, rate limiting at the HTTP layer, JS rendering
 - Backend administration (brokers are externally managed)
 
-**Scale:** 17,138 LOC in `src/`, 73 unit-test files + 9 integration suites, 1,881 unit tests / 37 skipped, 95%+ coverage floor, 26/26 integration green.
+**Scale:** ~18,191 LOC in `src/`, 73 unit-test files + 9 integration suites, **2,026 tests collected / 1,989 passed / 37 skipped (7 unit + 30 integration deselected) (2026-07-11)**, 99.42% coverage (95% floor), ruff + mypy --strict clean, 26/26 integration green.
 
 ---
 
@@ -75,19 +78,22 @@ A concrete backend (e.g. `RedisBackend`) inherits `Backend` + whichever capabili
 `QueueBackend` declares two class-level flags:
 
 ```python
-requires_ack: bool = False          # True for MQ backends (Kafka/RabbitMQ/SQS/Pulsar)
-supports_concurrent_ack: bool = True  # False for single-slot ack backends (SQS/Pulsar)
+requires_ack: bool = False          # True for all MQ backends (Kafka/RabbitMQ/RocketMQ/SQS/Pulsar)
+supports_concurrent_ack: bool = True  # True for ALL bundled backends — no bundled backend is single-slot (2026-07-10)
 ```
 
-- **Atomic-pop backends** (Redis, MongoDB, ElasticSearch, RocketMQ): `requires_ack=False`. Their `pop` removes the item in one step; `ack`/`nack` are no-ops; `pop_with_ack` returns `(item, None)`.
-- **Message-queue backends** (Kafka, RabbitMQ): `requires_ack=True`, `supports_concurrent_ack=True`. `pop_with_ack` returns `(item, token)`; the scheduler carries the token in `request.meta["_backend_ack_token"]` and hands it to `ack(token=...)` so the *specific* message is acked. Correct under `CONCURRENT_REQUESTS > 1` because each pop carries its own token.
-- **Single-slot ack backends** (SQS, Pulsar): `requires_ack=True`, `supports_concurrent_ack=False`. N pops before any ack would overwrite a single receipt slot. The scheduler's `from_settings` gate **raises `ConfigurationError`** for `requires_ack and not supports_concurrent_ack` under `CONCURRENT_REQUESTS > 1` unless the explicit `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` opt-out is set.
+- **Atomic-pop backends** (Redis, MongoDB, ElasticSearch): `requires_ack=False`. Their `pop` removes the item in one step; `ack`/`nack` are no-ops; `pop_with_ack` returns `(item, None)`.
+- **Per-message-ack (MQ) backends** (Kafka, RabbitMQ, **RocketMQ**, **SQS**, **Pulsar**): `requires_ack=True`, `supports_concurrent_ack=True` — **all five** MQ backends carry a per-message token (`pop_with_ack` returns `(item, token)`), so each pop is ackable independently and correctness holds under `CONCURRENT_REQUESTS > 1`. The scheduler carries the token in `request.meta["_backend_ack_token"]` and hands it to `ack(token=...)`. Per-backend ack mechanism: Kafka = contiguous-offset watermark commit (`kafka.py:678-687`); RabbitMQ = per-message delivery tag; RocketMQ = apache 5.1.1 gRPC `consumer.ack(msg)` over an invisible-duration window; SQS = per-message `ReceiptHandle` (`sqs.py:120-128`); Pulsar = per-message `MessageId` over a Shared subscription (`pulsar.py:182-193`).
 
-This contract is the reason the package can claim correct at-least-once semantics across heterogeneous MQ backends. It is non-obvious and load-bearing — touching it requires understanding all three buckets.
+> **Historical note (corrected 2026-07-10, parallel multi-agent verification):** earlier doc versions described a third "single-slot ack" bucket (SQS, Pulsar) with `supports_concurrent_ack=False` plus a scheduler `from_settings` gate that raised `ConfigurationError` under `CONCURRENT_REQUESTS > 1`. That classification is **stale** — SQS (`sqs.py:140`) and Pulsar (`pulsar.py:205`) both set `supports_concurrent_ack=True` with per-message tokens, so the single-slot bucket is **empty for every bundled backend**; there are now **two** buckets, not three. `_enforce_ack_concurrency_gate` (`scheduler.py:388`) is unreachable for all 10 bundled backends (it remains a defensive backstop for a hypothetical 3rd-party single-slot backend). Its error message (`scheduler.py:408`) still names only Kafka/RabbitMQ as concurrency-safe — stale, since SQS/Pulsar are also safe. The stale three-bucket model also persists in the `QueueBackend` ABC docstring (`base.py:388-404`) and the in-repo scheduler docstring (`scheduler.py:368`) — both still need correction.
+>
+> **⚠ Hidden interaction (the doc previously missed entirely):** per-message ack correlation is only honored when the queue strategy is `PassthroughQueueStrategy`. ANY non-passthrough strategy (delay / round_robin / throttle / priority / time_wheel / work_stealing / ring_buffer) paired with ANY MQ backend makes `BackendQueue._pop_with_ack` (`queue.py:374`) return `token=None` — silently dropping back into the backend's legacy/no-token ack path (an at-least-once hazard). 7 strategies × 5 MQ backends = 35 silent-misconfig combinations, with no config-time gate. See [`docs/insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md`](insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md) §B.
+
+This contract is the reason the package can claim correct at-least-once semantics across heterogeneous MQ backends. It is non-obvious and load-bearing — touching it requires understanding both buckets (and the strategy×MQ caveat above).
 
 ### 3.3 Serialization
 
-`JSONSerializer` + `_json_default` handles the non-JSON-native types that real Scrapy `request.meta` values contain: `datetime`/`date` → ISO, `bytes` → base64, `Decimal` → str, `UUID` → str, `set` → list, `Enum` → `.value`, `Path` → str. Unhandled types raise `TypeError` with a clear message — **no silent `str()` coercion** (the old behavior produced `"b'x'"` and lost data). `Serializer` is a `Protocol`, so users can substitute their own.
+`JSONSerializer` + `_json_default` handles the non-JSON-native types in real Scrapy `request.meta`: `datetime`/`date` → ISO, `bytes`/`bytearray` → **tagged `{"__b64__": "..."}` marker reversed symmetrically on deserialize (2026-07-09 P0 — previously one-way base64-str)**, `Decimal` → str, `UUID` → str, `set` → list, `Enum` → `.value`, `Path` → str. Unhandled types raise `TypeError` — **no silent `str()` coercion**. `Serializer` is a `Protocol` (substitutable). Request **bodies** bypass this path entirely: `BackendQueue._request_to_dict` pre-base64-encodes the body and `_decode_body` decodes it (legacy UTF-8 migration + `validate=True`); the serializer's bytes branch therefore governs only `meta`/`cookies`/`cb_kwargs`. `"__b64__"` is a reserved `request.meta` key.
 
 ### 3.4 Capability matrix (verified vs CLAUDE.md)
 
@@ -99,8 +105,8 @@ This contract is the reason the package can claim correct at-least-once semantic
 | Kafka | ✅ | — | — | MQ; `requires_ack=True` |
 | RabbitMQ | ✅ | — | — | MQ; `requires_ack=True` |
 | RocketMQ | ✅ (deferred-ack) | Guard | Guard | `queue_len` unsupported — `NotImplementedError`, callers degrade |
-| Pulsar | ✅ | — | — | Shared subscription; single-slot ack |
-| SQS | ✅ | — | — | Standard queues; single-slot ack |
+| Pulsar | ✅ | — | — | Shared subscription; per-message `MessageId` ack (`supports_concurrent_ack=True`) |
+| SQS | ✅ | — | — | Standard queues; per-message `ReceiptHandle` ack (`supports_concurrent_ack=True`) |
 | Memcached | — | — | ✅ | KV+TTL only |
 | DynamoDB | — | — | ✅ | KV+TTL; app-level TTL |
 
@@ -157,7 +163,7 @@ All five follow Scrapy's `from_settings()` / `from_crawler()` factory pattern.
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| `BackendScheduler` | `schedule/scheduler.py` (731 LOC) | Scrapy scheduler; uses `BackendQueue` + dedup; gates ack-unsafe concurrency; backpressure pause/resume |
+| `BackendScheduler` | `schedule/scheduler.py` (806 LOC) | Scrapy scheduler; uses `BackendQueue` + dedup; ack-concurrency gate (unreachable for bundled backends post-2026-07-10 — see §3.2) + strategy+MQ ack-bypass warning (2026-07-11); backpressure pause/resume |
 | `BackendDupeFilter` | `dupefilter/dupefilter.py` (403 LOC) | Delegates to a `MembershipFilter`; handles `FilterFull` gracefully |
 | `BackendQueue` | `queue/queue.py` (725 LOC) | Request serialization/deserialization; delegates push/pop to a `QueueStrategy`; carries ack tokens in `request.meta`; depth-probe sampling (U4) |
 | `BackendPipeline` | `pipeline/pipeline.py` (351 LOC) | Item storage via a `StorageStrategy` + `StorageBackend`; C2 escalation (max consecutive errors) |
@@ -253,15 +259,15 @@ Per-backend settings modules: `redis.py` (4 modes), `mongodb.py` (4 modes), `kaf
 
 | Dimension | Status |
 |-----------|--------|
-| Unit coverage floor | **95%+** (project rule: never below 95%) |
+| Unit coverage floor | **95%+** (actual **99.42%**, 2026-07-11) |
 | `circuit_breaker.py` | **100%** (137/137 stmts, 30/30 branches) — full state machine |
 | `monitor/` (base + stats) | **100%** |
 | `storage/strategies/` | 99-100% (batched.py 98.36% — 1 empty-flush branch) |
-| `connectors.py` | 100% (post connection-manager-suite-lock-fix + subsequent coverage work) |
+| `connectors.py` | ~90% (84.6% CM-only / 90.1% full L2 suite) — missing the `_registry_key` JSON-failure fallback + the `connect()` contract-violation guard (2026-07-10 re-measure; prior "100%" claim was stale) |
 | Integration suites | 26/26 green (skip-by-default; two-layer gate `SCRAPY_TEST_INTEGRATION=1` + per-backend URL) |
 | Ruff | clean |
 | Type hints | full; `py.typed` marker |
-| Test count | 1,881 unit + integration tests |
+| Test count | 2,026 collected / 1,989 passed / 37 skipped (2026-07-11) |
 
 Test architecture: pytest with mocked backends (no real services for unit); real-broker integration in `tests/integration/` (docker-compose bring-up).
 
@@ -272,7 +278,7 @@ Test architecture: pytest with mocked backends (no real services for unit); real
 ### Mature / low-risk
 - Backend ABCs and the 4-capability model — stable since early rounds
 - Ack-capability contract — non-obvious but well-tested
-- Circuit breaker — 100% coverage, 14-test suite
+- Circuit breaker — 100% coverage, 31-test suite (2026-07-11; wraps `push`/`pop`/`pop_with_ack`)
 - ConnectionManager — hardened by connection-manager-suite-lock-fix (R14-E)
 - Lazy import with R14-H dep-vs-bug discrimination
 
@@ -332,7 +338,7 @@ This is a **mature, deliberately-evolved** codebase. Each round left the code mo
 **Run to verify health:**
 ```bash
 uv sync
-uv run pytest -q                    # ~8s, 1881 passed / 37 skipped
+uv run pytest -q                    # ~13s, 1989 passed / 37 skipped (2026 collected)
 uv run pytest --cov=scrapy_extension --cov-report=term-missing  # 95%+ floor
 uv run ruff check src/ tests/       # clean
 ```
@@ -343,4 +349,4 @@ uv run ruff check src/ tests/       # clean
 
 `scrapy-extension` is a **layered, capability-gated, strategy-pluggable** Scrapy distribution layer. Its core insight: model backends as a 4-ABC family (`Backend` + `Queue` + `Set` + `Storage`), let concrete backends declare which they implement, and gate unsupported combinations at config time (`ConfigurationError`). Above that, three strategy ABCs (`MembershipFilter`, `QueueStrategy`, `StorageStrategy`) make dedup / queue semantics / persistence pluggable without touching backends. `ConnectionManager` owns lifecycle (singleton registry, retry, breaker, eviction). The ack-capability contract (round-2) is the most subtle load-bearing design — it's what makes at-least-once correctness uniform across heterogeneous MQ backends.
 
-The codebase is **mature and saturated** (95%+ coverage, 100% on critical modules, 26/26 integration green). Future value is feature-driven (new backends, new strategies, new monitor hooks), not surveillance-driven — `/loop`-style scanning has diminishing returns here.
+The codebase is **mature** (99.34% coverage, 100% on critical modules, ruff + mypy --strict clean, 26/26 integration green) — but **not yet "saturated"**: the 2026-07-10 14-agent parallel verification (see [`DEEP-INSIGHT-2026-07-10`](insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md)) found (a) the §3.2 ack model had drifted into a stale three-bucket framing whose single-slot bucket is empty for every bundled backend, (b) the strategy×MQ ack interaction (`queue.py:374`) is an undocumented silent-correctness hazard (35 misconfig combinations), and (c) `BackendSpiderMixin` bypasses the `from_settings` safety wiring. These are correctness-doc + integration-path gaps, not architectural debt — future value is feature-driven **and** a targeted cleanup of the integration contract.
