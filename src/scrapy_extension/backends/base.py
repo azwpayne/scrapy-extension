@@ -391,12 +391,17 @@ class QueueBackend(ABC):
     / ``ack`` rather than inheriting the atomic defaults.
   - ``supports_concurrent_ack``: True when ack is safe under
     ``CONCURRENT_REQUESTS > 1`` (i.e. the backend tracks per-message ack
-    state — Kafka/RabbitMQ via an in-flight set). False for single-slot
-    ack backends (SQS, Pulsar) where N pops before any ack overwrite a
-    single receipt slot. The scheduler's ``from_settings`` gate raises
+    state). **As of 2026-07-10 every bundled backend sets this True** —
+    atomic-pop backends (Redis/MongoDB/ES) because ack is a no-op, and all
+    five MQ backends (Kafka/RabbitMQ/RocketMQ/SQS/Pulsar) because each
+    tracks a per-message token (in-flight set / ReceiptHandle / MessageId).
+    A 3rd-party backend that can only hold a single ack slot may set False;
+    the scheduler's ``from_settings`` gate then raises
     ``ConfigurationError`` for ``requires_ack and not
     supports_concurrent_ack`` under ``CONCURRENT_REQUESTS > 1`` unless the
-    explicit ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set.
+    explicit ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is set. (The
+    gate is unreachable for the 10 bundled backends — it remains a defensive
+    backstop for a hypothetical single-slot 3rd-party backend.)
 
   Defaults (``requires_ack=False``, ``supports_concurrent_ack=True``) keep
   atomic-pop backends untouched and are the safe baseline for any new
