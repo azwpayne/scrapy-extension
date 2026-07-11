@@ -90,6 +90,23 @@ class TestDynamoDBConnect:
     resource.create_table.assert_called_once()
     new_table.wait_until_exists.assert_called_once()
 
+  def test_connect_concurrent_create_table_race(self, mocker) -> None:
+    # Two workers boot concurrently; both see ResourceNotFoundException from
+    # load(); the loser's create_table raises ResourceInUseException — connect
+    # must reattach to the existing (in-creation) table instead of failing.
+    b = _make_backend()
+    resource = mocker.MagicMock()
+    loser_table = mocker.MagicMock()
+    loser_table.load.side_effect = _make_client_error("ResourceNotFoundException")
+    reattached = mocker.MagicMock()
+    resource.Table.side_effect = [loser_table, reattached]
+    resource.create_table.side_effect = _make_client_error("ResourceInUseException")
+    mocker.patch.object(boto3, "resource", return_value=resource)
+    b.connect()  # must not raise BackendConnectionError
+    resource.create_table.assert_called_once()
+    reattached.wait_until_exists.assert_called_once()
+    assert b.is_connected() is True
+
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
     mocker.patch.object(boto3, "resource", side_effect=RuntimeError("boom"))
