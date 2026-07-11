@@ -217,18 +217,25 @@ class MemcachedBackend(Backend, StorageBackend):
     return None
 
   def clear_storage(self, prefix: str | None = None) -> None:
-    """Flush ALL keys (prefix filtering not supported by Memcached).
+    """Flush ALL keys (prefix scoping is unsupported by Memcached).
 
     Args:
-        prefix: Ignored — Memcached flush_all clears everything.
+        prefix: If ``None``, flush the entire cache. If non-None, rejected —
+            Memcached ``flush_all`` cannot scope to a prefix, so accepting
+            one would silently destroy other tenants on a shared cluster.
 
     Raises:
-        ValueError: If prefix contains invalid characters.
+        ValueError: If ``prefix`` contains invalid characters.
+        NotImplementedError: If ``prefix`` is not ``None`` (protocol limit).
         StorageError: If the underlying client raises (was previously
             silently swallowed).
     """
-    if prefix:
+    if prefix is not None:
       _validate_key_name(prefix, "prefix")
+      raise NotImplementedError(
+        "Memcached flush_all does not support prefix scoping; pass "
+        "prefix=None to flush the entire cache."
+      )
     try:
       self._client.flush_all()
     except Exception as e:
