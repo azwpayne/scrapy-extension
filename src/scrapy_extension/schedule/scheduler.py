@@ -436,9 +436,10 @@ class BackendScheduler:
     ack token AND the backend requires one (#28).
 
     A strategy threads the token iff its class overrides ``pop_with_ack``
-    (passthrough / priority / work_stealing override it; delay / round_robin /
-    throttle / time_wheel / ring_buffer inherit the ABC default
-    ``(pop(), None)``). Pairing a non-threading strategy with an MQ backend
+    (passthrough / priority / work_stealing / delay / throttle override it;
+    round_robin / time_wheel / ring_buffer inherit the ABC default
+    ``(pop(), None)`` -- correct for in-process strategies that hold no
+    broker message). Pairing a non-threading strategy with an MQ backend
     (``requires_ack=True``) silently drops per-message ack correlation — an
     at-least-once hazard. This surfaces it as a WARNING so operators can
     switch to a threading strategy or accept the tradeoff deliberately.

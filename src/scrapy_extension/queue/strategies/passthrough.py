@@ -59,27 +59,12 @@ class PassthroughQueueStrategy(QueueStrategy):
     backend provides one (#28 -- consolidates BackendQueue._pop_with_ack's
     passthrough branch into the strategy).
 
-    Only backends that genuinely override ``pop_with_ack`` (the MQ backends)
-    take the token-correlated path; atomic-pop backends inherit the ABC
-    default and keep the plain ``pop()`` path (byte-identical roundtrip for
-    them). The breaker proxy is unwrapped before the class-level check (the
-    proxy binds ``pop_with_ack`` as an instance attribute, so the proxy CLASS
-    resolves it to the ABC default via MRO).
+    Delegates to :meth:`QueueStrategy._pop_backend_with_ack` (shared with the
+    delay / throttle strategies). Only backends that genuinely override
+    ``pop_with_ack`` (the MQ backends) take the token-correlated path;
+    atomic-pop backends keep the plain ``pop()`` roundtrip.
     """
-    from scrapy_extension.backends.base import QueueBackend
-
-    backend = self._connection_manager.get_queue_backend()
-    unwrapped = getattr(backend, "_backend", backend)
-    backend_cls = getattr(unwrapped, "__class__", None)
-    override = (
-      backend_cls is not None
-      and getattr(backend_cls, "pop_with_ack", None) is not None
-      and backend_cls.pop_with_ack is not QueueBackend.pop_with_ack
-    )
-    if override:
-      return backend.pop_with_ack(queue_name, timeout)
-    data = backend.pop(queue_name, timeout)
-    return (data, None)
+    return self._pop_backend_with_ack(queue_name, timeout)
 
   def queue_len(self, queue_name: str) -> int:
     """Return the QueueBackend length.

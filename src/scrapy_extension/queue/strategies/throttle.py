@@ -136,6 +136,26 @@ class ThrottleQueueStrategy(QueueStrategy):
       self._last_pop = now
     return item
 
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, object | None]:
+    """Throttled pop, threading the per-message ack token (MQ backends, #28).
+
+    Same throttle gate as :meth:`pop`: returns ``(None, None)`` within
+    ``min_interval`` of the last successful pop (without touching the
+    backend). Past the gate, delegates to
+    :meth:`QueueStrategy._pop_backend_with_ack` so MQ backends keep their
+    deferred-ack token instead of silently falling back to atomic ``pop()``
+    (pre-fix the inherited base default dropped the token).
+    """
+    now = self._clock()
+    if self._last_pop is not None and (now - self._last_pop) < self._min_interval:
+      return (None, None)
+    data, token = self._pop_backend_with_ack(queue_name, timeout)
+    if data is not None:
+      self._last_pop = now
+    return data, token
+
   def queue_len(self, queue_name: str) -> int:
     """Return the backend queue length.
 

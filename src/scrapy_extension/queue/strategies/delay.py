@@ -192,6 +192,20 @@ class DelayQueueStrategy(QueueStrategy):
     self._drain_ready(queue_name)
     return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
 
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, object | None]:
+    """Drain due held items, then pop the live queue (threads ack token, #28).
+
+    Same drain-then-pop flow as :meth:`pop`, but delegates the live pop to
+    :meth:`QueueStrategy._pop_backend_with_ack` so MQ backends keep their
+    deferred-ack token instead of silently falling back to atomic ``pop()``
+    (pre-fix the inherited base default dropped the token). Held items are
+    re-pushed (not popped), so no token is involved in the drain.
+    """
+    self._drain_ready(queue_name)
+    return self._pop_backend_with_ack(queue_name, timeout)
+
   def _drain_ready(self, queue_name: str) -> None:
     """Move all due held items into the live queue.
 

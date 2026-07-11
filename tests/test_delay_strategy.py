@@ -29,6 +29,22 @@ class TestDelayQueueStrategy:
     assert len(strat._holding) == 1
     mock_connection_manager.get_queue_backend().push.assert_not_called()
 
+  def test_pop_with_ack_threads_mq_token(self, mock_connection_manager, mocker) -> None:
+    # delay.pop_with_ack must delegate to _pop_backend_with_ack (which threads
+    # the MQ per-message ack token) -- pre-fix the inherited base default
+    # dropped it and silently fell back to atomic pop() (at-most-once for MQ
+    # backends).
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager, default_delay=0.0, clock=_clock(now)
+    )
+    deleg = mocker.patch.object(
+      strat, "_pop_backend_with_ack", return_value=(b"item", "delay-token")
+    )
+    data, token = strat.pop_with_ack("q")
+    assert (data, token) == (b"item", "delay-token")
+    deleg.assert_called_once_with("q", 0.0)
+
   def test_close_with_held_items_warns_and_clears(
     self, mock_connection_manager, caplog
   ) -> None:
