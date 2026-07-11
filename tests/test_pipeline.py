@@ -193,6 +193,29 @@ class TestBackendPipelineOpenSpider:
 
     assert "Pipeline opened for spider test_spider" in caplog.text
 
+  def test_open_spider_transient_error_does_not_abort(
+    self, mock_connection_manager, mocker, caplog
+  ):
+    """A transient connection blip at open must not abort the crawl nor permanently disable storage."""
+    import logging
+
+    from scrapy_extension.exceptions import BackendConnectionError
+
+    mock_connection_manager.get_storage_backend.side_effect = BackendConnectionError(
+      "connection refused"
+    )
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    with caplog.at_level(logging.WARNING):
+      pipeline.open_spider(mock_spider)  # must NOT raise
+
+    # Neither True (confirmed) nor False (permanently disabled) — left as None
+    # so process_item lazily retries storage on each item.
+    assert pipeline._storage_supported is None
+    assert "not reachable at spider open" in caplog.text
+
 
 class TestBackendPipelineCloseSpider:
   """Test BackendPipeline.close_spider method."""

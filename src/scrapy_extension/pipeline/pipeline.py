@@ -223,6 +223,10 @@ class BackendPipeline:
     Detects whether the configured backend supports storage. If not
     (Kafka, RabbitMQ, RocketMQ), the pipeline degrades to a no-op and
     logs a warning so the operator knows items aren't being persisted.
+    A *transient* connection blip is neither — the pipeline leaves the
+    capability unconfirmed and retries storage lazily in ``process_item``
+    (whose own try/except handles ongoing failures best-effort) rather
+    than aborting the crawl at startup.
 
     Args:
         spider: The spider instance.
@@ -236,6 +240,18 @@ class BackendPipeline:
         "Backend %s does not support storage. "
         "Pipeline will be a no-op — items will not be persisted.",
         self.connection_manager.backend_type,
+      )
+    except Exception as exc:
+      # Transient startup blip (connection not yet up, momentary network
+      # error). Do NOT abort the crawl and do NOT permanently disable
+      # storage — leave _storage_supported as None so process_item retries
+      # lazily per item. The naive widening (set False) would turn a 1s blip
+      # into a whole-crawl persistence outage.
+      logger.warning(
+        "Storage backend %s not reachable at spider open: %s. Pipeline "
+        "will retry storage lazily on each item.",
+        self.connection_manager.backend_type,
+        exc,
       )
     logger.info("Pipeline opened for spider %s", spider.name)
 
