@@ -200,16 +200,25 @@ class BackendScheduler:
     bind to a different backend than the dedup filter or storage pipeline
     (multi-backend coexistence). Unset → falls back to the global keys.
 
-    **Ack-concurrency gate (round-2, C1 fix).** After the queue backend is
+    **Ack-concurrency gate (round-2 C1 fix; 2026-07-10 correction).** After the queue backend is
     resolved, the backend's ``QueueBackend.requires_ack`` /
     ``supports_concurrent_ack`` class attributes are inspected. If the
-    backend requires ack but does NOT support concurrent ack (SQS, Pulsar —
-    single-slot ack) AND ``CONCURRENT_REQUESTS > 1`` AND the explicit
+    backend requires ack but does NOT support concurrent ack AND
+    ``CONCURRENT_REQUESTS > 1`` AND the explicit
     ``SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`` opt-out is NOT set, this
-    raises :class:`ConfigurationError`. Atomic backends (Redis/Mongo/ES/
-    RocketMQ) and real in-flight-set backends (Kafka/RabbitMQ) are
-    unaffected. Read the opt-out via ``settings.get(..., False)`` — it is
-    NOT a pydantic field. See the class docstring for the full contract.
+    raises :class:`ConfigurationError`. **Note (2026-07-10):** every bundled
+    backend — atomic (Redis/Mongo/ES) and all five MQ backends (Kafka/RabbitMQ/
+    RocketMQ/SQS/Pulsar) — sets ``supports_concurrent_ack=True``, so this gate
+    is unreachable for bundled backends; it remains a defensive backstop for a
+    hypothetical 3rd-party single-slot backend. Read the opt-out via ``settings.get(..., False)`` — it is
+    NOT a pydantic field.
+
+    **Strategy+MQ ack-bypass warning (2026-07-10, §B).** After the queue
+    strategy is resolved, if it is non-passthrough AND the backend
+    ``requires_ack=True``, a WARNING is logged: ``BackendQueue._pop_with_ack``
+    returns ``token=None`` for non-passthrough strategies, silently disabling
+    MQ per-message ack (35 misconfig combinations). See
+    ``_warn_strategy_mq_ack_bypass``.
     """
     from scrapy_extension.queue.strategies.factory import (
       QueueStrategyType,
@@ -229,15 +238,18 @@ class BackendScheduler:
     )
 
     # Ack-concurrency gate (round-2 C1 fix). Inspect the backend CLASS —
-    # no instantiation/connection needed. Single-slot-ack backends (SQS,
-    # Pulsar) under CONCURRENT_REQUESTS>1 silently lose N-1/N acks; the
-    # gate converts that silent defect into a loud fail-fast unless the
-    # operator explicitly opts in via SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS.
+    # no instantiation/connection needed. NOTE (2026-07-10): every bundled
+    # backend sets supports_concurrent_ack=True, so this gate is unreachable
+    # for bundled backends — it remains a defensive backstop for a
+    # hypothetical 3rd-party single-slot backend.
     BackendScheduler._enforce_ack_concurrency_gate(settings, backend_type)
 
     strategy_type = QueueStrategyType(
       settings.get("SCRAPY_QUEUE_STRATEGY", QueueStrategyType.PASSTHROUGH.value)
     )
+    # Strategy+MQ ack-bypass warning (2026-07-10, §B): non-passthrough
+    # strategies + a requires_ack backend silently drop per-message ack.
+    BackendScheduler._warn_strategy_mq_ack_bypass(strategy_type, backend_type)
     # R14-C: read the delay-strategy max_held knob (round-9 U5). Unset → None
     # → build_queue_strategy falls back to the DelayQueueStrategy constructor
     # default (100_000). Read via get(...) + int() to mirror the
@@ -413,6 +425,47 @@ class BackendScheduler:
       msg,
       setting_name="CONCURRENT_REQUESTS",
       setting_value=concurrent,
+    )
+
+  @staticmethod
+  def _warn_strategy_mq_ack_bypass(strategy_type: Any, backend_type: Any) -> None:
+    """Warn when a non-passthrough queue strategy pairs with an MQ backend.
+
+    ``BackendQueue._pop_with_ack`` (``queue.py:374``) returns ``token=None``
+    for every strategy except ``PassthroughQueueStrategy``, so pairing any
+    non-passthrough strategy (delay / round_robin / throttle / priority /
+    time_wheel / work_stealing / ring_buffer) with an MQ backend
+    (``requires_ack=True``) silently drops per-message ack correlation — an
+    at-least-once hazard with no config-time gate (35 misconfig combinations
+    as of round-15). This surfaces it as a WARNING so operators can either
+    switch to ``passthrough`` or accept the tradeoff deliberately.
+
+    Atomic-pop backends (``requires_ack=False``) are unaffected: ``token=None``
+    is their correct path. ``PassthroughQueueStrategy`` is unaffected: it is
+    the one strategy that honors the token path.
+    """
+    from scrapy_extension.queue.strategies.factory import QueueStrategyType
+
+    if strategy_type == QueueStrategyType.PASSTHROUGH:
+      return
+    from scrapy_extension.backends.connectors import _load_object
+    from scrapy_extension.backends.registry import get_descriptor
+
+    descriptor = get_descriptor(str(backend_type))
+    backend_cls = _load_object(descriptor.backend_cls_path)
+    if not getattr(backend_cls, "requires_ack", False):
+      return
+    bt_name = (
+      backend_type.value if isinstance(backend_type, BackendType) else backend_type
+    )
+    logger.warning(
+      "Queue strategy %r paired with MQ backend %r (requires_ack=True): "
+      "BackendQueue._pop_with_ack returns token=None for non-passthrough "
+      "strategies, so per-message ack correlation is silently disabled "
+      "(at-least-once hazard). Use SCRAPY_QUEUE_STRATEGY=passthrough to keep "
+      "per-message ack, or accept the tradeoff deliberately.",
+      getattr(strategy_type, "value", strategy_type),
+      bt_name,
     )
 
   @classmethod
