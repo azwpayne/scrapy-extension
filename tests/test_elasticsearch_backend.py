@@ -373,6 +373,53 @@ class TestStorage:
       "prefix": {"key": "items:"}
     }
 
+  def test_store_wraps_transport_error_as_storage_error(self, mocker):
+    """#30: ES storage ops must join the StorageError family (Mongo/Memcached/
+    DynamoDB already do) so callers' ``except BackendError`` catches ES storage
+    failures uniformly instead of crashing on a raw TransportError.
+
+    R31-A1 (test_add_transport_error_propagates) is preserved -- it tests the
+    SET ``add()`` op, which stays raw-propagate by design; this wraps only the
+    storage ``store`` op.
+    """
+    from elasticsearch import TransportError
+
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.index.side_effect = TransportError("connection refused")
+    with pytest.raises(StorageError) as ei:
+      b.store("k", b"data")
+    assert ei.value.operation == "store"
+    assert ei.value.key == "k"
+    # The original TransportError is chained (not swallowed).
+    assert isinstance(ei.value.__cause__, TransportError)
+
+  def test_retrieve_wraps_transport_error_as_storage_error(self, mocker):
+    from elasticsearch import TransportError
+
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.get.side_effect = TransportError("timeout")
+    with pytest.raises(StorageError) as ei:
+      b.retrieve("k")
+    assert ei.value.operation == "retrieve"
+    assert isinstance(ei.value.__cause__, TransportError)
+
+  def test_delete_wraps_transport_error_as_storage_error(self, mocker):
+    from elasticsearch import TransportError
+
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.delete.side_effect = TransportError("timeout")
+    with pytest.raises(StorageError) as ei:
+      b.delete("k")
+    assert ei.value.operation == "delete"
+    assert ei.value.key == "k"
+    assert isinstance(ei.value.__cause__, TransportError)
+
 
 class TestValidation:
   def test_validate_key_name_empty_string(self):

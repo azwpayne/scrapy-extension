@@ -17,6 +17,7 @@ __all__ = [
 ]
 
 import base64
+import binascii
 import hashlib
 import json
 import re
@@ -80,6 +81,14 @@ def _json_default(obj: object) -> object:
   if isinstance(obj, Path):
     return str(obj)
   type_name = type(obj).__name__
+  if type_name in {"SecretStr", "SecretBytes"}:
+    # pydantic secrets in request.meta (#31) — emit the underlying value via
+    # the duck-typed accessor (no pydantic import; the type-name check mirrors
+    # exceptions/base._is_secret_value). Deserialize yields a plain str —
+    # SecretStr is not reconstructable from JSON without a pydantic hook; the
+    # goal here is "does not crash the push path".
+    get_secret_value = getattr(obj, "get_secret_value", None)
+    return get_secret_value() if callable(get_secret_value) else str(obj)
   raise TypeError(
     f"Object of type {type_name} is not JSON serializable. "
     f"Pre-serialize {type_name} instances before pushing to the queue, "
@@ -112,7 +121,15 @@ def _decode_bytes_tag(obj: object) -> object:
   if isinstance(obj, dict) and len(obj) == 1:
     value = obj.get(_BYTES_TAG)
     if isinstance(value, str):
-      return base64.b64decode(value)
+      try:
+        return base64.b64decode(value)
+      except (binascii.Error, ValueError):
+        # A legitimately-stored dict shaped like {"__b64__": "<non-base64>"}
+        # (a spider's own meta key, or a truncated/corrupt value) must NOT
+        # crash the entire request deserialize (#31). Fall through: the dict
+        # is returned unchanged so the value surfaces as a plain str instead
+        # of dropping the whole pop.
+        pass
   return obj
 
 

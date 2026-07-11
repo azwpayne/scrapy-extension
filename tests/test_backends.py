@@ -121,6 +121,32 @@ class TestJSONSerializer:
     assert deserialized["raw"] == b"\x00\xff\x42"
     assert isinstance(deserialized["raw"], bytes)
 
+  def test_corrupt_b64_marker_does_not_crash_deserialize(self):
+    """#31: a stored value shaped like {"__b64__": "<invalid base64>"} (a
+    spider's own meta key, or a truncated/corrupt value) must NOT crash the
+    whole request deserialize via binascii.Error -- it falls through as the
+    original dict so the pop surfaces a value instead of dropping the request.
+    """
+    serializer = JSONSerializer()
+    # 'A' is a single base64-alphabet char -> b64decode raises binascii.Error
+    # (data length 1 cannot be 1 more than a multiple of 4).
+    corrupt = b'{"k": {"__b64__": "A"}}'
+    result = serializer.deserialize(corrupt)
+    assert result == {"k": {"__b64__": "A"}}
+
+  def test_secret_str_in_meta_serializes(self):
+    """#31: pydantic SecretStr in request.meta serializes (does not raise
+    TypeError). Round-trip yields a plain str (SecretStr is not reconstructable
+    from JSON without a pydantic hook); the bar here is 'does not crash push'.
+    """
+    from pydantic import SecretStr
+
+    serializer = JSONSerializer()
+    data = {"token": SecretStr("hunter2")}
+    serialized = serializer.serialize(data)  # must not raise
+    deserialized = serializer.deserialize(serialized)
+    assert deserialized["token"] == "hunter2"
+
   def test_string_looking_like_base64_stays_str(self):
     """Guard: a plain string that happens to be valid base64 is NOT decoded.
 
