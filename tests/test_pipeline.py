@@ -223,6 +223,40 @@ class TestBackendPipelineCloseSpider:
 
     mock_connection_manager.close.assert_called_once_with()
 
+  def test_close_spider_releases_connection_on_flush_failure(
+    self, mock_connection_manager, mocker
+  ):
+    """Teardown invariant: connection_manager.close() runs even when the final flush raises."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline.storage_strategy = mocker.Mock()
+    pipeline.storage_strategy.close.side_effect = RuntimeError("flush failed")
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    with pytest.raises(RuntimeError, match="flush failed"):
+      pipeline.close_spider(mock_spider)
+
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_close_spider_flush_error_not_masked_by_connection_close(
+    self, mock_connection_manager, mocker, caplog
+  ):
+    """If both close() calls raise, the original flush error propagates; the connection-close error is logged, not swallowed."""
+    import logging
+
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline.storage_strategy = mocker.Mock()
+    pipeline.storage_strategy.close.side_effect = RuntimeError("flush failed")
+    mock_connection_manager.close.side_effect = ConnectionError("close failed")
+    mock_spider = mocker.Mock()
+    mock_spider.name = "test_spider"
+
+    with caplog.at_level(logging.ERROR):
+      with pytest.raises(RuntimeError, match="flush failed"):
+        pipeline.close_spider(mock_spider)
+
+    assert "connection_manager.close() failed" in caplog.text
+
 
 class TestBackendPipelineProcessItem:
   """Test BackendPipeline.process_item method."""

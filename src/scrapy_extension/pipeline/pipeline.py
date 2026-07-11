@@ -249,8 +249,19 @@ class BackendPipeline:
         spider: The spider instance.
     """
     logger.info("Pipeline closed for spider %s", spider.name)
-    self.storage_strategy.close()
-    self.connection_manager.close()
+    try:
+      self.storage_strategy.close()
+    finally:
+      # Teardown invariant: release the backend connection even if the final
+      # flush raised (batched partial-flush, backend error). Without this, a
+      # failed close leaks one socket/fd per spider-close-under-error on
+      # long-running Scrapyd deploys.
+      try:
+        self.connection_manager.close()
+      except Exception:
+        # Don't mask the original flush error (if any) — log and continue so
+        # the exception propagating from the try block is what callers see.
+        logger.exception("connection_manager.close() failed during teardown")
 
   def process_item(self, item: Item, spider: Spider) -> Item:
     """Process and store an item.
