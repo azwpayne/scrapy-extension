@@ -29,6 +29,20 @@ def _strategy(levels: int = 3) -> tuple[PriorityQueueStrategy, MagicMock]:
   return PriorityQueueStrategy(cm, levels=levels), qb
 
 
+def test_pop_with_ack_threads_backend_token_from_first_non_empty_bucket():
+  """#28: pop_with_ack scans buckets via backend.pop_with_ack and returns
+  (data, token) so MQ backends paired with the priority strategy keep
+  per-message ack correlation (previously pop() returned data only → the
+  scheduler saw token=None → silent at-least-once hazard under MQ)."""
+  s, qb = _strategy(levels=3)
+  qb.pop_with_ack.return_value = (b"item", "TOKEN-P0")
+  data, token = s.pop_with_ack("q", 0.0)
+  assert data == b"item"
+  assert token == "TOKEN-P0"
+  # First non-empty bucket (p0, highest priority) — does not scan further.
+  qb.pop_with_ack.assert_called_once_with("q:p0", 0.0)
+
+
 # ---------------------------------------------------------------------------
 # push — priority → level mapping
 # ---------------------------------------------------------------------------

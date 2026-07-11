@@ -11,7 +11,7 @@ from __future__ import annotations
 __all__ = ["QueueStrategy"]
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -68,6 +68,28 @@ class QueueStrategy(ABC):
     Returns:
         The next item, or None if empty.
     """
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop the next ready item plus a backend ack token (additive; #28).
+
+    Default returns ``(self.pop(...), None)`` -- correct for strategies that
+    hold no broker message to ack (in-process: round_robin / ring_buffer) and
+    for strategies whose ack semantics don't map to a single backend message.
+    Backend-using strategies that CAN correlate a per-message token override
+    this to call ``QueueBackend.pop_with_ack`` and thread the token through
+    (passthrough / priority / work_stealing).
+
+    Args:
+        queue_name: The queue name.
+        timeout: Seconds to block (0 = non-blocking).
+
+    Returns:
+        ``(item, token)`` -- ``token`` is ``None`` when the strategy/backend
+        has no per-message ack correlation.
+    """
+    return (self.pop(queue_name, timeout), None)
 
   @abstractmethod
   def queue_len(self, queue_name: str) -> int:
