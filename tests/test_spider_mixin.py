@@ -67,7 +67,11 @@ class TestSetupBackend:
   """Test setup_backend method."""
 
   def test_setup_backend_success(self, mocker):
-    """Test successful setup_backend call."""
+    """Test successful setup_backend call.
+
+    2026-07-10 (§C): setup_backend now acquires via the singleton accessor
+    ``ConnectionManager.get_manager`` (not the constructor), so patch that.
+    """
     mock_manager = mocker.MagicMock(spec=ConnectionManager)
 
     class TestSpider(BackendSpiderMixin, Spider):
@@ -75,16 +79,73 @@ class TestSetupBackend:
       backend_type = BackendType.REDIS
 
     spider = TestSpider()
-    # Patch ConnectionManager at the source where it's defined
-    mocker.patch(
-      "scrapy_extension.backends.connectors.ConnectionManager",
-      return_value=mock_manager,
-    )
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
     result = spider.setup_backend()
 
     assert result is mock_manager
     assert spider._connection_manager is mock_manager
+
+  def test_setup_backend_uses_singleton_get_manager(self, mocker):
+    """2026-07-10 (DEEP-INSIGHT-2026-07-10 §C): setup_backend must acquire via
+    ``ConnectionManager.get_manager`` (the refcounted singleton registry), NOT
+    construct ``ConnectionManager(...)`` directly. Direct construction
+    bypasses the registry, defeating refcounting + LRU eviction and leaving
+    the spider outside the co-located-sharing model.
+
+    RED pre-fix: setup_backend calls the constructor directly, so the patched
+    ``get_manager`` is never invoked → ``call_count == 0`` and the returned
+    manager is a real ConnectionManager (not the mock) → both asserts fail.
+    """
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+    get_manager_spy = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=mock_manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    result = spider.setup_backend()
+
+    assert result is mock_manager
+    assert get_manager_spy.call_count == 1
+
+  def test_setup_backend_shares_singleton_across_spiders(self):
+    """2026-07-11 (§C intent, no mocks): two spiders with identical backend
+    config must acquire the SAME ConnectionManager via the singleton registry.
+    This is the actual purpose of routing ``setup_backend`` through
+    ``get_manager`` — co-located sharing + refcounting + LRU. The call-site
+    test above only proves the accessor NAME is used; this one proves the
+    sharing semantics end-to-end against the real registry.
+    """
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    class SharedSpiderA(BackendSpiderMixin, Spider):
+      name = "shared_singleton_a"
+      backend_type = BackendType.REDIS
+      redis_db = 97  # distinctive settings → distinctive registry key
+
+    class SharedSpiderB(BackendSpiderMixin, Spider):
+      name = "shared_singleton_b"
+      backend_type = BackendType.REDIS
+      redis_db = 97  # identical → same registry key
+
+    spider1 = SharedSpiderA()
+    spider2 = SharedSpiderB()
+    try:
+      cm1 = spider1.setup_backend()
+      cm2 = spider2.setup_backend()
+      # Singleton: same backend_type:settings_hash → same instance.
+      assert cm1 is cm2
+      # Two acquires → refcount at least 2 (robust to any pre-existing entry).
+      assert cm1._users >= 2
+      assert isinstance(cm1, ConnectionManager)
+    finally:
+      # Release both so the registry entry evicts (no cross-test pollution).
+      spider1.close_backend()
+      spider2.close_backend()
 
   def test_setup_backend_without_backend_type_raises(self):
     """Test that setup_backend raises RuntimeError when backend_type is None."""
