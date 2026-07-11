@@ -43,6 +43,19 @@ def _strategy(
   )
 
 
+def test_pop_with_ack_threads_backend_token_from_own_queue():
+  """#28: pop_with_ack checks the own queue via backend.pop_with_ack and
+  returns (data, token) so MQ backends paired with the work-stealing strategy
+  keep per-message ack correlation (previously pop() returned data only)."""
+  s, qb = _strategy()
+  qb.pop_with_ack.return_value = (b"item", "TOKEN-OWN")
+  data, token = s.pop_with_ack("q", 0.0)
+  assert data == b"item"
+  assert token == "TOKEN-OWN"
+  # Own queue first (no peer steal needed since own was non-empty).
+  qb.pop_with_ack.assert_called_once_with("q:w1", 0.0)
+
+
 # ---------------------------------------------------------------------------
 # push — own queue only
 # ---------------------------------------------------------------------------

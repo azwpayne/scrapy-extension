@@ -26,10 +26,13 @@ from __future__ import annotations
 
 __all__ = ["DEFAULT_STEAL_TIMEOUT", "WorkStealingQueueStrategy"]
 
+import logging
 import uuid
 from typing import TYPE_CHECKING
 
 from scrapy_extension.queue.strategies.base import QueueStrategy
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -74,6 +77,17 @@ class WorkStealingQueueStrategy(QueueStrategy):
     if steal_timeout < 0:
       raise ValueError(f"steal_timeout must be >= 0, got {steal_timeout}")
     self._worker_id = worker_id if worker_id is not None else uuid.uuid4().hex
+    if worker_id is None:
+      # #31: a restart without a stable SCRAPY_QUEUE_WORKER_ID generates a NEW
+      # id → new own-queue name → the previous own-queue's items are stranded
+      # (queue_len reports 0, no cleanup). Warn so operators set a sticky id.
+      logger.warning(
+        "WorkStealingQueueStrategy auto-generated worker_id %r. A restart "
+        "without a stable SCRAPY_QUEUE_WORKER_ID strands the previous "
+        "own-queue's items. Set SCRAPY_QUEUE_WORKER_ID for production "
+        "multi-worker deployments.",
+        self._worker_id,
+      )
     self._peer_ids = tuple(peer_ids)
     self._steal_timeout = steal_timeout
     self._steal_idx = 0
@@ -140,6 +154,31 @@ class WorkStealingQueueStrategy(QueueStrategy):
     if timeout > 0:
       return qb.pop(own, timeout)
     return None
+
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, object | None]:
+    """Own queue first, steal from peers, then blocking fallback -- via
+    ``pop_with_ack`` so the MQ per-message ack token threads through (#28).
+    Mirrors ``pop`` but returns ``(data, token)``.
+    """
+    qb = self._connection_manager.get_queue_backend()
+    own = self._own_queue(queue_name)
+    data, token = qb.pop_with_ack(own, 0.0)
+    if data is not None:
+      return (data, token)
+    n_peers = len(self._peer_ids)
+    if n_peers:
+      for i in range(n_peers):
+        idx = (self._steal_idx + i) % n_peers
+        peer = self._peer_ids[idx]
+        data, token = qb.pop_with_ack(f"{queue_name}:{peer}", self._steal_timeout)
+        if data is not None:
+          self._steal_idx = (idx + 1) % n_peers
+          return (data, token)
+    if timeout > 0:
+      return qb.pop_with_ack(own, timeout)
+    return (None, None)
 
   def queue_len(self, queue_name: str) -> int:
     """Own queue length only (peer queues belong to other workers)."""

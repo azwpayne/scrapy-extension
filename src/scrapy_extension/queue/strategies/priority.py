@@ -135,6 +135,23 @@ class PriorityQueueStrategy(QueueStrategy):
       return qb.pop(f"{queue_name}:p0", timeout)
     return None
 
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, object | None]:
+    """Scan levels high-priority-first via ``pop_with_ack``, threading the MQ
+    per-message ack token (#28). Mirrors ``pop`` but returns ``(data, token)``
+    so MQ backends paired with the priority strategy keep per-message ack
+    correlation (previously the token was silently None).
+    """
+    qb = self._connection_manager.get_queue_backend()
+    for level in range(self._levels):
+      data, token = qb.pop_with_ack(f"{queue_name}:p{level}", 0.0)
+      if data is not None:
+        return (data, token)
+    if timeout > 0:
+      return qb.pop_with_ack(f"{queue_name}:p0", timeout)
+    return (None, None)
+
   def queue_len(self, queue_name: str) -> int:
     """Sum the lengths of all priority buckets.
 

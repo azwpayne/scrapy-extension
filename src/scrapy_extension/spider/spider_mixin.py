@@ -282,6 +282,65 @@ class BackendSpiderMixin(Spider):
     except Exception:
       logger.exception("close_backend() failed during spider_closed signal")
 
+  def _crawler_settings(self) -> Any | None:
+    """Return ``crawler.settings`` if a crawler is attached, else None.
+
+    BackendSpiderMixin is constructed both ways: with a crawler (production
+    Scrapy wiring) and without (unit tests / programmatic use). The getters
+    honor SCRAPY_* settings when a crawler is present and fall back to the
+    constructor defaults otherwise (#29).
+    """
+    crawler = getattr(self, "crawler", None)
+    if crawler is None:
+      return None
+    return getattr(crawler, "settings", None)
+
+  def _build_queue_strategy_from_settings(
+    self, connection_manager: ConnectionManager
+  ) -> Any | None:
+    """Honor ``SCRAPY_QUEUE_STRATEGY`` from crawler.settings.
+
+    Returns ``None`` (→ BackendQueue defaults to PassthroughQueueStrategy)
+    when there is no crawler, no setting, or the setting is ``passthrough``.
+    Per-strategy knobs use factory defaults; operators needing fine-tuning
+    should use the settings-driven SCHEDULER path (``from_crawler``).
+    """
+    settings = self._crawler_settings()
+    if settings is None:
+      return None
+    raw = settings.get("SCRAPY_QUEUE_STRATEGY")
+    if not raw or str(raw) == "passthrough":
+      return None
+    from scrapy_extension.queue.strategies.factory import (
+      QueueStrategyType,
+      build_queue_strategy,
+    )
+
+    return build_queue_strategy(QueueStrategyType(str(raw)), connection_manager)
+
+  def _build_membership_filter_from_settings(
+    self, connection_manager: ConnectionManager, key: str
+  ) -> Any | None:
+    """Honor ``SCRAPY_DEDUP_STRATEGY`` from crawler.settings.
+
+    Returns ``None`` (→ BackendDupeFilter defaults to SetMembershipFilter)
+    when there is no crawler, no setting, or the setting is ``set``.
+    """
+    settings = self._crawler_settings()
+    if settings is None:
+      return None
+    raw = settings.get("SCRAPY_DEDUP_STRATEGY")
+    if not raw or str(raw) == "set":
+      return None
+    from scrapy_extension.dupefilter.filters.factory import (
+      DedupeStrategy,
+      build_membership_filter,
+    )
+
+    return build_membership_filter(
+      DedupeStrategy(str(raw)), connection_manager, key=key
+    )
+
   def get_queue(self, queue_name: str | None = None) -> BackendQueue:
     """Get the backend queue for this spider.
 
@@ -310,6 +369,9 @@ class BackendSpiderMixin(Spider):
         connection_manager=self._connection_manager,
         queue_name=name,
         spider=self,
+        queue_strategy=self._build_queue_strategy_from_settings(
+          self._connection_manager
+        ),
       )
 
     return self._queue
@@ -333,9 +395,13 @@ class BackendSpiderMixin(Spider):
     if self._dupefilter is None:
       from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 
+      key = f"{self.name}:dupefilter"
       self._dupefilter = BackendDupeFilter(
         connection_manager=self._connection_manager,
-        key=f"{self.name}:dupefilter",
+        key=key,
+        membership_filter=self._build_membership_filter_from_settings(
+          self._connection_manager, key
+        ),
       )
 
     return self._dupefilter

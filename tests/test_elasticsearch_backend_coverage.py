@@ -6,7 +6,7 @@ import pytest
 from elasticsearch import NotFoundError, TransportError
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 
@@ -254,6 +254,12 @@ class TestRetrieve:
     is None: create_new()`` would silently overwrite existing data during
     any network blip / cluster red — silent data loss. Only NotFoundError
     (HTTP 404) legitimately produces None.
+
+    2026-07-11 (#30): retrieve now wraps TransportError as ``StorageError``
+    (joining Mongo/Memcached/DynamoDB). R32-A1's *propagate, don't swallow*
+    intent is preserved — StorageError propagates (with the TransportError
+    chained as ``__cause__``); only the type changed. ``except BackendError``
+    now catches ES storage failures uniformly.
     """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
@@ -270,8 +276,9 @@ class TestRetrieve:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(TransportError, match="Get failed"):
+    with pytest.raises(StorageError, match="Get failed") as ei:
       backend.retrieve("k")
+    assert isinstance(ei.value.__cause__, TransportError)
 
 
 class TestExists:

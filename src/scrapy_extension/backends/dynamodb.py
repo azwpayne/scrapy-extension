@@ -123,7 +123,12 @@ class DynamoDBBackend(Backend, StorageBackend):
       self._table = self._resource.Table(self.config.table_name)
       try:
         self._table.load()
-      except Exception:
+      except Exception as e:
+        # Only a genuine "table not found" triggers create_table — every other
+        # error (throttle, network, auth, validation) MUST propagate (#31), or
+        # a transient blip spuriously creates a conflicting table.
+        if not _is_resource_not_found(e):
+          raise
         self._table = self._resource.create_table(
           TableName=self.config.table_name,
           KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -327,10 +332,20 @@ class DynamoDBBackend(Backend, StorageBackend):
     if prefix:
       _validate_key_name(prefix, "prefix")
     try:
-      scan = self._table.scan()
-      with self._table.batch_writer() as batch:
-        for item in scan.get("Items", []):
-          batch.delete_item(Key={"pk": item["pk"]})
+      # Paginate: a single ``scan`` returns at most ~1 MB per page; without
+      # following ``LastEvaluatedKey`` a large table is silently partial-clear
+      # (#31). Loop until the scan reports no further page.
+      last_key: dict[str, Any] | None = None
+      while True:
+        scan = self._table.scan(
+          **({"ExclusiveStartKey": last_key} if last_key else {})
+        )
+        with self._table.batch_writer() as batch:
+          for item in scan.get("Items", []):
+            batch.delete_item(Key={"pk": item["pk"]})
+        last_key = scan.get("LastEvaluatedKey")
+        if not last_key:
+          break
     except Exception as e:
       msg = f"Failed to clear DynamoDB table: {e}"
       raise StorageError(msg, operation="clear_storage", key=None) from e

@@ -636,6 +636,12 @@ class PulsarBackend(Backend, QueueBackend):
     """
     if self._consumer is not None and self._subscribed_topic == topic:
       return
+    # #31: topic changed (or re-subscribe after a prior topic) — close the
+    # prior consumer first so it doesn't leak (Pulsar holds a server-side
+    # subscription + a client resource per consumer). Skipped on first call.
+    if self._consumer is not None:
+      with _suppress_pulsar_errors():
+        self._consumer.close()
     try:
       self._consumer = self._client.subscribe(
         topic,

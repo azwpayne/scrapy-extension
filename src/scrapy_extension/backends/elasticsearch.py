@@ -31,7 +31,7 @@ from scrapy_extension.backends.base import (
     _validate_key_name,
     secret_value,
 )
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
 
 if TYPE_CHECKING:
@@ -435,7 +435,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       doc["expireAt"] = (
         datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
       ).isoformat()
-    self.client.index(index=self.config.storage_index, id=key, document=doc)
+    try:
+      self.client.index(index=self.config.storage_index, id=key, document=doc)
+    except TransportError as e:
+      msg = f"Failed to store key {key!r} in ElasticSearch: {e}"
+      raise StorageError(msg, operation="store", key=key) from e
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
@@ -450,6 +454,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return None
+    except TransportError as e:
+      msg = f"Failed to retrieve key {key!r} from ElasticSearch: {e}"
+      raise StorageError(msg, operation="retrieve", key=key) from e
     return _b64decode(resp["_source"]["data"])
 
   def delete(self, key: str) -> bool:
@@ -465,7 +472,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If key contains invalid characters.
     """
     _validate_key_name(key, "key")
-    return self._delete_by_id(self.config.storage_index, key)
+    try:
+      return self._delete_by_id(self.config.storage_index, key)
+    except TransportError as e:
+      msg = f"Failed to delete key {key!r} from ElasticSearch: {e}"
+      raise StorageError(msg, operation="delete", key=key) from e
 
   def exists(self, key: str) -> bool:
     """Check if key exists.

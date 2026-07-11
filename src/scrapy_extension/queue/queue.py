@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from scrapy.utils.request import request_from_dict
 
-from scrapy_extension.backends.base import JSONSerializer, QueueBackend
+from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
@@ -333,55 +333,17 @@ class BackendQueue:
     return request
 
   def _pop_with_ack(self, timeout: float) -> tuple[bytes | None, Any | None]:
-    """Pop bytes + ack token, honoring the queue-semantics strategy.
+    """Pop bytes + ack token, delegating to the strategy's ``pop_with_ack``.
 
-    The passthrough strategy (default) delegates to the backend's
-    ``pop_with_ack`` so the ack token correlates to the specific popped
-    message (correct under ``CONCURRENT_REQUESTS > 1``). For in-process
-    reordering strategies (delay / round_robin / throttle) the strategy's
-    own ``pop`` is used and the token is ``None`` — those strategies hold
-    items in-process and break per-message backend ack correlation by
-    construction, so ack falls back to the backend's legacy last-message
-    path (acceptable: those strategies are not the concurrency-correctness
-    target of this fix).
-
-    Only backends that genuinely override ``pop_with_ack`` (Kafka,
-    RabbitMQ, RocketMQ) take the token-correlated path. Atomic-pop backends
-    (Redis, MongoDB, ElasticSearch) inherit the default
-    ``pop_with_ack → (pop(), None)``, and legacy test mocks that stub only
-    ``pop`` are detected and routed through ``pop()`` with token ``None``
-    so their existing assertions stay valid.
+    Each strategy owns whether it can thread a backend per-message ack token
+    (#28). ``PassthroughQueueStrategy`` / ``PriorityQueueStrategy`` /
+    ``WorkStealingQueueStrategy`` override ``pop_with_ack`` to call
+    ``QueueBackend.pop_with_ack`` and carry the token (correct under
+    ``CONCURRENT_REQUESTS > 1``). In-process strategies (round_robin /
+    ring_buffer) and the holding strategies inherit the ABC default
+    ``(pop(), None)`` -- correct, since they hold no broker message to ack.
     """
-    from scrapy_extension.queue.strategies.passthrough import (
-      PassthroughQueueStrategy,
-    )
-
-    if isinstance(self._strategy, PassthroughQueueStrategy):
-      backend = self.connection_manager.get_queue_backend()
-      # Only use the token-correlated path when the backend's class
-      # actually overrides pop_with_ack (Kafka/RabbitMQ/RocketMQ/SQS/Pulsar).
-      # Atomic-pop backends inherit the base default and keep the plain pop().
-      #
-      # 2026-07-11 fix: unwrap a circuit-breaker proxy before the class-level
-      # check. ``_QueueBackendProxy`` binds pop_with_ack as an INSTANCE
-      # attribute, so the proxy CLASS resolves pop_with_ack to the
-      # QueueBackend ABC default via MRO — without unwrapping, the detection
-      # would report "no override" and silently drop MQ tokens under
-      # SCRAPY_CIRCUIT_BREAKER_ENABLED. The proxy exposes the wrapped backend
-      # as ``_backend``; the CALL below still goes through the (breaker-wrapped)
-      # proxy, so ack-pop stays breaker-protected.
-      unwrapped = getattr(backend, "_backend", backend)
-      backend_cls = getattr(unwrapped, "__class__", None)
-      override = (
-        backend_cls is not None
-        and getattr(backend_cls, "pop_with_ack", None) is not None
-        and backend_cls.pop_with_ack is not QueueBackend.pop_with_ack
-      )
-      if override:
-        return backend.pop_with_ack(self.queue_name, timeout)
-      data = backend.pop(self.queue_name, timeout)
-      return (data, None)
-    return (self._strategy.pop(self.queue_name, timeout), None)
+    return self._strategy.pop_with_ack(self.queue_name, timeout)
 
   @staticmethod
   def _decode_body(request_dict: dict[str, Any]) -> None:

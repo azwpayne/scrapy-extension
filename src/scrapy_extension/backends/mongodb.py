@@ -750,7 +750,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if expire_at.tzinfo is None:
       expire_at = expire_at.replace(tzinfo=timezone.utc)
     remaining = (expire_at - datetime.now(tz=timezone.utc)).total_seconds()
-    return max(0, int(remaining))
+    # 2026-07-11 (#30): -1 for expired per the StorageBackend ttl() contract
+    # (None=no-TTL/missing, -1=expired), matching ElasticSearch. MongoDB's TTL
+    # index normally auto-deletes expired docs before this branch is reached,
+    # but a misconfigured/delayed index can surface an expired doc here.
+    return -1 if remaining <= 0 else max(0, int(remaining))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.

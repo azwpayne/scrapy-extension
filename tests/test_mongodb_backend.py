@@ -295,6 +295,29 @@ def test_mongodb_backend_storage_ttl(mocker):
   assert result is None
 
 
+def test_mongodb_backend_storage_ttl_expired_returns_negative_one(mocker):
+  """#30: an expired doc (expireAt in the past) returns -1 per the
+  StorageBackend ttl() contract (None=no-TTL/missing, -1=expired), matching
+  ElasticSearch. MongoDB's TTL index normally auto-deletes expired docs so
+  this branch is rarely hit in production, but contract conformance matters
+  for callers + for a misconfigured/delayed TTL index.
+
+  Pre-fix: ``return max(0, int(remaining))`` returned 0 for expired,
+  contradicting both the docstring ("-1 if expired") and the ABC contract.
+  """
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._storage_collection = mock_collection
+
+  past_time = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
+  mock_collection.find_one.return_value = {"key": "k", "expireAt": past_time}
+
+  assert backend.ttl("k") == -1
+
+
 # -----------------------------------------------------------------------------
 # Additional tests for coverage gaps
 # -----------------------------------------------------------------------------

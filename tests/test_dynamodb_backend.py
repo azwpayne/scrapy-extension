@@ -82,7 +82,7 @@ class TestDynamoDBConnect:
     resource = mocker.MagicMock()
     new_table = mocker.MagicMock()
     existing = mocker.MagicMock()
-    existing.load.side_effect = RuntimeError("not found")  # triggers create
+    existing.load.side_effect = _make_client_error("ResourceNotFoundException")  # triggers create
     resource.Table.return_value = existing
     resource.create_table.return_value = new_table
     mocker.patch.object(boto3, "resource", return_value=resource)
@@ -282,7 +282,7 @@ def test_dynamodb_credentials_redacted_in_resource_kwargs(mocker):
   class _FakeResource:
     def Table(self, name: str) -> object:
       table = mocker.MagicMock()
-      table.load.side_effect = RuntimeError("no table")
+      table.load.side_effect = _make_client_error("ResourceNotFoundException")
       return table
 
     def create_table(self, **kwargs: object) -> object:
@@ -343,7 +343,9 @@ class TestDynamoDBHalfCredentialGuard:
       aws_secret_access_key="top-secret",
     )
     fake_resource = mocker.MagicMock()
-    fake_resource.Table.return_value.load.side_effect = RuntimeError("no table")
+    fake_resource.Table.return_value.load.side_effect = _make_client_error(
+      "ResourceNotFoundException"
+    )
     mocker.patch.object(boto3, "resource", return_value=fake_resource)
     backend.connect()  # must not raise
     boto3.resource.assert_called_once()
@@ -352,7 +354,9 @@ class TestDynamoDBHalfCredentialGuard:
     """Neither set → no ConfigurationError; boto3 default credential chain."""
     backend = _make_backend()  # defaults: both None
     fake_resource = mocker.MagicMock()
-    fake_resource.Table.return_value.load.side_effect = RuntimeError("no table")
+    fake_resource.Table.return_value.load.side_effect = _make_client_error(
+      "ResourceNotFoundException"
+    )
     mocker.patch.object(boto3, "resource", return_value=fake_resource)
     backend.connect()  # must not raise
     _, kwargs = boto3.resource.call_args.args, boto3.resource.call_args.kwargs

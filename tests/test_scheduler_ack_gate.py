@@ -396,15 +396,32 @@ class TestStrategyMqAckBypassWarning:
       f"delay+redis (atomic, requires_ack=False) must NOT warn; got: {msgs}"
     )
 
+  def test_no_warn_when_priority_strategy_pairs_with_kafka(self, mocker, caplog) -> None:
+    """#28: priority overrides pop_with_ack (threads the MQ token), so the
+    warning must NOT fire — only strategies that inherit the ABC default
+    (delay/round_robin/throttle/time_wheel/ring_buffer) warn."""
+    import logging
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = _strategy_settings("kafka", "priority")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+      BackendScheduler.from_settings(settings)
+    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("pop_with_ack" in m for m in msgs), (
+      f"priority+kafka must NOT warn (priority overrides pop_with_ack); got: {msgs}"
+    )
+
   @pytest.mark.parametrize(
     ("strategy", "backend"),
     [
+      # Non-threading strategies (inherit the ABC pop_with_ack default → token
+      # None under MQ). priority/work_stealing are EXCLUDED — they override
+      # pop_with_ack (#28) and so thread the token (no warning).
       ("delay", "kafka"),
       ("round_robin", "kafka"),
       ("throttle", "kafka"),
-      ("priority", "kafka"),
       ("time_wheel", "kafka"),
-      ("work_stealing", "kafka"),
       ("ring_buffer", "kafka"),
       ("delay", "sqs"),
       ("delay", "rabbitmq"),
