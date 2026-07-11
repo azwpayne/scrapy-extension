@@ -86,6 +86,17 @@ class TestBatchedStorageStrategy:
     strat.store(backend, "k", b"v", ttl=42)
     backend.store.assert_called_once_with("k", b"v", ttl=42)
 
+  def test_close_joins_age_flusher(self, mocker) -> None:
+    # close() must join the age-flusher thread so BackendPipeline.close_spider
+    # cannot tear down the backend connection while the flusher is mid-store().
+    backend = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=100, max_buffer_age_s=0.01)
+    strat.store(backend, "k1", b"v1")  # triggers _ensure_flusher
+    flusher = strat._flusher
+    assert flusher is not None and flusher.is_alive()
+    strat.close()
+    assert not flusher.is_alive()
+
   def test_manual_flush_writes_all_buffered(self, mocker) -> None:
     backend = mocker.Mock()
     strat = BatchedStorageStrategy(threshold=100)
