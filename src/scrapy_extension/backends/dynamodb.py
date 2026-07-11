@@ -173,6 +173,19 @@ class DynamoDBBackend(Backend, StorageBackend):
     expire_at = item.get("expire_at")
     return expire_at is not None and float(expire_at) <= time.time()
 
+  def _lazy_reap_if_expired(self, item: dict[str, Any], key: str) -> bool:
+    """Lazy-reap an expired item; return True if expired (caller treats as absent).
+
+    Centralizes the TTL-expiry contract shared by ``retrieve`` and ``exists``:
+    if the item's ``expire_at`` is in the past, delete it best-effort (via
+    ``_swallow``) so the table does not accumulate dead rows, and return True.
+    """
+    if not self._is_expired(item):
+      return False
+    with _swallow():
+      self._table.delete_item(Key={"pk": key})
+    return True
+
   # StorageBackend implementation
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
     """Store ``data`` under ``key`` with optional TTL.
@@ -229,9 +242,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     item = resp.get("Item")
     if not item:
       return None
-    if self._is_expired(item):
-      with _swallow():
-        self._table.delete_item(Key={"pk": key})
+    if self._lazy_reap_if_expired(item, key):
       return None
     value = item.get("value")
     return bytes(value) if isinstance(value, (bytes, bytearray)) else None
@@ -288,7 +299,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     item = resp.get("Item")
     if not item:
       return False
-    return not self._is_expired(item)
+    return not self._lazy_reap_if_expired(item, key)
 
   def ttl(self, key: str) -> int | None:
     """Return remaining TTL seconds if the item has expire_at, else None.

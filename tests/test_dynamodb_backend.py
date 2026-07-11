@@ -153,6 +153,16 @@ class TestDynamoDBStorageOps:
     table.get_item.return_value = {"Item": {"pk": "k", "expire_at": 1.0}}
     assert b.exists("k") is False
 
+  def test_exists_lazy_deletes_expired_item(self, mocker) -> None:
+    # Symmetry with retrieve(): exists() must lazy-reap expired rows, not
+    # just return False while leaving the dead row in the table to accumulate.
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}  # epoch in 1970
+    }
+    assert b.exists("k") is False
+    table.delete_item.assert_called_once_with(Key={"pk": "k"})
+
   def test_ttl_returns_remaining(self, mocker) -> None:
     b, table = _connected(mocker)
     future = 9999999999.0  # year 2286
