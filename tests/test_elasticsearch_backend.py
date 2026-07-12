@@ -324,6 +324,17 @@ class TestStorage:
     b._client.get.side_effect = _make_not_found_error()
     assert b.retrieve("k") is None
 
+  def test_retrieve_expired_returns_none_and_reaps(self, mocker):
+    """R-esttl: retrieve() must not serve stale data — an expired doc returns
+    None (consistent with DynamoDB retrieve) AND is lazy-reaped so the index
+    does not accumulate dead docs (ES has no native TTL; expiry is app-level
+    via expireAt). Pre-fix retrieve returned the expired doc's data verbatim."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
+    assert b.retrieve("k") is None
+    b._client.delete.assert_called_once_with(index="scrapy_storage", id="k")
+
   def test_delete(self, mocker):
     b = _mock_backend(mocker)
     assert b.delete("k") is True
@@ -336,8 +347,22 @@ class TestStorage:
 
   def test_exists(self, mocker):
     b = _mock_backend(mocker)
-    b._client.exists.return_value = True
+    b._client.get.return_value = {"_source": {"data": "ZGF0YQ=="}}
     assert b.exists("k") is True
+
+  def test_exists_not_found(self, mocker):
+    b = _mock_backend(mocker)
+    b._client.get.side_effect = _make_not_found_error()
+    assert b.exists("k") is False
+
+  def test_exists_expired_returns_false_and_reaps(self, mocker):
+    """R-esttl: exists() respects TTL — an expired doc returns False (matches
+    DynamoDB exists contract: 'present AND not expired') AND is reaped."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
+    assert b.exists("k") is False
+    b._client.delete.assert_called_once_with(index="scrapy_storage", id="k")
 
   def test_ttl_no_expire(self, mocker):
     b = _mock_backend(mocker)
@@ -349,6 +374,15 @@ class TestStorage:
     future = (datetime.now(tz=timezone.utc) + timedelta(seconds=3600)).isoformat()
     b._client.get.return_value = {"_source": {"expireAt": future}}
     assert 3500 < b.ttl("k") <= 3600
+
+  def test_ttl_expired_returns_negative_and_reaps(self, mocker):
+    """R-esttl: ttl() reaps expired docs (storage hygiene) while preserving
+    the R48 contract (-1 = expired, distinct from None = absent)."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {"_source": {"expireAt": past}}
+    assert b.ttl("k") == -1
+    b._client.delete.assert_called_once_with(index="scrapy_storage", id="k")
 
   def test_ttl_not_found(self, mocker):
     """R48: a missing key returns None, not -1 (distinguish absent from expired).

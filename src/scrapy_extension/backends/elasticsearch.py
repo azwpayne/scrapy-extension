@@ -451,14 +451,54 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to store key {key!r} in ElasticSearch: {e}"
       raise StorageError(msg, operation="store", key=key) from e
 
+  def _is_storage_expired(self, source: dict[str, Any]) -> bool:
+    """R-esttl: is this storage doc's ``expireAt`` in the past?
+
+    ES has no native TTL — expiry is app-level via the ``expireAt`` field, so
+    the read paths (retrieve/exists/ttl) must enforce it (and lazy-reap)
+    themselves. Mirrors DynamoDB's contract so StorageBackend TTL semantics
+    are uniform across backends.
+    """
+    expire_str = source.get("expireAt")
+    if not expire_str:
+      return False
+    try:
+      expire_dt = datetime.fromisoformat(str(expire_str))
+    except (ValueError, TypeError):
+      return False
+    now = datetime.now(tz=expire_dt.tzinfo or timezone.utc)
+    return expire_dt <= now
+
+  def _lazy_reap_if_expired(self, source: dict[str, Any], key: str) -> bool:
+    """R-esttl: lazy-reap an expired storage doc; return True if expired.
+
+    Best-effort delete so the index does not accumulate dead docs (ES has no
+    native TTL reaper; only ``clear_storage`` wipes wholesale). Mirrors
+    DynamoDB's reap contract.
+    """
+    if not self._is_storage_expired(source):
+      return False
+    try:
+      self.client.delete(index=self.config.storage_index, id=key)
+    except NotFoundError:
+      pass
+    except TransportError as e:
+      logger.warning("Failed to reap expired ES storage key %r: %s", key, e)
+    return True
+
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
+
+    Returns None if the key is absent OR expired (R-esttl: expired docs are
+    lazy-reaped and treated as absent — matching DynamoDB retrieve. ES has no
+    native TTL so expiry is enforced on read). Pre-fix this returned expired
+    data verbatim (stale reads).
 
     Args:
         key: Storage key.
 
     Returns:
-        Stored data, or None if not found.
+        Stored data, or None if not found / expired.
     """
     try:
       resp = self.client.get(index=self.config.storage_index, id=key)
@@ -467,7 +507,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except TransportError as e:
       msg = f"Failed to retrieve key {key!r} from ElasticSearch: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
-    return _b64decode(resp["_source"]["data"])
+    source = resp.get("_source", {})
+    if self._lazy_reap_if_expired(source, key):
+      return None
+    return _b64decode(source["data"])
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -489,20 +532,35 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise StorageError(msg, operation="delete", key=key) from e
 
   def exists(self, key: str) -> bool:
-    """Check if key exists.
+    """Check if a key exists and is not expired.
+
+    R-esttl: uses ``get`` (not the cheap ``exists`` HEAD) so an expired doc can
+    be lazy-reaped and reported as absent — matches the DynamoDB ``exists``
+    contract ("present AND not expired"). Pre-fix this returned True for
+    expired docs (the cheap exists-check ignored ``expireAt``).
 
     Args:
         key: Storage key.
 
     Returns:
-        True if key exists.
+        True if the key exists and is current (not expired).
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: On a transport failure (was previously a raw
+            ``TransportError`` with no typed wrapper).
     """
     _validate_key_name(key, "key")
-    response = self.client.exists(index=self.config.storage_index, id=key)
-    return bool(response)
+    try:
+      resp = self.client.get(index=self.config.storage_index, id=key)
+    except NotFoundError:
+      return False
+    except TransportError as e:
+      msg = f"Failed to check existence of key {key!r} in ElasticSearch: {e}"
+      raise StorageError(msg, operation="exists", key=key) from e
+    if self._lazy_reap_if_expired(resp.get("_source", {}), key):
+      return False
+    return True
 
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
@@ -522,7 +580,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return None
-    expire_str = resp["_source"].get("expireAt")
+    source = resp.get("_source", {})
+    # R-esttl: lazy-reap expired docs (storage hygiene) — keeps the R48
+    # contract (-1 = expired, distinct from None = absent). The reap deletes
+    # the dead doc so the index does not accumulate it.
+    self._lazy_reap_if_expired(source, key)
+    expire_str = source.get("expireAt")
     if not expire_str:
       return None
     remaining = (
