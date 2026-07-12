@@ -23,6 +23,38 @@ class TestThrottleQueueStrategy:
     assert strat.pop("q") == b"a"
     assert strat.pop("q") == b"b"
 
+  def test_pop_with_ack_threads_mq_token(self, mock_connection_manager, mocker) -> None:
+    # throttle.pop_with_ack must delegate to _pop_backend_with_ack (which
+    # threads the MQ per-message ack token) -- pre-fix the inherited base
+    # default dropped it and silently fell back to atomic pop() (at-most-once
+    # for MQ backends).
+    now = [100.0]
+    strat = ThrottleQueueStrategy(
+      mock_connection_manager, min_interval=5.0, clock=_clock(now)
+    )
+    deleg = mocker.patch.object(
+      strat, "_pop_backend_with_ack", return_value=(b"item", "ack-token-123")
+    )
+    data, token = strat.pop_with_ack("q")
+    assert (data, token) == (b"item", "ack-token-123")
+    deleg.assert_called_once_with("q", 0.0)
+
+  def test_pop_with_ack_throttled_returns_none_none(
+    self, mock_connection_manager, mocker
+  ) -> None:
+    now = [100.0]
+    strat = ThrottleQueueStrategy(
+      mock_connection_manager, min_interval=5.0, clock=_clock(now)
+    )
+    deleg = mocker.patch.object(
+      strat, "_pop_backend_with_ack", return_value=(b"first", "t1")
+    )
+    assert strat.pop_with_ack("q") == (b"first", "t1")
+    now[0] = 103.0  # within min_interval
+    # Throttled pop must NOT touch the backend (no delegation).
+    assert strat.pop_with_ack("q") == (None, None)
+    deleg.assert_called_once_with("q", 0.0)
+
   def test_throttled_within_interval(self, mock_connection_manager) -> None:
     now = [100.0]
     strat = ThrottleQueueStrategy(

@@ -91,6 +91,41 @@ class QueueStrategy(ABC):
     """
     return (self.pop(queue_name, timeout), None)
 
+  def _pop_backend_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop from the backend, threading the per-message ack token when it provides one.
+
+    Shared by backend-delegating strategies (passthrough / delay / throttle).
+    MQ backends that override ``QueueBackend.pop_with_ack`` take the
+    token-correlated path; atomic-pop backends keep the plain ``pop()`` path
+    (byte-identical roundtrip for them). The breaker proxy is unwrapped
+    before the class-level check (the proxy binds ``pop_with_ack`` as an
+    instance attribute, so the proxy class resolves it to the ABC default
+    via MRO).
+
+    Args:
+        queue_name: The queue name.
+        timeout: Seconds to block (0 = non-blocking).
+
+    Returns:
+        ``(item, token)`` -- ``token`` is ``None`` for atomic-pop backends.
+    """
+    from scrapy_extension.backends.base import QueueBackend
+
+    backend = self._connection_manager.get_queue_backend()
+    unwrapped = getattr(backend, "_backend", backend)
+    backend_cls = getattr(unwrapped, "__class__", None)
+    override = (
+      backend_cls is not None
+      and getattr(backend_cls, "pop_with_ack", None) is not None
+      and backend_cls.pop_with_ack is not QueueBackend.pop_with_ack
+    )
+    if override:
+      return backend.pop_with_ack(queue_name, timeout)
+    data = backend.pop(queue_name, timeout)
+    return (data, None)
+
   @abstractmethod
   def queue_len(self, queue_name: str) -> int:
     """Return the number of pending (and held) items.
