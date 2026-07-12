@@ -659,3 +659,45 @@ def test_elasticsearch_basic_auth_password_redacted_in_kwargs_repr():
   assert str(password) == "top-secret-es-pwd"
   assert "top-secret-es-pwd" not in repr(kwargs)
   assert isinstance(password, _RedactedStr)
+
+
+# ---------------------------------------------------------------------------
+# R-es-validate: _validate_key_name parity with Redis/MongoDB — every public
+# name-taking method rejects invalid names (defense-in-depth vs query/prefix
+# injection via a special-char or non-string name). Validation fires before
+# self.client is accessed, so these need no connection.
+# ---------------------------------------------------------------------------
+
+
+def test_es_invalid_queue_name_rejected_before_backend_call():
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  with pytest.raises(ValueError, match="queue_name"):
+    backend.clear_queue("bad queue name!")  # space + ! outside KEY_NAME_PATTERN
+
+
+def test_es_invalid_set_name_rejected_before_backend_call():
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  with pytest.raises(ValueError, match="set_name"):
+    backend.remove("bad/set", b"x")  # slash outside KEY_NAME_PATTERN
+
+
+def test_es_invalid_storage_key_rejected_before_backend_call():
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  with pytest.raises(ValueError, match="key"):
+    backend.retrieve("bad key")  # space outside KEY_NAME_PATTERN
+
+
+def test_es_clear_storage_invalid_prefix_rejected():
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  with pytest.raises(ValueError, match="prefix"):
+    backend.clear_storage("bad prefix!")  # space + ! outside KEY_NAME_PATTERN
+
+
+def test_es_valid_names_pass_validation(mocker):
+  """Guard: pattern-valid names (the default queue/storage naming) keep working."""
+  b = _mock_backend(mocker)
+  b._client.exists.return_value = False
+  b._client.get.return_value = {"_source": {}}
+  # None should raise ValueError.
+  b.contains("dedup:spider.name", b"x")
+  b.ttl("items:a-b_c.1")

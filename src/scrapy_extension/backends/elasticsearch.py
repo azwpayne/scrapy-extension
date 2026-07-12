@@ -314,7 +314,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Args:
         queue_name: Name of the queue.
+
+    Raises:
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     self._delete_by_term(self.config.queue_index, "queue_name", queue_name)
 
   # ---- Set ----
@@ -389,7 +393,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if removed, False if didn't exist.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     return self._delete_by_id(self.config.set_index, self._set_doc_id(set_name, item))
 
   def contains(self, set_name: str, item: bytes) -> bool:
@@ -401,7 +409,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if item exists in the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     response = self.client.exists(
       index=self.config.set_index, id=self._set_doc_id(set_name, item)
     )
@@ -415,7 +427,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Number of items in the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     return self._count(self.config.set_index, "set_name", set_name)
 
   def clear_set(self, set_name: str) -> None:
@@ -423,7 +439,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Args:
         set_name: Name of the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     self._delete_by_term(self.config.set_index, "set_name", set_name)
 
   # ---- Storage ----
@@ -499,7 +519,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Stored data, or None if not found / expired.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
@@ -575,7 +599,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         A missing key returns None (not -1) so callers can distinguish
         "doesn't exist" from "expired" — matching the R5 contract fix on
         Redis and MongoDB. Pre-R48 this conflated the two via -1.
+
+    Raises:
+        ValueError: If key contains invalid characters.
     """
+    _validate_key_name(key, "key")
     try:
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
@@ -599,7 +627,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         prefix: If provided, only clear keys starting with this prefix.
                If None, clear all storage data.
+
+    Raises:
+        ValueError: If a provided prefix contains invalid characters.
     """
+    if prefix is not None:
+      _validate_key_name(prefix, "prefix")
     query = {"prefix": {"key": prefix}} if prefix else {"match_all": {}}
     self._delete_by_query(self.config.storage_index, query)
 
