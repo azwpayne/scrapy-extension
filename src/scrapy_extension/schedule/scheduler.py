@@ -598,6 +598,13 @@ class BackendScheduler:
     try:
       self._queue.ack(token=token)
     except QueueError:
+      # At-least-once is preserved — the message stays unacked and redelivers
+      # via the MQ visibility-timeout. The swallow is intentional (don't crash
+      # the engine on a transient broker blip); bump a stat so an ack-failure
+      # storm is operator-visible (mirrors scheduler/queue_error /
+      # scheduler/dupefilter_error). R-ack-obs.
+      if self.stats:
+        self.stats.inc_value("scheduler/ack_error")
       logger.exception("Failed to ack message after response_received")
 
   def _on_spider_error(
@@ -621,6 +628,12 @@ class BackendScheduler:
     try:
       self._queue.nack(token=token)
     except QueueError:
+      # A failed nack converges to the same outcome as a successful one on most
+      # MQ backends (message stays unacked → visibility-timeout redelivery), so
+      # the swallow is intentional. Bump a stat for observability parity with
+      # the ack path (R-ack-obs).
+      if self.stats:
+        self.stats.inc_value("scheduler/nack_error")
       logger.exception("Failed to nack message after spider_error")
 
   def close(self, reason: str) -> Deferred[None] | None:
