@@ -354,6 +354,14 @@ class DynamoDBBackend(Backend, StorageBackend):
     item = resp.get("Item")
     if not item or "expire_at" not in item:
       return None
+    # R-dynttl: symmetry with retrieve()/exists() — lazy-reap expired rows so
+    # the table does not accumulate dead rows, and return None (expired =
+    # absent, matching retrieve's None / exists's False). Pre-fix this
+    # returned 0 for an expired key without reaping, conflating "about to
+    # expire" with "expired long ago" and leaving the dead row to linger until
+    # a retrieve/exists/clear_storage touched it.
+    if self._lazy_reap_if_expired(item, key):
+      return None
     return max(0, int(float(item["expire_at"]) - time.time()))
 
   def clear_storage(self, prefix: str | None = None) -> None:

@@ -207,6 +207,20 @@ class TestDynamoDBStorageOps:
     table.get_item.return_value = {"Item": {"pk": "k", "value": b"x"}}
     assert b.ttl("k") is None
 
+  def test_ttl_lazy_deletes_expired_item_and_returns_none(self, mocker) -> None:
+    # R-dynttl: symmetry with retrieve()/exists() — ttl() must lazy-reap
+    # expired rows AND return None (consistent "expired = absent"), not return
+    # 0 while leaving the dead row to accumulate. Pre-fix: ttl() returned 0
+    # for an expired key AND did not reap, so an operator couldn't tell a
+    # genuinely-about-to-expire key (0) from one that expired long ago, and
+    # the dead row lingered until a retrieve/exists/clear_storage touched it.
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}  # epoch in 1970
+    }
+    assert b.ttl("k") is None
+    table.delete_item.assert_called_once_with(Key={"pk": "k"})
+
   def test_clear_storage_scans_and_deletes(self, mocker) -> None:
     b, table = _connected(mocker)
     table.scan.return_value = {"Items": [{"pk": "a"}, {"pk": "b"}]}
