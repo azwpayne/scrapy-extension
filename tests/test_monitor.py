@@ -879,7 +879,10 @@ class TestScrapyStatsMonitorResilience:
       ("on_delay_depth", {"depth": 3}),
     ],
   )
-  def test_hook_swallows_stats_failure(self, hook, kwargs) -> None:
+  def test_hook_swallows_stats_failure(self, hook, kwargs, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="scrapy_extension.monitor.stats")
     stats = MagicMock()
     stats.inc_value.side_effect = RuntimeError("stats backend down")
     stats.set_value.side_effect = RuntimeError("stats backend down")
@@ -887,3 +890,13 @@ class TestScrapyStatsMonitorResilience:
     # Must NOT raise — the @_stats_safe wrapper swallows + logs at debug.
     result = getattr(monitor, hook)(**kwargs)
     assert result is None  # hooks return None on the swallowed path
+    # Lock in the debug-log contract (review feedback): the failure is
+    # surfaced for diagnosis, not silently dropped.
+    debug_msgs = [
+      r.getMessage()
+      for r in caplog.records
+      if r.levelno == logging.DEBUG and r.name == "scrapy_extension.monitor.stats"
+    ]
+    assert any(hook in m and "ignored" in m for m in debug_msgs), (
+      f"expected debug log for {hook} failure; got: {debug_msgs}"
+    )

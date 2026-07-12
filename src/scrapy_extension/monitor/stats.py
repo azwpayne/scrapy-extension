@@ -35,6 +35,18 @@ def _stats_safe(hook):
   bug, a stats-backend outage), swallow the exception and log at ``debug`` so
   the spider keeps running and the operator can still diagnose via the log.
   Applied to every ``on_*`` hook (R5).
+
+  The broad ``except Exception`` is deliberate (review feedback, R5): the
+  decorated hook bodies are trivial -- the only callable that can raise is
+  ``self._stats.inc_value`` / ``set_value`` (the rest is a string key), so a
+  caught exception is in practice a StatsCollector failure, not a hidden
+  programmer error. The wrapper also preserves the wrapped hook's return
+  value on the success path (returns ``None`` only in the except branch), so
+  future hooks that return meaningful values are not silently dropped.
+
+  Directive: keep decorated hook bodies trivial (one stats call). If a hook
+  grows non-trivial logic, move ONLY the ``self._stats.*`` call under the
+  safe path -- don't let a buggy hook body hide behind this decorator.
   """
 
   @functools.wraps(hook)
