@@ -318,6 +318,25 @@ class TestRedisBackend:
     result = backend.pop("test_queue")
     assert result is None
 
+  def test_queue_pop_corrupt_payload_raises_queue_error(
+    self, redis_settings, mock_redis, mocker
+  ):
+    """Coverage: status==1 (success signal) but the payload is neither str nor
+    bytes (a corrupt Lua return — should never happen, but defensive) must raise
+    QueueError, NOT silently return a wrong-type value. Locks the corrupt-data
+    guard at redis.py:532-536.
+    """
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
+
+    mock_script = mocker.MagicMock()
+    mock_script.return_value = [1, 12345]  # int — neither str nor bytes
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    with pytest.raises(QueueError, match="Corrupt payload"):
+      backend.pop("test_queue")
+
   def test_queue_pop_lost_payload_race_returns_none(
     self, redis_settings, mock_redis, mocker
   ):

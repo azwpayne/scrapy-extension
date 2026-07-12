@@ -777,6 +777,45 @@ def test_mongodb_backend_clear_storage_without_prefix(mocker):
   assert filter_doc == {}
 
 
+def test_mongodb_clear_storage_prefix_wraps_pymongo_error(mocker):
+  """Coverage: clear_storage(prefix=...) wraps a PyMongoError as StorageError
+  (the #30 StorageError-family contract). Locks mongodb.py:818-820."""
+  from pymongo.errors import PyMongoError
+
+  from scrapy_extension.exceptions.base import StorageError
+
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._storage_collection = mock_collection
+  mock_collection.delete_many.side_effect = PyMongoError("delete failed")
+
+  with pytest.raises(StorageError, match="clear MongoDB storage") as ei:
+    backend.clear_storage(prefix="test_")
+  assert isinstance(ei.value.__cause__, PyMongoError)
+
+
+def test_mongodb_ttl_handles_naive_datetime(mocker):
+  """Coverage: PyMongo returns naive UTC datetimes by default (tz_aware=False);
+  ttl() must normalize to aware before subtraction or raise TypeError. Locks
+  mongodb.py:788-789 (the naive→aware replace branch)."""
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._storage_collection = mock_collection
+  # Naive future datetime (what PyMongo returns by default).
+  naive_future = datetime.now() + timedelta(seconds=3600)
+  mock_collection.find_one.return_value = {"expireAt": naive_future}
+
+  result = backend.ttl("k")
+  # Must not raise TypeError (naive - aware); returns a positive remaining.
+  assert result is not None and result > 0
+
+
 def test_mongodb_backend_disconnect_clears_all_collections(mocker):
   """Test disconnect clears all collection references."""
   config = MongoDBSettings()
