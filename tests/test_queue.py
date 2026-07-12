@@ -72,6 +72,44 @@ class TestBackendQueueRequestToDict:
     assert result["dont_filter"] is False
     assert result["flags"] == []
 
+  def test_request_to_dict_strips_non_serializable_ack_token(
+    self, mock_connection_manager, mock_spider
+  ):
+    """R-ack-serialize: the backend ack token is an opaque, non-JSON-serializable
+    object (RocketMQ apache ``Message``; Pulsar ``MessageId``). Scrapy's retry
+    middleware copies a failed request's meta (token included) and re-enqueues
+    it via ``push`` → ``_request_to_dict``. If the token reaches the JSON
+    serializer, serialization crashes (``SerializationError``) and the retry is
+    DROPPED — broken retry on RocketMQ/Pulsar. The fix strips
+    ``_backend_ack_token`` at the serialization boundary (non-mutating — the
+    in-memory request keeps the token so the scheduler can still ack on
+    ``response_received`` / ``spider_error`` after the download).
+    """
+    import json
+
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+    # Opaque non-serializable ack token (stands in for apache Message / Pulsar MessageId).
+    request = Request(
+      url="https://example.com",
+      meta={"_backend_ack_token": object(), "keep": 1},
+    )
+    result = queue._request_to_dict(request)
+
+    # The ack token must NOT survive into the serialized meta.
+    assert "_backend_ack_token" not in result["meta"], (
+      "ack token must be stripped at the serialization boundary"
+    )
+    # Other meta keys must survive.
+    assert result["meta"]["keep"] == 1
+    # The resulting dict MUST be JSON-serializable (the actual retry crash).
+    json.dumps(result)  # must not raise
+    # The in-memory request still carries the token (scheduler acks post-download).
+    assert "_backend_ack_token" in request.meta
+
   def test_request_to_dict_with_body_utf8(self, mock_connection_manager, mock_spider):
     """Test UTF-8 body is base64-encoded for safe JSON round-trip."""
     import base64
