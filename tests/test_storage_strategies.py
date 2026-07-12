@@ -169,10 +169,13 @@ class TestBatchedStoragePartialFailure:
   remain buffered for the next flush, and the error must surface to the caller.
   """
 
-  def test_partial_failure_keeps_tail_buffered_and_reraises(self, mocker) -> None:
-    """Store raises on item 2 of 3 → item 3 stays in _buffer AND the
-    exception propagates. Pre-fix: _buffer is cleared up-front, so item 3 is
-    silently lost and no exception surfaces (RED).
+  def test_partial_failure_keeps_tail_buffered_no_raise(self, mocker) -> None:
+    """R-pipe-1 (option A): a mid-batch store failure must not silently drop
+    the un-written tail (C4 at-least-once) AND must not propagate to the
+    caller — the item is safely buffered. Pre-R-pipe-1: ``store()`` re-raised
+    (C4 "surface the error"), which stormed the pipeline's ``max_storage_errors``
+    breaker per item during sustained outages. Post-R-pipe-1: ``store()``
+    swallows the threshold-flush exception; the un-written tail stays buffered.
     """
     backend = mocker.Mock()
     call_state = {"n": 0}
@@ -187,15 +190,18 @@ class TestBatchedStoragePartialFailure:
     strat = BatchedStorageStrategy(threshold=3)
     strat.store(backend, "k1", b"v1")
     strat.store(backend, "k2", b"v2")
-    # 3rd store hits threshold → triggers _flush_to → item-2 store raises.
-    with pytest.raises(RuntimeError, match="backend down on item 2"):
-      strat.store(backend, "k3", b"v3")
+    # 3rd store hits threshold → triggers _flush_to → item-2 store raises
+    # INSIDE _flush_to, which re-enqueues the tail; store() swallows it.
+    strat.store(backend, "k3", b"v3")  # MUST NOT raise (R-pipe-1 option A)
 
-    # Item 3 was never written (item 2 raised before reaching it). At-least-once
-    # requires it remain buffered for the next flush — NOT silently dropped.
+    # Items 2 (raised mid-flush) + 3 (never attempted) stay buffered for retry
+    # — NOT silently dropped (C4 at-least-once preserved).
     buffered_keys = [k for k, _v, _t in strat._buffer]
+    assert "k2" in buffered_keys, (
+      f"regression: item k2 lost on partial flush; buffer={buffered_keys}"
+    )
     assert "k3" in buffered_keys, (
-      f"C4 regression: item k3 silently lost on partial flush; buffer={buffered_keys}"
+      f"regression: item k3 lost on partial flush; buffer={buffered_keys}"
     )
     # Item 1 was written; item 2 raised; backend.store called exactly twice.
     assert backend.store.call_count == 2
@@ -231,8 +237,9 @@ class TestBatchedStoragePartialFailure:
     strat = BatchedStorageStrategy(threshold=3)
     strat.store(backend, "k1", b"v1")
     strat.store(backend, "k2", b"v2")
-    with pytest.raises(RuntimeError):
-      strat.store(backend, "k3", b"v3")
+    # 3rd store hits threshold → flush fails mid-batch → tail re-enqueued.
+    # R-pipe-1 option A: store() MUST NOT raise (item safely buffered).
+    strat.store(backend, "k3", b"v3")
 
     # k3 buffered. Recover: a manual flush drains it.
     strat.flush()
@@ -240,6 +247,43 @@ class TestBatchedStoragePartialFailure:
     written_keys = [c.args[0] for c in backend.store.call_args_list]
     assert "k3" in written_keys
     assert strat.pending == 0
+
+  def test_threshold_flush_failure_does_not_storm_caller(self, mocker) -> None:
+    """R-pipe-1 (option A): a threshold-flush failure must NOT propagate from
+    ``store()``. The item is safely buffered (at-least-once; ``_flush_to``
+    re-enqueued the tail and already logged the partial), so the caller must
+    see ``store()`` succeed. Pre-fix: ``store()`` re-raised, so once the
+    buffer saturated at threshold+ during a sustained outage, EVERY incoming
+    item raised → ``BackendPipeline.process_item``'s ``max_storage_errors``
+    counter stormed per item → ``BackendError`` killed the spider → buffered
+    tail LOST (crash-before-flush) = data loss. The at-least-once buffer was
+    defeated by the breaker meant to surface outages. Post-fix: ``store()``
+    swallows the threshold-flush exception; escalation moves to the
+    ``on_buffer_depth`` monitor hook.
+    """
+    backend = mocker.Mock()
+    backend.store.side_effect = RuntimeError("backend down")
+    strat = BatchedStorageStrategy(threshold=2)
+    # Saturate: each store past the 2nd triggers a failing threshold-flush.
+    # NONE may raise — the items are all safely buffered for retry.
+    for i in range(10):
+      strat.store(backend, f"k{i}", b"v")
+    # All 10 items preserved in the buffer (at-least-once held); no storm.
+    assert strat.pending == 10
+
+  def test_explicit_flush_still_propagates_failure(self, mocker) -> None:
+    """R-pipe-1 (option A): ``store()`` swallows threshold-flush failures (item
+    buffered), BUT explicit :meth:`flush` still propagates — a caller explicitly
+    draining must know the final flush failed (the items are buffered but the
+    caller is tearing down). Preserves the C4 'surface the error' intent for
+    the explicit-drain path while removing the per-item storm on the store path.
+    """
+    backend = mocker.Mock()
+    backend.store.side_effect = RuntimeError("backend down")
+    strat = BatchedStorageStrategy(threshold=100)
+    strat.store(backend, "k1", b"v1")  # buffered; depth 1 < threshold; no raise
+    with pytest.raises(RuntimeError, match="backend down"):
+      strat.flush()  # explicit drain → MUST still propagate
 
 
 class TestStorageStrategyFactory:
