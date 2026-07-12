@@ -360,3 +360,71 @@ class TestEnqueueBranchClosure:
     result = scheduler.enqueue_request(Request("https://example.com/a"))
 
     assert result is False
+
+
+class TestAckNackFailureObservability:
+  """R-ack-obs (ultracode workflow v2): the deferred-ack signal handlers
+  ``_on_response_received`` / ``_on_spider_error`` swallow ack/nack
+  ``QueueError`` with ``logger.exception`` only and bump NO stat counter.
+  At-least-once is PRESERVED (the message stays unacked → visibility-timeout
+  redelivery on MQ backends), so the swallow is correct — but operators
+  cannot detect ack/nack failure storms via Scrapy stats. Mirror the
+  ``scheduler/dupefilter_error`` / ``scheduler/queue_error`` pattern: bump
+  ``scheduler/ack_error`` / ``scheduler/nack_error`` so the storm is visible.
+  """
+
+  def test_ack_failure_increments_stat(self) -> None:
+    """A QueueError from BackendQueue.ack → logger.exception + scheduler/ack_error."""
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=MagicMock(),
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.ack.side_effect = QueueError("broker down")
+    scheduler._queue = queue
+
+    request = Request("https://example.com/x", meta={"_backend_ack_token": "tok"})
+    scheduler._on_response_received(
+      response=MagicMock(), request=request, spider=_FakeSpider(),
+    )  # MUST NOT raise (at-least-once preserved via redelivery)
+
+    queue.ack.assert_called_once_with(token="tok")
+    assert counts.get("scheduler/ack_error") == 1
+
+  def test_nack_failure_increments_stat(self) -> None:
+    """A QueueError from BackendQueue.nack → logger.exception + scheduler/nack_error."""
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=MagicMock(),
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.nack.side_effect = QueueError("broker down")
+    scheduler._queue = queue
+
+    failed_request = Request("https://example.com/x", meta={"_backend_ack_token": "tok"})
+    response = MagicMock()
+    response.request = failed_request
+    scheduler._on_spider_error(
+      failure=MagicMock(), response=response, spider=_FakeSpider(),
+    )  # MUST NOT raise
+
+    queue.nack.assert_called_once_with(token="tok")
+    assert counts.get("scheduler/nack_error") == 1
+
+  def test_ack_success_does_not_increment_error_stat(self) -> None:
+    """Guard: a successful ack bumps no error counter (no false-positive signal)."""
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=manager, stats=stats, dupefilter=MagicMock(),
+    )
+    queue = MagicMock(name="BackendQueue")  # ack succeeds (no side_effect)
+    scheduler._queue = queue
+
+    request = Request("https://example.com/x", meta={"_backend_ack_token": "tok"})
+    scheduler._on_response_received(response=MagicMock(), request=request, spider=_FakeSpider())
+
+    queue.ack.assert_called_once_with(token="tok")
+    assert counts.get("scheduler/ack_error") is None
