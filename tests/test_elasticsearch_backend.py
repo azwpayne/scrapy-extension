@@ -378,9 +378,10 @@ class TestStorage:
     DynamoDB already do) so callers' ``except BackendError`` catches ES storage
     failures uniformly instead of crashing on a raw TransportError.
 
-    R31-A1 (test_add_transport_error_propagates) is preserved -- it tests the
-    SET ``add()`` op, which stays raw-propagate by design; this wraps only the
-    storage ``store`` op.
+    R-dupe-1 (option b) now wraps the SET ``add()`` op's TransportError as
+    BackendConnectionError too (see test_add_transport_error_wrapped); this
+    test covers the storage ``store`` op, which wraps as StorageError — the two
+    ops raise different typed exceptions for their respective surfaces.
     """
     from elasticsearch import TransportError
 
