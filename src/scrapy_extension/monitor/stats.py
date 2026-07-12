@@ -11,6 +11,8 @@ from __future__ import annotations
 
 __all__ = ["ScrapyStatsMonitor"]
 
+import functools
+import logging
 from typing import TYPE_CHECKING
 
 from scrapy_extension.monitor.base import (
@@ -21,6 +23,43 @@ from scrapy_extension.monitor.base import (
 
 if TYPE_CHECKING:
   from scrapy.statscollectors import StatsCollector
+
+logger = logging.getLogger(__name__)
+
+
+def _stats_safe(hook):
+  """Decorator: a ScrapyStatsMonitor hook must never propagate stats failures.
+
+  Observability must not crash the data path. If the wrapped
+  :class:`~scrapy.statscollectors.StatsCollector` raises (a custom collector
+  bug, a stats-backend outage), swallow the exception and log at ``debug`` so
+  the spider keeps running and the operator can still diagnose via the log.
+  Applied to every ``on_*`` hook (R5).
+
+  The broad ``except Exception`` is deliberate (review feedback, R5): the
+  decorated hook bodies are trivial -- the only callable that can raise is
+  ``self._stats.inc_value`` / ``set_value`` (the rest is a string key), so a
+  caught exception is in practice a StatsCollector failure, not a hidden
+  programmer error. The wrapper also preserves the wrapped hook's return
+  value on the success path (returns ``None`` only in the except branch), so
+  future hooks that return meaningful values are not silently dropped.
+
+  Directive: keep decorated hook bodies trivial (one stats call). If a hook
+  grows non-trivial logic, move ONLY the ``self._stats.*`` call under the
+  safe path -- don't let a buggy hook body hide behind this decorator.
+  """
+
+  @functools.wraps(hook)
+  def _wrapper(self, *args, **kwargs):
+    try:
+      return hook(self, *args, **kwargs)
+    except Exception:
+      logger.debug(
+        "ScrapyStatsMonitor.%s raised; ignored", hook.__name__, exc_info=True
+      )
+      return None
+
+  return _wrapper
 
 
 class ScrapyStatsMonitor(Monitor):
@@ -40,9 +79,11 @@ class ScrapyStatsMonitor(Monitor):
   - ``pipeline/store_count`` (counter) — per successful store.
   - ``errors/<operation>`` (counter) — per operation error. Wired (R14-D) at
     the ``BackendQueue`` push-except and deserialize-fail arms.
-  - ``queue/backpressure`` (gauge) — current depth when it last exceeded
-    ``backpressure_threshold``; reset to ``0`` once depth drops back under.
-    ``None`` until the threshold has ever been crossed.
+  - ``queue/backpressure`` (gauge) — set to the sampled ``depth`` when it
+    exceeds ``backpressure_threshold``; reset to ``0`` once depth drops back
+    under. Set to an int on EVERY depth sample (``0`` under threshold) — it
+    is ``None`` only before the first sample, never "until the threshold is
+    crossed" (the gauge follows depth, not threshold-crossing history).
   - ``queue/pop_rate_1m`` (gauge) — rolling pops/sec over the trailing 60s
     window (U2 operability). Sampled on the same cadence as the pop-path
     depth probe; falling-edge to ~0 = stalled consumer.
@@ -58,6 +99,9 @@ class ScrapyStatsMonitor(Monitor):
     (R14-D connection-lifecycle). Wired from ``ConnectionManager.close``.
   - ``backend/retry_count`` (counter) — per connection retry
     (R14-D connection-lifecycle). Wired from ``ConnectionManager.connect``.
+
+  All hooks are ``@_stats_safe`` — a failing StatsCollector is swallowed +
+  logged at debug, never propagated into the data path (R5).
 
   Attributes:
       _stats: The wrapped Scrapy StatsCollector.
@@ -88,10 +132,12 @@ class ScrapyStatsMonitor(Monitor):
     self.backpressure_threshold = backpressure_threshold
     self.pop_rate_window_s = pop_rate_window_s
 
+  @_stats_safe
   def on_push(self, queue_name: str, priority: float) -> None:
     """Increment ``queue/push_count``."""
     self._stats.inc_value("queue/push_count")
 
+  @_stats_safe
   def on_pop(self, queue_name: str) -> None:
     """Increment ``queue/pop_attempt_count`` (R14-D rename — per attempt).
 
@@ -111,14 +157,17 @@ class ScrapyStatsMonitor(Monitor):
     # and the pre-rename test suite. Deprecated in favor of the renamed key.
     self._stats.inc_value("queue/pop_count")
 
+  @_stats_safe
   def on_dedup_hit(self, key: str) -> None:
     """Increment ``dupefilter/hit_count``."""
     self._stats.inc_value("dupefilter/hit_count")
 
+  @_stats_safe
   def on_dedup_miss(self, key: str) -> None:
     """Increment ``dupefilter/miss_count``."""
     self._stats.inc_value("dupefilter/miss_count")
 
+  @_stats_safe
   def on_queue_depth(self, queue_name: str, depth: int) -> None:
     """Set the ``queue/depth`` gauge and update ``queue/backpressure``.
 
@@ -138,6 +187,7 @@ class ScrapyStatsMonitor(Monitor):
     else:
       self._stats.set_value("queue/backpressure", 0)
 
+  @_stats_safe
   def on_store(self, key: str) -> None:
     """Increment ``pipeline/store_count``.
 
@@ -146,6 +196,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value("pipeline/store_count")
 
+  @_stats_safe
   def on_filter_full(self) -> None:
     """Increment ``dupefilter/filter_full``.
 
@@ -156,6 +207,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value("dupefilter/filter_full")
 
+  @_stats_safe
   def on_pop_rate(self, window_s: float, rate: float) -> None:
     """Set the ``queue/pop_rate_1m`` gauge.
 
@@ -172,6 +224,7 @@ class ScrapyStatsMonitor(Monitor):
     tag = "1m" if window_s == DEFAULT_POP_RATE_WINDOW_S else f"{window_s:g}s"
     self._stats.set_value(f"queue/pop_rate_{tag}", rate)
 
+  @_stats_safe
   def on_filter_saturation(self, used: int, capacity: int | None) -> None:
     """Set the ``dupefilter/filter_saturation`` gauge (0.0-1.0).
 
@@ -192,6 +245,7 @@ class ScrapyStatsMonitor(Monitor):
       ratio = min(1.0, max(0.0, used / capacity))
     self._stats.set_value("dupefilter/filter_saturation", ratio)
 
+  @_stats_safe
   def on_error(self, operation: str, error: BaseException) -> None:
     """Increment ``errors/<operation>``.
 
@@ -202,6 +256,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value(f"errors/{operation}")
 
+  @_stats_safe
   def on_connect(self, backend_type: str) -> None:
     """Increment ``backend/connect_count`` (R14-D connection-lifecycle).
 
@@ -210,6 +265,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value("backend/connect_count")
 
+  @_stats_safe
   def on_disconnect(self, backend_type: str, reason: str | None) -> None:
     """Increment ``backend/disconnect_count`` (R14-D connection-lifecycle).
 
@@ -219,6 +275,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value("backend/disconnect_count")
 
+  @_stats_safe
   def on_retry(self, backend_type: str, attempt: int) -> None:
     """Increment ``backend/retry_count`` (R14-D connection-lifecycle).
 
@@ -228,6 +285,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.inc_value("backend/retry_count")
 
+  @_stats_safe
   def on_buffer_depth(self, depth: int) -> None:
     """Set the ``pipeline/buffer_depth`` gauge (batched-storage operability).
 
@@ -240,6 +298,7 @@ class ScrapyStatsMonitor(Monitor):
     """
     self._stats.set_value("pipeline/buffer_depth", depth)
 
+  @_stats_safe
   def on_delay_depth(self, depth: int) -> None:
     """Set the ``queue/delay_depth`` gauge (delay-strategy operability).
 

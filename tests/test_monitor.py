@@ -852,3 +852,51 @@ class TestR14DObservability:
     assert null_monitor.on_connect("redis") is None
     assert null_monitor.on_disconnect("redis", "shutdown") is None
     assert null_monitor.on_retry("redis", 1) is None
+
+
+class TestScrapyStatsMonitorResilience:
+  """R5: every hook must swallow StatsCollector failures — observability must
+  not crash the data path. A custom/buggy collector or stats-backend outage is
+  logged at debug, never propagated into the push/pop/store hot paths."""
+
+  @pytest.mark.parametrize(
+    ("hook", "kwargs"),
+    [
+      ("on_push", {"queue_name": "q", "priority": 1.0}),
+      ("on_pop", {"queue_name": "q"}),
+      ("on_dedup_hit", {"key": "k"}),
+      ("on_dedup_miss", {"key": "k"}),
+      ("on_queue_depth", {"queue_name": "q", "depth": 5}),
+      ("on_store", {"key": "k"}),
+      ("on_filter_full", {}),
+      ("on_pop_rate", {"window_s": DEFAULT_POP_RATE_WINDOW_S, "rate": 1.0}),
+      ("on_filter_saturation", {"used": 1, "capacity": 10}),
+      ("on_error", {"operation": "push", "error": RuntimeError("x")}),
+      ("on_connect", {"backend_type": "redis"}),
+      ("on_disconnect", {"backend_type": "redis", "reason": None}),
+      ("on_retry", {"backend_type": "redis", "attempt": 1}),
+      ("on_buffer_depth", {"depth": 3}),
+      ("on_delay_depth", {"depth": 3}),
+    ],
+  )
+  def test_hook_swallows_stats_failure(self, hook, kwargs, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="scrapy_extension.monitor.stats")
+    stats = MagicMock()
+    stats.inc_value.side_effect = RuntimeError("stats backend down")
+    stats.set_value.side_effect = RuntimeError("stats backend down")
+    monitor = ScrapyStatsMonitor(stats)
+    # Must NOT raise — the @_stats_safe wrapper swallows + logs at debug.
+    result = getattr(monitor, hook)(**kwargs)
+    assert result is None  # hooks return None on the swallowed path
+    # Lock in the debug-log contract (review feedback): the failure is
+    # surfaced for diagnosis, not silently dropped.
+    debug_msgs = [
+      r.getMessage()
+      for r in caplog.records
+      if r.levelno == logging.DEBUG and r.name == "scrapy_extension.monitor.stats"
+    ]
+    assert any(hook in m and "ignored" in m for m in debug_msgs), (
+      f"expected debug log for {hook} failure; got: {debug_msgs}"
+    )
