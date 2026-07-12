@@ -256,6 +256,30 @@ class TestSignalPassthrough:
     assert b.state is BreakerState.CLOSED
     assert b.failure_count == 0
 
+  def test_signal_during_half_open_probe_does_not_wedge(self):
+    # Regression: a Ctrl-C / SystemExit arriving during a HALF_OPEN probe used
+    # to re-raise without releasing _probe_in_flight. Since the breaker sits in
+    # HALF_OPEN (not OPEN), no cool-down timer ever releases the slot — every
+    # subsequent call was rejected as OPEN permanently (until process restart).
+    clock = FakeClock()
+    b = CircuitBreaker("q", failure_threshold=1, reset_timeout=30.0, time_fn=clock)
+    with pytest.raises(RuntimeError):
+      b.call(_boom)
+    assert b.state is BreakerState.OPEN
+
+    clock.advance(30.0)  # cool-down elapses -> next call claims the probe slot
+    def raises_ki(*_args, **_kwargs):
+      raise KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+      b.call(raises_ki)
+    # Ctrl-C is not a failure -> state stays HALF_OPEN, but the probe slot
+    # MUST be released so the next call can retry.
+    assert b.state is BreakerState.HALF_OPEN
+    # Pre-fix this raised CircuitBreakerOpenError forever. With the fix the
+    # next call retries the probe and succeeds -> CLOSED.
+    assert b.call(_ok) == "ok"
+    assert b.state is BreakerState.CLOSED
+
   def test_system_exit_does_not_trip(self):
     b = CircuitBreaker("q", failure_threshold=1)
 

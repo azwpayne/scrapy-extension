@@ -90,6 +90,38 @@ class TestDynamoDBConnect:
     resource.create_table.assert_called_once()
     new_table.wait_until_exists.assert_called_once()
 
+  def test_connect_concurrent_create_table_race(self, mocker) -> None:
+    # Two workers boot concurrently; both see ResourceNotFoundException from
+    # load(); the loser's create_table raises ResourceInUseException — connect
+    # must reattach to the existing (in-creation) table instead of failing.
+    b = _make_backend()
+    resource = mocker.MagicMock()
+    loser_table = mocker.MagicMock()
+    loser_table.load.side_effect = _make_client_error("ResourceNotFoundException")
+    reattached = mocker.MagicMock()
+    resource.Table.side_effect = [loser_table, reattached]
+    resource.create_table.side_effect = _make_client_error("ResourceInUseException")
+    mocker.patch.object(boto3, "resource", return_value=resource)
+    b.connect()  # must not raise BackendConnectionError
+    resource.create_table.assert_called_once()
+    reattached.wait_until_exists.assert_called_once()
+    assert b.is_connected() is True
+
+  def test_connect_non_resource_in_use_create_error_propagates(self, mocker) -> None:
+    # Negative test (review feedback): a non-ResourceInUse create_table error
+    # (e.g. LimitExceededException) must NOT be misread as a race — it
+    # propagates as BackendConnectionError so real failures surface.
+    b = _make_backend()
+    resource = mocker.MagicMock()
+    existing = mocker.MagicMock()
+    existing.load.side_effect = _make_client_error("ResourceNotFoundException")
+    resource.Table.return_value = existing
+    resource.create_table.side_effect = _make_client_error("LimitExceededException")
+    mocker.patch.object(boto3, "resource", return_value=resource)
+    with pytest.raises(BackendConnectionError):
+      b.connect()
+    resource.create_table.assert_called_once()
+
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
     mocker.patch.object(boto3, "resource", side_effect=RuntimeError("boom"))
@@ -152,6 +184,16 @@ class TestDynamoDBStorageOps:
     b, table = _connected(mocker)
     table.get_item.return_value = {"Item": {"pk": "k", "expire_at": 1.0}}
     assert b.exists("k") is False
+
+  def test_exists_lazy_deletes_expired_item(self, mocker) -> None:
+    # Symmetry with retrieve(): exists() must lazy-reap expired rows, not
+    # just return False while leaving the dead row in the table to accumulate.
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}  # epoch in 1970
+    }
+    assert b.exists("k") is False
+    table.delete_item.assert_called_once_with(Key={"pk": "k"})
 
   def test_ttl_returns_remaining(self, mocker) -> None:
     b, table = _connected(mocker)

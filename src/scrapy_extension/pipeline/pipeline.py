@@ -12,7 +12,11 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import JSONSerializer
-from scrapy_extension.exceptions import BackendError, SerializationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  BackendError,
+  SerializationError,
+)
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
   StorageStrategy,
@@ -223,6 +227,10 @@ class BackendPipeline:
     Detects whether the configured backend supports storage. If not
     (Kafka, RabbitMQ, RocketMQ), the pipeline degrades to a no-op and
     logs a warning so the operator knows items aren't being persisted.
+    A *transient* connection blip is neither — the pipeline leaves the
+    capability unconfirmed and retries storage lazily in ``process_item``
+    (whose own try/except handles ongoing failures best-effort) rather
+    than aborting the crawl at startup.
 
     Args:
         spider: The spider instance.
@@ -237,6 +245,19 @@ class BackendPipeline:
         "Pipeline will be a no-op — items will not be persisted.",
         self.connection_manager.backend_type,
       )
+    except BackendConnectionError as exc:
+      # Transient startup blip — ``ConnectionManager.backend`` lazy-connects
+      # on first access (connectors.py), so a backend that is briefly
+      # unreachable raises here. Do NOT abort the crawl and do NOT permanently
+      # disable storage — leave _storage_supported as None so process_item
+      # retries lazily per item. Narrowed to BackendConnectionError (per review)
+      # so genuine programming/config errors still fail fast at startup.
+      logger.warning(
+        "Storage backend %s not reachable at spider open: %s. Pipeline "
+        "will retry storage lazily on each item.",
+        self.connection_manager.backend_type,
+        exc,
+      )
     logger.info("Pipeline opened for spider %s", spider.name)
 
   def close_spider(self, spider: Spider) -> None:
@@ -249,8 +270,19 @@ class BackendPipeline:
         spider: The spider instance.
     """
     logger.info("Pipeline closed for spider %s", spider.name)
-    self.storage_strategy.close()
-    self.connection_manager.close()
+    try:
+      self.storage_strategy.close()
+    finally:
+      # Teardown invariant: release the backend connection even if the final
+      # flush raised (batched partial-flush, backend error). Without this, a
+      # failed close leaks one socket/fd per spider-close-under-error on
+      # long-running Scrapyd deploys.
+      try:
+        self.connection_manager.close()
+      except Exception:
+        # Don't mask the original flush error (if any) — log and continue so
+        # the exception propagating from the try block is what callers see.
+        logger.exception("connection_manager.close() failed during teardown")
 
   def process_item(self, item: Item, spider: Spider) -> Item:
     """Process and store an item.

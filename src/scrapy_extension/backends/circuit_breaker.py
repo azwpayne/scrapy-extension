@@ -267,6 +267,14 @@ class CircuitBreaker:
     except BaseException as exc:
       # Do not let Ctrl-C / interpreter shutdown perturb breaker bookkeeping.
       if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        # Regression fix: _allow_call() claimed the single HALF_OPEN probe
+        # slot (_probe_in_flight=True) before func ran. If the signal arrives
+        # mid-probe we must release it — otherwise the breaker wedges
+        # HALF_OPEN forever (no timer releases the slot; only _record_success
+        # / _record_failure do, and we deliberately skip both for signals).
+        if prior_state is BreakerState.HALF_OPEN:
+          with self._lock:
+            self._probe_in_flight = False
         raise
       with self._lock:
         self._record_failure(prior_state)

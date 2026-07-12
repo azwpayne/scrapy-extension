@@ -155,12 +155,21 @@ class BatchedStorageStrategy(StorageStrategy):
       self._flush_to(backend)
 
   def close(self) -> None:
-    """Flush any remaining buffered items, then release resources.
+    """Flush remaining buffered items, then release resources.
 
-    Stops the age-based flusher (Risk 2) so a clean shutdown does not race
-    with the background flush, then drains the buffer.
+    Stops the age-based flusher (Risk 2) and joins it (bounded) before
+    draining, so ``BackendPipeline.close_spider`` does not tear down the
+    backend connection while the daemon flusher is mid-``store``.
     """
     self._stop.set()
+    flusher = self._flusher
+    if flusher is not None and flusher.is_alive():
+      flusher.join(timeout=5.0)
+      if flusher.is_alive():
+        logger.warning(
+          "batched-storage-age-flush did not exit within 5.0s; "
+          "in-flight items may be lost"
+        )
     self.flush()
 
   def _flush_to(self, storage_backend: StorageBackend) -> None:

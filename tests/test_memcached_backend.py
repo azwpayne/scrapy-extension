@@ -150,10 +150,15 @@ class TestMemcachedStorageOps:
     b.clear_storage()
     client.flush_all.assert_called_once()
 
-  def test_clear_storage_ignores_prefix(self, mocker) -> None:
+  def test_clear_storage_rejects_prefix(self, mocker) -> None:
+    # R3: prefix-based clear is unsupported on Memcached (flush_all is global).
+    # Calling clear_storage(prefix=...) must raise NotImplementedError and must
+    # NOT call flush_all — silently flushing a shared cache would cross-tenant
+    # destroy data.
     b, client = _connected(mocker)
-    b.clear_storage(prefix="foo")
-    client.flush_all.assert_called_once()  # prefix ignored
+    with pytest.raises(NotImplementedError):
+      b.clear_storage(prefix="foo")
+    client.flush_all.assert_not_called()
 
   def test_invalid_key_raises(self, mocker) -> None:
     b, _ = _connected(mocker)

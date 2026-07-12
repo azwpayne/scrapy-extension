@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # limit, validation, etc.) are operational failures and MUST raise
 # StorageError so the item pipeline does not treat them as success.
 _DDB_NOT_FOUND_CODES = frozenset({"ResourceNotFoundException"})
+_DDB_INUSE_CODES = frozenset({"ResourceInUseException"})
 
 
 def _is_resource_not_found(exc: BaseException) -> bool:
@@ -66,6 +67,23 @@ def _is_resource_not_found(exc: BaseException) -> bool:
   if not isinstance(err, dict):
     return False
   return err.get("Code") in _DDB_NOT_FOUND_CODES
+
+
+def _is_resource_in_use(exc: BaseException) -> bool:
+  """Return True if ``exc`` is a DynamoDB ``ResourceInUseException``.
+
+  Raised by ``create_table`` when another worker has already started creating
+  the table (concurrent boot race, e.g. k8s pod rollout). Mirrors
+  :func:`_is_resource_not_found` so the same test-suite ClientError stand-in
+  works against the mocked ``boto3``.
+  """
+  response = getattr(exc, "response", None)
+  if not isinstance(response, dict):
+    return False
+  err = response.get("Error")
+  if not isinstance(err, dict):
+    return False
+  return err.get("Code") in _DDB_INUSE_CODES
 
 
 class DynamoDBBackend(Backend, StorageBackend):
@@ -129,14 +147,23 @@ class DynamoDBBackend(Backend, StorageBackend):
         # a transient blip spuriously creates a conflicting table.
         if not _is_resource_not_found(e):
           raise
-        self._table = self._resource.create_table(
-          TableName=self.config.table_name,
-          KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-          AttributeDefinitions=[
-            {"AttributeName": "pk", "AttributeType": "S"}
-          ],
-          BillingMode="PAY_PER_REQUEST",
-        )
+        try:
+          self._table = self._resource.create_table(
+            TableName=self.config.table_name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+              {"AttributeName": "pk", "AttributeType": "S"}
+            ],
+            BillingMode="PAY_PER_REQUEST",
+          )
+        except Exception as create_err:
+          # Concurrent boot race (e.g. k8s pod rollout): another worker already
+          # started creating this table — ResourceInUseException. Reattach to
+          # the existing table and wait. Any other error propagates (#31): a
+          # transient blip must not mask as "created".
+          if not _is_resource_in_use(create_err):
+            raise
+          self._table = self._resource.Table(self.config.table_name)
         self._table.wait_until_exists()
       logger.debug("Connected to DynamoDB table %s", self.config.table_name)
     except Exception as e:
@@ -172,6 +199,19 @@ class DynamoDBBackend(Backend, StorageBackend):
     """Return True if the item has an expire_at that has passed."""
     expire_at = item.get("expire_at")
     return expire_at is not None and float(expire_at) <= time.time()
+
+  def _lazy_reap_if_expired(self, item: dict[str, Any], key: str) -> bool:
+    """Lazy-reap an expired item; return True if expired (caller treats as absent).
+
+    Centralizes the TTL-expiry contract shared by ``retrieve`` and ``exists``:
+    if the item's ``expire_at`` is in the past, delete it best-effort (via
+    ``_swallow``) so the table does not accumulate dead rows, and return True.
+    """
+    if not self._is_expired(item):
+      return False
+    with _swallow():
+      self._table.delete_item(Key={"pk": key})
+    return True
 
   # StorageBackend implementation
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
@@ -229,9 +269,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     item = resp.get("Item")
     if not item:
       return None
-    if self._is_expired(item):
-      with _swallow():
-        self._table.delete_item(Key={"pk": key})
+    if self._lazy_reap_if_expired(item, key):
       return None
     value = item.get("value")
     return bytes(value) if isinstance(value, (bytes, bytearray)) else None
@@ -288,7 +326,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     item = resp.get("Item")
     if not item:
       return False
-    return not self._is_expired(item)
+    return not self._lazy_reap_if_expired(item, key)
 
   def ttl(self, key: str) -> int | None:
     """Return remaining TTL seconds if the item has expire_at, else None.
