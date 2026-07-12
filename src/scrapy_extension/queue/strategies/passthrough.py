@@ -9,6 +9,8 @@ from __future__ import annotations
 
 __all__ = ["PassthroughQueueStrategy"]
 
+from typing import Any
+
 from scrapy_extension.queue.strategies.base import QueueStrategy
 
 
@@ -54,7 +56,7 @@ class PassthroughQueueStrategy(QueueStrategy):
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, object | None]:
+  ) -> tuple[bytes | None, Any | None]:
     """Pop from the QueueBackend, carrying the per-message ack token when the
     backend provides one (#28 -- consolidates BackendQueue._pop_with_ack's
     passthrough branch into the strategy).

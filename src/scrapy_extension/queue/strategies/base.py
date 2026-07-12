@@ -93,7 +93,7 @@ class QueueStrategy(ABC):
 
   def _pop_backend_with_ack(
     self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, Any]:
+  ) -> tuple[bytes | None, Any | None]:
     """Pop from the backend, threading the per-message ack token when it provides one.
 
     Shared by backend-delegating strategies (passthrough / delay / throttle).

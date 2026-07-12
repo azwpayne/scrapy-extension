@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.queue.strategies.base import QueueStrategy
@@ -194,7 +194,7 @@ class DelayQueueStrategy(QueueStrategy):
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, object | None]:
+  ) -> tuple[bytes | None, Any | None]:
     """Drain due held items, then pop the live queue (threads ack token, #28).
 
     Same drain-then-pop flow as :meth:`pop`, but delegates the live pop to

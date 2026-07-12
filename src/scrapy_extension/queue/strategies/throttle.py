@@ -20,7 +20,7 @@ __all__ = ["ThrottleQueueStrategy"]
 
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.queue.strategies.base import QueueStrategy
@@ -138,7 +138,7 @@ class ThrottleQueueStrategy(QueueStrategy):
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, object | None]:
+  ) -> tuple[bytes | None, Any | None]:
     """Throttled pop, threading the per-message ack token (MQ backends, #28).
 
     Same throttle gate as :meth:`pop`: returns ``(None, None)`` within
