@@ -50,6 +50,11 @@ jobs:
   # the stock GitHub runner. See #44.
   integration-tests:
     runs-on: ubuntu-latest
+    # Bound the whole job. A hung broker-client op (no per-op timeout) used to
+    # bleed to GitHub Actions' 360-min default — every run since the #44 series
+    # landed as cancelled-at-6h. 15 min is generous (broker bring-up ~2 min +
+    # the 27-test suite under per-test --timeout below).
+    timeout-minutes: 15
     services:
       redis:
         image: redis:7
@@ -164,4 +169,4 @@ jobs:
           SCRAPY_TEST_ROCKETMQ_NAMESRV: localhost:8081
         run: >
           uv run pytest tests/integration
-          -m integration --tb=short -q
+          -m integration --tb=short -v --timeout=120
