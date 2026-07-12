@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
-from scrapy_extension.exceptions.base import BackendConnectionError
+from scrapy_extension.exceptions.base import BackendConnectionError, ConfigurationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.utils.request import request_fingerprint
@@ -171,9 +171,22 @@ class BackendDupeFilter:
       settings=backend_settings,
     )
     key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
-    strategy = DedupeStrategy(
-      settings.get("SCRAPY_DEDUP_STRATEGY", DedupeStrategy.SET.value)
-    )
+    raw_strategy = settings.get("SCRAPY_DEDUP_STRATEGY", DedupeStrategy.SET.value)
+    try:
+      strategy = DedupeStrategy(raw_strategy)
+    except ValueError as e:
+      # R-dedup-cfg: translate the enum-coercion ValueError into the domain
+      # ConfigurationError so the dedup factory matches the storage-strategy
+      # factory contract (create_storage_strategy("bogus") → ConfigurationError)
+      # and callers catching ConfigurationError for config mistakes handle BOTH
+      # factories uniformly. The enum itself still raises ValueError (idiomatic
+      # for _missing_) — the config boundary translates it.
+      valid = ", ".join(repr(m.value) for m in DedupeStrategy)
+      raise ConfigurationError(
+        f"Invalid SCRAPY_DEDUP_STRATEGY {raw_strategy!r}. Valid: {valid}.",
+        setting_name="SCRAPY_DEDUP_STRATEGY",
+        setting_value=str(raw_strategy),
+      ) from e
     membership_filter = build_membership_filter(
       strategy,
       manager,

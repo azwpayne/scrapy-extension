@@ -18,6 +18,7 @@ from scrapy_extension.dupefilter.filters.factory import (
 )
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
+from scrapy_extension.exceptions import ConfigurationError
 
 
 def _make_settings(mocker, overrides=None):
@@ -121,9 +122,19 @@ class TestFromSettingsStrategyWiring:
     assert isinstance(df._filter, CuckooMembershipFilter)
 
   def test_invalid_strategy_raises(self, mocker) -> None:
+    """R-dedup-cfg: an invalid SCRAPY_DEDUP_STRATEGY raises ConfigurationError
+    (not the raw ValueError from enum coercion) — matching the storage-strategy
+    factory contract (create_storage_strategy("bogus") → ConfigurationError)
+    so callers catching ConfigurationError for config mistakes handle BOTH
+    factories uniformly. The enum itself still raises ValueError (tested at
+    line 81 — ``DedupeStrategy("bogus")``); the config boundary in
+    from_settings translates it to the domain config error.
+    """
     settings, _ = _make_settings(mocker, {"SCRAPY_DEDUP_STRATEGY": "bogus"})
-    with pytest.raises(ValueError, match="not a valid DedupeStrategy"):
+    with pytest.raises(ConfigurationError) as exc_info:
       BackendDupeFilter.from_settings(settings)
+    assert exc_info.value.setting_name == "SCRAPY_DEDUP_STRATEGY"
+    assert "bogus" in str(exc_info.value.setting_value)
 
   def test_preserves_key_and_debug(self, mocker) -> None:
     settings, _ = _make_settings(
