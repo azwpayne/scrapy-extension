@@ -444,7 +444,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         QueueError: If the pop operation fails.
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
     if self._queue_collection is None:
       msg = "MongoDBBackend not connected: queue collection is None"
@@ -476,6 +478,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Number of items in the queue (capped at 100000).
     """
+    _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
     if self._queue_collection is None:
       msg = "MongoDBBackend not connected: queue collection is None"
@@ -489,7 +492,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Args:
         queue_name: Name of the queue.
+
+    Raises:
+        ValueError: If queue_name contains invalid characters.
     """
+    _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
     if self._queue_collection is None:
       msg = "MongoDBBackend not connected: queue collection is None"
@@ -506,7 +513,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if added, False if already existed.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     self._assert_connected()
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
@@ -541,7 +552,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if removed, False if didn't exist.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     self._assert_connected()
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
@@ -563,7 +578,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         True if item exists in the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     self._assert_connected()
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
@@ -589,6 +608,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Number of items in the set (capped at 100000).
     """
+    _validate_key_name(set_name, "set_name")
     self._assert_connected()
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
@@ -602,7 +622,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Args:
         set_name: Name of the set.
+
+    Raises:
+        ValueError: If set_name contains invalid characters.
     """
+    _validate_key_name(set_name, "set_name")
     self._assert_connected()
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
@@ -620,10 +644,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         BackendConnectionError: If not connected.
+        ValueError: If key contains invalid characters.
         StorageError: On PyMongoError (was previously unwrapped, leaking
             ``pymongo.errors.PyMongoError`` to callers expecting
             ``except BackendError``).
     """
+    _validate_key_name(key, "key")
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
@@ -658,6 +684,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If not connected.
         StorageError: On PyMongoError (was previously unwrapped).
     """
+    _validate_key_name(key, "key")
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
@@ -685,6 +712,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If not connected.
         StorageError: On PyMongoError (was previously unwrapped).
     """
+    _validate_key_name(key, "key")
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
@@ -709,6 +737,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If not connected.
         StorageError: On PyMongoError (was previously unwrapped).
     """
+    _validate_key_name(key, "key")
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
@@ -734,6 +763,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If not connected.
         StorageError: On PyMongoError (was previously unwrapped).
     """
+    _validate_key_name(key, "key")
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
@@ -775,6 +805,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If not connected.
         StorageError: On PyMongoError (was previously unwrapped).
     """
+    if prefix is not None:
+      _validate_key_name(prefix, "prefix")
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
