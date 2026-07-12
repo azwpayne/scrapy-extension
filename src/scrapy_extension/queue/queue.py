@@ -703,4 +703,9 @@ class BackendQueue:
     # value (unexpected type / mock) is a no-op, never passed to restore().
     if not isinstance(state, (bytes, bytearray)):
       return
-    self._strategy.restore(bytes(state))
+    try:
+      self._strategy.restore(bytes(state))
+    except Exception:  # noqa: BLE001 — restore must not crash startup (docstring)
+      logger.exception(
+        "strategy.restore() raised for queue %r; starting clean.", self.queue_name
+      )

@@ -293,6 +293,31 @@ def test_backends_queue_restore_skips_non_bytes_state():
   assert strategy._holding == []
 
 
+def test_backends_queue_init_restore_crash_does_not_break_startup():
+  """Regression: a strategy.restore() that raises (buggy third-party strategy,
+  or a snapshot from an incompatible version) must NOT crash BackendQueue.__init__.
+
+  _restore_snapshot's docstring promises 'never crashes startup'; pre-fix the
+  restore() call was the one operation in the method NOT wrapped in try/except
+  (snapshot/get_storage/retrieve/store all were). The bundled strategies
+  (delay/time_wheel/ring_buffer) already catch their own decode errors, so the
+  live risk is a third-party strategy with an un-hardened restore().
+  """
+  storage = _storage_mock(retrieve_return=b'{"some":"prior"}')
+  cm = _wired_cm(storage=storage)
+  strategy = _delay(clock_value=100.0)
+
+  def _raise(_state):
+    raise RuntimeError("third-party restore bug")
+
+  strategy.restore = _raise  # type: ignore[assignment]
+
+  # Must NOT raise — the restore() crash is logged + swallowed.
+  BackendQueue(
+    connection_manager=cm, queue_name="q", queue_strategy=strategy, monitor=MagicMock()
+  )
+
+
 # ---------------------------------------------------------------------------
 # Spider-scoped snapshot key (initiative #16)
 # ---------------------------------------------------------------------------
