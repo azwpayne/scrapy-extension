@@ -70,6 +70,23 @@ SCRAPY_STORAGE_STRATEGY = "batched"
 
 Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance.
 
+## Storage TTL semantics (expired = absent)
+
+All five storage-capable backends (Redis, MongoDB, ElasticSearch, Memcached,
+DynamoDB) uniformly enforce **an expired key is absent** — `retrieve` and
+`exists` never surface a key whose TTL has elapsed. The mechanism differs by
+backend family; the operator-visible contract does not.
+
+| Backend family | TTL mechanism | `ttl()` return |
+|---|---|---|
+| Redis, Memcached | Native server-side expiry (`SET ... EX` / `client.set(..., expire=)`). The server reaps before the client sees the key. | Redis: seconds remaining (or `-1` no-TTL / `-2` no-key). Memcached: always `None` (no native introspection). |
+| MongoDB | Native TTL index on the `expireAt` field (created in `_create_indexes`). The server background sweeper reaps. | Seconds remaining, or `-1` in the rare race before the sweeper reaches it. |
+| ElasticSearch, DynamoDB | App-level TTL via an `expireAt` / `expire_at` field (neither has native TTL). `retrieve` / `exists` / `ttl` **lazily reap** an expired document on read (`_lazy_reap_if_expired`) and report it absent. | Seconds remaining, or `0` for an expired-or-missing key. |
+
+This closes a stale-data gap where a read could surface an already-expired
+document before the (infrequent) server reaper reached it. No setting change;
+the expired-is-absent contract is now uniform across all five storage backends.
+
 ## Ack and durability matrix
 
 | Surface | Ack / state boundary | Crash behavior | Operator action |
@@ -200,6 +217,8 @@ from the existing monitor stats:
 | `dupefilter/filtered` | Count of duplicates filtered. High + rising = dedup saturated. |
 | `dupefilter/filter_full` | Cuckoo filter hit capacity (each occurrence increments). Non-zero = Cuckoo at capacity, degrading to passthrough. |
 | `pipeline/storage_skipped` | Items skipped because backend has no `StorageBackend`. Non-zero on a storage-expected backend = misconfigured `SCRAPY_STORAGE_BACKEND_TYPE`. |
+| `scheduler/ack_error` | Ack commit to the queue backend failed (`QueueError` on `ack`). Non-zero on a deferred-ack backend (Kafka/RabbitMQ/RocketMQ/Pulsar/SQS) = the broker is rejecting commits; messages redeliver at-least-once via visibility-timeout — investigate broker health. |
+| `scheduler/nack_error` | Nack to the queue backend failed (`QueueError` on `nack`). Non-zero = the broker rejected the requeue; the message will redeliver via visibility-timeout rather than being explicitly requeued. |
 
 Differential diagnosis:
 
@@ -214,6 +233,11 @@ Differential diagnosis:
   gate error at startup.
 - **`dupefilter/filter_full` rising** → Cuckoo at capacity; raise
   `SCRAPY_DEDUP_CUCKOO_CAPACITY` or switch to `set` for unbounded dedup.
+- **`scheduler/ack_error` or `scheduler/nack_error` rising** → the broker is
+  rejecting ack/nack commits on a deferred-ack backend. Delivery keeps working
+  (at-least-once redelivery via visibility-timeout), but duplicates rise —
+  check broker connectivity/permissions and watch `dupefilter/filtered` for the
+  redelivery side-effect.
 
 ## Cutting a release
 
