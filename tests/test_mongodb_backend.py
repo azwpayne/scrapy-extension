@@ -1177,3 +1177,51 @@ class TestMongoDBNotConnectedGuards:
     with pytest.raises(BackendConnectionError) as exc:
       backend.clear_storage()
     assert "storage collection is None" in str(exc.value)
+
+
+def test_mongodb_invalid_queue_name_rejected_before_backend_call():
+  """R-mongo-validate: invalid queue names raise ValueError before any backend
+  interaction — parity with Redis (which validates in all methods). Defense-in-
+  depth vs NoSQL operator-injection (``$ne``/``$gt``) via a special-char name.
+  Validation fires before ``_assert_connected`` so this needs no connection.
+  """
+  backend = MongoDBBackend(MongoDBSettings())
+  with pytest.raises(ValueError, match="queue_name"):
+    backend.push("bad queue name!", b"x")  # space + ! are outside KEY_NAME_PATTERN
+
+
+def test_mongodb_invalid_set_name_rejected_before_backend_call():
+  """R-mongo-validate: set methods also validate (parity with Redis)."""
+  backend = MongoDBBackend(MongoDBSettings())
+  with pytest.raises(ValueError, match="set_name"):
+    backend.add("bad/set", b"x")  # slash is outside KEY_NAME_PATTERN
+
+
+def test_mongodb_invalid_storage_key_rejected_before_backend_call():
+  """R-mongo-validate: storage methods also validate (parity with Redis)."""
+  backend = MongoDBBackend(MongoDBSettings())
+  with pytest.raises(ValueError, match="key"):
+    backend.store("bad key", b"x")  # space is outside KEY_NAME_PATTERN
+
+
+def test_mongodb_clear_storage_invalid_prefix_rejected():
+  """R-mongo-validate: clear_storage validates a provided prefix (None still
+  clears all — the optional-prefix contract is preserved)."""
+  backend = MongoDBBackend(MongoDBSettings())
+  with pytest.raises(ValueError, match="prefix"):
+    backend.clear_storage("bad prefix!")  # space + ! outside KEY_NAME_PATTERN
+
+
+def test_mongodb_valid_names_pass_validation(mocker):
+  """R-mongo-validate guard: pattern-valid names (alnum, dots, underscores,
+  hyphens, colons) are NOT rejected — the default queue/storage naming
+  (``scheduler:queue``, ``k1``, ``prefix:spider``) keeps working."""
+  backend = MongoDBBackend(MongoDBSettings())
+  mocker.patch.object(backend, "_assert_connected", lambda: None)
+  backend._queue_collection = mocker.MagicMock()
+  backend._set_collection = mocker.MagicMock()
+  backend._storage_collection = mocker.MagicMock()
+  # None of these should raise ValueError.
+  backend.queue_len("scheduler:queue")
+  backend.set_len("dedup:spider.name")
+  backend.exists("items:a-b_c.1")
