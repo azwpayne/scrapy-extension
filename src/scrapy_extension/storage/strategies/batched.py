@@ -163,7 +163,7 @@ class BatchedStorageStrategy(StorageStrategy):
         # (crash-before-flush) = data loss. Escalation for sustained outages
         # moves to the on_buffer_depth monitor hook (emitted above). Explicit
         # flush()/close() still raise so teardown callers see the failure.
-        pass
+        pass  # nosec B110 — intentional swallow (R-pipe-1, documented above)
     self._ensure_flusher()
 
   def flush(self) -> None:
