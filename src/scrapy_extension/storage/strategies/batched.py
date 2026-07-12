@@ -117,6 +117,18 @@ class BatchedStorageStrategy(StorageStrategy):
   ) -> None:
     """Buffer one item; auto-flush when the buffer reaches the threshold.
 
+    Always succeeds in buffering the item (the at-least-once guarantee). A
+    threshold-triggered flush that fails mid-batch is swallowed — the
+    un-written tail is re-enqueued by ``_flush_to`` (which already logged the
+    partial) and retried by the next flush / the age-flusher. Propagating a
+    threshold-flush failure would storm ``BackendPipeline.process_item``'s
+    ``max_storage_errors`` breaker per incoming item during a sustained outage
+    → ``BackendError`` kills the spider → buffered tail lost (crash-before-flush)
+    = data loss. Escalation for sustained-outage-with-Batched moves to the
+    ``on_buffer_depth`` monitor hook (emitted per store). Explicit
+    :meth:`flush` / :meth:`close` STILL propagate a flush failure so teardown
+    callers see it.
+
     Args:
         storage_backend: The StorageBackend to flush to.
         key: The storage key.
@@ -140,7 +152,18 @@ class BatchedStorageStrategy(StorageStrategy):
     except Exception:  # noqa: BLE001 — monitor must never crash store
       logger.debug("on_buffer_depth hook raised", exc_info=True)
     if flush_now:
-      self._flush_to(storage_backend)
+      try:
+        self._flush_to(storage_backend)
+      except Exception:  # noqa: BLE001 — _flush_to logged + re-enqueued; see R-pipe-1
+        # R-pipe-1 (option A): the threshold flush failed but the item passed
+        # to THIS store() is safely buffered (at-least-once). Do NOT
+        # propagate — surfacing a flush failure as a store failure would storm
+        # the pipeline's max_storage_errors breaker per incoming item during a
+        # sustained outage, killing the spider and losing the buffered tail
+        # (crash-before-flush) = data loss. Escalation for sustained outages
+        # moves to the on_buffer_depth monitor hook (emitted above). Explicit
+        # flush()/close() still raise so teardown callers see the failure.
+        pass
     self._ensure_flusher()
 
   def flush(self) -> None:
