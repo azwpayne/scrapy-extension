@@ -390,6 +390,17 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._connection.close()
       self._connection = None
     self._declared_queues.clear()
+    # R-mq-reconnect: clear ack tracking so it cannot leak to the next channel.
+    # Delivery tags are channel-scoped — a tag from the closed channel is
+    # invalid on the reconnect's fresh channel (basic_ack would raise
+    # PRECONDITION_FAILED). Clearing the legacy slot makes the post-reconnect
+    # ack/nack take the "nothing pending" no-op branch instead of firing a
+    # stale-tag basic_ack. The in-flight set is also channel-scoped and would
+    # otherwise leak across reconnects (unbounded set[int] growth for a
+    # long-running crawler). At-least-once is preserved regardless — the
+    # broker requeues unacked messages on consumer disconnect.
+    self._last_delivery_tag = None
+    self._in_flight_tags.clear()
 
   def is_connected(self) -> bool:
     """Check if RabbitMQ is connected.

@@ -1309,3 +1309,32 @@ def test_rabbitmq_in_flight_set_bounded(mocker, caplog):
   # The one-shot warning fired.
   assert backend._in_flight_overflow_warned is True
   assert any("at cap" in r.message for r in caplog.records)
+
+
+def test_disconnect_clears_delivery_tag_state_and_in_flight_set():
+  """R-mq-reconnect: ``disconnect()`` must clear ``_last_delivery_tag`` AND the
+  ``_in_flight_tags`` set so a reconnect cannot (a) reuse a stale delivery tag
+  on the new channel via the legacy ack path (spurious QueueError /
+  PRECONDITION_FAILED on basic_ack) or (b) leak the in-flight set across
+  reconnect cycles (unbounded ``set[int]`` growth for a long-running crawler
+  that reconnects repeatedly). At-least-once is preserved either way — the
+  broker requeues unacked messages on consumer disconnect — so this is
+  correctness/hygiene, not a data-loss fix.
+  """
+  from unittest.mock import MagicMock
+
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+  # Simulate a connected backend with state accumulated by pops.
+  backend._channel = MagicMock()
+  backend._connection = MagicMock()
+  backend._last_delivery_tag = 42
+  backend._in_flight_tags = {10, 20, 30}
+
+  backend.disconnect()
+
+  # State from the closed channel must not survive to the next channel.
+  assert backend._last_delivery_tag is None
+  assert backend._in_flight_tags == set()
+  assert backend._channel is None
+  assert backend._connection is None
