@@ -1055,16 +1055,27 @@ class TestRedisBackendQueueOperations:
     assert "pop" in str(exc_info.value).lower()
 
   def test_queue_len_error(self, redis_settings, mock_redis, mocker):
-    """Test queue_len returns 0 on RedisError."""
+    """R-qlen: queue_len must wrap RedisError as QueueError, NOT swallow to 0.
+
+    Pre-R-qlen this returned 0 (pinned by this test as ``== 0``), conflating an
+    empty queue with a backend failure. The scheduler trusts ``len(queue)`` for
+    ``has_pending_requests`` / the backpressure gate — a swallowed 0 during a
+    Redis blip can trigger premature idle/CloseSpider and loses the backpressure
+    signal at the worst moment. ``pop()`` wraps RedisError as QueueError;
+    queue_len now matches. The scheduler's ``next_request`` already handles
+    QueueError from ``len(self._queue)`` (returns None safely — see
+    scheduler.py backpressure docstring).
+    """
     from redis.exceptions import RedisError
 
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
 
     mock_redis.zcard.side_effect = RedisError("Card error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    result = backend.queue_len("test_queue")
-    assert result == 0
+    with pytest.raises(QueueError):
+      backend.queue_len("test_queue")
 
   def test_clear_queue_error(self, redis_settings, mock_redis, mocker):
     """Test clear_queue logs warning on RedisError."""

@@ -616,8 +616,17 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # (Awaitable[Any] | int); the sync client returns int at runtime.
       # The cast narrows for Pyright; harmless under mypy.
       return cast("int", self.client.zcard(queue_name))  # type: ignore[redundant-cast]
-    except RedisError:
-      return 0
+    except RedisError as e:
+      # R-qlen: do NOT swallow to 0 — that conflates an empty queue with a
+      # backend failure. The scheduler trusts ``len(queue)`` for
+      # ``has_pending_requests`` and the backpressure gate; a swallowed 0
+      # during a Redis blip can trigger premature idle/CloseSpider and loses
+      # the backpressure signal at the worst moment. Wrap as QueueError
+      # (matching pop()'s contract); the scheduler's next_request already
+      # handles QueueError from ``len(self._queue)`` (returns None safely).
+      raise QueueError(
+        str(e), queue_name=queue_name, operation="queue_len"
+      ) from e
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
