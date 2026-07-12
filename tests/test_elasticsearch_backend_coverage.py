@@ -294,6 +294,13 @@ class TestExists:
     conflated "key doesn't exist" with "couldn't reach the cluster".
     Callers writing ``if not storage.exists(k): create_new()`` would
     silently overwrite existing data during network blips.
+
+    R-esttl (2026-07-12): exists now uses ``get`` (not the cheap ``exists``
+    HEAD) so it can lazy-reap expired docs. The TransportError is wrapped as
+    ``StorageError`` (joining retrieve/delete/ttl). R33-A1's *propagate, don't
+    swallow* intent is preserved — StorageError propagates with the raw
+    TransportError chained as ``__cause__``; only the type + mock target
+    changed (exists→get).
     """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
@@ -302,7 +309,7 @@ class TestExists:
         create=mocker.MagicMock(),
       ),
     )
-    mock_client.exists.side_effect = TransportError("Exists failed")
+    mock_client.get.side_effect = TransportError("Exists failed")
     mocker.patch(
       "scrapy_extension.backends.elasticsearch.Elasticsearch",
       return_value=mock_client,
@@ -310,8 +317,9 @@ class TestExists:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(TransportError, match="Exists failed"):
+    with pytest.raises(StorageError, match="Exists failed") as ei:
       backend.exists("k")
+    assert isinstance(ei.value.__cause__, TransportError)
 
 
 class TestTTL:
