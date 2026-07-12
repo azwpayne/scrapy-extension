@@ -170,6 +170,21 @@ class BackendQueue:
     if request.body:
       body_value = base64.b64encode(request.body).decode("ascii")
 
+    # R-ack-serialize: strip the per-message ack token from the SERIALIZED
+    # meta. The token is an opaque, non-JSON-serializable object (RocketMQ
+    # apache Message; Pulsar MessageId). Scrapy's retry middleware copies a
+    # failed request's meta (token included) and re-enqueues via push → this
+    # method → the JSON serializer. Leaving the token in would crash
+    # serialization (SerializationError) and DROP the retry — broken retry on
+    # RocketMQ/Pulsar. Stripping is NON-MUTATING (a fresh dict): the in-memory
+    # request keeps the token so the scheduler can still ack on
+    # response_received / spider_error (which fire after the download, before
+    # any retry re-push). On re-pop, a fresh token is injected — the stale one
+    # is meaningless after the original pop.
+    serialized_meta = {
+      k: v for k, v in request.meta.items() if k != BACKEND_ACK_TOKEN_META_KEY
+    }
+
     return {
       "url": request.url,
       "callback": request.callback.__name__ if request.callback else None,
@@ -178,7 +193,7 @@ class BackendQueue:
       "headers": dict(request.headers.to_unicode_dict()),
       "body": body_value,
       "cookies": request.cookies,
-      "meta": request.meta,
+      "meta": serialized_meta,
       "cb_kwargs": request.cb_kwargs,
       "encoding": request.encoding,
       "priority": request.priority,
