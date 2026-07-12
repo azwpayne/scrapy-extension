@@ -314,3 +314,63 @@ class TestBatchedStorageRisk2:
     time.sleep(0.15)
     backend.store.assert_called_with("k", b"v", ttl=None)
     strat.close()  # stops the flusher cleanly
+
+
+class TestBatchedStorageFlusherTOCTOU:
+  """R-flusher-1: ``_ensure_flusher``'s guard + create + start must be ATOMIC
+  (under ``self._lock``) so concurrent stores can't each spawn a daemon flusher.
+
+  Pre-fix, the guard checked ``self._flusher is not None`` OUTSIDE the lock, so
+  N threads racing the first ``store()`` each observed ``_flusher is None``,
+  each constructed a ``Thread``, each called ``start()`` → N orphaned daemon
+  flushers. The code comment claiming "idempotent guard guarantees no
+  double-start" was a false claim; this test pins the corrected atomic
+  behavior. Race-window widening (the patched ``threading.Thread`` sleeps) makes
+  the TOCTOU deterministic both pre-fix (N flushers) and post-fix (1 flusher).
+  """
+
+  def test_concurrent_stores_start_exactly_one_flusher(self, mocker) -> None:
+    import time
+
+    real_thread = threading.Thread
+
+    def slow_thread_ctor(*args, **kwargs):
+      # Widen the window between the `_flusher is not None` guard and the
+      # `self._flusher = flusher` assignment so the TOCTOU is observable
+      # deterministically rather than via scheduler timing.
+      time.sleep(0.02)
+      return real_thread(*args, **kwargs)
+
+    # Patch the Thread constructor the strategy resolves (``import threading``
+    # then ``threading.Thread(...)`` in batched.py). Global patch is fine —
+    # only the racer + flusher constructions happen during this test.
+    mocker.patch(
+      "scrapy_extension.storage.strategies.batched.threading.Thread",
+      side_effect=slow_thread_ctor,
+    )
+
+    backend = mocker.Mock()
+    # threshold huge so no threshold-flush interferes; max_buffer_age_s set so
+    # _ensure_flusher actually fires.
+    strat = BatchedStorageStrategy(threshold=10**9, max_buffer_age_s=1.0)
+
+    n = 8
+    barrier = threading.Barrier(n)
+
+    def racer(i: int) -> None:
+      barrier.wait()  # release all racers into store() simultaneously
+      strat.store(backend, f"k{i}", b"v")
+
+    threads = [threading.Thread(target=racer, args=(i,)) for i in range(n)]
+    for t in threads:
+      t.start()
+    for t in threads:
+      t.join()
+
+    try:
+      flushers = [t for t in threading.enumerate() if t.name == "batched-storage-age-flush"]
+      assert len(flushers) == 1, (
+        f"expected exactly 1 age-flush thread (atomic guard), found {len(flushers)}"
+      )
+    finally:
+      strat.close()

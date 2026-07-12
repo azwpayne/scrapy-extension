@@ -219,25 +219,39 @@ class BatchedStorageStrategy(StorageStrategy):
         raise
 
   def _ensure_flusher(self) -> None:
-    """Start the age-based background flusher (Risk 2), once.
+    """Start the age-based background flusher (Risk 2), exactly once.
 
-    Lazy + idempotent: the daemon thread is started on the first ``store``
-    after which a non-None ``max_buffer_age_s`` is configured. It runs until
+    Lazy + atomic: the daemon thread is started on the first ``store`` after
+    which a non-None ``max_buffer_age_s`` is configured. It runs until
     :meth:`close` sets ``_stop``. Pipelines are single-threaded per spider;
     the flusher is the only background thread and serializes flushes via
     ``_lock`` + ``_flush_to``.
+
+    R-flusher-1: the guard + create + start are performed UNDER ``self._lock``
+    so concurrent stores (a documented-supported scenario — see module
+    docstring) cannot each observe ``_flusher is None`` and each spawn a daemon
+    flusher. The pre-fix guard checked ``_flusher is not None`` outside the lock
+    (a TOCTOU); the first racer now holds the lock through Thread construction
+    + assignment + start, and the rest see ``_flusher`` non-None on entry and
+    return without constructing. ``max_buffer_age_s is None`` is checked outside
+    the lock (immutable after ``__init__`` — never changes, so it's a safe
+    fast-path that avoids acquiring the lock when the flusher is disabled).
     """
-    if self.max_buffer_age_s is None or self._flusher is not None:
+    if self.max_buffer_age_s is None:
       return
-    flusher = threading.Thread(
-      target=self._age_flush_loop,
-      name="batched-storage-age-flush",
-      daemon=True,
-    )
-    # Assign before start so the loop sees the assignment; idempotent guard
-    # above guarantees no double-start under concurrent stores.
-    self._flusher = flusher
-    flusher.start()
+    with self._lock:
+      if self._flusher is not None:
+        return
+      flusher = threading.Thread(
+        target=self._age_flush_loop,
+        name="batched-storage-age-flush",
+        daemon=True,
+      )
+      # Assign + start inside the lock so the guard (``_flusher is not None``)
+      # check above is atomic with the assignment — concurrent stores can't
+      # each pass the guard and each start a flusher.
+      self._flusher = flusher
+      flusher.start()
 
   def _age_flush_loop(self) -> None:
     """Periodically flush when the oldest buffered item exceeds the age cap.
