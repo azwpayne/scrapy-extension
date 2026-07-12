@@ -521,6 +521,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self._set_collection.insert_one(doc)
     except DuplicateKeyError:
       return False
+    except PyMongoError as e:
+      # R-dupe-1 (option b): wrap operational PyMongoError so BackendDupeFilter's
+      # graceful-degradation arm catches it (degrade to not-seen) instead of
+      # crashing the crawl. DuplicateKeyError (the "already existed" signal)
+      # stays first so it still returns False.
+      raise BackendConnectionError(
+        f"MongoDB set add failed for {set_name!r}: {e}", backend_type="mongodb"
+      ) from e
     else:
       return True
 

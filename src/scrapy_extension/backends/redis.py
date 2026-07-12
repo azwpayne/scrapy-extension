@@ -654,7 +654,15 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If set_name contains invalid characters.
     """
     _validate_key_name(set_name, "set_name")
-    return self.client.sadd(set_name, item) == 1
+    try:
+      return self.client.sadd(set_name, item) == 1
+    except RedisError as e:
+      # R-dupe-1 (option b): wrap the raw RedisError so BackendDupeFilter's
+      # ``except BackendConnectionError`` graceful-degradation arm fires
+      # (degrade to not-seen) instead of propagating and crashing the crawl.
+      raise BackendConnectionError(
+        f"Redis set add failed for {set_name!r}: {e}", backend_type="redis"
+      ) from e
 
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.

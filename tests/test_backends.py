@@ -369,6 +369,21 @@ class TestRedisBackend:
     result = backend.add("test_set", b"test_item")
     assert result is True
 
+  def test_set_add_wraps_redis_error(self, redis_settings, mock_redis, mocker):
+    """R-dupe-1 (option b): a transient RedisError during set add is wrapped as
+    BackendConnectionError so BackendDupeFilter's graceful-degradation arm fires
+    (degrade to not-seen) instead of crashing the crawl."""
+    from redis.exceptions import RedisError
+
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_redis.sadd.side_effect = RedisError("set add failed")
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    with pytest.raises(BackendConnectionError) as exc_info:
+      backend.add("test_set", b"test_item")
+    assert exc_info.value.backend_type == "redis"
+
   def test_set_contains(self, redis_settings, mock_redis, mocker):
     """Test set contains operation."""
     from scrapy_extension.backends.redis import RedisBackend
@@ -1319,24 +1334,30 @@ class TestRedisBackendSetOperations:
     assert result is False
 
   def test_set_add_error(self, redis_settings, mock_redis, mocker):
-    """R31-A1: RedisError must propagate, NOT return False.
+    """R-dupe-1 (option b): RedisError during set add is wrapped as
+    BackendConnectionError so BackendDupeFilter's graceful-degradation arm
+    catches it (degrade to not-seen) instead of crashing the crawl. The raw
+    RedisError is chained (``from e``) for diagnosis.
 
-    Returning False on RedisError conflated network/auth failures with
-    "item already existed" — the dupefilter's `return not added` then
-    treated every backend error as a duplicate, silently dropping new
-    requests during network blips. The SetBackend.add contract (base.py)
-    says False = "already existed"; only sadd's int return value (0 = existed)
-    can legitimately produce False. Real errors propagate so callers know.
+    Supersedes R31-A1's "must propagate raw" — but preserves R31-A1's core
+    concern: add does NOT return False on error (no silent mis-treatment as
+    duplicate, which would drop new requests during network blips). It still
+    raises a typed, catchable exception; only the type changed from raw
+    ``RedisError`` to ``BackendConnectionError`` so ``except BackendError``
+    (the dupefilter's degradation arm) catches it uniformly across backends.
     """
     from redis.exceptions import RedisError
 
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
 
     mock_redis.sadd.side_effect = RedisError("Add error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(RedisError, match="Add error"):
+    with pytest.raises(BackendConnectionError) as exc_info:
       backend.add("test_set", b"test_item")
+    assert exc_info.value.backend_type == "redis"
+    assert isinstance(exc_info.value.__cause__, RedisError)  # raw error chained
 
   def test_set_remove_success(self, redis_settings, mock_redis, mocker):
     """Test set remove returns True on successful removal."""
