@@ -378,9 +378,10 @@ class TestStorage:
     DynamoDB already do) so callers' ``except BackendError`` catches ES storage
     failures uniformly instead of crashing on a raw TransportError.
 
-    R31-A1 (test_add_transport_error_propagates) is preserved -- it tests the
-    SET ``add()`` op, which stays raw-propagate by design; this wraps only the
-    storage ``store`` op.
+    R-dupe-1 (option b) now wraps the SET ``add()`` op's TransportError as
+    BackendConnectionError too (see test_add_transport_error_wrapped); this
+    test covers the storage ``store`` op, which wraps as StorageError — the two
+    ops raise different typed exceptions for their respective surfaces.
     """
     from elasticsearch import TransportError
 
@@ -489,20 +490,32 @@ class TestSet:
     )
     assert b.add("s", b"item") is False
 
-  def test_add_transport_error_propagates(self, mocker):
-    """R31-A1: TransportError (network/auth) must propagate, NOT return False.
+  def test_add_transport_error_wrapped(self, mocker):
+    """R-dupe-1 (option b): TransportError during set add is wrapped as
+    BackendConnectionError so BackendDupeFilter's graceful-degradation arm
+    catches it (degrade to not-seen) instead of crashing the crawl. The raw
+    TransportError is chained (``from e``) for diagnosis.
 
-    Previously the broad ``except TransportError: return False`` conflated
-    any transport failure with "already existed" — the dupefilter's
-    ``return not added`` then treated every backend error as a duplicate,
-    silently dropping new requests during network blips / cluster red.
+    Supersedes R31-A1's "must propagate raw" — but preserves R31-A1's core
+    concern: add does NOT return False on error. Previously the broad
+    ``except TransportError: return False`` conflated any transport failure
+    with "already existed" — the dupefilter's ``return not added`` then
+    treated every backend error as a duplicate, silently dropping new
+    requests during network blips / cluster red. It still raises a typed,
+    catchable exception; only the type changed from raw ``TransportError``
+    to ``BackendConnectionError`` so ``except BackendError`` (the dupefilter's
+    degradation arm) catches it uniformly across backends.
     """
     from elasticsearch import TransportError
 
+    from scrapy_extension.exceptions import BackendConnectionError
+
     b = _mock_backend(mocker)
     b._client.index.side_effect = TransportError("connection refused")
-    with pytest.raises(TransportError):
+    with pytest.raises(BackendConnectionError) as exc_info:
       b.add("s", b"item")
+    assert exc_info.value.backend_type == "elasticsearch"
+    assert isinstance(exc_info.value.__cause__, TransportError)  # raw error chained
 
 
 class TestPing:

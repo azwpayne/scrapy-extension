@@ -187,13 +187,14 @@ class TestAdd:
   """Test add method exception handling."""
 
   def test_add_transport_error(self, mocker):
-    """R31-A1: TransportError must propagate, NOT return False.
-
-    The previous ``except TransportError: return False`` conflated every
-    transport-level failure (network blip, broker down, auth) with the
-    "already existed" signal. The dupefilter's ``return not added`` then
-    treated every backend error as a duplicate, silently dropping new
-    requests during coordinated outages.
+    """R-dupe-1 (option b): a transient TransportError during set add is wrapped
+    as BackendConnectionError so BackendDupeFilter's graceful-degradation arm
+    catches it (degrade to not-seen) instead of crashing the crawl. The raw
+    TransportError is chained (``from e``) for diagnosis. Supersedes R31-A1's
+    "must propagate" — but preserves R31-A1's core concern: add does NOT return
+    False on error (no silent mis-treatment as duplicate); it raises a typed,
+    catchable exception. The dupefilter degradation arm exists now and the
+    "dead spider is worse than a duplicate fetch" philosophy wins.
     """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
@@ -210,8 +211,10 @@ class TestAdd:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(TransportError, match="Index failed"):
+    with pytest.raises(BackendConnectionError) as exc_info:
       backend.add("s", b"item")
+    assert exc_info.value.backend_type == "elasticsearch"
+    assert isinstance(exc_info.value.__cause__, TransportError)  # raw error chained
 
 
 class TestContains:

@@ -179,6 +179,34 @@ def test_mongodb_backend_set_operations(mocker):
   assert result is False
 
 
+def test_mongodb_set_add_wraps_pymongo_error(mocker):
+  """R-dupe-1 (option b): a transient PyMongoError during set add is wrapped as
+  BackendConnectionError so BackendDupeFilter degrades instead of crashing.
+  DuplicateKeyError (the 'already existed' signal) still returns False -- it's a
+  success signal, NOT wrapped."""
+  from pymongo.errors import DuplicateKeyError, PyMongoError
+
+  from scrapy_extension.exceptions import BackendConnectionError
+
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._set_collection = mock_collection
+
+  # Operational PyMongoError → wrapped as BackendConnectionError.
+  mock_collection.insert_one.side_effect = PyMongoError("set add failed")
+  with pytest.raises(BackendConnectionError) as exc_info:
+    backend.add("test_set", b"item")
+  assert exc_info.value.backend_type == "mongodb"
+
+  # DuplicateKeyError (the 'already existed' signal) still returns False,
+  # NOT wrapped — it is a success signal, not a transient error.
+  mock_collection.insert_one.side_effect = DuplicateKeyError("dup")
+  assert backend.add("test_set", b"item") is False
+
+
 def test_mongodb_backend_set_remove(mocker):
   """Test MongoDB backend set remove."""
   config = MongoDBSettings()

@@ -368,6 +368,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       if "version_conflict" in str(e).lower():
         return False
       raise
+    except TransportError as e:
+      # R-dupe-1 (option b): wrap transient TransportError so BackendDupeFilter's
+      # graceful-degradation arm catches it (degrade to not-seen) instead of
+      # crashing the crawl. ConflictError + version-conflict RequestError (the
+      # "already existed" signals) stay first. Non-conflict RequestError still
+      # re-raises (contract error, not transient). Supersedes R31-A1.
+      raise BackendConnectionError(
+        f"ElasticSearch set add failed for {set_name!r}: {e}",
+        backend_type="elasticsearch",
+      ) from e
     return True
 
   def remove(self, set_name: str, item: bytes) -> bool:

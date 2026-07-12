@@ -50,6 +50,11 @@ jobs:
   # the stock GitHub runner. See #44.
   integration-tests:
     runs-on: ubuntu-latest
+    # Bound the whole job. A hung broker-client op (no per-op timeout) used to
+    # bleed to GitHub Actions' 360-min default — every run since the #44 series
+    # landed as cancelled-at-6h. 15 min is generous (broker bring-up ~2 min +
+    # the 27-test suite under per-test --timeout below).
+    timeout-minutes: 15
     services:
       redis:
         image: redis:7
@@ -162,6 +167,13 @@ jobs:
           # gRPC PROXY endpoint (host:8081), NOT the NameServer. The broker
           # runs with --enable-proxy via the compose step above.
           SCRAPY_TEST_ROCKETMQ_NAMESRV: localhost:8081
+        # Global addopts (pyproject.toml) set --disable-socket. That blocks the
+        # broker connections this job needs — redis/mongo/es/rabbitmq error fast
+        # (SocketBlockedError), but RocketMQ's apache gRPC client retries the
+        # blocked connection with no cap and HANGS (the original 6h-bleed root
+        # cause). --allow-hosts opens localhost, where every CI broker lives, so
+        # the suite can reach them while external sockets stay blocked.
         run: >
           uv run pytest tests/integration
-          -m integration --tb=short -q
+          -m integration --tb=short -v --timeout=120
+          --allow-hosts=localhost,127.0.0.1,::1
