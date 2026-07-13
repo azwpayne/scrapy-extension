@@ -34,6 +34,39 @@ def test_connection_manager_close_evicts_from_registry():
   assert manager_after is not manager
 
 
+def test_close_bare_instance_does_not_evict_registered_peer():
+  """A bare ``ConnectionManager(...)`` (not inserted via get_manager) sharing a
+  registry key with a registered peer must NOT evict that peer on close().
+
+  ``close()`` evicts by registry key (``cls._managers.pop(key, None)``). Without
+  an identity check, a bare instance constructed in tests — whose key collides
+  with a registered manager — silently evicts the peer on close(): the peer
+  disappears from the registry while still held by its caller, so the next
+  ``get_manager(same key)`` creates a second live manager (split-brain /
+  connection leak). The fix guards the pop with ``is self``.
+  """
+  registered = ConnectionManager.get_manager(
+    BackendType.REDIS, {"host": "bare-peer-host"}
+  )
+  key = ConnectionManager._registry_key(
+    BackendType.REDIS, {"host": "bare-peer-host"}
+  )
+  assert ConnectionManager._managers.get(key) is registered
+
+  # Bare instance — NOT inserted via get_manager — sharing the same key.
+  bare = ConnectionManager(BackendType.REDIS, {"host": "bare-peer-host"})
+  assert bare._users == 0
+  bare.close()  # must not raise, must not evict the registered peer
+
+  # The registered peer is STILL in the registry (bare close did not evict it).
+  assert ConnectionManager._managers.get(key) is registered, (
+    "bare ConnectionManager.close() evicted a registered peer sharing the key"
+  )
+
+  # Cleanup.
+  registered.close()
+
+
 def test_connection_manager_clear_registry():
   """R1-P1-8: clear_registry() wipes all managers — for test isolation."""
   ConnectionManager.get_manager(BackendType.REDIS, {"host": "h1"})

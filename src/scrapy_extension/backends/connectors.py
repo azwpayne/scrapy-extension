@@ -647,7 +647,14 @@ class ConnectionManager:
         self._users -= 1
       is_last_holder = self._users <= 0
       if is_last_holder:
-        cls._managers.pop(key, None)
+        # Evict by IDENTITY, not key — a bare ``ConnectionManager(...)`` (not
+        # inserted via get_manager) sharing this key must not evict a registered
+        # peer. A plain pop(key, None) would silently remove the peer while it's
+        # still held, so the next get_manager(same key) creates a second live
+        # manager (split-brain / connection leak). See
+        # test_close_bare_instance_does_not_evict_registered_peer.
+        if cls._managers.get(key) is self:
+          cls._managers.pop(key, None)
 
     if not is_last_holder:
       return
