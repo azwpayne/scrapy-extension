@@ -74,7 +74,7 @@ def test_push_short_delay_lands_in_correct_slot():
   s.push("q", b"x", delay=5.0)
   qb.push.assert_not_called()  # held, not live
   slot = 105 % 60
-  assert s._wheel[slot] == deque([(b"x", 0.0)])
+  assert s._wheel[slot] == deque([(105.0, b"x", 0.0)])
 
 
 def test_push_long_delay_goes_to_overflow_heap():
@@ -151,6 +151,33 @@ def test_drain_span_capped_to_one_rotation():
   qb.push.assert_called_once_with("q", b"x", 0.0)
 
 
+def test_long_idle_drain_does_not_release_future_wheel_item_early():
+  """A future wheel item pushed DURING a long idle (> one rotation) must NOT
+  be released early by the catch-up full-rotation drain.
+
+  The drain caps the span to wheel_size (one full rotation). After a long idle
+  the cap covers every slot — including a slot holding a future item pushed
+  during the idle. Without a ready_at check on drain, that item is released
+  before its delay elapses (the slot stored only (item, priority), so the drain
+  couldn't tell future from due).
+  """
+  s, qb, clock = _strategy(wheel_size=4, ticks_per_second=1.0, clock_value=0.0)
+  # _last_tick = 0. Idle past one full rotation (4s) to tick 5.
+  clock[0] = 5.0
+  # Push a future item: delay=3 -> ready_at=8, slot = 8 % 4 = 0.
+  s.push("q", b"future", delay=3.0)
+  # Pop at tick 5: the catch-up drain (span=min(5,4)=4) covers ticks 1-4
+  # (slots 1,2,3,0). Slot 0 is hit via tick 4. Without the fix the future
+  # item (ready_at=8) is released 3s early.
+  s.pop("q")
+  qb.push.assert_not_called()  # future item NOT released early
+
+  # Advance to ready_at=8 and pop — now it should be released.
+  clock[0] = 8.0
+  s.pop("q")
+  qb.push.assert_called_once_with("q", b"future", 0.0)
+
+
 def test_wrap_around_drains_correct_slot():
   """Wheel wrap: slot index mod wheel_size handles rotation past the end."""
   s, qb, clock = _strategy(wheel_size=10, ticks_per_second=1.0, clock_value=8.0)
@@ -210,21 +237,22 @@ def test_snapshot_serializes_wheel_and_overflow():
 
 
 def test_restore_round_trip_rebuilds_state():
-  """Restore preserves 'held items are not lost' — wheel items route to
-  overflow with ready_at=now (slots_flat carries no ready_at to recompute
-  the exact slot), so they drain on the next pop. Overflow items keep ready_at.
+  """Restore preserves ready_at — a future wheel item is re-placed in the wheel
+  at its recomputed slot (NOT routed to overflow), so its remaining delay
+  survives the restart. Overflow items keep ready_at. Past-due wheel items
+  route to overflow so they drain on the next pop.
   """
   s1, _, clock = _strategy(wheel_size=60, clock_value=100.0)
-  s1.push("q", b"w", delay=5.0, priority=2.0)
-  s1.push("q", b"o", delay=100.0, priority=1.0)
+  s1.push("q", b"w", delay=5.0, priority=2.0)   # ready_at=105 (future at restore)
+  s1.push("q", b"o", delay=100.0, priority=1.0)  # ready_at=200 (overflow)
   blob = s1.snapshot()
 
   s2, _, _ = _strategy(wheel_size=60, clock_value=100.0)
   s2.restore(blob)
-  # 1 wheel item (restored to overflow @ ready_at=now) + 1 original overflow
-  # item (ready_at preserved) = 2 items held; wheel itself stays empty.
-  assert sum(len(slot) for slot in s2._wheel) == 0
-  assert len(s2._overflow) == 2
+  # The future wheel item (ready_at=105 > now=100) is re-placed in the wheel
+  # at slot 105 % 60 = 45; the overflow item (ready_at=200) stays in overflow.
+  assert sum(len(slot) for slot in s2._wheel) == 1
+  assert len(s2._overflow) == 1
 
 
 def test_restore_none_is_noop():
