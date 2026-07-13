@@ -205,6 +205,79 @@ class TestStrategyCloseFailureIsNonFatal:
     assert scheduler._spider is None
 
 
+class TestSignalDisconnectFailureIsNonFatal:
+  """Behavior #5 (exception-safety symmetry): a signal ``disconnect()`` raising
+  does NOT block ``queue.close()`` (snapshot persist) or ``connection_manager.close()``.
+
+  Symmetric with ``TestStrategyCloseFailureIsNonFatal`` (#3). The close path
+  already guarded ``self._queue.close()`` with try/except (lines 654-658), but
+  the signal-disconnect block that PRECEDES it (lines 642-650) was unguarded —
+  so a raise from ``disconnect`` (realistic via pydispatch ``DispatcherKeyError``
+  on a stale/already-disconnected tuple, e.g. double-close after a partial engine
+  teardown, or a signal manager already torn down) skipped the queue snapshot
+  persist AND leaked the backend connection. This pins the symmetry fix: the
+  disconnect block is now guarded, so the queue/CM close + state-reset tail
+  always runs.
+  """
+
+  def test_signal_disconnect_raising_still_closes_queue_and_cm(
+    self, mock_connection_manager, mocker
+  ):
+    """A ``disconnect()`` that raises is swallowed; queue.close() + CM close still run."""
+    from scrapy_extension.queue.strategies.base import QueueStrategy
+
+    call_log: list[str] = []
+
+    class _RecordingStrategy(QueueStrategy):
+      def push(self, queue_name, item, *, priority=0.0, delay=0.0, source="default"):  # noqa: ARG002
+        pass
+
+      def pop(self, queue_name, timeout=0.0):  # noqa: ARG002
+        return None
+
+      def queue_len(self, queue_name):  # noqa: ARG002
+        return 0
+
+      def clear(self, queue_name):  # noqa: ARG002
+        pass
+
+      def close(self) -> None:
+        call_log.append("strategy_close")
+
+    def _cm_close_side_effect():
+      call_log.append("cm_close")
+
+    mock_connection_manager.close.side_effect = _cm_close_side_effect
+
+    scheduler, _ = _make_scheduler_with_queue(
+      mock_connection_manager, mocker,
+      queue_strategy=_RecordingStrategy(mock_connection_manager),
+    )
+
+    # After open(), _connected_signals is the crawler's signal manager. Make its
+    # disconnect raise as pydispatch does for a stale/already-disconnected tuple
+    # (DispatcherKeyError). The fix catches Exception, so any raise exercises it.
+    assert scheduler._connected_signals is not None
+    scheduler._connected_signals.disconnect.side_effect = RuntimeError(
+      "stale tuple (already disconnected)"
+    )
+
+    # Must NOT raise — the disconnect explosion is caught + logged inside close().
+    scheduler.close("finished")
+
+    # queue.close() (strategy_close) AND connection_manager.close() (cm_close)
+    # BOTH ran despite the disconnect raising — snapshot persist + connection
+    # teardown were NOT skipped, in the correct order.
+    assert call_log == ["strategy_close", "cm_close"], (
+      f"Expected strategy_close then cm_close despite disconnect raising; got {call_log}"
+    )
+    # State was STILL reset — no re-entry poison left for a second open().
+    assert scheduler._queue is None
+    assert scheduler._spider is None
+    assert scheduler._connected_signals is None
+    assert scheduler._signals_connected is False
+
+
 class TestCloseResetsStateForReuse:
   """Behavior #4: after close, scheduler is reusable (state cleared)."""
 
