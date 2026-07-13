@@ -1,7 +1,7 @@
 """Scrapy extension for distributed crawling with multiple backend support.
 
 This package provides distributed crawling capabilities for Scrapy with support
-for multiple backends: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, and RocketMQ.
+for multiple backends: Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ, Pulsar, SQS, Memcached, and DynamoDB.
 """
 
 from __future__ import annotations
@@ -210,6 +210,18 @@ def __getattr__(name: str) -> object:
             # Real bug (or a non-dep ImportError) — surface the original chain.
             raise
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """PEP 562 companion — expose lazily-imported names to dir() and autocomplete.
+
+    Without this, ``dir(scrapy_extension)`` / ``pydoc`` / IDE autocomplete see
+    only eagerly-imported names; the 30 lazily-imported ``__all__`` members
+    (backends, Mode enums, Settings classes) are invisible despite importing
+    successfully on access. Returns eager globals union the lazy
+    ``_OPTIONAL_IMPORTS`` keys — no optional dep is imported (dict keys only).
+    """
+    return sorted(set(globals()) | set(_OPTIONAL_IMPORTS))
 
 
 __all__ = [

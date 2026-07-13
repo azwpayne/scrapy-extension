@@ -873,5 +873,64 @@ class TestIsMissingOptionalDepBranches:
     )
 
 
+# ---------------------------------------------------------------------------
+# 11. PEP 562 __dir__() companion — dir() and autocomplete see lazy imports
+# ---------------------------------------------------------------------------
+
+
+class TestDirCompanionExposesLazyImports:
+    """PEP 562 __dir__() companion — dir() and IDE autocomplete see lazy imports.
+
+    Without __dir__, ``dir(scrapy_extension)`` lists only eagerly-imported
+    names; the lazily-imported __all__ members (backends, Mode enums, Settings
+    classes) are invisible to ``dir()``, ``pydoc``, and IDE autocomplete even
+    though they import successfully on access. The companion ``__dir__()``
+    returns ``sorted(set(globals()) | set(_OPTIONAL_IMPORTS))`` so every lazy
+    name is discoverable without eagerly importing its optional dep.
+    """
+
+    def test_dir_includes_lazy_backend_classes(self):
+        """dir(scrapy_extension) includes all 10 lazily-imported backend classes."""
+        dir_names = set(dir(scrapy_extension))
+        lazy_backends = {
+            "RedisBackend", "MongoDBBackend", "KafkaBackend",
+            "RabbitMQBackend", "ElasticSearchBackend", "RocketMQBackend",
+            "PulsarBackend", "SqsBackend", "MemcachedBackend", "DynamoDBBackend",
+        }
+        missing = lazy_backends - dir_names
+        assert not missing, (
+            f"Lazy backends missing from dir(scrapy_extension): {sorted(missing)}"
+        )
+
+    def test_dir_includes_lazy_settings_and_modes(self):
+        """dir(scrapy_extension) includes lazily-imported Settings + Mode names."""
+        dir_names = set(dir(scrapy_extension))
+        lazy_settings = {
+            "RedisSettings", "RedisMode", "SqsSettings", "SqsMode",
+            "DynamoDBSettings", "DynamoDBMode", "MemcachedSettings",
+            "MemcachedMode", "PulsarSettings", "PulsarMode",
+        }
+        missing = lazy_settings - dir_names
+        assert not missing, (
+            f"Lazy settings/modes missing from dir(scrapy_extension): {sorted(missing)}"
+        )
+
+    def test_dir_is_superset_of_all(self):
+        """Every name in __all__ appears in dir(scrapy_extension)."""
+        dir_names = set(dir(scrapy_extension))
+        missing = set(scrapy_extension.__all__) - dir_names
+        assert not missing, f"__all__ names missing from dir(): {sorted(missing)}"
+
+    def test_backends_dir_includes_lazy_backend_classes(self):
+        """dir(scrapy_extension.backends) includes all lazily-imported backends."""
+        from scrapy_extension.backends import _BACKEND_MODULES
+
+        dir_names = set(dir(scrapy_extension.backends))
+        missing = set(_BACKEND_MODULES) - dir_names
+        assert not missing, (
+            f"Lazy backends missing from dir(scrapy_extension.backends): {sorted(missing)}"
+        )
+
+
 
 
