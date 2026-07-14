@@ -640,7 +640,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     if prefix is not None:
       _validate_key_name(prefix, "prefix")
-    query = {"prefix": {"key": prefix}} if prefix else {"match_all": {}}
+    # R-es-keyword: target the ``.keyword`` subfield, not the analyzed ``key``
+    # text field. ``key`` is dynamically mapped as text (standard analyzer); a
+    # ``prefix`` query on the analyzed field matches tokens, not the full key
+    # value, so prefix clearing would silently over-match or no-op. The
+    # ``.keyword`` subfield is unanalyzed → exact-prefix match (same convention
+    # as ``_count`` / ``_delete_by_term`` / ``pop``). Parity with redis
+    # scan_iter(match=prefix*) and dynamodb begins_with (#64).
+    query = {"prefix": {"key.keyword": prefix}} if prefix else {"match_all": {}}
     self._delete_by_query(self.config.storage_index, query)
 
   # ---- Shared helpers ----
