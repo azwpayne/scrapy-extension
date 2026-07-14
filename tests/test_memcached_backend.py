@@ -95,6 +95,28 @@ class TestMemcachedConnect:
       b.connect()
     assert b.is_connected() is False
 
+  def test_connect_stats_failure_nulls_client(self, mocker) -> None:
+    """R-mcc: stats() failure must null the half-created client.
+
+    pymemcache's Client ctor is lazy (no network I/O); ``stats()`` is the real
+    probe. Pre-fix, a failed ``stats()`` left ``_client`` pointing at a
+    never-connected client, so ``is_connected()`` returned True after a
+    ``connect()`` that already raised ``BackendConnectionError`` -- wedging the
+    backend "connected-but-dead" (``ConnectionManager.is_connected()`` delegates
+    here, so external health checks saw the lying True and skipped reconnect).
+    Mirrors RabbitMQ R25-A1 null-on-failure. The ctor-raises path
+    (``test_connect_failure_raises``) is unaffected -- the ``is not None`` guard
+    skips close when ``_client`` was never assigned.
+    """
+    b = _make_backend()
+    client = mocker.MagicMock()
+    client.stats.side_effect = RuntimeError("stats probe failed")
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    with pytest.raises(BackendConnectionError):
+      b.connect()
+    assert b.is_connected() is False
+    client.close.assert_called_once()
+
   def test_disconnect_closes_client(self, mocker) -> None:
     b, client = _connected(mocker)
     b.disconnect()

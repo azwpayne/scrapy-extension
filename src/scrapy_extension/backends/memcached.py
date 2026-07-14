@@ -69,6 +69,11 @@ class MemcachedBackend(Backend, StorageBackend):
   def connect(self) -> None:
     """Connect to Memcached and verify with a stats() call.
 
+    On failure the half-created client is closed and ``_client`` is reset to
+    ``None`` so :meth:`is_connected` reports ``False`` truthfully (R-mcc,
+    mirrors RabbitMQ R25-A1) -- a failed ``stats()`` probe must not leave a
+    never-connected client that lies "connected" and wedges the backend.
+
     Raises:
         BackendConnectionError: If the connection cannot be established.
     """
@@ -82,6 +87,20 @@ class MemcachedBackend(Backend, StorageBackend):
       self._client.stats()
       logger.debug("Connected to Memcached at %s:%s", self.config.host, self.config.port)
     except Exception as e:
+      # R-mcc: null the half-created client so is_connected() stays truthful.
+      # pymemcache's Client ctor is lazy (no network I/O); stats() is the real
+      # probe, so a failed stats() leaves _client pointing at a never-connected
+      # client. Without this reset, is_connected() (``return self._client is not
+      # None``) returns True after a connect() that already raised
+      # BackendConnectionError -- ConnectionManager.is_connected() delegates
+      # here (connectors.py), so external health checks would see a lying True
+      # and skip reconnect, wedging the backend "connected-but-dead". Mirrors
+      # RabbitMQ R25-A1 null-on-failure (rabbitmq.py:246). The ``is not None``
+      # guard also covers the ctor-raises path (client never assigned -> skip).
+      if self._client is not None:
+        with _swallow():
+          self._client.close()
+        self._client = None
       raise BackendConnectionError(
         f"Failed to connect to Memcached ({self.config.host}:{self.config.port}): {e}",
         backend_type="memcached",
