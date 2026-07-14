@@ -947,7 +947,10 @@ class TestKafkaBackendClearQueue:
     assert new_topic.name == "scrapy-testq"
 
   def test_clear_queue_handles_kafka_error(self, mocker):
-    """Test clear_queue logs warning on KafkaError."""
+    """R-clearq: clear_queue raises QueueError on KafkaError (not log + swallow).
+
+    Parity with rabbitmq clear_queue (#69) and kafka queue_len (#68).
+    """
     config = KafkaSettings()
     backend = KafkaBackend(config)
 
@@ -955,8 +958,9 @@ class TestKafkaBackendClearQueue:
     mock_admin.delete_topics.side_effect = KafkaError("Delete failed")
     backend._admin_client = mock_admin
 
-    # Should not raise
-    backend.clear_queue("testq")
+    with pytest.raises(QueueError) as exc_info:
+      backend.clear_queue("testq")
+    assert exc_info.value.operation == "clear_queue"
 
 
 class TestKafkaBackendBackendType:

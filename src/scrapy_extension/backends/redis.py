@@ -640,6 +640,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the delete fails at the Redis layer.
     """
     _validate_key_name(queue_name, "queue_name")
     payload_key = self._payload_key(queue_name)
@@ -647,7 +648,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     try:
       self.client.delete(queue_name, payload_key, counter_key)
     except RedisError as e:
-      logger.warning("Failed to clear queue %s: %s", queue_name, e)
+      msg = f"Failed to clear queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
   # SetBackend implementation using Redis Sets
   def add(self, set_name: str, item: bytes) -> bool:

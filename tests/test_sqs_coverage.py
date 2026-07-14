@@ -70,10 +70,13 @@ class TestSqsErrorPaths:
     with pytest.raises(QueueError):
       b.ack("q")
 
-  def test_clear_swallows_failure(self, mocker) -> None:
+  def test_clear_raises_on_failure(self, mocker) -> None:
+    """R-clearq: clear_queue raises QueueError on purge failure (not swallow)."""
     b, client = _connected(mocker)
     client.purge_queue.side_effect = RuntimeError("purge fail")
-    b.clear_queue("q")  # must not raise
+    with pytest.raises(QueueError) as exc_info:
+      b.clear_queue("q")
+    assert exc_info.value.operation == "clear_queue"
 
   def test_disconnect_and_ping(self, mocker) -> None:
     b, _ = _connected(mocker)
