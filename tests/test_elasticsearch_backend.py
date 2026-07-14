@@ -251,9 +251,34 @@ class TestQueue:
     assert b.queue_len("q") == 5
 
   def test_queue_len_error(self, mocker):
+    """R-es-qlen: queue_len must raise QueueError on TransportError, not
+    swallow to 0 (the real _client.count path).
+
+    Pre-fix ``_count`` swallowed TransportError and returned 0, so queue_len's
+    own ``except TransportError -> raise QueueError`` arm was dead code and
+    queue_len returned 0 -- masking a backend failure from the scheduler's
+    idle/backpressure gate (R-qlen parity with Redis + SQS).
+    """
+    from scrapy_extension.exceptions import QueueError
+
     b = _mock_backend(mocker)
     b._client.count.side_effect = TransportError("err")
-    assert b.queue_len("q") == 0
+    with pytest.raises(QueueError):
+      b.queue_len("q")
+
+  def test_set_len_error_returns_zero(self, mocker):
+    """R-es-qlen: set_len returns 0 on TransportError (diagnostic, redis parity).
+
+    set_len is a diagnostic count (not safety-critical for idle detection), so
+    it returns 0 on error like Redis's ``set_len`` (``except RedisError: return
+    0``). The asymmetry with queue_len (which raises QueueError) is intentional:
+    the scheduler trusts ``len(queue)`` for idle/backpressure, but set_len is
+    observational. After ``_count``'s swallow was removed, set_len owns its own
+    except arm to preserve this contract.
+    """
+    b = _mock_backend(mocker)
+    b._client.count.side_effect = TransportError("err")
+    assert b.set_len("s") == 0
 
   def test_clear_queue(self, mocker):
     b = _mock_backend(mocker)
