@@ -160,7 +160,11 @@ class TestDynamoDBStorageOps:
       "Item": {"pk": "key1", "value": b"x", "expire_at": 1.0}  # epoch in 1970
     }
     assert b.retrieve("key1") is None
-    table.delete_item.assert_called_once_with(Key={"pk": "key1"})
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "key1"},
+      ConditionExpression="expire_at = :exp",
+      ExpressionAttributeValues={":exp": 1.0},
+    )
 
   def test_delete_returns_bool(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -193,7 +197,11 @@ class TestDynamoDBStorageOps:
       "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}  # epoch in 1970
     }
     assert b.exists("k") is False
-    table.delete_item.assert_called_once_with(Key={"pk": "k"})
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "k"},
+      ConditionExpression="expire_at = :exp",
+      ExpressionAttributeValues={":exp": 1.0},
+    )
 
   def test_ttl_returns_remaining(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -219,7 +227,34 @@ class TestDynamoDBStorageOps:
       "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}  # epoch in 1970
     }
     assert b.ttl("k") is None
-    table.delete_item.assert_called_once_with(Key={"pk": "k"})
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "k"},
+      ConditionExpression="expire_at = :exp",
+      ExpressionAttributeValues={":exp": 1.0},
+    )
+
+  def test_lazy_reap_delete_is_conditional_cas(self, mocker) -> None:
+    """R-dyncas: the lazy-reap delete must be a CAS on ``expire_at``.
+
+    Pre-fix ``_lazy_reap_if_expired`` did ``delete_item(Key={"pk": key})`` from
+    a stale ``get_item`` snapshot. A concurrent ``store()`` (``put_item``)
+    between the read and the reap would overwrite the key with a fresh value,
+    and the unconditional delete clobbered the fresh write -> data loss. The
+    CAS (``ConditionExpression="expire_at = :exp"``) makes a concurrent
+    overwrite fail the condition (``ConditionalCheckFailedException``, swallowed
+    by ``_swallow``) so the fresh item survives. ``expire_at`` is guaranteed
+    non-None here (``_is_expired`` returns False when None).
+    """
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}  # epoch in 1970
+    }
+    assert b.retrieve("k") is None
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "k"},
+      ConditionExpression="expire_at = :exp",
+      ExpressionAttributeValues={":exp": 1.0},
+    )
 
   def test_clear_storage_scans_and_deletes(self, mocker) -> None:
     b, table = _connected(mocker)
