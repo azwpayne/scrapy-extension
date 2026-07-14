@@ -221,6 +221,63 @@ class TestSuccessResets:
     assert b.last_failure_time is None
 
 
+class TestStaleSuccessRace:
+  """A late success from a slow call (stale ``prior_state``) must not wedge the
+  breaker OPEN.
+
+  Race: ``call()`` captures ``prior_state`` under the lock, RELEASES the lock,
+  runs ``func()`` (slow, no lock), then re-acquires the lock and calls
+  ``_record_success(prior_state)`` with a STALE prior_state. If another thread
+  trips the breaker OPEN during func(), the stale ``_record_success(CLOSED)``
+  clears ``_last_failure_time = None``. The cool-down check in ``_allow_call``
+  gates on ``opened_at is not None`` — a None timestamp prevents the
+  OPEN->HALF_OPEN transition, so the breaker can NEVER recover (no background
+  timer; recovery is lazy on the next call). Backend permanently unreachable
+  until manual ``reset()`` or process restart.
+  """
+
+  def test_late_success_does_not_wedge_open_breaker(self):
+    clock = FakeClock()
+    b = CircuitBreaker("q", failure_threshold=3, reset_timeout=10.0, time_fn=clock)
+
+    # Thread A: capture prior_state=CLOSED under the lock (the slow call's
+    # acquire), then "release" — func() is now in flight (not simulated).
+    with b._lock:
+      prior_state = b._allow_call()
+    assert prior_state is BreakerState.CLOSED
+
+    # Thread B: while A's func() is in flight, threshold failures trip OPEN.
+    for _ in range(3):
+      with b._lock:
+        b._record_failure(BreakerState.CLOSED)
+    assert b.state is BreakerState.OPEN
+    trip_time = b.last_failure_time
+    assert trip_time is not None
+
+    # Thread A: slow func() finally SUCCEEDS and records with the STALE
+    # prior_state=CLOSED (captured before the trip).
+    with b._lock:
+      b._record_success(prior_state)
+
+    # The breaker must STILL be OPEN with the trip timestamp INTACT — the wedge
+    # would clear _last_failure_time=None, blocking the OPEN->HALF_OPEN check.
+    assert b.state is BreakerState.OPEN
+    assert b.last_failure_time == trip_time, (
+      "late success clobbered _last_failure_time -> breaker wedged OPEN forever "
+      "(cool-down check gates on opened_at is not None)"
+    )
+
+    # Recovery: after reset_timeout elapses, _allow_call MUST transition to
+    # HALF_OPEN. The wedge (cleared timestamp) returns OPEN here — the regression.
+    clock.advance(100.0)
+    with b._lock:
+      effective = b._allow_call()
+    assert effective is BreakerState.HALF_OPEN, (
+      "breaker could not recover OPEN->HALF_OPEN — _last_failure_time was "
+      "cleared by a stale success (permanent backend outage)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reset helper
 # ---------------------------------------------------------------------------

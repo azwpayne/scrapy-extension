@@ -201,7 +201,23 @@ class CircuitBreaker:
     On any success the consecutive-failure count resets to zero. If the call
     was a HALF_OPEN probe, the breaker closes fully and the probe slot is
     released.
+
+    Stale-prior_state guard: ``call()`` captures ``prior_state`` under the
+    lock, releases it for ``func()``, then re-acquires the lock here. If
+    another thread tripped the breaker OPEN during func(), the stale success
+    must NOT clobber the trip's bookkeeping — clearing ``_last_failure_time``
+    here would wedge the breaker OPEN forever (the cool-down check in
+    :meth:`_allow_call` gates on ``opened_at is not None``, so a None
+    timestamp prevents the OPEN→HALF_OPEN transition; no background timer
+    runs, recovery is lazy on the next call). The late success is from a call
+    that started BEFORE the trip; it must not undo a trip reflecting the
+    backend's state at trip time. See
+    ``test_late_success_does_not_wedge_open_breaker``.
     """
+    if self._state is BreakerState.OPEN:
+      # Another thread tripped the breaker while func() was in flight; the
+      # stale success must not clobber the trip timestamp (would wedge OPEN).
+      return
     self._failure_count = 0
     self._last_failure_time = None
     if prior_state is BreakerState.HALF_OPEN:
