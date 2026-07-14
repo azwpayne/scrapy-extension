@@ -1501,17 +1501,29 @@ class TestRedisBackendStorageOperations:
     backend.store("test_key", b"test_data")
     mock_redis.set.assert_called_once_with("test_key", b"test_data")
 
-  def test_storage_store_error(self, redis_settings, mock_redis, mocker, caplog):
-    """Test storage store logs warning on RedisError."""
+  def test_storage_store_error(self, redis_settings, mock_redis, mocker):
+    """R-store: RedisError on store must raise StorageError, not be swallowed.
+
+    Pre-fix ``store()`` caught ``RedisError`` and returned normally, so the
+    item pipeline treated the failed write as a success — silent data loss AND
+    the ``max_storage_errors`` (C2) escalation was neutered (the success arm
+    reset the consecutive-error counter). Now mirrors the
+    mongodb/elasticsearch/memcached/dynamodb ``store()`` contracts (all raise
+    ``StorageError``). Redis ``retrieve()`` already propagates (R32-A1); this
+    closes the last storage-path swallow on the Redis backend.
+    """
     from redis.exceptions import RedisError
 
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import StorageError
 
     mock_redis.set.side_effect = RedisError("Write error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    backend.store("test_key", b"test_data")
-    assert "Failed to store key" in caplog.text
+    with pytest.raises(StorageError) as exc_info:
+      backend.store("test_key", b"test_data")
+    assert exc_info.value.operation == "store"
+    assert exc_info.value.key == "test_key"
 
   def test_storage_retrieve_string_conversion(self, redis_settings, mock_redis, mocker):
     """Test storage retrieve converts string to bytes."""

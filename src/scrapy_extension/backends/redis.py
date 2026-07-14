@@ -38,6 +38,7 @@ from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
+    StorageError,
 )
 from scrapy_extension.settings import RedisMode
 
@@ -750,6 +751,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the Redis write fails (R-store). Was previously
+            silently swallowed (warn + normal return), masking data loss in
+            the item pipeline; mirrors the mongodb/elasticsearch/memcached/
+            dynamodb ``store()`` contracts (all raise ``StorageError``).
     """
     _validate_key_name(key, "key")
     try:
@@ -758,7 +763,19 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       else:
         self.client.set(key, data)
     except RedisError as e:
-      logger.warning("Failed to store key %s: %s", key, e)
+      # R-store: do NOT swallow. Pre-fix this logged a warning and returned
+      # normally, so BackendPipeline.process_item's SUCCESS arm ran -- the
+      # item was silently dropped, ``pipeline/storage_errors`` was never
+      # incremented, and the C2 ``max_storage_errors`` escalation was neutered
+      # (the success path resets the consecutive-error counter). Raising lets
+      # the pipeline's ``except Exception`` arm count the failure and escalate.
+      # Matches the other four storage backends; ``retrieve()`` already
+      # propagates (R32-A1). See test_storage_store_error.
+      raise StorageError(
+        f"Failed to store key {key!r} in Redis: {e}",
+        operation="store",
+        key=key,
+      ) from e
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
