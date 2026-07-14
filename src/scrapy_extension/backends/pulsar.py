@@ -700,6 +700,11 @@ class _suppress_pulsar_errors:
   def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
     if exc_type is None:
       return False
-    # Swallow any exception raised inside the block.
+    # R-swallow: suppress only regular cleanup Exceptions -- NEVER BaseException
+    # (KeyboardInterrupt / SystemExit / GeneratorExit). Pre-fix this swallowed
+    # any exception (return True), trapping Ctrl+C during close() (the
+    # operator's shutdown signal disappeared into a debug log).
+    if not isinstance(exc, Exception):
+      return False
     logger.debug("Suppressed pulsar cleanup error: %s", exc)
     return True
