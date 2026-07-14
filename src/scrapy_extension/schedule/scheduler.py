@@ -640,14 +640,20 @@ class BackendScheduler:
     """Close the scheduler."""
     logger.info("Scheduler closed: %s", reason)
     if self._connected_signals is not None:
-      self._connected_signals.disconnect(
-        self._on_response_received,
-        signal=signals.response_received,
-      )
-      self._connected_signals.disconnect(
-        self._on_spider_error,
-        signal=signals.spider_error,
-      )
+      try:
+        self._connected_signals.disconnect(
+          self._on_response_received,
+          signal=signals.response_received,
+        )
+        self._connected_signals.disconnect(
+          self._on_spider_error,
+          signal=signals.spider_error,
+        )
+      except Exception:
+        # Mirrors the _queue.close() guard below — a stale/already-disconnected
+        # tuple (pydispatch DispatcherKeyError) must not block queue snapshot
+        # persist or connection teardown. See TestSignalDisconnectFailureIsNonFatal.
+        logger.exception("Failed to disconnect ack/nack signals during shutdown")
     # Close the queue strategy FIRST so it can warn about / release any
     # in-process held state (e.g. DelayQueueStrategy's delayed items) while
     # the backend is still connected. Must precede connection_manager.close().
