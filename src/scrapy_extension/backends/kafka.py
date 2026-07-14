@@ -11,6 +11,7 @@ Note: Kafka does not support SetBackend or StorageBackend operations.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections import defaultdict
@@ -202,18 +203,42 @@ class KafkaBackend(Backend, QueueBackend):
         self._connect_confluent()
       logger.debug("Connected to Kafka in %s mode", self.config.mode.value)
     except KafkaError as e:
+      self._abort_partial_connect()
       msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="kafka",
       ) from e
     except Exception as e:
+      self._abort_partial_connect()
       # Unexpected errors (e.g., RuntimeError from mocking in tests)
       msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="kafka",
       ) from e
+
+  def _abort_partial_connect(self) -> None:
+    """Close+null any clients assigned before ``connect()`` failed.
+
+    R-kacc: in each ``_connect_*`` path ``self._producer`` is assigned
+    BEFORE ``KafkaAdminClient`` is constructed. If admin construction (or
+    any later step) raises, ``self._producer`` would otherwise stay set so
+    :meth:`is_connected` lies ``True`` (silent wedge — backend reports
+    connected but has no admin client, so ping/queue_len/clear_queue are
+    dead) and the producer leaks under the ConnectionManager retry loop.
+    Mirror the R-mcc memcached connect-cleanup (PR #60): null the partial
+    state so ``is_connected()`` stays truthful. Idempotent and close-safe
+    (a failing ``close()`` during teardown cannot mask the original error).
+    """
+    if self._producer is not None:
+      with contextlib.suppress(Exception):
+        self._producer.close()
+      self._producer = None
+    if self._admin_client is not None:
+      with contextlib.suppress(Exception):
+        self._admin_client.close()
+      self._admin_client = None
 
   def _build_common_config(self) -> dict[str, Any]:
     """Build common Kafka client configuration.

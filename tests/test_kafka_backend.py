@@ -84,6 +84,38 @@ class TestKafkaBackendConnect:
       backend.connect()
     assert "Failed to connect to Kafka" in str(exc_info.value)
 
+  def test_connect_admin_client_failure_nulls_producer_no_wedge(self, mocker):
+    """R-kacc: admin-client failure AFTER producer assigned must not wedge.
+
+    ``KafkaAdminClient`` construction runs after ``self._producer`` is
+    assigned in each ``_connect_*`` path. If admin construction raises, the
+    producer must be closed and nulled so ``is_connected()`` reports False
+    truthfully (no silent wedge) and the producer is not leaked under the
+    ConnectionManager retry loop. Mirrors the R-mcc memcached connect-cleanup
+    (PR #60).
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+
+    mock_producer = mocker.MagicMock()
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer",
+      return_value=mock_producer,
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient",
+      side_effect=KafkaError("admin init failed"),
+    )
+
+    with pytest.raises(BackendConnectionError):
+      backend.connect()
+
+    # No wedge: is_connected() must be truthful False, not lie True.
+    assert backend.is_connected() is False
+    assert backend._producer is None
+    # No leak: the partially-assigned producer was closed before nulling.
+    mock_producer.close.assert_called_once()
+
 
 class TestKafkaBackendBuildCommonConfig:
   """Tests for _build_common_config method."""
