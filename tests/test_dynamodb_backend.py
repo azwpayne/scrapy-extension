@@ -264,6 +264,23 @@ class TestDynamoDBStorageOps:
     b.clear_storage()
     assert batch.delete_item.call_count == 2
 
+  def test_clear_storage_prefix_applies_filter_expression(self, mocker) -> None:
+    """R-dynprefix: clear_storage(prefix) scopes the scan via FilterExpression.
+
+    Pre-fix the prefix was validated then IGNORED -- scan+delete wiped the entire
+    table (``clear_storage("tenant_a:")`` nuked every tenant), violating the
+    StorageBackend ABC contract ("only clear keys starting with this prefix")
+    and Redis parity. Now the scan carries ``begins_with(pk, :p)`` so only
+    matching keys are deleted.
+    """
+    b, table = _connected(mocker)
+    table.scan.return_value = {"Items": []}
+    b.clear_storage(prefix="tenant_a:")
+    table.scan.assert_called_once()
+    kwargs = table.scan.call_args.kwargs
+    assert kwargs["FilterExpression"] == "begins_with(pk, :p)"
+    assert kwargs["ExpressionAttributeValues"] == {":p": "tenant_a:"}
+
   def test_invalid_key_raises(self, mocker) -> None:
     b, _ = _connected(mocker)
     with pytest.raises(ValueError):
