@@ -378,10 +378,12 @@ class DynamoDBBackend(Backend, StorageBackend):
     return max(0, int(float(item["expire_at"]) - time.time()))
 
   def clear_storage(self, prefix: str | None = None) -> None:
-    """Best-effort clear via scan + batch delete (prefix not filtered).
+    """Best-effort clear via scan + batch delete, optionally prefix-scoped.
 
     Args:
-        prefix: Ignored — DynamoDB scan+delete clears all items in one pass.
+        prefix: If provided, only clear keys whose ``pk`` starts with this
+            prefix (honors the StorageBackend ABC contract — matches Redis's
+            ``scan_iter(match=prefix*)``). If None, clears all items.
 
     Raises:
         ValueError: If prefix contains invalid characters.
@@ -390,6 +392,17 @@ class DynamoDBBackend(Backend, StorageBackend):
     """
     if prefix:
       _validate_key_name(prefix, "prefix")
+    # R-dynprefix: scope the scan to the prefix (StorageBackend ABC contract:
+    # "only clear keys starting with this prefix"). Pre-fix the prefix was
+    # validated then IGNORED -- scan+delete wiped the entire table
+    # (clear_storage("tenant_a:") nuked every tenant). String-form
+    # FilterExpression (no boto3.conditions import, assertable in tests); ``pk``
+    # is not a DynamoDB reserved word so it needs no ExpressionAttributeNames.
+    # Pagination still works: LastEvaluatedKey is returned regardless of filter.
+    scan_kwargs: dict[str, Any] = {}
+    if prefix:
+      scan_kwargs["FilterExpression"] = "begins_with(pk, :p)"
+      scan_kwargs["ExpressionAttributeValues"] = {":p": prefix}
     try:
       # Paginate: a single ``scan`` returns at most ~1 MB per page; without
       # following ``LastEvaluatedKey`` a large table is silently partial-clear
@@ -397,7 +410,8 @@ class DynamoDBBackend(Backend, StorageBackend):
       last_key: dict[str, Any] | None = None
       while True:
         scan = self._table.scan(
-          **({"ExclusiveStartKey": last_key} if last_key else {})
+          **scan_kwargs,
+          **({"ExclusiveStartKey": last_key} if last_key else {}),
         )
         with self._table.batch_writer() as batch:
           for item in scan.get("Items", []):
