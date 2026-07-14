@@ -426,10 +426,19 @@ class TestStorage:
     assert b._client.delete_by_query.call_args.kwargs["query"] == {"match_all": {}}
 
   def test_clear_storage_prefix(self, mocker):
+    """R-es-keyword: prefix clear must target ``key.keyword`` (unanalyzed).
+
+    ``key`` is dynamically mapped as ``text`` (standard analyzer); a ``prefix``
+    query on the analyzed field matches tokens, not the full key value, so prefix
+    clearing would silently over-match or no-op. The ``.keyword`` subfield is
+    unanalyzed → exact-prefix match (same convention as ``_count`` /
+    ``_delete_by_term`` / ``pop``). Parity with redis scan_iter(match=prefix*)
+    and dynamodb begins_with (#64).
+    """
     b = _mock_backend(mocker)
     b.clear_storage(prefix="items:")
     assert b._client.delete_by_query.call_args.kwargs["query"] == {
-      "prefix": {"key": "items:"}
+      "prefix": {"key.keyword": "items:"}
     }
 
   def test_store_wraps_transport_error_as_storage_error(self, mocker):
