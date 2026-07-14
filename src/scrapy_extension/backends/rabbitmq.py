@@ -774,10 +774,15 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Args:
         queue_name: Name of the queue.
+
+    Raises:
+        QueueError: If the purge fails at the AMQP layer (broker dropped the
+            channel, transient AMQPError during reset/teardown).
     """
     if self._channel is None:
       return
     try:
       self._channel.queue_purge(queue=queue_name)
     except AMQPError as e:
-      logger.warning("Failed to clear queue %s: %s", queue_name, e)
+      msg = f"Failed to clear queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
