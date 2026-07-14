@@ -105,7 +105,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
     self._wheel_duration = wheel_size / ticks_per_second
     self._default_delay = default_delay
     self._clock = clock
-    self._wheel: list[deque[tuple[bytes, float]]] = [
+    self._wheel: list[deque[tuple[float, bytes, float]]] = [
       deque() for _ in range(wheel_size)
     ]
     self._overflow: list[tuple[float, int, bytes, float]] = []
@@ -140,7 +140,9 @@ class TimeWheelQueueStrategy(QueueStrategy):
     ready_at = self._clock() + effective
     if effective <= self._wheel_duration:
       slot = int(ready_at * self._ticks_per_second) % self._wheel_size
-      self._wheel[slot].append((item, priority))
+      # Store ready_at in the slot entry so _drain_ready can skip items whose
+      # delay hasn't elapsed (matters after a long idle — see _drain_ready).
+      self._wheel[slot].append((ready_at, item, priority))
     else:
       heapq.heappush(self._overflow, (ready_at, next(self._seq), item, priority))
 
@@ -179,9 +181,23 @@ class TimeWheelQueueStrategy(QueueStrategy):
       tick = self._last_tick + 1 + i
       slot = tick % self._wheel_size
       dq = self._wheel[slot]
+      if not dq:
+        continue
+      # Release only items whose ready_at has passed; KEEP future items in the
+      # slot (re-checked on the next drain). After a long idle (> one rotation)
+      # the catch-up drain covers every slot — without this check a future item
+      # sharing a slot position with a past tick is released before its delay
+      # elapses. In normal operation (span < wheel_size) the filter is a no-op:
+      # a slot is only reached when its tick is in the drain window, at which
+      # point ready_at <= now.
+      still_held = deque()
       while dq:
-        item, priority = dq.popleft()
-        qb.push(queue_name, item, priority)
+        ready_at_h, item, priority = dq.popleft()
+        if ready_at_h <= now:
+          qb.push(queue_name, item, priority)
+        else:
+          still_held.append((ready_at_h, item, priority))
+      dq.extend(still_held)
     # Drain due overflow.
     while self._overflow and self._overflow[0][0] <= now:
       _, _, item, priority = heapq.heappop(self._overflow)
@@ -235,9 +251,13 @@ class TimeWheelQueueStrategy(QueueStrategy):
     if held_wheel == 0 and not self._overflow:
       return None
     slots_flat = [
-      {"item_b64": base64.b64encode(item).decode("ascii"), "priority": priority}
+      {
+        "ready_at": ready_at,
+        "item_b64": base64.b64encode(item).decode("ascii"),
+        "priority": priority,
+      }
       for slot in self._wheel
-      for item, priority in slot
+      for ready_at, item, priority in slot
     ]
     overflow = [
       {
@@ -289,18 +309,25 @@ class TimeWheelQueueStrategy(QueueStrategy):
       return
     now = self._clock()
     recovered = 0
-    # Wheel items have no ready_at in the snapshot — re-place as due overflow
-    # so they drain on the next pop (preserves "must not lose" contract).
+    # Wheel items carry ready_at in the snapshot — re-place by their original
+    # ready-time: into the wheel (recomputed slot) if still future, as due
+    # overflow if past. Old snapshots without ready_at fall back to ready_at=now
+    # (the prior behavior) so they drain on the next pop rather than being lost.
     for entry in data.get("slots_flat", []) or []:
       try:
         item = base64.b64decode(entry["item_b64"])
         priority = float(entry["priority"])
+        ready_at = float(entry["ready_at"]) if "ready_at" in entry else now
       except (KeyError, TypeError, ValueError) as e:
         logger.warning(
           "TimeWheelQueueStrategy restore: skipping malformed wheel entry (%s).", e
         )
         continue
-      heapq.heappush(self._overflow, (now, next(self._seq), item, priority))
+      if ready_at <= now:
+        heapq.heappush(self._overflow, (ready_at, next(self._seq), item, priority))
+      else:
+        slot = int(ready_at * self._ticks_per_second) % self._wheel_size
+        self._wheel[slot].append((ready_at, item, priority))
       recovered += 1
     for entry in data.get("overflow", []) or []:
       try:
