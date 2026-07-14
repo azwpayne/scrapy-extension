@@ -203,14 +203,27 @@ class DynamoDBBackend(Backend, StorageBackend):
   def _lazy_reap_if_expired(self, item: dict[str, Any], key: str) -> bool:
     """Lazy-reap an expired item; return True if expired (caller treats as absent).
 
-    Centralizes the TTL-expiry contract shared by ``retrieve`` and ``exists``:
-    if the item's ``expire_at`` is in the past, delete it best-effort (via
-    ``_swallow``) so the table does not accumulate dead rows, and return True.
+    Centralizes the TTL-expiry contract shared by ``retrieve`` / ``exists`` /
+    ``ttl``: if the item's ``expire_at`` is in the past, delete it best-effort
+    (via ``_swallow``) so the table does not accumulate dead rows, and return True.
+
+    R-dyncas: the delete is a CAS on ``expire_at``
+    (``ConditionExpression="expire_at = :exp"``), NOT unconditional. ``item`` is
+    a stale ``get_item`` snapshot; a concurrent ``store()`` (``put_item``) between
+    the read and this reap would overwrite the key with a fresh value, and an
+    unconditional delete would clobber the fresh write -> data loss. The CAS makes
+    a concurrent overwrite fail the condition (``ConditionalCheckFailedException``,
+    swallowed by ``_swallow``) so the fresh item survives. ``expire_at`` is
+    guaranteed non-None here (``_is_expired`` returns False when None).
     """
     if not self._is_expired(item):
       return False
     with _swallow():
-      self._table.delete_item(Key={"pk": key})
+      self._table.delete_item(
+        Key={"pk": key},
+        ConditionExpression="expire_at = :exp",
+        ExpressionAttributeValues={":exp": item.get("expire_at")},
+      )
     return True
 
   # StorageBackend implementation
