@@ -211,6 +211,18 @@ class TestSqsLenClear:
     b.clear_queue("queue1")
     client.purge_queue.assert_called_once_with(QueueUrl="https://sqs/test")
 
+  def test_clear_queue_raises_on_purge_error(self, mocker) -> None:
+    """R-clearq: clear_queue raises QueueError on purge failure (not log + swallow).
+
+    Parity with rabbitmq clear_queue (#69); matches the R-sqs-qlen queue_len
+    stance (test above).
+    """
+    b, client = _connected(mocker)
+    client.purge_queue.side_effect = RuntimeError("purge boom")
+    with pytest.raises(QueueError) as exc_info:
+      b.clear_queue("queue1")
+    assert exc_info.value.operation == "clear_queue"
+
 
 def _connected_multi_queue(mocker, urls: dict[str, str]):
   """Connect a backend whose queue-URL cache resolves multiple queues.

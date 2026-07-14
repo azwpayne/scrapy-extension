@@ -529,12 +529,14 @@ class SqsBackend(Backend, QueueBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the purge fails at the SQS layer.
     """
+    url = self._queue_url(queue_name)
     try:
-      url = self._queue_url(queue_name)
       self._client.purge_queue(QueueUrl=url)
     except Exception as e:
-      logger.warning("Failed to purge SQS queue %s: %s", queue_name, e)
+      msg = f"Failed to purge SQS queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
 
 class _swallow:

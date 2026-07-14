@@ -833,6 +833,7 @@ class KafkaBackend(Backend, QueueBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the topic delete/recreate fails at the Kafka layer.
     """
     _validate_topic_name(queue_name)
     try:
@@ -849,4 +850,5 @@ class KafkaBackend(Backend, QueueBackend):
       )
       self._admin_client.create_topics([new_topic])
     except KafkaError as e:
-      logger.warning("Failed to clear queue %s: %s", queue_name, e)
+      msg = f"Failed to clear queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e

@@ -1097,16 +1097,23 @@ class TestRedisBackendQueueOperations:
       backend.queue_len("test_queue")
 
   def test_clear_queue_error(self, redis_settings, mock_redis, mocker):
-    """Test clear_queue logs warning on RedisError."""
+    """R-clearq: clear_queue raises QueueError on RedisError (not log + swallow).
+
+    Parity with rabbitmq clear_queue (#69) and the queue_len stance: a failed
+    clear must surface, not silently return None (stale messages would be
+    redelivered as duplicate work next run).
+    """
     from redis.exceptions import RedisError
 
+    from scrapy_extension.exceptions import QueueError
     from scrapy_extension.backends.redis import RedisBackend
 
     mock_redis.delete.side_effect = RedisError("Delete error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    # Should not raise, just log warning
-    backend.clear_queue("test_queue")
+    with pytest.raises(QueueError) as exc_info:
+      backend.clear_queue("test_queue")
+    assert exc_info.value.operation == "clear_queue"
 
   def test_push_uses_lua_script(self, redis_settings, mock_redis, mocker):
     """Push must use a Lua script for atomic INCR + ZADD + HSET."""
