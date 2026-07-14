@@ -208,17 +208,20 @@ def test_queue_len_returns_zero_when_topic_has_no_partitions(mocker) -> None:
   assert backend.queue_len("q") == 0
 
 
-def test_queue_len_returns_zero_on_temp_consumer_kafka_error(mocker) -> None:
-  """Lines 785-786: a KafkaError during the temp-consumer depth query
-  (end_offsets / position) → 0 (eventual-consistency monitoring must not
-  crash the caller; the broker error is surfaced elsewhere)."""
+def test_queue_len_raises_on_temp_consumer_kafka_error(mocker) -> None:
+  """R-kqlen: a KafkaError during the temp-consumer depth query (end_offsets /
+  position) must raise QueueError, not return 0 — otherwise a broker outage
+  looks like an empty queue and the scheduler drops the backpressure signal
+  (parity with R-sqs-qlen #62 / R-es-qlen #65 / redis)."""
   backend = _backend()
   backend._consumer = None
   mock_temp = mocker.MagicMock()
   mock_temp.partitions_for_topic.return_value = {0}  # topic exists
   mock_temp.end_offsets.side_effect = KafkaError("end_offsets boom")
   mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer", return_value=mock_temp)
-  assert backend.queue_len("q") == 0
+  with pytest.raises(QueueError) as exc_info:
+    backend.queue_len("q")
+  assert exc_info.value.operation == "queue_len"
 
 
 # ---------------------------------------------------------------------------

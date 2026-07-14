@@ -770,6 +770,8 @@ class KafkaBackend(Backend, QueueBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the depth query fails (broker outage, leader
+            re-election, coordinator error).
 
     Note:
         This is eventually consistent and should be used for monitoring only.
@@ -785,8 +787,13 @@ class KafkaBackend(Backend, QueueBackend):
           max(0, end_offsets[tp] - self._consumer.position(tp))
           for tp in assignment
         )
-      except KafkaError:
-        return 0
+      except KafkaError as e:
+        msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
+        raise QueueError(
+          msg,
+          queue_name=queue_name,
+          operation="queue_len",
+        ) from e
       return cast(int, total)
 
     topic_name = f"scrapy-{queue_name}"
@@ -807,8 +814,13 @@ class KafkaBackend(Backend, QueueBackend):
         max(0, end_offsets[tp] - temp_consumer.position(tp))
         for tp in assignment
       )
-    except KafkaError:
-      return 0
+    except KafkaError as e:
+      msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="queue_len",
+      ) from e
     finally:
       temp_consumer.close()
     return cast(int, total)

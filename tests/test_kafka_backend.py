@@ -886,8 +886,13 @@ class TestKafkaBackendQueueLen:
 
     assert backend.queue_len("testq") == 0
 
-  def test_queue_len_returns_zero_on_kafka_error(self, mocker):
-    """queue_len returns 0 on KafkaError from end_offsets/position."""
+  def test_queue_len_raises_on_kafka_error(self, mocker):
+    """R-kqlen: queue_len must raise QueueError on KafkaError (not swallow to 0).
+
+    A broker failure during end_offsets/position must NOT look like an empty
+    queue — otherwise the scheduler mistakes outage for idle and drops the
+    backpressure signal (parity with R-sqs-qlen #62 / R-es-qlen #65 / redis).
+    """
     config = KafkaSettings()
     backend = KafkaBackend(config)
     mock_consumer = mocker.MagicMock()
@@ -895,7 +900,30 @@ class TestKafkaBackendQueueLen:
     mock_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
     backend._consumer = mock_consumer
 
-    assert backend.queue_len("testq") == 0
+    with pytest.raises(QueueError) as exc_info:
+      backend.queue_len("testq")
+    assert exc_info.value.queue_name == "testq"
+    assert exc_info.value.operation == "queue_len"
+
+  def test_queue_len_raises_on_kafka_error_temp_consumer(self, mocker):
+    """R-kqlen: temp-consumer branch must also raise (and still close it)."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    backend._consumer = None  # force the temp-consumer branch
+
+    mock_temp_consumer = mocker.MagicMock()
+    mock_temp_consumer.partitions_for_topic.return_value = {0}
+    mock_temp_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer",
+      return_value=mock_temp_consumer,
+    )
+
+    with pytest.raises(QueueError) as exc_info:
+      backend.queue_len("testq")
+    assert exc_info.value.operation == "queue_len"
+    # finally arm must still close the temp consumer (no leak).
+    mock_temp_consumer.close.assert_called_once()
 
 
 class TestKafkaBackendClearQueue:
