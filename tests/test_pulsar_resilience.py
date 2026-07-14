@@ -40,6 +40,26 @@ def _backend() -> PulsarBackend:
   return PulsarBackend(PulsarSettings())
 
 
+def test_suppress_pulsar_errors_does_not_suppress_base_exception() -> None:
+  """R-swallow: _suppress_pulsar_errors must NOT suppress BaseException.
+
+  Pre-fix ``__exit__`` returned True for any non-None ``exc_type``, so a
+  KeyboardInterrupt raised inside a ``with _suppress_pulsar_errors():`` cleanup
+  block was trapped -- the operator's shutdown signal disappeared into a debug
+  log. Now only regular Exceptions are suppressed; BaseException propagates.
+  """
+  from scrapy_extension.backends.pulsar import _suppress_pulsar_errors
+
+  sw = _suppress_pulsar_errors()
+  sw.__enter__()
+  # Regular Exception is suppressed (returns True).
+  assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+  # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
+  assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
+  # No exception (exc_type None) -> False (normal exit, propagate nothing).
+  assert sw.__exit__(None, None, None) is False
+
+
 # ---------------------------------------------------------------------------
 # disconnect() client-None branch (line 280->284)
 # ---------------------------------------------------------------------------

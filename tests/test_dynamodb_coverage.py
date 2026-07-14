@@ -93,3 +93,22 @@ class TestDynamoDBErrorPaths:
     table.get_item.return_value = {"Item": {"pk": "k", "expire_at": 1.0}}
     table.delete_item.side_effect = RuntimeError("delete failed")
     assert b.retrieve("k") is None  # expired; inner delete raised, swallowed
+
+  def test_swallow_does_not_suppress_base_exception(self) -> None:
+    """R-swallow: _swallow must NOT suppress BaseException (Ctrl+C / SystemExit).
+
+    Pre-fix ``__exit__`` returned True for any non-None ``exc_type``, so a
+    ``KeyboardInterrupt`` raised inside a ``with _swallow():`` cleanup block was
+    trapped -- the operator's shutdown signal disappeared into a debug log. Now
+    only regular Exceptions are suppressed; BaseException propagates.
+    """
+    from scrapy_extension.backends.dynamodb import _swallow
+
+    sw = _swallow()
+    sw.__enter__()
+    # Regular Exception is suppressed (returns True).
+    assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+    # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
+    assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
+    # No exception (exc_type None) -> False (normal exit, propagate nothing).
+    assert sw.__exit__(None, None, None) is False

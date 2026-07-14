@@ -419,5 +419,11 @@ class _swallow:
   def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
     if exc_type is None:
       return False
+    # R-swallow: suppress only regular cleanup Exceptions -- NEVER BaseException
+    # (KeyboardInterrupt / SystemExit / GeneratorExit). Pre-fix this returned
+    # True for any non-None exc_type, trapping Ctrl+C during the lazy-reap
+    # delete_item (the operator's shutdown signal disappeared into a debug log).
+    if not isinstance(exc, Exception):
+      return False
     logger.debug("Suppressed dynamodb cleanup error: %s", exc)
     return True
