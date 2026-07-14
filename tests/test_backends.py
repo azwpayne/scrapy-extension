@@ -1463,16 +1463,23 @@ class TestRedisBackendSetOperations:
     assert result == 0
 
   def test_clear_set_error(self, redis_settings, mock_redis, mocker):
-    """Test clear_set logs warning on RedisError."""
+    """R-rclears: clear_set raises BackendConnectionError on RedisError (not swallow).
+
+    Parity with redis add (R-dupe-1 #38): wrap the raw RedisError so
+    BackendDupeFilter's graceful-degradation arm fires. A swallowed clear hides
+    a failed dedup-set reset -> stale fingerprints -> duplicate requests.
+    """
     from redis.exceptions import RedisError
 
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
 
     mock_redis.delete.side_effect = RedisError("Delete error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    # Should not raise, just log warning
-    backend.clear_set("test_set")
+    with pytest.raises(BackendConnectionError) as exc_info:
+      backend.clear_set("test_set")
+    assert exc_info.value.backend_type == "redis"
 
 
 class TestRedisBackendStorageOperations:
@@ -1743,17 +1750,23 @@ class TestRedisBackendStorageOperations:
     # Verify settings are correctly stored for cluster mode
     assert backend.config.mode == RedisMode.CLUSTER
 
-  def test_clear_storage_error(self, redis_settings, mock_redis, mocker, caplog):
-    """Test clear_storage logs warning on RedisError."""
+  def test_clear_storage_error(self, redis_settings, mock_redis, mocker):
+    """R-rclears: clear_storage raises StorageError on RedisError (not swallow).
+
+    Parity with redis store (R-store #59) and mongodb/memcached/dynamodb/es
+    clear_storage (all raise StorageError). redis was the lone swallow.
+    """
     from redis.exceptions import RedisError
 
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import StorageError
 
     mock_redis.flushdb.side_effect = RedisError("Flush error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    backend.clear_storage()
-    assert "Failed to clear storage" in caplog.text
+    with pytest.raises(StorageError) as exc_info:
+      backend.clear_storage()
+    assert exc_info.value.operation == "clear_storage"
 
 
 class TestRedisBackendPingAndConnection:

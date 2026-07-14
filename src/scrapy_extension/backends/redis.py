@@ -735,12 +735,19 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If set_name contains invalid characters.
+        BackendConnectionError: If the delete fails at the Redis layer (parity
+            with add, R-dupe-1 #38).
     """
     _validate_key_name(set_name, "set_name")
     try:
       self.client.delete(set_name)
     except RedisError as e:
-      logger.warning("Failed to clear set %s: %s", set_name, e)
+      # R-rclears: wrap (parity with add R-dupe-1 #38) so BackendDupeFilter's
+      # graceful-degradation arm fires; a swallowed clear hides a failed dedup
+      # reset -> stale fingerprints -> duplicate requests.
+      raise BackendConnectionError(
+        f"Redis set clear failed for {set_name!r}: {e}", backend_type="redis"
+      ) from e
 
   # StorageBackend implementation using Redis Strings
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
@@ -862,6 +869,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If prefix contains invalid characters.
+        StorageError: If the clear fails at the Redis layer (parity with store
+            R-store #59 and mongodb/memcached/dynamodb clear_storage).
     """
     if prefix:
         _validate_key_name(prefix, "prefix")
@@ -883,4 +892,6 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       else:
         self.client.flushdb()
     except RedisError as e:
-      logger.warning("Failed to clear storage: %s", e)
+      raise StorageError(
+        f"Failed to clear Redis storage: {e}", operation="clear_storage"
+      ) from e
