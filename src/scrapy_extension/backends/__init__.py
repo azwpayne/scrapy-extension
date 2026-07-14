@@ -116,6 +116,18 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def __dir__() -> list[str]:
+    """PEP 562 companion — expose lazily-imported backends to dir() and autocomplete.
+
+    Without this, ``dir(scrapy_extension.backends)`` / ``pydoc`` / IDE
+    autocomplete see only eagerly-imported names; the lazily-imported
+    ``_BACKEND_MODULES`` backends are invisible despite importing successfully
+    on access. Returns eager globals union the lazy ``_BACKEND_MODULES`` keys
+    — no optional dep is imported (dict keys only).
+    """
+    return sorted(set(globals()) | set(_BACKEND_MODULES))
+
+
 __all__ = [
     "Backend",
     "BackendType",
