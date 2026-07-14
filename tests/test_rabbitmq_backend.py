@@ -819,9 +819,12 @@ def test_rabbitmq_backend_clear_queue_no_channel():
 
 
 def test_rabbitmq_backend_clear_queue_amqp_error(mocker):
-  """Test clear_queue logs warning on AMQPError (lines 451-452)."""
-  from scrapy_extension.backends import rabbitmq
+  """R-rmqcq: clear_queue raises QueueError on AMQPError (not log + swallow).
 
+  Parity with queue_len (which raises) and the #62/#65/#68 stance: a failed
+  purge must NOT look like success — otherwise a reset/teardown believes the
+  queue was emptied while stale messages remain and get redelivered next run.
+  """
   config = RabbitMQSettings()
   backend = RabbitMQBackend(config)
 
@@ -834,10 +837,11 @@ def test_rabbitmq_backend_clear_queue_amqp_error(mocker):
   backend.connect()
   mock_channel.queue_purge.side_effect = pika.exceptions.AMQPError("Purge failed")
 
-  mock_log = mocker.patch.object(rabbitmq.logger, "warning")
-  backend.clear_queue("test_queue")
-  mock_log.assert_called_once()
-  assert "Purge failed" in str(mock_log.call_args[0][2])
+  with pytest.raises(QueueError) as exc_info:
+    backend.clear_queue("test_queue")
+  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.operation == "clear_queue"
+  assert "Purge failed" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
