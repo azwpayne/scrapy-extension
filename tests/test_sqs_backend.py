@@ -188,10 +188,23 @@ class TestSqsLenClear:
     }
     assert b.queue_len("queue1") == 42
 
-  def test_queue_len_zero_on_error(self, mocker) -> None:
+  def test_queue_len_error_raises_queue_error(self, mocker) -> None:
+    """R-sqs-qlen: queue_len must wrap backend errors as QueueError, NOT
+    swallow to 0.
+
+    Pre-fix this returned 0 (pinned as ``== 0``), conflating an empty queue
+    with a backend failure (auth expiry, network outage, throttling). The
+    scheduler trusts ``len(queue)`` for ``has_pending_requests`` / the
+    backpressure gate -- a swallowed 0 during an SQS blip can trigger premature
+    idle/CloseSpider and loses the backpressure signal at the worst moment.
+    ``pop()`` / ``push()`` already wrap SQS errors as QueueError; queue_len now
+    matches (R-qlen parity with Redis). The scheduler's ``next_request``
+    handles QueueError from ``len(self._queue)`` (returns None safely).
+    """
     b, client = _connected(mocker)
     client.get_queue_attributes.side_effect = RuntimeError("oops")
-    assert b.queue_len("queue1") == 0
+    with pytest.raises(QueueError):
+      b.queue_len("queue1")
 
   def test_clear_purges_queue(self, mocker) -> None:
     b, client = _connected(mocker)

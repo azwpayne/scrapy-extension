@@ -498,14 +498,27 @@ class SqsBackend(Backend, QueueBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the SQS ``get_queue_attributes`` call fails (R-sqs-qlen).
+            Was previously swallowed to ``0``, conflating an empty queue with a
+            backend failure (auth expiry, network outage, throttling) -- a
+            swallowed 0 can trigger premature idle/CloseSpider and loses the
+            backpressure signal. Mirrors the Redis R-qlen contract.
     """
     try:
       url = self._queue_url(queue_name)
       resp = self._client.get_queue_attributes(
         QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"]
       )
-    except Exception:
-      return 0
+    except Exception as e:
+      # R-sqs-qlen: do NOT swallow to 0. The scheduler trusts ``len(queue)``
+      # for has_pending_requests / the backpressure gate; a swallowed 0 during
+      # an SQS blip triggers premature idle/CloseSpider and loses the
+      # backpressure signal at the worst moment. Wrap as QueueError (matches
+      # Redis R-qlen + SQS push/pop); the scheduler's next_request handles
+      # QueueError from ``len(self._queue)`` (returns None safely).
+      raise QueueError(
+        str(e), queue_name=queue_name, operation="queue_len"
+      ) from e
     return int(resp.get("Attributes", {}).get("ApproximateNumberOfMessages", 0))
 
   def clear_queue(self, queue_name: str) -> None:
