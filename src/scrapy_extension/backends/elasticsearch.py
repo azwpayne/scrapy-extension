@@ -432,7 +432,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If set_name contains invalid characters.
     """
     _validate_key_name(set_name, "set_name")
-    return self._count(self.config.set_index, "set_name", set_name)
+    # R-es-qlen: set_len is diagnostic (not safety-critical for idle detection)
+    # -> return 0 on TransportError, mirroring Redis's set_len. ``_count`` no
+    # longer swallows (queue_len needs the raise), so set_len owns its own
+    # except arm to preserve this contract.
+    try:
+      return self._count(self.config.set_index, "set_name", set_name)
+    except TransportError:
+      return 0
 
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
@@ -648,21 +655,29 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Number of matching documents.
+
+    Raises:
+        TransportError: If the refresh or count request fails. Propagates to
+            the caller (R-es-qlen) -- pre-fix this was swallowed to ``0``,
+            which dead-coded ``queue_len``'s ``QueueError`` arm.
     """
-    try:
-      # Forced refresh so just-written docs (push/add don't refresh) are
-      # searchable — same amortized-read-refresh rationale as pop.
-      self.client.indices.refresh(index=index)
-      # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
-      # ``set_name`` are dynamically mapped as ``text``; count must match the
-      # exact (unanalyzed) value via the keyword subfield.
-      resp = self.client.count(
-        index=index, query={"term": {f"{field}.keyword": value}}
-      )
-    except TransportError:
-      return 0
-    else:
-      return cast(int, resp.get("count", 0))
+    # R-es-qlen: do NOT swallow TransportError -> return 0. Pre-fix this
+    # swallowed, making queue_len's ``except TransportError -> raise QueueError``
+    # arm dead code (queue_len returned 0 on error, masking a backend failure
+    # from the scheduler's idle/backpressure gate -- R-qlen violation, same as
+    # sqs:507). Now TransportError propagates to the caller; each caller applies
+    # its own contract (queue_len raises QueueError; set_len returns 0 --
+    # diagnostic, redis parity).
+    # Forced refresh so just-written docs (push/add don't refresh) are
+    # searchable — same amortized-read-refresh rationale as pop.
+    self.client.indices.refresh(index=index)
+    # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
+    # ``set_name`` are dynamically mapped as ``text``; count must match the
+    # exact (unanalyzed) value via the keyword subfield.
+    resp = self.client.count(
+      index=index, query={"term": {f"{field}.keyword": value}}
+    )
+    return cast(int, resp.get("count", 0))
 
   def _delete_by_id(self, index: str, doc_id: str) -> bool:
     """Delete document by ID.
