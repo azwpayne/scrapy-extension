@@ -1185,6 +1185,20 @@ class TestMongoDBNotConnectedGuards:
       backend.clear_set("s")
     assert "set collection is None" in str(exc.value)
 
+  def test_clear_set_wraps_pymongo_error(self, mocker):
+    """R-rclears-mongo: a PyMongoError during clear_set is wrapped as
+    BackendConnectionError (parity with add R-dupe-1 #38 + redis clear_set #71),
+    not leaked raw."""
+    from pymongo.errors import PyMongoError
+
+    backend = self._connected(mocker)
+    backend._set_collection.delete_many.side_effect = PyMongoError("delete boom")
+    with pytest.raises(BackendConnectionError) as exc_info:
+      backend.clear_set("s")
+    assert exc_info.value.backend_type == "mongodb"
+    assert "clear failed" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, PyMongoError)  # `from e` chaining
+
   def test_delete_per_collection_guard_fires(self, mocker):
     backend = self._connected(mocker)
     backend._storage_collection = None
