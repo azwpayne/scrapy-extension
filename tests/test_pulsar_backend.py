@@ -176,6 +176,23 @@ class TestPulsarPop:
     b.pop("queue2")
     assert client.subscribe.call_count == 2
 
+  def test_pop_topic_change_subscribe_failure_nulls_state_no_wedge(self, mocker) -> None:
+    """R-pulsar-ensure: a failed re-subscribe on topic change must null the
+    closed consumer + stale topic. Otherwise a later pop of the OLD topic hits
+    the _ensure_consumer fast-path (``_subscribed_topic == topic``) and reuses
+    the dead consumer -> silent consumption wedge."""
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = RuntimeError("none")
+    b, client = _connected(mocker, subscribe=consumer)
+    b.pop("queue1")  # subscribes to topic1; _consumer set, _subscribed_topic=topic1
+    # topic change to queue2 -> re-subscribe fails
+    client.subscribe.side_effect = RuntimeError("subscribe failed")
+    with pytest.raises(QueueError):
+      b.pop("queue2")
+    # FIX: failed re-subscribe must null the closed consumer + stale topic
+    assert b._consumer is None
+    assert b._subscribed_topic is None
+
 
 class TestPulsarAckNack:
   def test_ack_calls_acknowledge(self, mocker) -> None:

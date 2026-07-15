@@ -642,6 +642,13 @@ class PulsarBackend(Backend, QueueBackend):
     if self._consumer is not None:
       with _suppress_pulsar_errors():
         self._consumer.close()
+      # R-pulsar-ensure: null the closed consumer + stale topic now, so a
+      # failed re-subscribe below can't leave a dead reference that the
+      # fast-path above would reuse on the next call for the old topic
+      # (silent consumption wedge). Mirrors the R-mcc/R-kacc null-partial-state
+      # pattern.
+      self._consumer = None
+      self._subscribed_topic = None
     try:
       self._consumer = self._client.subscribe(
         topic,
