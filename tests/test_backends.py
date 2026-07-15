@@ -1105,8 +1105,8 @@ class TestRedisBackendQueueOperations:
     """
     from redis.exceptions import RedisError
 
-    from scrapy_extension.exceptions import QueueError
     from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import QueueError
 
     mock_redis.delete.side_effect = RedisError("Delete error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
