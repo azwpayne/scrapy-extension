@@ -625,13 +625,24 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If set_name contains invalid characters.
+        BackendConnectionError: If not connected, or if the delete fails at the
+            MongoDB layer (parity with add R-dupe-1 #38 + redis clear_set #71).
     """
     _validate_key_name(set_name, "set_name")
     self._assert_connected()
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    self._set_collection.delete_many({"set_name": set_name})
+    try:
+      self._set_collection.delete_many({"set_name": set_name})
+    except PyMongoError as e:
+      # R-rclears-mongo: wrap operational PyMongoError (parity with add
+      # R-dupe-1 #38 + redis clear_set #71) so BackendDupeFilter's
+      # graceful-degradation arm can fire; a raw leak crashes callers
+      # expecting BackendError.
+      raise BackendConnectionError(
+        f"MongoDB set clear failed for {set_name!r}: {e}", backend_type="mongodb"
+      ) from e
 
   # StorageBackend implementation
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
