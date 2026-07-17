@@ -1126,7 +1126,10 @@ class TestKafkaBackendPopWithAckConcurrency:
     mock_consumer.poll.side_effect = [
       {TopicPartition("scrapy-testq", r.partition): [r]} for r in records
     ] + [{}] * 5  # subsequent polls return empty
-    mock_consumer.position.return_value = 0  # watermark base for partition 0
+    # Kafka position() is the NEXT offset to fetch, not the first in-flight
+    # record. The backend must seed its ack watermark from records as they are
+    # popped; using this realistic position would skip/no-op every pending ack.
+    mock_consumer.position.return_value = max(r.offset for r in records) + 1
     backend._consumer = mock_consumer
     return backend, mock_consumer
 
@@ -1190,6 +1193,7 @@ class TestKafkaBackendPopWithAckConcurrency:
     tp, oam = next(iter(committed_map.items()))
     assert tp == TopicPartition("scrapy-testq", 0)
     assert oam.offset == 3
+    mock_consumer.position.assert_not_called()
 
   def test_no_offset_skipped_under_concurrency(self, mocker):
     """(c) Interleaved pop/ack never skips an unprocessed offset.

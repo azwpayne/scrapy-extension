@@ -80,6 +80,8 @@ test = [
     "pytest-sugar",
     "pytest-instafail",
     "pytest-socket",
+    "mypy",
+    "bandit[toml]",
     "pytest-mypy",
     "pytest-ruff",
     "pytest-bandit",

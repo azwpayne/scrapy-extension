@@ -347,8 +347,11 @@ class TestTTL:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(TransportError, match="Get failed"):
+    with pytest.raises(StorageError, match="Get failed") as exc_info:
       backend.ttl("k")
+    assert exc_info.value.operation == "ttl"
+    assert exc_info.value.key == "k"
+    assert isinstance(exc_info.value.__cause__, TransportError)
 
 
 class TestDeleteById:
@@ -384,8 +387,8 @@ class TestDeleteById:
 class TestDeleteByQuery:
   """Test _delete_by_query method exception handling."""
 
-  def test_delete_by_query_transport_error(self, mocker, caplog):
-    """Test _delete_by_query logs warning when TransportError is raised."""
+  def test_delete_by_query_transport_error(self, mocker):
+    """The shared helper propagates so each public surface can type the error."""
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
       indices=mocker.MagicMock(
@@ -401,9 +404,8 @@ class TestDeleteByQuery:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    # Should not raise, just log warning
-    backend._delete_by_query("index", {"match_all": {}})
-    assert "Failed to delete" in caplog.text
+    with pytest.raises(TransportError, match="Delete failed"):
+      backend._delete_by_query("index", {"match_all": {}})
 
 
 class TestPush:

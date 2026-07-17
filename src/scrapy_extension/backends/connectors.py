@@ -243,6 +243,14 @@ def _normalize_backend_type(value: object, setting_name: str) -> str:
   return candidate
 
 
+class _ConnectionAttempt:
+  """Result shared by every caller waiting on one connection attempt."""
+
+  def __init__(self) -> None:
+    self.event = threading.Event()
+    self.error: BaseException | None = None
+
+
 class ConnectionManager:
   """Lazy singleton connection manager for backends.
 
@@ -311,12 +319,14 @@ class ConnectionManager:
     # disconnects + evicts the registry entry.
     self._users: int = 0
     # Single-connect ownership flag (A2). The first thread to enter the slow
-    # path takes ownership under ``_lock``; peers wait on ``_connected_event``
-    # until the owner finishes connect() — which runs its retry loop (and
-    # time.sleep backoff) WITHOUT holding ``_lock``, so peers backing off on
-    # a slow backend don't block threads that merely want to READ _backend.
+    # path takes ownership under ``_lock``; peers capture the same attempt and
+    # wait for its result. A distinct result object per attempt is necessary:
+    # after a failure, a later caller may start a fresh attempt before older
+    # peers are scheduled, but those peers must still receive the failure they
+    # waited for instead of joining the new attempt or retrying serially.
     self._connecting: bool = False
     self._connected_event = threading.Event()
+    self._connect_attempt: _ConnectionAttempt | None = None
     # Circuit-breaker holder. Lazily constructed on first
     # ``get_*_backend()`` call from the env-loaded ``Settings``
     # (``SCRAPY_CIRCUIT_BREAKER_ENABLED``). ``None`` while disabled — which
@@ -746,9 +756,11 @@ class ConnectionManager:
       lock-free read is safe for the already-connected case and avoids
       contending on ``_lock`` at all once warm.
     - Slow path: under ``_lock``, take ownership of connecting via the
-      ``_connecting`` flag. Peers that find ``_connecting`` set wait on
-      ``_connected_event`` (released by the owner once connect resolves) —
-      they do NOT spin on ``_lock`` while the owner backs off.
+      ``_connecting`` flag. Peers that find ``_connecting`` set capture that
+      attempt and wait on its event (released by the owner once connect
+      resolves). They do NOT spin on ``_lock`` while the owner backs off. A
+      failed attempt is fanned out to its waiter cohort; only a later,
+      independent call starts a new attempt.
     - The owner runs ``connect()`` (which performs ``time.sleep`` between
       retry attempts) WITHOUT holding ``_lock``. This is the load-bearing
       fix: a slow-connecting backend no longer blocks every peer thread
@@ -768,6 +780,7 @@ class ConnectionManager:
     if self._backend is not None:
       return self._backend
 
+    attempt: _ConnectionAttempt
     while True:
       with self._lock:
         # Re-check under lock: another thread may have connected while we
@@ -776,14 +789,22 @@ class ConnectionManager:
           return self._backend
         if not self._connecting:
           # Take ownership of connecting.
+          attempt = _ConnectionAttempt()
           self._connecting = True
-          self._connected_event.clear()
+          self._connect_attempt = attempt
+          # Keep this alias for diagnostics and backward-compatible tests.
+          self._connected_event = attempt.event
           break
         # Another thread owns the connect; wait OUTSIDE the lock below.
-        wait_event = self._connected_event
+        current_attempt = self._connect_attempt
+        if current_attempt is None:  # Defensive: _connecting implies an attempt.
+          continue
+        attempt = current_attempt
 
       # Wait for the owner to resolve connect() — without holding _lock.
-      wait_event.wait()
+      attempt.event.wait()
+      if attempt.error is not None:
+        raise attempt.error
 
     # Owner path: connect WITHOUT holding _lock so the retry-loop
     # time.sleep backoff does not block peer threads (A2).
@@ -792,21 +813,30 @@ class ConnectionManager:
       self.connect()
     except BaseException as e:  # noqa: BLE001 - re-signal to all waiters
       connect_error = e
-    finally:
-      with self._lock:
-        self._connecting = False
-        self._connected_event.set()
-
-    if connect_error is not None:
-      raise connect_error
-
-    if self._backend is None:
+    if connect_error is None and self._backend is None:
       # Defensive: connect() should either set _backend (success) or raise.
       # If we land here, connect() returned without connecting and without
       # raising — that is a contract violation, not a user input problem.
       # The explicit guard (rather than ``assert``) keeps the check live
       # under ``python -O`` and produces a clear, typed error instead of a
       # bare AssertionError.
+      msg = "connect() did not produce a backend"
+      connect_error = BackendConnectionError(
+        msg, backend_type=str(self.backend_type)
+      )
+
+    with self._lock:
+      attempt.error = connect_error
+      self._connecting = False
+      attempt.event.set()
+
+    if connect_error is not None:
+      raise connect_error
+
+    # ``connect_error`` is None only when connect() populated _backend. Keep
+    # an explicit runtime guard so that contract remains true under future
+    # refactors as well as in the static type system.
+    if self._backend is None:
       msg = "connect() did not produce a backend"
       raise BackendConnectionError(msg, backend_type=str(self.backend_type))
     return self._backend

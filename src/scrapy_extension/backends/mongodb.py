@@ -477,15 +477,22 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Returns:
         Number of items in the queue (capped at 100000).
+
+    Raises:
+        QueueError: If the count request fails.
     """
     _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
     if self._queue_collection is None:
       msg = "MongoDBBackend not connected: queue collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    return self._queue_collection.count_documents(
-      {"queue_name": queue_name}, limit=100000
-    )
+    try:
+      return self._queue_collection.count_documents(
+        {"queue_name": queue_name}, limit=100000
+      )
+    except PyMongoError as e:
+      msg = f"Failed to get queue length for {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="queue_len") from e
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
@@ -495,13 +502,18 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the delete request fails.
     """
     _validate_key_name(queue_name, "queue_name")
     self._assert_connected()
     if self._queue_collection is None:
       msg = "MongoDBBackend not connected: queue collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    self._queue_collection.delete_many({"queue_name": queue_name})
+    try:
+      self._queue_collection.delete_many({"queue_name": queue_name})
+    except PyMongoError as e:
+      msg = f"Failed to clear queue {queue_name}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
   # SetBackend implementation
   def add(self, set_name: str, item: bytes) -> bool:

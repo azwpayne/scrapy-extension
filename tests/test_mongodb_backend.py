@@ -135,6 +135,25 @@ def test_mongodb_backend_queue_len(mocker):
   )
 
 
+def test_mongodb_backend_queue_len_wraps_pymongo_error(mocker):
+  from pymongo.errors import PyMongoError
+
+  from scrapy_extension.exceptions import QueueError
+
+  backend = MongoDBBackend(MongoDBSettings())
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  backend._queue_collection = mocker.MagicMock()
+  backend._queue_collection.count_documents.side_effect = PyMongoError("count failed")
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.queue_len("test_queue")
+
+  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.operation == "queue_len"
+  assert isinstance(exc_info.value.__cause__, PyMongoError)
+
+
 def test_mongodb_backend_clear_queue(mocker):
   """Test MongoDB backend clear queue."""
   config = MongoDBSettings()
@@ -147,6 +166,25 @@ def test_mongodb_backend_clear_queue(mocker):
 
   backend.clear_queue("test_queue")
   mock_collection.delete_many.assert_called_once_with({"queue_name": "test_queue"})
+
+
+def test_mongodb_backend_clear_queue_wraps_pymongo_error(mocker):
+  from pymongo.errors import PyMongoError
+
+  from scrapy_extension.exceptions import QueueError
+
+  backend = MongoDBBackend(MongoDBSettings())
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  backend._queue_collection = mocker.MagicMock()
+  backend._queue_collection.delete_many.side_effect = PyMongoError("clear failed")
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.clear_queue("test_queue")
+
+  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.operation == "clear_queue"
+  assert isinstance(exc_info.value.__cause__, PyMongoError)
 
 
 def test_mongodb_backend_set_operations(mocker):

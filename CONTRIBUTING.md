@@ -68,11 +68,13 @@ uv run poe test-py310    # one version
 > interpreter-compat, not GIL-free concurrency. See
 > `docs/code-review-2026-06-15.md` Round 81.
 
-## Lint and format
+## Lint, types, and format
 
 ```bash
 uv run ruff check        # lint (whole project)
 uv run ruff check --fix  # auto-fix safe issues
+uv run mypy --strict src # verify the typed public package
+uv run bandit -r src -c pyproject.toml # security scan first-party code
 ```
 
 ## Coverage
@@ -81,7 +83,9 @@ uv run ruff check --fix  # auto-fix safe issues
 uv run pytest --cov=scrapy_extension --cov-report=term-missing
 ```
 
-Target: **≥95%**. This is enforced by `tool.coverage.report.fail_under = 95`; coverage commands fail below that floor.
+Target: **≥95%**. This is enforced by `tool.coverage.report.fail_under = 95`;
+coverage commands fail below that floor, and CI runs the coverage command on
+the Python 3.10 lane.
 
 ## Build
 
@@ -92,10 +96,12 @@ uv build                 # sdist + wheel → dist/
 ## CI
 
 `.github/workflows/ci.yml` runs the unit suite across Python 3.10–3.14 on every
-push/PR (`ruff check` + `pytest -m "not integration"`). The integration job is
-included as a commented stub — to enable it, uncomment the `integration-tests`
-job, add service containers for the backends you want, and wire the
-`SCRAPY_TEST_*` env vars to them and pass `--force-enable-socket` for live-service tests. RocketMQ uses the pure-Python Apache gRPC client and requires the broker proxy endpoint (usually `localhost:8081`), not the legacy NameServer-only port.
+push/PR and runs strict mypy, Bandit, plus branch coverage on the minimum
+supported Python lane. A separate integration job starts Redis,
+MongoDB, ElasticSearch, RabbitMQ, Kafka, and RocketMQ, then exercises their
+live-service suites with localhost sockets explicitly allowed. RocketMQ uses
+the pure-Python Apache gRPC client and requires the broker proxy endpoint
+(usually `localhost:8081`), not the legacy NameServer-only port.
 
 ## Architecture & rationale
 

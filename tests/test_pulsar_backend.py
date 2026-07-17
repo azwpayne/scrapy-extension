@@ -17,6 +17,13 @@ sys.modules.setdefault("pulsar", MagicMock())
 import pulsar  # noqa: E402 — the mocked module actually in sys.modules
 
 
+class _PulsarTimeout(Exception):
+  """Test double matching ``pulsar.Timeout`` from the C++ client binding."""
+
+
+pulsar.Timeout = _PulsarTimeout
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _cleanup_sys_modules_mock_pulsar():
   """Pop the module-level ``pulsar`` mock after this module's tests finish.
@@ -155,14 +162,27 @@ class TestPulsarPop:
 
   def test_pop_returns_none_on_empty(self, mocker) -> None:
     consumer = mocker.MagicMock()
-    consumer.receive.side_effect = RuntimeError("timed out")
+    consumer.receive.side_effect = pulsar.Timeout("timed out")
     b, _ = _connected(mocker, subscribe=consumer)
     assert b.pop("queue1") is None
     assert b._last_msg is None
 
+  def test_pop_wraps_non_timeout_receive_failure(self, mocker) -> None:
+    consumer = mocker.MagicMock()
+    failure = RuntimeError("broker disconnected")
+    consumer.receive.side_effect = failure
+    b, _ = _connected(mocker, subscribe=consumer)
+
+    with pytest.raises(QueueError) as exc_info:
+      b.pop("queue1")
+
+    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.operation == "pop"
+    assert exc_info.value.__cause__ is failure
+
   def test_pop_reuses_consumer_for_same_topic(self, mocker) -> None:
     consumer = mocker.MagicMock()
-    consumer.receive.side_effect = RuntimeError("none")
+    consumer.receive.side_effect = pulsar.Timeout("none")
     b, client = _connected(mocker, subscribe=consumer)
     b.pop("queue1")
     b.pop("queue1")
@@ -170,7 +190,7 @@ class TestPulsarPop:
 
   def test_pop_resubscribes_on_topic_change(self, mocker) -> None:
     consumer = mocker.MagicMock()
-    consumer.receive.side_effect = RuntimeError("none")
+    consumer.receive.side_effect = pulsar.Timeout("none")
     b, client = _connected(mocker, subscribe=consumer)
     b.pop("queue1")
     b.pop("queue2")
@@ -182,7 +202,7 @@ class TestPulsarPop:
     the _ensure_consumer fast-path (``_subscribed_topic == topic``) and reuses
     the dead consumer -> silent consumption wedge."""
     consumer = mocker.MagicMock()
-    consumer.receive.side_effect = RuntimeError("none")
+    consumer.receive.side_effect = pulsar.Timeout("none")
     b, client = _connected(mocker, subscribe=consumer)
     b.pop("queue1")  # subscribes to topic1; _consumer set, _subscribed_topic=topic1
     # topic change to queue2 -> re-subscribe fails
@@ -253,7 +273,7 @@ class TestPulsarRealAck:
 
   def test_pop_with_ack_empty_returns_none_none(self, mocker) -> None:
     consumer = mocker.MagicMock()
-    consumer.receive.side_effect = RuntimeError("timed out")
+    consumer.receive.side_effect = pulsar.Timeout("timed out")
     b, _ = _connected(mocker, subscribe=consumer)
     value, token = b.pop_with_ack("queue1")
     assert value is None
@@ -414,13 +434,15 @@ class TestPulsarLenClear:
     b, _ = _connected(mocker)
     assert b.queue_len("queue1") == 0
 
-  def test_clear_queue_drops_cached_handles(self, mocker) -> None:
-    producer = mocker.MagicMock()
-    b, _ = _connected(mocker, create_producer=producer)
-    b.push("queue1", b"x")
-    b.clear_queue("queue1")
-    producer.close.assert_called_once()
-    assert "scrapy-queue1" not in b._producers
+  def test_clear_queue_reports_unsupported(self, mocker) -> None:
+    b, _ = _connected(mocker)
+
+    with pytest.raises(QueueError) as exc_info:
+      b.clear_queue("queue1")
+
+    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.operation == "clear_queue"
+    assert "not supported" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

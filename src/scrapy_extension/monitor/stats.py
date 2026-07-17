@@ -13,7 +13,8 @@ __all__ = ["ScrapyStatsMonitor"]
 
 import functools
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, ParamSpec
 
 from scrapy_extension.monitor.base import (
   DEFAULT_BACKPRESSURE_THRESHOLD,
@@ -26,8 +27,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_P = ParamSpec("_P")
 
-def _stats_safe(hook):
+
+def _stats_safe(hook: Callable[_P, None]) -> Callable[_P, None]:
   """Decorator: a ScrapyStatsMonitor hook must never propagate stats failures.
 
   Observability must not crash the data path. If the wrapped
@@ -50,14 +53,13 @@ def _stats_safe(hook):
   """
 
   @functools.wraps(hook)
-  def _wrapper(self, *args, **kwargs):
+  def _wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
     try:
-      return hook(self, *args, **kwargs)
+      hook(*args, **kwargs)
     except Exception:
       logger.debug(
         "ScrapyStatsMonitor.%s raised; ignored", hook.__name__, exc_info=True
       )
-      return None
 
   return _wrapper
 

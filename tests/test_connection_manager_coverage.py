@@ -371,8 +371,9 @@ def test_T9_backend_property_single_connect_owner_among_peers():
 
 
 def test_T10_backend_property_owner_error_propagates_to_all_waiters():
-  """T10: owner's connect() raises -> all peer waiters re-raise; _connecting reset."""
-  fake = FakeBackend(connect_failures=99)
+  """T10: one failed attempt is fanned out to every waiting peer."""
+  connect_block = threading.Event()
+  fake = FakeBackend(connect_failures=99, connect_block=connect_block)
   m = ConnectionManager("redis", {"k": 10, "retry_attempts": 1, "retry_delay": 0.0})
   m._create_backend = lambda: fake  # type: ignore[method-assign]
 
@@ -391,9 +392,22 @@ def test_T10_backend_property_owner_error_propagates_to_all_waiters():
   threads = [threading.Thread(target=worker) for _ in range(3)]
   for t in threads:
     t.start()
+
+  # Hold the owner inside connect() long enough for the other two workers to
+  # enter the manager's waiter path. Releasing this gate produces one failed
+  # connection attempt whose result must be shared by the whole cohort.
+  deadline = time.monotonic() + 5
+  while fake.connect_calls < 1 and time.monotonic() < deadline:
+    time.sleep(0.01)
+  assert fake.connect_calls == 1, "owner did not enter connect()"
+  time.sleep(0.05)
+  connect_block.set()
+
   for t in threads:
     t.join(timeout=5)
+  assert not any(t.is_alive() for t in threads)
   assert len(errors) == 3  # every waiter re-raised
+  assert fake.connect_calls == 1  # peers reuse the owner's failed result
   assert m._connecting is False  # owner cleared the flag
 
 

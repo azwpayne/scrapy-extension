@@ -484,11 +484,19 @@ class PulsarBackend(Backend, QueueBackend):
       # timeout=0 -> a short poll; Pulsar needs a positive timeout_millis.
       timeout_ms = int(timeout * 1000) if timeout > 0 else 100
       return self._consumer.receive(timeout_millis=timeout_ms)
-    except Exception as e:
-      # No message within the timeout window is the normal "empty" case, not
-      # an error. Pulsar raises on timeout; treat any receive failure as empty.
+    except pulsar.Timeout as e:
+      # No message within the timeout window is the normal "empty" case.
       logger.debug("Pulsar receive returned no message for %s: %s", queue_name, e)
       return None
+    except Exception as e:
+      # Broker disconnects, authorization failures, and invalid consumer state
+      # are operational failures, not evidence that the queue is empty. A
+      # false empty result can make Scrapy close an active crawl prematurely.
+      raise QueueError(
+        f"Failed to pop from Pulsar queue {queue_name}: {e}",
+        queue_name=queue_name,
+        operation="pop",
+      ) from e
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message via ``consumer.acknowledge``.
@@ -603,30 +611,26 @@ class PulsarBackend(Backend, QueueBackend):
     return 0
 
   def clear_queue(self, queue_name: str) -> None:
-    """Best-effort clear: drop the cached consumer/producers for the queue.
+    """Report that broker-side queue purge is unsupported.
 
-    Full topic deletion requires the Pulsar admin API; this resets the
-    in-process handles so the queue is consumed fresh on next access.
+    Dropping cached client handles does not clear a Pulsar subscription or
+    its backlog. Returning success for that local-only cleanup would violate
+    the QueueBackend contract and can make callers believe durable messages
+    were deleted.
 
     Args:
         queue_name: Name of the queue.
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: Always; purging requires the Pulsar admin API, which this
+            backend does not configure.
     """
     _validate_key_name(queue_name, "queue_name")
-    topic = self._topic_name(queue_name)
-    if self._subscribed_topic == topic and self._consumer is not None:
-      with _suppress_pulsar_errors():
-        self._consumer.close()
-      self._consumer = None
-      self._subscribed_topic = None
-    producer = self._producers.pop(topic, None)
-    if producer is not None:
-      with _suppress_pulsar_errors():
-        producer.close()
-    self._last_msg = None
-    self._in_flight.clear()
+    msg = "clear_queue is not supported without the Pulsar admin API"
+    raise QueueError(
+      msg, queue_name=queue_name, operation="clear_queue"
+    )
 
   def _ensure_consumer(self, topic: str) -> None:
     """Create or reuse the consumer for ``topic`` (re-subscribes on change).

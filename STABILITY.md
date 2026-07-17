@@ -42,6 +42,12 @@ The tiers follow [Semantic Versioning 2.0.0](https://semver.org/):
 | Queue `delay` | Experimental | In-process `heapq`; lost on crash. Soft-cap warn (`max_held`). Distributed-delay is a post-1.0 roadmap item. |
 | Queue `round_robin` | Experimental | In-process per-worker index. |
 | Queue `throttle` | Experimental | In-process rate limiter; effective rate scales with worker count. |
+| Queue `priority` | Experimental | Backend-side physical buckets; distributed, but the bucket mapping and scan semantics are still young. |
+| Queue `time_wheel` | Experimental | In-process timing wheel + overflow heap; clean-shutdown snapshots only. |
+| Queue `work_stealing` | Experimental | Backend-side worker queues; production use requires stable worker IDs and an explicit peer list. |
+| Queue `ring_buffer` | Experimental | Bounded in-process storage; crash/restart loses unsnapshotted items. |
+| Storage `passthrough` | Stable | Default; writes directly to `StorageBackend`. |
+| Storage `batched` | Experimental | In-process buffer; hard crashes can lose an unflushed batch. |
 
 ### Fresh hooks / settings (may evolve in a minor bump)
 
@@ -68,8 +74,8 @@ in any release.
 | ElasticSearch | Yes | Yes | Yes | Stable — full | 2 modes (standalone, cloud). |
 | Kafka | Yes | No | No | Stable — queue-only | SASL/SSL; ack under `CONCURRENT_REQUESTS > 1` via per-message token. |
 | RabbitMQ | Yes | No | No | Stable — queue-only | Priority queues (`x-max-priority`); HA policy; per-message ack. |
-| Pulsar | Yes | No | No | Stable — queue-only | Shared subscription; single-slot ack (`supports_concurrent_ack=False`). |
-| SQS | Yes | No | No | Stable — queue-only | Standard queues; LocalStack + AWS; single-slot ack. |
+| Pulsar | Yes | No | No | Stable — queue-only | Shared subscription; concurrent-safe per-message ack tokens. |
+| SQS | Yes | No | No | Stable — queue-only | Standard queues; LocalStack + AWS; concurrent-safe per-message ack tokens. |
 | RocketMQ | Yes | Guard | Guard | Stable — queue-only | gRPC proxy (`--enable-proxy`, port 8081); deferred-ack (at-least-once) via per-message token; Set/Storage rejected at config time (`ConfigurationError` guard). Apache `rocketmq-python-client` 5.1.1 (pure-Python, maintained). |
 | DynamoDB | No | No | Yes | Stable — storage-only | KV+TTL; LocalStack + AWS. |
 | Memcached | No | No | Yes | **Experimental** | KV+TTL (storage-only). **Supply-chain caveat:** depends on `pymemcache==4.0.0` — unmaintained (last release 2022-10-17, ~1300+ days stale at the time of writing); tracked as U20. The label is applied to `pyproject.toml` separately; this document records the status. |

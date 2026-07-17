@@ -779,12 +779,18 @@ def test_clear_queue_not_connected() -> None:
   with pytest.raises(QueueError) as exc_info:
     backend.clear_queue("test_queue")
   assert "Not connected" in str(exc_info.value)
+  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.operation == "clear_queue"
 
 
 def test_clear_queue_connected(mocker) -> None:
-  """clear_queue logs a warning when connected (no-op)."""
+  """clear_queue reports that broker-side purge is unsupported."""
   backend, _, _, _ = _make_connected_backend(mocker)
-  backend.clear_queue("test_queue")  # should not raise
+  with pytest.raises(QueueError) as exc_info:
+    backend.clear_queue("test_queue")
+  assert "not supported" in str(exc_info.value)
+  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.operation == "clear_queue"
 
 
 # ---------------------------------------------------------------------------

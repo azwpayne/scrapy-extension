@@ -161,7 +161,7 @@ class Settings(BaseSettings):
   )
   storage_buffer_max_age_s: float | None = Field(
     default=None,
-    ge=0,
+    gt=0,
     description=(
       "Caps the BatchedStorageStrategy crash-before-flush loss window by "
       "spawning a background flush once the oldest buffered item is older "

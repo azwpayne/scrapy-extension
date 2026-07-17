@@ -414,25 +414,35 @@ class TestStrategyMqAckBypassWarning:
       f"priority+kafka must NOT warn (priority overrides pop_with_ack); got: {msgs}"
     )
 
+  def test_no_warn_when_time_wheel_threads_ack_with_kafka(
+    self, mocker, caplog
+  ) -> None:
+    import logging
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = _strategy_settings("kafka", "time_wheel")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+      BackendScheduler.from_settings(settings)
+    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("pop_with_ack" in m for m in msgs), (
+      f"time_wheel+kafka must NOT warn (time-wheel threads the MQ token); got: {msgs}"
+    )
+
   @pytest.mark.parametrize(
     ("strategy", "backend"),
     [
-      # In-process strategies that inherit the ABC pop_with_ack default
-      # ((pop(), None) -- correct for them: no broker message to ack).
-      # passthrough/priority/work_stealing AND delay/throttle (R2-2 fix) all
-      # override pop_with_ack -> thread the MQ token -> no warning.
+      # Fully in-process strategies inherit the ABC pop_with_ack default.
+      # Every backend-delegating bundled strategy overrides pop_with_ack.
       ("round_robin", "kafka"),
-      ("time_wheel", "kafka"),
       ("ring_buffer", "kafka"),
     ],
   )
   def test_warns_for_non_passthrough_strategy_x_mq_backend(
     self, mocker, caplog, strategy, backend
   ) -> None:
-    """In-process strategies (round_robin/time_wheel/ring_buffer) inherit the
-    ABC pop_with_ack default and don't thread the MQ token -- warn when paired
-    with an MQ backend. delay and throttle USED to be here but now override
-    pop_with_ack (R2-2 fix), so they're covered by the no-warn tests above.
+    """Fully in-process strategies inherit the ABC pop_with_ack default and
+    bypass broker durability -- warn when paired with an MQ backend.
     """
     import logging
 

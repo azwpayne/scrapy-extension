@@ -239,13 +239,17 @@ What the library contractually promises — and just as importantly, what it doe
 | Queue | `delay` | Per-process | In-process `heapq`; **survives clean restart** via snapshot/restore persisted to the storage backend on `close()` (initiatives #3 / #13) — **lost on hard crash** (no `close()` runs). Snapshots are **spider-scoped** — key `queue:snapshot:<spider.name>:<queue_name>` (initiative #16) — so two spiders sharing a storage backend with the same `queue_name` cannot clobber each other's snapshot. Soft-cap `max_held` warns once when exceeded (`queue/strategies/delay.py`). |
 | Queue | `round_robin` | Per-process | Fair dispatch across `request.meta['source']` using a per-worker index. |
 | Queue | `throttle` | Per-process | Effective rate under N workers = `N × (1 / min_interval)`. |
+| Queue | `priority` | Yes | Items live in backend-side priority buckets; no strategy-held in-process payload. |
+| Queue | `time_wheel` | Per-process | Timing wheel and overflow heap are local; clean shutdown can snapshot, hard crashes lose held items. |
+| Queue | `work_stealing` | Yes, with explicit topology | Worker queues live in the backend; use stable worker IDs and a complete peer list. |
+| Queue | `ring_buffer` | Per-process | The bounded in-process buffer is the queue; the backend is intentionally bypassed. |
 | Dedup | `set` (default) | Yes — exact | Backend `SADD`/`SISMEMBER` semantics; byte-identical to pre-strategy behavior (`dupefilter/filters/set_filter.py`). |
 | Dedup | `memory` | Per-process | In-process; optional LRU cap via `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000; round-9 U5). |
 | Dedup | `bloom` | Per-process | Pure-stdlib bit-vector; **never produces false negatives** (a seen URL is always reported seen); false-positive rate is configurable. |
 | Dedup | `cuckoo` | Per-process | Pure-stdlib; **never produces false negatives**; supports deletion; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
 | Storage | all storage-capable backends | Yes | Via backend KV+TTL (`backends/base.py:525`). |
 
-**Defaults are distributed-exact.** `set` dedup + `passthrough` queue are safe for multi-worker crawls out of the box. `delay` / `throttle` / `round_robin` / `memory` / `bloom` / `cuckoo` are **per-process opt-in** — safe for single-worker politeness/dedup; for multi-worker politeness or shared probabilistic dedup, run one process per backend or wait for the distributed-strategies roadmap.
+**Defaults are distributed-exact.** `set` dedup + `passthrough` queue are safe for multi-worker crawls out of the box. `delay` / `throttle` / `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo` are **per-process opt-in**. `priority` and correctly configured `work_stealing` retain backend-side payload durability.
 
 ### Contractual promises
 
@@ -255,7 +259,7 @@ What the library contractually promises — and just as importantly, what it doe
 | **Credentials are never logged.** Passwords / SASL tokens / API keys flow through `_RedactedStr`, whose `__repr__` / `__str__` return `***` rather than the raw value. | `backends/_redaction.py:22`, wired into Kafka/RabbitMQ config builders |
 | **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends/base.py:34` (`_json_default`), `backends/base.py:131` (`JSONSerializer`) |
 | **Input names are validated.** Queue / set / index / topic names match `^[a-zA-Z0-9._:-]+$` (topic names a stricter subset); injection-shaped inputs are rejected before use. | `backends/base.py:170` (`KEY_NAME_PATTERN`, `_validate_key_name`) |
-| **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Message-queue backends (Kafka, RabbitMQ) carry a per-message ack token so the *specific* popped message is acked; the scheduler's `from_settings` gate refuses unsafe configs unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py:313` (`QueueBackend` ack contract), `schedule/scheduler.py` |
+| **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) carry a per-message ack token so the *specific* popped message is acked; the scheduler's `from_settings` gate refuses a backend/plugin that declares single-slot ack unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py` (`QueueBackend` ack contract), `schedule/scheduler.py` |
 | **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | `__init__.py`, `backends/__init__.py`, every `backends/*.py` |
 | **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
 | **Backend capability honesty.** A backend never silently no-ops on an unsupported interface: queue-only backends omit `SetBackend`/`StorageBackend` entirely; RocketMQ set/storage are rejected at config time (`ConfigurationError` guard). The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
@@ -263,7 +267,7 @@ What the library contractually promises — and just as importantly, what it doe
 
 ### What is **not** promised
 
-- **Cross-worker behavior of `delay` / `throttle` / `round_robin` / `memory` / `bloom` / `cuckoo` strategies** — they are per-process by design (see table above).
+- **Cross-worker behavior of `delay` / `throttle` / `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo` strategies** — they are per-process by design (see table above).
 - **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [`STABILITY.md`](STABILITY.md).
 - **Stability of fresh hooks** — `on_filter_full` (round-7) and `backpressure_pause_at` / `backpressure_resume_at` (round-4) are new; the hook signatures and setting semantics may evolve in a minor bump.
 - **Wire compatibility for the SQS / Memcached / DynamoDB LocalStack paths** — exercised via LocalStack in CI; not certified against every AWS region or Memcached server version.
@@ -354,9 +358,8 @@ Use `passthrough` when item loss is unacceptable. Use `batched` only when throug
 
 | Surface | Ack / state boundary | Crash behavior | Operational guidance |
 |---|---|---|---|
-| Redis / MongoDB / ElasticSearch / RocketMQ queue pop | atomic-pop or deferred-ack handled by the backend implementation; scheduler ack is inert or token-specific | item is removed/owned once popped; callback/pipeline crash after downloader response can still lose downstream item work | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters |
-| Kafka / RabbitMQ queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | understand this is download-level ack, not pipeline-completion ack |
-| SQS / Pulsar queue pop | per-message ack token (`pop_with_ack`) tracked in a bounded in-flight set; acked on `response_received` | same download-level semantics as Kafka/RabbitMQ — crash before ack redelivers | safe under `CONCURRENT_REQUESTS > 1` (a real in-flight ack set, not a single slot) |
+| Redis / MongoDB / ElasticSearch queue pop | atomic backend pop; scheduler ack is inert | item is removed once popped; a later callback/pipeline crash can lose downstream item work | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters |
+| Kafka / RabbitMQ / RocketMQ / SQS / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; understand this is download-level ack, not pipeline-completion ack |
 | Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |
 | Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives | prefer `passthrough` for strongest distributed durability |
 | `batched` storage | in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the unwritten tail | prefer `passthrough` when persistence must happen before item acknowledgement |
@@ -463,6 +466,7 @@ Stores items as JSON with keys: `{prefix}:{spider_name}:{timestamp}:{uuid}`.
 BackendError (base)
 ├── BackendConnectionError   — connection failures (includes backend_type)
 ├── QueueError               — queue operation failures (includes queue_name, operation)
+├── StorageError             — storage operation failures (includes operation, key)
 ├── SerializationError       — serialization failures (includes data, serializer)
 └── ConfigurationError       — invalid settings (includes setting_name, setting_value)
 ```
@@ -515,5 +519,4 @@ Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomiz
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
 

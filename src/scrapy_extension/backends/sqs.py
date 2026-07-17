@@ -20,6 +20,7 @@ boto3 API (stable, well-known):
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -407,7 +408,14 @@ class SqsBackend(Backend, QueueBackend):
     receipt = msg.get("ReceiptHandle")
     if receipt is None:
       return (url, None, None)
-    body = base64.b64decode(msg.get("Body", ""))
+    try:
+      body = base64.b64decode(msg.get("Body", ""), validate=True)
+    except (binascii.Error, TypeError, ValueError) as e:
+      raise QueueError(
+        f"Invalid base64 body in SQS queue {queue_name}: {e}",
+        queue_name=queue_name,
+        operation="pop",
+      ) from e
     return (url, body, receipt)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:

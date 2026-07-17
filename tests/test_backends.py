@@ -1566,8 +1566,13 @@ class TestRedisBackendStorageOperations:
     mock_redis.get.side_effect = RedisError("Read error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(RedisError, match="Read error"):
+    from scrapy_extension.exceptions import StorageError
+
+    with pytest.raises(StorageError, match="Read error") as exc_info:
       backend.retrieve("test_key")
+    assert exc_info.value.operation == "retrieve"
+    assert exc_info.value.key == "test_key"
+    assert isinstance(exc_info.value.__cause__, RedisError)
 
   def test_delete_success(self, redis_settings, mock_redis, mocker):
     """Test delete returns True on successful deletion."""
@@ -1603,8 +1608,13 @@ class TestRedisBackendStorageOperations:
     mock_redis.delete.side_effect = RedisError("Delete error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(RedisError, match="Delete error"):
+    from scrapy_extension.exceptions import StorageError
+
+    with pytest.raises(StorageError, match="Delete error") as exc_info:
       backend.delete("test_key")
+    assert exc_info.value.operation == "delete"
+    assert exc_info.value.key == "test_key"
+    assert isinstance(exc_info.value.__cause__, RedisError)
 
   def test_exists_true(self, redis_settings, mock_redis, mocker):
     """Test exists returns True when key exists."""
@@ -1643,8 +1653,13 @@ class TestRedisBackendStorageOperations:
     mock_redis.exists.side_effect = RedisError("Exists error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(RedisError, match="Exists error"):
+    from scrapy_extension.exceptions import StorageError
+
+    with pytest.raises(StorageError, match="Exists error") as exc_info:
       backend.exists("test_key")
+    assert exc_info.value.operation == "exists"
+    assert exc_info.value.key == "test_key"
+    assert isinstance(exc_info.value.__cause__, RedisError)
 
   def test_ttl_with_ttl(self, redis_settings, mock_redis, mocker):
     """Test ttl returns seconds when TTL is set."""
@@ -1691,8 +1706,13 @@ class TestRedisBackendStorageOperations:
     mock_redis.ttl.side_effect = RedisError("TTL error")
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
-    with pytest.raises(RedisError, match="TTL error"):
+    from scrapy_extension.exceptions import StorageError
+
+    with pytest.raises(StorageError, match="TTL error") as exc_info:
       backend.ttl("test_key")
+    assert exc_info.value.operation == "ttl"
+    assert exc_info.value.key == "test_key"
+    assert isinstance(exc_info.value.__cause__, RedisError)
 
   def test_clear_storage_with_prefix(self, redis_settings, mock_redis, mocker):
     """Test clear_storage with prefix uses scan_iter."""

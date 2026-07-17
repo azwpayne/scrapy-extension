@@ -285,8 +285,21 @@ class TestQueue:
     b.clear_queue("q")
     b._client.delete_by_query.assert_called_once()
 
+  def test_clear_queue_wraps_transport_error(self, mocker):
+    from scrapy_extension.exceptions import QueueError
 
-class TestSet:
+    b = _mock_backend(mocker)
+    b._client.delete_by_query.side_effect = TransportError("cluster unavailable")
+
+    with pytest.raises(QueueError) as exc_info:
+      b.clear_queue("q")
+
+    assert exc_info.value.queue_name == "q"
+    assert exc_info.value.operation == "clear_queue"
+    assert isinstance(exc_info.value.__cause__, TransportError)
+
+
+class TestSetCore:
   def test_add_new(self, mocker):
     b = _mock_backend(mocker)
     assert b.add("s", b"item") is True
@@ -324,6 +337,18 @@ class TestSet:
     b = _mock_backend(mocker)
     b.clear_set("s")
     b._client.delete_by_query.assert_called_once()
+
+  def test_clear_set_wraps_transport_error(self, mocker):
+    from scrapy_extension.exceptions import BackendConnectionError
+
+    b = _mock_backend(mocker)
+    b._client.delete_by_query.side_effect = TransportError("cluster unavailable")
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      b.clear_set("s")
+
+    assert exc_info.value.backend_type == "elasticsearch"
+    assert isinstance(exc_info.value.__cause__, TransportError)
 
 
 class TestStorage:
@@ -420,6 +445,19 @@ class TestStorage:
     b._client.get.side_effect = _make_not_found_error()
     assert b.ttl("k") is None
 
+  def test_ttl_wraps_transport_error_as_storage_error(self, mocker):
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.get.side_effect = TransportError("cluster unavailable")
+
+    with pytest.raises(StorageError) as exc_info:
+      b.ttl("k")
+
+    assert exc_info.value.operation == "ttl"
+    assert exc_info.value.key == "k"
+    assert isinstance(exc_info.value.__cause__, TransportError)
+
   def test_clear_storage(self, mocker):
     b = _mock_backend(mocker)
     b.clear_storage()
@@ -440,6 +478,19 @@ class TestStorage:
     assert b._client.delete_by_query.call_args.kwargs["query"] == {
       "prefix": {"key.keyword": "items:"}
     }
+
+  def test_clear_storage_wraps_transport_error(self, mocker):
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.delete_by_query.side_effect = TransportError("cluster unavailable")
+
+    with pytest.raises(StorageError) as exc_info:
+      b.clear_storage("items:")
+
+    assert exc_info.value.operation == "clear_storage"
+    assert exc_info.value.key is None
+    assert isinstance(exc_info.value.__cause__, TransportError)
 
   def test_store_wraps_transport_error_as_storage_error(self, mocker):
     """#30: ES storage ops must join the StorageError family (Mongo/Memcached/

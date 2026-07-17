@@ -435,14 +435,12 @@ class BackendScheduler:
     """Warn when the resolved queue strategy does NOT thread the MQ per-message
     ack token AND the backend requires one (#28).
 
-    A strategy threads the token iff its class overrides ``pop_with_ack``
-    (passthrough / priority / work_stealing / delay / throttle override it;
-    round_robin / time_wheel / ring_buffer inherit the ABC default
-    ``(pop(), None)`` -- correct for in-process strategies that hold no
-    broker message). Pairing a non-threading strategy with an MQ backend
-    (``requires_ack=True``) silently drops per-message ack correlation — an
-    at-least-once hazard. This surfaces it as a WARNING so operators can
-    switch to a threading strategy or accept the tradeoff deliberately.
+    A strategy threads the token iff its class overrides ``pop_with_ack``.
+    Every backend-delegating bundled strategy does so; round-robin and ring
+    buffer are fully in-process and inherit ``(pop(), None)``. Pairing an
+    unknown non-threading strategy with an MQ backend is ambiguous: a backend
+    pop would lose its ack token, while local storage bypasses broker durability
+    entirely. Surface either case so operators choose it deliberately.
     """
     # Strategies that override pop_with_ack thread the MQ token — no warning.
     if "pop_with_ack" in type(queue_strategy).__dict__:
@@ -459,10 +457,11 @@ class BackendScheduler:
     )
     logger.warning(
       "Queue strategy %s paired with MQ backend %r (requires_ack=True) does "
-      "not override pop_with_ack, so per-message ack correlation is silently "
-      "disabled (at-least-once hazard). Use a threading strategy "
-      "(passthrough/priority/work_stealing) to keep per-message ack, or "
-      "accept the tradeoff deliberately.",
+      "not override pop_with_ack. A backend-delegating strategy would lose "
+      "per-message ack correlation; a local strategy bypasses broker "
+      "durability. Use a backend-threading strategy "
+      "(passthrough/delay/throttle/priority/time_wheel/work_stealing), or "
+      "accept the local-storage tradeoff deliberately.",
       type(queue_strategy).__name__,
       bt_name,
     )

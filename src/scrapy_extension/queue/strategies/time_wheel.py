@@ -161,6 +161,18 @@ class TimeWheelQueueStrategy(QueueStrategy):
     self._drain_ready(queue_name)
     return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
 
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, object | None]:
+    """Drain due items, then pop while preserving the backend ack token.
+
+    Time-wheel holding happens before items enter the live backend queue. Once
+    an item is due, the final pop has the same deferred-ack requirements as a
+    passthrough pop, so MQ tokens must be carried to the scheduler.
+    """
+    self._drain_ready(queue_name)
+    return self._pop_backend_with_ack(queue_name, timeout)
+
   def _drain_ready(self, queue_name: str) -> None:
     """Move all due held items (wheel + overflow) into the live queue.
 
@@ -190,7 +202,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
       # elapses. In normal operation (span < wheel_size) the filter is a no-op:
       # a slot is only reached when its tick is in the drain window, at which
       # point ready_at <= now.
-      still_held = deque()
+      still_held: deque[tuple[float, bytes, float]] = deque()
       while dq:
         ready_at_h, item, priority = dq.popleft()
         if ready_at_h <= now:

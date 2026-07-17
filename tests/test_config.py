@@ -35,6 +35,11 @@ class TestSettings:
     settings = Settings(backend_type=BackendType.MONGODB)
     assert settings.backend_type == BackendType.MONGODB
 
+  @pytest.mark.parametrize("age", [0.0, -0.1])
+  def test_storage_buffer_max_age_must_be_positive(self, age):
+    with pytest.raises(ValidationError):
+      Settings(storage_buffer_max_age_s=age)
+
 
 class TestRedisSettings:
   """Test RedisSettings."""
@@ -613,5 +618,4 @@ class TestR14COperabilitySettings:
     monkeypatch.setenv("SCRAPY_MONITOR_POP_RATE_WINDOW_S", "30.0")
     settings = Settings()
     assert settings.monitor_pop_rate_window_s == 30.0
-
 

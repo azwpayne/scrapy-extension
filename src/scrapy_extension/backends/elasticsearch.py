@@ -317,9 +317,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If the delete-by-query request fails.
     """
     _validate_key_name(queue_name, "queue_name")
-    self._delete_by_term(self.config.queue_index, "queue_name", queue_name)
+    try:
+      self._delete_by_term(self.config.queue_index, "queue_name", queue_name)
+    except TransportError as e:
+      msg = f"Failed to clear ElasticSearch queue {queue_name!r}: {e}"
+      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
   # ---- Set ----
 
@@ -449,9 +454,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If set_name contains invalid characters.
+        BackendConnectionError: If the delete-by-query request fails.
     """
     _validate_key_name(set_name, "set_name")
-    self._delete_by_term(self.config.set_index, "set_name", set_name)
+    try:
+      self._delete_by_term(self.config.set_index, "set_name", set_name)
+    except TransportError as e:
+      raise BackendConnectionError(
+        f"ElasticSearch set clear failed for {set_name!r}: {e}",
+        backend_type="elasticsearch",
+      ) from e
 
   # ---- Storage ----
 
@@ -465,6 +477,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the write request fails.
     """
     _validate_key_name(key, "key")
     doc: dict[str, Any] = {"key": key, "data": _b64encode(data)}
@@ -529,6 +542,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the read request fails.
     """
     _validate_key_name(key, "key")
     try:
@@ -554,6 +568,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the delete request fails.
     """
     _validate_key_name(key, "key")
     try:
@@ -609,12 +624,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the read request fails.
     """
     _validate_key_name(key, "key")
     try:
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return None
+    except TransportError as e:
+      msg = f"Failed to read TTL of key {key!r} in ElasticSearch: {e}"
+      raise StorageError(msg, operation="ttl", key=key) from e
     source = resp.get("_source", {})
     # R-esttl: lazy-reap expired docs (storage hygiene) — keeps the R48
     # contract (-1 = expired, distinct from None = absent). The reap deletes
@@ -637,6 +656,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If a provided prefix contains invalid characters.
+        StorageError: If the delete-by-query request fails.
     """
     if prefix is not None:
       _validate_key_name(prefix, "prefix")
@@ -648,7 +668,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # as ``_count`` / ``_delete_by_term`` / ``pop``). Parity with redis
     # scan_iter(match=prefix*) and dynamodb begins_with (#64).
     query = {"prefix": {"key.keyword": prefix}} if prefix else {"match_all": {}}
-    self._delete_by_query(self.config.storage_index, query)
+    try:
+      self._delete_by_query(self.config.storage_index, query)
+    except TransportError as e:
+      msg = f"Failed to clear ElasticSearch storage: {e}"
+      raise StorageError(msg, operation="clear_storage", key=None) from e
 
   # ---- Shared helpers ----
 
@@ -719,8 +743,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Args:
         index: Index name.
         query: Query dict.
+
+    Raises:
+        TransportError: If the delete request fails. Public callers map this
+            to the exception family for their interface.
     """
-    try:
-      self.client.delete_by_query(index=index, query=query)
-    except TransportError as e:
-      logger.warning("Failed to delete from %s: %s", index, e)
+    self.client.delete_by_query(index=index, query=query)

@@ -113,6 +113,28 @@ class TestSetupBackend:
     assert result is mock_manager
     assert get_manager_spy.call_count == 1
 
+  def test_setup_backend_is_idempotent(self, mocker):
+    """Repeated setup must not leak a manager acquire or duplicate signals."""
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+    get_manager = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=mock_manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    connect_signals = mocker.patch.object(spider, "_connect_signals")
+
+    first = spider.setup_backend()
+    second = spider.setup_backend()
+
+    assert first is mock_manager
+    assert second is mock_manager
+    get_manager.assert_called_once()
+    connect_signals.assert_called_once()
+
   def test_setup_backend_shares_singleton_across_spiders(self):
     """2026-07-11 (§C intent, no mocks): two spiders with identical backend
     config must acquire the SAME ConnectionManager via the singleton registry.

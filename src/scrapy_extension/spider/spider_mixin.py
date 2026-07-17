@@ -101,7 +101,9 @@ class BackendSpiderMixin(Spider):
 
     This method creates a ConnectionManager instance using the spider's
     backend configuration. It also connects Scrapy signals for automatic
-    connection lifecycle management.
+    connection lifecycle management. Repeated calls are idempotent: the
+    existing manager is returned without acquiring another registry reference
+    or registering duplicate signal handlers.
 
     Returns:
         ConnectionManager: The initialized connection manager.
@@ -110,6 +112,9 @@ class BackendSpiderMixin(Spider):
         RuntimeError: If backend_type is not set.
         ImportError: If required backend dependencies are not installed.
     """
+    if self._connection_manager is not None:
+      return self._connection_manager
+
     if self.backend_type is None:
       msg = (
         f"{self.__class__.__name__}.backend_type must be set. "

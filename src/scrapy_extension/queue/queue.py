@@ -351,12 +351,10 @@ class BackendQueue:
     """Pop bytes + ack token, delegating to the strategy's ``pop_with_ack``.
 
     Each strategy owns whether it can thread a backend per-message ack token
-    (#28). ``PassthroughQueueStrategy`` / ``PriorityQueueStrategy`` /
-    ``WorkStealingQueueStrategy`` override ``pop_with_ack`` to call
-    ``QueueBackend.pop_with_ack`` and carry the token (correct under
-    ``CONCURRENT_REQUESTS > 1``). In-process strategies (round_robin /
-    ring_buffer) and the holding strategies inherit the ABC default
-    ``(pop(), None)`` -- correct, since they hold no broker message to ack.
+    (#28). Every backend-delegating strategy overrides ``pop_with_ack`` and
+    carries the token (correct under ``CONCURRENT_REQUESTS > 1``). The fully
+    in-process round-robin and ring-buffer strategies inherit the ABC default
+    ``(pop(), None)`` because they never pop a broker message.
     """
     return self._strategy.pop_with_ack(self.queue_name, timeout)
 

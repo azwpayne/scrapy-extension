@@ -35,7 +35,11 @@ from scrapy_extension.backends.base import (
   QueueBackend,
   secret_value,
 )
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 from scrapy_extension.settings import RocketMQMode
 
 if TYPE_CHECKING:
@@ -489,18 +493,23 @@ class RocketMQBackend(Backend, QueueBackend):
     return 0
 
   def clear_queue(self, queue_name: str) -> None:
-    """Clear all items from queue.
+    """Report that RocketMQ broker-side queue purge is unsupported.
 
     Args:
       queue_name: Name of the queue.
-    """
-    from scrapy_extension.exceptions import QueueError
 
+    Raises:
+      QueueError: If disconnected or because the client has no purge API.
+    """
     if not self.is_connected():
       msg = "Not connected to RocketMQ"
-      raise QueueError(msg)
-    # RocketMQ doesn't support purge, log warning.
-    logger.warning("clear_queue not supported in RocketMQ")
+      raise QueueError(
+        msg, queue_name=queue_name, operation="clear_queue"
+      )
+    msg = "clear_queue is not supported by the RocketMQ client"
+    raise QueueError(
+      msg, queue_name=queue_name, operation="clear_queue"
+    )
 
 
 # ---------------------------------------------------------------------------

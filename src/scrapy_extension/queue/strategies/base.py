@@ -77,9 +77,9 @@ class QueueStrategy(ABC):
     Default returns ``(self.pop(...), None)`` -- correct for strategies that
     hold no broker message to ack (in-process: round_robin / ring_buffer) and
     for strategies whose ack semantics don't map to a single backend message.
-    Backend-using strategies that CAN correlate a per-message token override
-    this to call ``QueueBackend.pop_with_ack`` and thread the token through
-    (passthrough / priority / work_stealing).
+    Backend-using strategies override this to call
+    ``QueueBackend.pop_with_ack`` and thread the token through (passthrough /
+    delay / throttle / priority / time_wheel / work_stealing).
 
     Args:
         queue_name: The queue name.
@@ -96,7 +96,8 @@ class QueueStrategy(ABC):
   ) -> tuple[bytes | None, Any | None]:
     """Pop from the backend, threading the per-message ack token when it provides one.
 
-    Shared by backend-delegating strategies (passthrough / delay / throttle).
+    Shared by backend-delegating strategies (passthrough / delay / throttle /
+    time_wheel).
     MQ backends that override ``QueueBackend.pop_with_ack`` take the
     token-correlated path; atomic-pop backends keep the plain ``pop()`` path
     (byte-identical roundtrip for them). The breaker proxy is unwrapped

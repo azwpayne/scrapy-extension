@@ -140,6 +140,18 @@ class TestSqsPushPop:
     client.receive_message.return_value = {}
     assert b.pop("queue1") is None
 
+  def test_pop_wraps_malformed_external_body(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "not-base64!", "ReceiptHandle": "rh"}]
+    }
+
+    with pytest.raises(QueueError) as exc_info:
+      b.pop("queue1")
+
+    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.operation == "pop"
+
   def test_pop_caps_wait_at_20(self, mocker) -> None:
     b, client = _connected(mocker)
     client.receive_message.return_value = {}

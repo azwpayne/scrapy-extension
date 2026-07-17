@@ -797,9 +797,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the Redis read fails.
     """
     _validate_key_name(key, "key")
-    result = self.client.get(key)
+    try:
+      result = self.client.get(key)
+    except RedisError as e:
+      msg = f"Failed to retrieve key {key!r} from Redis: {e}"
+      raise StorageError(msg, operation="retrieve", key=key) from e
     if result is None:
       return None
     if isinstance(result, bytes):
@@ -818,9 +823,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the Redis delete fails.
     """
     _validate_key_name(key, "key")
-    return self.client.delete(key) == 1
+    try:
+      return self.client.delete(key) == 1
+    except RedisError as e:
+      msg = f"Failed to delete key {key!r} from Redis: {e}"
+      raise StorageError(msg, operation="delete", key=key) from e
 
   def exists(self, key: str) -> bool:
     """Check if key exists.
@@ -833,9 +843,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the Redis existence check fails.
     """
     _validate_key_name(key, "key")
-    return self.client.exists(key) == 1
+    try:
+      return self.client.exists(key) == 1
+    except RedisError as e:
+      msg = f"Failed to check existence of key {key!r} in Redis: {e}"
+      raise StorageError(msg, operation="exists", key=key) from e
 
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
@@ -849,9 +864,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If key contains invalid characters.
+        StorageError: If the Redis TTL query fails.
     """
     _validate_key_name(key, "key")
-    result = cast("int", self.client.ttl(key))  # type: ignore[redundant-cast]
+    try:
+      result = cast("int", self.client.ttl(key))  # type: ignore[redundant-cast]
+    except RedisError as e:
+      msg = f"Failed to read TTL of key {key!r} in Redis: {e}"
+      raise StorageError(msg, operation="ttl", key=key) from e
     # redis-py ttl() returns int: -2 = no key, -1 = no TTL, >= 0 = TTL seconds.
     # Per StorageBackend contract, both "missing key" and "no TTL" return None.
     if result < 0:

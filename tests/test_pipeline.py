@@ -5,7 +5,7 @@ from typing import cast
 import pytest
 from scrapy import Field, Item
 
-from scrapy_extension.backends.base import JSONSerializer
+from scrapy_extension.backends.base import JSONSerializer, _validate_key_name
 from scrapy_extension.exceptions import BackendError, SerializationError
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
@@ -355,6 +355,7 @@ class TestBackendPipelineProcessItem:
     call_args = mock_connection_manager.get_storage_backend().store.call_args
     key = call_args[0][0]
     assert key.startswith("my_items:my_spider:")
+    _validate_key_name(key, "key")
 
   def test_process_item_returns_original_item(self, mock_connection_manager, mocker):
     """Test that process_item returns the original item unchanged."""

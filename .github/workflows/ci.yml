@@ -31,10 +31,22 @@ jobs:
         run: uv sync --group test
       - name: Ruff
         run: uv run ruff check
+      - name: Mypy (strict)
+        if: matrix.python-version == '3.10'
+        run: uv run mypy --strict src
+      - name: Bandit
+        if: matrix.python-version == '3.10'
+        run: uv run bandit -r src -c pyproject.toml
+      - name: Unit tests with coverage (integration deselected)
+        if: matrix.python-version == '3.10'
+        run: >
+          uv run pytest -m "not integration" --tb=short -q
+          --cov=scrapy_extension --cov-report=term-missing
       - name: Unit tests (integration deselected)
+        if: matrix.python-version != '3.10'
         run: uv run pytest -m "not integration" --tb=short -q
 
-  # Integration job — runs the 27 tests under tests/integration/ against
+  # Integration job — runs tests under tests/integration/ against
   # containerized backends. Runs in parallel with unit-tests so it never
   # blocks the fast unit lane.
   #
@@ -53,7 +65,7 @@ jobs:
     # Bound the whole job. A hung broker-client op (no per-op timeout) used to
     # bleed to GitHub Actions' 360-min default — every run since the #44 series
     # landed as cancelled-at-6h. 15 min is generous (broker bring-up ~2 min +
-    # the 27-test suite under per-test --timeout below).
+    # the integration suite under per-test --timeout below).
     timeout-minutes: 15
     services:
       redis:
@@ -157,7 +169,7 @@ jobs:
           # every integration test SKIPS via the conftest-level guard and this job
           # validates nothing (false green — the per-backend URLs alone are not
           # enough; this flag is what actually enables the suite). Verified:
-          # unset → 26 skipped / 0 passed in 0.07s; set → 26 passed.
+          # Unset means the entire live-service suite skips (a false green).
           SCRAPY_TEST_INTEGRATION: "1"
           SCRAPY_TEST_REDIS_URL: redis://localhost:6379/0
           SCRAPY_TEST_MONGODB_URI: mongodb://localhost:27017

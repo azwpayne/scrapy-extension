@@ -131,6 +131,11 @@ class TestBatchedStorageStrategy:
     with pytest.raises(ValueError, match="threshold"):
       BatchedStorageStrategy(threshold=-5)
 
+  @pytest.mark.parametrize("age", [0.0, -0.1])
+  def test_nonpositive_max_buffer_age_raises(self, age: float) -> None:
+    with pytest.raises(ValueError, match="max_buffer_age_s must be > 0"):
+      BatchedStorageStrategy(max_buffer_age_s=age)
+
   def test_thread_safety_no_corruption(self, mocker) -> None:
     """Concurrent stores + flushes don't lose or duplicate items."""
     backend = mocker.Mock()

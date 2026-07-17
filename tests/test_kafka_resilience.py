@@ -129,21 +129,22 @@ def test_clear_queue_raises_when_admin_client_is_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _ack_token error paths (lines 668-670 position, 685-687 commit)
+# _ack_token error paths
 # ---------------------------------------------------------------------------
 
 
-def test_ack_token_raises_when_consumer_position_fails(mocker) -> None:
-  """Lines 668-670: ``_consumer.position()`` raising KafkaError surfaces as
-  a QueueError — the watermark base can't be seeded, so ack fails loudly
-  (the offset stays uncommitted → at-least-once re-delivery on restart)."""
+def test_ack_unknown_token_is_idempotent_noop(mocker) -> None:
+  """A duplicate/stale token must not seed state or query consumer position."""
   backend = _backend()
   backend._consumer = mocker.MagicMock()
-  backend._consumer.position.side_effect = KafkaError("position boom")
   backend._in_flight = defaultdict(set)
-  backend._watermarks = {}  # unseeded -> position() will be called
-  with pytest.raises(QueueError, match="Failed to read consumer position"):
-    backend._ack_token(_KafkaAckToken(partition=0, offset=1, topic="t"))
+  backend._watermarks = {}
+
+  backend._ack_token(_KafkaAckToken(partition=0, offset=1, topic="t"))
+
+  backend._consumer.position.assert_not_called()
+  backend._consumer.commit.assert_not_called()
+  assert backend._watermarks == {}
 
 
 def test_ack_token_raises_when_commit_fails(mocker) -> None:
@@ -156,8 +157,9 @@ def test_ack_token_raises_when_commit_fails(mocker) -> None:
   backend._consumer = mocker.MagicMock()
   backend._consumer.commit.side_effect = KafkaError("commit boom")
   backend._in_flight = defaultdict(set)
-  # Pre-seeded base (0) so position() is NOT called; high-water (5) lets the
-  # watermark walk advance past the base -> commit path taken.
+  backend._in_flight[0].add(1)
+  # Pre-seeded base (0); high-water (5) lets the watermark walk advance past
+  # the base -> commit path taken.
   backend._watermarks = {0: 0}
   backend._high_water = {0: 5}
   with pytest.raises(QueueError, match="Failed to ack Kafka message"):

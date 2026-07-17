@@ -71,10 +71,14 @@ class BatchedStorageStrategy(StorageStrategy):
             wired collector can alert before the loss window grows.
 
     Raises:
-        ValueError: If ``threshold`` is less than 1.
+        ValueError: If ``threshold`` is less than 1, or a configured
+            ``max_buffer_age_s`` is not positive.
     """
     if threshold < 1:
       msg = f"threshold must be >= 1, got {threshold}"
+      raise ValueError(msg)
+    if max_buffer_age_s is not None and max_buffer_age_s <= 0:
+      msg = f"max_buffer_age_s must be > 0, got {max_buffer_age_s}"
       raise ValueError(msg)
     self.threshold = threshold
     self.max_buffer_age_s = max_buffer_age_s

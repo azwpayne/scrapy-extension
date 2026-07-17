@@ -157,9 +157,10 @@ class KafkaBackend(Backend, QueueBackend):
     # partition — the largest offset such that all records from the last-
     # committed offset up to it are completed (no unprocessed record skipped).
     self._in_flight: dict[int, set[int]] = defaultdict(set)
-    # partition -> last-committed watermark (offset of the next record to
-    # consume). Seeded lazily from the consumer position on first ack so the
-    # watermark math is independent of enable_auto_commit.
+    # partition -> commit watermark base (lowest offset in the current
+    # in-flight cohort). Seeded from the first record delivered by
+    # pop_with_ack; consumer.position() is the NEXT fetch offset and would
+    # incorrectly skip the records awaiting application-level ack.
     self._watermarks: dict[int, int] = {}
     # partition -> highest offset ever popped + 1. Bounds the watermark walk
     # so it stops at the frontier of popped records (never walks into
@@ -545,6 +546,11 @@ class KafkaBackend(Backend, QueueBackend):
       offset=record.offset,
       topic=record.topic,
     )
+    # KafkaConsumer.position(tp) points at the NEXT record to fetch after a
+    # poll, so it cannot seed the lowest unprocessed offset. Capture the first
+    # record actually handed to the application instead; this is the commit
+    # watermark base for the current in-flight cohort on this partition.
+    self._watermarks.setdefault(record.partition, record.offset)
     self._in_flight[record.partition].add(record.offset)
     # Track the pop frontier so the watermark walk terminates at the highest
     # popped offset (+1) on this partition — never walks into not-yet-popped
@@ -668,7 +674,7 @@ class KafkaBackend(Backend, QueueBackend):
     Core watermark algorithm (4 lines):
     ::
 
-        in_flight.discard(token.offset)            # mark completed
+        in_flight.remove(token.offset)             # mark completed
         watermark = self._watermarks[partition]    # seeded base
         while watermark not in in_flight:          # contiguous run
             watermark += 1
@@ -681,18 +687,15 @@ class KafkaBackend(Backend, QueueBackend):
     if self._consumer is None:
       return
     partition = token.partition
-    in_flight = self._in_flight[partition]
-    # Idempotent guard — duplicate ack of an already-completed offset.
-    in_flight.discard(token.offset)
-    # Seed the watermark base from the consumer position once per partition,
-    # so the watermark math works whether enable_auto_commit is on or off.
-    if partition not in self._watermarks:
-      try:
-        tp = TopicPartition(token.topic, partition)
-        self._watermarks[partition] = self._consumer.position(tp)
-      except KafkaError as e:
-        msg = f"Failed to read consumer position for ack: {e}"
-        raise QueueError(msg, operation="ack") from e
+    in_flight = self._in_flight.get(partition)
+    # Idempotent guard: a duplicate, stale, or foreign token must not create
+    # partition state or advance a commit cursor.
+    if in_flight is None or token.offset not in in_flight:
+      return
+    in_flight.remove(token.offset)
+    # pop_with_ack seeds this from the first delivered record. The fallback is
+    # defensive for callers/tests that construct internal state directly.
+    self._watermarks.setdefault(partition, token.offset)
     # Advance the watermark past the contiguous completed run. Each step is
     # O(1) set membership; the walk is bounded by _high_water (the pop
     # frontier) so it never walks into not-yet-popped offsets and never

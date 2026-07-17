@@ -10,6 +10,13 @@ import pulsar  # noqa: E402 — the mocked module actually in sys.modules
 import pytest  # noqa: E402
 
 
+class _PulsarTimeout(Exception):
+  """Test double matching ``pulsar.Timeout`` from the C++ client binding."""
+
+
+pulsar.Timeout = _PulsarTimeout
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _cleanup_sys_modules_mock_pulsar():
   """Pop the module-level ``pulsar`` mock after this module's tests finish.
@@ -102,11 +109,11 @@ class TestPulsarErrorPaths:
     b.pop("q")
     b.disconnect()  # _suppress catches consumer.close failure
 
-  def test_clear_queue_closes_consumer(self, mocker) -> None:
+  def test_clear_queue_reports_unsupported(self, mocker) -> None:
     b, client = _connected(mocker)
     consumer = mocker.MagicMock()
-    consumer.receive.side_effect = RuntimeError("none")
+    consumer.receive.side_effect = pulsar.Timeout("none")
     client.subscribe.return_value = consumer
     b.pop("q")  # creates consumer for scrapy-q
-    b.clear_queue("q")
-    consumer.close.assert_called_once()
+    with pytest.raises(QueueError, match="not supported"):
+      b.clear_queue("q")

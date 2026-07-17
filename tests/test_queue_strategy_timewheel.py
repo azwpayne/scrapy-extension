@@ -138,6 +138,20 @@ def test_pop_returns_live_item_after_drain():
   assert item == b"from-live"
 
 
+def test_pop_with_ack_threads_mq_token_after_drain(mocker):
+  """Time-wheel must preserve a backend's per-message ack token."""
+  s, qb, _ = _strategy(wheel_size=60, clock_value=100.0)
+  delegated = mocker.patch.object(
+    s,
+    "_pop_backend_with_ack",
+    return_value=(b"from-live", "ack-token-123"),
+  )
+
+  assert s.pop_with_ack("q", timeout=2.0) == (b"from-live", "ack-token-123")
+  delegated.assert_called_once_with("q", 2.0)
+  qb.pop.assert_not_called()
+
+
 def test_drain_span_capped_to_one_rotation():
   """Idle > wheel_duration: drain at most wheel_size slots (one full rotation)."""
   s, qb, clock = _strategy(wheel_size=10, ticks_per_second=1.0, clock_value=0.0)
