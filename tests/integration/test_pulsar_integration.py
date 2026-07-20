@@ -8,8 +8,8 @@ on this backend:
 - ``push``/``pop`` round-trip + the per-message ``_PulsarAckToken`` (MessageId)
   contract under ``CONCURRENT_REQUESTS > 1``.
 - ``queue_len()`` is unsupported (the client exposes no broker-side depth) —
-  documented as always-0; only a real broker confirms the documented
-  limitation, not a silent regression to a wrong value.
+  it raises ``NotImplementedError`` so unknown depth cannot be mistaken for
+  an empty queue.
 
 Running
 -------

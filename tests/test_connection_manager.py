@@ -4,7 +4,7 @@ import pytest
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 
 
 def test_connection_manager_get_manager_singleton():
@@ -277,7 +277,7 @@ def test_connect_retry_sleep_outside_backend_lock(mocker):
   with pytest.raises(Exception, match="Failed to connect"):  # noqa: B017 - testing retry exhaustion
     manager.connect()
 
-  assert mock_sleep.call_count == 2  # 3 attempts → 2 sleeps
+  assert mock_sleep.call_count == 3  # 1 initial attempt + 3 retries
   # The load-bearing assertion: _lock must NOT be held during any sleep.
   assert lock_held_during_sleep, "time.sleep was never observed"
   assert not any(lock_held_during_sleep), (
@@ -285,6 +285,74 @@ def test_connect_retry_sleep_outside_backend_lock(mocker):
     "peer threads sharing the manager. connect() must run its retry loop "
     "without holding _lock."
   )
+
+
+@pytest.mark.parametrize(
+  ("settings", "setting_name"),
+  [
+    ({"retry_attempts": -1}, "retry_attempts"),
+    ({"retry_attempts": 21}, "retry_attempts"),
+    ({"retry_attempts": True}, "retry_attempts"),
+    ({"retry_attempts": "many"}, "retry_attempts"),
+    ({"retry_delay": -0.1}, "retry_delay"),
+    ({"retry_delay": float("inf")}, "retry_delay"),
+    ({"retry_delay": True}, "retry_delay"),
+    ({"manager_retry_attempts": -1}, "retry_attempts"),
+    ({"manager_retry_delay": float("nan")}, "retry_delay"),
+  ],
+)
+def test_connect_rejects_invalid_retry_policy_before_backend_creation(
+  mocker, settings, setting_name
+):
+  manager = ConnectionManager(BackendType.REDIS, settings)
+  create_backend = mocker.patch.object(manager, "_create_backend")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager.connect()
+
+  assert exc_info.value.setting_name == setting_name
+  create_backend.assert_not_called()
+
+
+def test_connect_normalizes_string_retry_policy(mocker):
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": "0", "retry_delay": "0.25"},
+  )
+  backend = mocker.MagicMock()
+  create_backend = mocker.patch.object(
+    manager,
+    "_create_backend",
+    return_value=backend,
+  )
+
+  manager.connect()
+
+  create_backend.assert_called_once_with()
+  assert manager._backend is backend
+
+
+def test_connect_does_not_retry_configuration_errors(mocker):
+  """Static configuration cannot recover through network retry backoff."""
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 3, "retry_delay": 0.25},
+  )
+  attempt = mocker.patch.object(
+    manager,
+    "_attempt_connection",
+    side_effect=ConfigurationError(
+      "invalid backend setting",
+      setting_name="host",
+    ),
+  )
+  sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+  with pytest.raises(ConfigurationError, match="invalid backend setting"):
+    manager.connect()
+
+  attempt.assert_called_once_with()
+  sleep.assert_not_called()
 
 
 def test_backend_property_concurrent_first_connect_single_connect(mocker):
@@ -328,6 +396,65 @@ def test_backend_property_concurrent_first_connect_single_connect(mocker):
   assert all(r is mock_backend for r in results)
   # Exactly one _create_backend call (single connect).
   assert ConnectionManager._create_backend.call_count == 1
+
+
+def test_direct_concurrent_connect_calls_create_one_backend(mocker):
+  """Public ``connect()`` calls share one connection attempt.
+
+  ``BackendSpiderMixin`` invokes ``ConnectionManager.connect()`` directly from
+  the ``spider_opened`` signal, so the single-connect guarantee cannot live
+  only in the lazy ``backend`` property. Block the first caller inside the
+  backend factory: a racing direct caller must not enter the factory and build
+  a second connection that would overwrite (and leak) the first one.
+  """
+  import threading
+
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 0})
+  first_factory_entered = threading.Event()
+  release_first_factory = threading.Event()
+  second_factory_entered = threading.Event()
+  factory_lock = threading.Lock()
+  factory_calls = 0
+  backends = [mocker.MagicMock(name="backend-one"), mocker.MagicMock(name="backend-two")]
+
+  def create_backend():
+    nonlocal factory_calls
+    with factory_lock:
+      factory_calls += 1
+      call_number = factory_calls
+    if call_number == 1:
+      first_factory_entered.set()
+      assert release_first_factory.wait(timeout=2.0)
+    else:
+      second_factory_entered.set()
+    return backends[call_number - 1]
+
+  mocker.patch.object(manager, "_create_backend", side_effect=create_backend)
+  errors: list[BaseException] = []
+
+  def connect() -> None:
+    try:
+      manager.connect()
+    except BaseException as exc:  # noqa: BLE001 - surface thread failures
+      errors.append(exc)
+
+  first = threading.Thread(target=connect, daemon=True)
+  second = threading.Thread(target=connect, daemon=True)
+  first.start()
+  assert first_factory_entered.wait(timeout=2.0)
+  second.start()
+  try:
+    assert not second_factory_entered.wait(timeout=0.2)
+  finally:
+    release_first_factory.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+  assert not first.is_alive()
+  assert not second.is_alive()
+  assert errors == []
+  assert factory_calls == 1
+  assert manager._backend is backends[0]
 
 
 # ===========================================================================
@@ -597,3 +724,69 @@ def test_owner_connect_failure_signals_all_peer_waiters(mocker):
   manager.close()
   ConnectionManager.clear_registry()
   mocker.stopall()
+
+
+def test_last_close_during_connect_cannot_publish_orphan_backend(mocker):
+  """A manager evicted while connect is slow must never resurrect afterwards."""
+  import threading
+
+  manager = ConnectionManager.get_manager(
+    BackendType.REDIS,
+    {"host": "close-during-connect", "retry_attempts": 0},
+  )
+  connect_entered = threading.Event()
+  release_connect = threading.Event()
+  backend = mocker.MagicMock(name="slow-backend")
+
+  def slow_connect() -> None:
+    connect_entered.set()
+    assert release_connect.wait(timeout=2.0)
+
+  backend.connect.side_effect = slow_connect
+  mocker.patch.object(manager, "_create_backend", return_value=backend)
+  outcomes: list[BaseException | object] = []
+
+  def materialize() -> None:
+    try:
+      outcomes.append(manager.backend)
+    except BaseException as exc:  # noqa: BLE001 - capture thread outcome
+      outcomes.append(exc)
+
+  thread = threading.Thread(target=materialize, daemon=True)
+  thread.start()
+  assert connect_entered.wait(timeout=2.0)
+
+  manager.close()
+  release_connect.set()
+  thread.join(timeout=2.0)
+
+  assert not thread.is_alive()
+  assert len(outcomes) == 1
+  assert isinstance(outcomes[0], BackendConnectionError)
+  assert manager._backend is None
+  backend.disconnect.assert_called_once_with()
+  key = ConnectionManager._registry_key(manager.backend_type, manager.settings)
+  assert key not in ConnectionManager._managers
+
+
+def test_backend_property_rejects_released_manager(mocker):
+  """A warmed manager is terminal after its final holder releases it."""
+  manager = ConnectionManager.get_manager(
+    BackendType.REDIS,
+    {"host": "access-after-close", "retry_attempts": 0},
+  )
+  backend = mocker.MagicMock(name="connected-backend")
+  create_backend = mocker.patch.object(
+    manager,
+    "_create_backend",
+    return_value=backend,
+  )
+
+  assert manager.backend is backend
+  manager.close()
+
+  with pytest.raises(BackendConnectionError, match="released"):
+    _ = manager.backend
+
+  backend.disconnect.assert_called_once_with()
+  create_backend.assert_called_once_with()

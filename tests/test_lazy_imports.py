@@ -456,7 +456,10 @@ class TestBackendImportErrorMessage:
 
         def blocking_import(name, *args, **kwargs):
             if name == dep_name or name.startswith(dep_name + "."):
-                raise ImportError(f"No module named '{dep_name}' (mocked)")
+                raise ModuleNotFoundError(
+                    f"No module named '{dep_name}' (mocked)",
+                    name=dep_name,
+                )
             return original_import(name, *args, **kwargs)
 
         mocker.patch.object(builtins, "__import__", side_effect=blocking_import)
@@ -930,7 +933,6 @@ class TestDirCompanionExposesLazyImports:
         assert not missing, (
             f"Lazy backends missing from dir(scrapy_extension.backends): {sorted(missing)}"
         )
-
 
 
 

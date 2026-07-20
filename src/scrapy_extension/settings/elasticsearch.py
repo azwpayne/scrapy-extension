@@ -56,7 +56,7 @@ class ElasticSearchSettings(BaseSettings):
   model_config = SettingsConfigDict(
     env_prefix="SCRAPY_ELASTICSEARCH_",
     case_sensitive=False,
-    extra="ignore",
+    extra="forbid",
   )
 
   # === Mode Selection ===
@@ -198,6 +198,12 @@ class ElasticSearchSettings(BaseSettings):
         ConfigurationError: if any host URL scheme is ``http://`` and either
             ``api_key`` or ``password`` is set.
     """
+    # Cloud connections use ``cloud_id`` and never pass ``hosts`` to the
+    # Elasticsearch client. The standalone localhost default is therefore not
+    # a transport target in CLOUD mode and must not trigger this guard.
+    if self.mode == ElasticSearchMode.CLOUD:
+      return self
+
     has_credential = self.api_key is not None or self.password is not None
     if not has_credential:
       return self

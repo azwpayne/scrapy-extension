@@ -27,6 +27,7 @@ from unittest.mock import Mock
 import pytest
 from scrapy import Spider
 
+from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -39,6 +40,9 @@ def _make_settings(
   delay_max_held: int | None = None,
   monitor_backpressure_threshold: int | None = None,
   monitor_pop_rate_window_s: float | None = None,
+  queue_strategy: str = "passthrough",
+  ring_buffer_full_policy: str | None = None,
+  snapshot_owner: str | None = None,
 ) -> Mock:
   """Build a Scrapy-Settings-like Mock resolving the R14-C SCRAPY_* keys.
 
@@ -50,7 +54,7 @@ def _make_settings(
   overrides: dict[str, Any] = {
     "SCRAPY_BACKEND_TYPE": "redis",
     "SCRAPY_QUEUE_KEY": "scheduler:queue",
-    "SCRAPY_QUEUE_STRATEGY": "passthrough",
+    "SCRAPY_QUEUE_STRATEGY": queue_strategy,
   }
   if depth_sample_every is not None:
     overrides["SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY"] = depth_sample_every
@@ -62,6 +66,10 @@ def _make_settings(
     overrides["SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD"] = monitor_backpressure_threshold
   if monitor_pop_rate_window_s is not None:
     overrides["SCRAPY_MONITOR_POP_RATE_WINDOW_S"] = monitor_pop_rate_window_s
+  if ring_buffer_full_policy is not None:
+    overrides["SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY"] = ring_buffer_full_policy
+  if snapshot_owner is not None:
+    overrides["SCRAPY_QUEUE_SNAPSHOT_OWNER"] = snapshot_owner
 
   def get(key: str, default: Any = None) -> Any:
     return overrides.get(key, default)
@@ -70,6 +78,26 @@ def _make_settings(
   settings.getfloat.return_value = 0.0
   settings.getdict.return_value = {}
   return settings
+
+
+class TestRingBufferBlockingPolicyGate:
+  def test_block_policy_is_rejected_before_manager_acquire(self, mocker) -> None:
+    settings = _make_settings(
+      queue_strategy="ring_buffer",
+      ring_buffer_full_policy="block",
+    )
+    settings.getint.side_effect = lambda _key, default=0: default
+    get_manager = mocker.patch(
+      "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
+      return_value=mocker.Mock(),
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      BackendScheduler.from_settings(settings)
+
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY"
+    assert exc_info.value.setting_value == "block"
+    get_manager.assert_not_called()
 
 
 class _FakeSpider(Spider):
@@ -214,3 +242,38 @@ class TestR14CPopRateWindowThreading:
     settings = _make_settings(monitor_pop_rate_window_s=30.0)
     scheduler = BackendScheduler.from_settings(settings)
     assert scheduler._monitor_pop_rate_window_s == pytest.approx(30.0)
+
+
+class TestSnapshotOwnerThreading:
+  def test_explicit_snapshot_owner_reaches_backend_queue(self, mocker) -> None:
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
+      return_value=mocker.Mock(),
+    )
+    settings = _make_settings(snapshot_owner="worker-a")
+
+    queue = _open_scheduler(BackendScheduler.from_settings(settings))
+
+    assert queue._snapshot_owner == "worker-a"
+    assert queue._snapshot_key() == (
+      "queue:snapshot:v2:8:worker-a:4:r14c:scheduler:queue"
+    )
+
+  def test_worker_id_is_snapshot_owner_fallback(self, mocker) -> None:
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
+      return_value=mocker.Mock(),
+    )
+    settings = _make_settings()
+    original_get = settings.get.side_effect
+
+    def get(key: str, default: Any = None) -> Any:
+      if key == "SCRAPY_QUEUE_WORKER_ID":
+        return "worker-fallback"
+      return original_get(key, default)
+
+    settings.get.side_effect = get
+
+    queue = _open_scheduler(BackendScheduler.from_settings(settings))
+
+    assert queue._snapshot_owner == "worker-fallback"

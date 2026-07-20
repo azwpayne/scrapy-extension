@@ -11,7 +11,10 @@ __all__ = ["PassthroughQueueStrategy"]
 
 from typing import Any
 
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.base import (
+  QueueStrategy,
+  normalize_queue_timeout,
+)
 
 
 class PassthroughQueueStrategy(QueueStrategy):
@@ -52,6 +55,7 @@ class PassthroughQueueStrategy(QueueStrategy):
     Returns:
         The next item, or None if empty.
     """
+    timeout = normalize_queue_timeout(timeout)
     return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
 
   def pop_with_ack(
@@ -66,6 +70,7 @@ class PassthroughQueueStrategy(QueueStrategy):
     ``pop_with_ack`` (the MQ backends) take the token-correlated path;
     atomic-pop backends keep the plain ``pop()`` roundtrip.
     """
+    timeout = normalize_queue_timeout(timeout)
     return self._pop_backend_with_ack(queue_name, timeout)
 
   def queue_len(self, queue_name: str) -> int:

@@ -1,10 +1,11 @@
 """Unit BP-2: scheduler depth-driven backpressure gate.
 
-Round-4 (B1): ``next_request`` returns None when queue depth exceeds the
-``pause_at`` threshold; resumes popping only after depth drains to
-``resume_at`` (hysteresis). Depth source is ``len(self._queue)`` (fresh,
-same source ``has_pending_requests`` trusts). Default-off when
-``pause_at is None`` → byte-identical behavior to the pre-fix path.
+Round-4 (B1): ``next_request`` slows consumption when queue depth reaches the
+``pause_at`` threshold; while paused it makes one bounded progress pop every
+two polls so a sole consumer can drain to ``resume_at`` (hysteresis). Depth
+source is ``len(self._queue)`` (fresh, same source ``has_pending_requests``
+trusts). Default-off when ``pause_at is None`` → byte-identical behavior to
+the pre-fix path.
 
 Mock-queue only — no real backend. Mirrors the pattern in
 ``test_scheduler_envelope.py``.
@@ -18,7 +19,9 @@ from unittest.mock import MagicMock
 import pytest
 from scrapy import Request, Spider
 
-from scrapy_extension.exceptions import QueueError
+from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
+from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -71,6 +74,22 @@ class _LenControllableQueue:
     self._depth = depth
 
 
+class _SelfDrainingQueue(_LenControllableQueue):
+  """Queue whose only depth change comes from successful ``pop`` calls."""
+
+  def __init__(self, depth: int) -> None:
+    super().__init__(depth=depth)
+    self.pop = MagicMock(name="pop", side_effect=self._pop)
+
+  def _pop(self, timeout: float = 0.0) -> Request | None:
+    del timeout
+    if self._depth <= 0:
+      return None
+    request = Request(f"https://example.com/{self._depth}")
+    self._depth -= 1
+    return request
+
+
 class TestBackpressureDefaultOff:
   """Test 1: pause_at=None → current behavior pinned (pop is called)."""
 
@@ -111,9 +130,11 @@ class TestBackpressurePause:
 
 
 class TestBackpressureHysteresis:
-  """Test 3: pause_at=10, resume_at=5; drain from 10 → 7 (still None) → 5 (pops)."""
+  """Test 3: a paused sole consumer makes bounded progress to resume_at."""
 
-  def test_hysteresis_resumes_only_at_resume_threshold(self) -> None:
+  def test_paused_consumer_drains_to_resume_threshold_without_external_help(
+    self,
+  ) -> None:
     manager = MagicMock(name="ConnectionManager")
     counts, stats = _stats_counter()
     scheduler = BackendScheduler(
@@ -122,36 +143,38 @@ class TestBackpressureHysteresis:
       backpressure_pause_at=10,
       backpressure_resume_at=5,
     )
-    req = Request("https://example.com/a")
-    queue = _LenControllableQueue(depth=10, pop_value=req)
+    queue = _SelfDrainingQueue(depth=10)
     scheduler._queue = queue  # type: ignore[assignment]
 
-    # 1. depth=10 → pause, return None.
-    assert scheduler.next_request() is None
+    # The scheduler is the only consumer. Ten polls must deterministically
+    # alternate five pauses with five progress pops, draining 10 -> 5 without
+    # any test-side set_depth() escape hatch.
+    results = [scheduler.next_request() for _ in range(10)]
+
+    assert sum(request is not None for request in results) == 5
+    assert len(queue) == 5
+    assert queue.pop.call_count == 5
+    assert scheduler._backpressure_paused is True
     assert counts.get("scheduler/backpressure_pause") == 1
-    queue.pop.assert_not_called()
-
-    # 2. depth=7 (still above resume_at=5) → still None, no resume stat.
-    queue.set_depth(7)
-    assert scheduler.next_request() is None
     assert counts.get("scheduler/backpressure_resume") is None
-    queue.pop.assert_not_called()
 
-    # 3. depth=5 (== resume_at) → resume, pop returns the request.
-    queue.set_depth(5)
+    # The next bounded poll observes depth == resume_at, exits hysteresis, and
+    # returns to the normal pop path.
     result = scheduler.next_request()
-    assert result is req
+
+    assert result is not None
+    assert len(queue) == 4
+    assert queue.pop.call_count == 6
+    assert scheduler._backpressure_paused is False
     assert counts.get("scheduler/backpressure_resume") == 1
-    queue.pop.assert_called_once()
 
 
 class TestBackpressureFlapDefaultResume:
   """Test 4: pause_at=10 only (resume_at defaults to pause_at).
 
-  With resume_at == pause_at, the pause and resume thresholds coincide: at
-  depth==10 the gate sets paused=True then immediately checks resume
-  (10 <= 10 → resume), so depth==10 pops. Only depth STRICTLY ABOVE resume_at
-  stays paused (flap-free single-threshold behavior).
+  With resume_at == pause_at, the pause and resume thresholds coincide. The
+  first crossing still emits one paused poll; once depth reaches the shared
+  threshold, the next poll resumes the normal pop path.
   """
 
   def test_resume_at_defaults_to_pause_at(self) -> None:
@@ -211,9 +234,9 @@ class TestBackpressureStatNames:
 
 
 class TestBackpressureOpenResets:
-  """Test 6: open(spider) resets _backpressure_paused to False."""
+  """Test 6: open(spider) resets both per-spider gate state fields."""
 
-  def test_open_resets_paused_flag(self) -> None:
+  def test_open_resets_paused_state(self) -> None:
     manager = MagicMock(name="ConnectionManager")
     manager.get_queue_backend.return_value = MagicMock(name="QueueBackend")
     scheduler = BackendScheduler(
@@ -222,10 +245,12 @@ class TestBackpressureOpenResets:
     )
     # Manually set the flag True (simulating a prior paused state / re-open).
     scheduler._backpressure_paused = True
+    scheduler._backpressure_probe_due = True
 
-    scheduler.open(_FakeSpider())  # type: ignore[assignment]
+    scheduler.open(_FakeSpider())
 
     assert scheduler._backpressure_paused is False
+    assert scheduler._backpressure_probe_due is False
 
 
 class TestBackpressureLenErrorDegradesToPop:
@@ -247,7 +272,7 @@ class TestBackpressureLenErrorDegradesToPop:
     queue = MagicMock(name="BackendQueue")
     queue.__len__ = MagicMock(side_effect=QueueError("len unavailable"))
     queue.pop = MagicMock(return_value=None)
-    scheduler._queue = queue  # type: ignore[assignment]
+    scheduler._queue = queue
 
     result = scheduler.next_request()
     assert result is None  # pop returned None
@@ -268,7 +293,7 @@ class TestBackpressureLenErrorDegradesToPop:
     queue = MagicMock(name="BackendQueue")
     queue.__len__ = MagicMock(side_effect=NotImplementedError("rocketmq queue_len"))
     queue.pop = MagicMock(return_value=None)
-    scheduler._queue = queue  # type: ignore[assignment]
+    scheduler._queue = queue
 
     result = scheduler.next_request()  # must NOT raise NotImplementedError
     assert result is None
@@ -359,6 +384,85 @@ class TestBackpressureStatsNoneAndFallthrough:
     # No pause/resume stat bumped — gate didn't trigger.
     assert "scheduler/backpressure_pause" not in counts
     assert "scheduler/backpressure_resume" not in counts
+
+
+class TestEnqueueDedupReservation:
+  """A failed queue push must not permanently commit a dedup reservation."""
+
+  @pytest.mark.parametrize(
+    "push_error",
+    [QueueError("temporary queue outage"), SerializationError("temporary encoding error")],
+  )
+  def test_push_failure_rolls_back_new_fingerprint_for_healthy_retry(
+    self,
+    push_error: Exception,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = [push_error, None]
+    scheduler._queue = queue
+    request = Request("https://example.com/retry")
+
+    assert scheduler.enqueue_request(request) is False
+    assert len(membership_filter) == 0
+
+    assert scheduler.enqueue_request(request) is True
+    assert len(membership_filter) == 1
+    assert queue.push.call_count == 2
+
+  def test_reservation_precedes_push_and_filters_reentrant_duplicate(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request("https://example.com/concurrent")
+    nested_results: list[bool] = []
+
+    def push(_request: Request, *, priority: float = 0.0) -> None:
+      del _request, priority
+      nested_results.append(scheduler.enqueue_request(request.replace()))
+
+    queue.push.side_effect = push
+
+    assert scheduler.enqueue_request(request) is True
+    assert nested_results == [False]
+    assert queue.push.call_count == 1
+    assert len(membership_filter) == 1
+
+  def test_custom_dupefilter_without_forget_records_rollback_error(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    dupefilter = MagicMock(spec=["request_seen", "log"])
+    dupefilter.request_seen.return_value = False
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      stats=stats,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("queue unavailable")
+    scheduler._queue = queue
+
+    assert scheduler.enqueue_request(Request("https://example.com/custom")) is False
+    assert counts.get("scheduler/dupefilter_rollback_error") == 1
+    assert counts.get("scheduler/queue_error") == 1
 
 
 if __name__ == "__main__":

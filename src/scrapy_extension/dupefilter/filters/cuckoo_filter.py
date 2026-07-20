@@ -207,14 +207,20 @@ class CuckooMembershipFilter(MembershipFilter):
       buckets[i2].append(fp)
       return True
     index = i1
+    kick_path: list[tuple[int, int]] = []
     for _ in range(self._MAX_KICKS):
       slot = self._rng.randrange(b)
+      kick_path.append((index, slot))
       # Swap fp into bucket[index][slot]; the evicted value becomes fp.
       fp, buckets[index][slot] = buckets[index][slot], fp
       index = self._alt_index(index, fp)
       if len(buckets[index]) < b:
         buckets[index].append(fp)
         return True
+    # A swap is reversible when replayed with the dangling fingerprint. Undo
+    # the path so FilterFull leaves every previously inserted item intact.
+    for index, slot in reversed(kick_path):
+      fp, buckets[index][slot] = buckets[index][slot], fp
     return False
 
   def __contains__(self, item: bytes) -> bool:

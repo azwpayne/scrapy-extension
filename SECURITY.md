@@ -29,12 +29,12 @@ abstractions, connection management, request/item serialization, and Scrapy
 component integration.
 
 It does **not** cover the underlying backend client libraries
-(`redis`, `pymongo`, `kafka-python`, `pika`, `elasticsearch`,
+(`redis`, `pymongo`, `kafka-python-ng`, `pika`, `elasticsearch`,
 `rocketmq-python-client`, `pulsar-client`, `boto3`, `pymemcache`) or Scrapy
 itself — report those to their respective projects. `scrapy-extension`
-handles secrets via pydantic `SecretStr` and redacts them in exceptions (see
-`docs/code-review-2026-06-15.md`, Rounds 13, 26–28); credential-handling
-bugs in this package are in scope.
+uses pydantic `SecretStr` for structured secret fields and redacts sensitive
+`ConfigurationError.setting_value` values. Credential-handling bugs in this
+package are in scope.
 
 ## Response SLA
 
@@ -54,18 +54,24 @@ can audit and rely on it.
 
 ### Credential redaction
 
-Every password / SASL token / API key that flows through a backend's config
-builder is wrapped in `_RedactedStr`
-(`src/scrapy_extension/backends/_redaction.py`). `_RedactedStr.__repr__` and
-`__str__` return `***` instead of the raw value, so credentials do not leak
-via:
+Structured password, token, API-key, and AWS-secret fields use Pydantic
+`SecretStr`, so their model repr is redacted. Selected client config values are
+also converted to the internal `_RedactedStr`, whose repr/string form is `***`.
+`ConfigurationError` redacts `setting_value` when its setting name contains a
+sensitive fragment.
 
-- `repr(backend.config)`
-- Logs emitted by the backend or its caller
-- Tracebacks printed when a backend operation fails
+This is defense-in-depth, not a universal no-leak guarantee:
 
-This is defense-in-depth; it does **not** relieve callers of the duty to
-keep their own logs free of raw credentials.
+- Plain URI/DSN fields can contain userinfo. In particular, a MongoDB URI is a
+  normal string and its caller/model repr can expose an embedded password.
+- A caller-owned `dict`, application log, debugger, broker/client diagnostic,
+  or third-party traceback is outside the redaction boundary.
+- Backends must pass the underlying secret to their SDK to authenticate; SDK
+  internals are not controlled by this package.
+
+Prefer discrete `SecretStr` fields when available, avoid credentials inside
+URIs, and never log complete settings dictionaries or DSNs. Treat a redacted
+display as a convenience, not as an access-control mechanism.
 
 ### TLS / scheme guards (round-6 SEC-1..7 + round-9 SV3/SV4)
 
@@ -99,19 +105,34 @@ silently `str()`-ed. There is no `pickle`, `eval`, `exec`, or `marshal` on
 the request / item path. Callers who supply a custom `Serializer`
 implementation are responsible for its safety.
 
+JSON serialization is not encryption and redaction wrappers are not a data
+classification boundary. Request metadata, callback arguments, items, queue
+snapshots, and custom settings may contain credentials or personal data; their
+underlying values can be serialized even when a configuration repr is masked.
+Use authenticated TLS to every remote backend, backend ACLs scoped to the
+smallest required key/topic/index namespace, and encryption at rest (or
+application-layer encryption where the backend cannot provide it). Restrict
+broker and snapshot access as if it granted access to the crawl's source data.
+
 ### Ack safety under concurrency
 
-For message-queue backends (Kafka, RabbitMQ), the scheduler's
-`from_settings` gate refuses to start under `CONCURRENT_REQUESTS > 1` with a
-backend that does not support concurrent ack
-(`supports_concurrent_ack=False` — SQS, Pulsar single-slot ack), unless the
-explicit `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` opt-out is set. This
-prevents the "pop N, ack last" footgun where N-1 messages are silently
-unacked.
+All five bundled message-queue backends (Kafka, RabbitMQ, Pulsar, SQS, and
+RocketMQ) return a token per delivery and support multiple in-flight tokens.
+RabbitMQ publishing also enables confirms and mandatory routing, so an
+unroutable or negatively acknowledged publish fails instead of being reported
+as queued.
+
+The scheduler still refuses `CONCURRENT_REQUESTS > 1` for a third-party backend
+that declares `supports_concurrent_ack=False`, unless the operator explicitly
+sets `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True`. That opt-out accepts possible
+loss or duplicate delivery and should not be used as a performance switch.
+SQS and RocketMQ tokens are additionally bounded by visibility/invisibility
+leases; this package does not renew those leases, so size them above the maximum
+pop-to-downloader-response time.
 
 ## Supply-chain notes
 
-One bundled backend currently carries a known supply-chain caveat:
+Two bundled backends currently carry supply-chain caveats:
 
 - **RocketMQ** — uses Apache `rocketmq-python-client>=5.1.1,<6`, the
   maintained pure-Python gRPC client. The old unmaintained
@@ -119,8 +140,27 @@ One bundled backend currently carries a known supply-chain caveat:
   supported dependency path. RocketMQ is still queue-only: Set/Storage are
   rejected at config time (`ConfigurationError`) and guard classes fail fast if
   the capability gate is bypassed.
-- **Memcached** — depends on `pymemcache==4.0.0`, unmaintained (last release
+- **Memcached** — depends on `pymemcache>=4.0,<5`, whose current release line is
+  unmaintained (last release
   2022-10-17). Marked Experimental in [`STABILITY.md`](STABILITY.md);
   tracked as U20.
+
+### Dependency-audit exception
+
+The locked dependency graph contains Scrapy 2.17.0 and setuptools 83.0.0.
+`uv audit --locked` still reports `PYSEC-2017-83` for Scrapy because the PyPA
+record has no fixed-version event. The reviewed
+[GitHub advisory](https://github.com/advisories/GHSA-h7wm-ph43-c39p) limits the
+affected range to `>=0.7, <=2.15.2`; locked Scrapy 2.17.0 is outside that
+range. This is a record-specific false positive, not a blanket waiver.
+
+Reproduce the audit with only that exact finding suppressed:
+
+```bash
+uv audit --locked --ignore PYSEC-2017-83
+```
+
+Do not add a package-wide or advisory-class ignore. Re-check the locked Scrapy
+version and upstream range whenever the lockfile or advisory changes.
 
 See [`STABILITY.md`](STABILITY.md) for the per-backend maturity tiers.

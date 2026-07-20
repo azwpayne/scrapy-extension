@@ -17,9 +17,9 @@ behaviors that this module pins:
    strategy is caught + logged; the connection manager STILL closes and
    scheduler state is STILL reset. One bad strategy can't leak the
    connection.
-4. **State reset.** After close, ``_queue``/``_spider``/``_connected_signals``
-   are ``None`` and ``_signals_connected`` is ``False`` — so the scheduler
-   is reusable (``open()`` again wires signals cleanly).
+4. **Terminal state.** After close, ``_queue``/``_spider``/``_connected_signals``
+   are ``None`` and ``_signals_connected`` is ``False``. The scheduler cannot
+   be reopened because its single ConnectionManager acquire was released.
 
 HONESTY NOTE — no close-race exists in the code:
 ``close()`` does NOT touch any in-flight / unacked tracker. The at-least-once
@@ -62,6 +62,158 @@ def _make_scheduler_with_queue(
   )
   scheduler.open(spider)
   return scheduler, queue_strategy
+
+
+def _make_from_crawler_scheduler_with_dupefilter(mocker):
+  """Build a scheduler that owns the dupefilter created by ``from_crawler``."""
+  manager = mocker.MagicMock(name="ConnectionManager")
+  scheduler = BackendScheduler(
+    connection_manager=manager,
+    queue_key="test:queue",
+  )
+  mocker.patch.object(
+    BackendScheduler,
+    "from_settings",
+    return_value=scheduler,
+  )
+  dupefilter = mocker.MagicMock(name="OwnedDupeFilter")
+  dupefilter_cls = mocker.Mock(name="DupeFilterClass")
+  dupefilter_cls.from_crawler.return_value = dupefilter
+  mocker.patch(
+    "scrapy_extension.schedule.scheduler.load_object",
+    return_value=dupefilter_cls,
+  )
+  crawler = mocker.Mock()
+  crawler.settings.get.return_value = "example.OwnedDupeFilter"
+  crawler.stats = mocker.Mock()
+  return BackendScheduler.from_crawler(crawler), dupefilter, manager
+
+
+class TestOwnedDupeFilterLifecycle:
+  """A scheduler-created dupefilter follows the scheduler's lifecycle."""
+
+  def test_open_opens_owned_dupefilter_with_spider(self, mocker):
+    scheduler, dupefilter, _ = _make_from_crawler_scheduler_with_dupefilter(mocker)
+    spider = mocker.Mock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.Mock()
+
+    scheduler.open(spider)
+
+    dupefilter.open.assert_called_once_with(spider)
+
+  def test_close_closes_owned_dupefilter_with_reason(self, mocker):
+    scheduler, dupefilter, _ = _make_from_crawler_scheduler_with_dupefilter(mocker)
+    spider = mocker.Mock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.Mock()
+    scheduler.open(spider)
+
+    scheduler.close("finished")
+
+    dupefilter.close.assert_called_once_with("finished")
+
+  def test_close_before_open_releases_owned_dupefilter(self, mocker):
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+
+    scheduler.close("startup-failed")
+
+    dupefilter.open.assert_not_called()
+    dupefilter.close.assert_called_once_with("startup-failed")
+    manager.close.assert_called_once_with()
+
+  def test_repeated_open_and_close_do_not_repeat_releases(self, mocker):
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    spider = mocker.Mock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.Mock()
+
+    scheduler.open(spider)
+    first_queue = scheduler._queue
+    scheduler.open(spider)
+    assert scheduler._queue is first_queue
+    scheduler.close("finished")
+    scheduler.close("finished-again")
+
+    dupefilter.open.assert_called_once_with(spider)
+    dupefilter.close.assert_called_once_with("finished")
+    manager.close.assert_called_once_with()
+    assert first_queue is not None
+
+  def test_signal_registration_failure_rolls_back_all_owned_resources(
+    self, mocker
+  ):
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    signal_manager = mocker.Mock(name="SignalManager")
+    signal_manager.connect.side_effect = [
+      None,
+      RuntimeError("second signal registration failed"),
+    ]
+    spider = mocker.Mock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.Mock(signals=signal_manager)
+
+    with pytest.raises(RuntimeError, match="second signal registration failed"):
+      scheduler.open(spider)
+
+    signal_manager.disconnect.assert_called_once_with(
+      scheduler._on_response_received,
+      signal=ANY,
+    )
+    dupefilter.open.assert_called_once_with(spider)
+    dupefilter.close.assert_called_once_with("open-failed")
+    manager.close.assert_called_once_with()
+    assert scheduler._queue is None
+
+    with pytest.raises(RuntimeError, match="closed"):
+      scheduler.open(spider)
+
+
+class TestOperationCloseRaces:
+  """Operations retain the queue selected before a concurrent close."""
+
+  def test_enqueue_uses_captured_queue_after_close_clears_attribute(self, mocker):
+    manager = mocker.MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(manager)
+    queue = mocker.MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request("https://example.test")
+
+    def close_after_initial_queue_read(_request):
+      scheduler._queue = None
+
+    mocker.patch.object(
+      scheduler,
+      "_restore_original_errback",
+      side_effect=close_after_initial_queue_read,
+    )
+
+    assert scheduler.enqueue_request(request) is True
+    queue.push.assert_called_once_with(request, priority=0)
+
+  def test_next_request_uses_captured_queue_after_depth_probe(self, mocker):
+    manager = mocker.MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(manager, backpressure_pause_at=10)
+    request = Request("https://example.test")
+
+    class ClosingQueue:
+      def __len__(self):
+        scheduler._queue = None
+        return 0
+
+      def pop(self, timeout=0):
+        assert timeout == 0
+        return request
+
+    scheduler._queue = ClosingQueue()
+
+    assert scheduler.next_request() is request
 
 
 class TestCloseDisconnectsAckSignals:
@@ -277,9 +429,39 @@ class TestSignalDisconnectFailureIsNonFatal:
     assert scheduler._connected_signals is None
     assert scheduler._signals_connected is False
 
+  def test_first_disconnect_failure_does_not_skip_second_handler(
+    self, mock_connection_manager, mocker
+  ):
+    signals_mock = mocker.Mock()
+    crawler = mocker.Mock(signals=signals_mock)
+    spider = mocker.Mock(crawler=crawler)
+    spider.name = "test_spider"
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    scheduler.open(spider)
+    signals_mock.disconnect.reset_mock()
+    signals_mock.disconnect.side_effect = [
+      RuntimeError("response handler already disconnected"),
+      None,
+    ]
 
-class TestCloseResetsStateForReuse:
-  """Behavior #4: after close, scheduler is reusable (state cleared)."""
+    scheduler.close("finished")
+
+    assert signals_mock.disconnect.call_count == 2
+    signals_mock.disconnect.assert_any_call(
+      scheduler._on_response_received,
+      signal=ANY,
+    )
+    signals_mock.disconnect.assert_any_call(
+      scheduler._on_spider_error,
+      signal=ANY,
+    )
+
+
+class TestTerminalLifecycle:
+  """Behavior #4: close is terminal after releasing the manager acquire."""
 
   def test_close_clears_queue_spider_and_signals_flag(
     self, mock_connection_manager, mocker
@@ -299,15 +481,10 @@ class TestCloseResetsStateForReuse:
     assert scheduler._connected_signals is None
     assert scheduler._signals_connected is False
 
-  def test_scheduler_is_reusable_after_close(self, mock_connection_manager, mocker):
-    """After close, open() again wires signals cleanly (no double-register).
-
-    Pins the R12-followup contract: ``_signals_connected`` reset enables
-    signal re-wiring on the second open. This is the close→reopen race the
-    fix targets — without the reset, ``_connect_ack_signals`` would
-    short-circuit on the stale True flag and the second spider's signals
-    would never wire.
-    """
+  def test_scheduler_rejects_reopen_after_close(
+    self, mock_connection_manager, mocker
+  ):
+    """A closed scheduler cannot use its already-released manager again."""
     spider1 = mock_connection_manager.get_queue_backend()
     spider1.name = "spider_one"
     spider1.crawler = mocker.MagicMock()
@@ -318,23 +495,43 @@ class TestCloseResetsStateForReuse:
     )
     scheduler.open(spider1)
     assert scheduler._signals_connected is True
-    first_connect_count = spider1.crawler.signals.connect.call_count
-
     scheduler.close("finished")
     assert scheduler._signals_connected is False
 
-    # Re-open with a second spider — signals must wire again.
     spider2 = mocker.MagicMock()
     spider2.name = "spider_two"
     spider2.crawler = mocker.MagicMock()
-    scheduler.open(spider2)
 
-    assert scheduler._signals_connected is True
-    # Second spider's crawler got the two connect calls (idempotency reset
-    # worked — the False from close() let _connect_ack_signals proceed).
-    assert spider2.crawler.signals.connect.call_count == 2
-    # And the first spider's crawler was NOT touched again.
-    assert spider1.crawler.signals.connect.call_count == first_connect_count
+    with pytest.raises(RuntimeError, match="closed"):
+      scheduler.open(spider2)
+
+    spider2.crawler.signals.connect.assert_not_called()
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_open_scheduler_rejects_a_different_spider(
+    self, mock_connection_manager, mocker
+  ):
+    spider1 = mocker.MagicMock(name="FirstSpider")
+    spider1.name = "spider_one"
+    spider1.crawler = mocker.MagicMock()
+    spider2 = mocker.MagicMock(name="SecondSpider")
+    spider2.name = "spider_two"
+    spider2.crawler = mocker.MagicMock()
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    scheduler.open(spider1)
+    first_queue = scheduler._queue
+
+    with pytest.raises(RuntimeError, match="different spider"):
+      scheduler.open(spider2)
+
+    assert scheduler._queue is first_queue
+    assert scheduler._spider is spider1
+    spider2.crawler.signals.connect.assert_not_called()
+    mock_connection_manager.close.assert_not_called()
+    scheduler.close("finished")
 
 
 class TestClosePopsThenClosesCleanly:

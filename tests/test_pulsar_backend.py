@@ -9,6 +9,7 @@ patterns against the mock.
 from __future__ import annotations
 
 import sys
+from threading import Event, Lock, Thread
 from unittest.mock import MagicMock
 
 import pytest
@@ -44,6 +45,7 @@ from scrapy_extension.backends.pulsar import (  # noqa: E402
   _PulsarAckToken,
 )
 from scrapy_extension.exceptions import BackendConnectionError, QueueError  # noqa: E402
+from scrapy_extension.schedule.scheduler import BackendScheduler  # noqa: E402
 from scrapy_extension.settings import PulsarMode, PulsarSettings  # noqa: E402
 
 
@@ -105,12 +107,72 @@ class TestPulsarConnect:
     b.connect()
     auth_mock.assert_called_once_with("secret-token")
 
+  def test_connect_is_idempotent_while_connected(self, mocker) -> None:
+    consumer = mocker.MagicMock(name="consumer")
+    consumer.receive.side_effect = pulsar.Timeout("empty")
+    b, old_client = _connected(mocker, subscribe=consumer)
+    b.pop("queue")
+    new_client = mocker.MagicMock(name="new_client")
+    pulsar.Client.return_value = new_client
+
+    b.connect()
+
+    assert pulsar.Client.call_count == 1
+    assert b._client is old_client
+    assert b._consumers == {"scrapy-queue": consumer}
+    new_client.close.assert_not_called()
+
   def test_disconnect_closes_client(self, mocker) -> None:
     b, client = _connected(mocker)
     b.disconnect()
     client.close.assert_called_once()
     assert b.is_connected() is False
 
+  def test_disconnect_closes_all_topic_consumers(self, mocker) -> None:
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_a.receive.side_effect = pulsar.Timeout("empty a")
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    consumer_b.receive.side_effect = pulsar.Timeout("empty b")
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = [consumer_a, consumer_b]
+    b.pop("queue_a")
+    b.pop("queue_b")
+
+    b.disconnect()
+
+    consumer_a.close.assert_called_once_with()
+    consumer_b.close.assert_called_once_with()
+    assert b._consumers == {}
+    assert b._consumer is None
+    assert b._subscribed_topic is None
+
+  def test_reconnect_during_disconnect_does_not_close_new_client(self, mocker) -> None:
+    close_started = Event()
+    release_close = Event()
+    old_consumer = mocker.MagicMock(name="old_consumer")
+    old_consumer.receive.side_effect = pulsar.Timeout("empty")
+
+    def blocking_close() -> None:
+      close_started.set()
+      release_close.wait(timeout=3.0)
+
+    old_consumer.close.side_effect = blocking_close
+    b, old_client = _connected(mocker, subscribe=old_consumer)
+    b.pop("queue")
+    disconnect_thread = Thread(target=b.disconnect)
+    disconnect_thread.start()
+    assert close_started.wait(timeout=2.0)
+
+    new_client = mocker.MagicMock(name="new_client")
+    pulsar.Client.return_value = new_client
+    b.connect()
+    release_close.set()
+    disconnect_thread.join(timeout=2.0)
+
+    assert not disconnect_thread.is_alive()
+    old_client.close.assert_called_once_with()
+    new_client.close.assert_not_called()
+    assert b._client is new_client
 
 class TestPulsarPush:
   def test_push_creates_producer_and_sends(self, mocker) -> None:
@@ -143,6 +205,41 @@ class TestPulsarPush:
     b, _ = _connected(mocker)
     with pytest.raises(ValueError):
       b.push("bad name!", b"x")
+
+  def test_disconnect_during_producer_creation_closes_loser(self, mocker) -> None:
+    creation_started = Event()
+    release_creation = Event()
+    producer = mocker.MagicMock(name="loser_producer")
+
+    def create_producer(*_args, **_kwargs):
+      creation_started.set()
+      release_creation.wait(timeout=3.0)
+      return producer
+
+    b, client = _connected(mocker)
+    client.create_producer.side_effect = create_producer
+    errors: list[Exception] = []
+
+    def push_one() -> None:
+      try:
+        b.push("queue", b"payload")
+      except Exception as error:
+        errors.append(error)
+
+    push_thread = Thread(target=push_one)
+    push_thread.start()
+    assert creation_started.wait(timeout=2.0)
+    b.disconnect()
+    release_creation.set()
+    push_thread.join(timeout=2.0)
+
+    assert not push_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], QueueError)
+    assert errors[0].operation == "push"
+    producer.close.assert_called_once_with()
+    producer.send.assert_not_called()
+    assert b._producers == {}
 
 
 class TestPulsarPop:
@@ -196,23 +293,113 @@ class TestPulsarPop:
     b.pop("queue2")
     assert client.subscribe.call_count == 2
 
-  def test_pop_topic_change_subscribe_failure_nulls_state_no_wedge(self, mocker) -> None:
-    """R-pulsar-ensure: a failed re-subscribe on topic change must null the
-    closed consumer + stale topic. Otherwise a later pop of the OLD topic hits
-    the _ensure_consumer fast-path (``_subscribed_topic == topic``) and reuses
-    the dead consumer -> silent consumption wedge."""
+  def test_pop_topic_subscribe_failure_preserves_cached_consumer(self, mocker) -> None:
+    """A failed subscription for one topic must not break another topic."""
     consumer = mocker.MagicMock()
     consumer.receive.side_effect = pulsar.Timeout("none")
     b, client = _connected(mocker, subscribe=consumer)
-    b.pop("queue1")  # subscribes to topic1; _consumer set, _subscribed_topic=topic1
-    # topic change to queue2 -> re-subscribe fails
+    b.pop("queue1")
     client.subscribe.side_effect = RuntimeError("subscribe failed")
     with pytest.raises(QueueError):
       b.pop("queue2")
-    # FIX: failed re-subscribe must null the closed consumer + stale topic
-    assert b._consumer is None
-    assert b._subscribed_topic is None
 
+    assert b._consumer is consumer
+    assert b._subscribed_topic == "scrapy-queue1"
+    assert b._consumers == {"scrapy-queue1": consumer}
+    assert b.pop("queue1") is None
+    assert consumer.receive.call_count == 2
+
+  def test_concurrent_first_pop_creates_one_consumer_per_topic(self, mocker) -> None:
+    first_subscribe_started = Event()
+    second_pop_started = Event()
+    second_subscribe_started = Event()
+    release_first_subscribe = Event()
+    call_lock = Lock()
+    subscribe_index = 0
+
+    consumers = [mocker.MagicMock(name=f"consumer_{i}") for i in range(2)]
+    for i, consumer in enumerate(consumers):
+      msg = mocker.MagicMock(name=f"msg_{i}")
+      msg.data.return_value = f"payload-{i}".encode()
+      msg.message_id.return_value = mocker.MagicMock(name=f"msg_id_{i}")
+      consumer.receive.return_value = msg
+
+    def subscribe(*_args, **_kwargs):
+      nonlocal subscribe_index
+      with call_lock:
+        index = subscribe_index
+        subscribe_index += 1
+      if index == 0:
+        first_subscribe_started.set()
+        release_first_subscribe.wait(timeout=3.0)
+      else:
+        second_subscribe_started.set()
+      return consumers[index]
+
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = subscribe
+    errors: list[Exception] = []
+
+    def pop_one(started: Event | None = None) -> None:
+      if started is not None:
+        started.set()
+      try:
+        b.pop_with_ack("queue")
+      except Exception as error:
+        errors.append(error)
+
+    first = Thread(target=pop_one)
+    second = Thread(target=pop_one, args=(second_pop_started,))
+    first.start()
+    assert first_subscribe_started.wait(timeout=2.0)
+    second.start()
+    assert second_pop_started.wait(timeout=2.0)
+    duplicate_created = second_subscribe_started.wait(timeout=1.0)
+    release_first_subscribe.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert duplicate_created is False
+    assert errors == []
+    assert client.subscribe.call_count == 1
+    assert b._consumers == {"scrapy-queue": consumers[0]}
+
+  def test_disconnect_during_consumer_creation_closes_loser(self, mocker) -> None:
+    subscribe_started = Event()
+    release_subscribe = Event()
+    consumer = mocker.MagicMock(name="loser_consumer")
+
+    def subscribe(*_args, **_kwargs):
+      subscribe_started.set()
+      release_subscribe.wait(timeout=3.0)
+      return consumer
+
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = subscribe
+    errors: list[Exception] = []
+
+    def pop_one() -> None:
+      try:
+        b.pop("queue")
+      except Exception as error:
+        errors.append(error)
+
+    pop_thread = Thread(target=pop_one)
+    pop_thread.start()
+    assert subscribe_started.wait(timeout=2.0)
+    b.disconnect()
+    release_subscribe.set()
+    pop_thread.join(timeout=2.0)
+
+    assert not pop_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], QueueError)
+    assert errors[0].operation == "pop"
+    consumer.close.assert_called_once_with()
+    assert b._consumers == {}
+    assert b._consumer is None
 
 class TestPulsarAckNack:
   def test_ack_calls_acknowledge(self, mocker) -> None:
@@ -230,6 +417,36 @@ class TestPulsarAckNack:
     b, _ = _connected(mocker)
     b.ack("queue1")  # no prior pop -> no error, no call
 
+  def test_ack_unknown_token_does_not_ack_legacy_message(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    b.pop("queue1")
+
+    b.ack("queue1", token=object())
+
+    consumer.acknowledge.assert_not_called()
+    assert b._last_msg is msg
+
+  def test_legacy_ack_uses_consumer_that_delivered_last_message(self, mocker) -> None:
+    msg = mocker.MagicMock(name="msg_a")
+    msg.data.return_value = b"a"
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_a.receive.return_value = msg
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    consumer_b.receive.side_effect = pulsar.Timeout("empty b")
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = [consumer_a, consumer_b]
+    assert b.pop("queue_a") == b"a"
+    assert b.pop("queue_b") is None
+
+    b.ack("queue_a")
+
+    consumer_a.acknowledge.assert_called_once_with(msg)
+    consumer_b.acknowledge.assert_not_called()
+
   def test_nack_calls_negative_acknowledge(self, mocker) -> None:
     msg = mocker.MagicMock()
     msg.data.return_value = b"x"
@@ -240,6 +457,37 @@ class TestPulsarAckNack:
     b.nack("queue1")
     consumer.negative_acknowledge.assert_called_once_with(msg)
     assert b._last_msg is None
+
+  def test_nack_unknown_token_does_not_nack_legacy_message(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    b.pop("queue1")
+
+    b.nack("queue1", token=object())
+
+    consumer.negative_acknowledge.assert_not_called()
+    assert b._last_msg is msg
+
+  def test_legacy_nack_uses_consumer_that_delivered_last_message(self, mocker) -> None:
+    msg = mocker.MagicMock(name="msg_a")
+    msg.data.return_value = b"a"
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_a.receive.return_value = msg
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    consumer_b.receive.side_effect = pulsar.Timeout("empty b")
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = [consumer_a, consumer_b]
+    assert b.pop("queue_a") == b"a"
+    assert b.pop("queue_b") is None
+
+    b.nack("queue_a")
+
+    consumer_a.negative_acknowledge.assert_called_once_with(msg)
+    consumer_b.negative_acknowledge.assert_not_called()
+    assert b._last_delivery is None
 
 
 class TestPulsarRealAck:
@@ -317,6 +565,103 @@ class TestPulsarRealAck:
     assert actual_ids == [t.message_id for t in tokens]
     assert len(set(id(x) for x in actual_ids)) == 3  # 3 distinct objects
     assert b._in_flight == set()
+
+  def test_cross_topic_ack_uses_consumer_that_popped_message(self, mocker) -> None:
+    msg_a = mocker.MagicMock(name="msg_a")
+    msg_a.data.return_value = b"a"
+    msg_id_a = mocker.MagicMock(name="msg_id_a")
+    msg_a.message_id.return_value = msg_id_a
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_a.receive.return_value = msg_a
+
+    msg_b = mocker.MagicMock(name="msg_b")
+    msg_b.data.return_value = b"b"
+    msg_b.message_id.return_value = mocker.MagicMock(name="msg_id_b")
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    consumer_b.receive.return_value = msg_b
+
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = [consumer_a, consumer_b]
+
+    _, token_a = b.pop_with_ack("queue_a")
+    b.pop_with_ack("queue_b")
+    b.ack("queue_a", token=token_a)
+
+    consumer_a.close.assert_not_called()
+    consumer_a.acknowledge.assert_called_once_with(msg_id_a)
+    consumer_b.acknowledge.assert_not_called()
+
+  def test_cross_topic_nack_uses_consumer_that_popped_message(self, mocker) -> None:
+    msg_a = mocker.MagicMock(name="msg_a")
+    msg_a.data.return_value = b"a"
+    msg_id_a = mocker.MagicMock(name="msg_id_a")
+    msg_a.message_id.return_value = msg_id_a
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_a.receive.return_value = msg_a
+
+    msg_b = mocker.MagicMock(name="msg_b")
+    msg_b.data.return_value = b"b"
+    msg_b.message_id.return_value = mocker.MagicMock(name="msg_id_b")
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    consumer_b.receive.return_value = msg_b
+
+    b, client = _connected(mocker)
+    client.subscribe.side_effect = [consumer_a, consumer_b]
+
+    _, token_a = b.pop_with_ack("queue_a")
+    b.pop_with_ack("queue_b")
+    b.nack("queue_a", token=token_a)
+
+    consumer_a.negative_acknowledge.assert_called_once_with(msg_id_a)
+    consumer_b.negative_acknowledge.assert_not_called()
+
+  def test_stale_token_does_not_ack_reconnected_topic_consumer(self, mocker) -> None:
+    old_msg = mocker.MagicMock(name="old_msg")
+    old_msg.data.return_value = b"old"
+    old_msg.message_id.return_value = mocker.MagicMock(name="old_msg_id")
+    old_consumer = mocker.MagicMock(name="old_consumer")
+    old_consumer.receive.return_value = old_msg
+    b, _ = _connected(mocker, subscribe=old_consumer)
+    _, old_token = b.pop_with_ack("queue")
+    b.disconnect()
+
+    new_msg = mocker.MagicMock(name="new_msg")
+    new_msg.data.return_value = b"new"
+    new_msg.message_id.return_value = mocker.MagicMock(name="new_msg_id")
+    new_consumer = mocker.MagicMock(name="new_consumer")
+    new_consumer.receive.return_value = new_msg
+    new_client = mocker.MagicMock(name="new_client")
+    new_client.subscribe.return_value = new_consumer
+    pulsar.Client.return_value = new_client
+    b.connect()
+    b.pop_with_ack("queue")
+
+    b.ack("queue", token=old_token)
+
+    old_consumer.acknowledge.assert_not_called()
+    new_consumer.acknowledge.assert_not_called()
+
+  def test_disconnect_during_receive_returns_stale_token_safely(self, mocker) -> None:
+    msg = mocker.MagicMock(name="msg")
+    msg.data.return_value = b"payload"
+    msg.message_id.return_value = mocker.MagicMock(name="msg_id")
+    consumer = mocker.MagicMock(name="consumer")
+    b, _ = _connected(mocker, subscribe=consumer)
+
+    def receive_and_disconnect(**_kwargs):
+      b.disconnect()
+      return msg
+
+    consumer.receive.side_effect = receive_and_disconnect
+
+    value, token = b.pop_with_ack("queue")
+    b.ack("queue", token=token)
+
+    assert value == b"payload"
+    assert isinstance(token, _PulsarAckToken)
+    assert token.consumer is consumer
+    consumer.acknowledge.assert_not_called()
+    assert token not in b._in_flight
 
   def test_ack_with_token_discards_from_in_flight(self, mocker) -> None:
     msg = mocker.MagicMock()
@@ -430,9 +775,25 @@ class TestPulsarRealAck:
 
 
 class TestPulsarLenClear:
-  def test_queue_len_returns_zero(self, mocker) -> None:
+  def test_queue_len_reports_unsupported(self, mocker) -> None:
     b, _ = _connected(mocker)
-    assert b.queue_len("queue1") == 0
+    with pytest.raises(NotImplementedError, match="admin API"):
+      b.queue_len("queue1")
+
+  def test_unsupported_depth_keeps_scheduler_conservative(self) -> None:
+    backend = _make_backend()
+    queue = MagicMock(name="BackendQueue")
+    queue.__len__.side_effect = lambda: backend.queue_len("queue1")
+    queue.pop.return_value = None
+    scheduler = BackendScheduler(
+      connection_manager=MagicMock(name="ConnectionManager"),
+      backpressure_pause_at=1,
+    )
+    scheduler._queue = queue
+
+    assert scheduler.has_pending_requests() is True
+    assert scheduler.next_request() is None
+    queue.pop.assert_called_once_with(timeout=0)
 
   def test_clear_queue_reports_unsupported(self, mocker) -> None:
     b, _ = _connected(mocker)

@@ -27,12 +27,16 @@ the broker must run with ``--enable-proxy`` (see tests/integration/docker-compos
 from __future__ import annotations
 
 import logging
+import math
+import threading
 from typing import TYPE_CHECKING, Any
 
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
   QueueBackend,
+  _validate_key_name,
   secret_value,
 )
 from scrapy_extension.exceptions import (
@@ -49,10 +53,28 @@ logger = logging.getLogger(__name__)
 
 # Module-level warn-once flag for the unsupported-depth signal (Risk 1).
 # RocketMQ's deferred-ack model has no broker-side depth RPC, so queue_len
-# returns 0 (standardized with Kafka/Pulsar/SQS). The first call warns once
-# per process so operators know idle-detection / depth-backpressure cannot
-# rely on this value for RocketMQ. Tests reset this for isolation.
+# raises NotImplementedError. The first call warns once per process so
+# operators know idle detection / depth backpressure will degrade
+# conservatively. Tests reset this for isolation.
 _queue_len_warned: bool = False
+
+# RocketMQ 5.x documents a 10-second floor for SimpleConsumer invisible time.
+# ``ChangeInvisibleDuration`` uses the same range, so an explicit nack shortens
+# the retry delay to this floor rather than waiting out the normal processing
+# lease. Zero-delay nack is not supported by the broker.
+_MIN_INVISIBLE_DURATION = 10
+
+
+class _RocketMQAckToken:
+  """Consumer-generation-scoped token for one RocketMQ delivery."""
+
+  __slots__ = ("_completed", "consumer", "generation", "message")
+
+  def __init__(self, message: Any, consumer: Any, generation: int) -> None:
+    self.message = message
+    self.consumer = consumer
+    self.generation = generation
+    self._completed = False
 
 
 class RocketMQBackend(Backend, QueueBackend):
@@ -70,7 +92,7 @@ class RocketMQBackend(Backend, QueueBackend):
 
   # Ack capability (initiative #4 — at-least-once): the apache SimpleConsumer
   # uses a deferred-ack model. ``receive`` yields messages WITHOUT acking; the
-  # caller acks via ``ack(token=msg)`` after processing. A crash before ack →
+  # caller acks via the opaque token after processing. A crash before ack →
   # the broker's invisible-duration window redelivers the message (at-least-once).
   # ``supports_concurrent_ack=True`` because ack is per-message (no single-slot
   # overwrite) — correct under ``CONCURRENT_REQUESTS > 1``.
@@ -86,12 +108,18 @@ class RocketMQBackend(Backend, QueueBackend):
     self.config = config
     self._producer: Any = None
     self._consumer: Any = None
+    self._consumer_generation = 0
     self._subscribed_topics: set[str] = set()
+    # ``SimpleConsumer.await_duration`` is mutable global state on the client.
+    # Serialize receive calls so concurrent callers cannot overwrite one
+    # another's requested long-poll window before the RPC reads it.
+    self._receive_lock = threading.Lock()
     # Legacy single-slot for the ``ack(token=None)`` fallback path. Set by
     # ``pop`` / ``pop_with_ack``; cleared when ``ack`` acks the tracked message.
     # The token path (preferred under ``CONCURRENT_REQUESTS > 1``) does not
     # depend on this slot.
     self._last_msg: Any = None
+    self._last_delivery: tuple[Any, int, Any] | None = None
 
   def connect(self) -> None:
     """Establish connection to RocketMQ (gRPC proxy).
@@ -104,6 +132,8 @@ class RocketMQBackend(Backend, QueueBackend):
     try:
       from rocketmq import ClientConfiguration, Credentials, Producer, SimpleConsumer
     except ImportError as e:
+      if not _is_missing_optional_dependency(e, "rocketmq"):
+        raise
       msg = f"rocketmq-python-client not installed: {e}"
       raise BackendConnectionError(msg, backend_type="rocketmq") from e
 
@@ -153,29 +183,59 @@ class RocketMQBackend(Backend, QueueBackend):
         raise BackendConnectionError(msg, backend_type="rocketmq")
       self._producer.startup()
 
-      self._consumer = SimpleConsumer(config_obj, self.config.consumer_group)
+      # QueueBackend defines ``pop(timeout=0)`` as non-blocking. The client
+      # defaults await_duration to 20 seconds, so initialize it explicitly to
+      # zero; each receive updates the public property from that pop's timeout.
+      self._consumer = SimpleConsumer(
+        config_obj, self.config.consumer_group, await_duration=0
+      )
       if self._consumer is None:
         msg = "RocketMQBackend consumer initialization returned None"
         raise BackendConnectionError(msg, backend_type="rocketmq")
       self._consumer.startup()
+      self._consumer_generation += 1
 
       logger.debug(
         "Connected to RocketMQ proxy at %s", self.config.namesrv_address
       )
     except BackendConnectionError:
+      self._abort_partial_connect()
       raise
     except Exception as e:
+      self._abort_partial_connect()
       msg = f"Failed to connect to RocketMQ: {e}"
       raise BackendConnectionError(msg, backend_type="rocketmq") from e
+
+  def _abort_partial_connect(self) -> None:
+    """Detach and best-effort stop clients created by a failed connect."""
+    producer = self._producer
+    consumer = self._consumer
+    self._producer = None
+    self._consumer = None
+    self._consumer_generation += 1
+    self._subscribed_topics.clear()
+    self._last_msg = None
+    self._last_delivery = None
+    for closer in (consumer, producer):
+      if closer is not None:
+        try:
+          closer.shutdown()
+        except Exception:
+          logger.debug("Failed to abort partial RocketMQ client", exc_info=True)
 
   def disconnect(self) -> None:
     """Close RocketMQ connections (shutdown producer + consumer)."""
     # apache Producer/Consumer shutdown is best-effort — guard each so a
     # failure in one doesn't skip the other.
-    for closer, label in (
-      (self._producer, "producer"),
-      (self._consumer, "consumer"),
-    ):
+    producer = self._producer
+    consumer = self._consumer
+    self._producer = None
+    self._consumer = None
+    self._consumer_generation += 1
+    self._subscribed_topics.clear()
+    self._last_msg = None
+    self._last_delivery = None
+    for closer, label in ((producer, "producer"), (consumer, "consumer")):
       if closer is not None:
         try:
           closer.shutdown()
@@ -183,10 +243,6 @@ class RocketMQBackend(Backend, QueueBackend):
           logger.warning(
             "RocketMQ %s shutdown raised; ignoring", label, exc_info=True
           )
-    self._producer = None
-    self._consumer = None
-    self._subscribed_topics.clear()
-    self._last_msg = None
     logger.debug("Disconnected from RocketMQ")
 
   def is_connected(self) -> bool:
@@ -231,9 +287,12 @@ class RocketMQBackend(Backend, QueueBackend):
     Returns:
       Full topic name.
     """
+    _validate_key_name(queue_name, "queue_name")
     return f"{self.config.topic_prefix}_{queue_name}"
 
-  def _ensure_subscribed(self, topic_name: str) -> None:
+  def _ensure_subscribed(
+    self, topic_name: str, queue_name: str, consumer: Any
+  ) -> None:
     """Ensure the consumer is subscribed to ``topic_name``.
 
     The apache SimpleConsumer only receives messages from topics it has
@@ -245,16 +304,15 @@ class RocketMQBackend(Backend, QueueBackend):
     """
     if topic_name in self._subscribed_topics:
       return
-    if self._consumer is not None:
-      try:
-        self._consumer.subscribe(topic_name)
-        self._subscribed_topics.add(topic_name)
-      except Exception:  # noqa: BLE001 - subscription best-effort; receive surfaces real errors
-        logger.debug(
-          "subscribe(%s) raised; will retry next pop",
-          topic_name,
-          exc_info=True,
-        )
+    try:
+      consumer.subscribe(topic_name)
+    except Exception as e:
+      raise QueueError(
+        f"Failed to subscribe to RocketMQ queue {queue_name}: {e}",
+        queue_name=queue_name,
+        operation="pop",
+      ) from e
+    self._subscribed_topics.add(topic_name)
 
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to queue.
@@ -267,13 +325,14 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
       QueueError: If push fails.
     """
+    _validate_key_name(queue_name, "queue_name")
     from rocketmq import Message
 
     from scrapy_extension.exceptions import QueueError
 
     if not self.is_connected():
       msg = "Not connected to RocketMQ"
-      raise QueueError(msg)
+      raise QueueError(msg, queue_name=queue_name, operation="push")
 
     try:
       topic_name = self._get_topic_name(queue_name)
@@ -287,22 +346,54 @@ class RocketMQBackend(Backend, QueueBackend):
       msg.keys = str(priority)
       if self._producer is None:
         error = "RocketMQBackend not connected: producer is None"
-        raise QueueError(error)
+        raise QueueError(error, queue_name=queue_name, operation="push")
       self._producer.send(msg)
     except QueueError:
       raise
     except Exception as e:
       err = f"Failed to push to queue: {e}"
-      raise QueueError(err, queue_name=queue_name) from e
+      raise QueueError(err, queue_name=queue_name, operation="push") from e
+
+  def _receive_delivery(
+    self, queue_name: str, timeout: float
+  ) -> tuple[Any | None, Any, int]:
+    """Receive one message together with its consumer generation."""
+    _validate_key_name(queue_name, "queue_name")
+    if not self.is_connected():
+      msg = "Not connected to RocketMQ"
+      raise QueueError(msg, queue_name=queue_name, operation="pop")
+
+    try:
+      topic_name = self._get_topic_name(queue_name)
+      consumer = self._consumer
+      generation = self._consumer_generation
+      if consumer is None:
+        error = "RocketMQBackend not connected: consumer is None"
+        raise QueueError(error, queue_name=queue_name, operation="pop")
+      self._ensure_subscribed(topic_name, queue_name, consumer)
+      await_duration = math.ceil(timeout) if timeout > 0 else 0
+      with self._receive_lock:
+        consumer.await_duration = await_duration
+        messages = consumer.receive(1, self.config.invisible_duration)
+      if not messages:
+        return (None, consumer, generation)
+      return (messages[0], consumer, generation)
+    except QueueError:
+      raise
+    except Exception as e:
+      msg = f"Failed to pop from queue: {e}"
+      raise QueueError(
+        msg, queue_name=queue_name, operation="pop"
+      ) from e
 
   def _receive_message(self, queue_name: str, timeout: float) -> Any | None:
     """Receive a single message from ``queue_name`` WITHOUT acking.
 
     Args:
       queue_name: Name of the queue.
-      timeout: Seconds to wait (apache ``receive`` uses an invisible-duration,
-        not a polling timeout; this value is used as the invisible duration so
-        an unacked message becomes re-visible after it).
+      timeout: Seconds to wait for a message. The SDK exposes this as the
+        consumer's ``await_duration`` property, separate from the processing
+        lease passed to ``receive``.
 
     Returns:
       The received message object, or None if no message was available.
@@ -310,34 +401,8 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
       QueueError: If not connected or the receive fails.
     """
-    from scrapy_extension.exceptions import QueueError
-
-    if not self.is_connected():
-      msg = "Not connected to RocketMQ"
-      raise QueueError(msg)
-
-    try:
-      topic_name = self._get_topic_name(queue_name)
-      self._ensure_subscribed(topic_name)
-      if self._consumer is None:
-        error = "RocketMQBackend not connected: consumer is None"
-        raise QueueError(error)
-      # ``receive(max_message_num, invisible_duration)`` — invisible_duration
-      # (SECONDS) is how long the message stays invisible to peers (the
-      # redelivery window for at-least-once). The apache broker enforces a
-      # 10s floor (error 40011 "the invisibleTime is too small. min is 10000"
-      # below it), so clamp small/polling-style timeouts up to the floor;
-      # ``receive`` itself long-polls up to the consumer's await_duration.
-      invisible_duration = max(int(timeout), 10) if timeout > 0 else 15
-      messages = self._consumer.receive(1, invisible_duration)
-      if not messages:
-        return None
-      return messages[0]
-    except QueueError:
-      raise
-    except Exception as e:
-      msg = f"Failed to pop from queue: {e}"
-      raise QueueError(msg, queue_name=queue_name) from e
+    message, _consumer, _generation = self._receive_delivery(queue_name, timeout)
+    return message
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop item from queue WITHOUT acking (deferred-ack model).
@@ -353,29 +418,30 @@ class RocketMQBackend(Backend, QueueBackend):
 
     Args:
       queue_name: Name of the queue.
-      timeout: Seconds to wait (0 = use default invisible-duration).
+      timeout: Seconds to wait (0 = non-blocking).
 
     Returns:
       Popped item, or None if queue is empty.
     """
-    msg = self._receive_message(queue_name, timeout)
+    msg, consumer, generation = self._receive_delivery(queue_name, timeout)
     if msg is None:
       return None
     self._last_msg = msg
+    self._last_delivery = (consumer, generation, msg)
     return self._extract_body(msg)
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
   ) -> tuple[bytes | None, Any | None]:
-    """Pop an item together with an ack token (the message object itself).
+    """Pop an item together with a consumer-generation-scoped ack token.
 
-    Does NOT ack — the caller acks via :meth:`ack` (``token=msg``) after
-    processing. :class:`BackendScheduler` threads the token through
+    Does NOT ack — the caller acks via :meth:`ack` after processing.
+    :class:`BackendScheduler` threads the opaque token through
     ``request.meta["_backend_ack_token"]``.
 
     Args:
       queue_name: Name of the queue.
-      timeout: Seconds to wait (0 = use default invisible-duration).
+      timeout: Seconds to wait (0 = non-blocking).
 
     Returns:
       ``(body_bytes, msg_token)`` or ``(None, None)`` when empty.
@@ -383,11 +449,13 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
       QueueError: If not connected or the receive fails.
     """
-    msg = self._receive_message(queue_name, timeout)
+    msg, consumer, generation = self._receive_delivery(queue_name, timeout)
     if msg is None:
       return (None, None)
     self._last_msg = msg
-    return (self._extract_body(msg), msg)
+    self._last_delivery = (consumer, generation, msg)
+    token = _RocketMQAckToken(msg, consumer, generation)
+    return (self._extract_body(msg), token)
 
   @staticmethod
   def _extract_body(msg: Any) -> bytes:
@@ -414,83 +482,148 @@ class RocketMQBackend(Backend, QueueBackend):
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message (deferred from :meth:`pop` / :meth:`pop_with_ack`).
 
-    With a ``token`` (the message object): ack the specific message. With
-    ``token=None`` (legacy single-pop caller): ack the tracked ``_last_msg``.
+    With a token: ack the specific message on the consumer generation that
+    delivered it. With ``token=None`` (legacy single-pop caller): ack the
+    tracked ``_last_msg``.
 
     Args:
       queue_name: Name of the queue (unused; kept for interface symmetry).
-      token: The message object returned by :meth:`pop_with_ack`, or ``None``
-        to ack the last-popped message.
+      token: The opaque token returned by :meth:`pop_with_ack`, or ``None`` to
+        ack the last-popped message.
 
     Raises:
       QueueError: If the underlying ack call fails.
     """
-    from scrapy_extension.exceptions import QueueError
-
     del queue_name
-    target = token if token is not None else self._last_msg
-    if target is None or self._consumer is None:
-      return
+    token_obj: _RocketMQAckToken | None = None
+    if token is not None:
+      if not isinstance(token, _RocketMQAckToken) or token._completed:
+        return
+      if (
+        token.generation != self._consumer_generation
+        or token.consumer is not self._consumer
+      ):
+        return
+      token_obj = token
+      target = token.message
+      consumer = token.consumer
+    else:
+      target = self._last_msg
+      if target is None:
+        return
+      if self._last_delivery is not None:
+        consumer, generation, delivery = self._last_delivery
+        if (
+          delivery is not target
+          or generation != self._consumer_generation
+          or consumer is not self._consumer
+        ):
+          return
+      else:
+        consumer = self._consumer
+      if consumer is None:
+        return
     try:
-      self._consumer.ack(target)
+      consumer.ack(target)
     except Exception as e:
       msg = f"Failed to ack RocketMQ message: {e}"
       raise QueueError(msg, operation="ack") from e
-    finally:
+    else:
+      if token_obj is not None:
+        token_obj._completed = True
       # Clear the legacy slot when we acked the tracked message so a later
       # ack(token=None) is a no-op, not a re-ack.
       if self._last_msg is target:
         self._last_msg = None
+        self._last_delivery = None
 
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
-    """Nack a popped message — deliberate no-op (invisible-duration redelivery).
+    """Shorten a popped message's lease to RocketMQ's 10-second floor.
 
-    The apache gRPC client has no explicit nack; an unacked message is
-    automatically redelivered after the invisible-duration window (same
-    at-least-once model as SQS/RocketMQ remoting). Logged at debug so the
-    retry path is observable without pretending work was done.
+    The client has no dedicated nack call, but its
+    ``change_invisible_duration`` operation can schedule prompt redelivery.
+    RocketMQ rejects durations below 10 seconds, so unlike SQS this cannot
+    make a message immediately visible.
 
     Args:
       queue_name: Name of the queue (unused; interface symmetry).
-      token: The message object (unused; interface symmetry).
+      token: The opaque token returned by :meth:`pop_with_ack`, or ``None`` to
+        nack the last-popped message.
+
+    Raises:
+      QueueError: If changing the message lease fails.
     """
-    del queue_name, token
-    logger.debug(
-      "RocketMQ nack: no explicit nack API — message will redeliver "
-      "after the invisible-duration window (at-least-once)."
-    )
+    del queue_name
+    token_obj: _RocketMQAckToken | None = None
+    if token is not None:
+      if not isinstance(token, _RocketMQAckToken) or token._completed:
+        return
+      if (
+        token.generation != self._consumer_generation
+        or token.consumer is not self._consumer
+      ):
+        return
+      token_obj = token
+      target = token.message
+      consumer = token.consumer
+    else:
+      target = self._last_msg
+      if target is None:
+        return
+      if self._last_delivery is not None:
+        consumer, generation, delivery = self._last_delivery
+        if (
+          delivery is not target
+          or generation != self._consumer_generation
+          or consumer is not self._consumer
+        ):
+          return
+      else:
+        consumer = self._consumer
+      if consumer is None:
+        return
+    try:
+      consumer.change_invisible_duration(
+        target, _MIN_INVISIBLE_DURATION
+      )
+    except Exception as e:
+      msg = f"Failed to nack RocketMQ message: {e}"
+      raise QueueError(msg, operation="nack") from e
+    else:
+      if token_obj is not None:
+        token_obj._completed = True
+      if self._last_msg is target:
+        self._last_msg = None
+        self._last_delivery = None
 
   def queue_len(self, queue_name: str) -> int:
-    """Get queue length (Risk 1: standardized — always 0, depth unsupported).
+    """Report that queue depth is unsupported by the RocketMQ client.
 
-    RocketMQ's deferred-ack model has no broker-side depth RPC. Previously
-    this raised ``NotImplementedError``, which propagated uncaught through
-    ``BackendQueue._probe_depth`` and could crash the pop /
-    ``has_pending_requests`` loop. Standardized to return 0 (matching the
-    Kafka/Pulsar/SQS contract) so the depth-query contract is uniform across
-    MQ backends. A one-time per-process WARNING surfaces the limitation so
-    operators know Scrapy idle detection and depth-based backpressure cannot
-    rely on this value for RocketMQ — monitor via pop-rate / consumer-liveness
-    instead.
+    RocketMQ's deferred-ack model has no broker-side depth RPC. Returning 0
+    would falsely report an empty queue and can make Scrapy enter idle while
+    work is pending. ``NotImplementedError`` lets queue monitoring ignore the
+    sample, backpressure continue to pop, and pending detection stay
+    conservative. A one-time warning surfaces the limitation to operators.
 
     Args:
       queue_name: Name of the queue.
 
-    Returns:
-      Always 0 (depth unsupported — see the one-time WARNING).
+    Raises:
+      NotImplementedError: Always; the client has no broker-side depth RPC.
     """
     global _queue_len_warned
-    del queue_name
+    _validate_key_name(queue_name, "queue_name")
     if not _queue_len_warned:
       _queue_len_warned = True
       logger.warning(
         "RocketMQ queue_len() is unsupported (deferred-ack model has no "
-        "broker-side depth RPC); returning 0. Scrapy idle detection and "
-        "depth-based backpressure cannot rely on this value for RocketMQ — "
+        "broker-side depth RPC). Pending detection will stay conservative; "
         "monitor via pop-rate / consumer-liveness instead. This warning "
         "fires once per process."
       )
-    return 0
+    raise NotImplementedError(
+      "RocketMQ queue depth is unsupported: no broker-side depth RPC"
+    )
 
   def clear_queue(self, queue_name: str) -> None:
     """Report that RocketMQ broker-side queue purge is unsupported.
@@ -501,6 +634,7 @@ class RocketMQBackend(Backend, QueueBackend):
     Raises:
       QueueError: If disconnected or because the client has no purge API.
     """
+    _validate_key_name(queue_name, "queue_name")
     if not self.is_connected():
       msg = "Not connected to RocketMQ"
       raise QueueError(

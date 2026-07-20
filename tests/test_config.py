@@ -484,7 +484,8 @@ class TestSec4EndpointUrlSchemeGuard:
 
   Catches typos and bare host:port values that would otherwise fall through
   to boto3's default chain (silent wrong target). ``http://`` is allowed
-  (LocalStack). Unset is allowed (real AWS via default chain).
+  (LocalStack). In standalone mode, unset uses the safe LocalStack default;
+  cloud mode alone may use the real AWS default chain.
   """
 
   def test_sqs_no_scheme_rejected(self):
@@ -510,12 +511,12 @@ class TestSec4EndpointUrlSchemeGuard:
     settings = SqsSettings(endpoint_url="https://sqs.example.com")
     assert settings.endpoint_url == "https://sqs.example.com"
 
-  def test_sqs_unset_accepted(self):
-    """SQS endpoint_url unset → accepted (default chain to AWS)."""
+  def test_sqs_standalone_unset_uses_safe_local_default(self):
+    """SQS standalone without endpoint_url targets local LocalStack."""
     from scrapy_extension.settings import SqsSettings
 
     settings = SqsSettings()
-    assert settings.endpoint_url is None
+    assert settings.endpoint_url == "http://localhost:4566"
 
   def test_dynamodb_no_scheme_rejected(self):
     """DynamoDB endpoint_url without scheme → ConfigurationError."""
@@ -539,12 +540,12 @@ class TestSec4EndpointUrlSchemeGuard:
     settings = DynamoDBSettings(endpoint_url="https://dynamodb.example.com")
     assert settings.endpoint_url == "https://dynamodb.example.com"
 
-  def test_dynamodb_unset_accepted(self):
-    """DynamoDB endpoint_url unset → accepted (default chain to AWS)."""
+  def test_dynamodb_standalone_unset_uses_safe_local_default(self):
+    """DynamoDB standalone without endpoint_url targets local LocalStack."""
     from scrapy_extension.settings import DynamoDBSettings
 
     settings = DynamoDBSettings()
-    assert settings.endpoint_url is None
+    assert settings.endpoint_url == "http://localhost:4566"
 
 
 # =============================================================================
@@ -618,4 +619,3 @@ class TestR14COperabilitySettings:
     monkeypatch.setenv("SCRAPY_MONITOR_POP_RATE_WINDOW_S", "30.0")
     settings = Settings()
     assert settings.monitor_pop_rate_window_s == 30.0
-

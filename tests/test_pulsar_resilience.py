@@ -11,7 +11,7 @@ lines + 6 partial branches). 8 tests pin the documented contracts:
 - nack legacy path when the consumer lacks negative_acknowledge
   (line 570->576 false branch): best-effort, message re-delivers on
   timeout/restart.
-- _nack_token error logging (lines 585-586): best-effort, must not raise.
+- _nack_token driver errors surface as QueueError and retain retry state.
 - _ensure_consumer subscribe failure (lines 648-649).
 - _message_bytes non-bytes payload fallbacks (lines 673, 679): a producer
   whose data()/value() returns a non-bytes payload is str-encoded rather
@@ -151,18 +151,19 @@ def test_nack_legacy_noop_when_consumer_lacks_negative_acknowledge() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_nack_token_logs_and_swallows_when_negative_acknowledge_fails(caplog) -> None:
-  """Lines 585-586: a failure inside ``_nack_token`` (negative_acknowledge
-  raises) is logged and swallowed — nack is best-effort, the message
-  re-delivers on restart regardless. Must NOT raise (would break the
-  caller's error path)."""
+def test_nack_token_raises_when_negative_acknowledge_fails() -> None:
+  """A broker-side nack failure must remain observable and retryable."""
   backend = _backend()
   backend._consumer = MagicMock()
   backend._consumer.negative_acknowledge.side_effect = RuntimeError("nack boom")
   token = _PulsarAckToken(message_id="id", topic="t")
-  with caplog.at_level(logging.WARNING):
-    backend.nack("q", token=token)  # must not raise
-  assert any("redeliver on restart" in r.message for r in caplog.records)
+  backend._in_flight.add(token)
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.nack("q", token=token)
+
+  assert exc_info.value.operation == "nack"
+  assert token in backend._in_flight
 
 
 # ---------------------------------------------------------------------------

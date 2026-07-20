@@ -13,12 +13,13 @@ class QuotesElasticsearchSpider(BackendSpiderMixin, scrapy.Spider):
   """
 
   backend_type = BackendType.ELASTICSEARCH
+  elasticsearch_hosts = ["http://localhost:9200"]
   name = "quotes_elasticsearch"
   start_urls = ["https://quotes.toscrape.com/"]
-
-  def __init__(self, **kwargs):
-    super().__init__(**kwargs)
-    self.setup_backend()
+  custom_settings = {
+    "SCRAPY_BACKEND_TYPE": "elasticsearch",
+    "SCRAPY_ELASTICSEARCH_HOSTS": elasticsearch_hosts,
+  }
 
   def parse(self, response):
     for quote in response.css("div.quote"):

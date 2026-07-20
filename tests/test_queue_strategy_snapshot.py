@@ -14,22 +14,34 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+from scrapy.http import Request
+
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
+from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 
 _SNAPSHOT_KEY = "queue:snapshot:q"
 
 
-def _delay(*, clock_value: float = 100.0, default_delay: float = 0.0) -> DelayQueueStrategy:
+def _delay(
+  *,
+  clock_value: float = 100.0,
+  wall_clock_value: float = 1_000.0,
+  default_delay: float = 0.0,
+) -> DelayQueueStrategy:
   """DelayQueueStrategy with a frozen clock (deterministic ready_at)."""
   return DelayQueueStrategy(
     MagicMock(name="ConnectionManager"),
     default_delay=default_delay,
     clock=lambda: clock_value,
+    wall_clock=lambda: wall_clock_value,
   )
 
 
@@ -57,15 +69,16 @@ def test_delay_snapshot_serializes_held_items():
   blob = strategy.snapshot()
   assert blob is not None
   data = json.loads(blob.decode("utf-8"))
-  assert data["version"] == 1
+  assert data["version"] == 2
   assert data["strategy"] == "delay"
   assert len(data["items"]) == 2
-  by_ready = {item["ready_at"]: item for item in data["items"]}
-  assert set(by_ready) == {110.0, 120.0}
-  assert base64.b64decode(by_ready[110.0]["item_b64"]) == b"item-1"
-  assert base64.b64decode(by_ready[120.0]["item_b64"]) == b"item-2"
-  assert by_ready[110.0]["priority"] == 2.0
-  assert by_ready[120.0]["priority"] == 1.0
+  assert data["snapshot_wall_time"] == 1_000.0
+  by_remaining = {item["remaining"]: item for item in data["items"]}
+  assert set(by_remaining) == {10.0, 20.0}
+  assert base64.b64decode(by_remaining[10.0]["item_b64"]) == b"item-1"
+  assert base64.b64decode(by_remaining[20.0]["item_b64"]) == b"item-2"
+  assert by_remaining[10.0]["priority"] == 2.0
+  assert by_remaining[20.0]["priority"] == 1.0
 
 
 def test_delay_snapshot_excludes_seq():
@@ -92,6 +105,62 @@ def test_delay_restore_round_trip_preserves_state():
   dst.restore(src.snapshot())
 
   assert _strip_seq(dst._holding) == [(110.0, b"a", 1.0), (120.0, b"b", 2.0)]
+
+
+def test_delay_restore_rebases_monotonic_deadline_and_counts_downtime():
+  """Persisted deadlines must survive a different monotonic clock epoch."""
+  source_clock = [5_000.0]
+  source_wall = [10_000.0]
+  source = DelayQueueStrategy(
+    MagicMock(),
+    clock=lambda: source_clock[0],
+    wall_clock=lambda: source_wall[0],
+  )
+  source.push("q", b"later", delay=60.0)
+  blob = source.snapshot()
+
+  destination_clock = [7.0]
+  destination_wall = [10_030.0]
+  manager = MagicMock()
+  backend = manager.get_queue_backend.return_value
+  destination = DelayQueueStrategy(
+    manager,
+    clock=lambda: destination_clock[0],
+    wall_clock=lambda: destination_wall[0],
+  )
+  destination.restore(blob)
+
+  # 30 seconds elapsed while stopped, leaving 30 seconds from the new
+  # monotonic epoch: 7 + 30 = 37, never the old absolute 5060.
+  assert destination._holding[0][0] == 37.0
+  destination_clock[0] = 36.9
+  destination.pop("q")
+  backend.push.assert_not_called()
+  destination_clock[0] = 37.0
+  destination.pop("q")
+  backend.push.assert_called_once_with("q", b"later", 0.0)
+
+
+def test_delay_restore_v1_deadline_is_due_instead_of_cross_boot_stall():
+  """Legacy absolute-monotonic snapshots cannot be rebased reliably."""
+  blob = json.dumps(
+    {
+      "version": 1,
+      "strategy": "delay",
+      "items": [
+        {
+          "ready_at": 999_999.0,
+          "item_b64": base64.b64encode(b"legacy").decode(),
+          "priority": 0.0,
+        }
+      ],
+    }
+  ).encode()
+  strategy = _delay(clock_value=3.0)
+
+  strategy.restore(blob)
+
+  assert strategy._holding[0][0] == 3.0
 
 
 def test_delay_restore_none_is_noop():
@@ -140,7 +209,10 @@ def test_delay_restore_past_ready_drains_on_pop():
   src.push("q", b"due", delay=10.0)  # ready_at = 110
   blob = src.snapshot()
 
-  dst = _delay(clock_value=200.0)  # clock now past ready_at -> item is due
+  dst = _delay(
+    clock_value=200.0,
+    wall_clock_value=1_100.0,
+  )  # 100s downtime -> item is due
   dst.restore(blob)
 
   dst.pop("q")  # drain fires
@@ -206,6 +278,228 @@ def test_backends_queue_close_persists_snapshot_before_clearing():
   assert json.loads(args[1].decode())["items"][0]["item_b64"]
 
 
+@pytest.mark.parametrize("operation", ["push", "pop", "ack", "nack", "len", "clear"])
+def test_close_rejects_operations_after_snapshot_store_starts(operation):
+  storage = _storage_mock()
+  store_started = threading.Event()
+  release_store = threading.Event()
+  close_done = threading.Event()
+  close_errors: list[Exception] = []
+
+  def blocking_store(key, state):
+    del key, state
+    store_started.set()
+    if not release_store.wait(timeout=2.0):
+      raise AssertionError("snapshot store was not released")
+
+  storage.store.side_effect = blocking_store
+  cm = _wired_cm(storage=storage)
+  strategy = RingBufferQueueStrategy(cm, capacity=2)
+  queue = BackendQueue(cm, "q", queue_strategy=strategy, monitor=MagicMock())
+  queue.push(Request("https://example.com/first"))
+
+  def close_queue():
+    try:
+      queue.close()
+    except Exception as exc:
+      close_errors.append(exc)
+    finally:
+      close_done.set()
+
+  thread = threading.Thread(target=close_queue, daemon=True)
+  thread.start()
+  assert store_started.wait(timeout=2.0), "close should reach snapshot storage"
+
+  try:
+    with pytest.raises(QueueError, match="clos"):
+      if operation == "push":
+        queue.push(Request("https://example.com/late"))
+      elif operation == "pop":
+        queue.pop()
+      elif operation == "ack":
+        queue.ack(token="late-token")
+      elif operation == "nack":
+        queue.nack(token="late-token")
+      elif operation == "len":
+        len(queue)
+      else:
+        queue.clear()
+  finally:
+    release_store.set()
+    thread.join(timeout=2.0)
+
+  assert close_done.is_set()
+  assert not thread.is_alive()
+  assert close_errors == []
+  snapshot = json.loads(storage.store.call_args.args[1].decode())
+  assert len(snapshot["items"]) == 1
+
+
+def test_close_waits_for_entered_push_before_snapshot():
+  storage = _storage_mock()
+  cm = _wired_cm(storage=storage)
+  strategy = MagicMock(name="QueueStrategy")
+  push_entered = threading.Event()
+  release_push = threading.Event()
+  pushed_items: list[bytes] = []
+  push_errors: list[Exception] = []
+  close_errors: list[Exception] = []
+
+  def blocking_push(_queue_name, item, **_kwargs):
+    push_entered.set()
+    if not release_push.wait(timeout=2.0):
+      raise AssertionError("entered push was not released")
+    pushed_items.append(item)
+
+  strategy.push.side_effect = blocking_push
+  strategy.begin_close.side_effect = release_push.set
+  strategy.close.side_effect = release_push.set
+  strategy.snapshot.side_effect = lambda: str(len(pushed_items)).encode()
+  queue = BackendQueue(cm, "q", queue_strategy=strategy, monitor=MagicMock())
+
+  def push_request():
+    try:
+      queue.push(Request("https://example.com/in-flight"))
+    except Exception as exc:
+      push_errors.append(exc)
+
+  def close_queue():
+    try:
+      queue.close()
+    except Exception as exc:
+      close_errors.append(exc)
+
+  push_thread = threading.Thread(target=push_request, daemon=True)
+  close_thread = threading.Thread(target=close_queue, daemon=True)
+  push_thread.start()
+  assert push_entered.wait(timeout=2.0)
+  close_thread.start()
+  close_thread.join(timeout=2.0)
+  release_push.set()
+  push_thread.join(timeout=2.0)
+
+  assert not push_thread.is_alive()
+  assert not close_thread.is_alive()
+  assert push_errors == []
+  assert close_errors == []
+  storage.store.assert_called_once_with(_SNAPSHOT_KEY, b"1")
+
+
+@pytest.mark.parametrize("operation", ["ack", "nack"])
+def test_close_waits_for_entered_terminal_operation(operation):
+  storage = _storage_mock()
+  backend = MagicMock(name="QueueBackend")
+  cm = _wired_cm(storage=storage, queue_backend=backend)
+  strategy = MagicMock(name="QueueStrategy")
+  strategy.snapshot.return_value = None
+  operation_entered = threading.Event()
+  release_operation = threading.Event()
+  begin_close_called = threading.Event()
+  operation_errors: list[Exception] = []
+  close_errors: list[Exception] = []
+
+  def blocking_terminal(*_args, **_kwargs):
+    operation_entered.set()
+    if not release_operation.wait(timeout=2.0):
+      raise AssertionError("terminal operation was not released")
+
+  getattr(backend, operation).side_effect = blocking_terminal
+  strategy.begin_close.side_effect = begin_close_called.set
+  queue = BackendQueue(cm, "q", queue_strategy=strategy, monitor=MagicMock())
+
+  def run_operation():
+    try:
+      getattr(queue, operation)(token="delivery-token")
+    except Exception as exc:
+      operation_errors.append(exc)
+
+  def close_queue():
+    try:
+      queue.close()
+    except Exception as exc:
+      close_errors.append(exc)
+
+  operation_thread = threading.Thread(target=run_operation, daemon=True)
+  close_thread = threading.Thread(target=close_queue, daemon=True)
+  operation_thread.start()
+  assert operation_entered.wait(timeout=2.0)
+  close_thread.start()
+  assert begin_close_called.wait(timeout=2.0)
+
+  try:
+    assert close_thread.is_alive(), "close returned before ack/nack completed"
+    storage.delete.assert_not_called()
+  finally:
+    release_operation.set()
+    operation_thread.join(timeout=2.0)
+    close_thread.join(timeout=2.0)
+
+  assert not operation_thread.is_alive()
+  assert not close_thread.is_alive()
+  assert operation_errors == []
+  assert close_errors == []
+  getattr(backend, operation).assert_called_once_with("q", token="delivery-token")
+
+
+def test_blocked_pop_does_not_hold_queue_lifecycle_lock():
+  storage = _storage_mock()
+  cm = _wired_cm(storage=storage)
+  strategy = MagicMock(name="QueueStrategy")
+  pop_entered = threading.Event()
+  release_pop = threading.Event()
+  begin_close_called = threading.Event()
+  pop_errors: list[Exception] = []
+  close_errors: list[Exception] = []
+
+  def blocking_pop(_queue_name, _timeout):
+    pop_entered.set()
+    if not release_pop.wait(timeout=2.0):
+      raise AssertionError("blocked pop was not released")
+    return (None, None)
+
+  def begin_close():
+    begin_close_called.set()
+    release_pop.set()
+
+  strategy.pop_with_ack.side_effect = blocking_pop
+  strategy.begin_close.side_effect = begin_close
+  strategy.close.side_effect = release_pop.set
+  strategy.snapshot.return_value = None
+  queue = BackendQueue(cm, "q", queue_strategy=strategy, monitor=MagicMock())
+
+  def pop_request():
+    try:
+      queue.pop(timeout=30.0)
+    except Exception as exc:
+      pop_errors.append(exc)
+
+  def close_queue():
+    try:
+      queue.close()
+    except Exception as exc:
+      close_errors.append(exc)
+
+  pop_thread = threading.Thread(target=pop_request, daemon=True)
+  close_thread = threading.Thread(target=close_queue, daemon=True)
+  pop_thread.start()
+  assert pop_entered.wait(timeout=2.0)
+  close_thread.start()
+
+  try:
+    assert begin_close_called.wait(timeout=2.0), (
+      "close should run begin_close while broker pop is blocked"
+    )
+  finally:
+    release_pop.set()
+    pop_thread.join(timeout=2.0)
+    close_thread.join(timeout=2.0)
+
+  assert not pop_thread.is_alive()
+  assert not close_thread.is_alive()
+  assert pop_errors == []
+  assert close_errors == []
+
+
 def test_backends_queue_init_restores_snapshot():
   """BackendQueue.__init__ retrieves the snapshot + strategy.restore runs."""
   src = _delay(clock_value=100.0)
@@ -223,10 +517,11 @@ def test_backends_queue_init_restores_snapshot():
   assert len(strategy._holding) == 1
   assert strategy._holding[0][2] == b"recovered"
   storage.retrieve.assert_called_once_with(_SNAPSHOT_KEY)
+  storage.delete.assert_called_once_with(_SNAPSHOT_KEY)
 
 
-def test_backends_queue_close_skips_when_strategy_has_no_state():
-  """Passthrough (snapshot -> None) skips the storage.store call entirely."""
+def test_backends_queue_close_deletes_stale_snapshot_when_strategy_is_empty():
+  """An empty clean close must invalidate any snapshot from an earlier run."""
   storage = _storage_mock()
   cm = _wired_cm(storage=storage)
   bq = BackendQueue(connection_manager=cm, queue_name="q", monitor=MagicMock())
@@ -234,6 +529,7 @@ def test_backends_queue_close_skips_when_strategy_has_no_state():
   bq.close()
 
   storage.store.assert_not_called()
+  storage.delete.assert_called_once_with(_SNAPSHOT_KEY)
 
 
 def test_backends_queue_storage_incapable_skips_cleanly():
@@ -323,7 +619,7 @@ def test_backends_queue_init_restore_crash_does_not_break_startup():
 # ---------------------------------------------------------------------------
 
 
-def _make_queue_for_key(spider=None, queue_name="jobs"):
+def _make_queue_for_key(spider=None, queue_name="jobs", snapshot_owner=None):
   """Minimal BackendQueue for snapshot-key unit tests.
 
   ``connection_manager`` is a spec-empty Mock so the queue can be constructed
@@ -334,6 +630,7 @@ def _make_queue_for_key(spider=None, queue_name="jobs"):
     connection_manager=MagicMock(spec=[]),
     queue_name=queue_name,
     spider=spider,
+    snapshot_owner=snapshot_owner,
   )
 
 
@@ -378,3 +675,25 @@ def test_snapshot_key_spider_without_name_attr_falls_back():
   """
   key = _make_queue_for_key(spider=SimpleNamespace(), queue_name="jobs")._snapshot_key()
   assert key == "queue:snapshot:jobs"
+
+
+def test_snapshot_key_isolates_workers_with_stable_owner():
+  spider = SimpleNamespace(name="shared-spider")
+
+  key_a = _make_queue_for_key(
+    spider=spider,
+    snapshot_owner="worker-a",
+  )._snapshot_key()
+  key_b = _make_queue_for_key(
+    spider=spider,
+    snapshot_owner="worker-b",
+  )._snapshot_key()
+
+  assert key_a == "queue:snapshot:v2:8:worker-a:13:shared-spider:jobs"
+  assert key_b == "queue:snapshot:v2:8:worker-b:13:shared-spider:jobs"
+  assert key_a != key_b
+
+
+def test_snapshot_owner_rejects_unsafe_storage_key_characters():
+  with pytest.raises(ValueError, match="snapshot_owner"):
+    _make_queue_for_key(snapshot_owner="worker with spaces")

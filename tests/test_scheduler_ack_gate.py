@@ -58,12 +58,13 @@ def _make_settings(
   *,
   concurrent: int,
   opt_out: bool = False,
+  queue_key: str = "scheduler:queue",
 ) -> Mock:
   """Build a Scrapy-Settings-like mock resolving queue + concurrency + opt-out."""
   settings = Mock()
   backend_map = {
     "SCRAPY_BACKEND_TYPE": backend_type,
-    "SCRAPY_QUEUE_KEY": "scheduler:queue",
+    "SCRAPY_QUEUE_KEY": queue_key,
     "SCRAPY_QUEUE_STRATEGY": "passthrough",
   }
 
@@ -81,6 +82,7 @@ def _make_settings(
 
   settings.get.side_effect = get
   settings.getint.side_effect = getint
+  settings.getbool.return_value = opt_out
   settings.getfloat.return_value = 0.0
   settings.getdict.return_value = {}
   return settings
@@ -96,6 +98,45 @@ class TestAckCapabilityGate:
 
     scheduler = BackendScheduler.from_settings(settings)  # must not raise
     assert scheduler.queue_key == "scheduler:queue"
+
+  @pytest.mark.parametrize("backend_type", ["kafka", "rocketmq"])
+  def test_single_consumer_manager_is_scoped_by_queue_key(
+    self, mocker, backend_type: str
+  ) -> None:
+    """A consumer-bearing manager cannot be shared across logical queues."""
+    from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
+
+    get_manager = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=mocker.Mock()
+    )
+
+    BackendScheduler.from_settings(
+      _make_settings(backend_type, concurrent=1, queue_key="queue-a")
+    )
+    first_settings = get_manager.call_args.kwargs["settings"]
+    get_manager.reset_mock()
+    BackendScheduler.from_settings(
+      _make_settings(backend_type, concurrent=1, queue_key="queue-b")
+    )
+    second_settings = get_manager.call_args.kwargs["settings"]
+
+    assert first_settings[_CONNECTION_MANAGER_SCOPE_KEY] == "queue-a"
+    assert second_settings[_CONNECTION_MANAGER_SCOPE_KEY] == "queue-b"
+
+  def test_multi_interface_backend_keeps_existing_sharing(self, mocker) -> None:
+    """Redis manager identity remains settings-only; queue keys do not split it."""
+    from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
+
+    get_manager = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=mocker.Mock()
+    )
+
+    BackendScheduler.from_settings(
+      _make_settings("redis", concurrent=1, queue_key="queue-a")
+    )
+
+    manager_settings = get_manager.call_args.kwargs["settings"]
+    assert _CONNECTION_MANAGER_SCOPE_KEY not in manager_settings
 
   def test_gate_fires_for_synthetic_single_slot_backend(self, mocker) -> None:
     """After round-3 every real backend is concurrency-safe, so the gate
@@ -398,21 +439,29 @@ class TestStrategyMqAckBypassWarning:
       f"delay+redis (atomic, requires_ack=False) must NOT warn; got: {msgs}"
     )
 
-  def test_no_warn_when_priority_strategy_pairs_with_kafka(self, mocker, caplog) -> None:
-    """#28: priority overrides pop_with_ack (threads the MQ token), so the
-    warning must NOT fire — only strategies that inherit the ABC default
-    (delay/round_robin/throttle/time_wheel/ring_buffer) warn."""
-    import logging
+  @pytest.mark.parametrize(
+    ("strategy", "backend"),
+    [
+      ("priority", "kafka"),
+      ("work_stealing", "kafka"),
+      ("priority", "rocketmq"),
+      ("work_stealing", "rocketmq"),
+    ],
+  )
+  def test_rejects_fanout_strategy_when_backend_cannot_isolate_topics(
+    self, mocker, strategy, backend
+  ) -> None:
+    """Token threading is insufficient when one consumer switches topics."""
+    manager = mocker.Mock(backend_type=backend)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+    settings = _strategy_settings(backend, strategy)
 
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
-    settings = _strategy_settings("kafka", "priority")
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.schedule.scheduler"):
+    with pytest.raises(ConfigurationError, match="passthrough") as exc_info:
       BackendScheduler.from_settings(settings)
-    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert not any("pop_with_ack" in m for m in msgs), (
-      f"priority+kafka must NOT warn (priority overrides pop_with_ack); got: {msgs}"
-    )
+
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_STRATEGY"
+    assert exc_info.value.setting_value == strategy
+    manager.close.assert_called_once()
 
   def test_no_warn_when_time_wheel_threads_ack_with_kafka(
     self, mocker, caplog

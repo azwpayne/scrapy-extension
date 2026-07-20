@@ -20,9 +20,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
+
 try:
   from pymemcache.client.base import Client as MemcachedClient
 except ImportError as e:
+  if not _is_missing_optional_dependency(e, "pymemcache"):
+    raise
   raise ImportError(
     "Memcached backend requires 'pymemcache'. "
     "Install with: pip install scrapy-extension[memcached]"
@@ -33,8 +37,9 @@ from scrapy_extension.backends.base import (
   BackendType,
   StorageBackend,
   _validate_key_name,
+  _validate_ttl,
 )
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MemcachedMode
 
@@ -49,8 +54,9 @@ class MemcachedBackend(Backend, StorageBackend):
 
   Stores values under keys with an optional TTL (``expire``). Limitations
   (Memcached has no native support): ``ttl()`` always returns ``None``
-  (remaining TTL not exposed); ``clear_storage(prefix)`` flushes ALL keys
-  (prefix filtering not supported).
+  (remaining TTL not exposed). Memcached cannot enumerate or prefix-filter
+  keys, so ``clear_storage`` is disabled by default; the destructive
+  server-wide ``flush_all`` operation requires ``allow_flush_all=True``.
 
   Attributes:
       config: MemcachedSettings instance.
@@ -78,9 +84,10 @@ class MemcachedBackend(Backend, StorageBackend):
         BackendConnectionError: If the connection cannot be established.
     """
     if self.config.mode is not MemcachedMode.STANDALONE:
-      raise BackendConnectionError(
+      raise ConfigurationError(
         f"Unsupported Memcached mode: {self.config.mode}",
-        backend_type="memcached",
+        setting_name="mode",
+        setting_value=self.config.mode,
       )
     try:
       self._client = MemcachedClient((self.config.host, self.config.port))
@@ -151,11 +158,18 @@ class MemcachedBackend(Backend, StorageBackend):
             silently swallowed to ``return None``, masking data loss).
     """
     _validate_key_name(key, "key")
+    _validate_ttl(ttl)
     try:
-      self._client.set(key, data, expire=ttl)
+      stored = self._client.set(key, data, expire=0 if ttl is None else ttl)
     except Exception as e:
       msg = f"Failed to store key {key!r} in Memcached: {e}"
       raise StorageError(msg, operation="store", key=key) from e
+    if stored is not True:
+      raise StorageError(
+        f"Memcached rejected the write for key {key!r}",
+        operation="store",
+        key=key,
+      )
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
@@ -236,16 +250,17 @@ class MemcachedBackend(Backend, StorageBackend):
     return None
 
   def clear_storage(self, prefix: str | None = None) -> None:
-    """Flush ALL keys (prefix scoping is unsupported by Memcached).
+    """Flush all server keys only when explicitly enabled.
 
     Args:
-        prefix: If ``None``, flush the entire cache. If non-None, rejected —
-            Memcached ``flush_all`` cannot scope to a prefix, so accepting
-            one would silently destroy other tenants on a shared cluster.
+        prefix: A non-None prefix is always rejected because Memcached cannot
+            scope ``flush_all``. ``None`` is accepted only when the backend
+            was configured with ``allow_flush_all=True``.
 
     Raises:
         ValueError: If ``prefix`` contains invalid characters.
-        NotImplementedError: If ``prefix`` is not ``None`` (protocol limit).
+        NotImplementedError: If prefix scoping is requested or the destructive
+            global flush has not been explicitly enabled.
         StorageError: If the underlying client raises (was previously
             silently swallowed).
     """
@@ -253,7 +268,13 @@ class MemcachedBackend(Backend, StorageBackend):
       _validate_key_name(prefix, "prefix")
       raise NotImplementedError(
         "Memcached flush_all does not support prefix scoping; pass "
-        "prefix=None to flush the entire cache."
+        "prefix=None only when a server-wide flush is explicitly acceptable."
+      )
+    if not self.config.allow_flush_all:
+      raise NotImplementedError(
+        "Memcached clear_storage would flush every key on the server. Set "
+        "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=true (allow_flush_all=True) only "
+        "for a dedicated cache where that destructive scope is intended."
       )
     try:
       self._client.flush_all()

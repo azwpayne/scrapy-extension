@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.exceptions import BackendError
 
 
 def _make_manager() -> ConnectionManager:
@@ -82,7 +83,10 @@ def test_get_breaker_enabled_threads_settings_into_circuitbreaker():
     manager._get_breaker()
 
   mock_cb.assert_called_once_with(
-    name="redis-backend", failure_threshold=7, reset_timeout=45.0
+    name="redis-backend",
+    failure_threshold=7,
+    reset_timeout=45.0,
+    failure_exceptions=(BackendError,),
   )
 
 

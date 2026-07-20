@@ -8,7 +8,9 @@ importing optional dependencies at module level.
 """
 
 import importlib
+from typing import TYPE_CHECKING
 
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -19,6 +21,18 @@ from scrapy_extension.backends.base import (
     StorageBackend,
 )
 from scrapy_extension.backends.connectors import ConnectionManager
+
+if TYPE_CHECKING:
+    from scrapy_extension.backends.dynamodb import DynamoDBBackend
+    from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+    from scrapy_extension.backends.kafka import KafkaBackend
+    from scrapy_extension.backends.memcached import MemcachedBackend
+    from scrapy_extension.backends.mongodb import MongoDBBackend
+    from scrapy_extension.backends.pulsar import PulsarBackend
+    from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.backends.rocketmq import RocketMQBackend
+    from scrapy_extension.backends.sqs import SqsBackend
 
 _BACKEND_MODULES = {
     "RedisBackend": ("scrapy_extension.backends.redis", "RedisBackend"),
@@ -82,17 +96,10 @@ def _is_missing_optional_dep(exc: ImportError, module_path: str) -> bool:
     rationale. Rule: must be a ``ModuleNotFoundError`` whose ``name`` is (or is
     a submodule of) one of this backend's documented optional-dep modules.
     """
-    if not isinstance(exc, ModuleNotFoundError):
-        return False
-    missing_name = getattr(exc, "name", None)
-    if not missing_name:
-        return False
     dep_modules = _BACKEND_DEP_MODULES.get(module_path, frozenset())
-    if not dep_modules:
-        return False
-    return (
-        missing_name in dep_modules
-        or missing_name.split(".", 1)[0] in dep_modules
+    return any(
+        _is_missing_optional_dependency(exc, dependency)
+        for dependency in dep_modules
     )
 
 

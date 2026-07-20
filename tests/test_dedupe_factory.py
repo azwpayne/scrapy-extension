@@ -6,6 +6,7 @@ import logging
 
 import pytest
 from scrapy.http import Request
+from scrapy.settings import Settings
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters import factory as factory_module
@@ -16,7 +17,10 @@ from scrapy_extension.dupefilter.filters.factory import (
   DedupeStrategy,
   build_membership_filter,
 )
-from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
+from scrapy_extension.dupefilter.filters.memory_filter import (
+  DEFAULT_MEMORY_MAXSIZE,
+  MemoryMembershipFilter,
+)
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import ConfigurationError
 
@@ -34,6 +38,7 @@ def _make_settings(mocker, overrides=None):
   mock_settings.get.side_effect = lambda k, default=None: base.get(k, default)
   mock_settings.getbool.side_effect = lambda k, default=False: base.get(k, default)
   mock_settings.getdict.return_value = {}
+  mock_settings.getpriority.side_effect = lambda k: 20 if k in base else None
   return mock_settings, mock_manager
 
 
@@ -52,6 +57,15 @@ class TestBuildMembershipFilter:
       DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
     )
     assert isinstance(flt, MemoryMembershipFilter)
+    assert flt._maxsize == 10
+
+  def test_memory_strategy_uses_default_cap_when_maxsize_is_omitted(
+    self, mock_connection_manager
+  ) -> None:
+    flt = build_membership_filter(DedupeStrategy.MEMORY, mock_connection_manager)
+
+    assert isinstance(flt, MemoryMembershipFilter)
+    assert flt._maxsize == DEFAULT_MEMORY_MAXSIZE
 
   def test_bloom_strategy(self, mock_connection_manager) -> None:
     flt = build_membership_filter(
@@ -97,6 +111,38 @@ class TestFromSettingsStrategyWiring:
     df = BackendDupeFilter.from_settings(settings)
     assert isinstance(df._filter, MemoryMembershipFilter)
 
+  def test_memory_strategy_uses_default_cap_when_maxsize_is_absent(
+    self, mocker
+  ) -> None:
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = Settings(
+      {"SCRAPY_BACKEND_TYPE": "redis", "SCRAPY_DEDUP_STRATEGY": "memory"}
+    )
+
+    df = BackendDupeFilter.from_settings(settings)
+
+    assert isinstance(df._filter, MemoryMembershipFilter)
+    assert df._filter._maxsize == DEFAULT_MEMORY_MAXSIZE
+
+  def test_memory_strategy_preserves_explicit_unbounded_opt_out(self, mocker) -> None:
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = Settings(
+      {
+        "SCRAPY_BACKEND_TYPE": "redis",
+        "SCRAPY_DEDUP_STRATEGY": "memory",
+        "SCRAPY_DEDUP_MEMORY_MAXSIZE": None,
+      }
+    )
+
+    df = BackendDupeFilter.from_settings(settings)
+
+    assert isinstance(df._filter, MemoryMembershipFilter)
+    assert df._filter._maxsize is None
+
   def test_bloom_strategy(self, mocker) -> None:
     settings, _ = _make_settings(
       mocker,
@@ -120,6 +166,40 @@ class TestFromSettingsStrategyWiring:
     )
     df = BackendDupeFilter.from_settings(settings)
     assert isinstance(df._filter, CuckooMembershipFilter)
+
+  @pytest.mark.parametrize("strategy", ["memory", "bloom", "cuckoo"])
+  def test_local_strategy_does_not_require_set_capable_backend(
+    self, mocker, strategy: str
+  ) -> None:
+    """Per-process filters may coexist with a queue-only global backend."""
+    from scrapy.settings import Settings
+
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = mocker.Mock()
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+    settings = Settings(
+      {
+        "SCRAPY_BACKEND_TYPE": "kafka",
+        "SCRAPY_DEDUP_STRATEGY": strategy,
+        "SCRAPY_DEDUP_BLOOM_CAPACITY": 100,
+        "SCRAPY_DEDUP_CUCKOO_CAPACITY": 100,
+      }
+    )
+
+    dupefilter = BackendDupeFilter.from_settings(settings)
+
+    assert not isinstance(dupefilter._filter, SetMembershipFilter)
+
+  def test_set_strategy_still_requires_set_capable_backend(self) -> None:
+    from scrapy.settings import Settings
+
+    settings = Settings(
+      {"SCRAPY_BACKEND_TYPE": "kafka", "SCRAPY_DEDUP_STRATEGY": "set"}
+    )
+
+    with pytest.raises(ConfigurationError, match="missing capabilities"):
+      BackendDupeFilter.from_settings(settings)
 
   def test_invalid_strategy_raises(self, mocker) -> None:
     """R-dedup-cfg: an invalid SCRAPY_DEDUP_STRATEGY raises ConfigurationError

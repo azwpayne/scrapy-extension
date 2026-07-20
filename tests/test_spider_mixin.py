@@ -1,6 +1,7 @@
 """Tests for BackendSpiderMixin."""
 
 import os
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -12,6 +13,27 @@ from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 
 # Redis password fixture - use env var to avoid S105 warnings
 REDIS_PASSWORD = os.environ.get("TEST_REDIS_PASSWORD", "test_password_placeholder")
+
+
+class _ObservedLock:
+  """RLock wrapper that exposes when a second lifecycle operation arrives."""
+
+  def __init__(self) -> None:
+    self._lock = threading.RLock()
+    self._counter_lock = threading.Lock()
+    self._attempts = 0
+    self.second_attempted = threading.Event()
+
+  def __enter__(self):
+    with self._counter_lock:
+      self._attempts += 1
+      if self._attempts == 2:
+        self.second_attempted.set()
+    self._lock.acquire()
+    return self
+
+  def __exit__(self, *_exc_info):
+    self._lock.release()
 
 
 class TestBackendSpiderMixinInit:
@@ -64,6 +86,73 @@ class TestBackendSpiderMixinInit:
     assert spider.name == "test_spider"
 
 
+class TestBackendSpiderMixinFromCrawler:
+  def test_configured_spider_sets_up_after_crawler_attachment(self, mocker):
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    acquire = mocker.patch.object(
+      ConnectionManager,
+      "get_manager",
+      return_value=manager,
+    )
+    crawler = mocker.MagicMock()
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider.from_crawler(crawler)
+
+    assert spider.crawler is crawler
+    assert spider._connection_manager is manager
+    acquire.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
+    crawler.signals.connect.assert_any_call(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    crawler.signals.connect.assert_any_call(
+      spider._on_spider_closed, signals.spider_closed
+    )
+
+  def test_early_setup_is_finalized_without_second_acquire(self, mocker):
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    acquire = mocker.patch.object(
+      ConnectionManager,
+      "get_manager",
+      return_value=manager,
+    )
+    crawler = mocker.MagicMock()
+
+    class EarlySetupSpider(BackendSpiderMixin, Spider):
+      name = "early_setup_spider"
+      backend_type = BackendType.REDIS
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.setup_backend()
+
+    spider = EarlySetupSpider.from_crawler(crawler)
+
+    assert spider._connection_manager is manager
+    acquire.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
+    crawler.signals.connect.assert_any_call(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    crawler.signals.connect.assert_any_call(
+      spider._on_spider_closed, signals.spider_closed
+    )
+
+  def test_unconfigured_spider_does_not_implicitly_acquire(self, mocker):
+    acquire = mocker.patch.object(ConnectionManager, "get_manager")
+    crawler = mocker.MagicMock()
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "plain_spider"
+
+    spider = TestSpider.from_crawler(crawler)
+
+    assert spider._connection_manager is None
+    acquire.assert_not_called()
+
+
 class TestSetupBackend:
   """Test setup_backend method."""
 
@@ -114,7 +203,7 @@ class TestSetupBackend:
     assert get_manager_spy.call_count == 1
 
   def test_setup_backend_is_idempotent(self, mocker):
-    """Repeated setup must not leak a manager acquire or duplicate signals."""
+    """Repeated setup must not leak a manager acquire."""
     mock_manager = mocker.MagicMock(spec=ConnectionManager)
     get_manager = mocker.patch.object(
       ConnectionManager, "get_manager", return_value=mock_manager
@@ -125,15 +214,162 @@ class TestSetupBackend:
       backend_type = BackendType.REDIS
 
     spider = TestSpider()
-    connect_signals = mocker.patch.object(spider, "_connect_signals")
-
     first = spider.setup_backend()
     second = spider.setup_backend()
 
     assert first is mock_manager
     assert second is mock_manager
     get_manager.assert_called_once()
-    connect_signals.assert_called_once()
+
+  def test_setup_backend_rolls_back_acquire_when_signal_wiring_fails(self, mocker):
+    """A half-wired spider must not retain a manager or stale signal handler."""
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    get_manager = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    signal_manager.connect.side_effect = [None, RuntimeError("closed signal bus")]
+    spider.crawler = mocker.MagicMock(signals=signal_manager)
+
+    with pytest.raises(RuntimeError, match="closed signal bus"):
+      spider.setup_backend()
+
+    get_manager.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
+    manager.close.assert_called_once_with()
+    signal_manager.disconnect.assert_any_call(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    assert spider._connection_manager is None
+    assert spider._signals_connected is False
+
+  def test_setup_backend_first_signal_failure_has_nothing_to_disconnect(self, mocker):
+    """Rollback touches only handlers whose connect call completed."""
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    signal_manager.connect.side_effect = RuntimeError("signal bus unavailable")
+    spider.crawler = mocker.MagicMock(signals=signal_manager)
+
+    with pytest.raises(RuntimeError, match="signal bus unavailable"):
+      spider.setup_backend()
+
+    signal_manager.disconnect.assert_not_called()
+    manager.close.assert_called_once_with()
+    assert spider._connection_manager is None
+    assert spider._connected_signals is None
+    assert spider._signals_connected is False
+
+  def test_concurrent_setup_acquires_manager_once(self, mocker):
+    """Concurrent setup calls pair with exactly one registry acquire."""
+    import threading
+
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+
+    def get_manager(**_kwargs):
+      factory_entered.set()
+      assert release_factory.wait(timeout=2.0)
+      return manager
+
+    acquire = mocker.patch.object(
+      ConnectionManager, "get_manager", side_effect=get_manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    results: list[ConnectionManager] = []
+    errors: list[BaseException] = []
+
+    def setup() -> None:
+      try:
+        results.append(spider.setup_backend())
+      except BaseException as exc:  # noqa: BLE001 - surface worker failure
+        errors.append(exc)
+
+    first = threading.Thread(target=setup, daemon=True)
+    second = threading.Thread(target=setup, daemon=True)
+    first.start()
+    assert factory_entered.wait(timeout=2.0)
+    second.start()
+    release_factory.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert errors == []
+    assert results == [manager, manager]
+    acquire.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
+
+  def test_setup_backend_connects_signals_after_crawler_is_attached(self, mocker):
+    """A later setup wires signals without acquiring the manager again."""
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+    get_manager = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=mock_manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    first = spider.setup_backend()
+
+    mock_crawler = mocker.MagicMock()
+    spider.crawler = mock_crawler
+    second = spider.setup_backend()
+    third = spider.setup_backend()
+
+    assert first is mock_manager
+    assert second is mock_manager
+    assert third is mock_manager
+    get_manager.assert_called_once()
+    assert mock_crawler.signals.connect.call_count == 2
+    mock_crawler.signals.connect.assert_any_call(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    mock_crawler.signals.connect.assert_any_call(
+      spider._on_spider_closed, signals.spider_closed
+    )
+
+  def test_setup_backend_moves_signals_to_replacement_crawler(self, mocker):
+    """Changing crawler without closing first must detach the old dispatcher."""
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    acquire = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    first_signals = mocker.MagicMock()
+    second_signals = mocker.MagicMock()
+    spider.crawler = mocker.MagicMock(signals=first_signals)
+    spider.setup_backend()
+
+    spider.crawler = mocker.MagicMock(signals=second_signals)
+    assert spider.setup_backend() is manager
+
+    acquire.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
+    assert first_signals.disconnect.call_count == 2
+    assert second_signals.connect.call_count == 2
+    assert spider._connected_signals is second_signals
 
   def test_setup_backend_shares_singleton_across_spiders(self):
     """2026-07-11 (§C intent, no mocks): two spiders with identical backend
@@ -875,6 +1111,17 @@ class TestGetDupefilter:
 
     assert result1 is result2
 
+  def test_mixin_dupefilter_borrows_manager(self, mocker):
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+    dupefilter = spider.get_dupefilter()
+
+    assert dupefilter._owns_connection_manager is False
+
 
 class TestGetScheduler:
   """Test get_scheduler method."""
@@ -915,6 +1162,137 @@ class TestGetScheduler:
     result2 = spider.get_scheduler()
 
     assert result1 is result2
+
+  def test_mixin_scheduler_borrows_manager(self, mocker):
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+    scheduler = spider.get_scheduler()
+
+    assert scheduler._owns_connection_manager is False
+
+
+class TestConcurrentComponentGetters:
+  """Each lazy component constructor is serialized with backend shutdown."""
+
+  @pytest.mark.parametrize(
+    ("getter_name", "constructor_path"),
+    (
+      ("get_queue", "scrapy_extension.queue.queue.BackendQueue"),
+      (
+        "get_dupefilter",
+        "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter",
+      ),
+      ("get_scheduler", "scrapy_extension.schedule.scheduler.BackendScheduler"),
+    ),
+  )
+  def test_concurrent_getter_constructs_component_once(
+    self,
+    mocker,
+    getter_name,
+    constructor_path,
+  ):
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+    observed_lock = _ObservedLock()
+    spider._lifecycle_lock = observed_lock
+    component = mocker.MagicMock()
+    constructor_entered = threading.Event()
+    release_constructor = threading.Event()
+
+    def construct(**_kwargs):
+      constructor_entered.set()
+      assert release_constructor.wait(timeout=2.0)
+      return component
+
+    constructor = mocker.patch(constructor_path, side_effect=construct)
+    results = []
+    errors: list[BaseException] = []
+
+    def get_component() -> None:
+      try:
+        results.append(getattr(spider, getter_name)())
+      except BaseException as exc:  # noqa: BLE001 - surface worker failure
+        errors.append(exc)
+
+    first = threading.Thread(target=get_component, daemon=True)
+    second = threading.Thread(target=get_component, daemon=True)
+    first.start()
+    assert constructor_entered.wait(timeout=2.0)
+    second.start()
+    assert observed_lock.second_attempted.wait(timeout=2.0)
+    release_constructor.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert errors == []
+    assert len(results) == 2
+    assert all(result is component for result in results)
+    constructor.assert_called_once()
+
+  def test_close_waits_for_inflight_getter_then_closes_component(self, mocker):
+    """A component cannot publish itself after its manager was released."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    component = mocker.MagicMock()
+    observed_lock = _ObservedLock()
+    constructor_entered = threading.Event()
+    release_constructor = threading.Event()
+    getter_finished = threading.Event()
+    close_finished = threading.Event()
+    errors: list[BaseException] = []
+    spider._connection_manager = manager
+    spider._lifecycle_lock = observed_lock
+
+    def construct(**_kwargs):
+      constructor_entered.set()
+      assert release_constructor.wait(timeout=2.0)
+      return component
+
+    mocker.patch("scrapy_extension.queue.queue.BackendQueue", side_effect=construct)
+
+    def get_queue() -> None:
+      try:
+        assert spider.get_queue() is component
+        getter_finished.set()
+      except BaseException as exc:  # noqa: BLE001 - surface worker failure
+        errors.append(exc)
+
+    def close() -> None:
+      try:
+        spider.close_backend()
+        close_finished.set()
+      except BaseException as exc:  # noqa: BLE001 - surface worker failure
+        errors.append(exc)
+
+    getter_thread = threading.Thread(target=get_queue, daemon=True)
+    close_thread = threading.Thread(target=close, daemon=True)
+    getter_thread.start()
+    assert constructor_entered.wait(timeout=2.0)
+    close_thread.start()
+    assert observed_lock.second_attempted.wait(timeout=2.0)
+    assert close_finished.is_set() is False
+    release_constructor.set()
+    getter_thread.join(timeout=2.0)
+    close_thread.join(timeout=2.0)
+
+    assert errors == []
+    assert getter_finished.is_set() is True
+    assert close_finished.is_set() is True
+    component.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+    assert spider._queue is None
+    assert spider._connection_manager is None
 
 
 class TestCloseBackend:
@@ -997,6 +1375,170 @@ class TestCloseBackend:
 
     # Should not raise
     spider.close_backend()
+
+  def test_close_backend_is_idempotent(self, mocker):
+    """Repeated close must release the acquired manager only once."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    mock_manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._connection_manager = mock_manager
+
+    spider.close_backend()
+    spider.close_backend()
+
+    mock_manager.close.assert_called_once()
+
+  def test_close_backend_closes_components_before_manager(self, mocker):
+    """Borrowing components quiesce while their shared manager is still live."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    call_order: list[str] = []
+    spider._queue = mocker.MagicMock()
+    spider._dupefilter = mocker.MagicMock()
+    spider._scheduler = mocker.MagicMock()
+    spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._queue.close.side_effect = lambda: call_order.append("queue")
+    spider._dupefilter.close.side_effect = lambda _reason: call_order.append("dupe")
+    spider._scheduler.close.side_effect = lambda _reason: call_order.append("scheduler")
+    spider._connection_manager.close.side_effect = lambda: call_order.append("manager")
+
+    spider.close_backend()
+
+    assert call_order == ["scheduler", "queue", "dupe", "manager"]
+
+  def test_close_backend_isolates_each_cleanup_failure(self, mocker, caplog):
+    """One failed cleanup must not skip any later component or manager."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    queue = mocker.MagicMock()
+    dupefilter = mocker.MagicMock()
+    scheduler = mocker.MagicMock()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._connected_signals = signal_manager
+    spider._signals_connected = True
+    spider._queue = queue
+    spider._dupefilter = dupefilter
+    spider._scheduler = scheduler
+    spider._connection_manager = manager
+    signal_manager.disconnect.side_effect = RuntimeError("disconnect failed")
+    queue.close.side_effect = RuntimeError("queue failed")
+    dupefilter.close.side_effect = RuntimeError("dupefilter failed")
+    scheduler.close.side_effect = RuntimeError("scheduler failed")
+    manager.close.side_effect = RuntimeError("manager failed")
+
+    spider.close_backend()
+
+    assert spider._connected_signals is None
+    assert spider._signals_connected is False
+    assert spider._queue is None
+    assert spider._dupefilter is None
+    assert spider._scheduler is None
+    assert spider._connection_manager is None
+    assert signal_manager.disconnect.call_count == 2
+    scheduler.close.assert_called_once_with("spider-mixin-close")
+    queue.close.assert_called_once_with()
+    dupefilter.close.assert_called_once_with("spider-mixin-close")
+    manager.close.assert_called_once_with()
+    assert caplog.text.count("Failed to disconnect backend lifecycle signal") == 2
+
+  def test_close_backend_reentrant_component_close_is_idempotent(self, mocker):
+    """A component close hook may safely trigger duplicate spider shutdown."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    scheduler = mocker.MagicMock()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._scheduler = scheduler
+    spider._connection_manager = manager
+    scheduler.close.side_effect = lambda _reason: spider.close_backend()
+    finished = threading.Event()
+
+    def close() -> None:
+      spider.close_backend()
+      finished.set()
+
+    thread = threading.Thread(target=close, daemon=True)
+    thread.start()
+    assert finished.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+
+    scheduler.close.assert_called_once_with("spider-mixin-close")
+    manager.close.assert_called_once_with()
+
+  def test_borrowed_components_do_not_release_manager(self, mocker):
+    """Only the mixin releases the acquire shared by its real components."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._connection_manager = manager
+    spider.get_dupefilter()
+    spider.get_scheduler()
+
+    spider.close_backend()
+
+    manager.close.assert_called_once_with()
+
+  def test_close_backend_disconnects_mixin_signals(self, mocker):
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    spider._connected_signals = signal_manager
+    spider._signals_connected = True
+
+    spider.close_backend()
+
+    signal_manager.disconnect.assert_any_call(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    signal_manager.disconnect.assert_any_call(
+      spider._on_spider_closed, signals.spider_closed
+    )
+    assert spider._connected_signals is None
+    assert spider._signals_connected is False
+
+  def test_close_then_setup_wires_replacement_crawler(self, mocker):
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    first_manager = mocker.MagicMock(spec=ConnectionManager)
+    second_manager = mocker.MagicMock(spec=ConnectionManager)
+    acquire = mocker.patch.object(
+      ConnectionManager,
+      "get_manager",
+      side_effect=[first_manager, second_manager],
+    )
+    first_signals = mocker.MagicMock()
+    second_signals = mocker.MagicMock()
+    spider = TestSpider()
+    spider.crawler = mocker.MagicMock(signals=first_signals)
+    spider.setup_backend()
+    spider.close_backend()
+
+    spider.crawler = mocker.MagicMock(signals=second_signals)
+    assert spider.setup_backend() is second_manager
+
+    assert acquire.call_count == 2
+    assert first_signals.connect.call_count == 2
+    assert first_signals.disconnect.call_count == 2
+    assert second_signals.connect.call_count == 2
 
 
 class TestConnectionManagerProperty:

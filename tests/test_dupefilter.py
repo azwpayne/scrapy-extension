@@ -1,12 +1,16 @@
 """Tests for BackendDupeFilter component."""
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from scrapy.http import Request
 
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
+from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 
 
 class TestBackendDupeFilterInit:
@@ -89,7 +93,7 @@ class TestBackendDupeFilterClassMethods:
     mock_settings.getbool.side_effect = lambda key, default=False: {
       "DUPEFILTER_DEBUG": True,
     }.get(key, default)
-    mock_settings.getdict.return_value = {"host": "localhost"}
+    mock_settings.getdict.return_value = {"uri": "mongodb://localhost:27017"}
 
     mock_manager = mocker.Mock()
     mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
@@ -211,6 +215,136 @@ class TestBackendDupeFilterOpenClose:
     dupefilter.close("finished")
 
     mock_connection_manager.close.assert_called_once_with()
+
+  def test_close_releases_connection_manager_only_once(self, mock_connection_manager):
+    """Duplicate close notifications must not over-release a shared manager."""
+    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+
+    dupefilter.close("finished")
+    dupefilter.close("duplicate")
+
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_duplicate_close_closes_membership_filter_once(
+    self, mock_connection_manager, mocker
+  ):
+    membership_filter = mocker.MagicMock()
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+
+    dupefilter.close("finished")
+    dupefilter.close("duplicate")
+
+    membership_filter.close.assert_called_once_with()
+
+  def test_duplicate_open_is_idempotent(self, mock_connection_manager, mocker):
+    membership_filter = mocker.MagicMock()
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+      clear_on_open=True,
+    )
+    spider = mocker.Mock(name="spider")
+    spider.name = "test_spider"
+
+    dupefilter.open(spider)
+    dupefilter.open(spider)
+
+    membership_filter.open.assert_called_once_with()
+    membership_filter.clear.assert_called_once_with()
+
+  def test_open_for_different_spider_is_rejected(
+    self, mock_connection_manager, mocker
+  ):
+    membership_filter = mocker.MagicMock()
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+    first = mocker.Mock(name="first")
+    first.name = "first"
+    second = mocker.Mock(name="second")
+    second.name = "second"
+    dupefilter.open(first)
+
+    with pytest.raises(RuntimeError, match="different spider"):
+      dupefilter.open(second)
+
+    membership_filter.open.assert_called_once_with()
+
+  def test_open_failure_closes_filter_and_manager(
+    self, mock_connection_manager, mocker
+  ):
+    membership_filter = mocker.MagicMock()
+    membership_filter.open.side_effect = RuntimeError("filter open failed")
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+
+    with pytest.raises(RuntimeError, match="filter open failed"):
+      dupefilter.open()
+
+    membership_filter.close.assert_called_once_with()
+    mock_connection_manager.close.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="closed"):
+      dupefilter.open()
+
+  @pytest.mark.parametrize("operation", ["open", "clear", "request_seen", "forget"])
+  def test_operations_after_close_are_rejected(
+    self, operation, mock_connection_manager
+  ):
+    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    dupefilter.close("finished")
+    request = Request("https://example.com")
+
+    with pytest.raises(RuntimeError, match="closed"):
+      if operation in {"request_seen", "forget"}:
+        getattr(dupefilter, operation)(request)
+      else:
+        getattr(dupefilter, operation)()
+
+  def test_filter_close_error_is_not_masked_by_manager_close_error(
+    self, mock_connection_manager, mocker
+  ):
+    membership_filter = mocker.MagicMock()
+    membership_filter.close.side_effect = RuntimeError("filter close failed")
+    mock_connection_manager.close.side_effect = ConnectionError(
+      "manager close failed"
+    )
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+
+    with pytest.raises(RuntimeError, match="filter close failed"):
+      dupefilter.close("finished")
+
+    membership_filter.close.assert_called_once_with()
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_from_crawler_rethreads_resolved_monitor_to_memory_filter(
+    self, mock_connection_manager, mocker
+  ):
+    from scrapy_extension.dupefilter.filters.memory_filter import (
+      MemoryMembershipFilter,
+    )
+
+    membership_filter = MemoryMembershipFilter(maxsize=1)
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+    mocker.patch.object(BackendDupeFilter, "from_settings", return_value=dupefilter)
+    crawler = mocker.MagicMock()
+    crawler.stats = mocker.MagicMock()
+    crawler.request_fingerprinter = None
+
+    resolved = BackendDupeFilter.from_crawler(crawler)
+
+    assert membership_filter._monitor is resolved._monitor
 
 
 class TestBackendDupeFilterLog:
@@ -358,6 +492,86 @@ class TestBackendDupeFilterRequestSeen:
     assert isinstance(fingerprint_bytes, bytes)
     # Fingerprint should be hex string encoded to bytes
     assert len(fingerprint_bytes) > 0
+
+
+class TestBackendDupeFilterForget:
+  """Compensate request_seen reservations when the later queue push fails."""
+
+  def test_removable_filter_forgets_reservation(self, mock_connection_manager):
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+    request = Request("https://example.com/removable")
+
+    assert dupefilter.request_seen(request) is False
+    assert len(membership_filter) == 1
+
+    dupefilter.forget(request)
+
+    assert len(membership_filter) == 0
+    assert dupefilter.request_seen(request) is False
+
+  def test_bloom_filter_grants_exactly_one_retry_allowance(
+    self, mock_connection_manager
+  ):
+    membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+    request = Request("https://example.com/bloom")
+
+    assert dupefilter.request_seen(request) is False
+    dupefilter.forget(request)
+
+    assert dupefilter.request_seen(request) is False
+    assert dupefilter.request_seen(request) is True
+
+  def test_retry_allowance_has_single_linearized_concurrent_consumer(
+    self, mock_connection_manager
+  ):
+    membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+    request = Request("https://example.com/concurrent-allowance")
+    assert dupefilter.request_seen(request) is False
+    dupefilter.forget(request)
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+
+    def request_seen_together() -> bool:
+      barrier.wait()
+      return dupefilter.request_seen(request)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+      results = list(executor.map(lambda _: request_seen_together(), range(worker_count)))
+
+    assert results.count(False) == 1
+    assert results.count(True) == worker_count - 1
+
+  def test_retry_allowances_evict_oldest_at_fixed_bound(
+    self, mock_connection_manager
+  ):
+    membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+    dupefilter._retry_allowance_limit = 2
+    requests = [Request(f"https://example.com/bounded/{i}") for i in range(3)]
+
+    for request in requests:
+      assert dupefilter.request_seen(request) is False
+      dupefilter.forget(request)
+
+    assert len(dupefilter._retry_allowances) == 2
+    assert dupefilter.request_seen(requests[0]) is True
+    assert dupefilter.request_seen(requests[1]) is False
+    assert dupefilter.request_seen(requests[2]) is False
 
 
 class TestBackendDupeFilterRequestFingerprint:

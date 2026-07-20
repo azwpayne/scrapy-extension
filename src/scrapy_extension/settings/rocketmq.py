@@ -31,7 +31,7 @@ class RocketMQSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SCRAPY_ROCKETMQ_",
         case_sensitive=False,
-        extra="ignore",
+        extra="forbid",
     )
 
     # === Mode Selection ===
@@ -53,6 +53,15 @@ class RocketMQSettings(BaseSettings):
     # === Queue/Priority Settings ===
     max_message_size: int = Field(default=1024 * 1024, ge=0)  # 1MB default
     send_timeout: int = Field(default=3000, ge=0)  # ms
+    invisible_duration: int = Field(
+        default=300,
+        ge=10,
+        le=12 * 60 * 60,
+        description=(
+            "Maximum message processing time in seconds before RocketMQ "
+            "makes an unacked delivery available for retry"
+        ),
+    )
 
     # === Topic Settings ===
     topic_prefix: str = Field(default="scrapy-queue")

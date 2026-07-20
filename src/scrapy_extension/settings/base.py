@@ -32,7 +32,7 @@ class Settings(BaseSettings):
   model_config = SettingsConfigDict(
     env_prefix="SCRAPY_",
     case_sensitive=False,
-    extra="ignore",
+    extra="forbid",
   )
 
   backend_type: BackendType | str = Field(

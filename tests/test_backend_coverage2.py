@@ -46,7 +46,6 @@ from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
 from scrapy_extension.backends.pulsar import PulsarBackend  # noqa: E402
 from scrapy_extension.backends.sqs import SqsBackend  # noqa: E402
 from scrapy_extension.exceptions import (  # noqa: E402
-  BackendConnectionError,
   ConfigurationError,
   QueueError,
 )
@@ -68,19 +67,19 @@ class TestInvalidModeGuards:
   def test_dynamodb_invalid_mode(self) -> None:
     b = DynamoDBBackend(DynamoDBSettings())
     b.config.mode = "bogus"  # type: ignore[assignment]
-    with pytest.raises(BackendConnectionError):
+    with pytest.raises(ConfigurationError):
       b.connect()
 
   def test_memcached_invalid_mode(self) -> None:
     b = MemcachedBackend(MemcachedSettings())
     b.config.mode = "bogus"  # type: ignore[assignment]
-    with pytest.raises(BackendConnectionError):
+    with pytest.raises(ConfigurationError):
       b.connect()
 
   def test_sqs_invalid_mode(self) -> None:
     b = SqsBackend(SqsSettings())
     b.config.mode = "bogus"  # type: ignore[assignment]
-    with pytest.raises(BackendConnectionError):
+    with pytest.raises(ConfigurationError):
       b.connect()
 
 
@@ -122,6 +121,7 @@ class TestPulsarRemaining:
     b.disconnect()
     producer.close.assert_called_once()
 
-  def test_queue_len_returns_zero(self, mocker) -> None:
+  def test_queue_len_reports_unsupported(self, mocker) -> None:
     b, _ = _pulsar(mocker)
-    assert b.queue_len("q") == 0
+    with pytest.raises(NotImplementedError, match="admin API"):
+      b.queue_len("q")

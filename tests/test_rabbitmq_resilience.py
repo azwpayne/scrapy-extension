@@ -18,6 +18,7 @@ from pika.exceptions import AMQPError
 from scrapy_extension.backends.rabbitmq import (
   _MAX_IN_FLIGHT,
   RabbitMQBackend,
+  _RabbitMQAckToken,
 )
 from scrapy_extension.exceptions import QueueError
 from scrapy_extension.settings import RabbitMQSettings
@@ -26,6 +27,19 @@ from scrapy_extension.settings import RabbitMQSettings
 def _backend() -> RabbitMQBackend:
   """Constructed-but-not-connected backend (channel / connection are None)."""
   return RabbitMQBackend(RabbitMQSettings())
+
+
+def _connected_backend() -> tuple[RabbitMQBackend, MagicMock]:
+  """Construct a backend with one active mock channel generation."""
+  backend = _backend()
+  channel = MagicMock(name="channel")
+  backend._activate_channel(MagicMock(name="connection"), channel)
+  return backend, channel
+
+
+def _token(backend: RabbitMQBackend, delivery_tag: int) -> _RabbitMQAckToken:
+  """Build a token belonging to ``backend``'s current channel generation."""
+  return _RabbitMQAckToken(delivery_tag, backend._channel_generation)
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +99,12 @@ def test_track_in_flight_warns_once_on_overflow(caplog) -> None:
   unaffected."""
   backend = _backend()
   for i in range(_MAX_IN_FLIGHT):
-    backend._track_in_flight(i)
+    backend._track_in_flight(_token(backend, i))
   assert len(backend._in_flight_tags) == _MAX_IN_FLIGHT
 
   with caplog.at_level(logging.WARNING):
-    backend._track_in_flight(_MAX_IN_FLIGHT + 1)
-    backend._track_in_flight(_MAX_IN_FLIGHT + 2)
+    backend._track_in_flight(_token(backend, _MAX_IN_FLIGHT + 1))
+    backend._track_in_flight(_token(backend, _MAX_IN_FLIGHT + 2))
 
   overflow_warnings = [r for r in caplog.records if "at cap" in r.message]
   assert len(overflow_warnings) == 1  # warn-once
@@ -109,18 +123,17 @@ def test_ack_with_token_is_noop_when_channel_is_none() -> None:
   ``AttributeError``-ing on ``None.basic_ack()``."""
   backend = _backend()
   backend._channel = None
-  backend.ack("q", token=5)  # must not raise
+  backend.ack("q", token=_token(backend, 5))  # must not raise
 
 
 def test_ack_with_token_raises_on_amqp_error() -> None:
   """Lines 675-677: a ``basic_ack`` AMQP failure surfaces as a QueueError —
   the caller must see the ack failure (at-least-once redelivery follows
   from the broker's visibility-timeout, not a silent swallow)."""
-  backend = _backend()
-  backend._channel = MagicMock()
-  backend._channel.basic_ack.side_effect = AMQPError("ack boom")
+  backend, channel = _connected_backend()
+  channel.basic_ack.side_effect = AMQPError("ack boom")
   with pytest.raises(QueueError, match="Failed to ack RabbitMQ message"):
-    backend.ack("q", token=5)
+    backend.ack("q", token=_token(backend, 5))
 
 
 # ---------------------------------------------------------------------------
@@ -134,27 +147,25 @@ def test_nack_with_token_is_noop_when_channel_is_none() -> None:
   broker re-delivers on visibility-timeout regardless (at-least-once)."""
   backend = _backend()
   backend._channel = None
-  backend.nack("q", token=5)  # must not raise
+  backend.nack("q", token=_token(backend, 5))  # must not raise
 
 
 def test_nack_with_token_raises_on_amqp_error() -> None:
   """Lines 715-717: a ``basic_nack`` AMQP failure surfaces as a QueueError
   (operation='nack') — matches ack's raise-on-failure contract."""
-  backend = _backend()
-  backend._channel = MagicMock()
-  backend._channel.basic_nack.side_effect = AMQPError("nack boom")
+  backend, channel = _connected_backend()
+  channel.basic_nack.side_effect = AMQPError("nack boom")
   with pytest.raises(QueueError, match="Failed to nack RabbitMQ message"):
-    backend.nack("q", token=5)
+    backend.nack("q", token=_token(backend, 5))
 
 
 def test_nack_with_token_clears_matching_last_delivery_tag() -> None:
   """Line 720->722 (true branch): nack(token=...) clears ``_last_delivery_tag``
   when it matches the token — keeps the legacy single-pop slot coherent
   with the per-message token path (single-process sanity)."""
-  backend = _backend()
-  backend._channel = MagicMock()
+  backend, _channel = _connected_backend()
   backend._last_delivery_tag = 5
-  backend.nack("q", token=5)
+  backend.nack("q", token=_token(backend, 5))
   assert backend._last_delivery_tag is None
 
 
@@ -188,11 +199,86 @@ def test_nack_with_token_keeps_nonmatching_last_delivery_tag() -> None:
   points at a DIFFERENT tag leaves it intact — only the matching case clears
   the legacy slot (the token path and legacy path are independent except
   for the single-process coherence optimization)."""
-  backend = _backend()
-  backend._channel = MagicMock()
+  backend, _channel = _connected_backend()
   backend._last_delivery_tag = 99  # different from the token below
-  backend.nack("q", token=5)
+  backend.nack("q", token=_token(backend, 5))
   assert backend._last_delivery_tag == 99  # unchanged
+
+
+def test_ack_token_identity_includes_channel_generation() -> None:
+  """The same numeric tag in two channel generations is not the same token."""
+  old = _RabbitMQAckToken(delivery_tag=1, channel_generation=3)
+  same = _RabbitMQAckToken(delivery_tag=1, channel_generation=3)
+  reconnected = _RabbitMQAckToken(delivery_tag=1, channel_generation=4)
+
+  assert old == same
+  assert hash(old) == hash(same)
+  assert old != reconnected
+  assert old != 1
+
+
+def test_raw_delivery_tag_token_is_safely_ignored() -> None:
+  """A bare int has no channel identity and must never reach the broker."""
+  backend, channel = _connected_backend()
+
+  backend.ack("q", token=1)
+  backend.nack("q", token=1)
+
+  channel.basic_ack.assert_not_called()
+  channel.basic_nack.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("operation", "channel_method"),
+  [("ack", "basic_ack"), ("nack", "basic_nack")],
+)
+def test_stale_token_cannot_ack_same_delivery_tag_after_reconnect(
+  mocker, operation: str, channel_method: str
+) -> None:
+  """Delivery tags are channel-scoped and restart on a fresh channel.
+
+  A completion from the previous channel must never acknowledge the new
+  channel's message when both deliveries happen to have the same numeric tag.
+  The current-generation token must remain usable after the stale completion.
+  """
+  old_connection = MagicMock(name="old_connection")
+  old_channel = MagicMock(name="old_channel")
+  old_connection.channel.return_value = old_channel
+  old_channel.basic_get.return_value = (
+    MagicMock(delivery_tag=1),
+    None,
+    b"old-body",
+  )
+  new_connection = MagicMock(name="new_connection")
+  new_channel = MagicMock(name="new_channel")
+  new_connection.channel.return_value = new_channel
+  new_channel.basic_get.return_value = (
+    MagicMock(delivery_tag=1),
+    None,
+    b"new-body",
+  )
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    side_effect=[old_connection, new_connection],
+  )
+
+  backend = _backend()
+  backend.connect()
+  _old_body, stale_token = backend.pop_with_ack("q")
+  backend.disconnect()
+  backend.connect()
+  _new_body, current_token = backend.pop_with_ack("q")
+
+  getattr(backend, operation)("q", token=stale_token)
+
+  channel_call = getattr(new_channel, channel_method)
+  channel_call.assert_not_called()
+
+  getattr(backend, operation)("q", token=current_token)
+  if operation == "ack":
+    channel_call.assert_called_once_with(delivery_tag=1, multiple=False)
+  else:
+    channel_call.assert_called_once_with(delivery_tag=1, requeue=True)
 
 
 # ---------------------------------------------------------------------------

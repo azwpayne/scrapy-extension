@@ -342,14 +342,13 @@ class TestMongoDBModeConditional:
     )
     assert s.replica_set_name == "rs0"
 
-  def test_atlas_requires_srv_uri_or_cluster_name(self) -> None:
-    """ATLAS mode with plain ``mongodb://`` URI and no ``atlas_cluster_name``
-    must fail fast — Atlas resolves brokers via DNS SRV (``+srv``)."""
+  def test_atlas_requires_srv_uri(self) -> None:
+    """ATLAS mode requires the SRV URI consumed verbatim by the backend."""
     with pytest.raises(ConfigurationError) as exc_info:
       MongoDBSettings(
         mode=MongoDBMode.ATLAS, uri="mongodb://localhost:27017"
       )
-    assert exc_info.value.setting_name == "atlas_cluster_name"
+    assert exc_info.value.setting_name == "uri"
 
   def test_atlas_accepts_srv_uri(self) -> None:
     """ATLAS mode + ``mongodb+srv://`` URI is valid."""

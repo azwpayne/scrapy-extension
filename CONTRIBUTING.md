@@ -10,7 +10,7 @@ This project uses [uv](https://docs.astral.sh/uv/) for environment and
 dependency management.
 
 ```bash
-uv sync --group test      # runtime + test deps (creates .venv)
+uv sync --locked --group test  # exact locked runtime + test deps (creates .venv)
 ```
 
 Python 3.10+ (`requires-python = ">=3.10"`). The CI matrix tests 3.10–3.14.
@@ -96,12 +96,14 @@ uv build                 # sdist + wheel → dist/
 ## CI
 
 `.github/workflows/ci.yml` runs the unit suite across Python 3.10–3.14 on every
-push/PR and runs strict mypy, Bandit, plus branch coverage on the minimum
-supported Python lane. A separate integration job starts Redis,
-MongoDB, ElasticSearch, RabbitMQ, Kafka, and RocketMQ, then exercises their
-live-service suites with localhost sockets explicitly allowed. RocketMQ uses
-the pure-Python Apache gRPC client and requires the broker proxy endpoint
-(usually `localhost:8081`), not the legacy NameServer-only port.
+push/PR. Every lane syncs the locked environment against its declared Python
+minor and asserts that interpreter before testing. The minimum supported lane
+also runs strict mypy, Bandit, branch coverage, and an sdist/wheel installation
+smoke test. A separate Python 3.12 integration job starts Redis, MongoDB,
+ElasticSearch, RabbitMQ, Kafka, and RocketMQ, then exercises their live-service
+suites with localhost sockets explicitly allowed. RocketMQ uses the pure-Python
+Apache gRPC client and requires the broker proxy endpoint (usually
+`localhost:8081`), not the legacy NameServer-only port.
 
 ## Architecture & rationale
 

@@ -18,12 +18,17 @@ from __future__ import annotations
 
 __all__ = ["ThrottleQueueStrategy"]
 
+import math
+import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.exceptions import ConfigurationError
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.base import (
+  QueueStrategy,
+  normalize_queue_timeout,
+)
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -53,6 +58,7 @@ class ThrottleQueueStrategy(QueueStrategy):
       _min_interval: Minimum seconds between successful pops.
       _clock: Monotonic clock callable (injectable for tests).
       _last_pop: Timestamp of the last successful pop, or None.
+      _gate_lock: Serializes the positive-interval check/pop/commit transaction.
   """
 
   def __init__(
@@ -71,14 +77,22 @@ class ThrottleQueueStrategy(QueueStrategy):
             the ceiling are rejected as ``ConfigurationError`` — a
             pathologically large value (e.g. ``1e9``) would make the queue
             look permanently empty for the process lifetime (R14-F: soft
-            DoS via misconfig). Negative values raise ``ValueError``.
+            DoS via misconfig). Negative and NaN values raise ``ValueError``.
         clock: Monotonic clock callable returning seconds (injectable for tests).
 
     Raises:
-        ValueError: If min_interval is negative.
+        ValueError: If min_interval is negative or NaN.
         ConfigurationError: If min_interval exceeds the documented ceiling.
     """
     super().__init__(connection_manager)
+    if isinstance(min_interval, bool) or not isinstance(min_interval, (int, float)):
+      raise ValueError(f"min_interval must be finite, got {min_interval!r}")
+    try:
+      min_interval = float(min_interval)
+    except (OverflowError, TypeError, ValueError) as e:
+      raise ValueError(f"min_interval must be finite, got {min_interval!r}") from e
+    if not math.isfinite(min_interval):
+      raise ValueError(f"min_interval must be finite, got {min_interval}")
     if min_interval < 0:
       raise ValueError(f"min_interval must be >= 0, got {min_interval}")
     # R14-F MED: bound min_interval — a value of e.g. 1e9 makes the queue
@@ -96,6 +110,7 @@ class ThrottleQueueStrategy(QueueStrategy):
     self._min_interval = min_interval
     self._clock = clock
     self._last_pop: float | None = None
+    self._gate_lock = threading.Lock()
 
   def push(
     self,
@@ -128,13 +143,18 @@ class ThrottleQueueStrategy(QueueStrategy):
     Returns:
         The next item, or None if throttled or empty.
     """
-    now = self._clock()
-    if self._last_pop is not None and (now - self._last_pop) < self._min_interval:
-      return None
-    item = self._connection_manager.get_queue_backend().pop(queue_name, timeout)
-    if item is not None:
-      self._last_pop = now
-    return item
+    timeout = normalize_queue_timeout(timeout)
+    backend = self._connection_manager.get_queue_backend()
+    if self._min_interval == 0:
+      return backend.pop(queue_name, timeout)
+    with self._gate_lock:
+      now = self._clock()
+      if self._last_pop is not None and (now - self._last_pop) < self._min_interval:
+        return None
+      item = backend.pop(queue_name, timeout)
+      if item is not None:
+        self._last_pop = self._clock()
+      return item
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
@@ -148,13 +168,17 @@ class ThrottleQueueStrategy(QueueStrategy):
     deferred-ack token instead of silently falling back to atomic ``pop()``
     (pre-fix the inherited base default dropped the token).
     """
-    now = self._clock()
-    if self._last_pop is not None and (now - self._last_pop) < self._min_interval:
-      return (None, None)
-    data, token = self._pop_backend_with_ack(queue_name, timeout)
-    if data is not None:
-      self._last_pop = now
-    return data, token
+    timeout = normalize_queue_timeout(timeout)
+    if self._min_interval == 0:
+      return self._pop_backend_with_ack(queue_name, timeout)
+    with self._gate_lock:
+      now = self._clock()
+      if self._last_pop is not None and (now - self._last_pop) < self._min_interval:
+        return (None, None)
+      data, token = self._pop_backend_with_ack(queue_name, timeout)
+      if data is not None:
+        self._last_pop = self._clock()
+      return data, token
 
   def queue_len(self, queue_name: str) -> int:
     """Return the backend queue length.
@@ -173,5 +197,6 @@ class ThrottleQueueStrategy(QueueStrategy):
     Args:
         queue_name: The queue name.
     """
-    self._connection_manager.get_queue_backend().clear_queue(queue_name)
-    self._last_pop = None
+    with self._gate_lock:
+      self._connection_manager.get_queue_backend().clear_queue(queue_name)
+      self._last_pop = None

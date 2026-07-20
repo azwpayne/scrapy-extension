@@ -8,13 +8,35 @@ without changing the backend interface or the request-serialization layer.
 
 from __future__ import annotations
 
-__all__ = ["QueueStrategy"]
+__all__ = ["QueueStrategy", "normalize_queue_timeout"]
 
+import math
+import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
+
+
+def normalize_queue_timeout(timeout: float) -> float:
+  """Return a finite non-negative queue timeout.
+
+  A non-finite timeout is not merely malformed input for polling backends:
+  Redis' deadline loop never expires for ``NaN`` or ``inf``. Keep one strict
+  contract for every strategy before any backend is touched.
+  """
+  if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+    raise ValueError(f"timeout must be a finite non-negative number, got {timeout!r}")
+  try:
+    normalized = float(timeout)
+  except (OverflowError, TypeError, ValueError) as e:
+    raise ValueError(
+      f"timeout must be a finite non-negative number, got {timeout!r}"
+    ) from e
+  if not math.isfinite(normalized) or normalized < 0:
+    raise ValueError(f"timeout must be a finite non-negative number, got {timeout!r}")
+  return normalized
 
 
 class QueueStrategy(ABC):
@@ -36,6 +58,29 @@ class QueueStrategy(ABC):
         connection_manager: Connection manager providing the backends.
     """
     self._connection_manager = connection_manager
+    self._queue_binding_lock = threading.Lock()
+    self._bound_queue_name: str | None = None
+
+  def bind(self, queue_name: str) -> None:  # noqa: B027
+    """Bind a strategy to its owning logical queue when it requires one.
+
+    Backend-delegating strategies remain shareable and use the default no-op.
+    In-process strategies override this hook with
+    :meth:`_bind_single_queue`, preventing state restored under one snapshot
+    key from being popped through another logical queue.
+    """
+
+  def _bind_single_queue(self, queue_name: str) -> None:
+    """Bind in-process state to exactly one logical queue name."""
+    with self._queue_binding_lock:
+      if self._bound_queue_name is None:
+        self._bound_queue_name = queue_name
+        return
+      if self._bound_queue_name != queue_name:
+        raise ValueError(
+          f"{type(self).__name__} is already bound to logical queue "
+          f"{self._bound_queue_name!r}; cannot reuse it for {queue_name!r}"
+        )
 
   @abstractmethod
   def push(
@@ -148,6 +193,15 @@ class QueueStrategy(ABC):
 
   def open(self) -> None:  # noqa: B027
     """Lifecycle hook — prepare the strategy. Default no-op."""
+
+  def begin_close(self) -> None:  # noqa: B027
+    """Stop blocking operations without destroying snapshot state.
+
+    Called after the owning queue stops admitting new operations but before it
+    waits for already-admitted operations to finish. Strategies with blocking
+    operations may override this hook to wake them. Destructive cleanup belongs
+    in :meth:`close`, which runs only after the final snapshot is persisted.
+    """
 
   def close(self) -> None:  # noqa: B027
     """Lifecycle hook — release resources. Default no-op."""

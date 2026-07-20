@@ -21,6 +21,9 @@ mid-run crash still loses what's in-flight. Documented.
 
 Thread-safe via a single :class:`threading.Lock` (the ``block`` policy uses a
 :class:`threading.Condition` so blocked pushers wake when a pop frees a slot).
+Closing the strategy rejects new pushes and wakes blocked pushers with a
+:class:`~scrapy_extension.exceptions.QueueError`. An explicit ``open()``
+starts a new lifecycle without admitting pushers blocked in the prior one.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ __all__ = [
 ]
 
 import base64
+import binascii
 import json
 import logging
 import threading
@@ -39,7 +43,10 @@ from collections import deque
 from typing import TYPE_CHECKING, Literal
 
 from scrapy_extension.exceptions import QueueError
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.base import (
+  QueueStrategy,
+  normalize_queue_timeout,
+)
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
@@ -67,6 +74,8 @@ class RingBufferQueueStrategy(QueueStrategy):
       _full_policy: Overflow behavior (reject / drop_oldest / block).
       _buffer: :class:`collections.deque` of buffered item bytes (FIFO).
       _dropped: Count of items dropped by ``drop_oldest`` overflows.
+      _closed: Whether the strategy has stopped accepting pushes.
+      _generation: Monotonic lifecycle epoch used to reject stale pushers.
       _lock: Thread-safety lock.
       _not_full: Condition signaled by ``pop`` to wake blocked ``push`` calls.
   """
@@ -90,12 +99,12 @@ class RingBufferQueueStrategy(QueueStrategy):
             for a pop to free a slot).
 
     Raises:
-        ValueError: If ``capacity < 1`` or ``full_policy`` is not one of the
-            allowed values.
+        ValueError: If ``capacity`` is not a positive integer or ``full_policy``
+            is not one of the allowed values.
     """
     super().__init__(connection_manager)
-    if capacity < 1:
-      raise ValueError(f"capacity must be >= 1, got {capacity}")
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+      raise ValueError(f"capacity must be >= 1 (positive integer), got {capacity!r}")
     if full_policy not in ("reject", "drop_oldest", "block"):
       raise ValueError(
         f"full_policy must be one of 'reject', 'drop_oldest', 'block'; got {full_policy!r}"
@@ -104,8 +113,14 @@ class RingBufferQueueStrategy(QueueStrategy):
     self._full_policy = full_policy
     self._buffer: deque[bytes] = deque()
     self._dropped = 0
+    self._closed = False
+    self._generation = 0
     self._lock = threading.Lock()
     self._not_full = threading.Condition(self._lock)
+
+  def bind(self, queue_name: str) -> None:
+    """Bind this in-process buffer to one logical queue."""
+    self._bind_single_queue(queue_name)
 
   # ------------------------------------------------------------------ push
 
@@ -129,14 +144,28 @@ class RingBufferQueueStrategy(QueueStrategy):
         source: Ignored.
 
     Raises:
-        QueueError: If ``full_policy='reject'`` and the buffer is full.
+        QueueError: If the strategy is closed, or if
+            ``full_policy='reject'`` and the buffer is full.
     """
-    del queue_name, priority, delay, source
+    self.bind(queue_name)
+    del priority, delay, source
     with self._not_full:
-      while len(self._buffer) >= self._capacity:
+      generation = self._generation
+      while True:
+        if self._closed or generation != self._generation:
+          raise QueueError(
+            "ring buffer lifecycle closed; push rejected",
+            queue_name=queue_name,
+            operation="push",
+          )
+        if len(self._buffer) < self._capacity:
+          self._buffer.append(item)
+          return
         if self._full_policy == "reject":
           raise QueueError(
-            f"ring buffer full (capacity={self._capacity}, full_policy=reject)"
+            f"ring buffer full (capacity={self._capacity}, full_policy=reject)",
+            queue_name=queue_name,
+            operation="push",
           )
         if self._full_policy == "drop_oldest":
           self._buffer.popleft()
@@ -144,9 +173,8 @@ class RingBufferQueueStrategy(QueueStrategy):
           self._buffer.append(item)
           return
         # block — wait for a pop to free a slot. Loop re-checks capacity
-        # against spurious wakeups and concurrent pushes.
+        # and closed state against spurious wakeups and concurrent pushes.
         self._not_full.wait()
-      self._buffer.append(item)
 
   # ------------------------------------------------------------------ pop
 
@@ -161,7 +189,9 @@ class RingBufferQueueStrategy(QueueStrategy):
     Returns:
         The oldest buffered item, or None if empty.
     """
-    del queue_name, timeout
+    timeout = normalize_queue_timeout(timeout)
+    self.bind(queue_name)
+    del timeout
     with self._not_full:
       if not self._buffer:
         return None
@@ -174,21 +204,33 @@ class RingBufferQueueStrategy(QueueStrategy):
 
   def queue_len(self, queue_name: str) -> int:
     """Buffer size (backend is unused)."""
-    del queue_name
+    self.bind(queue_name)
     with self._lock:
       return len(self._buffer)
 
   def clear(self, queue_name: str) -> None:
     """Empty the buffer; wake all blocked pushers (slots are now free)."""
-    del queue_name
+    self.bind(queue_name)
     with self._not_full:
       self._buffer.clear()
       self._not_full.notify_all()
 
-  def close(self) -> None:
-    """Wake any blocked pushers so they don't outlive the strategy."""
+  def open(self) -> None:
+    """Start a new push lifecycle after :meth:`close`."""
     with self._not_full:
+      if self._closed:
+        self._generation += 1
+        self._closed = False
+
+  def begin_close(self) -> None:
+    """Stop accepting pushes and wake blocked pushers without clearing state."""
+    with self._not_full:
+      self._closed = True
       self._not_full.notify_all()
+
+  def close(self) -> None:
+    """Stop accepting pushes and wake blocked pushers with ``QueueError``."""
+    self.begin_close()
 
   # ------------------------------------------------------------------ snapshot/restore
 
@@ -202,9 +244,7 @@ class RingBufferQueueStrategy(QueueStrategy):
     with self._lock:
       if not self._buffer and self._dropped == 0:
         return None
-      items = [
-        base64.b64encode(item).decode("ascii") for item in self._buffer
-      ]
+      items = [base64.b64encode(item).decode("ascii") for item in self._buffer]
       return json.dumps(
         {
           "version": 1,
@@ -231,7 +271,8 @@ class RingBufferQueueStrategy(QueueStrategy):
       data = json.loads(state.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
       logger.warning(
-        "RingBufferQueueStrategy restore: corrupt snapshot (%s); starting clean.", e
+        "RingBufferQueueStrategy restore: corrupt snapshot (%s); starting clean.",
+        e,
       )
       return
     if (
@@ -252,8 +293,8 @@ class RingBufferQueueStrategy(QueueStrategy):
     decoded: list[bytes] = []
     for entry in raw_items:
       try:
-        decoded.append(base64.b64decode(entry))
-      except (TypeError, ValueError) as e:
+        decoded.append(base64.b64decode(entry, validate=True))
+      except (binascii.Error, TypeError, ValueError) as e:
         logger.warning(
           "RingBufferQueueStrategy restore: skipping malformed item (%s).", e
         )
@@ -276,6 +317,10 @@ class RingBufferQueueStrategy(QueueStrategy):
       snapshot_dropped = data.get("dropped", 0)
       if isinstance(snapshot_dropped, int):
         self._dropped = snapshot_dropped
+      # Replacing a previously full buffer may have created free slots. The
+      # notification must happen while holding the condition lock so waiting
+      # pushers cannot miss the state transition.
+      self._not_full.notify_all()
       if decoded:
         logger.info(
           "RingBufferQueueStrategy restore: recovered %d item(s) from snapshot.",

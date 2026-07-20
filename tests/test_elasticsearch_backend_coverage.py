@@ -92,6 +92,23 @@ class TestBuildKwargs:
 class TestConnect:
   """Test connect method exception handling."""
 
+  def test_connect_rejects_false_ping_and_discards_client(self, mocker):
+    """A false health probe must not leave a reusable half-connection."""
+    mock_client = mocker.MagicMock()
+    mock_client.ping.return_value = False
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
+    )
+
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    with pytest.raises(BackendConnectionError):
+      backend.connect()
+
+    assert backend._client is None
+    mock_client.indices.create.assert_not_called()
+    mock_client.close.assert_called_once()
+
   def test_connect_transport_error(self, mocker):
     """Test TransportError during connect raises BackendConnectionError."""
     mock_client = mocker.MagicMock()
@@ -106,6 +123,8 @@ class TestConnect:
       backend.connect()
     assert "elasticsearch" in str(exc_info.value).lower()
     assert "Connection failed" in str(exc_info.value)
+    assert backend._client is None
+    mock_client.close.assert_called_once()
 
 
 class TestIsConnected:
@@ -242,8 +261,9 @@ class TestContains:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(TransportError, match="Exists failed"):
+    with pytest.raises(BackendConnectionError, match="Exists failed") as exc_info:
       backend.contains("s", b"item")
+    assert isinstance(exc_info.value.__cause__, TransportError)
 
 
 class TestRetrieve:

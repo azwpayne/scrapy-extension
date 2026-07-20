@@ -31,7 +31,7 @@ class MemcachedSettings(BaseSettings):
   """
 
   model_config = SettingsConfigDict(
-    env_prefix="SCRAPY_MEMCACHED_", case_sensitive=False, extra="ignore"
+    env_prefix="SCRAPY_MEMCACHED_", case_sensitive=False, extra="forbid"
   )
 
   mode: MemcachedMode = Field(
@@ -48,4 +48,11 @@ class MemcachedSettings(BaseSettings):
     ge=1,
     le=65535,
     description="Memcached port",
+  )
+  allow_flush_all: bool = Field(
+    default=False,
+    description=(
+      "Permit clear_storage(None) to issue server-wide flush_all. Disabled by "
+      "default because Memcached cannot scope deletion to this application."
+    ),
   )

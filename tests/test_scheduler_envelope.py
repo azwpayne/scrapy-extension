@@ -20,10 +20,11 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from scrapy import Request, Spider
 
 from scrapy_extension.exceptions import BackendError, QueueError, SerializationError
-from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.queue import BACKEND_ACK_TOKEN_META_KEY, BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -128,8 +129,8 @@ class TestQueueKeySpiderTemplating:
     assert isinstance(scheduler._queue, BackendQueue)
     assert scheduler._queue.queue_name == "q:foo"
 
-  def test_default_queue_key_unchanged(self) -> None:
-    """Default 'scheduler:queue' (no template token) -> unchanged at open()."""
+  def test_default_queue_key_is_backend_neutral(self) -> None:
+    """The default key must also be valid as an MQ topic/queue name."""
     manager = MagicMock(name="ConnectionManager")
     manager.get_queue_backend.return_value = MagicMock(name="QueueBackend")
 
@@ -139,7 +140,7 @@ class TestQueueKeySpiderTemplating:
     scheduler.open(spider)
 
     assert isinstance(scheduler._queue, BackendQueue)
-    assert scheduler._queue.queue_name == "scheduler:queue"
+    assert scheduler._queue.queue_name == "scheduler-queue"
 
   def test_queue_key_attribute_unchanged_when_no_template(self) -> None:
     """Without {spider}, the public queue_key attr stays the literal string."""
@@ -170,6 +171,32 @@ class TestQueueKeySpiderTemplating:
     scheduler.open(spider)
     # Public attr reflects substituted key (post-open).
     assert scheduler.queue_key == "q:foo"
+
+  def test_template_scheduler_rejects_reopen_after_close(self) -> None:
+    """Template resolution cannot revive a scheduler with a retired manager."""
+    manager = MagicMock(name="ConnectionManager")
+    manager.get_queue_backend.return_value = MagicMock(name="QueueBackend")
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      queue_key="q:{spider}",
+    )
+    first_spider = MagicMock(name="FirstSpider")
+    first_spider.name = "spider_one"
+    first_spider.crawler = None
+    second_spider = MagicMock(name="SecondSpider")
+    second_spider.name = "spider_two"
+    second_spider.crawler = None
+
+    scheduler.open(first_spider)
+    assert scheduler._queue is not None
+    assert scheduler._queue.queue_name == "q:spider_one"
+    scheduler.close("first-finished")
+
+    with pytest.raises(RuntimeError, match="closed"):
+      scheduler.open(second_spider)
+
+    assert scheduler._queue is None
+    assert scheduler.queue_key == "q:spider_one"
 
 
 # Keep an explicit Any alias so type-checkers don't gripe about the mock spider.
@@ -207,6 +234,153 @@ class TestEnqueueBranchClosure:
     queue.push.assert_not_called()  # dedup-hit short-circuits before push
     dupefilter.log.assert_not_called()  # _spider None → log skipped
     assert not counts, f"dedup-hit should bump no stats, got {counts}"
+
+  def test_duplicate_replacement_acks_its_original_delivery(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    dupefilter = MagicMock(name="DupeFilter")
+    dupefilter.request_seen.return_value = True
+    scheduler = BackendScheduler(
+      connection_manager=manager, dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request(
+      "https://example.com/already-seen",
+      meta={BACKEND_ACK_TOKEN_META_KEY: "old-token"},
+    )
+
+    assert scheduler.enqueue_request(request) is False
+
+    queue.ack.assert_called_once_with(token="old-token")
+    queue.push.assert_not_called()
+    assert BACKEND_ACK_TOKEN_META_KEY not in request.meta
+
+  def test_final_download_failure_nacks_before_calling_original_errback(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(connection_manager=manager)
+    queue = MagicMock(name="BackendQueue")
+    original_errback = MagicMock(
+      name="original_errback", side_effect=RuntimeError("errback failed")
+    )
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=original_errback,
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+
+    request = scheduler.next_request()
+    assert request is queued_request
+    assert request.errback is not original_errback
+    failure = MagicMock(name="Failure")
+    failure.request = request
+
+    assert request.errback is not None
+    with pytest.raises(RuntimeError, match="errback failed"):
+      request.errback(failure)
+
+    queue.nack.assert_called_once_with(token="delivery-token")
+    original_errback.assert_called_once_with(failure)
+    assert BACKEND_ACK_TOKEN_META_KEY not in request.meta
+
+  def test_handled_download_failure_acks_after_original_errback(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(connection_manager=manager)
+    queue = MagicMock(name="BackendQueue")
+    original_errback = MagicMock(name="original_errback", return_value=None)
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=original_errback,
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+    failure = MagicMock(name="Failure")
+    failure.request = request
+
+    assert request.errback(failure) is None
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+    queue.nack.assert_not_called()
+    original_errback.assert_called_once_with(failure)
+    assert BACKEND_ACK_TOKEN_META_KEY not in request.meta
+
+  def test_deferred_errback_finalizes_after_resolution(self) -> None:
+    from twisted.internet.defer import Deferred
+
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    deferred: Deferred[None] = Deferred()
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=deferred),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+    failure = MagicMock(request=request)
+
+    assert request.errback(failure) is deferred
+    queue.ack.assert_not_called()
+    queue.nack.assert_not_called()
+    deferred.callback(None)
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+    queue.nack.assert_not_called()
+
+  def test_failed_deferred_errback_nacks(self) -> None:
+    from twisted.internet.defer import Deferred
+
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    deferred: Deferred[None] = Deferred()
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=deferred),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+    failure = MagicMock(request=request)
+    result = request.errback(failure)
+    result.addErrback(lambda _failure: None)
+
+    deferred.errback(RuntimeError("async errback failed"))
+
+    queue.nack.assert_called_once_with(token="delivery-token")
+    queue.ack.assert_not_called()
+
+  def test_async_errback_acks_after_awaited_success(self) -> None:
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+
+    async def handled(_failure):
+      return None
+
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=handled,
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+    failure = MagicMock(request=request)
+
+    awaitable = request.errback(failure)
+    with pytest.raises(StopIteration):
+      awaitable.send(None)
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+    queue.nack.assert_not_called()
 
   def test_G2_dont_filter_skips_dedup_and_pushes(self) -> None:
     """G2: request.dont_filter=True → dedup NOT consulted, push proceeds."""
@@ -413,6 +587,33 @@ class TestAckNackFailureObservability:
     queue.nack.assert_called_once_with(token="tok")
     assert counts.get("scheduler/nack_error") == 1
 
+  @pytest.mark.parametrize("operation", ["ack", "nack"])
+  def test_backend_error_from_terminal_operation_is_observed(
+    self, operation: str
+  ) -> None:
+    """Connection-level backend failures follow the same observable path."""
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=MagicMock(),
+      stats=stats,
+    )
+    queue = MagicMock(name="BackendQueue")
+    getattr(queue, operation).side_effect = BackendError("connection retired")
+    scheduler._queue = queue
+    request = Request(
+      "https://example.com/x",
+      meta={BACKEND_ACK_TOKEN_META_KEY: "tok"},
+    )
+
+    getattr(scheduler, f"_{operation}_request_token")(
+      request,
+      log_message=f"{operation} failed",
+    )
+
+    getattr(queue, operation).assert_called_once_with(token="tok")
+    assert counts.get(f"scheduler/{operation}_error") == 1
+    assert request.meta[BACKEND_ACK_TOKEN_META_KEY] == "tok"
+
   def test_ack_success_does_not_increment_error_stat(self) -> None:
     """Guard: a successful ack bumps no error counter (no false-positive signal)."""
     manager = MagicMock(name="ConnectionManager")
@@ -428,3 +629,34 @@ class TestAckNackFailureObservability:
 
     queue.ack.assert_called_once_with(token="tok")
     assert counts.get("scheduler/ack_error") is None
+
+  def test_successful_ack_consumes_token_before_later_spider_error(self) -> None:
+    """Scrapy emits response_received before spider_error; terminate only once."""
+    scheduler = BackendScheduler(
+      connection_manager=MagicMock(),
+      stats=MagicMock(),
+      dupefilter=MagicMock(),
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request(
+      "https://example.com/x",
+      meta={"_backend_ack_token": "tok"},
+    )
+    response = MagicMock()
+    response.request = request
+
+    scheduler._on_response_received(
+      response=response,
+      request=request,
+      spider=_FakeSpider(),
+    )
+    scheduler._on_spider_error(
+      failure=MagicMock(),
+      response=response,
+      spider=_FakeSpider(),
+    )
+
+    queue.ack.assert_called_once_with(token="tok")
+    queue.nack.assert_not_called()
+    assert "_backend_ack_token" not in request.meta

@@ -36,6 +36,14 @@ class RedisSettings(BaseSettings):
   These settings configure the Redis connection and can be set
   via environment variables with the SCRAPY_REDIS_ prefix.
 
+  Redis keys created by older releases were not namespaced. The safe layout
+  intentionally does not fall back to those raw keys: an automatic fallback
+  could read or delete an unrelated application's key in a shared database.
+  Operators upgrading a persistent deployment must drain or explicitly
+  migrate legacy keys into the configured namespace before switching versions.
+  Independent applications sharing one Redis database must configure distinct
+  namespaces; the default separates backend domains, not separate deployments.
+
   Supports four deployment modes:
   - standalone: Single Redis instance (default)
   - master_slave: Master with replica(s) for read scaling
@@ -47,6 +55,7 @@ class RedisSettings(BaseSettings):
       host: Redis server hostname (standalone/master_slave).
       port: Redis server port (standalone/master_slave).
       db: Redis database number (standalone/master_slave/sentinel).
+      namespace: Physical Redis key namespace for application isolation.
       password: Redis authentication password.
       socket_timeout: Socket timeout in seconds.
       socket_connect_timeout: Socket connection timeout in seconds.
@@ -64,7 +73,7 @@ class RedisSettings(BaseSettings):
   model_config = SettingsConfigDict(
     env_prefix="SCRAPY_REDIS_",
     case_sensitive=False,
-    extra="ignore",
+    extra="forbid",
   )
 
   # === Mode Selection ===
@@ -89,6 +98,19 @@ class RedisSettings(BaseSettings):
     default=0,
     ge=0,
     description="Redis database number (standalone/master_slave/sentinel)",
+  )
+
+  # === Physical Key Isolation ===
+  namespace: str = Field(
+    default="scrapy-extension",
+    min_length=1,
+    max_length=128,
+    pattern=r"^[a-zA-Z0-9._-]+$",
+    description=(
+      "Namespace prepended to every physical Redis key. Queue, set, and "
+      "storage keys also receive fixed domain prefixes so the same logical "
+      "name can be used safely by all three backend interfaces."
+    ),
   )
 
   # === Authentication ===

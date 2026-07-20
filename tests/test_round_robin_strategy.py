@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from collections import deque
+import base64
+import json
+import threading
+from collections import OrderedDict, deque
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -13,6 +16,24 @@ from scrapy_extension.queue.strategies.factory import (
   build_queue_strategy,
 )
 from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
+
+
+class _ObservedLock:
+  """Lock that signals when one named competitor attempts acquisition."""
+
+  def __init__(self, attempted: threading.Event, thread_name: str) -> None:
+    self._lock = threading.Lock()
+    self._attempted = attempted
+    self._thread_name = thread_name
+
+  def __enter__(self):  # type: ignore[no-untyped-def]
+    if threading.current_thread().name == self._thread_name:
+      self._attempted.set()
+    self._lock.acquire()
+    return self
+
+  def __exit__(self, *args):  # type: ignore[no-untyped-def]
+    self._lock.release()
 
 
 class TestRoundRobinQueueStrategy:
@@ -170,6 +191,402 @@ class TestRoundRobinQueueStrategy:
     assert {second, third} == {b"b1", b"c1"}
     assert s.pop("q") is None  # all drained
 
+  def test_pop_does_not_materialize_all_source_keys(self) -> None:
+    """A pop must stay O(1) in live-source count rather than copying keys."""
+
+    class NoKeyIterationOrderedDict(OrderedDict[str, deque[bytes]]):
+      def __iter__(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("pop materialized every source key")
+
+    s = RoundRobinQueueStrategy(object())
+    guarded = NoKeyIterationOrderedDict()
+    guarded["A"] = deque([b"a1", b"a2"])
+    guarded["B"] = deque([b"b1"])
+    s._sources = guarded
+
+    assert s.pop("q") == b"a1"
+
+  def test_snapshot_round_trip_preserves_items_and_next_source(self) -> None:
+    """Restart recovery must retain FIFO contents and the fairness cursor."""
+    source = RoundRobinQueueStrategy(object())
+    source.push("q", b"a1", source="A")
+    source.push("q", b"a2", source="A")
+    source.push("q", b"b1", source="B")
+    source.push("q", b"b2", source="B")
+    assert source.pop("q") == b"a1"  # next source must now be B
+
+    state = source.snapshot()
+    assert state is not None
+    restored = RoundRobinQueueStrategy(object())
+    restored.restore(state)
+
+    assert [restored.pop("q") for _ in range(3)] == [b"b1", b"a2", b"b2"]
+    assert restored.pop("q") is None
+
+  def test_empty_snapshot_and_empty_restore_are_noops(self) -> None:
+    strategy = RoundRobinQueueStrategy(object())
+
+    assert strategy.snapshot() is None
+    strategy.restore(None)
+    strategy.restore(b"")
+    assert strategy.queue_len("q") == 0
+
+  @pytest.mark.parametrize(
+    "state",
+    [
+      b"\xff",
+      b"{not-json",
+      json.dumps({"version": 2, "strategy": "round_robin", "sources": []}).encode(),
+      json.dumps({"version": 1, "strategy": "other", "sources": []}).encode(),
+      json.dumps({"version": 1, "strategy": "round_robin", "sources": {}}).encode(),
+    ],
+  )
+  def test_invalid_snapshot_preserves_live_state(self, state: bytes) -> None:
+    strategy = RoundRobinQueueStrategy(object())
+    strategy.push("q", b"live", source="live")
+
+    strategy.restore(state)
+
+    assert strategy.pop("q") == b"live"
+
+  def test_restore_skips_malformed_duplicate_and_empty_entries(self) -> None:
+    valid = base64.b64encode(b"valid").decode("ascii")
+    duplicate = base64.b64encode(b"duplicate").decode("ascii")
+    state = json.dumps(
+      {
+        "version": 1,
+        "strategy": "round_robin",
+        "sources": [
+          None,
+          {"source": 7, "items": []},
+          {"source": "A", "items": ["not-base64!", valid]},
+          {"source": "A", "items": [duplicate]},
+          {"source": "empty", "items": []},
+        ],
+      }
+    ).encode()
+
+    strategy = RoundRobinQueueStrategy(object())
+    strategy.restore(state)
+
+    assert strategy.pop("q") == b"valid"
+    assert strategy.pop("q") is None
+
+
+class TestRoundRobinConcurrency:
+  def test_concurrent_pushes_to_new_source_do_not_lose_an_item(self) -> None:
+    first_get_entered = threading.Event()
+    second_push_reached = threading.Event()
+
+    class CoordinatedGetDict(OrderedDict[str, deque[bytes]]):
+      def __init__(self) -> None:
+        super().__init__()
+        self._get_calls = 0
+        self._coordination_lock = threading.Lock()
+
+      def get(
+        self, key: str, default: deque[bytes] | None = None
+      ) -> deque[bytes] | None:
+        value = super().get(key, default)
+        with self._coordination_lock:
+          self._get_calls += 1
+          call_number = self._get_calls
+        if call_number == 1:
+          first_get_entered.set()
+          if not second_push_reached.wait(timeout=2.0):
+            raise AssertionError("second push did not reach the shared source")
+        elif call_number == 2:
+          second_push_reached.set()
+        return value
+
+    strategy = RoundRobinQueueStrategy(object())
+    strategy._sources = CoordinatedGetDict()
+    strategy._lock = _ObservedLock(second_push_reached, "second-push")  # type: ignore[assignment]
+    errors: list[Exception] = []
+
+    def push(item: bytes) -> None:
+      try:
+        strategy.push("q", item, source="shared")
+      except Exception as exc:
+        errors.append(exc)
+
+    first = threading.Thread(target=push, args=(b"first",), daemon=True)
+    second = threading.Thread(
+      target=push,
+      args=(b"second",),
+      name="second-push",
+      daemon=True,
+    )
+    first.start()
+    assert first_get_entered.wait(timeout=2.0)
+    second.start()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert strategy.queue_len("q") == 2
+    assert {strategy.pop("q"), strategy.pop("q")} == {b"first", b"second"}
+
+  def test_pop_and_clear_are_atomic_against_each_other(self) -> None:
+    pop_entered = threading.Event()
+    release_pop = threading.Event()
+    clear_called = threading.Event()
+
+    class BlockingPopDeque(deque[bytes]):
+      def popleft(self) -> bytes:
+        pop_entered.set()
+        if not release_pop.wait(timeout=2.0):
+          raise AssertionError("pop was not released")
+        return super().popleft()
+
+    class ObservableClearDict(OrderedDict[str, deque[bytes]]):
+      def clear(self) -> None:
+        clear_called.set()
+        super().clear()
+
+    strategy = RoundRobinQueueStrategy(object())
+    sources = ObservableClearDict()
+    sources["A"] = BlockingPopDeque([b"item"])
+    strategy._sources = sources
+    strategy._lock = _ObservedLock(clear_called, "clear-thread")  # type: ignore[assignment]
+    pop_results: list[bytes | None] = []
+    errors: list[Exception] = []
+
+    def pop() -> None:
+      try:
+        pop_results.append(strategy.pop("q"))
+      except Exception as exc:
+        errors.append(exc)
+
+    def clear() -> None:
+      try:
+        strategy.clear("q")
+      except Exception as exc:
+        errors.append(exc)
+
+    pop_thread = threading.Thread(target=pop, daemon=True)
+    clear_thread = threading.Thread(target=clear, name="clear-thread", daemon=True)
+    pop_thread.start()
+    assert pop_entered.wait(timeout=2.0)
+    clear_thread.start()
+    assert clear_called.wait(timeout=2.0)
+    release_pop.set()
+    pop_thread.join(timeout=2.0)
+    clear_thread.join(timeout=2.0)
+
+    assert not pop_thread.is_alive()
+    assert not clear_thread.is_alive()
+    assert errors == []
+    assert pop_results == [b"item"]
+    assert clear_called.is_set()
+    assert strategy.queue_len("q") == 0
+
+  def test_queue_len_is_consistent_during_new_source_push(self) -> None:
+    len_entered = threading.Event()
+    release_len = threading.Event()
+    push_reached = threading.Event()
+
+    class ObservableGetDict(OrderedDict[str, deque[bytes]]):
+      def get(
+        self, key: str, default: deque[bytes] | None = None
+      ) -> deque[bytes] | None:
+        if key == "C":
+          push_reached.set()
+        return super().get(key, default)
+
+    class BlockingLenDeque(deque[bytes]):
+      def __len__(self) -> int:
+        len_entered.set()
+        if not release_len.wait(timeout=2.0):
+          raise AssertionError("queue_len was not released")
+        return super().__len__()
+
+    strategy = RoundRobinQueueStrategy(object())
+    sources = ObservableGetDict()
+    sources["A"] = BlockingLenDeque([b"a"])
+    sources["B"] = deque([b"b"])
+    strategy._sources = sources
+    strategy._lock = _ObservedLock(push_reached, "push-thread")  # type: ignore[assignment]
+    lengths: list[int] = []
+    errors: list[Exception] = []
+
+    def read_len() -> None:
+      try:
+        lengths.append(strategy.queue_len("q"))
+      except Exception as exc:
+        errors.append(exc)
+
+    def push() -> None:
+      try:
+        strategy.push("q", b"c", source="C")
+      except Exception as exc:
+        errors.append(exc)
+
+    len_thread = threading.Thread(target=read_len, daemon=True)
+    push_thread = threading.Thread(target=push, name="push-thread", daemon=True)
+    len_thread.start()
+    assert len_entered.wait(timeout=2.0)
+    push_thread.start()
+    assert push_reached.wait(timeout=2.0)
+    release_len.set()
+    len_thread.join(timeout=2.0)
+    push_thread.join(timeout=2.0)
+
+    assert not len_thread.is_alive()
+    assert not push_thread.is_alive()
+    assert errors == []
+    assert lengths == [2]
+    assert strategy.queue_len("q") == 3
+
+  def test_snapshot_is_consistent_during_pop(self) -> None:
+    snapshot_iterating = threading.Event()
+    release_snapshot = threading.Event()
+    pop_reached = threading.Event()
+
+    class BlockingIterDeque(deque[bytes]):
+      def __iter__(self):  # type: ignore[no-untyped-def]
+        iterator = super().__iter__()
+        first = True
+        for item in iterator:
+          if first:
+            first = False
+            snapshot_iterating.set()
+            if not release_snapshot.wait(timeout=2.0):
+              raise AssertionError("snapshot was not released")
+          yield item
+
+      def popleft(self) -> bytes:
+        pop_reached.set()
+        return super().popleft()
+
+    strategy = RoundRobinQueueStrategy(object())
+    strategy._sources["A"] = BlockingIterDeque([b"a1", b"a2"])
+    strategy._sources["B"] = deque([b"b1"])
+    strategy._lock = _ObservedLock(pop_reached, "pop-thread")  # type: ignore[assignment]
+    snapshots: list[bytes | None] = []
+    popped: list[bytes | None] = []
+    errors: list[Exception] = []
+
+    def snapshot() -> None:
+      try:
+        snapshots.append(strategy.snapshot())
+      except Exception as exc:
+        errors.append(exc)
+
+    def pop() -> None:
+      try:
+        popped.append(strategy.pop("q"))
+      except Exception as exc:
+        errors.append(exc)
+
+    snapshot_thread = threading.Thread(target=snapshot, daemon=True)
+    pop_thread = threading.Thread(target=pop, name="pop-thread", daemon=True)
+    snapshot_thread.start()
+    assert snapshot_iterating.wait(timeout=2.0)
+    pop_thread.start()
+    assert pop_reached.wait(timeout=2.0)
+    release_snapshot.set()
+    snapshot_thread.join(timeout=2.0)
+    pop_thread.join(timeout=2.0)
+
+    assert not snapshot_thread.is_alive()
+    assert not pop_thread.is_alive()
+    assert errors == []
+    assert popped == [b"a1"]
+    assert len(snapshots) == 1
+    assert snapshots[0] is not None
+    data = json.loads(snapshots[0].decode())
+    assert [entry["source"] for entry in data["sources"]] == ["A", "B"]
+
+  def test_snapshot_encodes_outside_state_lock(self, monkeypatch) -> None:
+    strategy = RoundRobinQueueStrategy(object())
+    strategy.push("q", b"a", source="A")
+    encode_entered = threading.Event()
+    release_encode = threading.Event()
+    push_done = threading.Event()
+    original_encode = base64.b64encode
+
+    def blocking_encode(item: bytes) -> bytes:
+      encode_entered.set()
+      if not release_encode.wait(timeout=2.0):
+        raise AssertionError("snapshot encoding was not released")
+      return original_encode(item)
+
+    monkeypatch.setattr(
+      "scrapy_extension.queue.strategies.round_robin.base64.b64encode",
+      blocking_encode,
+    )
+    snapshot_thread = threading.Thread(target=strategy.snapshot, daemon=True)
+    push_thread = threading.Thread(
+      target=lambda: (strategy.push("q", b"b", source="B"), push_done.set()),
+      daemon=True,
+    )
+    snapshot_thread.start()
+    assert encode_entered.wait(timeout=2.0)
+    push_thread.start()
+    try:
+      assert push_done.wait(timeout=2.0), "base64 encoding held the state lock"
+    finally:
+      release_encode.set()
+      snapshot_thread.join(timeout=2.0)
+      push_thread.join(timeout=2.0)
+
+    assert not snapshot_thread.is_alive()
+    assert not push_thread.is_alive()
+
+  def test_restore_decodes_before_atomic_state_replacement(self, monkeypatch) -> None:
+    strategy = RoundRobinQueueStrategy(object())
+    strategy.push("q", b"old", source="old")
+    encoded = base64.b64encode(b"restored").decode("ascii")
+    state = json.dumps(
+      {
+        "version": 1,
+        "strategy": "round_robin",
+        "sources": [{"source": "new", "items": [encoded]}],
+      }
+    ).encode()
+    decode_entered = threading.Event()
+    release_decode = threading.Event()
+    push_done = threading.Event()
+    original_decode = base64.b64decode
+
+    def blocking_decode(item, *, validate=False):  # type: ignore[no-untyped-def]
+      decode_entered.set()
+      if not release_decode.wait(timeout=2.0):
+        raise AssertionError("restore decoding was not released")
+      return original_decode(item, validate=validate)
+
+    monkeypatch.setattr(
+      "scrapy_extension.queue.strategies.round_robin.base64.b64decode",
+      blocking_decode,
+    )
+    restore_thread = threading.Thread(
+      target=strategy.restore, args=(state,), daemon=True
+    )
+    push_thread = threading.Thread(
+      target=lambda: (
+        strategy.push("q", b"during-parse", source="old"),
+        push_done.set(),
+      ),
+      daemon=True,
+    )
+    restore_thread.start()
+    assert decode_entered.wait(timeout=2.0)
+    push_thread.start()
+    try:
+      assert push_done.wait(timeout=2.0), "base64 decoding held the state lock"
+    finally:
+      release_decode.set()
+      restore_thread.join(timeout=2.0)
+      push_thread.join(timeout=2.0)
+
+    assert not restore_thread.is_alive()
+    assert not push_thread.is_alive()
+    assert strategy.pop("q") == b"restored"
+    assert strategy.pop("q") is None
+
 
 class TestFactoryRoundRobin:
   def test_build_round_robin(self, mock_connection_manager) -> None:
@@ -250,7 +667,7 @@ class TestRoundRobinFairnessProperty:
           assert served[served_src] - served[other] <= 1, (
             f"starvation: src{served_src} served {served[served_src]}x while "
             f"src{other} (still pending) served only {served[other]}x "
-            f"(drain prefix {drained[:sum(served) + 0]})"
+            f"(drain prefix {drained[: sum(served) + 0]})"
           )
 
     # Sanity: every source was served exactly its allotted count.

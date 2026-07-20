@@ -7,6 +7,11 @@ class QuotesSpider(scrapy.Spider):
   name = "quotes"
   allowed_domains = ["quotes.toscrape.com"]
   start_urls = ["https://quotes.toscrape.com"]
+  custom_settings = {
+    "SCHEDULER": "scrapy.core.scheduler.Scheduler",
+    "DUPEFILTER_CLASS": "scrapy.dupefilters.RFPDupeFilter",
+    "ITEM_PIPELINES": {},
+  }
 
   def parse(self, response):
     self.logger.info("Parsing %s", response.url)

@@ -44,7 +44,10 @@ from scrapy_extension.backends.base import (  # noqa: E402
   StorageBackend,
 )
 from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
-from scrapy_extension.exceptions import BackendConnectionError  # noqa: E402
+from scrapy_extension.exceptions import (  # noqa: E402
+  BackendConnectionError,
+  ConfigurationError,
+)
 from scrapy_extension.exceptions.base import StorageError  # noqa: E402
 from scrapy_extension.settings import MemcachedMode, MemcachedSettings  # noqa: E402
 
@@ -56,6 +59,7 @@ def _make_backend(**overrides) -> MemcachedBackend:
 def _connected(mocker):
   b = _make_backend()
   client = mocker.MagicMock()
+  client.set.return_value = True
   # Patch the backend's captured MemcachedClient name (bound at import).
   mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
   b.connect()
@@ -77,9 +81,19 @@ class TestMemcachedBackendType:
     assert s.mode is MemcachedMode.STANDALONE
     assert s.host == "localhost"
     assert s.port == 11211
+    assert s.allow_flush_all is False
 
 
 class TestMemcachedConnect:
+  def test_unsupported_mode_is_configuration_error(self) -> None:
+    b = _make_backend()
+    b.config.mode = "unsupported"  # type: ignore[assignment]
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      b.connect()
+
+    assert exc_info.value.setting_name == "mode"
+
   def test_connect_creates_client_and_stats(self, mocker) -> None:
     b, client = _connected(mocker)
     memcached_mod.MemcachedClient.assert_called_once_with(("localhost", 11211))
@@ -133,7 +147,14 @@ class TestMemcachedStorageOps:
   def test_store_without_ttl(self, mocker) -> None:
     b, client = _connected(mocker)
     b.store("key1", b"value")
-    client.set.assert_called_once_with("key1", b"value", expire=None)
+    client.set.assert_called_once_with("key1", b"value", expire=0)
+
+  def test_store_with_none_ttl_uses_memcached_no_expiry_sentinel(self, mocker) -> None:
+    b, client = _connected(mocker)
+
+    b.store("key1", b"value", ttl=None)
+
+    client.set.assert_called_once_with("key1", b"value", expire=0)
 
   def test_retrieve_gets(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -167,10 +188,21 @@ class TestMemcachedStorageOps:
     b, _ = _connected(mocker)
     assert b.ttl("key1") is None
 
-  def test_clear_storage_flushes_all(self, mocker) -> None:
-    b, client = _connected(mocker)
+  def test_clear_storage_flushes_all_when_explicitly_enabled(self, mocker) -> None:
+    b = _make_backend(allow_flush_all=True)
+    client = mocker.MagicMock()
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    b.connect()
     b.clear_storage()
     client.flush_all.assert_called_once()
+
+  def test_clear_storage_rejects_global_flush_by_default(self, mocker) -> None:
+    b, client = _connected(mocker)
+
+    with pytest.raises(NotImplementedError, match="allow_flush_all"):
+      b.clear_storage()
+
+    client.flush_all.assert_not_called()
 
   def test_clear_storage_rejects_prefix(self, mocker) -> None:
     # R3: prefix-based clear is unsupported on Memcached (flush_all is global).
@@ -197,6 +229,18 @@ class TestMemcachedStorageOps:
 
 class TestMemcachedStorageErrorContract:
   """R14-A: each storage op raises StorageError on client-lib failure."""
+
+  @pytest.mark.parametrize("result", [False, None])
+  def test_store_rejected_result_raises_storage_error(self, mocker, result) -> None:
+    """A rejected write must not be reported as a successful store."""
+    b, client = _connected(mocker)
+    client.set.return_value = result
+
+    with pytest.raises(StorageError) as exc_info:
+      b.store("key1", b"value")
+
+    assert exc_info.value.operation == "store"
+    assert exc_info.value.key == "key1"
 
   def test_store_failure_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -232,7 +276,10 @@ class TestMemcachedStorageErrorContract:
     assert exc_info.value.key == "key1"
 
   def test_clear_storage_failure_raises_storage_error(self, mocker) -> None:
-    b, client = _connected(mocker)
+    b = _make_backend(allow_flush_all=True)
+    client = mocker.MagicMock()
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    b.connect()
     client.flush_all.side_effect = RuntimeError("memcached unreachable")
     with pytest.raises(StorageError) as exc_info:
       b.clear_storage()

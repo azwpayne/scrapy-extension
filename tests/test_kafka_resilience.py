@@ -65,6 +65,10 @@ def test_ack_token_eq_true_for_equal_tokens_and_hash_stable() -> None:
   assert a == b
   assert hash(a) == hash(b)
   assert _KafkaAckToken(partition=0, offset=2, topic="t") != a
+  assert (
+    _KafkaAckToken(partition=0, offset=1, topic="t", consumer_generation=1)
+    != a
+  )
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +161,15 @@ def test_ack_token_raises_when_commit_fails(mocker) -> None:
   backend._consumer = mocker.MagicMock()
   backend._consumer.commit.side_effect = KafkaError("commit boom")
   backend._in_flight = defaultdict(set)
-  backend._in_flight[0].add(1)
+  topic_partition = ("t", 0)
+  backend._in_flight[topic_partition].add(1)
   # Pre-seeded base (0); high-water (5) lets the watermark walk advance past
   # the base -> commit path taken.
-  backend._watermarks = {0: 0}
-  backend._high_water = {0: 5}
+  backend._watermarks = {topic_partition: 0}
+  backend._high_water = {topic_partition: 5}
   with pytest.raises(QueueError, match="Failed to ack Kafka message"):
     backend._ack_token(_KafkaAckToken(partition=0, offset=1, topic="t"))
+  assert 1 in backend._in_flight[topic_partition]
 
 
 # ---------------------------------------------------------------------------
@@ -171,15 +177,15 @@ def test_ack_token_raises_when_commit_fails(mocker) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_nack_with_token_re_adds_offset_to_in_flight() -> None:
-  """Line 732 (true branch): nack(token=_KafkaAckToken) re-adds the offset
-  to the partition's in-flight set so the watermark never advances past it →
-  uncommitted → re-delivered on consumer restart (at-least-once)."""
+def test_nack_with_unknown_token_does_not_create_in_flight_state(mocker) -> None:
+  """A forged or already-completed token cannot rewind or create ack state."""
   backend = _backend()
+  backend._consumer = mocker.MagicMock()
   backend._in_flight = defaultdict(set)
   token = _KafkaAckToken(partition=0, offset=7, topic="t")
   backend.nack("q", token=token)
-  assert 7 in backend._in_flight[0]
+  assert backend._in_flight == {}
+  backend._consumer.seek.assert_not_called()
 
 
 def test_nack_with_non_kafka_token_is_a_silent_noop() -> None:
@@ -190,7 +196,7 @@ def test_nack_with_non_kafka_token_is_a_silent_noop() -> None:
   backend = _backend()
   backend._in_flight = defaultdict(set)
   backend.nack("q", token="some-legacy-opaque-token")  # must not raise
-  assert backend._in_flight[0] == set()  # nothing added
+  assert backend._in_flight == {}  # nothing added
 
 
 # ---------------------------------------------------------------------------

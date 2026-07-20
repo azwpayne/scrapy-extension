@@ -11,7 +11,9 @@ class QuotesRabbitMQSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider
 
   backend_type = BackendType.RABBITMQ
   rabbitmq_url = "amqp://guest:guest@localhost:5672/"
-
-  def __init__(self, **kwargs):
-    super().__init__(**kwargs)
-    self.setup_backend()
+  custom_settings = {
+    "SCRAPY_QUEUE_BACKEND_TYPE": "rabbitmq",
+    "SCRAPY_RABBITMQ_URL": rabbitmq_url,
+    "SCRAPY_SET_BACKEND_TYPE": "redis",
+    "SCRAPY_STORAGE_BACKEND_TYPE": "redis",
+  }

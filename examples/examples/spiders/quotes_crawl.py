@@ -6,6 +6,11 @@ class QuotesCrawlSpider(CrawlSpider):
   name = "quotes_crawl"
   allowed_domains = ["quotes.toscrape.com"]
   start_urls = ["https://quotes.toscrape.com"]
+  custom_settings = {
+    "SCHEDULER": "scrapy.core.scheduler.Scheduler",
+    "DUPEFILTER_CLASS": "scrapy.dupefilters.RFPDupeFilter",
+    "ITEM_PIPELINES": {},
+  }
 
   rules = (Rule(LinkExtractor(allow=r"/page/\d+"), callback="parse_item", follow=True),)
 

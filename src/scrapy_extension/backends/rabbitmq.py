@@ -14,12 +14,17 @@ from __future__ import annotations
 import contextlib
 import logging
 import ssl
+import time
 from typing import TYPE_CHECKING, Any, Literal, cast
+
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
     import pika
     from pika.exceptions import AMQPError
 except ImportError as e:
+    if not _is_missing_optional_dependency(e, "pika"):
+        raise
     raise ImportError(
         "RabbitMQ backend requires 'pika'. Install with: pip install scrapy-extension[rabbitmq]"
     ) from e
@@ -48,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Used to detect the insecure default guest/guest login in non-standalone modes.
 _DEFAULT_GUEST_CREDENTIAL = "guest"  # nosec B105
 
-# R14-E: cap on the diagnostic in-flight delivery-tag set. Each unacked pop
+# R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
 # bug that never acks) grows the set unbounded. We warn-once on overflow and
 # STOP adding (the set is diagnostic — ack correctness lives in the broker's
@@ -56,6 +61,41 @@ _DEFAULT_GUEST_CREDENTIAL = "guest"  # nosec B105
 # signal, never the ack state). 10k is generous for normal CONCURRENT_REQUESTS
 # backpressure and tight enough to flag a real leak.
 _MAX_IN_FLIGHT = 10_000
+
+
+class _RabbitMQAckToken:
+  """Opaque acknowledgement token for one channel-scoped delivery tag.
+
+  RabbitMQ delivery tags are scoped to a channel and may restart from the
+  same integer after reconnecting. The channel generation prevents a late
+  completion from an old channel from acknowledging an unrelated delivery
+  on the current channel.
+  """
+
+  __slots__ = ("_completed", "channel_generation", "delivery_tag")
+
+  def __init__(self, delivery_tag: int, channel_generation: int) -> None:
+    """Initialize a token for ``delivery_tag`` in one channel generation."""
+    self.delivery_tag = delivery_tag
+    self.channel_generation = channel_generation
+    self._completed = False
+
+  def __eq__(self, other: object) -> bool:
+    if not isinstance(other, _RabbitMQAckToken):
+      return NotImplemented
+    return (
+      self.delivery_tag == other.delivery_tag
+      and self.channel_generation == other.channel_generation
+    )
+
+  def __hash__(self) -> int:
+    return hash((self.delivery_tag, self.channel_generation))
+
+  def __repr__(self) -> str:
+    return (
+      f"_RabbitMQAckToken(delivery_tag={self.delivery_tag}, "
+      f"channel_generation={self.channel_generation})"
+    )
 
 
 class RabbitMQBackend(Backend, QueueBackend):
@@ -66,10 +106,10 @@ class RabbitMQBackend(Backend, QueueBackend):
   Does NOT implement SetBackend or StorageBackend.
 
   Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
-  Pops carry the RabbitMQ delivery tag, tracked in an in-flight set;
-  :meth:`ack` ``basic_ack``s the specific tag. N pops before any ack no
-  longer overwrite a single slot — ack is correct under
-  ``CONCURRENT_REQUESTS > 1``.
+  Pops carry an ack token containing the RabbitMQ delivery tag and channel
+  generation. :meth:`ack` confirms the specific current-channel tag. N pops
+  before any ack no longer overwrite a single slot, and reconnects cannot
+  redirect a stale token to a new channel.
 
   Attributes:
       config: RabbitMQSettings instance with connection parameters.
@@ -89,16 +129,21 @@ class RabbitMQBackend(Backend, QueueBackend):
     self.config = config
     self._connection: pika.BlockingConnection | None = None
     self._channel: pika.channel.Channel | None = None
+    self._channel_generation = 0
+    # Ack operations use this immutable snapshot instead of ``_channel`` so
+    # a reconnect between validation and the broker call cannot redirect an
+    # old token to the new channel.
+    self._channel_session: tuple[int, pika.channel.Channel] | None = None
     self._declared_queues: set[str] = set()
     # Legacy single-slot for the ``ack(token=None)`` fallback path. Kept so
     # external callers that pop() then ack() without a token still work.
     self._last_delivery_tag: int | None = None
-    # In-flight delivery tags for correctness under CONCURRENT_REQUESTS>1.
-    # Every pop_with_ack adds its tag here; ack(token) basic_acks the
+    # In-flight ack tokens for correctness under CONCURRENT_REQUESTS>1.
+    # Every pop_with_ack adds its token here; ack(token) basic_acks the
     # specific tag and removes it. Without this, N pops before any ack
     # overwrite _last_delivery_tag and only the last-popped message is
     # ackable — silent at-least-once violation.
-    self._in_flight_tags: set[int] = set()
+    self._in_flight_tags: set[_RabbitMQAckToken] = set()
     self._ssl_warning_emitted: bool = False
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
@@ -144,6 +189,8 @@ class RabbitMQBackend(Backend, QueueBackend):
       else:
         self._connect_mirrored_queues()
       logger.debug("Connected to RabbitMQ in %s mode", self.config.mode.value)
+    except ConfigurationError:
+      raise
     except AMQPError as e:
       msg = f"Failed to connect to RabbitMQ ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
@@ -249,22 +296,8 @@ class RabbitMQBackend(Backend, QueueBackend):
     """
     parameters = self._build_common_parameters()
     connection = pika.BlockingConnection(parameters)
-    channel = connection.channel()
-    try:
-      self._apply_qos(channel)
-    except AMQPError:
-      # QoS failed on a half-init channel — close the freshly-opened
-      # handles and null both instance attrs so is_connected() stays
-      # truthful. Re-raise so connect()'s retry loop sees the failure.
-      with contextlib.suppress(AMQPError):
-        channel.close()
-      with contextlib.suppress(AMQPError):
-        connection.close()
-      self._channel = None
-      self._connection = None
-      raise
-    self._connection = connection
-    self._channel = channel
+    channel = self._open_prepared_channel(connection)
+    self._activate_channel(connection, channel)
     logger.debug(
       "Connected to standalone RabbitMQ at %s:%s", self.config.host, self.config.port
     )
@@ -298,20 +331,45 @@ class RabbitMQBackend(Backend, QueueBackend):
       connection_parameters = self._build_common_parameters()
 
     connection = pika.BlockingConnection(connection_parameters)
-    channel = connection.channel()
+    channel = self._open_prepared_channel(connection)
+    self._activate_channel(connection, channel)
+    logger.debug("Connected to RabbitMQ cluster")
+
+  def _open_prepared_channel(
+    self, connection: pika.BlockingConnection
+  ) -> pika.channel.Channel:
+    """Open and initialize a channel, closing local handles on failure."""
+    channel: pika.channel.Channel | None = None
     try:
-      self._apply_qos(channel)
-    except AMQPError:
-      with contextlib.suppress(AMQPError):
-        channel.close()
-      with contextlib.suppress(AMQPError):
+      channel = connection.channel()
+      self._prepare_channel(channel)
+      return channel
+    except Exception:
+      if channel is not None:
+        with contextlib.suppress(Exception):
+          channel.close()
+      with contextlib.suppress(Exception):
         connection.close()
+      self._channel_session = None
       self._channel = None
       self._connection = None
       raise
+
+  def _activate_channel(
+    self,
+    connection: pika.BlockingConnection,
+    channel: pika.channel.Channel,
+  ) -> None:
+    """Commit a successfully initialized channel as a new ack generation."""
+    self._declared_queues.clear()
+    self._last_delivery_tag = None
+    self._in_flight_tags.clear()
+    self._channel_generation += 1
     self._connection = connection
     self._channel = channel
-    logger.debug("Connected to RabbitMQ cluster")
+    # Assign the complete session last so ack/pop readers see either the old
+    # session or the new one, never a new channel paired with an old generation.
+    self._channel_session = (self._channel_generation, channel)
 
   def _connect_mirrored_queues(self) -> None:
     """Connect to RabbitMQ with mirrored queues (HA).
@@ -352,6 +410,22 @@ class RabbitMQBackend(Backend, QueueBackend):
     if self._channel is not None:
       self._apply_qos(self._channel)
 
+  def _prepare_channel(self, channel: pika.channel.Channel) -> None:
+    """Apply consumer QoS and enable synchronous publisher confirms.
+
+    A channel is not published to instance state until both steps succeed.
+    With confirm mode enabled, ``BlockingChannel.basic_publish`` waits for a
+    broker ack and can report unroutable mandatory messages or broker nacks.
+
+    Args:
+        channel: Freshly opened channel that has not been activated yet.
+
+    Raises:
+        AMQPError: If QoS or publisher-confirm setup fails.
+    """
+    self._apply_qos(channel)
+    channel.confirm_delivery()
+
   def _apply_qos(self, channel: pika.channel.Channel) -> None:
     """Apply QoS (prefetch) settings to ``channel``.
 
@@ -381,14 +455,20 @@ class RabbitMQBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Close RabbitMQ connection."""
-    if self._channel:
-      with contextlib.suppress(AMQPError):
-        self._channel.close()
-      self._channel = None
-    if self._connection:
-      with contextlib.suppress(AMQPError):
-        self._connection.close()
-      self._connection = None
+    # Invalidate the ack session before closing either handle. A concurrent
+    # stale completion can at worst retain the old channel snapshot; it can
+    # never be redirected to a later channel.
+    channel = self._channel
+    connection = self._connection
+    self._channel_session = None
+    self._channel = None
+    self._connection = None
+    if channel is not None:
+      with contextlib.suppress(Exception):
+        channel.close()
+    if connection is not None:
+      with contextlib.suppress(Exception):
+        connection.close()
     self._declared_queues.clear()
     # R-mq-reconnect: clear ack tracking so it cannot leak to the next channel.
     # Delivery tags are channel-scoped — a tag from the closed channel is
@@ -396,7 +476,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     # PRECONDITION_FAILED). Clearing the legacy slot makes the post-reconnect
     # ack/nack take the "nothing pending" no-op branch instead of firing a
     # stale-tag basic_ack. The in-flight set is also channel-scoped and would
-    # otherwise leak across reconnects (unbounded set[int] growth for a
+    # otherwise leak across reconnects (unbounded token-set growth for a
     # long-running crawler). At-least-once is preserved regardless — the
     # broker requeues unacked messages on consumer disconnect.
     self._last_delivery_tag = None
@@ -408,7 +488,15 @@ class RabbitMQBackend(Backend, QueueBackend):
     Returns:
         True if connection is available.
     """
-    return self._connection is not None and self._connection.is_open
+    try:
+      return bool(
+        self._connection is not None
+        and self._connection.is_open
+        and self._channel is not None
+        and self._channel.is_open
+      )
+    except Exception:
+      return False
 
   def ping(self) -> bool:
     """Check RabbitMQ health.
@@ -417,7 +505,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     in ConnectionParameters). No channel creation needed, avoiding
     resource leaks from repeated channel allocation.
     """
-    return self._connection is not None and self._connection.is_open
+    return self.is_connected()
 
   @property
   def backend_type(self) -> BackendType:
@@ -443,6 +531,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         QueueError: If queue declaration fails. The message includes
             recovery guidance when ``PRECONDITION_FAILED`` is detected.
     """
+    _validate_key_name(queue_name, "queue_name")
     if self._channel is None:
       msg = "Not connected to RabbitMQ"
       raise QueueError(
@@ -491,7 +580,8 @@ class RabbitMQBackend(Backend, QueueBackend):
         ValueError: If queue_name contains invalid characters.
     """
     _validate_key_name(queue_name, "queue_name")
-    if self._channel is None:
+    channel = self._channel
+    if channel is None:
       msg = "Not connected to RabbitMQ"
       raise QueueError(
         msg,
@@ -511,12 +601,19 @@ class RabbitMQBackend(Backend, QueueBackend):
         delivery_mode=delivery_mode,
       )
 
-      self._channel.basic_publish(
+      confirmed = channel.basic_publish(
         exchange="",
         routing_key=queue_name,
         body=item,
         properties=properties,
+        mandatory=True,
       )
+      # Pika's BlockingChannel returns None on confirmed success and raises
+      # UnroutableError/NackError on failure. Some compatible channels return
+      # a boolean instead, so reject an explicit negative confirmation too.
+      if confirmed is False:
+        msg = f"RabbitMQ publish to queue {queue_name} was not confirmed"
+        raise QueueError(msg, queue_name=queue_name, operation="push")
     except AMQPError as e:
       msg = f"Failed to push to queue {queue_name}: {e}"
       raise QueueError(
@@ -544,13 +641,13 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         QueueError: If the pop operation fails.
     """
-    body, _tag = self._basic_get(queue_name)
+    body, _token = self._basic_get(queue_name, timeout=timeout)
     return body
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, Any | None]:
-    """Pop an item together with its RabbitMQ delivery tag.
+  ) -> tuple[bytes | None, _RabbitMQAckToken | None]:
+    """Pop an item together with a channel-scoped ack token.
 
     Records the delivery tag in the in-flight set so :meth:`ack` can
     ``basic_ack`` the specific message — correct under
@@ -562,18 +659,19 @@ class RabbitMQBackend(Backend, QueueBackend):
         timeout: Seconds to wait (unused for RabbitMQ).
 
     Returns:
-        ``(body, delivery_tag)`` where ``delivery_tag`` is the int AMQP
-        delivery tag, or ``(None, None)`` when the queue is empty.
+        ``(body, token)`` where ``token`` carries the AMQP delivery tag and
+        channel generation, or ``(None, None)`` when the queue is empty.
 
     Raises:
         QueueError: If the pop operation fails.
     """
-    del timeout  # RabbitMQ basic_get is non-blocking; timeout is unused.
-    body, tag = self._basic_get(queue_name, track_in_flight=True)
-    return (body, tag)
+    body, token = self._basic_get(
+      queue_name, timeout=timeout, track_in_flight=True
+    )
+    return (body, token)
 
-  def _track_in_flight(self, delivery_tag: int) -> None:
-    """Add ``delivery_tag`` to the diagnostic in-flight set, bounded.
+  def _track_in_flight(self, token: _RabbitMQAckToken) -> None:
+    """Add ``token`` to the diagnostic in-flight set, bounded.
 
     R14-E: the in-flight set is diagnostic (the broker tracks delivery
     tags — ack correctness does not depend on this set). It grows one
@@ -584,10 +682,10 @@ class RabbitMQBackend(Backend, QueueBackend):
     still tracks its delivery tag for ack.
 
     Args:
-        delivery_tag: The AMQP delivery tag to track.
+        token: The channel-scoped acknowledgement token to track.
     """
     if len(self._in_flight_tags) < _MAX_IN_FLIGHT:
-      self._in_flight_tags.add(delivery_tag)
+      self._in_flight_tags.add(token)
       return
     if not self._in_flight_overflow_warned:
       self._in_flight_overflow_warned = True
@@ -600,8 +698,12 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
 
   def _basic_get(
-    self, queue_name: str, *, track_in_flight: bool = False
-  ) -> tuple[bytes | None, int | None]:
+    self,
+    queue_name: str,
+    *,
+    timeout: float = 0.0,
+    track_in_flight: bool = False,
+  ) -> tuple[bytes | None, _RabbitMQAckToken | None]:
     """Fetch one message via ``basic_get(auto_ack=False)``.
 
     Shared by :meth:`pop` and :meth:`pop_with_ack` so channel validation,
@@ -610,17 +712,18 @@ class RabbitMQBackend(Backend, QueueBackend):
     Args:
         queue_name: Name of the queue.
         track_in_flight: When True (pop_with_ack path), add the delivery
-            tag to the in-flight set so ack(token) can ack it. When False
+            token to the in-flight set so ack(token) can ack it. When False
             (legacy pop path), only set ``_last_delivery_tag``.
 
     Returns:
-        ``(body, delivery_tag)``. ``body`` is ``None`` when the queue is
-        empty.
+        ``(body, token)``. ``body`` is ``None`` when the queue is empty.
 
     Raises:
         QueueError: If the get fails at the AMQP layer.
     """
-    if self._channel is None:
+    _validate_key_name(queue_name, "queue_name")
+    session = self._channel_session
+    if session is None:
       msg = "Not connected to RabbitMQ"
       raise QueueError(
         msg,
@@ -630,17 +733,31 @@ class RabbitMQBackend(Backend, QueueBackend):
     try:
       self._ensure_queue_exists(queue_name)
 
-      method_frame, _header_frame, body = self._channel.basic_get(
-        queue=queue_name,
-        auto_ack=False,
-      )
+      channel_generation, channel = session
+      deadline = time.monotonic() + timeout if timeout > 0 else None
+      while True:
+        method_frame, _header_frame, body = channel.basic_get(
+          queue=queue_name,
+          auto_ack=False,
+        )
 
-      if method_frame:
-        delivery_tag = method_frame.delivery_tag
-        self._last_delivery_tag = delivery_tag
-        if track_in_flight:
-          self._track_in_flight(delivery_tag)
-        return (body, delivery_tag)
+        if method_frame:
+          delivery_tag = method_frame.delivery_tag
+          token = _RabbitMQAckToken(delivery_tag, channel_generation)
+          self._last_delivery_tag = delivery_tag
+          if track_in_flight:
+            self._track_in_flight(token)
+          return (body, token)
+        if deadline is None:
+          return (None, None)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          return (None, None)
+        connection = self._connection
+        if connection is not None:
+          connection.process_data_events(time_limit=min(0.05, remaining))
+        else:
+          time.sleep(min(0.05, remaining))
     except AMQPError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(
@@ -648,16 +765,14 @@ class RabbitMQBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
-    return (None, None)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message via ``basic_ack``.
 
-    With a ``token`` (the scheduler path under
-    ``CONCURRENT_REQUESTS > 1``): ``basic_ack(delivery_tag=token,
-    multiple=False)`` the specific message and remove it from the
-    in-flight set. Order-independent — ack the right tag regardless of
-    pop/ack interleaving.
+    With a current-generation token (the scheduler path under
+    ``CONCURRENT_REQUESTS > 1``), acknowledge the specific message and
+    remove it from the in-flight set. Tokens from a closed channel are
+    ignored because delivery tags may be reused by the next channel.
 
     Without a ``token`` (legacy single-pop caller): ``basic_ack`` the
     tracked ``_last_delivery_tag``. Only correct for
@@ -669,25 +784,31 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     Args:
         queue_name: Name of the queue (unused; kept for interface symmetry).
-        token: A delivery tag from :meth:`pop_with_ack`, or ``None`` for
-            the legacy last-tag path.
+        token: An opaque token from :meth:`pop_with_ack`, or ``None`` for
+            the legacy last-tag path. Unknown or stale tokens are ignored.
 
     Raises:
         QueueError: If ``basic_ack`` fails at the AMQP layer.
     """
     del queue_name
     if token is not None:
-      delivery_tag = int(token)
-      if self._channel is None:
+      if not isinstance(token, _RabbitMQAckToken):
         return
+      if token._completed:
+        return
+      session = self._channel_session
+      if session is None or token.channel_generation != session[0]:
+        return
+      channel = session[1]
       try:
-        self._channel.basic_ack(delivery_tag=delivery_tag, multiple=False)
+        channel.basic_ack(delivery_tag=token.delivery_tag, multiple=False)
       except AMQPError as e:
         msg = f"Failed to ack RabbitMQ message: {e}"
         raise QueueError(msg, operation="ack") from e
-      finally:
-        self._in_flight_tags.discard(delivery_tag)
-        if self._last_delivery_tag == delivery_tag:
+      else:
+        token._completed = True
+        self._in_flight_tags.discard(token)
+        if self._last_delivery_tag == token.delivery_tag:
           self._last_delivery_tag = None
       return
     # Legacy path: ack the tracked last-popped tag.
@@ -698,36 +819,42 @@ class RabbitMQBackend(Backend, QueueBackend):
     except AMQPError as e:
       msg = f"Failed to ack RabbitMQ message: {e}"
       raise QueueError(msg, operation="ack") from e
-    finally:
+    else:
       self._last_delivery_tag = None
 
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Nack a popped message; requeue it for retry.
 
-    With a ``token``: ``basic_nack(delivery_tag=token, requeue=True)`` the
-    specific message. Without a ``token``: nack the tracked last-popped
-    tag (legacy).
+    With a current-generation token, negatively acknowledge the specific
+    message. Tokens from a closed channel are ignored. Without a token,
+    nack the tracked last-popped tag (legacy).
 
     Args:
         queue_name: Name of the queue (unused; interface symmetry).
-        token: A delivery tag from :meth:`pop_with_ack`, or ``None``.
+        token: An opaque token from :meth:`pop_with_ack`, or ``None``.
 
     Raises:
         QueueError: If ``basic_nack`` fails at the AMQP layer.
     """
     del queue_name
     if token is not None:
-      delivery_tag = int(token)
-      if self._channel is None:
+      if not isinstance(token, _RabbitMQAckToken):
         return
+      if token._completed:
+        return
+      session = self._channel_session
+      if session is None or token.channel_generation != session[0]:
+        return
+      channel = session[1]
       try:
-        self._channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+        channel.basic_nack(delivery_tag=token.delivery_tag, requeue=True)
       except AMQPError as e:
         msg = f"Failed to nack RabbitMQ message: {e}"
         raise QueueError(msg, operation="nack") from e
-      finally:
-        self._in_flight_tags.discard(delivery_tag)
-        if self._last_delivery_tag == delivery_tag:
+      else:
+        token._completed = True
+        self._in_flight_tags.discard(token)
+        if self._last_delivery_tag == token.delivery_tag:
           self._last_delivery_tag = None
       return
     # Legacy path: nack the tracked last-popped tag.
@@ -741,7 +868,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     except AMQPError as e:
       msg = f"Failed to nack RabbitMQ message: {e}"
       raise QueueError(msg, operation="nack") from e
-    finally:
+    else:
       self._last_delivery_tag = None
 
   def queue_len(self, queue_name: str) -> int:
@@ -756,6 +883,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         QueueError: If the queue_len operation fails.
     """
+    _validate_key_name(queue_name, "queue_name")
     if self._channel is None:
       msg = "Not connected to RabbitMQ"
       raise QueueError(msg, queue_name=queue_name, operation="queue_len")
@@ -779,8 +907,13 @@ class RabbitMQBackend(Backend, QueueBackend):
         QueueError: If the purge fails at the AMQP layer (broker dropped the
             channel, transient AMQPError during reset/teardown).
     """
+    _validate_key_name(queue_name, "queue_name")
     if self._channel is None:
-      return
+      raise QueueError(
+        "Not connected to RabbitMQ",
+        queue_name=queue_name,
+        operation="clear_queue",
+      )
     try:
       self._channel.queue_purge(queue=queue_name)
     except AMQPError as e:

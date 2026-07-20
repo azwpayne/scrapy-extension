@@ -257,10 +257,10 @@ def test_T2_connect_all_attempts_fail_raises(patch_sleep_random):
   fake = FakeBackend(connect_failures=99)
   m = _manager_with_backend(fake)
   with pytest.raises(
-    BackendConnectionError, match="Failed to connect after 3 attempts"
+    BackendConnectionError, match="Failed to connect after 4 attempts"
   ):
     m.connect()
-  assert fake.connect_calls == 3
+  assert fake.connect_calls == 4
 
 
 def test_T3_connect_emits_on_retry_monitor(patch_sleep_random):
@@ -374,7 +374,7 @@ def test_T10_backend_property_owner_error_propagates_to_all_waiters():
   """T10: one failed attempt is fanned out to every waiting peer."""
   connect_block = threading.Event()
   fake = FakeBackend(connect_failures=99, connect_block=connect_block)
-  m = ConnectionManager("redis", {"k": 10, "retry_attempts": 1, "retry_delay": 0.0})
+  m = ConnectionManager("redis", {"k": 10, "retry_attempts": 0, "retry_delay": 0.0})
   m._create_backend = lambda: fake  # type: ignore[method-assign]
 
   barrier = threading.Barrier(3)
@@ -520,17 +520,21 @@ def test_connect_re_raises_keyboard_interrupt_not_swallowed_by_retry(
     m.connect()
 
 
-def test_connect_zero_retry_attempts_is_a_silent_noop(patch_sleep_random):
-  """586->exit: ``retry_attempts=0`` -> the for-loop body never runs,
-  ``last_exception`` stays None, and connect() falls through the trailing
-  ``if last_exception is not None`` guard (FALSE branch) to an implicit
-  return. Characterizes the current behavior; the success-path ``else``
-  (line 580) is unreachable when there are no attempts."""
+def test_connect_zero_retries_makes_one_initial_attempt(patch_sleep_random):
+  """``retry_attempts=0`` means one initial attempt and no retries."""
+  from scrapy_extension.exceptions import BackendConnectionError
+
   fake = FakeBackend(connect_failures=99)
   m = ConnectionManager("redis", {"retry_attempts": 0, "retry_delay": 1.0})
   m._create_backend = lambda: fake  # type: ignore[method-assign]
-  m.connect()  # no attempts -> no raise, silent return
-  assert fake.connect_calls == 0
+
+  with pytest.raises(
+    BackendConnectionError, match="Failed to connect after 1 attempt"
+  ):
+    m.connect()
+
+  assert fake.connect_calls == 1
+  assert patch_sleep_random == []
 
 
 def test_clear_registry_resets_each_configured_breaker(monkeypatch):

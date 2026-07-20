@@ -67,6 +67,16 @@ class TestSqsBackendType:
     assert s.mode is SqsMode.STANDALONE
     assert s.region_name == "us-east-1"
     assert s.queue_name_prefix == "scrapy-"
+    assert s.visibility_timeout == 300
+
+  @pytest.mark.parametrize("timeout", [0, 43_201])
+  def test_visibility_timeout_respects_sqs_api_bounds(self, timeout: int) -> None:
+    with pytest.raises(ValueError, match="visibility_timeout"):
+      SqsSettings(visibility_timeout=timeout)
+
+  @pytest.mark.parametrize("timeout", [1, 43_200])
+  def test_visibility_timeout_accepts_supported_boundaries(self, timeout: int) -> None:
+    assert SqsSettings(visibility_timeout=timeout).visibility_timeout == timeout
 
 
 class TestSqsConnect:
@@ -151,12 +161,29 @@ class TestSqsPushPop:
 
     assert exc_info.value.queue_name == "queue1"
     assert exc_info.value.operation == "pop"
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/test",
+      ReceiptHandle="rh",
+    )
 
   def test_pop_caps_wait_at_20(self, mocker) -> None:
     b, client = _connected(mocker)
     client.receive_message.return_value = {}
     b.pop("queue1", timeout=99.0)
     assert client.receive_message.call_args.kwargs["WaitTimeSeconds"] == 20
+    assert client.receive_message.call_args.kwargs["VisibilityTimeout"] == 300
+
+  def test_pop_wait_and_processing_visibility_are_independent(self, mocker) -> None:
+    b = _make_backend(visibility_timeout=90)
+    client = mocker.MagicMock()
+    client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
+    client.receive_message.return_value = {}
+    b._client = client
+
+    b.pop("queue1", timeout=7.0)
+
+    assert client.receive_message.call_args.kwargs["WaitTimeSeconds"] == 7
+    assert client.receive_message.call_args.kwargs["VisibilityTimeout"] == 90
 
 
 class TestSqsAckNack:
@@ -179,7 +206,7 @@ class TestSqsAckNack:
     b.ack("queue1")
     client.delete_message.assert_not_called()
 
-  def test_nack_is_noop_and_clears_receipt(self, mocker) -> None:
+  def test_nack_makes_message_immediately_visible_and_clears_receipt(self, mocker) -> None:
     import base64
 
     b, client = _connected(mocker)
@@ -189,16 +216,80 @@ class TestSqsAckNack:
     b.pop("queue1")
     b.nack("queue1")
     client.delete_message.assert_not_called()
+    client.change_message_visibility.assert_called_once_with(
+      QueueUrl="https://sqs/test",
+      ReceiptHandle="rh",
+      VisibilityTimeout=0,
+    )
     assert b._last_receipt is None
 
 
 class TestSqsLenClear:
+  def test_queue_len_counts_visible_in_flight_and_delayed_messages(
+    self, mocker
+  ) -> None:
+    b, client = _connected(mocker)
+    client.get_queue_attributes.return_value = {
+      "Attributes": {
+        "ApproximateNumberOfMessages": "0",
+        "ApproximateNumberOfMessagesNotVisible": "4",
+        "ApproximateNumberOfMessagesDelayed": "3",
+      }
+    }
+
+    assert b.queue_len("queue1") == 7
+    client.get_queue_attributes.assert_called_once_with(
+      QueueUrl="https://sqs/test",
+      AttributeNames=[
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+        "ApproximateNumberOfMessagesDelayed",
+      ],
+    )
+
   def test_queue_len_reads_attributes(self, mocker) -> None:
     b, client = _connected(mocker)
     client.get_queue_attributes.return_value = {
-      "Attributes": {"ApproximateNumberOfMessages": "42"}
+      "Attributes": {
+        "ApproximateNumberOfMessages": "42",
+        "ApproximateNumberOfMessagesNotVisible": "0",
+        "ApproximateNumberOfMessagesDelayed": "0",
+      }
     }
     assert b.queue_len("queue1") == 42
+
+  def test_queue_len_missing_depth_attribute_raises_queue_error(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.get_queue_attributes.return_value = {
+      "Attributes": {
+        "ApproximateNumberOfMessages": "1",
+        "ApproximateNumberOfMessagesNotVisible": "2",
+      }
+    }
+
+    with pytest.raises(QueueError) as exc_info:
+      b.queue_len("queue1")
+
+    assert exc_info.value.operation == "queue_len"
+    assert isinstance(exc_info.value.__cause__, KeyError)
+
+  def test_queue_len_non_numeric_depth_attribute_raises_queue_error(
+    self, mocker
+  ) -> None:
+    b, client = _connected(mocker)
+    client.get_queue_attributes.return_value = {
+      "Attributes": {
+        "ApproximateNumberOfMessages": "1",
+        "ApproximateNumberOfMessagesNotVisible": "not-a-number",
+        "ApproximateNumberOfMessagesDelayed": "2",
+      }
+    }
+
+    with pytest.raises(QueueError) as exc_info:
+      b.queue_len("queue1")
+
+    assert exc_info.value.operation == "queue_len"
+    assert isinstance(exc_info.value.__cause__, ValueError)
 
   def test_queue_len_error_raises_queue_error(self, mocker) -> None:
     """R-sqs-qlen: queue_len must wrap backend errors as QueueError, NOT
@@ -215,8 +306,10 @@ class TestSqsLenClear:
     """
     b, client = _connected(mocker)
     client.get_queue_attributes.side_effect = RuntimeError("oops")
-    with pytest.raises(QueueError):
+    with pytest.raises(QueueError) as exc_info:
       b.queue_len("queue1")
+    assert exc_info.value.operation == "queue_len"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
   def test_clear_purges_queue(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -464,7 +557,7 @@ class TestSqsRealInFlightAck:
 
 
 class TestSqsRealNack:
-  def test_nack_with_token_is_noop_and_discards_from_in_flight(
+  def test_nack_with_token_requeues_immediately_and_discards_from_in_flight(
     self, mocker
   ) -> None:
     import base64
@@ -476,10 +569,27 @@ class TestSqsRealNack:
     _, tok = b.pop_with_ack("q")
     assert tok in b._in_flight
     b.nack("q", token=tok)
-    # No delete_message call — SQS re-delivers on visibility timeout.
+    # No delete_message call; visibility=0 makes the message available now.
     client.delete_message.assert_not_called()
+    client.change_message_visibility.assert_called_once_with(
+      QueueUrl="https://sqs/test",
+      ReceiptHandle="rh-1",
+      VisibilityTimeout=0,
+    )
     # Token removed from the in-flight set.
     assert tok not in b._in_flight
+
+  def test_nack_failure_raises_queue_error_and_keeps_local_token(self, mocker) -> None:
+    token = _SqsAckToken("https://sqs/test", "rh-1")
+    b, client = _connected(mocker)
+    b._in_flight.add(token)
+    client.change_message_visibility.side_effect = RuntimeError("visibility failed")
+
+    with pytest.raises(QueueError) as exc_info:
+      b.nack("q", token=token)
+
+    assert exc_info.value.operation == "nack"
+    assert token in b._in_flight
 
 
 class TestSqsCrashMidAck:
@@ -571,7 +681,23 @@ class TestSqsLegacyAckCompat:
     b.pop("queue1")
     b.nack("queue1")  # no token
     client.delete_message.assert_not_called()
+    client.change_message_visibility.assert_called_once_with(
+      QueueUrl="https://sqs/test",
+      ReceiptHandle="rh",
+      VisibilityTimeout=0,
+    )
     assert b._last_receipt is None
+
+  def test_foreign_token_does_not_ack_or_nack_legacy_receipt(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b._last_receipt = ("https://sqs/test", "legacy-rh")
+
+    b.ack("queue1", token=object())
+    b.nack("queue1", token=object())
+
+    client.delete_message.assert_not_called()
+    client.change_message_visibility.assert_not_called()
+    assert b._last_receipt == ("https://sqs/test", "legacy-rh")
 
 
 # ---------------------------------------------------------------------------

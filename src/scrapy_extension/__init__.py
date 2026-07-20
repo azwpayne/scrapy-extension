@@ -9,7 +9,9 @@ from __future__ import annotations
 import importlib
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from typing import TYPE_CHECKING
 
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -19,9 +21,12 @@ from scrapy_extension.backends.base import (
     SetBackend,
     StorageBackend,
 )
-from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.connectors import (
+    ConnectionManager,
+    resolve_backend_config,
+)
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
-from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 from scrapy_extension.dupefilter.filters.factory import (
@@ -36,12 +41,39 @@ from scrapy_extension.exceptions import (
     ConfigurationError,
     QueueError,
     SerializationError,
+    StorageError,
 )
+from scrapy_extension.monitor import Monitor, NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings.base import Settings
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
+
+if TYPE_CHECKING:
+    from scrapy_extension.backends.dynamodb import DynamoDBBackend
+    from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+    from scrapy_extension.backends.kafka import KafkaBackend
+    from scrapy_extension.backends.memcached import MemcachedBackend
+    from scrapy_extension.backends.mongodb import MongoDBBackend
+    from scrapy_extension.backends.pulsar import PulsarBackend
+    from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.backends.rocketmq import RocketMQBackend
+    from scrapy_extension.backends.sqs import SqsBackend
+    from scrapy_extension.settings.dynamodb import DynamoDBMode, DynamoDBSettings
+    from scrapy_extension.settings.elasticsearch import (
+        ElasticSearchMode,
+        ElasticSearchSettings,
+    )
+    from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
+    from scrapy_extension.settings.memcached import MemcachedMode, MemcachedSettings
+    from scrapy_extension.settings.mongodb import MongoDBMode, MongoDBSettings
+    from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
+    from scrapy_extension.settings.rabbitmq import RabbitMQMode, RabbitMQSettings
+    from scrapy_extension.settings.redis import RedisMode, RedisSettings
+    from scrapy_extension.settings.rocketmq import RocketMQMode, RocketMQSettings
+    from scrapy_extension.settings.sqs import SqsMode, SqsSettings
 
 try:
     __version__ = _pkg_version("scrapy-extension")
@@ -167,17 +199,10 @@ def _is_missing_optional_dep(exc: ImportError, module_path: str) -> bool:
     imports some third-party helper that itself went missing) — is treated
     as a real bug and surfaced as-is.
     """
-    if not isinstance(exc, ModuleNotFoundError):
-        return False
-    missing_name = getattr(exc, "name", None)
-    if not missing_name:
-        return False
     dep_modules = _OPTIONAL_DEP_MODULES.get(module_path, frozenset())
-    if not dep_modules:
-        return False
-    return (
-        missing_name in dep_modules
-        or missing_name.split(".", 1)[0] in dep_modules
+    return any(
+        _is_missing_optional_dependency(exc, dependency)
+        for dependency in dep_modules
     )
 
 
@@ -251,6 +276,7 @@ __all__ = [
     "ElasticSearchBackend",
     "ElasticSearchMode",
     "ElasticSearchSettings",
+    "FilterFull",
     "JSONSerializer",
     "KafkaBackend",
     "KafkaMode",
@@ -263,6 +289,8 @@ __all__ = [
     "MongoDBBackend",
     "MongoDBMode",
     "MongoDBSettings",
+    "Monitor",
+    "NullMonitor",
     "PulsarBackend",
     "PulsarMode",
     "PulsarSettings",
@@ -277,6 +305,7 @@ __all__ = [
     "RocketMQBackend",
     "RocketMQMode",
     "RocketMQSettings",
+    "ScrapyStatsMonitor",
     "SerializationError",
     # Serialization
     "Serializer",
@@ -288,5 +317,7 @@ __all__ = [
     "SqsMode",
     "SqsSettings",
     "StorageBackend",
+    "StorageError",
     "build_membership_filter",
+    "resolve_backend_config",
 ]

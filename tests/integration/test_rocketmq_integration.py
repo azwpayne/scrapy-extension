@@ -16,8 +16,8 @@ apache rocketmq-python-client 5.1.1 gRPC):
   ``_drain`` acks each message as it arrives.
 - ``pop(timeout=t)`` passes ``t`` as the invisible-duration (seconds; default
   15s when t=0). ``receive`` long-polls up to the consumer's await_duration.
-- ``queue_len`` returns ``0`` (no broker-side depth RPC) — RocketMQ has no count API;
-  counts are verified by popping, not queue_len.
+- ``queue_len`` raises ``NotImplementedError`` (no broker-side depth RPC) so
+  unknown depth cannot be mistaken for an empty queue.
 - Topic name is ``{topic_prefix}_{queue_name}``. **RocketMQ topic names
   reject colons**, so this suite uses hyphen-delimited queue names (not the
   ``inttest:`` colon style of the other suites) or pushes fail.
@@ -28,8 +28,8 @@ What's pinned
   verification: pre-R7 this returned 0 (pop always None).
 - ``test_pop_empty_returns_none`` — pop on a topic with no messages returns
   None after the receive timeout (no spurious hang/raise).
-- ``test_queue_len_returns_zero`` — RocketMQ queue_len returns 0
-  (standardized with Kafka/Pulsar/SQS).
+- ``test_queue_len_reports_unsupported`` — RocketMQ reports that depth is
+  unavailable instead of pretending the queue is empty.
 
 Running
 -------
@@ -250,16 +250,7 @@ def test_pop_empty_returns_none(rocketmq_backend, unique_prefix):
   )
 
 
-def test_queue_len_returns_zero(rocketmq_backend, unique_prefix):
-  """RocketMQ queue_len returns 0 — standardized with Kafka/Pulsar/SQS.
-
-  c92b128 (Risk 1) changed queue_len from raising NotImplementedError to
-  returning 0 + a once-per-process warning, standardizing the
-  unsupported-depth contract across the MQ-only backends (Kafka/Pulsar/SQS
-  already return 0). RocketMQ's deferred-ack model has no broker-side depth
-  RPC, so 0 is the honest answer; the scheduler's ``has_pending_requests``
-  treats it conservatively. (Depth-query errors stay inside ``_probe_depth``,
-  which propagates them so has_pending_requests stays conservative on lookup
-  failure rather than crashing the pop loop as the old raise did.)
-  """
-  assert rocketmq_backend.queue_len(f"{unique_prefix}-qlen") == 0
+def test_queue_len_reports_unsupported(rocketmq_backend, unique_prefix):
+  """Unknown RocketMQ depth must not masquerade as an empty queue."""
+  with pytest.raises(NotImplementedError, match="broker-side depth RPC"):
+    rocketmq_backend.queue_len(f"{unique_prefix}-qlen")

@@ -15,29 +15,34 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
+
 try:
-    from pymongo import ASCENDING, MongoClient
-    from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
+  from pymongo import ASCENDING, MongoClient
+  from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 except ImportError as e:
-    raise ImportError(
-        "MongoDB backend requires 'pymongo'. Install with: pip install scrapy-extension[mongodb]"
-    ) from e
+  if not _is_missing_optional_dependency(e, "pymongo"):
+    raise
+  raise ImportError(
+    "MongoDB backend requires 'pymongo'. Install with: pip install scrapy-extension[mongodb]"
+  ) from e
 
 from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
-    Backend,
-    BackendType,
-    QueueBackend,
-    SetBackend,
-    StorageBackend,
-    _hash_item,
-    _validate_key_name,
-    secret_value,
+  Backend,
+  BackendType,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
+  _hash_item,
+  _validate_key_name,
+  _validate_ttl,
+  secret_value,
 )
 from scrapy_extension.exceptions import (
-    BackendConnectionError,
-    ConfigurationError,
-    QueueError,
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
 )
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
@@ -133,18 +138,34 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._connect_atlas()
       logger.debug("Connected to MongoDB in %s mode", self.config.mode.value)
     except ConnectionFailure as e:
+      self._discard_client()
       msg = f"Failed to connect to MongoDB ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="mongodb",
       ) from e
     except Exception as e:
+      self._discard_client()
       # Unexpected errors (e.g., RuntimeError from mocking in tests)
       msg = f"Failed to connect to MongoDB ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="mongodb",
       ) from e
+
+  def _discard_client(self) -> None:
+    """Clear all handles and best-effort close the current client."""
+    client = self._client
+    self._client = None
+    self._db = None
+    self._queue_collection = None
+    self._set_collection = None
+    self._storage_collection = None
+    if client is not None:
+      try:
+        client.close()
+      except Exception:
+        logger.debug("Failed to close MongoDB client", exc_info=True)
 
   def _build_client_kwargs(self) -> dict[str, Any]:
     """Build common MongoDB client kwargs.
@@ -330,7 +351,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise BackendConnectionError(msg, backend_type="mongodb")
     # Queue indexes
     self._queue_collection.create_index(
-      [("queue_name", ASCENDING), ("priority", ASCENDING), ("created_at", ASCENDING)]
+      [
+        ("queue_name", ASCENDING),
+        ("priority", ASCENDING),
+        ("created_at", ASCENDING),
+      ]
     )
 
     # Set indexes
@@ -348,13 +373,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def disconnect(self) -> None:
     """Close MongoDB connection."""
-    if self._client:
-      self._client.close()
-      self._client = None
-      self._db = None
-      self._queue_collection = None
-      self._set_collection = None
-      self._storage_collection = None
+    self._discard_client()
 
   def is_connected(self) -> bool:
     """Check if MongoDB is connected.
@@ -573,12 +592,18 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    result = self._set_collection.delete_one(
-      {
-        "set_name": set_name,
-        "item_hash": _hash_item(item),
-      }
-    )
+    try:
+      result = self._set_collection.delete_one(
+        {
+          "set_name": set_name,
+          "item_hash": _hash_item(item),
+        }
+      )
+    except PyMongoError as e:
+      raise BackendConnectionError(
+        f"MongoDB set remove failed for {set_name!r}: {e}",
+        backend_type="mongodb",
+      ) from e
     return result.deleted_count > 0
 
   def contains(self, set_name: str, item: bytes) -> bool:
@@ -599,12 +624,18 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    result = self._set_collection.find_one(
-      {
-        "set_name": set_name,
-        "item_hash": _hash_item(item),
-      }
-    )
+    try:
+      result = self._set_collection.find_one(
+        {
+          "set_name": set_name,
+          "item_hash": _hash_item(item),
+        }
+      )
+    except PyMongoError as e:
+      raise BackendConnectionError(
+        f"MongoDB set contains failed for {set_name!r}: {e}",
+        backend_type="mongodb",
+      ) from e
     return result is not None
 
   def set_len(self, set_name: str) -> int:
@@ -625,9 +656,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self._set_collection is None:
       msg = "MongoDBBackend not connected: set collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
-    return self._set_collection.count_documents(
-      {"set_name": set_name}, limit=100000
-    )
+    try:
+      return self._set_collection.count_documents({"set_name": set_name}, limit=100000)
+    except PyMongoError as e:
+      raise BackendConnectionError(
+        f"MongoDB set length failed for {set_name!r}: {e}",
+        backend_type="mongodb",
+      ) from e
 
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
@@ -653,7 +688,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # graceful-degradation arm can fire; a raw leak crashes callers
       # expecting BackendError.
       raise BackendConnectionError(
-        f"MongoDB set clear failed for {set_name!r}: {e}", backend_type="mongodb"
+        f"MongoDB set clear failed for {set_name!r}: {e}",
+        backend_type="mongodb",
       ) from e
 
   # StorageBackend implementation
@@ -673,6 +709,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ``except BackendError``).
     """
     _validate_key_name(key, "key")
+    _validate_ttl(ttl)
     self._assert_connected()
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
@@ -694,14 +731,48 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to store key {key!r} in MongoDB: {e}"
       raise StorageError(msg, operation="store", key=key) from e
 
+  @staticmethod
+  def _remaining_storage_ttl(document: dict[str, Any]) -> float | None:
+    """Return seconds until ``document`` expires, or None without a TTL."""
+    raw_expiry = document.get("expireAt")
+    if raw_expiry is None:
+      return None
+
+    expire_at = cast(datetime, raw_expiry)
+    # BSON datetimes are UTC, but PyMongo returns them without tzinfo unless
+    # the client opts into tz-aware decoding.
+    if expire_at.tzinfo is None:
+      expire_at = expire_at.replace(tzinfo=timezone.utc)
+    return (expire_at - datetime.now(tz=timezone.utc)).total_seconds()
+
+  def _lazy_reap_expired_storage(self, document: dict[str, Any], key: str) -> bool:
+    """Conditionally reap an expired snapshot and report whether it expired."""
+    remaining = self._remaining_storage_ttl(document)
+    if remaining is None or remaining > 0:
+      return False
+
+    if self._storage_collection is None:
+      msg = "MongoDBBackend not connected: storage collection is None"
+      raise BackendConnectionError(msg, backend_type="mongodb")
+    try:
+      # The read snapshot may be stale: a concurrent store() can replace the
+      # same key before this delete runs. Matching the observed expireAt makes
+      # the cleanup a CAS, so a fresh replacement is not removed.
+      self._storage_collection.delete_one(
+        {"key": key, "expireAt": document["expireAt"]}
+      )
+    except PyMongoError as e:
+      logger.warning("Failed to reap expired MongoDB storage key %r: %s", key, e)
+    return True
+
   def retrieve(self, key: str) -> bytes | None:
-    """Retrieve data by key.
+    """Retrieve current data by key.
 
     Args:
         key: Storage key.
 
     Returns:
-        Stored data, or None if not found.
+        Stored data, or None if not found or expired.
 
     Raises:
         BackendConnectionError: If not connected.
@@ -714,6 +785,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise BackendConnectionError(msg, backend_type="mongodb")
     try:
       result = self._storage_collection.find_one({"key": key})
+      if result and self._lazy_reap_expired_storage(result, key):
+        return None
     except PyMongoError as e:
       msg = f"Failed to retrieve key {key!r} from MongoDB: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
@@ -748,13 +821,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     return result.deleted_count > 0
 
   def exists(self, key: str) -> bool:
-    """Check if key exists.
+    """Check if key exists and has not expired.
 
     Args:
         key: Storage key.
 
     Returns:
-        True if key exists.
+        True if key exists and is current.
 
     Raises:
         BackendConnectionError: If not connected.
@@ -766,7 +839,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = "MongoDBBackend not connected: storage collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
     try:
-      result = self._storage_collection.find_one({"key": key}, {"_id": 1})
+      result = self._storage_collection.find_one(
+        {"key": key}, {"_id": 1, "expireAt": 1}
+      )
+      if result and self._lazy_reap_expired_storage(result, key):
+        return False
     except PyMongoError as e:
       msg = f"Failed to check existence of key {key!r} in MongoDB: {e}"
       raise StorageError(msg, operation="exists", key=key) from e
@@ -779,8 +856,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
 
     Returns:
-        Seconds remaining, None if no TTL or key doesn't exist,
-        -1 if expired (rare since MongoDB TTL index auto-deletes).
+        Non-negative seconds remaining, or None if absent, permanent, or expired.
 
     Raises:
         BackendConnectionError: If not connected.
@@ -798,24 +874,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise StorageError(msg, operation="ttl", key=key) from e
     if result is None:
       return None
-    if "expireAt" not in result:
+    remaining = self._remaining_storage_ttl(result)
+    if remaining is None:
       return None
-
-    expire_at = result["expireAt"]
-    # PyMongo returns naive UTC datetimes by default (``tz_aware=False`` on the
-    # client). ``store()`` writes an aware datetime, but BSON stores UTC without
-    # tzinfo and PyMongo strips it on read-back — so a naive ``expire_at``
-    # subtracted from an aware ``datetime.now(tz=timezone.utc)`` raises
-    # ``TypeError: can't subtract offset-naive and offset-aware datetimes``.
-    # Normalize the read-back to aware UTC (the value IS UTC per BSON spec).
-    if expire_at.tzinfo is None:
-      expire_at = expire_at.replace(tzinfo=timezone.utc)
-    remaining = (expire_at - datetime.now(tz=timezone.utc)).total_seconds()
-    # 2026-07-11 (#30): -1 for expired per the StorageBackend ttl() contract
-    # (None=no-TTL/missing, -1=expired), matching ElasticSearch. MongoDB's TTL
-    # index normally auto-deletes expired docs before this branch is reached,
-    # but a misconfigured/delayed index can surface an expired doc here.
-    return -1 if remaining <= 0 else max(0, int(remaining))
+    if remaining <= 0:
+      self._lazy_reap_expired_storage(result, key)
+      return None
+    return max(0, int(remaining))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.

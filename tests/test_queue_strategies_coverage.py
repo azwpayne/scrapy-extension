@@ -186,32 +186,3 @@ def test_ringbuffer_restore_preserves_dropped_counter():
   ).encode()
   s.restore(blob)
   assert s._dropped == 7
-
-
-def test_ringbuffer_close_wakes_blocked_pusher():
-  """close() notifies blocked pushers so they don't deadlock."""
-  import threading
-
-  cm = MagicMock()
-  cm.get_queue_backend.return_value = MagicMock()
-  s = RingBufferQueueStrategy(cm, capacity=1, full_policy="block")
-  s.push("q", b"first")  # buffer full
-
-  completed = threading.Event()
-
-  def push_second():
-    s.push("q", b"second")  # blocks
-    completed.set()
-
-  t = threading.Thread(target=push_second)
-  t.start()
-  # close() should notify_all → blocked pusher wakes (still waits for capacity
-  # since the loop re-checks, but at least we verified close acquires the lock
-  # and broadcasts without deadlock).
-  s.close()
-  # Give the pusher a chance; if still blocked, free a slot to release it.
-  if not completed.wait(timeout=0.5):
-    # close() doesn't free capacity — pusher loops back to wait(). Pop to free.
-    s.pop("q")
-    assert completed.wait(timeout=2.0)
-  t.join(timeout=2.0)

@@ -14,6 +14,44 @@ crawlers carrying unsafe or incoherent config. Each item is security-motivated
 and was previously a silent footgun, but they ARE behavior breaks — read before
 upgrading.
 
+- **Redis now uses a namespaced, domain-separated physical-key layout.** Queue,
+  set, and storage operations no longer address legacy raw keys. The default
+  namespace is `scrapy-extension`; independent applications sharing a Redis
+  database must choose distinct `SCRAPY_REDIS_NAMESPACE` values. There is no
+  implicit legacy fallback because it could read or delete another
+  application's key. Drain or explicitly migrate persistent data before
+  upgrading; see [`docs/migration-guide.md`](docs/migration-guide.md).
+- **Storage TTL inputs and results are uniform across all five backends.** Direct
+  `StorageBackend.store` calls accept only `None` or a positive integer number
+  of seconds; zero, negatives, floats, and booleans now raise `ValueError`.
+  `ttl()` returns a non-negative integer or `None`; Redis/MongoDB/ElasticSearch/
+  DynamoDB no longer expose backend-specific `-2`, `-1`, or expired `0`
+  sentinels. `SCRAPY_PIPELINE_TTL=0` remains the pipeline-level permanent-value
+  shorthand and is normalized to `None`.
+- **Memcached global clear is disabled by default.** Because Memcached cannot
+  scope deletion to this extension, `clear_storage(None)` now raises
+  `NotImplementedError` unless `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`.
+  Prefix clearing remains unsupported. Enabling the flag issues server-wide
+  `flush_all` and is intended only for dedicated instances.
+- **Unknown bundled-backend settings now fail fast.** Nested extras and typoed
+  flat/environment names under a selected backend prefix raise
+  `ConfigurationError` (with a nearest-name suggestion) instead of silently
+  falling back to defaults. Pydantic type/range/enum failures continue to use
+  `ValidationError`.
+- **Pulsar and RocketMQ queue depth is explicitly unsupported.** Their
+  `queue_len()` methods raise `NotImplementedError` instead of returning false
+  zero, so scheduler idle detection remains conservative. Callers that treated
+  zero as empty must handle the unsupported signal.
+- **`priority` and `work_stealing` are rejected with Kafka and RocketMQ.** Those
+  backends' single consumers cannot isolate a scan to one strategy-created
+  physical topic; the previous combinations could rebalance, consume from the
+  wrong topic, or invalidate ack correlation.
+- **Malformed broker payloads are terminally consumed.** When deserialization
+  deterministically fails and an ack token exists, `BackendQueue` attempts to
+  ack/drop the delivery, increments `scheduler/queue/poison_dropped`, and still
+  raises `SerializationError`. The prior nack/redelivery behavior could pin a
+  Kafka partition or create a permanently hot poison loop.
+
 - **Pulsar `auth_token` now requires `pulsar+ssl://`.** `PulsarSettings(
   auth_token=…)` rejects `service_url` values that do not start with
   `pulsar+ssl://` (round-9c SV3-2). Sending a token over plaintext `pulsar://`
@@ -45,15 +83,14 @@ upgrading.
   **Additive:** registered 3rd-party backend strings (entry-point group
   `scrapy_extension.backends`) are now ACCEPTED at the Settings layer — they
   were previously rejected as `ValidationError`, contradicting round-5 R5-1.
-- **`BackendQueue` strategy snapshots are now scoped by `(spider.name, queue_name)`** (#16).
-  The snapshot storage key changed from `queue:snapshot:<queue_name>` to
-  `queue:snapshot:<spider.name>:<queue_name>`. Two spiders sharing a storage
-  backend with the same `queue_name` previously overwrote each other's
-  `Delay`-strategy snapshot on close (and on restart one restored the wrong
-  spider's held heap). **BREAKING for multi-spider deployments**: legacy
-  snapshots under the old key are orphaned on upgrade (ignored, not restored);
-  no migration is provided because the prior format (#13) shipped immediately
-  before this fix. Single-spider deployments are unaffected.
+- **Strategy snapshots support stable per-worker ownership.** Without an owner,
+  the existing spider+queue key remains for single-worker compatibility. Setting
+  `SCRAPY_QUEUE_SNAPSHOT_OWNER` (or the `SCRAPY_QUEUE_WORKER_ID` fallback)
+  selects a length-prefixed v2 key so same-spider workers cannot overwrite one
+  another. A successfully restored snapshot is now consumed/deleted and is
+  rewritten only on the next clean close, preventing stale replay after a later
+  crash. Enabling an owner intentionally leaves the old unowned key untouched;
+  migrate or discard it explicitly.
 - **RocketMQ backend rewritten against apache `rocketmq-python-client` 5.1.1 gRPC** (#15/#44).
   The prior backend's `connect()` imported fictional API paths
   (`rocketmq.consumer.SimpleConsumer`, `rocketmq.endpoint.Endpoint`, …) matching
@@ -70,24 +107,30 @@ upgrading.
   creation" subsection (`enableAutoTopicCreation` in `rmq-proxy.json` or
   `mqadmin updateTopic`). Two real production bugs fixed in the rewrite:
   `is_connected()` was calling `is_running()` (a bool **property**, not a
-  method) → every push/pop raised "Not connected"; and `invisible_duration`
-  is now clamped to the broker's 10s floor (was error 40011 on any
-  polling-style timeout < 10s). Deferred-ack semantics preserved (initiative
-  #4): `pop` returns the body without acking; the caller acks via
-  `ack(token=msg)` for at-least-once delivery.
+  method) → every push/pop raised "Not connected". Poll wait and processing
+  invisibility are now separate controls: `timeout` changes only the receive
+  wait, while `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s, minimum 10s)
+  owns the delivery lease. Deferred-ack semantics are preserved: `pop` returns
+  the body without acking; the caller acks via `ack(token=msg)`.
 
 ### Added
 
-- `QueueBackend.ack()` / `nack()` API for message-queue backends (Kafka,
-  RabbitMQ). Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ)
-  inherit no-op defaults.
+- Locked Scrapy 2.17.0 and setuptools 83.0.0. The dependency audit documents
+  one exact exception, `PYSEC-2017-83`: the reviewed
+  [GHSA-h7wm-ph43-c39p](https://github.com/advisories/GHSA-h7wm-ph43-c39p)
+  affected range ends at Scrapy 2.15.2, so locked 2.17.0 is outside it even
+  though the PyPA record lacks a fixed-version event. CI suppresses only that
+  advisory ID and continues auditing the rest of the locked graph.
+- `QueueBackend.ack()` / `nack()` API and concurrent-safe per-message tokens for
+  Kafka, RabbitMQ, RocketMQ, Pulsar, and SQS. Atomic backends (Redis, MongoDB,
+  ElasticSearch) inherit no-op defaults.
 - Signal-driven ack: `BackendScheduler.open` connects Scrapy's
   `response_received` → `ack()` and `spider_error` → `nack()` for
   at-least-once delivery semantics. Warns if `spider.crawler` is absent.
 - Redis pop/push atomicity via Lua scripts (`ZPOPMAX+HGET+HDEL`,
   `INCR+ZADD+HSET`). FIFO ordering within same priority via counter prefix.
-- Hash-tagged payload/counter keys (`{queue_name}:payload`, etc.) for
-  Redis Cluster slot affinity.
+- Namespaced hash-tagged queue item/payload/counter keys
+  (`{<namespace>:queue:<name>}:*`) for Redis Cluster slot affinity.
 - Cross-mode settings validation: Redis SENTINEL mode validates `sentinels`
   and `sentinel_master_name` at construction time.
 - `[project.urls]` metadata for PyPI.
@@ -98,9 +141,14 @@ upgrading.
 - `ConnectionManager.clear_registry()` classmethod for test isolation.
 - Full-jitter exponential backoff on connection retry (thundering herd
   prevention).
-- Concurrent-pop warning on Kafka/RabbitMQ when `CONCURRENT_REQUESTS > 1`.
+- Bounded connection-manager retry controls:
+  `SCRAPY_RETRY_ATTEMPTS` means retries after the initial attempt (0..20), and
+  `SCRAPY_RETRY_DELAY` is the full-jitter exponential base.
 - Lazy-import error-message tests for all 5 module-guard backends.
 - `CHANGELOG.md`.
+- Stable snapshot-owner routing through `SCRAPY_QUEUE_SNAPSHOT_OWNER`, with
+  `SCRAPY_QUEUE_WORKER_ID` as the fallback.
+- Poison/empty/replacement terminal-drop stats under `scheduler/queue/*`.
 - ElasticSearch + RocketMQ shortcut attributes on `BackendSpiderMixin`
   (`elasticsearch_hosts` / `cloud_id` / `api_key`,
   `rocketmq_namesrv_address` / `access_key` / `secret_key`), matching the
@@ -129,6 +177,23 @@ upgrading.
   `repr(settings)` shows `**********`; raw value only via
   `.get_secret_value()` via the `secret_value()` helper.
 - Kafka `enable_auto_commit` default changed from `True` to `False`.
+- RabbitMQ enables synchronous publisher confirms on every connection mode and
+  publishes with `mandatory=True`. Broker nacks, unroutable messages, AMQP
+  errors, and explicit negative confirmations raise `QueueError`; a successful
+  `push()` now means the broker confirmed routing, not merely that the client
+  accepted bytes.
+- SQS `nack()` changes the specific receipt's visibility to zero for immediate
+  redelivery. RocketMQ `nack()` changes the specific message's invisibility to
+  the broker's 10-second minimum. Neither backend automatically renews the
+  processing lease.
+- SQS and DynamoDB standalone mode normalize an omitted endpoint to
+  `http://localhost:4566`; cloud mode preserves an omitted endpoint for real
+  AWS. This prevents zero-config standalone use from silently targeting AWS.
+- RabbitMQ accepts an `amqp://` / `amqps://` URL shortcut and expands missing
+  host/port/credential/vhost fields. Explicit discrete fields take precedence.
+- Bundled backend config now merges nested settings over flat Scrapy settings,
+  then environment/default values, while keeping generic ConnectionManager
+  retry controls separate from backend-native retry fields.
 - Dependency pins tightened: all deps now have upper bounds.
   `pymongo` minimum bumped to 4.8 (CVE hardening).
 - Test dependency group trimmed from 48 to 19 packages. Removed unused
@@ -183,6 +248,19 @@ upgrading.
 
 ### Fixed
 
+- Redis blocking pop now polls the same atomic Lua pop used by the non-blocking
+  path, eliminating the `BZPOPMIN` followed by payload-read crash window.
+- Kafka ack tokens include topic, partition, offset, and consumer generation;
+  stale or cross-topic tokens cannot commit an unrelated delivery.
+- RabbitMQ ack tokens include channel generation; a delivery tag reused after
+  reconnect cannot be acknowledged by an old completion.
+- Pulsar ack tokens remain bound to the consumer/topic that issued them rather
+  than following the backend's latest subscription.
+- Invalid/missing Base64 SQS bodies are best-effort deleted before raising
+  `QueueError`, preventing poison redelivery below the `BackendQueue` layer.
+- Delay/time-wheel snapshots persist remaining delay plus wall-clock context and
+  rebase to the new process's monotonic clock; old absolute monotonic deadlines
+  no longer drift across host restart.
 - **Registry entry-point discovery no longer emits 5 ``SelectableGroups`` deprecation warnings** (#38).
   ``_discover_entry_points`` branched on ``sys.version_info`` to use the legacy
   ``entry_points().get(group, [])`` dict form on Python 3.10/3.11 — based on the

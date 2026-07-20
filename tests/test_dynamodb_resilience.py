@@ -14,9 +14,8 @@ test:
   LocalStack path).
 - ping() both branches: False when the table handle is None (line 154),
   True on a successful ``table.load()`` (line 157).
-- store()/exists()/ttl() ResourceNotFound handling (lines 196, 280, 308):
-  a vanished table is a clean "missing" signal (False / None for reads),
-  but a StorageError for writes — at-least-once preserved.
+- store()/exists()/ttl() distinguish item absence from a vanished table:
+  ResourceNotFoundException is a resource-level StorageError on every op.
 - exists() returning False when the item is absent (line 285).
 """
 
@@ -132,8 +131,7 @@ def test_ping_returns_true_on_successful_load(mocker) -> None:
 def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
   """Line 196: a vanished table mid-``put_item`` (ResourceNotFoundException)
   is a StorageError (NOT silently swallowed) — preserves at-least-once: the
-  caller (item pipeline) must see the failure, not a silent data loss.
-  Distinct from the read paths which treat 'missing table' as 'missing item'."""
+  caller (item pipeline) must see the failure, not a silent data loss."""
   backend = _backend()
   backend._table = mocker.MagicMock()
   backend._table.put_item.side_effect = _FakeClientError("ResourceNotFoundException")
@@ -142,17 +140,19 @@ def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# exists() ResourceNotFound -> False (line 280) + missing item -> False (285)
+# exists() distinguishes vanished table from missing item
 # ---------------------------------------------------------------------------
 
 
-def test_exists_returns_false_when_table_vanishes(mocker) -> None:
-  """Line 280: a vanished table on read is a clean 'missing' signal → False
-  (the existence check's missing-sentinel), unlike store() which raises."""
+def test_exists_raises_storage_error_when_table_vanishes(mocker) -> None:
   backend = _backend()
   backend._table = mocker.MagicMock()
-  backend._table.get_item.side_effect = _FakeClientError("ResourceNotFoundException")
-  assert backend.exists("k") is False
+  error = _FakeClientError("ResourceNotFoundException")
+  backend._table.get_item.side_effect = error
+  with pytest.raises(StorageError) as exc_info:
+    backend.exists("k")
+  assert exc_info.value.operation == "exists"
+  assert exc_info.value.__cause__ is error
 
 
 def test_exists_returns_false_when_item_is_absent(mocker) -> None:
@@ -164,14 +164,16 @@ def test_exists_returns_false_when_item_is_absent(mocker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ttl() ResourceNotFound -> None (line 308)
+# ttl() treats a vanished table as operational failure
 # ---------------------------------------------------------------------------
 
 
-def test_ttl_returns_none_when_table_vanishes(mocker) -> None:
-  """Line 308: a vanished table on the ttl read is a clean 'no TTL' signal
-  → None (the missing-sentinel), mirroring exists()'s missing-table handling."""
+def test_ttl_raises_storage_error_when_table_vanishes(mocker) -> None:
   backend = _backend()
   backend._table = mocker.MagicMock()
-  backend._table.get_item.side_effect = _FakeClientError("ResourceNotFoundException")
-  assert backend.ttl("k") is None
+  error = _FakeClientError("ResourceNotFoundException")
+  backend._table.get_item.side_effect = error
+  with pytest.raises(StorageError) as exc_info:
+    backend.ttl("k")
+  assert exc_info.value.operation == "ttl"
+  assert exc_info.value.__cause__ is error

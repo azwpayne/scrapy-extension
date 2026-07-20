@@ -36,7 +36,9 @@ class QueueStrategyType(str, Enum):
       ROUND_ROBIN: Fairness across ``source`` tags.
       THROTTLE: Rate-limited pop (min seconds between pops).
       PRIORITY: N-level physical bucket priority — strategy-layer priority
-          that works on backends without native priority (SQS Standard, Kafka).
+          for backends that can isolate multiple physical queues. Kafka and
+          RocketMQ are rejected because their consumers cannot isolate a scan
+          to the requested physical topic.
       TIME_WHEEL: O(1) hashed timing wheel for many short delays; overflow
           heap for long delays. Faster than DELAY's heap on big short-delay
           workloads.
@@ -140,4 +142,6 @@ def build_queue_strategy(
       capacity=capacity,
       full_policy=full_policy,  # type: ignore[arg-type]
     )
-  raise ConfigurationError(f"Unknown queue strategy: {strategy_type!r}")  # pragma: no cover
+  raise ConfigurationError(
+    f"Unknown queue strategy: {strategy_type!r}"
+  )  # pragma: no cover

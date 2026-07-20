@@ -6,10 +6,12 @@
 # @desc    :
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
+from urllib.parse import unquote
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AmqpDsn, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
@@ -44,7 +46,7 @@ class RabbitMQSettings(BaseSettings):
   model_config = SettingsConfigDict(
     env_prefix="SCRAPY_RABBITMQ_",
     case_sensitive=False,
-    extra="ignore",
+    extra="forbid",
   )
 
   # === Mode Selection ===
@@ -54,6 +56,13 @@ class RabbitMQSettings(BaseSettings):
   )
 
   # === Connection Settings ===
+  url: SecretStr | None = Field(
+    default=None,
+    description=(
+      "AMQP connection URL shortcut. Values from explicit host/port/credential "
+      "fields take precedence over URL components."
+    ),
+  )
   host: str = Field(
     default="localhost",
     min_length=1,
@@ -189,6 +198,47 @@ class RabbitMQSettings(BaseSettings):
     ge=0,
     description="QoS prefetch size in bytes (0 = unlimited)",
   )
+
+  @model_validator(mode="before")
+  @classmethod
+  def _expand_connection_url(cls, data: Any) -> Any:
+    """Validate an AMQP URL and fill missing discrete connection fields."""
+    if not isinstance(data, Mapping):
+      return data
+    raw_url = data.get("url")
+    if raw_url is None:
+      return data
+
+    url_value = (
+      raw_url.get_secret_value() if isinstance(raw_url, SecretStr) else str(raw_url)
+    )
+    try:
+      parsed = AmqpDsn(url_value)
+    except ValueError:
+      raise ConfigurationError(
+        "url must be a valid 'amqp://' or 'amqps://' connection URL.",
+        setting_name="url",
+      ) from None
+
+    values = dict(data)
+    if parsed.host is not None:
+      host = parsed.host
+      if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+      values.setdefault("host", host)
+    values.setdefault(
+      "port", parsed.port or (5671 if parsed.scheme == "amqps" else 5672)
+    )
+    if parsed.username is not None:
+      values.setdefault("username", unquote(parsed.username))
+    if parsed.password is not None:
+      values.setdefault("password", unquote(parsed.password))
+
+    path = parsed.path or ""
+    virtual_host = unquote(path[1:] if path.startswith("/") else path)
+    values.setdefault("virtual_host", virtual_host or "/")
+    values.setdefault("ssl_enabled", parsed.scheme == "amqps")
+    return values
 
   @model_validator(mode="after")
   def _validate_mode_requirements(self) -> RabbitMQSettings:

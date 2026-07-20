@@ -1,6 +1,6 @@
 """Tests for BackendPipeline component."""
 
-from typing import cast
+from dataclasses import dataclass
 
 import pytest
 from scrapy import Field, Item
@@ -37,6 +37,15 @@ class TestBackendPipelineInit:
       key_prefix="custom_items",
     )
     assert pipeline.key_prefix == "custom_items"
+
+  def test_rejects_key_prefix_that_storage_backends_cannot_accept(
+    self, mock_connection_manager
+  ):
+    with pytest.raises(ValueError, match="Invalid key_prefix"):
+      BackendPipeline(
+        connection_manager=mock_connection_manager,
+        key_prefix="bad prefix",
+      )
 
   def test_sets_ttl(self, mock_connection_manager):
     """Test that __init__ sets ttl with default None."""
@@ -230,6 +239,55 @@ class TestBackendPipelineOpenSpider:
     # And storage is NOT marked supported (the bug never confirmed it).
     assert pipeline._storage_supported is None
 
+  def test_open_spider_rejects_name_that_cannot_form_a_storage_key(
+    self, mock_connection_manager, mocker
+  ):
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.name = "bad spider"
+
+    with pytest.raises(ValueError, match="Invalid spider.name"):
+      pipeline.open_spider(spider)
+
+    mock_connection_manager.get_storage_backend.assert_not_called()
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_open_spider_opens_storage_strategy_once(
+    self, mock_connection_manager, mocker
+  ):
+    strategy = mocker.MagicMock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+    )
+    spider = mocker.Mock(name="spider")
+    spider.name = "test_spider"
+
+    pipeline.open_spider(spider)
+    pipeline.open_spider(spider)
+
+    strategy.open.assert_called_once_with()
+
+  def test_open_spider_rejects_a_different_spider(
+    self, mock_connection_manager, mocker
+  ):
+    strategy = mocker.MagicMock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+    )
+    first = mocker.Mock(name="first")
+    first.name = "first"
+    second = mocker.Mock(name="second")
+    second.name = "second"
+    pipeline.open_spider(first)
+
+    with pytest.raises(RuntimeError, match="different spider"):
+      pipeline.open_spider(second)
+
+    strategy.open.assert_called_once_with()
+    mock_connection_manager.close.assert_not_called()
+
 
 class TestBackendPipelineCloseSpider:
   """Test BackendPipeline.close_spider method."""
@@ -294,6 +352,23 @@ class TestBackendPipelineCloseSpider:
 
     assert "connection_manager.close() failed" in caplog.text
 
+  def test_duplicate_close_closes_strategy_and_manager_once(
+    self, mock_connection_manager, mocker
+  ):
+    strategy = mocker.MagicMock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+    )
+    spider = mocker.Mock(name="spider")
+    spider.name = "test_spider"
+
+    pipeline.close_spider(spider)
+    pipeline.close_spider(spider)
+
+    strategy.close.assert_called_once_with()
+    mock_connection_manager.close.assert_called_once_with()
+
 
 class TestBackendPipelineProcessItem:
   """Test BackendPipeline.process_item method."""
@@ -314,8 +389,23 @@ class TestBackendPipelineProcessItem:
     assert result is item
     mock_connection_manager.get_storage_backend().store.assert_called_once()
 
-  def test_process_item_without_iter(self, mock_connection_manager, mocker):
-    """Test that process_item handles non-iterable items."""
+  def test_process_item_after_close_is_rejected(
+    self, mock_connection_manager, mocker
+  ):
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+    pipeline.close_spider(spider)
+
+    with pytest.raises(RuntimeError, match="closed"):
+      pipeline.process_item(SampleItem(name="late", value=1), spider)
+
+    mock_connection_manager.get_storage_backend.assert_not_called()
+
+  def test_process_item_rejects_unsupported_root_object(
+    self, mock_connection_manager, mocker
+  ):
+    """Unsupported roots must not be silently stringified and persisted."""
     pipeline = BackendPipeline(
       connection_manager=mock_connection_manager,
       key_prefix="items",
@@ -324,18 +414,35 @@ class TestBackendPipelineProcessItem:
     mock_spider = mocker.Mock()
     mock_spider.name = "test_spider"
 
-    # Pass a non-iterable object - intentionally testing process_item's fallback handling
     item = object()
-    result = pipeline.process_item(cast("SampleItem", item), mock_spider)
 
-    assert result is item
-    # Should be stored under {"data": str(item)}
-    call_args = mock_connection_manager.get_storage_backend().store.call_args
-    serialized = call_args[0][1]
-    # Serializer returns bytes, decode for string comparison
-    if isinstance(serialized, bytes):
-      serialized = serialized.decode("utf-8")
-    assert '"data"' in serialized
+    with pytest.raises(SerializationError, match="Unsupported pipeline item type"):
+      pipeline.process_item(item, mock_spider)  # type: ignore[arg-type]
+
+    mock_connection_manager.get_storage_backend().store.assert_not_called()
+
+  def test_process_item_serializes_dataclass_via_item_adapter(
+    self, mock_connection_manager, mocker
+  ):
+    @dataclass
+    class DataclassItem:
+      name: str
+      value: int
+
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      key_prefix="items",
+    )
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+    item = DataclassItem(name="structured", value=7)
+
+    assert pipeline.process_item(item, spider) is item  # type: ignore[arg-type]
+    wire = mock_connection_manager.get_storage_backend().store.call_args.args[1]
+    assert JSONSerializer().deserialize(wire) == {
+      "name": "structured",
+      "value": 7,
+    }
 
   def test_process_item_key_contains_prefix_spider_timestamp_unique_id(
     self, mock_connection_manager, mocker
@@ -399,6 +506,20 @@ class TestBackendPipelineProcessItem:
     assert result is item
     # Storage was attempted.
     assert mock_storage.store.call_count == 1
+
+  def test_process_item_wraps_item_serialization_failure(
+    self, mock_connection_manager, mocker
+  ):
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+    item = SampleItem(name="bad", value=object())
+
+    with pytest.raises(SerializationError, match="Failed to serialize item"):
+      pipeline.process_item(item, spider)
+
+    mock_connection_manager.get_storage_backend().store.assert_not_called()
 
   def test_open_spider_detects_no_storage_support(self, mock_connection_manager, mocker):
     """R3-G5: backends without storage (Kafka, RabbitMQ) degrade to no-op."""
@@ -605,6 +726,61 @@ class TestBackendPipelineStorageStrategy:
     pipeline.close_spider(mock_spider)  # drains the buffer
     assert store.call_count == 2
     assert strat.pending == 0
+
+  def test_batched_monitor_reports_only_durable_flushes(
+    self, mock_connection_manager, mocker
+  ):
+    """Buffered acceptance is not reported as a completed backend write."""
+    from scrapy_extension.storage.strategies.batched import (
+      BatchedStorageStrategy,
+    )
+
+    monitor = mocker.Mock()
+    strategy = BatchedStorageStrategy(threshold=100)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "s"
+
+    pipeline.process_item(SampleItem(name="a", value=1), spider)
+    pipeline.process_item(SampleItem(name="b", value=2), spider)
+
+    monitor.on_store.assert_not_called()
+    pipeline.close_spider(spider)
+    assert monitor.on_store.call_count == 2
+
+  def test_batched_threshold_failure_drives_pipeline_error_guard(
+    self, mock_connection_manager, mocker
+  ):
+    """A volatile retry tail is not reported as a successful persisted item."""
+    from scrapy_extension.storage.strategies.batched import (
+      BatchedStorageStrategy,
+    )
+
+    monitor = mocker.Mock()
+    strategy = BatchedStorageStrategy(threshold=1)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+      max_storage_errors=0,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    mock_connection_manager.get_storage_backend().store.side_effect = RuntimeError(
+      "backend down"
+    )
+    spider = mocker.Mock()
+    spider.name = "s"
+
+    with pytest.raises(BackendError, match="max_storage_errors"):
+      pipeline.process_item(SampleItem(name="a", value=1), spider)
+
+    assert strategy.pending == 1
+    monitor.on_store.assert_not_called()
 
   def test_max_item_bytes_still_rejects_oversize_with_strategy(
     self, mock_connection_manager, mocker
@@ -837,6 +1013,24 @@ class TestBackendPipelineMonitorWiring:
     pipeline.process_item(SampleItem(name="x", value=1), mock_spider)
 
     monitor.on_store.assert_not_called()
+
+  def test_on_store_failure_does_not_fail_already_persisted_item(
+    self, mock_connection_manager, mocker
+  ):
+    """Observability callbacks cannot reverse a successful storage write."""
+    monitor = mocker.Mock()
+    monitor.on_store.side_effect = RuntimeError("monitor boom")
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "s"
+    item = SampleItem(name="x", value=1)
+
+    assert pipeline.process_item(item, spider) is item
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
 
   def test_default_monitor_is_null_when_unset(self, mock_connection_manager):
     """When no monitor is passed, the pipeline holds a ``NullMonitor`` (no-op).

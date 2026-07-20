@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, cast
+
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
     from redis import Redis
@@ -21,6 +24,8 @@ try:
     from redis.exceptions import RedisError
     from redis.sentinel import Sentinel
 except ImportError as e:
+    if not _is_missing_optional_dependency(e, "redis"):
+        raise
     raise ImportError(
         "Redis backend requires 'redis'. Install with: pip install scrapy-extension[redis]"
     ) from e
@@ -32,6 +37,7 @@ from scrapy_extension.backends.base import (
     SetBackend,
     StorageBackend,
     _validate_key_name,
+    _validate_ttl,
     secret_value,
 )
 from scrapy_extension.exceptions import (
@@ -46,6 +52,8 @@ if TYPE_CHECKING:
   from scrapy_extension.settings import RedisSettings
 
 logger = logging.getLogger(__name__)
+
+_BLOCKING_POP_POLL_INTERVAL = 0.05
 
 _POP_LUA = """
 local popped = redis.call('ZPOPMIN', KEYS[1])
@@ -76,6 +84,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   - Queue: Redis Sorted Sets (ZADD/ZRANGEBYSCORE/ZREM)
   - Set: Redis Sets (SADD/SREM/SISMEMBER/SCARD/DEL)
   - Storage: Redis Strings with TTL (SET/GET/DEL/EXISTS/TTL)
+
+  Logical names are mapped into disjoint physical domains below the configured
+  namespace. For example, logical name ``crawl`` maps to separate
+  ``<namespace>:queue:*``, ``<namespace>:set:crawl``, and
+  ``<namespace>:storage:crawl`` keys. This prevents Redis WRONGTYPE failures
+  and cross-interface deletion when one backend instance serves all roles.
 
   Supports standalone, master-slave, sentinel, and cluster deployment modes.
 
@@ -117,7 +131,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       elif self.config.mode == RedisMode.CLUSTER:
         self._connect_cluster()
       logger.debug("Connected to Redis in %s mode", self.config.mode.value)
-    except RedisError as e:
+    except (BackendConnectionError, ConfigurationError):
+      self.disconnect()
+      raise
+    except Exception as e:
+      self.disconnect()
       msg = f"Failed to connect to Redis ({self.config.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
@@ -151,7 +169,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def _connect_standalone(self) -> None:
     """Connect to standalone Redis instance."""
     self._client = self._create_redis_client()
-    self._client.ping()
+    if not self._client.ping():
+      raise BackendConnectionError(
+        "Redis health check returned false during connect",
+        backend_type="redis",
+      )
 
   def _connect_master_slave(self) -> None:
     """Connect to master-slave setup.
@@ -163,7 +185,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ConfigurationError: If replicas are not configured.
     """
     self._master_client = self._create_redis_client()
-    self._master_client.ping()
+    if not self._master_client.ping():
+      raise BackendConnectionError(
+        "Redis master health check returned false during connect",
+        backend_type="redis",
+      )
     self._client = self._master_client
 
     # Store replica info for potential read scaling (not yet implemented)
@@ -234,7 +260,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # Verify connection. SEC-6: a connection failure here (bad master name,
       # unreachable sentinels) must surface as BackendConnectionError, not the
       # raw redis-py exception type that varies across versions.
-      self._master_client.ping()
+      if not self._master_client.ping():
+        raise BackendConnectionError(
+          "Redis Sentinel master health check returned false during connect",
+          backend_type="redis",
+        )
     except BackendConnectionError:
       raise
     except Exception as e:
@@ -287,7 +317,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
 
       # Verify connection
-      self._client.ping()
+      if not self._client.ping():
+        raise BackendConnectionError(
+          "Redis Cluster health check returned false during connect",
+          backend_type="redis",
+        )
     except BackendConnectionError:
       raise
     except Exception as e:
@@ -300,17 +334,17 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Closes the connection pool and releases resources.
     """
-    if self._master_client and self._master_client is not self._client:
-      with contextlib.suppress(RedisError):
-        self._master_client.close()
-      self._master_client = None
-
-    if self._client:
-      with contextlib.suppress(RedisError):
-        self._client.close()
-      self._client = None
-
+    clients = {
+      id(client): client
+      for client in (self._master_client, self._client)
+      if client is not None
+    }
+    self._master_client = None
+    self._client = None
     self._sentinel = None
+    for client in clients.values():
+      with contextlib.suppress(Exception):
+        client.close()
 
   def is_connected(self) -> bool:
     """Check if Redis is connected.
@@ -389,12 +423,22 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     return cast("Redis", self.client).register_script(_PUSH_LUA)
 
   # QueueBackend implementation using Sorted Sets
+  def _queue_key(self, queue_name: str) -> str:
+    """Return the namespaced ZSET key for a logical queue.
+
+    The complete queue identity is placed in a Redis Cluster hash tag. The
+    item ZSET, payload hash, and FIFO counter therefore remain in one slot for
+    Lua and transactional operations while other backend domains stay
+    physically disjoint.
+    """
+    return f"{{{self.config.namespace}:queue:{queue_name}}}:items"
+
   def _payload_key(self, queue_name: str) -> str:
     """Return the hash key used to store payloads for a queue.
 
-    The key uses a Redis Cluster hash tag (`{queue_name}`) so that the
-    ZSET, the payload hash, and the counter all land in the same cluster
-    slot — required for Lua scripts and DELETE across all keys.
+    The key uses a Redis Cluster hash tag containing namespace, domain, and
+    logical queue name so the ZSET, payload hash, and counter all land in the
+    same cluster slot — required for Lua scripts and DELETE across all keys.
 
     Args:
         queue_name: Name of the queue.
@@ -402,7 +446,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         The Redis key for the payload hash, with hash tag.
     """
-    return f"{{{queue_name}}}:payload"
+    return f"{{{self.config.namespace}:queue:{queue_name}}}:payload"
 
   def _counter_key(self, queue_name: str) -> str:
     """Return the INCR counter key used to FIFO-order same-priority items.
@@ -413,7 +457,15 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         The Redis key for the monotonic counter, with hash tag.
     """
-    return f"{{{queue_name}}}:counter"
+    return f"{{{self.config.namespace}:queue:{queue_name}}}:counter"
+
+  def _set_key(self, set_name: str) -> str:
+    """Return the namespaced physical key for a logical set."""
+    return f"{self.config.namespace}:set:{set_name}"
+
+  def _storage_key(self, key: str) -> str:
+    """Return the namespaced physical key for a logical storage key."""
+    return f"{self.config.namespace}:storage:{key}"
 
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to priority queue.
@@ -436,11 +488,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     member_uuid = uuid.uuid4().hex
+    queue_key = self._queue_key(queue_name)
     payload_key = self._payload_key(queue_name)
     counter_key = self._counter_key(queue_name)
     try:
       self._push_script(
-        keys=[queue_name, payload_key, counter_key],
+        keys=[queue_key, payload_key, counter_key],
         args=[member_uuid, -priority, item],
       )
     except RedisError as e:
@@ -454,24 +507,19 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
-    Non-blocking path (``timeout=0``) runs ZPOPMIN + HGET + HDEL inside a
-    single Lua ``EVAL`` — fully atomic, no orphan window between ZSET
-    removal and payload consumption. This is the path Scrapy's scheduler
-    uses on every tick.
+    Every attempt runs ZPOPMIN + HGET + HDEL inside a single Lua ``EVAL``.
+    This is fully atomic, with no crash window between ZSET removal and
+    payload consumption. For ``timeout>0``, the same atomic attempt is polled
+    against a monotonic deadline; using ``BZPOPMIN`` would remove the member
+    before a separate payload read and could make the message unreachable if
+    the worker exited between those operations.
 
-    Blocking path (``timeout>0``) cannot use Lua (Redis forbids blocking
-    commands inside scripts); falls back to ``bzpopmin`` followed by an
-    atomic MULTI/EXEC for HGET+HDEL.
-
-    Three outcomes are distinguished by the pop path, so a recoverable
-    race is never escalated to a hard error:
+    Three outcomes are distinguished by the pop path:
 
     - **Empty queue**: the ZSET had no member. Returns ``None`` (no error).
-    - **Lost-payload race**: a ZSET member was popped but its payload was
-      already consumed by a concurrent consumer (the loser of a
-      ``ZPOPMIN`` race finds the payload ``HDEL``'d before its ``HGET``).
-      This is an item-consumed-elsewhere race, not corruption — DEBUG-log
-      and return ``None`` so the scheduler simply retries on the next tick.
+    - **Orphaned member**: the ZSET referenced a missing sidecar payload.
+      The atomic script removes the stale member and returns ``None`` so a
+      blocking call can continue polling for a valid item.
     - **Structural corruption**: the Lua script surfaced a payload whose
       type cannot be normalized to bytes (an invariant violation).
       Raises ``QueueError`` so the caller can surface it.
@@ -481,23 +529,36 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         timeout: Seconds to wait (0 = non-blocking).
 
     Returns:
-        The popped item, or None if the queue is empty or the item was
-        consumed by a concurrent consumer.
+        The popped item, or None if the queue is empty or an orphaned member
+        was discarded and no valid item was available before the deadline.
 
     Raises:
         QueueError: If the pop fails, or on structural corruption.
         ValueError: If queue_name contains invalid characters.
     """
     _validate_key_name(queue_name, "queue_name")
+    queue_key = self._queue_key(queue_name)
     payload_key = self._payload_key(queue_name)
+
+    if timeout <= 0:
+      return self._atomic_pop_once(queue_name, queue_key, payload_key)
+
+    deadline = time.monotonic() + timeout
+    while True:
+      item = self._atomic_pop_once(queue_name, queue_key, payload_key)
+      if item is not None:
+        return item
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        return None
+      time.sleep(min(_BLOCKING_POP_POLL_INTERVAL, remaining))
+
+  def _atomic_pop_once(
+    self, queue_name: str, queue_key: str, payload_key: str
+  ) -> bytes | None:
+    """Atomically remove one queue member and its sidecar payload."""
     try:
-      if timeout > 0:
-        bz_result = self.client.bzpopmin(queue_name, timeout=timeout)
-        if bz_result is None:
-          return None
-        member = cast("tuple[Any, Any]", bz_result)[1]
-        return self._consume_payload(payload_key, member)
-      result = self._pop_script(keys=[queue_name, payload_key])
+      result = self._pop_script(keys=[queue_key, payload_key])
     except RedisError as e:
       msg = f"Failed to pop from queue {queue_name}: {e}"
       raise QueueError(
@@ -509,7 +570,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # so a real payload can never collide with a control signal:
     #   {0, _}             empty queue          -> None
     #   {1, payload}       success              -> bytes(payload)
-    #   {2, _}             lost-payload race    -> DEBUG log, None
+    #   {2, _}             orphaned member      -> DEBUG log, None
     #   {3, errmsg}        structural corruption -> QueueError
     # redis-py decodes Lua tables as Python lists. A legacy / unexpected
     # non-list result is treated as corruption (defensive — the script
@@ -536,11 +597,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
       raise QueueError(msg, queue_name=queue_name, operation="pop")
     if status == 2:
-      # Recoverable concurrent-consumer race: another worker already
-      # consumed this item's payload. Not corruption — retry next tick.
+      # A stale ZSET member without its sidecar payload can be discarded. The
+      # script removed it atomically; the next blocking poll can make progress.
       logger.debug(
-        "Lost-payload race on %s: ZSET member popped but payload already "
-        "consumed by a concurrent consumer. Returning None (no error).",
+        "Orphaned member on %s: ZSET member had no sidecar payload. "
+        "Discarding the stale member and returning None.",
         queue_name,
       )
       return None
@@ -550,54 +611,6 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       f"and payload hash are in an unexpected state."
     )
     raise QueueError(msg, queue_name=queue_name, operation="pop")
-
-  def _consume_payload(self, payload_key: str, member: str | bytes) -> bytes:
-    """Atomically fetch and delete a payload from the sidecar hash.
-
-    Uses MULTI/EXEC so the HGET and HDEL commit together. The hash tag
-    on ``payload_key`` keeps this transaction valid under Redis Cluster.
-
-    Args:
-        payload_key: Redis key of the payload hash.
-        member: The ZSET member (uuid str or bytes).
-
-    Returns:
-        The stored payload bytes.
-
-    Raises:
-        QueueError: If the payload is missing — the ZSET referenced a
-            member that has no payload, indicating queue corruption.
-    """
-    try:
-      pipe = self.client.pipeline(transaction=True)
-      field = cast("str", member)
-      pipe.hget(payload_key, field)
-      pipe.hdel(payload_key, field)
-      payload, _ = pipe.execute()
-    except RedisError as e:
-      msg = f"Failed to consume payload from {payload_key}: {e}"
-      raise QueueError(
-        msg,
-        queue_name=payload_key,
-        operation="pop",
-      ) from e
-    if payload is None:
-      msg = (
-        f"Queue corruption: ZSET member {member!r} has no payload in "
-        f"{payload_key}. The ZSET and payload hash are out of sync."
-      )
-      raise QueueError(
-        msg,
-        queue_name=payload_key,
-        operation="pop",
-      )
-    # decode_responses=True returns str; normalize to bytes for the queue contract.
-    if isinstance(payload, str):
-      return payload.encode("utf-8")
-    if isinstance(payload, (bytes, bytearray)):
-      return bytes(payload)
-    msg = f"Unexpected payload type from HGET: {type(payload).__name__}"
-    raise QueueError(msg, queue_name=payload_key, operation="pop")
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -616,7 +629,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # redis-py's shared sync/async stubs type zcard() as ResponseT
       # (Awaitable[Any] | int); the sync client returns int at runtime.
       # The cast narrows for Pyright; harmless under mypy.
-      return cast("int", self.client.zcard(queue_name))  # type: ignore[redundant-cast]
+      return cast(  # type: ignore[redundant-cast]
+        "int", self.client.zcard(self._queue_key(queue_name))
+      )
     except RedisError as e:
       # R-qlen: do NOT swallow to 0 — that conflates an empty queue with a
       # backend failure. The scheduler trusts ``len(queue)`` for
@@ -643,10 +658,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         QueueError: If the delete fails at the Redis layer.
     """
     _validate_key_name(queue_name, "queue_name")
+    queue_key = self._queue_key(queue_name)
     payload_key = self._payload_key(queue_name)
     counter_key = self._counter_key(queue_name)
     try:
-      self.client.delete(queue_name, payload_key, counter_key)
+      self.client.delete(queue_key, payload_key, counter_key)
     except RedisError as e:
       msg = f"Failed to clear queue {queue_name}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
@@ -667,7 +683,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return self.client.sadd(set_name, item) == 1
+      return self.client.sadd(self._set_key(set_name), item) == 1
     except RedisError as e:
       # R-dupe-1 (option b): wrap the raw RedisError so BackendDupeFilter's
       # ``except BackendConnectionError`` graceful-degradation arm fires
@@ -688,9 +704,15 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If set_name contains invalid characters.
+        BackendConnectionError: If Redis cannot remove the item.
     """
     _validate_key_name(set_name, "set_name")
-    return self.client.srem(set_name, item) == 1
+    try:
+      return self.client.srem(self._set_key(set_name), item) == 1
+    except RedisError as e:
+      raise BackendConnectionError(
+        f"Redis set remove failed for {set_name!r}: {e}", backend_type="redis"
+      ) from e
 
   def contains(self, set_name: str, item: bytes) -> bool:
     """Check if item is in set.
@@ -704,9 +726,15 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If set_name contains invalid characters.
+        BackendConnectionError: If Redis cannot check membership.
     """
     _validate_key_name(set_name, "set_name")
-    result = self.client.sismember(set_name, cast("str", item))
+    try:
+      result = self.client.sismember(self._set_key(set_name), cast("str", item))
+    except RedisError as e:
+      raise BackendConnectionError(
+        f"Redis set contains failed for {set_name!r}: {e}", backend_type="redis"
+      ) from e
     return bool(result)
 
   def set_len(self, set_name: str) -> int:
@@ -720,12 +748,17 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     Raises:
         ValueError: If set_name contains invalid characters.
+        BackendConnectionError: If Redis cannot read the set size.
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return cast("int", self.client.scard(set_name))  # type: ignore[redundant-cast]
-    except RedisError:
-      return 0
+      return cast(  # type: ignore[redundant-cast]
+        "int", self.client.scard(self._set_key(set_name))
+      )
+    except RedisError as e:
+      raise BackendConnectionError(
+        f"Redis set length failed for {set_name!r}: {e}", backend_type="redis"
+      ) from e
 
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
@@ -740,7 +773,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      self.client.delete(set_name)
+      self.client.delete(self._set_key(set_name))
     except RedisError as e:
       # R-rclears: wrap (parity with add R-dupe-1 #38) so BackendDupeFilter's
       # graceful-degradation arm fires; a swallowed clear hides a failed dedup
@@ -766,11 +799,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             dynamodb ``store()`` contracts (all raise ``StorageError``).
     """
     _validate_key_name(key, "key")
+    _validate_ttl(ttl)
+    storage_key = self._storage_key(key)
+    stored: bool | str | bytes | None
     try:
       if ttl is not None:
-        self.client.setex(key, ttl, data)
+        stored = self.client.setex(storage_key, ttl, data)
       else:
-        self.client.set(key, data)
+        stored = self.client.set(storage_key, data)
     except RedisError as e:
       # R-store: do NOT swallow. Pre-fix this logged a warning and returned
       # normally, so BackendPipeline.process_item's SUCCESS arm ran -- the
@@ -785,6 +821,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         operation="store",
         key=key,
       ) from e
+    if stored is False or stored is None:
+      raise StorageError(
+        f"Redis rejected the write for key {key!r}",
+        operation="store",
+        key=key,
+      )
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
@@ -801,7 +843,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      result = self.client.get(key)
+      result = self.client.get(self._storage_key(key))
     except RedisError as e:
       msg = f"Failed to retrieve key {key!r} from Redis: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
@@ -827,7 +869,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      return self.client.delete(key) == 1
+      return self.client.delete(self._storage_key(key)) == 1
     except RedisError as e:
       msg = f"Failed to delete key {key!r} from Redis: {e}"
       raise StorageError(msg, operation="delete", key=key) from e
@@ -847,7 +889,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      return self.client.exists(key) == 1
+      return self.client.exists(self._storage_key(key)) == 1
     except RedisError as e:
       msg = f"Failed to check existence of key {key!r} in Redis: {e}"
       raise StorageError(msg, operation="exists", key=key) from e
@@ -859,8 +901,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
 
     Returns:
-        Seconds remaining, None if no TTL or key doesn't exist,
-        -1 if expired (rare since Redis auto-evicts expired keys).
+        Non-negative seconds remaining, or None if absent, permanent, or expired.
 
     Raises:
         ValueError: If key contains invalid characters.
@@ -868,7 +909,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      result = cast("int", self.client.ttl(key))  # type: ignore[redundant-cast]
+      result = cast(  # type: ignore[redundant-cast]
+        "int", self.client.ttl(self._storage_key(key))
+      )
     except RedisError as e:
       msg = f"Failed to read TTL of key {key!r} in Redis: {e}"
       raise StorageError(msg, operation="ttl", key=key) from e
@@ -881,36 +924,27 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
 
-    In cluster mode, this scans all nodes.
+    This always scans only the configured namespace's storage domain. It never
+    uses ``FLUSHDB``/``FLUSHALL``, because a Redis database may be shared with
+    queues, deduplication sets, or unrelated applications. In cluster mode,
+    redis-py's cluster ``scan_iter`` scans all nodes.
 
     Args:
-        prefix: If provided, only clear keys starting with this prefix.
-               If None, clear all storage data.
+        prefix: If provided, only clear logical storage keys starting with this
+               prefix. If None, clear all storage keys owned by this namespace.
 
     Raises:
         ValueError: If prefix contains invalid characters.
         StorageError: If the clear fails at the Redis layer (parity with store
             R-store #59 and mongodb/memcached/dynamodb clear_storage).
     """
-    if prefix:
-        _validate_key_name(prefix, "prefix")
+    if prefix is not None:
+      _validate_key_name(prefix, "prefix")
+    logical_prefix = prefix or ""
+    pattern = f"{self._storage_key(logical_prefix)}*"
     try:
-      if prefix:
-        # Use scan + delete for prefixed keys
-        pattern = f"{prefix}*"
-        if isinstance(self._client, RedisCluster):
-          # For cluster, use the cluster's scan_iter which handles all nodes
-          for key in self._client.scan_iter(match=pattern):
-            self.client.delete(key)
-        else:
-          for key in self.client.scan_iter(match=pattern):
-            self.client.delete(key)
-      # Clear all keys in the current database
-      elif isinstance(self._client, RedisCluster):
-        # For cluster, flush all nodes
-        self._client.flushall()
-      else:
-        self.client.flushdb()
+      for physical_key in self.client.scan_iter(match=pattern):
+        self.client.delete(physical_key)
     except RedisError as e:
       raise StorageError(
         f"Failed to clear Redis storage: {e}", operation="clear_storage"

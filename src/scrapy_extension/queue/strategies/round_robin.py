@@ -10,9 +10,19 @@ from __future__ import annotations
 
 __all__ = ["RoundRobinQueueStrategy"]
 
+import base64
+import binascii
+import json
+import logging
+import threading
 from collections import OrderedDict, deque
 
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.base import (
+  QueueStrategy,
+  normalize_queue_timeout,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class RoundRobinQueueStrategy(QueueStrategy):
@@ -32,7 +42,9 @@ class RoundRobinQueueStrategy(QueueStrategy):
 
   Attributes:
       _sources: OrderedDict source -> deque (insertion-ordered for stable rotation).
-      _idx: Rotation cursor into the live ``_sources`` key order.
+      The first key in ``_sources`` is the next source to serve. Successful
+      pops move a still-live source to the end in O(1).
+      _lock: Protects source membership, rotation, and per-source deques.
   """
 
   def __init__(self, connection_manager: object) -> None:
@@ -43,7 +55,11 @@ class RoundRobinQueueStrategy(QueueStrategy):
     """
     super().__init__(connection_manager)  # type: ignore[arg-type]
     self._sources: OrderedDict[str, deque[bytes]] = OrderedDict()
-    self._idx = 0
+    self._lock = threading.Lock()
+
+  def bind(self, queue_name: str) -> None:
+    """Bind this in-process fairness state to one logical queue."""
+    self._bind_single_queue(queue_name)
 
   def push(
     self,
@@ -63,24 +79,22 @@ class RoundRobinQueueStrategy(QueueStrategy):
         delay: Ignored.
         source: Source tag for round-robin fairness (default ``"default"``).
     """
-    del queue_name, priority, delay
-    dq = self._sources.get(source)
-    if dq is None:
-      dq = deque()
-      self._sources[source] = dq
-    dq.append(item)
+    self.bind(queue_name)
+    del priority, delay
+    with self._lock:
+      dq = self._sources.get(source)
+      if dq is None:
+        dq = deque()
+        self._sources[source] = dq
+      dq.append(item)
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop the next item, cycling through non-empty sources.
 
-    Drained-source keys are evicted from ``_sources`` (R14-F): once a
-    source's deque empties, its key is removed so the rotation state stays
-    bounded at the live source set. The cursor (``_idx``) is re-pointed at
-    the next source in rotation *by identity* (not by index) so fairness
-    ordering survives the eviction — index-based positioning would break
-    because eviction shifts the rotation list. Without eviction, a long
-    crawl with transient sources would leak every source key ever seen
-    into ``_sources`` and make every pop O(n) in historical-source count.
+    The first ordered-dict entry is the rotation cursor. A source that still
+    has items moves to the end via :meth:`OrderedDict.move_to_end`; a drained
+    source is deleted. Both operations are O(1), so draining N one-item
+    sources is O(N), not O(N²) from repeatedly materializing/searching keys.
 
     Args:
         queue_name: The queue name (unused).
@@ -89,43 +103,22 @@ class RoundRobinQueueStrategy(QueueStrategy):
     Returns:
         The next item in round-robin order, or None if all sources are empty.
     """
-    del queue_name, timeout
-    while self._sources:
-      rotation = list(self._sources)
-      # n >= 1 is an invariant of the ``while self._sources`` condition (a
-      # truthy OrderedDict has at least one key), so the rotation is always
-      # non-empty here — the dead ``if n == 0: return None`` guard that lived
-      # here was removed as provably unreachable (initiative #23).
-      n = len(rotation)
-      idx = self._idx % n
-      source = rotation[idx]
-      dq = self._sources[source]
-      if dq:
-        item = dq.popleft()
-        # Remember the NEXT source in rotation (by identity) BEFORE any
-        # eviction shifts the rotation list. The cursor must land on this
-        # source so the fairness order survives the deletion.
-        next_source = rotation[(idx + 1) % n]
-        # R14-F: evict drained sources to keep _sources bounded at the
-        # live set. Empty sources left behind would (a) leak unboundedly
-        # under source churn and (b) make every pop O(n) in the historical
-        # source count as the rotation walks past empty slots.
+    timeout = normalize_queue_timeout(timeout)
+    self.bind(queue_name)
+    del timeout
+    with self._lock:
+      while self._sources:
+        source, dq = next(iter(self._sources.items()))
         if not dq:
           del self._sources[source]
-        # Re-point the cursor at the remembered next source. If it was
-        # evicted too (or the dict is now empty), clamp by size.
-        if next_source in self._sources:
-          new_rotation = list(self._sources)
-          self._idx = new_rotation.index(next_source) % len(new_rotation)
+          continue
+        item = dq.popleft()
+        if dq:
+          self._sources.move_to_end(source)
         else:
-          self._idx = 0
+          del self._sources[source]
         return item
-      # Defensive: an empty deque at the cursor (shouldn't normally happen
-      # since we evict on drain) — evict it and let the loop retry from a
-      # fresh rotation rather than spin on an empty slot.
-      del self._sources[source]
-      self._idx = 0
-    return None
+      return None
 
   def queue_len(self, queue_name: str) -> int:
     """Return total items across all sources.
@@ -136,8 +129,9 @@ class RoundRobinQueueStrategy(QueueStrategy):
     Returns:
         Sum of all per-source deque lengths.
     """
-    del queue_name
-    return sum(len(dq) for dq in self._sources.values())
+    self.bind(queue_name)
+    with self._lock:
+      return sum(len(dq) for dq in self._sources.values())
 
   def clear(self, queue_name: str) -> None:
     """Clear all sources.
@@ -145,6 +139,105 @@ class RoundRobinQueueStrategy(QueueStrategy):
     Args:
         queue_name: The queue name (unused).
     """
-    del queue_name
-    self._sources.clear()
-    self._idx = 0
+    self.bind(queue_name)
+    with self._lock:
+      self._sources.clear()
+
+  def snapshot(self) -> bytes | None:
+    """Serialize pending items and ordered-source cursor for restart recovery."""
+    with self._lock:
+      snapshot_sources = [
+        (source, tuple(items)) for source, items in self._sources.items() if items
+      ]
+    if not snapshot_sources:
+      return None
+    sources = [
+      {
+        "source": source,
+        "items": [base64.b64encode(item).decode("ascii") for item in items],
+      }
+      for source, items in snapshot_sources
+    ]
+    return json.dumps(
+      {"version": 1, "strategy": "round_robin", "sources": sources},
+      separators=(",", ":"),
+    ).encode("utf-8")
+
+  def restore(self, state: bytes | None) -> None:
+    """Restore pending items and fairness cursor from a versioned snapshot.
+
+    The serialized source order starts with the next source to serve. Parsing
+    happens into a temporary ordered dict so malformed snapshots cannot leave
+    partially restored live state.
+    """
+    if not state:
+      return
+    try:
+      data = json.loads(state.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+      logger.warning(
+        "RoundRobinQueueStrategy restore: corrupt snapshot (%s); starting clean.",
+        e,
+      )
+      return
+    if (
+      not isinstance(data, dict)
+      or data.get("strategy") != "round_robin"
+      or data.get("version") != 1
+    ):
+      logger.warning(
+        "RoundRobinQueueStrategy restore: unknown snapshot format; starting clean."
+      )
+      return
+    raw_sources = data.get("sources")
+    if not isinstance(raw_sources, list):
+      logger.warning(
+        "RoundRobinQueueStrategy restore: snapshot 'sources' not a list; "
+        "starting clean."
+      )
+      return
+
+    recovered: OrderedDict[str, deque[bytes]] = OrderedDict()
+    for entry in raw_sources:
+      if not isinstance(entry, dict):
+        logger.warning(
+          "RoundRobinQueueStrategy restore: skipping malformed source entry."
+        )
+        continue
+      source = entry.get("source")
+      raw_items = entry.get("items")
+      if not isinstance(source, str) or not isinstance(raw_items, list):
+        logger.warning(
+          "RoundRobinQueueStrategy restore: skipping malformed source entry."
+        )
+        continue
+      if source in recovered:
+        logger.warning(
+          "RoundRobinQueueStrategy restore: skipping duplicate source %r.",
+          source,
+        )
+        continue
+      items: deque[bytes] = deque()
+      for raw_item in raw_items:
+        try:
+          items.append(base64.b64decode(raw_item, validate=True))
+        except (binascii.Error, TypeError, ValueError) as e:
+          logger.warning(
+            "RoundRobinQueueStrategy restore: skipping malformed item for "
+            "source %r (%s).",
+            source,
+            e,
+          )
+      if items:
+        recovered[source] = items
+
+    recovered_count = sum(len(items) for items in recovered.values())
+    recovered_sources = len(recovered)
+    with self._lock:
+      self._sources = recovered
+    if recovered_sources:
+      logger.info(
+        "RoundRobinQueueStrategy restore: recovered %d item(s) across %d source(s).",
+        recovered_count,
+        recovered_sources,
+      )

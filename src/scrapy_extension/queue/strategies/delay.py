@@ -12,16 +12,22 @@ from __future__ import annotations
 __all__ = ["DEFAULT_DELAY_MAX_HELD", "DelayQueueStrategy"]
 
 import base64
+import binascii
 import heapq
 import itertools
 import json
 import logging
+import math
+import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.monitor.base import Monitor, NullMonitor
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.base import (
+  QueueStrategy,
+  normalize_queue_timeout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +43,23 @@ DEFAULT_DELAY_MAX_HELD: int = 100_000
 # `_warned`. Tests reset this to verify the warn-once contract from a clean
 # slate.
 _over_cap_warned: bool = False
+_over_cap_lock = threading.Lock()
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
+
+
+def _require_finite(value: object, name: str) -> float:
+  """Return a finite numeric value or reject it before it enters queue state."""
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise ValueError(f"{name} must be finite, got {value!r}")
+  try:
+    normalized = float(value)
+  except (OverflowError, TypeError, ValueError) as e:
+    raise ValueError(f"{name} must be finite, got {value!r}") from e
+  if not math.isfinite(normalized):
+    raise ValueError(f"{name} must be finite, got {value!r}")
+  return normalized
 
 
 class DelayQueueStrategy(QueueStrategy):
@@ -73,6 +93,7 @@ class DelayQueueStrategy(QueueStrategy):
     *,
     default_delay: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
     max_held: int = DEFAULT_DELAY_MAX_HELD,
     monitor: Monitor | None = None,
   ) -> None:
@@ -82,6 +103,8 @@ class DelayQueueStrategy(QueueStrategy):
         connection_manager: Connection manager providing the QueueBackend.
         default_delay: Default delay seconds when push omits ``delay``.
         clock: Monotonic clock callable returning seconds (injectable for tests).
+        wall_clock: Unix wall clock used only to account for downtime between
+            snapshot and restore. Deadlines themselves remain monotonic.
         max_held: Soft cap on the in-process holding heap. When the heap
             exceeds this size a one-time WARNING fires (warn-only — items are
             never refused, since dropping a delayed item would silently lose
@@ -98,10 +121,12 @@ class DelayQueueStrategy(QueueStrategy):
         ValueError: If default_delay is negative.
     """
     super().__init__(connection_manager)
+    default_delay = _require_finite(default_delay, "default_delay")
     if default_delay < 0:
-      raise ValueError(f"default_delay must be >= 0, got {default_delay}")
+      raise ValueError(f"default_delay must be finite and >= 0, got {default_delay}")
     self._default_delay = default_delay
     self._clock = clock
+    self._wall_clock = wall_clock
     # R14-F: heap tuple gains a `priority` slot so the drain path can re-pass
     # the caller's priority to the live queue. Without it every delayed item
     # would silently land at priority 0 (priority inversion for callers
@@ -110,8 +135,19 @@ class DelayQueueStrategy(QueueStrategy):
     # trailing two slots are payload that never participate in ordering.
     self._holding: list[tuple[float, int, bytes, float]] = []
     self._seq = itertools.count()
+    # One lock protects every transition of the in-process state. In
+    # particular, draining must keep ``peek -> backend push -> heap pop``
+    # indivisible: two concurrent consumers must never transfer the same due
+    # item twice or pop a different item after racing on the same heap head.
+    self._state_lock = threading.RLock()
+    if isinstance(max_held, bool) or not isinstance(max_held, int):
+      raise ValueError(f"max_held must be an integer, got {max_held!r}")
     self._max_held = max_held
     self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
+
+  def bind(self, queue_name: str) -> None:
+    """Bind this in-process heap to one logical queue."""
+    self._bind_single_queue(queue_name)
 
   def push(
     self,
@@ -132,25 +168,34 @@ class DelayQueueStrategy(QueueStrategy):
         source: Ignored (delay strategy holds by ready-time, not source).
     """
     del source
+    delay = _require_finite(delay, "delay")
+    priority = _require_finite(priority, "priority")
+    if delay < 0:
+      raise ValueError(f"delay must be >= 0, got {delay}")
+    self.bind(queue_name)
     effective = delay if delay > 0 else self._default_delay
     if effective <= 0:
-      self._connection_manager.get_queue_backend().push(queue_name, item, priority)
+      with self._state_lock:
+        self._connection_manager.get_queue_backend().push(queue_name, item, priority)
       return
-    ready_at = self._clock() + effective
-    # R14-F: stash priority in the heap tuple so _drain_ready re-passes it
-    # to the live queue (preserves caller priority across the delay hop).
-    heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
+    with self._state_lock:
+      now = _require_finite(self._clock(), "clock value")
+      ready_at = _require_finite(now + effective, "ready_at")
+      # R14-F: stash priority in the heap tuple so _drain_ready re-passes it
+      # to the live queue (preserves caller priority across the delay hop).
+      heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
+      held = len(self._holding)
     # Risk 3: emit the held-depth gauge so operators can alert before the
     # in-process delay heap grows unbounded (held-delay state is lost on
     # crash). No-op under NullMonitor; BLE001-guarded so a misbehaving
     # monitor cannot crash the push path.
     try:
-      self._monitor.on_delay_depth(len(self._holding))
+      self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 — monitor must never crash push
       logger.debug("on_delay_depth hook raised", exc_info=True)
-    self._warn_over_cap_once()
+    self._warn_over_cap_once(held)
 
-  def _warn_over_cap_once(self) -> None:
+  def _warn_over_cap_once(self, held: int) -> None:
     """Emit a one-time per-process WARNING when the holding heap exceeds cap.
 
     The holding heap grows unboundedly whenever push-rate outpaces
@@ -160,14 +205,15 @@ class DelayQueueStrategy(QueueStrategy):
     module-level ``_over_cap_warned`` flag so a multi-spider process does
     not spam the log. Points at the distributed-delay roadmap (U10).
     """
-    global _over_cap_warned
-    if _over_cap_warned:
-      return
     if self._max_held <= 0:
       return
-    if len(self._holding) <= self._max_held:
+    if held <= self._max_held:
       return
-    _over_cap_warned = True
+    global _over_cap_warned
+    with _over_cap_lock:
+      if _over_cap_warned:
+        return
+      _over_cap_warned = True
     logger.warning(
       "DelayQueueStrategy holding heap exceeded max_held=%d items "
       "(now=%d). The in-process heap grows unboundedly when push-rate "
@@ -176,7 +222,7 @@ class DelayQueueStrategy(QueueStrategy):
       "max_held, drain sooner, or wait for distributed-delay support "
       "(roadmap U10).",
       self._max_held,
-      len(self._holding),
+      held,
     )
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
@@ -189,6 +235,8 @@ class DelayQueueStrategy(QueueStrategy):
     Returns:
         The next ready item, or None if empty.
     """
+    timeout = normalize_queue_timeout(timeout)
+    self.bind(queue_name)
     self._drain_ready(queue_name)
     return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
 
@@ -203,6 +251,8 @@ class DelayQueueStrategy(QueueStrategy):
     (pre-fix the inherited base default dropped the token). Held items are
     re-pushed (not popped), so no token is involved in the drain.
     """
+    timeout = normalize_queue_timeout(timeout)
+    self.bind(queue_name)
     self._drain_ready(queue_name)
     return self._pop_backend_with_ack(queue_name, timeout)
 
@@ -220,10 +270,12 @@ class DelayQueueStrategy(QueueStrategy):
         queue_name: The queue name to drain into.
     """
     qb = self._connection_manager.get_queue_backend()
-    now = self._clock()
-    while self._holding and self._holding[0][0] <= now:
-      _, _, item, priority = heapq.heappop(self._holding)
-      qb.push(queue_name, item, priority)
+    with self._state_lock:
+      now = _require_finite(self._clock(), "clock value")
+      while self._holding and self._holding[0][0] <= now:
+        _, _, item, priority = self._holding[0]
+        qb.push(queue_name, item, priority)
+        heapq.heappop(self._holding)
 
   def queue_len(self, queue_name: str) -> int:
     """Return live-queue length plus held-item count.
@@ -234,10 +286,10 @@ class DelayQueueStrategy(QueueStrategy):
     Returns:
         Number of pending live items plus held (delayed) items.
     """
-    return (
-      self._connection_manager.get_queue_backend().queue_len(queue_name)
-      + len(self._holding)
-    )
+    self.bind(queue_name)
+    with self._state_lock:
+      held = len(self._holding)
+    return self._connection_manager.get_queue_backend().queue_len(queue_name) + held
 
   def clear(self, queue_name: str) -> None:
     """Clear the live queue and all held items.
@@ -250,8 +302,10 @@ class DelayQueueStrategy(QueueStrategy):
     Args:
         queue_name: The queue name.
     """
-    self._connection_manager.get_queue_backend().clear_queue(queue_name)
-    self._holding.clear()
+    self.bind(queue_name)
+    with self._state_lock:
+      self._connection_manager.get_queue_backend().clear_queue(queue_name)
+      self._holding.clear()
 
   def close(self) -> None:
     """Release resources, warning about any held (delayed) items.
@@ -262,22 +316,24 @@ class DelayQueueStrategy(QueueStrategy):
 
     If ``_holding`` is empty, this is a quiet no-op (clears nothing).
     """
-    held = len(self._holding)
-    if held > 0:
-      logger.warning(
-        "DelayQueueStrategy close: discarding %d held delayed item(s) "
-        "from the in-process holding queue; these delayed items are lost "
-        "on close/restart (non-silent data loss).",
-        held,
-      )
-    self._holding.clear()
+    with self._state_lock:
+      held = len(self._holding)
+      if held > 0:
+        logger.warning(
+          "DelayQueueStrategy close: discarding %d held delayed item(s) "
+          "from the in-process holding queue; these delayed items are lost "
+          "on close/restart (non-silent data loss).",
+          held,
+        )
+      self._holding.clear()
 
   def snapshot(self) -> bytes | None:
     """Serialize the holding heap for restart recovery (initiative #3).
 
-    Returns ``None`` when the heap is empty (nothing to persist). Otherwise
-    a versioned JSON blob: ``{"version":1,"strategy":"delay","items":[
-    {"ready_at":..,"item_b64":..,"priority":..},...]}``.
+    Returns ``None`` when the heap is empty (nothing to persist). Version 2
+    stores each item's remaining delay plus the snapshot wall-clock time.
+    Absolute monotonic timestamps are process-local and cannot be restored
+    safely after a reboot or on another host.
 
     The ``seq`` tie-breaker is deliberately NOT persisted — it's a monotonic
     process-local counter; :meth:`restore` re-sequences with a fresh ``_seq``,
@@ -285,18 +341,26 @@ class DelayQueueStrategy(QueueStrategy):
     serialized list order preserves relative order among equal-``ready_at``
     items, so the rebuilt heap is equivalent).
     """
-    if not self._holding:
-      return None
-    items = [
-      {
-        "ready_at": ready_at,
-        "item_b64": base64.b64encode(item).decode("ascii"),
-        "priority": priority,
-      }
-      for ready_at, _seq, item, priority in self._holding
-    ]
+    with self._state_lock:
+      if not self._holding:
+        return None
+      snapshot_now = _require_finite(self._clock(), "clock value")
+      snapshot_wall_time = _require_finite(self._wall_clock(), "wall clock value")
+      items = [
+        {
+          "remaining": max(0.0, ready_at - snapshot_now),
+          "item_b64": base64.b64encode(item).decode("ascii"),
+          "priority": priority,
+        }
+        for ready_at, _seq, item, priority in sorted(self._holding)
+      ]
     return json.dumps(
-      {"version": 1, "strategy": "delay", "items": items}
+      {
+        "version": 2,
+        "strategy": "delay",
+        "snapshot_wall_time": snapshot_wall_time,
+        "items": items,
+      }
     ).encode("utf-8")
 
   def restore(self, state: bytes | None) -> None:
@@ -321,7 +385,7 @@ class DelayQueueStrategy(QueueStrategy):
     if (
       not isinstance(data, dict)
       or data.get("strategy") != "delay"
-      or data.get("version") != 1
+      or data.get("version") not in (1, 2)
     ):
       logger.warning(
         "DelayQueueStrategy restore: unknown snapshot format "
@@ -336,21 +400,75 @@ class DelayQueueStrategy(QueueStrategy):
         "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
       )
       return
-    recovered = 0
-    for entry in items:
+    version = int(data["version"])
+    try:
+      now = _require_finite(self._clock(), "clock value")
+    except (TypeError, ValueError) as e:
+      logger.warning(
+        "DelayQueueStrategy restore: invalid clock metadata (%s); starting clean.",
+        e,
+      )
+      return
+    downtime = 0.0
+    if version == 2:
+      try:
+        snapshot_wall_time = float(data["snapshot_wall_time"])
+        current_wall_time = float(self._wall_clock())
+        if not math.isfinite(snapshot_wall_time) or not math.isfinite(
+          current_wall_time
+        ):
+          raise ValueError("wall clock is not finite")
+        downtime = max(0.0, current_wall_time - snapshot_wall_time)
+      except (KeyError, TypeError, ValueError) as e:
+        logger.warning(
+          "DelayQueueStrategy restore: invalid v2 clock metadata (%s); starting clean.",
+          e,
+        )
+        return
+
+    recovered_entries: list[tuple[float, float, int, bytes, float]] = []
+    for input_order, entry in enumerate(items):
       if not isinstance(entry, dict):
         continue
       try:
-        ready_at = float(entry["ready_at"])
-        item = base64.b64decode(entry["item_b64"])
+        if version == 2:
+          remaining = float(entry["remaining"])
+          if not math.isfinite(remaining):
+            raise ValueError("remaining delay is not finite")
+          ready_at = _require_finite(now + max(0.0, remaining - downtime), "ready_at")
+          original_deadline = remaining
+        else:
+          # v1 persisted an absolute monotonic value. Its epoch is unknowable
+          # after reboot or host migration, so make the item due immediately
+          # instead of risking an arbitrarily long stall. Preserve only its
+          # relative ordering so earlier legacy deadlines still drain first.
+          original_deadline = _require_finite(float(entry["ready_at"]), "ready_at")
+          ready_at = now
+        item = base64.b64decode(entry["item_b64"], validate=True)
         priority = float(entry["priority"])
-      except (KeyError, TypeError, ValueError) as e:
-        logger.warning(
-          "DelayQueueStrategy restore: skipping malformed entry (%s).", e
-        )
+        _require_finite(priority, "priority")
+      except (KeyError, TypeError, ValueError, binascii.Error) as e:
+        logger.warning("DelayQueueStrategy restore: skipping malformed entry (%s).", e)
         continue
-      heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
-      recovered += 1
+      recovered_entries.append(
+        (ready_at, original_deadline, input_order, item, priority)
+      )
+    recovered_entries.sort(key=lambda entry: entry[:3])
+    rebuilt = [
+      (ready_at, seq, item, priority)
+      for seq, (
+        ready_at,
+        _original_deadline,
+        _input_order,
+        item,
+        priority,
+      ) in enumerate(recovered_entries)
+    ]
+    heapq.heapify(rebuilt)
+    with self._state_lock:
+      self._holding = rebuilt
+      self._seq = itertools.count(len(rebuilt))
+    recovered = len(recovered_entries)
     if recovered:
       logger.info(
         "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",

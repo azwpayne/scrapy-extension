@@ -94,6 +94,8 @@ class CircuitBreaker:
       reset_timeout: Seconds the breaker stays OPEN before allowing a
           HALF_OPEN probe. Must be >= 0.
       time_fn: Monotonic clock callable; defaults to :func:`time.monotonic`.
+      failure_exceptions: Exception classes that represent backend failures.
+          Other exceptions propagate without changing breaker state.
   """
 
   def __init__(
@@ -103,6 +105,7 @@ class CircuitBreaker:
     failure_threshold: int = 5,
     reset_timeout: float = 30.0,
     time_fn: Callable[[], float] | None = None,
+    failure_exceptions: tuple[type[BaseException], ...] = (BaseException,),
   ) -> None:
     if failure_threshold < 1:
       msg = f"failure_threshold must be >= 1, got {failure_threshold}"
@@ -113,6 +116,7 @@ class CircuitBreaker:
     self.name = name
     self.failure_threshold = failure_threshold
     self.reset_timeout = reset_timeout
+    self.failure_exceptions = failure_exceptions
     self._time_fn: Callable[[], float] = time_fn or time.monotonic
     self._lock = threading.Lock()
     self._state = BreakerState.CLOSED
@@ -189,10 +193,15 @@ class CircuitBreaker:
         self._probe_in_flight = True
       else:
         return BreakerState.OPEN
-    elif self._state is BreakerState.HALF_OPEN and self._probe_in_flight:
-      # A probe is already in flight (another thread claimed the slot in this
-      # HALF_OPEN window). Fail fast without issuing a second concurrent probe.
-      return BreakerState.OPEN
+    elif self._state is BreakerState.HALF_OPEN:
+      if self._probe_in_flight:
+        # A probe is already in flight (another thread claimed the slot in this
+        # HALF_OPEN window). Fail fast without issuing a second concurrent probe.
+        return BreakerState.OPEN
+      # A prior non-counted exception or process signal released the probe
+      # slot while deliberately leaving the breaker HALF_OPEN. Re-claim it for
+      # this call so concurrent callers still observe the single-probe rule.
+      self._probe_in_flight = True
     return self._state
 
   def _record_success(self, prior_state: BreakerState) -> None:
@@ -291,6 +300,16 @@ class CircuitBreaker:
         if prior_state is BreakerState.HALF_OPEN:
           with self._lock:
             self._probe_in_flight = False
+        raise
+      if not isinstance(exc, self.failure_exceptions):
+        # Caller/input errors are neither a backend success nor a backend
+        # failure. A HALF_OPEN call already claimed the sole probe slot, so
+        # release it without closing or re-opening the breaker; the next
+        # eligible call can perform the real recovery probe.
+        if prior_state is BreakerState.HALF_OPEN:
+          with self._lock:
+            if self._state is BreakerState.HALF_OPEN:
+              self._probe_in_flight = False
         raise
       with self._lock:
         self._record_failure(prior_state)

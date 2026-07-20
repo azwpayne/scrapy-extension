@@ -17,13 +17,29 @@ registry to maintain.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import json
 import logging
+import math
+import os
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
+from copy import deepcopy
+from datetime import date, datetime, timedelta
+from datetime import time as datetime_time
+from decimal import Decimal
+from difflib import get_close_matches
+from enum import Enum
+from json import JSONEncoder
+from pathlib import PurePath
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, cast
+from uuid import UUID
+
+from pydantic import BaseModel, SecretBytes, SecretStr, ValidationError
 
 from scrapy_extension.backends._retry import compute_full_jitter_backoff
 from scrapy_extension.backends.base import (
@@ -39,13 +55,59 @@ from scrapy_extension.backends.registry import (
   get_registry,
   has_capability,
 )
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  BackendError,
+  ConfigurationError,
+)
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import Backend
 
 logger = logging.getLogger(__name__)
+
+_BUNDLED_BACKEND_TYPES: frozenset[str] = frozenset(
+  backend_type.value for backend_type in BackendType
+)
+_CONNECTION_MANAGER_SETTING_NAMES: frozenset[str] = frozenset(
+  {"retry_attempts", "retry_delay"}
+)
+_CONNECTION_MANAGER_INTERNAL_KEYS: dict[str, str] = {
+  "retry_attempts": "__connection_manager_retry_attempts",
+  "retry_delay": "__connection_manager_retry_delay",
+}
+_CONNECTION_MANAGER_DIRECT_KEYS: dict[str, str] = {
+  "retry_attempts": "manager_retry_attempts",
+  "retry_delay": "manager_retry_delay",
+}
+# Registry-only discriminator used by components whose backend owns mutable
+# consumer state tied to one logical queue. It participates in ``_registry_key``
+# but is stripped before constructing the backend's Pydantic settings model.
+_CONNECTION_MANAGER_SCOPE_KEY = "__connection_manager_queue_scope"
+_CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS: frozenset[str] = frozenset(
+  {
+    *_CONNECTION_MANAGER_INTERNAL_KEYS.values(),
+    *_CONNECTION_MANAGER_DIRECT_KEYS.values(),
+    _CONNECTION_MANAGER_SCOPE_KEY,
+  }
+)
+_CONNECTION_MANAGER_SCRAPY_KEYS: dict[str, str] = {
+  "retry_attempts": "SCRAPY_RETRY_ATTEMPTS",
+  "retry_delay": "SCRAPY_RETRY_DELAY",
+}
+_CONNECTION_MANAGER_DEFAULTS: dict[str, int | float] = {
+  "retry_attempts": 3,
+  "retry_delay": 1.0,
+}
+
+
+def _model_field_names(settings_cls: Any) -> frozenset[str]:
+  """Return declared Pydantic field names without assuming a model class."""
+  fields = getattr(settings_cls, "model_fields", None)
+  if not isinstance(fields, Mapping):
+    return frozenset()
+  return frozenset(name for name in fields if isinstance(name, str))
 
 
 # ---------------------------------------------------------------------------
@@ -121,11 +183,16 @@ def resolve_backend_config(
 
   Multi-backend coexistence: each component (queue / set / storage) can bind
   to its own backend via a per-component key pair — e.g. queue seeds in
-  Redis-Cluster while dedup fingerprints live in MongoDB. When the
-  per-component ``type_key`` is set, the component uses the per-component
-  ``settings_key``; otherwise it falls back to the global
-  ``SCRAPY_BACKEND_TYPE`` / ``SCRAPY_BACKEND_SETTINGS`` so existing
-  single-backend configurations keep working unchanged.
+  Redis-Cluster while dedup fingerprints live in MongoDB. Backend-type
+  precedence is Scrapy per-component, Scrapy global, environment
+  per-component, environment global, then Redis. A per-component type source
+  uses the matching per-component ``settings_key``; global/default sources use
+  ``SCRAPY_BACKEND_SETTINGS``.
+
+  Bundled backend fields may be supplied as flat Scrapy settings using the
+  Pydantic model's environment prefix (for example ``SCRAPY_REDIS_HOST``).
+  Explicit nested backend settings take precedence over those flat values.
+  Plugin and non-Pydantic settings classes are left untouched.
 
   Capability validation (round-5 R5-1): when ``required_capabilities`` is
   supplied, the resolved backend's descriptor must declare EVERY capability
@@ -165,19 +232,34 @@ def resolve_backend_config(
           or if ``required_capabilities`` is set and the backend does not
           declare all of them.
   """
-  per_component_type = settings.get(type_key)
-  if per_component_type:
-    backend_type, source_key = (
-      _normalize_backend_type(per_component_type, type_key),
-      type_key,
-    )
-    backend_settings = settings.getdict(settings_key, {})
-  else:
-    backend_type = _normalize_backend_type(
-      settings.get("SCRAPY_BACKEND_TYPE") or "redis", "SCRAPY_BACKEND_TYPE"
-    )
-    backend_settings = settings.getdict("SCRAPY_BACKEND_SETTINGS", {})
+  scrapy_component_type = settings.get(type_key)
+  scrapy_global_type = settings.get("SCRAPY_BACKEND_TYPE")
+  if scrapy_component_type:
+    raw_backend_type = scrapy_component_type
+    source_key = type_key
+    nested_settings_key = settings_key
+  elif scrapy_global_type:
+    raw_backend_type = scrapy_global_type
     source_key = "SCRAPY_BACKEND_TYPE"
+    nested_settings_key = "SCRAPY_BACKEND_SETTINGS"
+  else:
+    environment_component_type = os.environ.get(type_key)
+    environment_global_type = os.environ.get("SCRAPY_BACKEND_TYPE")
+    if environment_component_type:
+      raw_backend_type = environment_component_type
+      source_key = type_key
+      nested_settings_key = settings_key
+    else:
+      raw_backend_type = environment_global_type or "redis"
+      source_key = "SCRAPY_BACKEND_TYPE"
+      nested_settings_key = "SCRAPY_BACKEND_SETTINGS"
+
+  backend_type = _normalize_backend_type(raw_backend_type, source_key)
+  backend_settings = _adapt_backend_settings(
+    settings,
+    backend_type,
+    settings.getdict(nested_settings_key, {}),
+  )
 
   if required_capabilities is not None:
     missing = [
@@ -199,6 +281,156 @@ def resolve_backend_config(
       raise ConfigurationError(msg, setting_name=source_key)
 
   return backend_type, backend_settings
+
+
+def _adapt_backend_settings(
+  settings: Any,
+  backend_type: str,
+  nested_settings: Mapping[str, Any],
+) -> dict[str, Any]:
+  """Validate and merge flat/nested settings for a bundled backend model."""
+  if backend_type not in _BUNDLED_BACKEND_TYPES:
+    return _merge_connection_manager_settings(
+      settings,
+      {},
+      nested_settings,
+      frozenset(),
+    )
+
+  descriptor = get_descriptor(backend_type)
+  settings_cls = _load_object(descriptor.settings_cls_path)
+  if not isinstance(settings_cls, type) or not issubclass(settings_cls, BaseModel):
+    return _merge_connection_manager_settings(
+      settings,
+      {},
+      nested_settings,
+      frozenset(),
+    )
+
+  env_prefix = settings_cls.model_config.get("env_prefix")
+  if not isinstance(env_prefix, str) or not env_prefix:
+    return _merge_connection_manager_settings(
+      settings,
+      {},
+      nested_settings,
+      frozenset(settings_cls.model_fields),
+    )
+
+  field_names = frozenset(settings_cls.model_fields)
+  allowed_nested_names = field_names | _CONNECTION_MANAGER_SETTING_NAMES
+  for setting_name in nested_settings:
+    if not isinstance(setting_name, str) or setting_name not in allowed_nested_names:
+      raise _unknown_backend_setting(
+        str(setting_name),
+        allowed_nested_names,
+        backend_type,
+      )
+
+  flat_key_to_field = {
+    f"{env_prefix}{field_name.upper()}".upper(): field_name
+    for field_name in field_names
+  }
+  flat_settings: dict[str, Any] = {}
+  if isinstance(settings, Mapping):
+    for setting_name, value in settings.items():
+      if not isinstance(setting_name, str):
+        continue
+      normalized_name = setting_name.upper()
+      field_name = flat_key_to_field.get(normalized_name)
+      if field_name is not None:
+        flat_settings[field_name] = value
+      elif normalized_name.startswith(env_prefix.upper()):
+        raise _unknown_backend_setting(
+          setting_name,
+          frozenset(flat_key_to_field),
+          backend_type,
+        )
+  else:
+    missing = object()
+    for setting_name, field_name in flat_key_to_field.items():
+      value = settings.get(setting_name, missing)
+      if value is not missing:
+        flat_settings[field_name] = value
+
+  for setting_name in os.environ:
+    normalized_name = setting_name.upper()
+    if normalized_name.startswith(env_prefix.upper()) and (
+      normalized_name not in flat_key_to_field
+    ):
+      raise _unknown_backend_setting(
+        setting_name,
+        frozenset(flat_key_to_field),
+        backend_type,
+      )
+
+  return _merge_connection_manager_settings(
+    settings,
+    flat_settings,
+    nested_settings,
+    field_names,
+  )
+
+
+def _merge_connection_manager_settings(
+  settings: Any,
+  backend_settings: Mapping[str, Any],
+  nested_settings: Mapping[str, Any],
+  backend_field_names: frozenset[str],
+) -> dict[str, Any]:
+  """Separate generic connection retries from backend model fields.
+
+  ``retry_delay`` is also a RabbitMQ model field. Keeping the generic retry
+  under the same key made one value drive both pika's inner connection loop
+  and ConnectionManager's outer loop. Internal keys preserve the public
+  nested setting names while letting each layer consume only its own value.
+  """
+  merged_backend_settings = dict(backend_settings)
+  merged_nested_settings = dict(nested_settings)
+  manager_settings: dict[str, Any] = {}
+
+  for public_name, internal_name in _CONNECTION_MANAGER_INTERNAL_KEYS.items():
+    scrapy_key = _CONNECTION_MANAGER_SCRAPY_KEYS[public_name]
+    global_value = settings.get(scrapy_key)
+    if global_value is None:
+      global_value = os.environ.get(scrapy_key)
+    if global_value is not None:
+      manager_settings[internal_name] = global_value
+
+    if public_name in merged_nested_settings:
+      if public_name in backend_field_names:
+        # This is a backend-specific field with a colliding name. Keep it for
+        # the backend and ensure the outer manager uses its independent global
+        # value (or the documented default).
+        manager_settings.setdefault(
+          internal_name,
+          _CONNECTION_MANAGER_DEFAULTS[public_name],
+        )
+      else:
+        manager_settings[internal_name] = merged_nested_settings.pop(public_name)
+
+    if public_name in merged_backend_settings:
+      manager_settings.setdefault(
+        internal_name,
+        _CONNECTION_MANAGER_DEFAULTS[public_name],
+      )
+
+  merged_backend_settings.update(merged_nested_settings)
+  merged_backend_settings.update(manager_settings)
+  return merged_backend_settings
+
+
+def _unknown_backend_setting(
+  setting_name: str,
+  valid_names: frozenset[str],
+  backend_type: str,
+) -> ConfigurationError:
+  """Build a value-free typo error with a best-effort setting suggestion."""
+  suggestions = get_close_matches(setting_name, sorted(valid_names), n=1, cutoff=0.6)
+  suggestion = f" Did you mean {suggestions[0]!r}?" if suggestions else ""
+  return ConfigurationError(
+    f"Unknown {backend_type!r} backend setting {setting_name!r}.{suggestion}",
+    setting_name=setting_name,
+  )
 
 
 def _normalize_backend_type(value: object, setting_name: str) -> str:
@@ -249,6 +481,162 @@ class _ConnectionAttempt:
   def __init__(self) -> None:
     self.event = threading.Event()
     self.error: BaseException | None = None
+
+
+def _registry_type_name(value: object) -> str:
+  """Return a process-stable, module-qualified type name."""
+  value_type = type(value)
+  return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _canonical_registry_json(value: Any) -> str:
+  """Encode an already-normalized value without a lossy string fallback."""
+  return JSONEncoder(
+    ensure_ascii=True,
+    allow_nan=False,
+    sort_keys=True,
+    separators=(",", ":"),
+  ).encode(value)
+
+
+def _normalize_registry_value(value: Any, active_ids: set[int]) -> Any:
+  """Build a deterministic, type-tagged JSON value for registry hashing.
+
+  ``active_ids`` tracks only the current recursion path. Repeated references
+  outside that path are normalized by value, while actual cycles receive a
+  deterministic type marker instead of an address-bearing ``repr``.
+  """
+  if isinstance(value, SecretStr):
+    return ["secret-str", value.get_secret_value()]
+  if isinstance(value, SecretBytes):
+    return ["secret-bytes", value.get_secret_value().hex()]
+  if isinstance(value, Enum):
+    return [
+      "enum",
+      _registry_type_name(value),
+      value.name,
+      _normalize_registry_value(value.value, active_ids),
+    ]
+  if value is None:
+    return ["none"]
+  if isinstance(value, bool):
+    return ["bool", value]
+  if isinstance(value, int):
+    return ["int", str(value)]
+  if isinstance(value, float):
+    return ["float", value.hex()]
+  if isinstance(value, str):
+    return ["str", value]
+  if isinstance(value, bytes):
+    return ["bytes", value.hex()]
+  if isinstance(value, bytearray):
+    return ["bytearray", bytes(value).hex()]
+  if isinstance(value, memoryview):
+    return ["memoryview", value.tobytes().hex()]
+  if isinstance(value, datetime):
+    return ["datetime", _registry_type_name(value), value.isoformat(), value.fold]
+  if isinstance(value, date):
+    return ["date", _registry_type_name(value), value.isoformat()]
+  if isinstance(value, datetime_time):
+    return ["time", _registry_type_name(value), value.isoformat(), value.fold]
+  if isinstance(value, timedelta):
+    return ["timedelta", value.days, value.seconds, value.microseconds]
+  if isinstance(value, Decimal):
+    return ["decimal", str(value)]
+  if isinstance(value, UUID):
+    return ["uuid", value.hex]
+  if isinstance(value, PurePath):
+    return ["path", _registry_type_name(value), str(value)]
+  if isinstance(value, range):
+    return ["range", value.start, value.stop, value.step]
+  if isinstance(value, complex):
+    return ["complex", value.real.hex(), value.imag.hex()]
+  if isinstance(value, type):
+    return ["class", value.__module__, value.__qualname__]
+  if isinstance(value, ModuleType):
+    return ["module", value.__name__]
+
+  value_id = id(value)
+  if value_id in active_ids:
+    return ["cycle", _registry_type_name(value)]
+
+  active_ids.add(value_id)
+  try:
+    if isinstance(value, Mapping):
+      entries = [
+        [
+          _normalize_registry_value(key, active_ids),
+          _normalize_registry_value(item, active_ids),
+        ]
+        for key, item in value.items()
+      ]
+      entries.sort(key=_canonical_registry_json)
+      return ["mapping", _registry_type_name(value), entries]
+
+    if isinstance(value, (list, tuple)):
+      return [
+        "sequence",
+        _registry_type_name(value),
+        [_normalize_registry_value(item, active_ids) for item in value],
+      ]
+
+    if isinstance(value, (set, frozenset)):
+      items = [_normalize_registry_value(item, active_ids) for item in value]
+      items.sort(key=_canonical_registry_json)
+      return ["set", _registry_type_name(value), items]
+
+    module_name = getattr(value, "__module__", None)
+    qualified_name = getattr(value, "__qualname__", None)
+    if (
+      callable(value)
+      and isinstance(module_name, str)
+      and isinstance(qualified_name, str)
+    ):
+      return [
+        "callable",
+        _registry_type_name(value),
+        module_name,
+        qualified_name,
+      ]
+
+    state: list[Any] = []
+    try:
+      instance_dict = vars(value)
+    except TypeError:
+      instance_dict = None
+    if instance_dict is not None:
+      state.append(["dict", _normalize_registry_value(instance_dict, active_ids)])
+
+    slot_state: list[Any] = []
+    for owner in type(value).__mro__:
+      declared_slots = owner.__dict__.get("__slots__", ())
+      if isinstance(declared_slots, str):
+        declared_slots = (declared_slots,)
+      for slot in declared_slots:
+        if slot in {"__dict__", "__weakref__"}:
+          continue
+        attribute_name = slot
+        if slot.startswith("__") and not slot.endswith("__"):
+          attribute_name = f"_{owner.__name__.lstrip('_')}{slot}"
+        try:
+          slot_value = getattr(value, attribute_name)
+        except (AttributeError, TypeError, ValueError):
+          continue
+        slot_state.append(
+          [
+            f"{owner.__module__}.{owner.__qualname__}:{slot}",
+            _normalize_registry_value(slot_value, active_ids),
+          ]
+        )
+    if slot_state:
+      slot_state.sort(key=_canonical_registry_json)
+      state.append(["slots", slot_state])
+
+    if state:
+      return ["object", _registry_type_name(value), state]
+    return ["opaque", _registry_type_name(value)]
+  finally:
+    active_ids.remove(value_id)
 
 
 class ConnectionManager:
@@ -311,6 +699,18 @@ class ConnectionManager:
     self.settings = settings or {}
     self._backend: Backend | None = None
     self._lock = threading.Lock()
+    # Serialize the complete create/connect/publish transaction. The lazy
+    # ``backend`` property already elects one owner among property callers, but
+    # ``connect()`` is public and is called directly by spider lifecycle
+    # signals. Without a separate lock, two direct callers can each create a
+    # backend and the later publish overwrites (and leaks) the earlier one.
+    # Keep this distinct from ``_lock`` so retry backoff and network I/O remain
+    # outside the shared state lock.
+    self._connect_lock = threading.Lock()
+    # Terminal lifecycle marker. Once the final holder releases (or registry
+    # teardown evicts this manager), a slow in-progress connect must not
+    # publish a backend into the now-unowned instance.
+    self._retired = False
     # Refcount of outstanding ``get_manager()`` acquire calls sharing this
     # instance (A1). The manager is only created via ``get_manager()``, so
     # the constructor sets the initial count to 0; ``get_manager()`` then
@@ -368,8 +768,11 @@ class ConnectionManager:
     Returns:
         A ConnectionManager instance for the given backend.
     """
-    normalized_settings = settings or {}
-    key = cls._registry_key(backend_type, normalized_settings)
+    # Hash and retain the same deep snapshot. Otherwise a caller can mutate a
+    # nested value after hashing and make the old registry key point at new
+    # connection settings.
+    settings_snapshot = deepcopy(settings) if settings is not None else {}
+    key = cls._registry_key(backend_type, settings_snapshot)
 
     victims: list[ConnectionManager] = []
     with cls._registry_lock:
@@ -387,7 +790,7 @@ class ConnectionManager:
         # AFTER release (see the loop below) so a slow victim disconnect
         # does not serialize peer get_manager() calls.
         victims = cls._collect_orphans_under_lock()
-        manager = cls(backend_type, normalized_settings)
+        manager = cls(backend_type, settings_snapshot)
         cls._managers[key] = manager
       else:
         # LRU touch — recently-used entries move to the back (newest).
@@ -466,6 +869,7 @@ class ConnectionManager:
     hooks that ``suppress()`` would skip, so its teardown stays inline.
     """
     with manager._lock:
+      manager._retired = True
       if manager._backend is not None:
         with contextlib.suppress(Exception):
           manager._backend.disconnect()
@@ -483,15 +887,13 @@ class ConnectionManager:
     is the repr-like ``"BackendType.REDIS"`` — NOT the registry key — so we
     extract ``.value`` explicitly. Plain strings pass through unchanged.
 
-    Initiative #14: ``default=str`` was lossy — ``str(datetime(2024,1,1))``
-    and the string ``"2024-01-01 00:00:00"`` both rendered as
-    ``2024-01-01 00:00:00``, so two workers whose settings differed only in
-    a non-JSON-typed value silently shared one connection manager (wrong
-    backend conn / wrong DB index — the prime victim is multi-backend
-    coexistence via ``resolve_backend_config``). The ``_tag`` default emits
-    ``{"__type__": <qualname>, "__value__": <str>}`` so distinct types render
-    distinctly, while pure-JSON settings stay byte-identical to the pre-#14
-    form (``default`` is only invoked for values JSON can't natively encode).
+    Settings are recursively normalized into a type-tagged JSON structure,
+    then the complete structure is reduced to a SHA-256 digest. Pydantic
+    ``SecretStr`` / ``SecretBytes`` values contribute their underlying secret,
+    so distinct credentials never share a manager, while neither those values
+    nor plain-string credentials remain in the class registry key. The
+    normalization avoids address-bearing or secret-bearing ``repr`` fallbacks
+    and is deterministic across equivalent settings objects.
     """
     bt_key = (
       backend_type.value
@@ -499,31 +901,25 @@ class ConnectionManager:
       else backend_type
     )
 
-    def _tag(obj: Any) -> Any:
-      # Type-tagged fallback for values JSON can't natively encode — distinct
-      # types now render distinctly (the str()-only form collapsed them).
-      return {"__type__": type(obj).__qualname__, "__value__": str(obj)}
-
+    normalized_settings = [
+      "connection-manager-registry-v1",
+      _normalize_registry_value(settings, set()),
+    ]
     try:
       settings_key = json.dumps(
-        settings,
+        normalized_settings,
+        ensure_ascii=True,
+        allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
-        default=_tag,
       )
     except (TypeError, ValueError):
-      # Pathological settings json can't traverse even with the type-tagging
-      # default (e.g. circular references, non-string dict keys). Fall back to
-      # a type-tagged repr so even here distinct values cannot collide — the
-      # old ``str(sorted(settings.items()))`` had the same lossy ``str()``
-      # collision risk as ``default=str``. ``sorted`` over strings is total
-      # (always comparable), so it never raises on mixed-type keys.
-      tagged = sorted(
-        f"{type(k).__qualname__}:{k!r}={type(v).__qualname__}:{v!r}"
-        for k, v in settings.items()
-      )
-      settings_key = "[" + ",".join(tagged) + "]"
-    return f"{bt_key}:{settings_key}"
+      # ``normalized_settings`` contains JSON-native values only. This branch
+      # keeps key generation available if the module-level JSON facade is
+      # replaced/fails, without falling back to a plaintext ``repr``.
+      settings_key = _canonical_registry_json(normalized_settings)
+    settings_digest = hashlib.sha256(settings_key.encode("utf-8")).hexdigest()
+    return f"{bt_key}:{settings_digest}"
 
   def _create_backend(self) -> Backend:
     """Create a backend instance based on type.
@@ -549,26 +945,59 @@ class ConnectionManager:
     )
     backend_cls = _load_object(descriptor.backend_cls_path)
     settings_cls = _load_object(descriptor.settings_cls_path)
+    backend_field_names = _model_field_names(settings_cls)
+    manager_only_names = _CONNECTION_MANAGER_SETTING_NAMES - backend_field_names
+    backend_settings = {
+      name: value
+      for name, value in self.settings.items()
+      if name not in _CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS
+      and name not in manager_only_names
+    }
     # Both loaded objects are dynamically-discovered plugin classes (typed as
     # ``Any``); cast narrows to the concrete ``Backend`` instance we construct.
-    return cast("Backend", backend_cls(settings_cls(**self.settings)))
+    return cast("Backend", backend_cls(settings_cls(**backend_settings)))
 
   def connect(self) -> None:
     """Establish connection with retry logic.
 
-    Attempts to connect with exponential backoff based on
-    retry_attempts and retry_delay settings.
+    Makes one initial connection attempt, then up to ``retry_attempts`` retries
+    with exponential backoff based on ``retry_delay``. Concurrent direct calls
+    share the resulting backend: the complete retry transaction is serialized,
+    and each waiter re-checks the connected fast path after acquiring the
+    connection lock.
 
     Raises:
-        ConnectionError: If all retry attempts fail.
+        BackendConnectionError: If all network retry attempts fail.
+        ConfigurationError: If generic retry controls are invalid.
+        ValidationError: If backend-specific Pydantic settings are invalid.
+        ImportError: If the selected backend's optional dependency is missing.
     """
-    retry_attempts = self.settings.get("retry_attempts", 3)
-    retry_delay = self.settings.get("retry_delay", 1.0)
+    with self._connect_lock:
+      self._connect_with_retries()
+
+  def _connect_with_retries(self) -> None:
+    """Run one serialized connection transaction for :meth:`connect`."""
+    with self._lock:
+      if self._retired:
+        raise BackendConnectionError(
+          "Cannot connect a released ConnectionManager",
+          backend_type=str(self.backend_type),
+        )
+      if self._backend is not None:
+        return
+
+    retry_attempts, retry_delay = self._retry_policy()
+    total_attempts = retry_attempts + 1
 
     last_exception: Exception | None = None
-    for attempt in range(retry_attempts):
+    for attempt in range(total_attempts):
       try:
         self._attempt_connection()
+      except (ConfigurationError, ValidationError, ImportError):
+        # Invalid settings and missing optional dependencies cannot recover via
+        # network backoff. Preserve their actionable exception and avoid
+        # constructing/sleeping through the remaining retry attempts.
+        raise
       except Exception as e:
         # Intentional broad catch: any backend connection error should trigger retry.
         # Backend-specific exceptions (RedisError, PyMongoError, KafkaError, AMQPError)
@@ -579,29 +1008,121 @@ class ConnectionManager:
         # nothing caught by ``except Exception`` can be an instance of either.)
         last_exception = e
         logger.warning(
-          "Connection attempt %d/%d failed: %s", attempt + 1, retry_attempts, e
+          "Connection attempt %d/%d failed: %s", attempt + 1, total_attempts, e
         )
-        if attempt < retry_attempts - 1:
+        with self._lock:
+          retired = self._retired
+        if retired:
+          break
+        if attempt < retry_attempts:
           # R14-D: emit on_retry before each exponential-backoff sleep so a
           # flapping backend surfaces as ``backend/retry_count``. ``attempt``
           # here is the 0-based just-failed index; the retry is 1-based
           # (attempt+1 = first retry = second overall attempt). No-op on the
           # default NullMonitor.
-          self._monitor.on_retry(str(self.backend_type), attempt + 1)
+          self._notify_monitor("on_retry", str(self.backend_type), attempt + 1)
           time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
       else:
         logger.debug("Connected to %s", self.backend_type)
         # R14-D: emit on_connect on the success path so ``backend/connect_count``
         # reflects successful connections. No-op on the default NullMonitor.
-        self._monitor.on_connect(str(self.backend_type))
+        self._notify_monitor("on_connect", str(self.backend_type))
         return
 
     if last_exception is not None:
-      msg = f"Failed to connect after {retry_attempts} attempts: {last_exception}"
+      attempt_word = "attempt" if total_attempts == 1 else "attempts"
+      msg = (
+        f"Failed to connect after {total_attempts} {attempt_word}: {last_exception}"
+      )
       raise BackendConnectionError(
         msg,
         backend_type=str(self.backend_type),
       ) from last_exception
+
+  def _retry_policy(self) -> tuple[int, float]:
+    """Normalize and validate generic connection retry controls.
+
+    ConnectionManager consumes these values before the backend-specific
+    Pydantic model is constructed, so relying on that later model would allow
+    malformed strings to crash arithmetic and huge raw integers to drive an
+    unbounded retry loop. The bounds mirror ``settings.Settings``.
+
+    Returns:
+        ``(retry_attempts, retry_delay_seconds)``.
+
+    Raises:
+        ConfigurationError: If either raw setting is invalid.
+    """
+    descriptor = get_descriptor(
+      self.backend_type.value
+      if isinstance(self.backend_type, BackendType)
+      else self.backend_type
+    )
+    settings_cls = _load_object(descriptor.settings_cls_path)
+    backend_field_names = _model_field_names(settings_cls)
+
+    raw_attempts = self.settings.get(
+      _CONNECTION_MANAGER_INTERNAL_KEYS["retry_attempts"],
+      self.settings.get(
+        _CONNECTION_MANAGER_DIRECT_KEYS["retry_attempts"],
+        (
+          _CONNECTION_MANAGER_DEFAULTS["retry_attempts"]
+          if "retry_attempts" in backend_field_names
+          else self.settings.get(
+            "retry_attempts", _CONNECTION_MANAGER_DEFAULTS["retry_attempts"]
+          )
+        ),
+      ),
+    )
+    try:
+      if isinstance(raw_attempts, bool):
+        raise ValueError
+      retry_attempts = int(raw_attempts)
+      if isinstance(raw_attempts, float) and not raw_attempts.is_integer():
+        raise ValueError
+    except (TypeError, ValueError, OverflowError) as e:
+      raise ConfigurationError(
+        "retry_attempts must be an integer between 0 and 20",
+        setting_name="retry_attempts",
+        setting_value=raw_attempts,
+      ) from e
+    if not 0 <= retry_attempts <= 20:
+      raise ConfigurationError(
+        "retry_attempts must be between 0 and 20",
+        setting_name="retry_attempts",
+        setting_value=raw_attempts,
+      )
+
+    raw_delay = self.settings.get(
+      _CONNECTION_MANAGER_INTERNAL_KEYS["retry_delay"],
+      self.settings.get(
+        _CONNECTION_MANAGER_DIRECT_KEYS["retry_delay"],
+        (
+          _CONNECTION_MANAGER_DEFAULTS["retry_delay"]
+          if "retry_delay" in backend_field_names
+          else self.settings.get(
+            "retry_delay", _CONNECTION_MANAGER_DEFAULTS["retry_delay"]
+          )
+        ),
+      ),
+    )
+    try:
+      if isinstance(raw_delay, bool):
+        raise ValueError
+      retry_delay = float(raw_delay)
+    except (TypeError, ValueError, OverflowError) as e:
+      raise ConfigurationError(
+        "retry_delay must be a finite non-negative number",
+        setting_name="retry_delay",
+        setting_value=raw_delay,
+      ) from e
+    if not math.isfinite(retry_delay) or retry_delay < 0:
+      raise ConfigurationError(
+        "retry_delay must be a finite non-negative number",
+        setting_name="retry_delay",
+        setting_value=raw_delay,
+      )
+    return retry_attempts, retry_delay
 
   def _attempt_connection(self) -> None:
     """Attempt a single connection.
@@ -620,6 +1141,12 @@ class ConnectionManager:
     Raises:
         Exception: If the connection attempt fails.
     """
+    with self._lock:
+      if self._retired:
+        raise BackendConnectionError(
+          "Cannot connect a released ConnectionManager",
+          backend_type=str(self.backend_type),
+        )
     backend = self._create_backend()
     try:
       backend.connect()
@@ -627,7 +1154,19 @@ class ConnectionManager:
       with contextlib.suppress(Exception):
         backend.disconnect()
       raise
-    self._backend = backend
+    with self._lock:
+      if not self._retired:
+        self._backend = backend
+        return
+
+    # The final holder released while backend.connect() was in flight. Dispose
+    # the successful handle instead of resurrecting an evicted manager.
+    with contextlib.suppress(Exception):
+      backend.disconnect()
+    raise BackendConnectionError(
+      "Connection completed after ConnectionManager release; backend discarded",
+      backend_type=str(self.backend_type),
+    )
 
   def close(self) -> None:
     """Release this holder's acquire on the shared manager (refcount).
@@ -670,6 +1209,13 @@ class ConnectionManager:
       return
 
     with self._lock:
+      # Make the final release terminal before inspecting the backend. A
+      # connection attempt runs backend.connect() outside this lock; when it
+      # later tries to publish the successful handle, _attempt_connection()
+      # observes this marker and disposes that handle instead. Without this
+      # assignment, an in-flight connect can resurrect an evicted manager and
+      # leak an unowned connection.
+      self._retired = True
       if self._backend:
         try:
           self._backend.disconnect()
@@ -691,7 +1237,7 @@ class ConnectionManager:
         # regardless. No-op on the default NullMonitor. Inside the ``if
         # self._backend`` block so a no-op close (already disconnected) does
         # not double-count.
-        self._monitor.on_disconnect(str(self.backend_type), None)
+        self._notify_monitor("on_disconnect", str(self.backend_type), None)
       # R14-E: reset the circuit breaker so a manager that reconnects after
       # teardown (or an orphan-evicted manager re-created from the same
       # settings) does not inherit a stale OPEN state from the prior
@@ -745,16 +1291,22 @@ class ConnectionManager:
     """
     self._monitor = monitor
 
+  def _notify_monitor(self, hook_name: str, *args: Any) -> None:
+    """Emit one lifecycle hook without letting telemetry alter control flow."""
+    try:
+      getattr(self._monitor, hook_name)(*args)
+    except Exception:
+      logger.debug("Monitor.%s raised; ignored", hook_name, exc_info=True)
+
   @property
   def backend(self) -> Backend:
     """Get the backend instance, connecting if necessary.
 
     A2 — fast path / slow path split with single-connect ownership:
 
-    - Fast path: lock-free read of ``self._backend``. A non-None value is
-      stable (only ever transitioned ``None``→backend under ``_lock``), so a
-      lock-free read is safe for the already-connected case and avoids
-      contending on ``_lock`` at all once warm.
+    - Fast path: lock-free reads of the terminal marker and ``self._backend``.
+      The terminal marker is checked on both sides of the backend read so a
+      released manager is never deliberately handed out as reusable.
     - Slow path: under ``_lock``, take ownership of connecting via the
       ``_connecting`` flag. Peers that find ``_connecting`` set capture that
       attempt and wait on its event (released by the owner once connect
@@ -776,13 +1328,23 @@ class ConnectionManager:
         BackendConnectionError: If connection fails or ``connect()``
             violates its contract (returns without setting ``_backend``).
     """
-    # Fast path: lock-free read.
-    if self._backend is not None:
-      return self._backend
+    # Fast path: lock-free read. The second terminal-state check closes the
+    # common ordering where close() retires the manager between the first
+    # check and the backend read. The slow path remains the synchronization
+    # boundary for first-connect and close-during-connect races.
+    if not self._retired:
+      backend = self._backend
+      if backend is not None and not self._retired:
+        return backend
 
     attempt: _ConnectionAttempt
     while True:
       with self._lock:
+        if self._retired:
+          raise BackendConnectionError(
+            "Cannot access a released ConnectionManager",
+            backend_type=str(self.backend_type),
+          )
         # Re-check under lock: another thread may have connected while we
         # were waiting on _lock.
         if self._backend is not None:
@@ -826,6 +1388,15 @@ class ConnectionManager:
       )
 
     with self._lock:
+      # A final-holder close can win after connect() publishes a backend but
+      # before this owner fans the result out. close() has already detached
+      # and disconnected that backend, so convert the apparent success into
+      # a terminal error before waking peers.
+      if connect_error is None and self._retired:
+        connect_error = BackendConnectionError(
+          "ConnectionManager was released while connecting",
+          backend_type=str(self.backend_type),
+        )
       attempt.error = connect_error
       self._connecting = False
       attempt.event.set()
@@ -902,6 +1473,7 @@ class ConnectionManager:
           name=f"{bt_key}-backend",
           failure_threshold=failure_threshold,
           reset_timeout=reset_timeout,
+          failure_exceptions=(BackendError,),
         )
       else:
         self._breaker = None

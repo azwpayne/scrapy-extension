@@ -51,7 +51,7 @@ class MongoDBSettings(BaseSettings):
   model_config = SettingsConfigDict(
     env_prefix="SCRAPY_MONGO_",
     case_sensitive=False,
-    extra="ignore",
+    extra="forbid",
   )
 
   # === Mode Selection ===
@@ -113,7 +113,10 @@ class MongoDBSettings(BaseSettings):
   # === Atlas Settings ===
   atlas_cluster_name: str | None = Field(
     default=None,
-    description="Atlas cluster name (for atlas mode)",
+    description=(
+      "Optional Atlas cluster label. It cannot replace uri because an Atlas "
+      "SRV hostname cannot be derived from the display name alone."
+    ),
   )
 
   # === Connection Pool Settings ===
@@ -275,12 +278,8 @@ class MongoDBSettings(BaseSettings):
     """
     if not v or not v.lower().startswith(_VALID_MONGO_SCHEMES):
       raise ConfigurationError(
-        (
-          "uri must start with 'mongodb://' or 'mongodb+srv://'. "
-          f"Got uri={v!r}."
-        ),
+        "uri must start with 'mongodb://' or 'mongodb+srv://'.",
         setting_name="uri",
-        setting_value=v,
       )
     return v
 
@@ -293,9 +292,9 @@ class MongoDBSettings(BaseSettings):
       the RS in the URI). This preserves the documented URI-verbatim fallback
       (mongodb.py:_connect_replica_set) while catching the genuine footgun
       (REPLICA_SET mode with neither name nor URI hint → opaque driver error).
-    - ATLAS: requires ``mongodb+srv://`` in ``uri`` OR an explicit
-      ``atlas_cluster_name``. Without ``+srv``, Atlas DNS SRV resolution
-      silently fails.
+    - ATLAS: requires an explicit ``mongodb+srv://`` URI. The backend connects
+      with ``uri`` verbatim; ``atlas_cluster_name`` is only a label and lacks
+      the deployment-specific DNS suffix needed to construct a connection URI.
 
     Mirrors the Redis SENTINEL validator (raise, not warn). STANDALONE and
     SHARDED_CLUSTER are unaffected (SHARDED_CLUSTER uses mongos routers in
@@ -310,24 +309,22 @@ class MongoDBSettings(BaseSettings):
         raise ConfigurationError(
           (
             "MongoDB REPLICA_SET mode requires 'replica_set_name' to be set, "
-            "or a uri that already carries a '?replicaSet=...' query. "
-            f"Got replica_set_name={self.replica_set_name!r}, "
-            f"uri={self.uri!r}."
+            "or a uri that already carries a '?replicaSet=...' query."
           ),
           setting_name="replica_set_name",
           setting_value=self.replica_set_name,
         )
     elif self.mode == MongoDBMode.ATLAS:
       uri_is_srv = self.uri.lower().startswith("mongodb+srv://")
-      if not uri_is_srv and not self.atlas_cluster_name:
+      if not uri_is_srv:
         raise ConfigurationError(
           (
-            "MongoDB ATLAS mode requires a 'mongodb+srv://' uri OR "
-            "'atlas_cluster_name' to be set (Atlas resolves brokers via DNS "
-            f"SRV records). Got uri={self.uri!r}, atlas_cluster_name={self.atlas_cluster_name!r}."
+            "MongoDB ATLAS mode requires an explicit 'mongodb+srv://' uri. "
+            "atlas_cluster_name cannot replace uri because the backend uses "
+            "uri verbatim and a complete Atlas SRV hostname cannot be derived "
+            "from a cluster display name."
           ),
-          setting_name="atlas_cluster_name",
-          setting_value=self.atlas_cluster_name,
+          setting_name="uri",
         )
     return self
 

@@ -5,13 +5,27 @@ build-backend = "uv_build"
 [project]
 name = "scrapy-extension"
 version = "0.1.0"
-description = "Distributed crawling for Scrapy with pluggable backends — Redis, MongoDB, Kafka, RabbitMQ, ElasticSearch, RocketMQ."
+description = "Distributed crawling for Scrapy with ten pluggable queue, deduplication, and storage backends."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "azwpayne", email = "paynewu0719@gmail.com" }]
 requires-python = ">=3.10"
-keywords = ["scrapy", "crawler", "distributed", "redis", "mongodb", "kafka", "rabbitmq", "elasticsearch", "rocketmq"]
+keywords = [
+    "scrapy",
+    "crawler",
+    "distributed",
+    "redis",
+    "mongodb",
+    "kafka",
+    "rabbitmq",
+    "elasticsearch",
+    "rocketmq",
+    "pulsar",
+    "sqs",
+    "memcached",
+    "dynamodb",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Scrapy",
@@ -26,8 +40,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "pydantic>=2.7,<3",
     "pydantic-settings>=2.13.1,<3",
     "scrapy>=2.14.2,<3",
+    "typing-extensions>=4.12.2,<5",
 ]
 
 [project.urls]
@@ -104,6 +120,26 @@ test = [
 [tool.uv]
 default-groups = ["dev", "test"]
 
+[tool.uv.build-backend]
+source-include = [
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "STABILITY.md",
+    "docs/**",
+    "examples/**",
+    "tests/**",
+]
+source-exclude = [
+    # uv-build's explicit source includes are broader than .gitignore. Keep
+    # workstation state, local databases, and internal scratch plans out of a
+    # release even when a maintainer builds from a dirty checkout.
+    "**/.omc/**",
+    "**/*.db",
+    "**/.DS_Store",
+    "docs/superpowers/**",
+]
+
 [tool.poe]
 executor.type = "uv"
 tasks.full = ["clean", "format"]
@@ -178,8 +214,11 @@ addopts = [
     "--disable-socket",
 ]
 filterwarnings = [
-    #    "ignore::pytest_benchmark.logger.PytestBenchmarkWarning",
     "error::UserWarning", # 将警告视为错误
+    # xdist disables benchmarks during pytest_configure; keep that one expected
+    # plugin warning from becoming an INTERNALERROR. This must follow the broad
+    # UserWarning rule because the last matching filter takes precedence.
+    "ignore:Benchmarks are automatically disabled because xdist plugin is active:pytest_benchmark.logger.PytestBenchmarkWarning",
     "ignore::DeprecationWarning:pkg_resources.*",
 ]
 markers = [

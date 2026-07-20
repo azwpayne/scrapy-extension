@@ -10,7 +10,3 @@ class QuotesRedisSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
   start_urls = ["https://quotes.toscrape.com"]
 
   backend_type = BackendType.REDIS
-
-  def __init__(self, **kwargs):
-    super().__init__(**kwargs)
-    self.setup_backend()

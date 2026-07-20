@@ -18,11 +18,16 @@ API verified against the pulsar-client sync Python client:
 from __future__ import annotations
 
 import logging
+from threading import Lock
 from typing import TYPE_CHECKING, Any
+
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
   import pulsar
 except ImportError as e:
+  if not _is_missing_optional_dependency(e, "pulsar"):
+    raise
   raise ImportError(
     "Pulsar backend requires 'pulsar-client'. "
     "Install with: pip install scrapy-extension[pulsar]"
@@ -73,25 +78,35 @@ class _PulsarAckToken:
       message_id: The ``msg.message_id()`` object returned by the pulsar
           client for the popped message. Passed to
           ``consumer.acknowledge`` / ``consumer.negative_acknowledge``.
-      topic: The topic the message was consumed from (diagnostics only).
+      topic: The topic the message was consumed from. Used to route ack/nack
+          back to the consumer that delivered the message.
+      consumer: The consumer that delivered the message. Runtime-generated
+          tokens use its identity to reject stale tokens after reconnect.
   """
 
-  __slots__ = ("message_id", "topic")
+  __slots__ = ("consumer", "message_id", "topic")
 
-  def __init__(self, message_id: Any, topic: str) -> None:
+  def __init__(self, message_id: Any, topic: str, consumer: Any = None) -> None:
     """Initialize the token.
 
     Args:
         message_id: The pulsar ``MessageId`` for the popped message.
         topic: The topic the message was consumed from.
+        consumer: The consumer that delivered the message. ``None`` keeps
+            compatibility with tokens constructed by older callers/tests.
     """
     self.message_id = message_id
     self.topic = topic
+    self.consumer = consumer
 
   def __eq__(self, other: object) -> bool:
     if not isinstance(other, _PulsarAckToken):
       return NotImplemented
-    return self.message_id is other.message_id and self.topic == other.topic
+    return (
+      self.message_id is other.message_id
+      and self.topic == other.topic
+      and self.consumer is other.consumer
+    )
 
   def __hash__(self) -> int:
     # Pulsar ``MessageId`` hashability varies by client version (the C++
@@ -102,7 +117,7 @@ class _PulsarAckToken:
     # robust across all client versions. Equality mirrors this (identity
     # on message_id) so the token that came out of the set is the one
     # ``discard`` removes.
-    return hash((id(self.message_id), self.topic))
+    return hash((id(self.message_id), self.topic, id(self.consumer)))
 
   def __repr__(self) -> str:
     return (
@@ -174,10 +189,11 @@ class PulsarBackend(Backend, QueueBackend):
   delivered to exactly one consumer in the subscription, which is the work-queue
   behavior Scrapy's scheduler needs for distributed crawling.
 
-  Does NOT implement SetBackend or StorageBackend. ``queue_len`` returns 0
-  (Pulsar backlog stats require the admin REST API, out of scope here).
-  ``clear_queue`` is best-effort: it drops the cached consumer/producers and
-  relies on topic retention / admin tooling for actual cleanup.
+  Does NOT implement SetBackend or StorageBackend. ``queue_len`` raises
+  ``NotImplementedError`` because Pulsar backlog stats require the admin REST
+  API, which is out of scope here.
+  ``clear_queue`` raises ``QueueError`` because broker-side purge requires the
+  admin API; local handle cleanup must not masquerade as durable deletion.
 
   Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
   Pulsar's Shared subscription is natively per-message —
@@ -195,9 +211,11 @@ class PulsarBackend(Backend, QueueBackend):
       config: PulsarSettings instance.
       _client: The pulsar.Client instance (None until connected).
       _producers: Per-topic cached producers.
-      _consumer: The current consumer (None until first pop).
-      _subscribed_topic: Topic the consumer is currently subscribed to.
+      _consumers: Per-topic cached consumers.
+      _consumer: The most recently used consumer (legacy compatibility view).
+      _subscribed_topic: Topic for the most recently used consumer.
       _last_msg: The last-popped message (legacy ``ack(token=None)`` path).
+      _last_delivery: Consumer/message pair for the legacy ack/nack path.
       _in_flight: Diagnostic set of popped-but-unacked ack tokens.
   """
 
@@ -213,11 +231,19 @@ class PulsarBackend(Backend, QueueBackend):
     self.config = config
     self._client: Any = None
     self._producers: dict[str, Any] = {}
+    self._consumers: dict[str, Any] = {}
+    self._lifecycle_lock = Lock()
+    self._lifecycle_generation = 0
+    self._producer_creation_lock = Lock()
+    self._consumer_creation_lock = Lock()
+    # Compatibility view for callers/tests that inspect the historical
+    # single-consumer state. Message-token routing uses ``_consumers``.
     self._consumer: Any = None
     self._subscribed_topic: str | None = None
     # Legacy single-slot for the ``ack(token=None)`` fallback path. Kept so
     # external callers that pop() then ack() without a token still work.
     self._last_msg: Any = None
+    self._last_delivery: tuple[Any, Any] | None = None
     # In-flight ack tokens for correctness under CONCURRENT_REQUESTS>1.
     # DIAGNOSTIC ONLY: Pulsar acks each message independently (unlike Kafka's
     # watermark commit), so the set is for leak detection / monitoring —
@@ -258,7 +284,17 @@ class PulsarBackend(Backend, QueueBackend):
         kwargs["authentication"] = pulsar.AuthenticationToken(
           _redact(secret_value(self.config.auth_token))
         )
-      self._client = pulsar.Client(self.config.service_url, **kwargs)
+      with self._lifecycle_lock:
+        # ``connect`` is idempotent and linearizes with ``disconnect``.  Keep
+        # client construction inside the lifecycle boundary so a concurrent
+        # disconnect either runs before this connect or detaches the newly
+        # published client afterwards; it can never miss an in-progress
+        # client that is published just after teardown takes its snapshot.
+        if self._client is not None:
+          return
+        client = pulsar.Client(self.config.service_url, **kwargs)
+        self._lifecycle_generation += 1
+        self._client = client
       logger.debug("Connected to Pulsar at %s (%s)", self.config.service_url, self.config.mode.value)
     except Exception as e:
       raise BackendConnectionError(
@@ -268,21 +304,32 @@ class PulsarBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Close the Pulsar client and release producers/consumers."""
-    if self._consumer is not None:
-      with _suppress_pulsar_errors():
-        self._consumer.close()
+    with self._lifecycle_lock:
+      consumers = {id(consumer): consumer for consumer in self._consumers.values()}
+      if self._consumer is not None:
+        # Include directly injected historical single-consumer state while
+        # avoiding a duplicate close for the normal cached path.
+        consumers.setdefault(id(self._consumer), self._consumer)
+      producers = {id(producer): producer for producer in self._producers.values()}
+      client = self._client
+      self._lifecycle_generation += 1
+      self._consumers.clear()
       self._consumer = None
       self._subscribed_topic = None
-    for producer in self._producers.values():
+      self._producers.clear()
+      self._client = None
+      self._last_msg = None
+      self._last_delivery = None
+      self._in_flight.clear()
+    for consumer in consumers.values():
+      with _suppress_pulsar_errors():
+        consumer.close()
+    for producer in producers.values():
       with _suppress_pulsar_errors():
         producer.close()
-    self._producers.clear()
-    if self._client is not None:
+    if client is not None:
       with _suppress_pulsar_errors():
-        self._client.close()
-      self._client = None
-    self._last_msg = None
-    self._in_flight.clear()
+        client.close()
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
@@ -328,18 +375,38 @@ class PulsarBackend(Backend, QueueBackend):
     Raises:
         QueueError: If the producer cannot be created.
     """
-    if topic in self._producers:
-      return self._producers[topic]
-    try:
-      producer = self._client.create_producer(topic)
-      self._producers[topic] = producer
-      return producer
-    except Exception as e:
+    with self._producer_creation_lock:
+      with self._lifecycle_lock:
+        producer = self._producers.get(topic)
+        if producer is not None:
+          return producer
+        client = self._client
+        generation = self._lifecycle_generation
+      if client is None:
+        raise QueueError(
+          f"Cannot create Pulsar producer for {topic}: backend is disconnected",
+          queue_name=topic,
+          operation="push",
+        )
+      try:
+        producer = client.create_producer(topic)
+      except Exception as e:
+        raise QueueError(
+          f"Failed to create Pulsar producer for {topic}: {e}",
+          queue_name=topic,
+          operation="push",
+        ) from e
+      with self._lifecycle_lock:
+        if self._client is client and self._lifecycle_generation == generation:
+          self._producers[topic] = producer
+          return producer
+      with _suppress_pulsar_errors():
+        producer.close()
       raise QueueError(
-        f"Failed to create Pulsar producer for {topic}: {e}",
+        f"Failed to create Pulsar producer for {topic}: connection changed",
         queue_name=topic,
         operation="push",
-      ) from e
+      )
 
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
@@ -388,10 +455,11 @@ class PulsarBackend(Backend, QueueBackend):
         QueueError: If the receive fails for a non-timeout reason.
         ValueError: If queue_name contains invalid characters.
     """
-    msg = self._receive(queue_name, timeout)
+    msg, consumer = self._receive(queue_name, timeout)
     if msg is None:
       return None
     self._last_msg = msg
+    self._last_delivery = (consumer, msg)
     return _message_bytes(msg)
 
   def pop_with_ack(
@@ -419,14 +487,19 @@ class PulsarBackend(Backend, QueueBackend):
         ValueError: If queue_name contains invalid characters.
     """
     topic = self._topic_name(queue_name)
-    msg = self._receive(queue_name, timeout)
+    msg, consumer = self._receive(queue_name, timeout)
     if msg is None:
       return (None, None)
-    token = _PulsarAckToken(message_id=msg.message_id(), topic=topic)
+    token = _PulsarAckToken(
+      message_id=msg.message_id(),
+      topic=topic,
+      consumer=consumer,
+    )
     self._track_in_flight(token)
     # Keep _last_msg in sync so the legacy ack(token=None) path stays
     # usable for callers that don't thread the token through.
     self._last_msg = msg
+    self._last_delivery = (consumer, msg)
     return (_message_bytes(msg), token)
 
   def _track_in_flight(self, token: _PulsarAckToken) -> None:
@@ -456,8 +529,8 @@ class PulsarBackend(Backend, QueueBackend):
         _MAX_IN_FLIGHT,
       )
 
-  def _receive(self, queue_name: str, timeout: float) -> Any:
-    """Receive one message from ``queue_name``; return None if empty.
+  def _receive(self, queue_name: str, timeout: float) -> tuple[Any, Any]:
+    """Receive one message and return it with the consumer that delivered it.
 
     Shared by :meth:`pop` and :meth:`pop_with_ack` so consumer
     subscription, topic validation, and error wrapping live in one place.
@@ -469,7 +542,8 @@ class PulsarBackend(Backend, QueueBackend):
         timeout: Seconds to wait (0 = a short non-blocking poll).
 
     Returns:
-        A Pulsar Message, or None if no message arrived in time.
+        ``(message, consumer)``. ``message`` is None if no message arrived
+        in time; ``consumer`` is the topic-specific consumer used to poll.
 
     Raises:
         QueueError: If the receive fails at the Pulsar layer for a
@@ -479,15 +553,15 @@ class PulsarBackend(Backend, QueueBackend):
     topic = self._topic_name(queue_name)
     # Subscribe errors must propagate (not be masked as "empty"); only the
     # receive call maps a no-message result to None.
-    self._ensure_consumer(topic)
+    consumer = self._ensure_consumer(topic)
     try:
       # timeout=0 -> a short poll; Pulsar needs a positive timeout_millis.
       timeout_ms = int(timeout * 1000) if timeout > 0 else 100
-      return self._consumer.receive(timeout_millis=timeout_ms)
+      return (consumer.receive(timeout_millis=timeout_ms), consumer)
     except pulsar.Timeout as e:
       # No message within the timeout window is the normal "empty" case.
       logger.debug("Pulsar receive returned no message for %s: %s", queue_name, e)
-      return None
+      return (None, consumer)
     except Exception as e:
       # Broker disconnects, authorization failures, and invalid consumer state
       # are operational failures, not evidence that the queue is empty. A
@@ -523,15 +597,24 @@ class PulsarBackend(Backend, QueueBackend):
     if isinstance(token, _PulsarAckToken):
       self._ack_token(token)
       return
+    if token is not None:
+      return
     # Legacy path: ack the tracked last-popped message.
-    if self._consumer is None or self._last_msg is None:
+    if self._last_msg is None:
+      return
+    if self._last_delivery is not None:
+      consumer, message = self._last_delivery
+    else:
+      consumer, message = self._consumer, self._last_msg
+    if consumer is None:
       return
     try:
-      self._consumer.acknowledge(self._last_msg)
+      consumer.acknowledge(message)
     except Exception as e:
       raise QueueError(f"Failed to ack Pulsar message: {e}", operation="ack") from e
-    finally:
+    else:
       self._last_msg = None
+      self._last_delivery = None
 
   def _ack_token(self, token: _PulsarAckToken) -> None:
     """Ack the specific message identified by ``token``.
@@ -541,10 +624,12 @@ class PulsarBackend(Backend, QueueBackend):
     re-acking an already-acked message_id is a no-op server-side; the
     in-flight ``discard`` is always safe.
     """
-    if self._consumer is None:
+    consumer = self._consumer_for_token(token)
+    if consumer is None:
+      self._in_flight.discard(token)
       return
     try:
-      self._consumer.acknowledge(token.message_id)
+      consumer.acknowledge(token.message_id)
     except Exception as e:
       raise QueueError(f"Failed to ack Pulsar message: {e}", operation="ack") from e
     finally:
@@ -570,45 +655,72 @@ class PulsarBackend(Backend, QueueBackend):
     if isinstance(token, _PulsarAckToken):
       self._nack_token(token)
       return
+    if token is not None:
+      return
     # Legacy path: nack the tracked last-popped message.
-    if self._consumer is None or self._last_msg is None:
+    if self._last_msg is None:
+      return
+    if self._last_delivery is not None:
+      consumer, message = self._last_delivery
+    else:
+      consumer, message = self._consumer, self._last_msg
+    if consumer is None:
       return
     try:
-      nack = getattr(self._consumer, "negative_acknowledge", None)
+      nack = getattr(consumer, "negative_acknowledge", None)
       if callable(nack):
-        nack(self._last_msg)
+        nack(message)
       # else: leave unacked -> redelivered on timeout / restart
     except Exception as e:
-      logger.warning("Pulsar nack failed; message will redeliver on restart: %s", e)
-    finally:
+      raise QueueError(
+        f"Failed to nack Pulsar message: {e}", operation="nack"
+      ) from e
+    else:
       self._last_msg = None
+      self._last_delivery = None
 
   def _nack_token(self, token: _PulsarAckToken) -> None:
-    """Nack the specific message identified by ``token`` (best-effort)."""
+    """Nack the specific message identified by ``token``."""
+    consumer = self._consumer_for_token(token)
     try:
-      nack = getattr(self._consumer, "negative_acknowledge", None)
+      nack = getattr(consumer, "negative_acknowledge", None)
       if callable(nack):
         nack(token.message_id)
       # else: leave unacked -> redelivered on timeout / restart
     except Exception as e:
-      logger.warning("Pulsar nack failed; message will redeliver on restart: %s", e)
-    finally:
+      raise QueueError(
+        f"Failed to nack Pulsar message: {e}", operation="nack"
+      ) from e
+    else:
       self._in_flight.discard(token)
 
+  def _consumer_for_token(self, token: _PulsarAckToken) -> Any:
+    """Return the active consumer that originally issued ``token``."""
+    consumer = self._consumers.get(token.topic)
+    if token.consumer is not None:
+      return consumer if consumer is token.consumer else None
+    if consumer is not None:
+      return consumer
+    if self._subscribed_topic in (None, token.topic):
+      # Compatibility fallback for callers that inject the historical
+      # single-consumer state directly.
+      return self._consumer
+    return None
+
   def queue_len(self, queue_name: str) -> int:
-    """Return 0 — Pulsar backlog stats need the admin REST API (out of scope).
+    """Report that queue depth is unavailable without the Pulsar admin API.
 
     Args:
         queue_name: Name of the queue.
 
-    Returns:
-        0 (unsupported; monitoring should query the admin API).
-
     Raises:
         ValueError: If queue_name contains invalid characters.
+        NotImplementedError: Always; backlog depth requires the admin API.
     """
     _validate_key_name(queue_name, "queue_name")
-    return 0
+    raise NotImplementedError(
+      "Pulsar queue depth requires the admin API, which is not configured"
+    )
 
   def clear_queue(self, queue_name: str) -> None:
     """Report that broker-side queue purge is unsupported.
@@ -632,42 +744,54 @@ class PulsarBackend(Backend, QueueBackend):
       msg, queue_name=queue_name, operation="clear_queue"
     )
 
-  def _ensure_consumer(self, topic: str) -> None:
-    """Create or reuse the consumer for ``topic`` (re-subscribes on change).
+  def _ensure_consumer(self, topic: str) -> Any:
+    """Create or reuse the cached consumer for ``topic``.
 
     Args:
         topic: The Pulsar topic to subscribe to.
     """
-    if self._consumer is not None and self._subscribed_topic == topic:
-      return
-    # #31: topic changed (or re-subscribe after a prior topic) — close the
-    # prior consumer first so it doesn't leak (Pulsar holds a server-side
-    # subscription + a client resource per consumer). Skipped on first call.
-    if self._consumer is not None:
+    with self._consumer_creation_lock:
+      with self._lifecycle_lock:
+        consumer = self._consumers.get(topic)
+        if consumer is not None:
+          self._consumer = consumer
+          self._subscribed_topic = topic
+          return consumer
+        client = self._client
+        generation = self._lifecycle_generation
+      if client is None:
+        raise QueueError(
+          f"Cannot subscribe to Pulsar topic {topic}: backend is disconnected",
+          queue_name=topic,
+          operation="pop",
+        )
+      try:
+        consumer = client.subscribe(
+          topic,
+          self.config.subscription_name,
+          consumer_type=_consumer_type(self.config.consumer_type),
+          initial_position=_initial_position(self.config.initial_position),
+          negative_ack_redelivery_delay_ms=self.config.negative_ack_redelivery_delay_ms,
+        )
+      except Exception as e:
+        raise QueueError(
+          f"Failed to subscribe to Pulsar topic {topic}: {e}",
+          queue_name=topic,
+          operation="pop",
+        ) from e
+      with self._lifecycle_lock:
+        if self._client is client and self._lifecycle_generation == generation:
+          self._consumers[topic] = consumer
+          self._consumer = consumer
+          self._subscribed_topic = topic
+          return consumer
       with _suppress_pulsar_errors():
-        self._consumer.close()
-      # R-pulsar-ensure: null the closed consumer + stale topic now, so a
-      # failed re-subscribe below can't leave a dead reference that the
-      # fast-path above would reuse on the next call for the old topic
-      # (silent consumption wedge). Mirrors the R-mcc/R-kacc null-partial-state
-      # pattern.
-      self._consumer = None
-      self._subscribed_topic = None
-    try:
-      self._consumer = self._client.subscribe(
-        topic,
-        self.config.subscription_name,
-        consumer_type=_consumer_type(self.config.consumer_type),
-        initial_position=_initial_position(self.config.initial_position),
-        negative_ack_redelivery_delay_ms=self.config.negative_ack_redelivery_delay_ms,
-      )
-      self._subscribed_topic = topic
-    except Exception as e:
+        consumer.close()
       raise QueueError(
-        f"Failed to subscribe to Pulsar topic {topic}: {e}",
+        f"Failed to subscribe to Pulsar topic {topic}: connection changed",
         queue_name=topic,
         operation="pop",
-      ) from e
+      )
 
 
 def _message_bytes(msg: Any) -> bytes:

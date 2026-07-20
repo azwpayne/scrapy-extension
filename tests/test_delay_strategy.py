@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -58,7 +59,9 @@ class TestDelayQueueStrategy:
     strat.push("q", b"c")
     assert len(strat._holding) == 3
 
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.close()
 
     assert len(strat._holding) == 0
@@ -73,17 +76,78 @@ class TestDelayQueueStrategy:
     strat = DelayQueueStrategy(mock_connection_manager)
     assert len(strat._holding) == 0
 
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.close()
 
     assert len(strat._holding) == 0
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == []
 
-  @pytest.mark.parametrize("default_delay", [-0.01, -1.0])
-  def test_invalid_delay_raises(self, mock_connection_manager, default_delay: float) -> None:
+  @pytest.mark.parametrize(
+    "default_delay",
+    [True, -0.01, -1.0, float("nan"), float("inf"), float("-inf")],
+  )
+  def test_invalid_delay_raises(
+    self, mock_connection_manager, default_delay: float
+  ) -> None:
     with pytest.raises(ValueError, match="default_delay"):
       DelayQueueStrategy(mock_connection_manager, default_delay=default_delay)
+
+  @pytest.mark.parametrize("delay", [float("nan"), float("inf"), float("-inf")])
+  def test_non_finite_push_delay_is_rejected(
+    self, mock_connection_manager, delay: float
+  ) -> None:
+    strat = DelayQueueStrategy(mock_connection_manager)
+
+    with pytest.raises(ValueError, match="delay"):
+      strat.push("q", b"x", delay=delay)
+
+    assert strat._holding == []
+    mock_connection_manager.get_queue_backend().push.assert_not_called()
+
+  @pytest.mark.parametrize("delay", [True, -1.0])
+  def test_bool_and_negative_push_delay_are_rejected(
+    self, mock_connection_manager, delay: float
+  ) -> None:
+    strat = DelayQueueStrategy(mock_connection_manager, default_delay=1.0)
+
+    with pytest.raises(ValueError, match="delay"):
+      strat.push("q", b"x", delay=delay)
+
+    assert strat._holding == []
+    mock_connection_manager.get_queue_backend.assert_not_called()
+
+  def test_bool_max_held_is_rejected(self, mock_connection_manager) -> None:
+    with pytest.raises(ValueError, match="max_held"):
+      DelayQueueStrategy(mock_connection_manager, max_held=True)
+
+  @pytest.mark.parametrize("priority", [float("nan"), float("inf"), float("-inf")])
+  def test_non_finite_priority_is_rejected(
+    self, mock_connection_manager, priority: float
+  ) -> None:
+    strat = DelayQueueStrategy(mock_connection_manager, default_delay=1.0)
+
+    with pytest.raises(ValueError, match="priority"):
+      strat.push("q", b"x", priority=priority)
+
+    assert strat._holding == []
+
+  @pytest.mark.parametrize("clock_value", [float("nan"), float("inf")])
+  def test_non_finite_clock_cannot_create_held_item(
+    self, mock_connection_manager, clock_value: float
+  ) -> None:
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=1.0,
+      clock=lambda: clock_value,
+    )
+
+    with pytest.raises(ValueError, match="clock"):
+      strat.push("q", b"x")
+
+    assert strat._holding == []
 
   def test_default_max_held_threshold(self, mock_connection_manager) -> None:
     """Constructor ships a 100k default soft cap on the holding heap (SPEC U5)."""
@@ -95,6 +159,7 @@ class TestDelayQueueStrategy:
   ) -> None:
     """Holding >max_held items fires ONE warning; further pushes stay quiet."""
     import scrapy_extension.queue.strategies.delay as mod
+
     mod._over_cap_warned = False  # reset module-level flag for a clean slate
     now = [100.0]
     strat = DelayQueueStrategy(
@@ -106,7 +171,9 @@ class TestDelayQueueStrategy:
     strat.push("q", b"c")
     assert len(strat._holding) == 3
 
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.push("q", b"d")  # exceeds cap → warn
       strat.push("q", b"e")  # still over → no second warning (warn-once)
       strat.push("q", b"f")
@@ -114,18 +181,19 @@ class TestDelayQueueStrategy:
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     # Exactly one warning (the soft-cap one); close() would add another but is not called here.
     cap_warnings = [
-      w for w in warnings if "max_held" in w.getMessage() or "delay" in w.getMessage().lower()
+      w
+      for w in warnings
+      if "max_held" in w.getMessage() or "delay" in w.getMessage().lower()
     ]
     assert len(cap_warnings) == 1
     msg = cap_warnings[0].getMessage()
     # Warn points at the unbounded-growth risk + distributed-delay roadmap (U10).
     assert "max_held" in msg or "holding" in msg
 
-  def test_soft_cap_does_not_block_push(
-    self, mock_connection_manager, caplog
-  ) -> None:
+  def test_soft_cap_does_not_block_push(self, mock_connection_manager, caplog) -> None:
     """The cap is a SOFT cap (warn-only) — push still succeeds past the cap."""
     import scrapy_extension.queue.strategies.delay as mod
+
     mod._over_cap_warned = False
     now = [100.0]
     strat = DelayQueueStrategy(
@@ -142,17 +210,22 @@ class TestDelayQueueStrategy:
   ) -> None:
     """max_held<=0 disables the soft-cap warning (explicit opt-out for advanced users)."""
     import scrapy_extension.queue.strategies.delay as mod
+
     mod._over_cap_warned = False
     now = [100.0]
     strat = DelayQueueStrategy(
       mock_connection_manager, default_delay=10.0, max_held=0, clock=_clock(now)
     )
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       for i in range(10):
         strat.push("q", str(i).encode())
     cap_warnings = [
-      r for r in caplog.records
-      if r.levelno == logging.WARNING and ("max_held" in r.getMessage() or "holding" in r.getMessage())
+      r
+      for r in caplog.records
+      if r.levelno == logging.WARNING
+      and ("max_held" in r.getMessage() or "holding" in r.getMessage())
     ]
     assert cap_warnings == []
 
@@ -190,7 +263,9 @@ class TestDelayQueueStrategy:
     assert call.args[0] == "q"
     assert call.args[1] == b"x"
     # Either positional (priority as 3rd arg) or keyword — assert it's 10.0.
-    priority_arg = call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
+    priority_arg = (
+      call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
+    )
     assert priority_arg == 10.0, (
       f"delayed item drained at priority {priority_arg} instead of 10.0 "
       "(silent priority inversion — R14-F HIGH regression)"
@@ -209,7 +284,9 @@ class TestDelayQueueStrategy:
     strat.pop("q")
     call = mock_connection_manager.get_queue_backend().push.call_args
     # Keyword form preferred (matches the existing live-push call shape).
-    assert call.kwargs.get("priority", call.args[2] if len(call.args) > 2 else 0.0) == 7.5
+    assert (
+      call.kwargs.get("priority", call.args[2] if len(call.args) > 2 else 0.0) == 7.5
+    )
 
   def test_drain_priority_defaults_to_zero_when_unspecified(
     self, mock_connection_manager
@@ -225,8 +302,154 @@ class TestDelayQueueStrategy:
     now[0] = 102.0
     strat.pop("q")
     call = mock_connection_manager.get_queue_backend().push.call_args
-    priority_arg = call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
+    priority_arg = (
+      call.args[2] if len(call.args) > 2 else call.kwargs.get("priority", 0.0)
+    )
     assert priority_arg == 0.0
+
+  def test_failed_drain_keeps_due_item_for_retry(self, mock_connection_manager) -> None:
+    """A transient live-queue push failure must not discard a due item."""
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=1.0,
+      clock=_clock(now),
+    )
+    strat.push("q", b"retry-me")
+    now[0] = 101.0
+    backend = mock_connection_manager.get_queue_backend()
+    backend.push.side_effect = [RuntimeError("temporary"), None]
+
+    with pytest.raises(RuntimeError, match="temporary"):
+      strat.pop("q")
+    assert len(strat._holding) == 1
+
+    strat.pop("q")
+    assert len(strat._holding) == 0
+    assert backend.push.call_count == 2
+
+  def test_concurrent_drains_do_not_duplicate_due_item(
+    self, mock_connection_manager
+  ) -> None:
+    """Only one pop may transfer a given due item to the live queue."""
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=1.0,
+      clock=_clock(now),
+    )
+    strat.push("q", b"once")
+    now[0] = 101.0
+
+    clock_calls = 0
+    clock_calls_lock = threading.Lock()
+    second_drain_observed = threading.Event()
+
+    def concurrent_clock() -> float:
+      nonlocal clock_calls
+      with clock_calls_lock:
+        clock_calls += 1
+        if clock_calls == 2:
+          second_drain_observed.set()
+      return now[0]
+
+    strat._clock = concurrent_clock
+    backend = mock_connection_manager.get_queue_backend()
+    first_push_entered = threading.Event()
+    release_first_push = threading.Event()
+
+    def blocking_push(*_args) -> None:
+      first_push_entered.set()
+      if not release_first_push.wait(timeout=2.0):
+        raise AssertionError("first due-item transfer was not released")
+
+    backend.push.side_effect = blocking_push
+    errors: list[BaseException] = []
+
+    def pop_once() -> None:
+      try:
+        strat.pop("q")
+      except BaseException as exc:  # noqa: BLE001 - capture thread failures
+        errors.append(exc)
+
+    first = threading.Thread(target=pop_once, daemon=True)
+    second = threading.Thread(target=pop_once, daemon=True)
+    first.start()
+    assert first_push_entered.wait(timeout=2.0)
+    second.start()
+
+    try:
+      assert not second_drain_observed.wait(timeout=0.2), (
+        "a second drain observed the same heap head while its transfer was in flight"
+      )
+    finally:
+      release_first_push.set()
+      first.join(timeout=2.0)
+      second.join(timeout=2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert backend.push.call_count == 1
+    assert strat._holding == []
+
+  def test_snapshot_cannot_duplicate_item_during_live_transfer(
+    self, mock_connection_manager
+  ) -> None:
+    """A snapshot observes one side of the held-to-live commit, never both."""
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=1.0,
+      clock=_clock(now),
+    )
+    strat.push("q", b"moving")
+    now[0] = 101.0
+    backend = mock_connection_manager.get_queue_backend()
+    transfer_entered = threading.Event()
+    release_transfer = threading.Event()
+    snapshot_done = threading.Event()
+    snapshots: list[bytes | None] = []
+    errors: list[BaseException] = []
+
+    def blocking_push(*_args) -> None:
+      transfer_entered.set()
+      if not release_transfer.wait(timeout=2.0):
+        raise AssertionError("due-item transfer was not released")
+
+    backend.push.side_effect = blocking_push
+
+    def pop_once() -> None:
+      try:
+        strat.pop("q")
+      except BaseException as exc:  # noqa: BLE001 - capture thread failures
+        errors.append(exc)
+
+    def take_snapshot() -> None:
+      try:
+        snapshots.append(strat.snapshot())
+      except BaseException as exc:  # noqa: BLE001 - capture thread failures
+        errors.append(exc)
+      finally:
+        snapshot_done.set()
+
+    pop_thread = threading.Thread(target=pop_once, daemon=True)
+    snapshot_thread = threading.Thread(target=take_snapshot, daemon=True)
+    pop_thread.start()
+    assert transfer_entered.wait(timeout=2.0)
+    snapshot_thread.start()
+
+    try:
+      assert not snapshot_done.wait(timeout=0.2)
+    finally:
+      release_transfer.set()
+      pop_thread.join(timeout=2.0)
+      snapshot_thread.join(timeout=2.0)
+
+    assert not pop_thread.is_alive()
+    assert not snapshot_thread.is_alive()
+    assert errors == []
+    assert snapshots == [None]
 
 
 class TestSnapshotRestore:
@@ -262,6 +485,55 @@ class TestSnapshotRestore:
     recovered_items = {entry[2] for entry in fresh._holding}
     assert recovered_items == {b"item-a", b"item-b"}
 
+  def test_restore_atomically_replaces_existing_state_and_is_idempotent(
+    self, mock_connection_manager
+  ) -> None:
+    source = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=10.0,
+      clock=lambda: 100.0,
+      wall_clock=lambda: 1_000.0,
+    )
+    source.push("q", b"restored")
+    state = source.snapshot()
+
+    target = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=10.0,
+      clock=lambda: 200.0,
+      wall_clock=lambda: 1_000.0,
+    )
+    target.push("q", b"pre-existing")
+
+    target.restore(state)
+    target.restore(state)
+
+    assert [entry[2] for entry in target._holding] == [b"restored"]
+
+  def test_restore_v1_due_items_preserves_original_deadline_order(
+    self, mock_connection_manager
+  ) -> None:
+    state = json.dumps(
+      {
+        "version": 1,
+        "strategy": "delay",
+        # A legacy heap array is not globally sorted beyond its root.
+        "items": [
+          {"ready_at": 10.0, "item_b64": "Zmlyc3Q=", "priority": 0.0},
+          {"ready_at": 30.0, "item_b64": "dGhpcmQ=", "priority": 0.0},
+          {"ready_at": 20.0, "item_b64": "c2Vjb25k", "priority": 0.0},
+        ],
+      }
+    ).encode()
+    strat = DelayQueueStrategy(mock_connection_manager, clock=lambda: 100.0)
+
+    strat.restore(state)
+    strat.pop("q")
+
+    backend = mock_connection_manager.get_queue_backend.return_value
+    pushed = [call.args[1] for call in backend.push.call_args_list]
+    assert pushed == [b"first", b"second", b"third"]
+
   def test_restore_none_is_noop(self, mock_connection_manager) -> None:
     """restore(None) and restore(b'') return without touching the heap."""
     strat = DelayQueueStrategy(mock_connection_manager)
@@ -274,18 +546,20 @@ class TestSnapshotRestore:
   ) -> None:
     """Non-JSON / non-UTF-8 bytes → warning + clean start (no crash)."""
     strat = DelayQueueStrategy(mock_connection_manager)
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.restore(b"\xff\xfe not valid json")
     assert any("corrupt snapshot" in r.message for r in caplog.records)
     assert len(strat._holding) == 0
 
-  def test_restore_unknown_format_warns(
-    self, mock_connection_manager, caplog
-  ) -> None:
+  def test_restore_unknown_format_warns(self, mock_connection_manager, caplog) -> None:
     """Valid JSON but wrong strategy/version → unknown-format warning."""
     strat = DelayQueueStrategy(mock_connection_manager)
     bogus = json.dumps({"version": 99, "strategy": "other", "items": []}).encode()
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.restore(bogus)
     assert any("unknown snapshot format" in r.message for r in caplog.records)
 
@@ -297,19 +571,17 @@ class TestSnapshotRestore:
     bogus = json.dumps(
       {"version": 1, "strategy": "delay", "items": "not-a-list"}
     ).encode()
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.restore(bogus)
     assert any("'items' not a list" in r.message for r in caplog.records)
 
-  def test_restore_non_dict_entry_skipped(
-    self, mock_connection_manager
-  ) -> None:
+  def test_restore_non_dict_entry_skipped(self, mock_connection_manager) -> None:
     """A non-dict entry in ``items`` is silently skipped (the ``continue``)."""
     strat = DelayQueueStrategy(mock_connection_manager)
     items = ["not-a-dict", 42, None]  # all non-dict → all skipped
-    bogus = json.dumps(
-      {"version": 1, "strategy": "delay", "items": items}
-    ).encode()
+    bogus = json.dumps({"version": 1, "strategy": "delay", "items": items}).encode()
     strat.restore(bogus)
     assert len(strat._holding) == 0
 
@@ -322,13 +594,44 @@ class TestSnapshotRestore:
       {"ready_at": 1.0},  # missing item_b64 + priority
       {"ready_at": "not-a-float", "item_b64": "Yg==", "priority": 1.0},
     ]
-    bogus = json.dumps(
-      {"version": 1, "strategy": "delay", "items": items}
-    ).encode()
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.delay"):
+    bogus = json.dumps({"version": 1, "strategy": "delay", "items": items}).encode()
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.restore(bogus)
     assert any("malformed entry" in r.message for r in caplog.records)
     assert len(strat._holding) == 0  # both entries malformed → none recovered
+
+  def test_restore_skips_non_finite_priority(
+    self, mock_connection_manager, caplog
+  ) -> None:
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      clock=lambda: 10.0,
+      wall_clock=lambda: 100.0,
+    )
+    state = json.dumps(
+      {
+        "version": 2,
+        "strategy": "delay",
+        "snapshot_wall_time": 100.0,
+        "items": [
+          {
+            "remaining": 1.0,
+            "item_b64": "eA==",
+            "priority": "nan",
+          }
+        ],
+      }
+    ).encode()
+
+    with caplog.at_level(
+      logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
+    ):
+      strat.restore(state)
+
+    assert strat._holding == []
+    assert any("malformed entry" in r.message for r in caplog.records)
 
   def test_restore_zero_recovered_no_info_log(
     self, mock_connection_manager, caplog
@@ -337,10 +640,10 @@ class TestSnapshotRestore:
     NOT emitted (covers the ``if recovered`` False branch)."""
     strat = DelayQueueStrategy(mock_connection_manager)
     items = ["non-dict-entry"]  # skipped → recovered stays 0
-    bogus = json.dumps(
-      {"version": 1, "strategy": "delay", "items": items}
-    ).encode()
-    with caplog.at_level(logging.INFO, logger="scrapy_extension.queue.strategies.delay"):
+    bogus = json.dumps({"version": 1, "strategy": "delay", "items": items}).encode()
+    with caplog.at_level(
+      logging.INFO, logger="scrapy_extension.queue.strategies.delay"
+    ):
       strat.restore(bogus)
     assert not any("recovered" in r.message for r in caplog.records)
 

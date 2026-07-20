@@ -6,13 +6,22 @@ This module provides a Scrapy dupefilter component using backend set interfaces.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
+from threading import Lock, RLock
 from typing import TYPE_CHECKING, Protocol
 
+from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
+from scrapy_extension.dupefilter.filters.memory_filter import DEFAULT_MEMORY_MAXSIZE
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions.base import BackendConnectionError, ConfigurationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import Monitor
+from scrapy_extension.utils._config import (
+  get_bool_setting,
+  parse_float_setting,
+  parse_int_setting,
+)
 from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:
@@ -53,6 +62,12 @@ _filter_full_warned: bool = False
 # a crashed crawl). Tests reset this for isolation.
 _backend_error_warned: bool = False
 
+# Non-removable filters (notably Bloom) cannot compensate a successful add
+# after the scheduler's later queue push fails. Keep a bounded, one-shot retry
+# allowance per fingerprint instead. 1,024 limits failure-path memory while
+# covering a useful transient queue-outage window; overflow evicts FIFO.
+_DEFAULT_RETRY_ALLOWANCE_LIMIT = 1_024
+
 
 class BackendDupeFilter:
   """Scrapy duplicate filter using a pluggable membership-filter strategy.
@@ -80,6 +95,7 @@ class BackendDupeFilter:
     membership_filter: MembershipFilter | None = None,
     monitor: Monitor | None = None,
     clear_on_open: bool = False,
+    owns_connection_manager: bool = True,
   ) -> None:
     """Initialize the dupefilter.
 
@@ -109,6 +125,10 @@ class BackendDupeFilter:
         clear_on_open: When True, :meth:`open` clears any prior fingerprints
             before the run begins (C5 fix). Default False → zero compat break
             (re-running a spider sees the prior run's fingerprints, as before).
+        owns_connection_manager: Whether :meth:`close` releases the supplied
+            manager. Defaults to True for factory-created standalone
+            dupefilters; composite owners can pass False and release their
+            single shared acquire after all borrowed components are closed.
     """
     self.connection_manager = connection_manager
     self.key = key
@@ -124,12 +144,26 @@ class BackendDupeFilter:
       if membership_filter is not None
       else SetMembershipFilter(connection_manager, key)
     )
+    self._retry_allowances: OrderedDict[bytes, None] = OrderedDict()
+    self._retry_allowance_lock = Lock()
+    self._retry_allowance_limit = _DEFAULT_RETRY_ALLOWANCE_LIMIT
+    self._retry_allowance_overflow_warned = False
+    self._manager_released = False
+    self._owns_connection_manager = owns_connection_manager
+    self._lifecycle_lock = RLock()
+    self._opened = False
+    self._opened_spider: Spider | None = None
+    self._closed = False
     # R14-D: thread the monitor into MemoryMembershipFilter so its LRU
     # eviction can emit ``on_filter_saturation`` (was log-warning only).
     # ``set_monitor`` exists only on the memory filter; guard via hasattr so
     # set/bloom/cuckoo filters are unaffected. The dupefilter owns the
     # monitor, so the filter emits through the same channel as cuckoo
     # saturation (which the dupefilter emits directly via getattr).
+    self._set_filter_monitor()
+
+  def _set_filter_monitor(self) -> None:
+    """Thread the currently resolved monitor into filters that support it."""
     set_monitor = getattr(self._filter, "set_monitor", None)
     if callable(set_monitor):
       set_monitor(self._monitor)
@@ -159,54 +193,139 @@ class BackendDupeFilter:
       build_membership_filter,
     )
 
-    backend_type, backend_settings = resolve_backend_config(
-      settings,
-      type_key="SCRAPY_SET_BACKEND_TYPE",
-      settings_key="SCRAPY_SET_BACKEND_SETTINGS",
-      required_capabilities={"set"},
-      component_name="set",
+    raw_strategy = settings.get(
+      "SCRAPY_DEDUP_STRATEGY", DedupeStrategy.SET.value
     )
-    manager = ConnectionManager.get_manager(
-      backend_type=backend_type,
-      settings=backend_settings,
-    )
-    key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
-    raw_strategy = settings.get("SCRAPY_DEDUP_STRATEGY", DedupeStrategy.SET.value)
     try:
       strategy = DedupeStrategy(raw_strategy)
     except ValueError as e:
-      # R-dedup-cfg: translate the enum-coercion ValueError into the domain
-      # ConfigurationError so the dedup factory matches the storage-strategy
-      # factory contract (create_storage_strategy("bogus") → ConfigurationError)
-      # and callers catching ConfigurationError for config mistakes handle BOTH
-      # factories uniformly. The enum itself still raises ValueError (idiomatic
-      # for _missing_) — the config boundary translates it.
       valid = ", ".join(repr(m.value) for m in DedupeStrategy)
       raise ConfigurationError(
         f"Invalid SCRAPY_DEDUP_STRATEGY {raw_strategy!r}. Valid: {valid}.",
         setting_name="SCRAPY_DEDUP_STRATEGY",
         setting_value=str(raw_strategy),
       ) from e
-    membership_filter = build_membership_filter(
-      strategy,
-      manager,
-      key=key,
-      memory_maxsize=settings.get("SCRAPY_DEDUP_MEMORY_MAXSIZE"),
-      bloom_capacity=settings.get("SCRAPY_DEDUP_BLOOM_CAPACITY", 1_000_000),
-      bloom_error_rate=settings.get("SCRAPY_DEDUP_BLOOM_ERROR_RATE", 0.001),
-      cuckoo_capacity=settings.get("SCRAPY_DEDUP_CUCKOO_CAPACITY", 1_000_000),
-      cuckoo_error_rate=settings.get("SCRAPY_DEDUP_CUCKOO_ERROR_RATE", 0.001),
-      strict=settings.getbool("SCRAPY_DEDUP_STRICT", default=False),
+    backend_type, backend_settings = resolve_backend_config(
+      settings,
+      type_key="SCRAPY_SET_BACKEND_TYPE",
+      settings_key="SCRAPY_SET_BACKEND_SETTINGS",
+      required_capabilities={"set"} if strategy is DedupeStrategy.SET else set(),
+      component_name="set",
     )
-    return cls(
-      connection_manager=manager,
-      key=key,
-      debug=settings.getbool("DUPEFILTER_DEBUG", default=False),
-      membership_filter=membership_filter,
-      clear_on_open=settings.getbool(
-        "SCRAPY_DUPEFILTER_CLEAR_ON_OPEN", default=False
-      ),
+    manager = ConnectionManager.get_manager(
+      backend_type=backend_type,
+      settings=backend_settings,
     )
+    try:
+      key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
+      # getpriority() distinguishes an absent setting from an explicitly stored
+      # None; Settings.get(name, default) intentionally treats both alike.
+      memory_maxsize = (
+        settings.get("SCRAPY_DEDUP_MEMORY_MAXSIZE")
+        if settings.getpriority("SCRAPY_DEDUP_MEMORY_MAXSIZE") is not None
+        else DEFAULT_MEMORY_MAXSIZE
+      )
+      if memory_maxsize is not None:
+        memory_maxsize = parse_int_setting(
+          memory_maxsize,
+          "SCRAPY_DEDUP_MEMORY_MAXSIZE",
+          minimum=1,
+        )
+      bloom_capacity = parse_int_setting(
+        settings.get("SCRAPY_DEDUP_BLOOM_CAPACITY", 1_000_000),
+        "SCRAPY_DEDUP_BLOOM_CAPACITY",
+        minimum=1,
+      )
+      bloom_error_rate = parse_float_setting(
+        settings.get("SCRAPY_DEDUP_BLOOM_ERROR_RATE", 0.001),
+        "SCRAPY_DEDUP_BLOOM_ERROR_RATE",
+        minimum=0.0,
+        maximum=1.0,
+        minimum_exclusive=True,
+        maximum_exclusive=True,
+      )
+      cuckoo_capacity = parse_int_setting(
+        settings.get("SCRAPY_DEDUP_CUCKOO_CAPACITY", 1_000_000),
+        "SCRAPY_DEDUP_CUCKOO_CAPACITY",
+        minimum=1,
+      )
+      cuckoo_error_rate = parse_float_setting(
+        settings.get("SCRAPY_DEDUP_CUCKOO_ERROR_RATE", 0.001),
+        "SCRAPY_DEDUP_CUCKOO_ERROR_RATE",
+        minimum=0.0,
+        maximum=1.0,
+        minimum_exclusive=True,
+        maximum_exclusive=True,
+      )
+      strict = get_bool_setting(
+        settings,
+        "SCRAPY_DEDUP_STRICT",
+      )
+      debug = get_bool_setting(
+        settings,
+        "DUPEFILTER_DEBUG",
+      )
+      clear_on_open = get_bool_setting(
+        settings,
+        "SCRAPY_DUPEFILTER_CLEAR_ON_OPEN",
+      )
+      if not isinstance(key, str):
+        raise ConfigurationError(
+          f"SCRAPY_DUPEFILTER_KEY must be a string, got {key!r}.",
+          setting_name="SCRAPY_DUPEFILTER_KEY",
+          setting_value=key,
+        )
+      try:
+        _validate_key_name(
+          key.replace("{spider}", "spider"),
+          "SCRAPY_DUPEFILTER_KEY",
+        )
+      except ValueError as exc:
+        raise ConfigurationError(
+          str(exc),
+          setting_name="SCRAPY_DUPEFILTER_KEY",
+          setting_value=key,
+        ) from exc
+      try:
+        membership_filter = build_membership_filter(
+          strategy,
+          manager,
+          key=key,
+          memory_maxsize=memory_maxsize,
+          bloom_capacity=bloom_capacity,
+          bloom_error_rate=bloom_error_rate,
+          cuckoo_capacity=cuckoo_capacity,
+          cuckoo_error_rate=cuckoo_error_rate,
+          strict=strict,
+        )
+      except ConfigurationError:
+        raise
+      except (TypeError, ValueError, OverflowError) as exc:
+        constructor_setting = {
+          DedupeStrategy.MEMORY: "SCRAPY_DEDUP_MEMORY_MAXSIZE",
+          DedupeStrategy.BLOOM: "SCRAPY_DEDUP_BLOOM_CAPACITY",
+          DedupeStrategy.CUCKOO: "SCRAPY_DEDUP_CUCKOO_CAPACITY",
+        }.get(strategy, "SCRAPY_DEDUP_STRATEGY")
+        raise ConfigurationError(
+          f"Invalid {constructor_setting}: {exc}",
+          setting_name=constructor_setting,
+          setting_value=settings.get(constructor_setting),
+        ) from exc
+      return cls(
+        connection_manager=manager,
+        key=key,
+        debug=debug,
+        membership_filter=membership_filter,
+        clear_on_open=clear_on_open,
+      )
+    except BaseException:
+      try:
+        manager.close()
+      except BaseException:
+        logger.exception(
+          "Failed to release ConnectionManager after dupefilter factory failure"
+        )
+      raise
 
   @classmethod
   def from_crawler(cls, crawler: Crawler) -> BackendDupeFilter:
@@ -223,14 +342,24 @@ class BackendDupeFilter:
         A new BackendDupeFilter instance.
     """
     dupefilter = cls.from_settings(crawler.settings)
-    dupefilter._fingerprinter = getattr(crawler, "request_fingerprinter", None)
-    # Default-on observability: wire a ScrapyStatsMonitor when crawler.stats is
-    # available so dedup hit/miss counts show up on the Scrapy stats dump
-    # without an explicit ``monitor=`` kwarg. Additive — existing stats untouched.
-    stats = getattr(crawler, "stats", None)
-    if stats is not None:
-      dupefilter._monitor = ScrapyStatsMonitor(stats)
-    return dupefilter
+    try:
+      dupefilter._fingerprinter = getattr(crawler, "request_fingerprinter", None)
+      # Default-on observability: wire a ScrapyStatsMonitor when crawler.stats is
+      # available so dedup hit/miss counts show up on the Scrapy stats dump
+      # without an explicit ``monitor=`` kwarg. Additive — existing stats untouched.
+      stats = getattr(crawler, "stats", None)
+      if stats is not None:
+        dupefilter._monitor = ScrapyStatsMonitor(stats)
+        dupefilter._set_filter_monitor()
+      return dupefilter
+    except BaseException:
+      try:
+        dupefilter.close("crawler-factory-failed")
+      except BaseException:
+        logger.exception(
+          "Failed to release ConnectionManager after dupefilter crawler factory failure"
+        )
+      raise
 
   def open(self, spider: Spider | None = None) -> None:
     """Open the dupefilter and its membership filter.
@@ -255,11 +384,29 @@ class BackendDupeFilter:
     Args:
         spider: The spider opening the crawl (optional).
     """
-    if spider is not None:
-      self._resolve_spider_key(spider)
-    self._filter.open()
-    if self.clear_on_open:
-      self.clear()
+    with self._lifecycle_lock:
+      if self._closed:
+        raise RuntimeError("dupefilter is closed")
+      if self._opened:
+        if spider is self._opened_spider:
+          return
+        raise RuntimeError("dupefilter is already open for a different spider")
+      try:
+        if spider is not None:
+          _validate_key_name(spider.name, field_name="spider.name")
+          self._resolve_spider_key(spider)
+        self._clear_retry_allowances()
+        self._filter.open()
+        if self.clear_on_open:
+          self.clear()
+      except BaseException:
+        try:
+          self._close_locked()
+        except BaseException:
+          logger.exception("Failed to clean up dupefilter after open failure")
+        raise
+      self._opened = True
+      self._opened_spider = spider
 
   def _resolve_spider_key(self, spider: Spider) -> None:
     """Substitute ``{spider}`` in :attr:`key` with ``spider.name``, propagating
@@ -289,8 +436,36 @@ class BackendDupeFilter:
     Args:
         reason: The reason for closing.
     """
-    self._filter.close()
-    self.connection_manager.close()
+    del reason
+    with self._lifecycle_lock:
+      self._close_locked()
+
+  def _close_locked(self) -> None:
+    """Release one dupefilter lifecycle while ``_lifecycle_lock`` is held."""
+    if self._closed:
+      return
+    self._closed = True
+    self._opened = False
+    self._opened_spider = None
+    self._clear_retry_allowances()
+    filter_failed = False
+    try:
+      self._filter.close()
+    except BaseException:
+      filter_failed = True
+      raise
+    finally:
+      if self._owns_connection_manager and not self._manager_released:
+        self._manager_released = True
+        try:
+          self.connection_manager.close()
+        except BaseException:
+          if filter_failed:
+            logger.exception(
+              "ConnectionManager close failed while propagating filter close error"
+            )
+          else:
+            raise
 
   def clear(self) -> None:
     """Clear all tracked fingerprints via the membership filter.
@@ -299,7 +474,11 @@ class BackendDupeFilter:
     the underlying strategy's :meth:`MembershipFilter.clear`, so every
     concrete filter (set/memory/bloom/cuckoo) supports it.
     """
-    self._filter.clear()
+    with self._lifecycle_lock:
+      if self._closed:
+        raise RuntimeError("dupefilter is closed")
+      self._clear_retry_allowances()
+      self._filter.clear()
 
   def log(self, request: Request, spider: Spider) -> None:
     """Log a filtered request.
@@ -316,6 +495,13 @@ class BackendDupeFilter:
       )
 
   def request_seen(self, request: Request) -> bool:
+    """Check whether a request was seen while the filter is active."""
+    with self._lifecycle_lock:
+      if self._closed:
+        raise RuntimeError("dupefilter is closed")
+      return self._request_seen_unlocked(request)
+
+  def _request_seen_unlocked(self, request: Request) -> bool:
     """Check if a request has been seen before.
 
     Args:
@@ -325,9 +511,19 @@ class BackendDupeFilter:
         True if the request is a duplicate, False otherwise.
     """
     fingerprint = self.request_fingerprint(request)
+    encoded_fingerprint = fingerprint.encode()
+
+    # Non-removable filters retain their original bit/fingerprint after a
+    # failed queue push. ``forget`` grants exactly one retry miss; deletion
+    # under the shared lock is the linearization point, so concurrent callers
+    # cannot consume the same allowance twice. The underlying retained marker
+    # makes every other caller a duplicate before and after that one retry.
+    if self._consume_retry_allowance(encoded_fingerprint):
+      self._monitor.on_dedup_miss(fingerprint)
+      return False
 
     try:
-      added = self._filter.add(fingerprint.encode())
+      added = self._filter.add(encoded_fingerprint)
     except NotImplementedError as exc:
       raise RuntimeError(
         "Configured backend does not support set/duplicate filtering; "
@@ -392,6 +588,66 @@ class BackendDupeFilter:
       cap = getattr(self._filter, "capacity", None)
       self._monitor.on_filter_saturation(len(self._filter), cap)
     return seen
+
+  def forget(self, request: Request) -> None:
+    """Compensate a new fingerprint whose subsequent queue push failed.
+
+    Filters with atomic deletion remove the reservation immediately. Filters
+    such as Bloom that raise ``NotImplementedError`` retain their marker and
+    receive one bounded retry allowance instead. The next matching
+    :meth:`request_seen` atomically consumes that allowance and returns a miss;
+    a successful queue push consumes no further state, while another push
+    failure calls ``forget`` again and re-arms one allowance.
+
+    Allowances are unique per fingerprint and capped at 1,024 entries. At the
+    cap, the oldest allowance is evicted. Insertion and consumption share one
+    lock, giving concurrent callers a single linearization order and ensuring
+    no allowance can admit two queue pushes.
+
+    Args:
+        request: The request whose newly-added fingerprint must be compensated.
+    """
+    with self._lifecycle_lock:
+      if self._closed:
+        raise RuntimeError("dupefilter is closed")
+      fingerprint = self.request_fingerprint(request).encode()
+      try:
+        self._filter.remove(fingerprint)
+      except NotImplementedError:
+        self._grant_retry_allowance(fingerprint)
+
+  def _grant_retry_allowance(self, fingerprint: bytes) -> None:
+    """Insert or refresh one bounded retry allowance for ``fingerprint``."""
+    warn_overflow = False
+    with self._retry_allowance_lock:
+      if fingerprint in self._retry_allowances:
+        self._retry_allowances.move_to_end(fingerprint)
+        return
+      if len(self._retry_allowances) >= self._retry_allowance_limit:
+        self._retry_allowances.popitem(last=False)
+        if not self._retry_allowance_overflow_warned:
+          self._retry_allowance_overflow_warned = True
+          warn_overflow = True
+      self._retry_allowances[fingerprint] = None
+    if warn_overflow:
+      logger.warning(
+        "Dedup retry allowances reached the %d-entry bound; evicting the "
+        "oldest failed-push allowance",
+        self._retry_allowance_limit,
+      )
+
+  def _consume_retry_allowance(self, fingerprint: bytes) -> bool:
+    """Atomically consume at most one allowance for ``fingerprint``."""
+    with self._retry_allowance_lock:
+      if fingerprint not in self._retry_allowances:
+        return False
+      del self._retry_allowances[fingerprint]
+      return True
+
+  def _clear_retry_allowances(self) -> None:
+    """Discard transient failed-push allowances at lifecycle boundaries."""
+    with self._retry_allowance_lock:
+      self._retry_allowances.clear()
 
   def _handle_filter_full(self, fingerprint: str) -> None:
     """Degrade gracefully when the membership filter reports it is full.

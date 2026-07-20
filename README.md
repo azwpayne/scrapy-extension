@@ -3,7 +3,7 @@
 Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**, **Kafka**, **RabbitMQ**, **ElasticSearch**, **RocketMQ**, **Pulsar**, **SQS**, **Memcached**, **DynamoDB**) and pluggable strategy layers for dedup and queue semantics.
 
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/azwpayne/scrapy-extension/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://pypi.org/project/scrapy-extension/)
 
 ## Contents
@@ -15,7 +15,7 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 - [Architecture](#architecture) · [Scrapy Components](#scrapy-components) · [Exceptions](#exceptions)
 - [Examples](#examples) · [Security](#security) · [Testing](#testing) · [License](#license)
 
-> **Deeper docs:** operations → [`docs/runbook.md`](docs/runbook.md) · plugin authors → [`docs/backend-plugins.md`](docs/backend-plugins.md) · API/maturity → [`STABILITY.md`](STABILITY.md) · runnable spiders → [`examples/README.md`](examples/README.md)
+> **Deeper docs:** [operations](https://github.com/azwpayne/scrapy-extension/blob/main/docs/runbook.md) · [upgrade and backlog migration](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md) · [plugin authors](https://github.com/azwpayne/scrapy-extension/blob/main/docs/backend-plugins.md) · [API/maturity](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md) · [runnable examples](https://github.com/azwpayne/scrapy-extension/tree/main/examples)
 
 ## Features
 
@@ -36,7 +36,7 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 pip install scrapy-extension                  # Core (no backend deps required)
 pip install scrapy-extension[redis]           # Redis backend
 pip install scrapy-extension[mongodb]         # MongoDB backend (pymongo)
-pip install scrapy-extension[kafka]           # Kafka backend (kafka-python)
+pip install scrapy-extension[kafka]           # Kafka backend (kafka-python-ng)
 pip install scrapy-extension[rabbitmq]        # RabbitMQ backend (pika)
 pip install scrapy-extension[elasticsearch]   # ElasticSearch backend
 pip install scrapy-extension[rocketmq]        # RocketMQ backend
@@ -53,15 +53,11 @@ Backends are loaded lazily via PEP 562 — the core package works without any ba
 
 ```python
 import scrapy
-from scrapy_extension import BackendSpiderMixin
 
 
-class MySpider(BackendSpiderMixin, scrapy.Spider):
+class MySpider(scrapy.Spider):
     name = "example"
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.setup_backend()
+    start_urls = ["https://example.com/"]
 
     def parse(self, response):
         yield {"url": response.url}
@@ -78,9 +74,23 @@ SCRAPY_BACKEND_TYPE = "redis"
 SCRAPY_REDIS_HOST = "localhost"
 ```
 
+This settings-driven path is the normal Scrapy integration: the scheduler,
+dupefilter, and pipeline own their backend lifecycles. `BackendSpiderMixin` is
+for direct programmatic access to backend interfaces; see the
+[examples guide](https://github.com/azwpayne/scrapy-extension/blob/main/examples/README.md)
+for that separate pattern.
+
 ## Backend Configuration
 
-All settings use `SCRAPY_<BACKEND>_<KEY>` env vars via pydantic-settings.
+Each backend's documented `SCRAPY_...` names work as flat Scrapy settings and as OS environment variables; explicit `*_BACKEND_SETTINGS` dictionaries override flat Scrapy values.
+
+For a selected backend the value precedence is: explicit nested component/global
+dictionary, flat Scrapy setting, environment variable, then model default.
+Scrapy project settings therefore take precedence over same-named environment
+variables. Unknown nested fields and unknown names under the selected backend's
+environment prefix fail fast instead of silently falling back to a default.
+Those project checks raise `ConfigurationError`; Pydantic type/range/enum
+failures raise `ValidationError`.
 
 ### Redis (standalone, master_slave, sentinel, cluster)
 
@@ -88,7 +98,15 @@ All settings use `SCRAPY_<BACKEND>_<KEY>` env vars via pydantic-settings.
 SCRAPY_BACKEND_TYPE = "redis"
 SCRAPY_REDIS_HOST = "localhost"
 SCRAPY_REDIS_PORT = 6379
+SCRAPY_REDIS_NAMESPACE = "my-crawler"  # unique per application/deployment
 ```
+
+Redis physical keys are now isolated as `<namespace>:set:*`,
+`<namespace>:storage:*`, and hash-tagged `<namespace>:queue:*` keys. There is
+deliberately no fallback to the legacy unnamespaced layout because that could
+read or delete another application's keys in a shared database. Persistent
+deployments must drain or explicitly migrate the old keys before upgrading;
+see the [migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md#redis-physical-key-layout).
 
 ### MongoDB (standalone, replica_set, sharded_cluster, atlas)
 
@@ -109,9 +127,14 @@ SCRAPY_KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 
 ```python
 SCRAPY_BACKEND_TYPE = "rabbitmq"
-SCRAPY_RABBITMQ_HOST = "localhost"
-SCRAPY_RABBITMQ_PORT = 5672
+SCRAPY_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 ```
+
+RabbitMQ has no implicit guest credential fallback: use the URL shortcut above
+or provide both `SCRAPY_RABBITMQ_USERNAME` and
+`SCRAPY_RABBITMQ_PASSWORD`. Publishes use `mandatory=True` and synchronous
+publisher confirms; an unroutable or broker-nacked publish raises `QueueError`
+instead of reporting a successful enqueue.
 
 ### ElasticSearch (standalone, cloud)
 
@@ -127,6 +150,7 @@ SCRAPY_BACKEND_TYPE = "rocketmq"
 # Point at the broker's gRPC PROXY (port 8081), not the legacy NameServer.
 # The broker must run with --enable-proxy (apache rocketmq-python-client 5.1.1).
 SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
+SCRAPY_ROCKETMQ_INVISIBLE_DURATION = 300
 ```
 
 <details><summary><b>Topic creation — required setup</b> (the first push otherwise fails)</summary>
@@ -165,8 +189,11 @@ usually unreachable from the host.
 
 > **At-least-once delivery:** RocketMQ uses a deferred-ack model — `pop`
 > returns a message body **without** acking; the scheduler acks via
-> `ack(token=msg)` after the request completes. A crash before ack → the
+> `ack(token=msg)` when Scrapy emits `response_received`. A crash before ack → the
 > broker's invisible-duration window redelivers (at-least-once, not exactly-once).
+> The lease is not auto-renewed: configure `INVISIBLE_DURATION` above the
+> maximum expected pop-to-downloader-response time. Explicit nack shortens the
+> lease to RocketMQ's 10-second minimum.
 
 ### Pulsar (standalone, cluster)
 
@@ -179,9 +206,17 @@ SCRAPY_PULSAR_SERVICE_URL = "pulsar://localhost:6655"
 
 ```python
 SCRAPY_BACKEND_TYPE = "sqs"
+SCRAPY_SQS_MODE = "standalone"
 SCRAPY_SQS_REGION_NAME = "us-east-1"
-SCRAPY_SQS_ENDPOINT_URL = "http://localhost:4566"  # LocalStack
+SCRAPY_SQS_ENDPOINT_URL = "http://localhost:4566"  # optional standalone override
+SCRAPY_SQS_VISIBILITY_TIMEOUT = 300
 ```
+
+Standalone mode defaults an omitted endpoint to loopback LocalStack. To use
+real AWS, set `SCRAPY_SQS_MODE = "cloud"` and leave the endpoint unset. The
+visibility lease is not auto-renewed; size it above the maximum expected
+pop-to-downloader-response time. Explicit nack makes the message immediately
+visible (`VisibilityTimeout=0`).
 
 ### Memcached (standalone, NoSQL KV)
 
@@ -189,18 +224,28 @@ SCRAPY_SQS_ENDPOINT_URL = "http://localhost:4566"  # LocalStack
 SCRAPY_BACKEND_TYPE = "memcached"
 SCRAPY_MEMCACHED_HOST = "localhost"
 SCRAPY_MEMCACHED_PORT = 11211
+# SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL = True  # dedicated servers only
 ```
+
+Memcached cannot enumerate or prefix-delete application keys. Consequently,
+`clear_storage(prefix=...)` is unsupported and `clear_storage(None)` raises by
+default. Enabling `ALLOW_FLUSH_ALL` permits a server-wide destructive flush and
+is appropriate only for a dedicated Memcached instance.
 
 ### DynamoDB (standalone=LocalStack, cloud=AWS, NoSQL KV)
 
 ```python
 SCRAPY_BACKEND_TYPE = "dynamodb"
+SCRAPY_DYNAMODB_MODE = "standalone"
 SCRAPY_DYNAMODB_TABLE_NAME = "scrapy-extension"
 SCRAPY_DYNAMODB_REGION_NAME = "us-east-1"
-SCRAPY_DYNAMODB_ENDPOINT_URL = "http://localhost:4566"  # LocalStack
+SCRAPY_DYNAMODB_ENDPOINT_URL = "http://localhost:4566"  # optional standalone override
 ```
 
-See [`examples/`](examples) for representative runnable spiders and deployment-mode recipes (Sentinel, Cluster, Atlas, Confluent, etc).
+As with SQS, standalone mode defaults to loopback LocalStack. Set mode to
+`cloud` and leave `endpoint_url` unset for real AWS.
+
+See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/main/examples) for representative spiders and deployment-mode recipes (Sentinel, Cluster, Atlas, Confluent, etc).
 
 ## Backend Capabilities
 
@@ -217,7 +262,8 @@ See [`examples/`](examples) for representative runnable spiders and deployment-m
 | Memcached     | No    | No  | Yes     | standalone                                   |
 | DynamoDB      | No    | No  | Yes     | standalone (LocalStack), cloud (AWS)         |
 
-- **Yes** — fully implemented
+- **Yes** — implements the capability interface; per-operation limitations are
+  listed below
 - **No** — not implemented (this backend doesn't expose the interface)
 - **Guard** — rejected at config time (`ConfigurationError`); a guard class fails-fast if the capability gate is bypassed (RocketMQ set/storage)
 
@@ -227,27 +273,38 @@ See [`examples/`](examples) for representative runnable spiders and deployment-m
 
 **Memcached, DynamoDB**: Storage-only (key-value with TTL). Pair with a queue-capable backend for request distribution.
 
+Operational limits within otherwise supported interfaces:
+
+- Pulsar and RocketMQ cannot query broker backlog through their bundled clients;
+  `queue_len()` raises `NotImplementedError`. Scheduler pending detection stays
+  conservative and continues polling, while depth-based monitoring and
+  backpressure are unavailable.
+- Memcached cannot prefix-clear keys. Its only global clear operation is gated
+  by `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=False` by default.
+- SQS depth is an eventually consistent approximation (visible + in-flight +
+  delayed counts), not an exact instantaneous value.
+
 ## Guarantees
 
-What the library contractually promises — and just as importantly, what it does **not**. Read this before relying on any feature in production. Every claim below is backed by code in `src/scrapy_extension/`; follow the linked file anchors to verify.
+What the library contractually promises — and just as importantly, what it does **not**. Read this before relying on any feature in production. The stable source of truth is the named symbol in `src/scrapy_extension/`; numeric source line references are intentionally avoided because they drift as the implementation evolves.
 
 ### Per-feature cross-worker behavior
 
 | Layer | Strategy | Cross-worker safe? | Notes |
 |---|---|---|---|
-| Queue | `passthrough` (default) | Yes | Items live in the backend queue; atomic pop on every backend (`backends/base.py:359`). |
-| Queue | `delay` | Per-process | In-process `heapq`; **survives clean restart** via snapshot/restore persisted to the storage backend on `close()` (initiatives #3 / #13) — **lost on hard crash** (no `close()` runs). Snapshots are **spider-scoped** — key `queue:snapshot:<spider.name>:<queue_name>` (initiative #16) — so two spiders sharing a storage backend with the same `queue_name` cannot clobber each other's snapshot. Soft-cap `max_held` warns once when exceeded (`queue/strategies/delay.py`). |
+| Queue | `passthrough` (default) | Yes | Items remain in the backend queue. Redis/MongoDB/ElasticSearch remove atomically; Kafka/RabbitMQ/RocketMQ/Pulsar/SQS lease or deliver with a per-message ack token. |
+| Queue | `delay` | Per-process | In-process `heapq`; a clean-close snapshot is available only when the **queue backend itself** also implements `StorageBackend`. Queue-only backends cannot persist it. Hard crashes lose unsnapshotted state. In multi-worker deployments set a stable, unique `SCRAPY_QUEUE_SNAPSHOT_OWNER` (or `SCRAPY_QUEUE_WORKER_ID` fallback) to prevent workers from sharing a snapshot key. |
 | Queue | `round_robin` | Per-process | Fair dispatch across `request.meta['source']` using a per-worker index. |
 | Queue | `throttle` | Per-process | Effective rate under N workers = `N × (1 / min_interval)`. |
-| Queue | `priority` | Yes | Items live in backend-side priority buckets; no strategy-held in-process payload. |
-| Queue | `time_wheel` | Per-process | Timing wheel and overflow heap are local; clean shutdown can snapshot, hard crashes lose held items. |
-| Queue | `work_stealing` | Yes, with explicit topology | Worker queues live in the backend; use stable worker IDs and a complete peer list. |
+| Queue | `priority` | Yes | Items live in backend-side priority buckets; Kafka and RocketMQ are rejected because their consumers cannot isolate a scan across strategy-created topics. |
+| Queue | `time_wheel` | Per-process | Timing wheel and overflow heap are local; the same snapshot capability and owner requirements as `delay` apply. |
+| Queue | `work_stealing` | Yes, with explicit topology | Worker queues live in the backend; use stable worker IDs and a complete peer list. Kafka and RocketMQ are rejected. |
 | Queue | `ring_buffer` | Per-process | The bounded in-process buffer is the queue; the backend is intentionally bypassed. |
 | Dedup | `set` (default) | Yes — exact | Backend `SADD`/`SISMEMBER` semantics; byte-identical to pre-strategy behavior (`dupefilter/filters/set_filter.py`). |
 | Dedup | `memory` | Per-process | In-process; optional LRU cap via `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000; round-9 U5). |
 | Dedup | `bloom` | Per-process | Pure-stdlib bit-vector; **never produces false negatives** (a seen URL is always reported seen); false-positive rate is configurable. |
 | Dedup | `cuckoo` | Per-process | Pure-stdlib; **never produces false negatives**; supports deletion; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
-| Storage | all storage-capable backends | Yes | Via backend KV+TTL (`backends/base.py:525`). |
+| Storage | all storage-capable backends | Yes | Via the `StorageBackend` KV+TTL contract. |
 
 **Defaults are distributed-exact.** `set` dedup + `passthrough` queue are safe for multi-worker crawls out of the box. `delay` / `throttle` / `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo` are **per-process opt-in**. `priority` and correctly configured `work_stealing` retain backend-side payload durability.
 
@@ -255,24 +312,24 @@ What the library contractually promises — and just as importantly, what it doe
 
 | Promise | Where enforced |
 |---|---|
-| **Config-time validation.** Invalid settings (bad mode, bad scheme, half-configured AWS creds, insecure-TLS-in-prod, negative backpressure thresholds, unknown backend type) raise `ConfigurationError` at startup, not an opaque runtime stack trace. `ConfigurationError.setting_name` / `.setting_value` are frozen Stable attributes (round-14 R14-B) — downstream log handlers can rely on them. Sensitive names (`password`/`secret`/`api_key`/`token`/`credential`) are auto-redacted to `***REDACTED***`. | `settings/base.py`, `settings/{kafka,pulsar,redis,mongodb,elasticsearch,sqs,dynamodb,rocketmq}.py` (round-6 SEC-1..7 + round-9 SV1..SV5 + round-14 R14-B); see [`STABILITY.md`](STABILITY.md) for the frozen attribute contract |
-| **Credentials are never logged.** Passwords / SASL tokens / API keys flow through `_RedactedStr`, whose `__repr__` / `__str__` return `***` rather than the raw value. | `backends/_redaction.py:22`, wired into Kafka/RabbitMQ config builders |
-| **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends/base.py:34` (`_json_default`), `backends/base.py:131` (`JSONSerializer`) |
-| **Input names are validated.** Queue / set / index / topic names match `^[a-zA-Z0-9._:-]+$` (topic names a stricter subset); injection-shaped inputs are rejected before use. | `backends/base.py:170` (`KEY_NAME_PATTERN`, `_validate_key_name`) |
+| **Fail-fast configuration.** Unknown nested fields and typoed flat `SCRAPY_<BACKEND>_*` names raise `ConfigurationError` with a suggestion. Project cross-field/capability checks also raise `ConfigurationError`; Pydantic type/range/enum validation raises `ValidationError`. `ConfigurationError.setting_name` / `.setting_value` are Stable attributes, and sensitive setting names are redacted. | `backends.connectors.resolve_backend_config`, backend settings models; see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md) |
+| **Structured credential redaction.** Password/token/API-key fields use `SecretStr`; selected client configuration values are additionally wrapped in a redacting string. This does not cover credentials embedded in plain URI fields, caller-owned dictionaries, broker logs, or arbitrary third-party tracebacks; do not log those values. | backend settings models and `backends._redaction` |
+| **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends.base.JSONSerializer` |
+| **Input names are validated.** Queue / set / index / topic names match the documented safe subsets; injection-shaped inputs are rejected before use. | `backends.base._validate_key_name` and backend topic validators |
 | **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) carry a per-message ack token so the *specific* popped message is acked; the scheduler's `from_settings` gate refuses a backend/plugin that declares single-slot ack unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py` (`QueueBackend` ack contract), `schedule/scheduler.py` |
-| **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | `__init__.py`, `backends/__init__.py`, every `backends/*.py` |
+| **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | package and backends `__getattr__` implementations |
 | **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
 | **Backend capability honesty.** A backend never silently no-ops on an unsupported interface: queue-only backends omit `SetBackend`/`StorageBackend` entirely; RocketMQ set/storage are rejected at config time (`ConfigurationError` guard). The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
-| **`py.typed` marker shipped.** Full type annotations on the public surface; downstream type-checkers consume the shipped typing. | `src/scrapy_extension/py.typed` |
+| **`py.typed` marker shipped.** Full type annotations on the public surface; downstream type-checkers consume the shipped typing. | `scrapy_extension/py.typed` in the wheel |
 
 ### What is **not** promised
 
 - **Cross-worker behavior of `delay` / `throttle` / `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo` strategies** — they are per-process by design (see table above).
-- **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [`STABILITY.md`](STABILITY.md).
+- **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md).
 - **Stability of fresh hooks** — `on_filter_full` (round-7) and `backpressure_pause_at` / `backpressure_resume_at` (round-4) are new; the hook signatures and setting semantics may evolve in a minor bump.
 - **Wire compatibility for the SQS / Memcached / DynamoDB LocalStack paths** — exercised via LocalStack in CI; not certified against every AWS region or Memcached server version.
 
-For the full stability/maturity tiering per backend, see [`STABILITY.md`](STABILITY.md). To report a security issue, see [`SECURITY.md`](SECURITY.md). For what changed in each release, see [`CHANGELOG.md`](CHANGELOG.md).
+For the full stability/maturity tiering per backend, see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md). To report a security issue, see [SECURITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/SECURITY.md). For what changed in each release, see [CHANGELOG.md](https://github.com/azwpayne/scrapy-extension/blob/main/CHANGELOG.md).
 
 ## Multi-Backend Coexistence
 
@@ -296,7 +353,11 @@ ITEM_PIPELINES = {"scrapy_extension.pipeline.pipeline.BackendPipeline": 300}
 
 # Queue: Redis-Cluster
 SCRAPY_QUEUE_BACKEND_TYPE = "redis"
-SCRAPY_QUEUE_BACKEND_SETTINGS = {"mode": "cluster", "startup_nodes": [...]}
+SCRAPY_QUEUE_BACKEND_SETTINGS = {
+    "mode": "cluster",
+    "cluster_startup_nodes": ["redis-1:6379", "redis-2:6379"],
+    "namespace": "crawler-prod",
+}
 
 # Dedup fingerprints: MongoDB
 SCRAPY_SET_BACKEND_TYPE = "mongodb"
@@ -326,6 +387,11 @@ Three strategy layers sit above the backend interfaces, selected via Scrapy sett
 
 Probabilistic filters never produce false negatives; in-memory filters are per-process (single-worker). Use `set` for multi-worker exact dedup.
 
+The default `set` strategy requires a set-capable backend. Queue-only backends
+can use a local `memory`, `bloom`, or `cuckoo` filter, but those filters do not
+deduplicate across workers. For distributed exact dedup, bind
+`SCRAPY_SET_BACKEND_TYPE` to Redis, MongoDB, or ElasticSearch.
+
 ### Queue semantics — `SCRAPY_QUEUE_STRATEGY`
 
 `BackendQueue` delegates bytes-level push/pop to a `QueueStrategy` (task-queue types beyond queue/stack/priority):
@@ -343,6 +409,20 @@ Probabilistic filters never produce false negatives; in-memory filters are per-p
 
 `delay`, `round_robin`, `throttle`, `time_wheel`, `work_stealing`, and `ring_buffer` keep some state in-process. `passthrough` is the distributed-exact default. See [Ack and durability matrix](#ack-and-durability-matrix) before using a stateful strategy in production.
 
+`priority` and `work_stealing` fan out one logical queue into multiple physical
+queues. They fail fast with Kafka and RocketMQ because those backends cannot
+isolate a pop to one strategy-selected topic. Backend-delegating strategies
+(`passthrough`, `delay`, `throttle`, `priority`, `time_wheel`, and
+`work_stealing`) preserve MQ ack tokens where supported. `round_robin` and
+`ring_buffer` are fully local and intentionally bypass broker durability.
+
+`delay`, `round_robin`, `time_wheel`, and `ring_buffer` implement clean-close
+snapshots. Persistence is available only when the queue's connection manager
+also exposes storage. In a multi-worker deployment, configure a stable unique
+`SCRAPY_QUEUE_SNAPSHOT_OWNER` per worker; when omitted,
+`SCRAPY_QUEUE_WORKER_ID` is the fallback. Successfully restored snapshots are
+consumed and deleted, then rewritten on the next clean close.
+
 ### Storage strategy — `SCRAPY_STORAGE_STRATEGY`
 
 `BackendPipeline` delegates item writes to a `StorageStrategy`:
@@ -359,12 +439,18 @@ Use `passthrough` when item loss is unacceptable. Use `batched` only when throug
 | Surface | Ack / state boundary | Crash behavior | Operational guidance |
 |---|---|---|---|
 | Redis / MongoDB / ElasticSearch queue pop | atomic backend pop; scheduler ack is inert | item is removed once popped; a later callback/pipeline crash can lose downstream item work | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters |
-| Kafka / RabbitMQ / RocketMQ / SQS / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; understand this is download-level ack, not pipeline-completion ack |
+| Kafka / RabbitMQ / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; RabbitMQ push also waits for publisher confirmation |
+| SQS / RocketMQ queue pop | per-message token plus a finite broker visibility/invisibility lease | an unacked message becomes deliverable again when the lease expires, including while a slow download is still running | no automatic lease renewal; set the lease above maximum pop-to-response time. SQS nack is immediate; RocketMQ nack uses its 10-second floor |
 | Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |
 | Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives | prefer `passthrough` for strongest distributed durability |
 | `batched` storage | in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the unwritten tail | prefer `passthrough` when persistence must happen before item acknowledgement |
 
 Ack is tied to Scrapy downloader response delivery, not spider callback or item pipeline completion. If a crawl must tolerate process death after response download but before item persistence, make item processing idempotent and use a durable storage strategy/topology.
+
+Pulsar and RocketMQ do not expose queue depth through the bundled clients.
+Their scheduler stays conservative (`has_pending_requests()` returns true when
+depth is unavailable) and continues polling, but depth-driven backpressure and
+`queue/depth` monitoring cannot operate.
 
 
 ## Architecture
@@ -399,28 +485,57 @@ Backend (ABC)
 
 All backends implement `Backend` plus the capability interfaces declared in the [Backend Capabilities](#backend-capabilities) matrix. Redis, MongoDB, and ElasticSearch implement all three capability interfaces; queue-only and storage-only backends are rejected at config time when selected for an unsupported component.
 
+An interface does not imply every optional operation can be implemented by the
+underlying service. In particular, Memcached cannot prefix-clear storage, and
+Pulsar/RocketMQ cannot report queue depth. These cases fail explicitly rather
+than returning a misleading success or zero.
+
 ### Connection Management
 
 ```python
 from scrapy_extension import ConnectionManager, BackendType
 
 manager = ConnectionManager.get_manager(backend_type=BackendType.REDIS)
-queue = manager.get_queue_backend()
-queue.push("my_queue", b"item_data", priority=1.0)
+try:
+    queue = manager.get_queue_backend()
+    queue.push("my_queue", b"item_data", priority=1.0)
+finally:
+    manager.close()
 ```
 
 `ConnectionManager` provides:
 - **Lazy singleton**: thread-safe registry keyed by `backend_type:settings_hash`
-- **Retry logic**: exponential backoff on connection failures
-- **Lifecycle management**: automatic connect/disconnect
+- **Retry logic**: one initial attempt plus up to `SCRAPY_RETRY_ATTEMPTS`
+  retries (default 3, range 0..20), with full-jitter exponential backoff whose
+  base is `SCRAPY_RETRY_DELAY` (default 1 second)
+- **Reference-counted lifecycle**: every successful `get_manager()` acquisition
+  must be paired with exactly one `close()`. A shared manager is disconnected
+  only when its final holder releases it; do not close the same acquisition
+  twice
 
 ### Per-Spider Settings
 
 ```python
 class MySpider(BackendSpiderMixin, scrapy.Spider):
     backend_type = BackendType.REDIS
-    backend_settings = {"host": "localhost", "port": 6379}
+    backend_settings = {
+        "host": "localhost",
+        "port": 6379,
+        "namespace": "my-spider",
+    }
 ```
+
+For spiders created by Scrapy, `BackendSpiderMixin.from_crawler()` performs
+backend setup automatically after the crawler is attached and binds lifecycle
+signals exactly once. Do not add a second `from_crawler()` or call
+`setup_backend()` from `__init__`. Only code that constructs `MySpider()`
+directly, outside Scrapy's factory, must call `setup_backend()` before using the
+low-level backend properties and must later call `close_backend()`.
+
+The class attributes configure the mixin's direct manager only. Scheduler,
+dupefilter, and pipeline selection still comes from Scrapy settings; use the
+global or component-specific settings shown above when those components must
+use the same backend.
 
 ## Scrapy Components
 
@@ -440,7 +555,7 @@ All components follow Scrapy's `from_settings()` / `from_crawler()` factory patt
 SCHEDULER = "scrapy_extension.schedule.scheduler.BackendScheduler"
 ```
 
-Integrates `BackendQueue` for request distribution and `BackendDupeFilter` for deduplication (when the backend supports sets). For Kafka/RabbitMQ, ack/nack is tied to Scrapy's `response_received` signal only; it does not wait for callback or item pipeline completion.
+Integrates `BackendQueue` for request distribution and `BackendDupeFilter` for deduplication. For Kafka, RabbitMQ, RocketMQ, Pulsar, and SQS, ack/nack is tied to Scrapy's downloader response lifecycle; it does not wait for callback or item pipeline completion.
 
 ### DupeFilter
 
@@ -448,7 +563,12 @@ Integrates `BackendQueue` for request distribution and `BackendDupeFilter` for d
 DUPEFILTER_CLASS = "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter"
 ```
 
-Uses a `MembershipFilter` for duplicate detection (default: `SetBackend.add()`). Select the strategy via `SCRAPY_DEDUP_STRATEGY` (see [Pluggable Strategy Layers](#pluggable-strategy-layers)). Gracefully skips dedup for queue-only backends (Kafka, RabbitMQ, Pulsar, SQS).
+Uses a `MembershipFilter` for duplicate detection (default:
+`SetBackend.add()`). Select the strategy via `SCRAPY_DEDUP_STRATEGY` (see
+[Pluggable Strategy Layers](#pluggable-strategy-layers)). The default `set`
+strategy fails fast when the selected set backend lacks that capability; bind a
+separate set backend for distributed dedup or deliberately choose a local
+filter.
 
 ### Pipeline
 
@@ -471,11 +591,14 @@ BackendError (base)
 └── ConfigurationError       — invalid settings (includes setting_name, setting_value)
 ```
 
-All exceptions carry context attributes for debugging.
+Project exceptions expose the context shown above where applicable. Pydantic
+schema failures are `pydantic.ValidationError`, not `BackendError`, while
+project cross-field, capability, and unknown-setting failures use
+`ConfigurationError`.
 
 ## Examples
 
-See [`examples/`](examples) — representative runnable spiders and recipes. Some shipped backends are documented as settings recipes rather than dedicated spiders:
+See the [examples guide](https://github.com/azwpayne/scrapy-extension/blob/main/examples/README.md) for representative spiders and recipes. Some shipped backends are documented as settings recipes rather than dedicated spiders:
 
 | Spider | Backend | Features Demonstrated |
 |--------|---------|----------------------|
@@ -498,6 +621,17 @@ See [`examples/`](examples) — representative runnable spiders and recipes. Som
 - **Input sanitization**: all user-provided queue/set names validated before use
 - **No code execution**: JSON serialization only — never pickle or eval
 
+JSON safety is not confidentiality. Request metadata, request bodies, and
+scraped items are serialized as data and may include secret-bearing values;
+some supported types such as Pydantic secret wrappers are serialized to their
+underlying value. Use TLS for every backend connection, least-privilege broker
+and database ACLs, and encryption at rest. Do not place secrets in queued or
+stored payloads unless the application encrypts them before handing them to the
+extension. Credentials embedded in plain DSN/URI strings are caller-owned and
+must not be logged.
+
+See the complete [security policy](https://github.com/azwpayne/scrapy-extension/blob/main/SECURITY.md).
+
 ## Testing
 
 ```bash
@@ -518,5 +652,4 @@ Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomiz
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
+MIT — see [LICENSE](https://github.com/azwpayne/scrapy-extension/blob/main/LICENSE).

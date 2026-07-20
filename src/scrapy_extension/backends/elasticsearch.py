@@ -3,33 +3,40 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
 
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
+
 try:
-    from elasticsearch import (
-        ConflictError,
-        Elasticsearch,
-        NotFoundError,
-        RequestError,
-        TransportError,
-    )
+  from elasticsearch import (
+    ApiError,
+    ConflictError,
+    Elasticsearch,
+    NotFoundError,
+    RequestError,
+    TransportError,
+  )
 except ImportError as e:
-    raise ImportError(
-        "ElasticSearch backend requires 'elasticsearch'. Install with: pip install scrapy-extension[elasticsearch]"
-    ) from e
+  if not _is_missing_optional_dependency(e, "elasticsearch"):
+    raise
+  raise ImportError(
+    "ElasticSearch backend requires 'elasticsearch'. Install with: pip install scrapy-extension[elasticsearch]"
+  ) from e
 
 from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
-    Backend,
-    BackendType,
-    QueueBackend,
-    SetBackend,
-    StorageBackend,
-    _validate_key_name,
-    secret_value,
+  Backend,
+  BackendType,
+  QueueBackend,
+  SetBackend,
+  StorageBackend,
+  _validate_key_name,
+  _validate_ttl,
+  secret_value,
 )
 from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
@@ -99,12 +106,30 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         if self.config.ca_certs:
           kwargs["ca_certs"] = self.config.ca_certs
       self._client = Elasticsearch(**kwargs)
-      self._client.ping()
+      if not self._client.ping():
+        raise BackendConnectionError(
+          "ElasticSearch health check returned false during connect",
+          backend_type="elasticsearch",
+        )
       self._ensure_indices()
       logger.debug("Connected to ElasticSearch in %s mode", self.config.mode.value)
-    except TransportError as e:
+    except BackendConnectionError:
+      self._discard_client()
+      raise
+    except (ApiError, TransportError) as e:
+      self._discard_client()
       msg = f"Failed to connect to ElasticSearch ({self.config.mode.value}): {e}"
       raise BackendConnectionError(msg, backend_type="elasticsearch") from e
+
+  def _discard_client(self) -> None:
+    """Clear and best-effort close a failed or retired client."""
+    client = self._client
+    self._client = None
+    if client is not None:
+      try:
+        client.close()
+      except Exception:
+        logger.debug("Failed to close ElasticSearch client", exc_info=True)
 
   def _ensure_indices(self) -> None:
     """Create the queue/set/storage indices if absent.
@@ -137,9 +162,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def disconnect(self) -> None:
     """Close ElasticSearch connection."""
-    if self._client:
-      self._client.close()
-      self._client = None
+    self._discard_client()
 
   def is_connected(self) -> bool:
     """Check if ElasticSearch is connected.
@@ -216,7 +239,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # ``wait_for`` across consecutive pushes, so each one pays the full
       # refresh-interval wait.
       self.client.index(index=self.config.queue_index, document=doc)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
@@ -306,7 +329,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     _validate_key_name(queue_name, "queue_name")
     try:
       return self._count(self.config.queue_index, "queue_name", queue_name)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       raise QueueError(str(e), queue_name=queue_name, operation="queue_len") from e
 
   def clear_queue(self, queue_name: str) -> None:
@@ -322,7 +345,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     _validate_key_name(queue_name, "queue_name")
     try:
       self._delete_by_term(self.config.queue_index, "queue_name", queue_name)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to clear ElasticSearch queue {queue_name!r}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
@@ -403,7 +426,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If set_name contains invalid characters.
     """
     _validate_key_name(set_name, "set_name")
-    return self._delete_by_id(self.config.set_index, self._set_doc_id(set_name, item))
+    try:
+      return self._delete_by_id(self.config.set_index, self._set_doc_id(set_name, item))
+    except (ApiError, TransportError) as e:
+      raise BackendConnectionError(
+        f"ElasticSearch set remove failed for {set_name!r}: {e}",
+        backend_type="elasticsearch",
+      ) from e
 
   def contains(self, set_name: str, item: bytes) -> bool:
     """Check if item is in set.
@@ -419,9 +448,15 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If set_name contains invalid characters.
     """
     _validate_key_name(set_name, "set_name")
-    response = self.client.exists(
-      index=self.config.set_index, id=self._set_doc_id(set_name, item)
-    )
+    try:
+      response = self.client.exists(
+        index=self.config.set_index, id=self._set_doc_id(set_name, item)
+      )
+    except (ApiError, TransportError) as e:
+      raise BackendConnectionError(
+        f"ElasticSearch set contains failed for {set_name!r}: {e}",
+        backend_type="elasticsearch",
+      ) from e
     return bool(response)
 
   def set_len(self, set_name: str) -> int:
@@ -437,14 +472,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ValueError: If set_name contains invalid characters.
     """
     _validate_key_name(set_name, "set_name")
-    # R-es-qlen: set_len is diagnostic (not safety-critical for idle detection)
-    # -> return 0 on TransportError, mirroring Redis's set_len. ``_count`` no
-    # longer swallows (queue_len needs the raise), so set_len owns its own
-    # except arm to preserve this contract.
     try:
       return self._count(self.config.set_index, "set_name", set_name)
-    except TransportError:
-      return 0
+    except (ApiError, TransportError) as e:
+      raise BackendConnectionError(
+        f"ElasticSearch set length failed for {set_name!r}: {e}",
+        backend_type="elasticsearch",
+      ) from e
 
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
@@ -459,7 +493,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     _validate_key_name(set_name, "set_name")
     try:
       self._delete_by_term(self.config.set_index, "set_name", set_name)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       raise BackendConnectionError(
         f"ElasticSearch set clear failed for {set_name!r}: {e}",
         backend_type="elasticsearch",
@@ -480,6 +514,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         StorageError: If the write request fails.
     """
     _validate_key_name(key, "key")
+    _validate_ttl(ttl)
     doc: dict[str, Any] = {"key": key, "data": _b64encode(data)}
     if ttl is not None:
       doc["expireAt"] = (
@@ -487,42 +522,101 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       ).isoformat()
     try:
       self.client.index(index=self.config.storage_index, id=key, document=doc)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to store key {key!r} in ElasticSearch: {e}"
       raise StorageError(msg, operation="store", key=key) from e
 
-  def _is_storage_expired(self, source: dict[str, Any]) -> bool:
-    """R-esttl: is this storage doc's ``expireAt`` in the past?
+  @staticmethod
+  def _storage_source(response: Any, key: str, operation: str) -> dict[str, Any]:
+    """Return a validated storage document source."""
+    source = response.get("_source")
+    if not isinstance(source, dict):
+      raise StorageError(
+        f"Corrupt ElasticSearch storage document for key {key!r}: "
+        "missing object _source",
+        operation=operation,
+        key=key,
+      )
+    return cast("dict[str, Any]", source)
 
-    ES has no native TTL — expiry is app-level via the ``expireAt`` field, so
-    the read paths (retrieve/exists/ttl) must enforce it (and lazy-reap)
-    themselves. Mirrors DynamoDB's contract so StorageBackend TTL semantics
-    are uniform across backends.
-    """
-    expire_str = source.get("expireAt")
-    if not expire_str:
-      return False
+  @staticmethod
+  def _storage_expiry(
+    source: dict[str, Any], key: str, operation: str
+  ) -> datetime | None:
+    """Parse an optional expiry, rejecting corrupt persisted schema."""
+    if "expireAt" not in source or source["expireAt"] is None:
+      return None
+    raw_expiry = source["expireAt"]
+    if not isinstance(raw_expiry, str):
+      raise StorageError(
+        f"Corrupt ElasticSearch expiry for key {key!r}: expected ISO string",
+        operation=operation,
+        key=key,
+      )
     try:
-      expire_dt = datetime.fromisoformat(str(expire_str))
-    except (ValueError, TypeError):
-      return False
-    now = datetime.now(tz=expire_dt.tzinfo or timezone.utc)
-    return expire_dt <= now
+      expiry = datetime.fromisoformat(raw_expiry)
+    except ValueError as e:
+      raise StorageError(
+        f"Corrupt ElasticSearch expiry for key {key!r}: {raw_expiry!r}",
+        operation=operation,
+        key=key,
+      ) from e
+    if expiry.tzinfo is None:
+      expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry
 
-  def _lazy_reap_if_expired(self, source: dict[str, Any], key: str) -> bool:
+  @staticmethod
+  def _storage_data(source: dict[str, Any], key: str) -> bytes:
+    """Strictly decode the required Base64 storage payload."""
+    encoded = source.get("data")
+    if not isinstance(encoded, str):
+      raise StorageError(
+        f"Corrupt ElasticSearch storage payload for key {key!r}",
+        operation="retrieve",
+        key=key,
+      )
+    try:
+      return base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as e:
+      raise StorageError(
+        f"Corrupt ElasticSearch Base64 payload for key {key!r}",
+        operation="retrieve",
+        key=key,
+      ) from e
+
+  def _lazy_reap_if_expired(self, response: Any, key: str, operation: str) -> bool:
     """R-esttl: lazy-reap an expired storage doc; return True if expired.
 
     Best-effort delete so the index does not accumulate dead docs (ES has no
     native TTL reaper; only ``clear_storage`` wipes wholesale). Mirrors
     DynamoDB's reap contract.
     """
-    if not self._is_storage_expired(source):
+    source = self._storage_source(response, key, operation)
+    expiry = self._storage_expiry(source, key, operation)
+    if expiry is None or expiry > datetime.now(tz=timezone.utc):
       return False
+    seq_no = response.get("_seq_no")
+    primary_term = response.get("_primary_term")
+    if seq_no is None or primary_term is None:
+      # The value is still logically absent, but an unconditional delete could
+      # remove a fresh concurrent replacement. ES normally returns both fields;
+      # fail open on physical cleanup if a proxy/client omitted either one.
+      logger.warning(
+        "Skipping unsafe reap of expired ES storage key %r: response omitted "
+        "_seq_no/_primary_term",
+        key,
+      )
+      return True
     try:
-      self.client.delete(index=self.config.storage_index, id=key)
-    except NotFoundError:
+      self.client.delete(
+        index=self.config.storage_index,
+        id=key,
+        if_seq_no=seq_no,
+        if_primary_term=primary_term,
+      )
+    except (ConflictError, NotFoundError):
       pass
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       logger.warning("Failed to reap expired ES storage key %r: %s", key, e)
     return True
 
@@ -549,13 +643,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return None
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to retrieve key {key!r} from ElasticSearch: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
-    source = resp.get("_source", {})
-    if self._lazy_reap_if_expired(source, key):
+    source = self._storage_source(resp, key, "retrieve")
+    if self._lazy_reap_if_expired(resp, key, "retrieve"):
       return None
-    return _b64decode(source["data"])
+    return self._storage_data(source, key)
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -573,7 +667,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     _validate_key_name(key, "key")
     try:
       return self._delete_by_id(self.config.storage_index, key)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to delete key {key!r} from ElasticSearch: {e}"
       raise StorageError(msg, operation="delete", key=key) from e
 
@@ -601,10 +695,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return False
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to check existence of key {key!r} in ElasticSearch: {e}"
       raise StorageError(msg, operation="exists", key=key) from e
-    if self._lazy_reap_if_expired(resp.get("_source", {}), key):
+    if self._lazy_reap_if_expired(resp, key, "exists"):
       return False
     return True
 
@@ -615,12 +709,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key: Storage key.
 
     Returns:
-        Seconds remaining, None if no TTL or key is absent, -1 if expired.
-
-    Note:
-        A missing key returns None (not -1) so callers can distinguish
-        "doesn't exist" from "expired" — matching the R5 contract fix on
-        Redis and MongoDB. Pre-R48 this conflated the two via -1.
+        Non-negative seconds remaining, or None if absent, permanent, or expired.
 
     Raises:
         ValueError: If key contains invalid characters.
@@ -631,21 +720,17 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       resp = self.client.get(index=self.config.storage_index, id=key)
     except NotFoundError:
       return None
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to read TTL of key {key!r} in ElasticSearch: {e}"
       raise StorageError(msg, operation="ttl", key=key) from e
-    source = resp.get("_source", {})
-    # R-esttl: lazy-reap expired docs (storage hygiene) — keeps the R48
-    # contract (-1 = expired, distinct from None = absent). The reap deletes
-    # the dead doc so the index does not accumulate it.
-    self._lazy_reap_if_expired(source, key)
-    expire_str = source.get("expireAt")
-    if not expire_str:
+    source = self._storage_source(resp, key, "ttl")
+    expiry = self._storage_expiry(source, key, "ttl")
+    if expiry is None:
       return None
-    remaining = (
-      datetime.fromisoformat(expire_str) - datetime.now(tz=timezone.utc)
-    ).total_seconds()
-    return -1 if remaining <= 0 else max(0, int(remaining))
+    if self._lazy_reap_if_expired(resp, key, "ttl"):
+      return None
+    remaining = (expiry - datetime.now(tz=timezone.utc)).total_seconds()
+    return max(0, int(remaining))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
@@ -670,7 +755,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     query = {"prefix": {"key.keyword": prefix}} if prefix else {"match_all": {}}
     try:
       self._delete_by_query(self.config.storage_index, query)
-    except TransportError as e:
+    except (ApiError, TransportError) as e:
       msg = f"Failed to clear ElasticSearch storage: {e}"
       raise StorageError(msg, operation="clear_storage", key=None) from e
 
@@ -697,17 +782,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # arm dead code (queue_len returned 0 on error, masking a backend failure
     # from the scheduler's idle/backpressure gate -- R-qlen violation, same as
     # sqs:507). Now TransportError propagates to the caller; each caller applies
-    # its own contract (queue_len raises QueueError; set_len returns 0 --
-    # diagnostic, redis parity).
+    # its own typed error contract.
     # Forced refresh so just-written docs (push/add don't refresh) are
     # searchable — same amortized-read-refresh rationale as pop.
     self.client.indices.refresh(index=index)
     # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
     # ``set_name`` are dynamically mapped as ``text``; count must match the
     # exact (unanalyzed) value via the keyword subfield.
-    resp = self.client.count(
-      index=index, query={"term": {f"{field}.keyword": value}}
-    )
+    resp = self.client.count(index=index, query={"term": {f"{field}.keyword": value}})
     return cast(int, resp.get("count", 0))
 
   def _delete_by_id(self, index: str, doc_id: str) -> bool:

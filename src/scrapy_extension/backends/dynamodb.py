@@ -16,12 +16,17 @@ boto3 resource API (stable):
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import TYPE_CHECKING, Any
+
+from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
   import boto3
 except ImportError as e:
+  if not _is_missing_optional_dependency(e, "boto3"):
+    raise
   raise ImportError(
     "DynamoDB backend requires 'boto3'. "
     "Install with: pip install scrapy-extension[dynamodb]"
@@ -33,6 +38,7 @@ from scrapy_extension.backends.base import (
   BackendType,
   StorageBackend,
   _validate_key_name,
+  _validate_ttl,
   secret_value,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
@@ -44,11 +50,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# DynamoDB ClientError codes that represent genuine "missing" semantics —
-# callers expect ``retrieve``/``delete`` to signal "not found" via None/False
-# rather than raising. All other ClientError codes (throttling, throughput,
-# limit, validation, etc.) are operational failures and MUST raise
-# StorageError so the item pipeline does not treat them as success.
+# DynamoDB ClientError codes used while establishing the table. A
+# ResourceNotFoundException means the TABLE is missing, never that an item is
+# absent (missing items are successful responses without Item/Attributes).
+# Runtime storage operations must therefore surface this code as StorageError.
 _DDB_NOT_FOUND_CODES = frozenset({"ResourceNotFoundException"})
 _DDB_INUSE_CODES = frozenset({"ResourceInUseException"})
 
@@ -111,9 +116,10 @@ class DynamoDBBackend(Backend, StorageBackend):
         BackendConnectionError: If the resource/table cannot be set up.
     """
     if self.config.mode not in (DynamoDBMode.STANDALONE, DynamoDBMode.CLOUD):
-      raise BackendConnectionError(
+      raise ConfigurationError(
         f"Unsupported DynamoDB mode: {self.config.mode}",
-        backend_type="dynamodb",
+        setting_name="mode",
+        setting_value=self.config.mode,
       )
     # SEC-7: AWS credentials must be both-or-neither (see SqsBackend.connect).
     key_id = secret_value(self.config.aws_access_key_id)
@@ -167,6 +173,8 @@ class DynamoDBBackend(Backend, StorageBackend):
         self._table.wait_until_exists()
       logger.debug("Connected to DynamoDB table %s", self.config.table_name)
     except Exception as e:
+      self._table = None
+      self._resource = None
       raise BackendConnectionError(
         f"Failed to connect to DynamoDB: {e}", backend_type="dynamodb"
       ) from e
@@ -242,9 +250,10 @@ class DynamoDBBackend(Backend, StorageBackend):
             masking data loss in the item pipeline.
     """
     _validate_key_name(key, "key")
+    _validate_ttl(ttl)
     item: dict[str, Any] = {"pk": key, "value": data}
-    if ttl:
-      item["expire_at"] = time.time() + ttl
+    if ttl is not None:
+      item["expire_at"] = math.ceil(time.time() + ttl)
     try:
       self._table.put_item(Item=item)
     except Exception as e:
@@ -274,9 +283,6 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       resp = self._table.get_item(Key={"pk": key})
     except Exception as e:
-      if _is_resource_not_found(e):
-        # Genuine "missing" signal — preserve None sentinel.
-        return None
       msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
     item = resp.get("Item")
@@ -285,7 +291,14 @@ class DynamoDBBackend(Backend, StorageBackend):
     if self._lazy_reap_if_expired(item, key):
       return None
     value = item.get("value")
-    return bytes(value) if isinstance(value, (bytes, bytearray)) else None
+    if isinstance(value, (bytes, bytearray)):
+      return bytes(value)
+    binary_value = getattr(value, "value", None)
+    return (
+      bytes(binary_value)
+      if isinstance(binary_value, (bytes, bytearray))
+      else None
+    )
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -306,9 +319,6 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       resp = self._table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
     except Exception as e:
-      if _is_resource_not_found(e):
-        # Genuine "missing" signal — preserve False sentinel.
-        return False
       msg = f"Failed to delete key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="delete", key=key) from e
     return "Attributes" in resp
@@ -331,9 +341,6 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       resp = self._table.get_item(Key={"pk": key})
     except Exception as e:
-      if _is_resource_not_found(e):
-        # Genuine "missing" signal — preserve False sentinel.
-        return False
       msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="exists", key=key) from e
     item = resp.get("Item")
@@ -348,7 +355,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         key: Storage key.
 
     Returns:
-        Seconds remaining (>= 0), or None if no TTL / not found.
+        Seconds remaining (>= 0), or None if no TTL, not found, or expired.
 
     Raises:
         ValueError: If key contains invalid characters.
@@ -359,13 +366,13 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       resp = self._table.get_item(Key={"pk": key})
     except Exception as e:
-      if _is_resource_not_found(e):
-        # Genuine "missing" signal — preserve None sentinel.
-        return None
       msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="ttl", key=key) from e
     item = resp.get("Item")
-    if not item or "expire_at" not in item:
+    if not item:
+      return None
+    expire_at = item.get("expire_at")
+    if expire_at is None:
       return None
     # R-dynttl: symmetry with retrieve()/exists() — lazy-reap expired rows so
     # the table does not accumulate dead rows, and return None (expired =
@@ -375,7 +382,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     # a retrieve/exists/clear_storage touched it.
     if self._lazy_reap_if_expired(item, key):
       return None
-    return max(0, int(float(item["expire_at"]) - time.time()))
+    return max(0, int(float(expire_at) - time.time()))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Best-effort clear via scan + batch delete, optionally prefix-scoped.

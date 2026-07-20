@@ -788,7 +788,7 @@ class TestR14DObservability:
     from scrapy_extension.backends.connectors import ConnectionManager
 
     manager = ConnectionManager("redis", {"retry_attempts": 3, "retry_delay": 0})
-    # _attempt_connection always raises → 2 retries fire (attempts 0 and 1).
+    # _attempt_connection always raises → all 3 configured retries fire.
     mocker.patch.object(
       manager, "_attempt_connection", side_effect=RuntimeError("boom")
     )
@@ -797,8 +797,8 @@ class TestR14DObservability:
     manager.set_monitor(ScrapyStatsMonitor(stats))
     with pytest.raises(BackendConnectionError):
       manager.connect()
-    # 3 attempts → 2 retries (between them) → on_retry fires twice.
-    assert stats.get_value("backend/retry_count") == 2
+    # 1 initial attempt + 3 retries → on_retry fires three times.
+    assert stats.get_value("backend/retry_count") == 3
     # on_connect must NOT fire (never succeeded).
     assert stats.get_value("backend/connect_count") is None
 
@@ -828,6 +828,65 @@ class TestR14DObservability:
     manager.connect()
     manager._backend = mocker.MagicMock()
     manager.close()
+
+  def test_raising_on_connect_monitor_does_not_turn_success_into_failure(
+    self, mocker
+  ):
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager("redis", {"retry_attempts": 0})
+    backend = mocker.MagicMock(name="backend")
+    mocker.patch.object(manager, "_create_backend", return_value=backend)
+    monitor = mocker.MagicMock(name="monitor")
+    monitor.on_connect.side_effect = RuntimeError("stats unavailable")
+    manager.set_monitor(monitor)
+
+    manager.connect()
+
+    assert manager._backend is backend
+    backend.connect.assert_called_once_with()
+
+  def test_raising_on_retry_monitor_does_not_abort_retry(self, mocker):
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager(
+      "redis",
+      {"retry_attempts": 1, "retry_delay": 0},
+    )
+    failed_backend = mocker.MagicMock(name="failed-backend")
+    failed_backend.connect.side_effect = OSError("first attempt failed")
+    recovered_backend = mocker.MagicMock(name="recovered-backend")
+    mocker.patch.object(
+      manager,
+      "_create_backend",
+      side_effect=[failed_backend, recovered_backend],
+    )
+    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    monitor = mocker.MagicMock(name="monitor")
+    monitor.on_retry.side_effect = RuntimeError("stats unavailable")
+    manager.set_monitor(monitor)
+
+    manager.connect()
+
+    assert manager._backend is recovered_backend
+    monitor.on_retry.assert_called_once_with("redis", 1)
+
+  def test_raising_on_disconnect_monitor_does_not_skip_breaker_reset(
+    self, mocker
+  ):
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager("redis")
+    manager._backend = mocker.MagicMock(name="backend")
+    manager._breaker = mocker.MagicMock(name="breaker")
+    monitor = mocker.MagicMock(name="monitor")
+    monitor.on_disconnect.side_effect = RuntimeError("stats unavailable")
+    manager.set_monitor(monitor)
+
+    manager.close()
+
+    assert manager._backend is None
+    manager._breaker.reset.assert_called_once_with()
 
   def test_on_pop_attempt_stat_name_matches_behavior(
     self, mock_connection_manager

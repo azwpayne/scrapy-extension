@@ -19,6 +19,15 @@ from scrapy_extension.settings import KafkaMode, KafkaSettings
 class TestKafkaBackendConnect:
   """Tests for connect() method and its helper methods."""
 
+  def test_backend_rejects_auto_commit_with_explicit_ack_contract(self):
+    """KafkaBackend requires application-level ack, so auto-commit is unsafe."""
+    config = KafkaSettings(enable_auto_commit=True)
+
+    with pytest.raises(ConfigurationError, match="enable_auto_commit") as exc_info:
+      KafkaBackend(config)
+
+    assert exc_info.value.setting_name == "enable_auto_commit"
+
   def test_connect_unsupported_mode(self):
     """Test connect raises ConfigurationError for unsupported mode."""
     from unittest.mock import MagicMock
@@ -372,6 +381,26 @@ class TestKafkaBackendDisconnect:
 
     # All are None initially
     backend.disconnect()  # Should not raise
+
+  def test_disconnect_releases_all_clients_when_one_close_fails(self, mocker):
+    """A producer close failure must not leak the consumer or admin client."""
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    producer.close.side_effect = RuntimeError("producer close failed")
+    backend._producer = producer
+    backend._consumer = consumer
+    backend._admin_client = admin
+
+    backend.disconnect()
+
+    producer.close.assert_called_once()
+    consumer.close.assert_called_once()
+    admin.close.assert_called_once()
+    assert backend._producer is None
+    assert backend._consumer is None
+    assert backend._admin_client is None
 
 
 class TestKafkaBackendPing:
@@ -808,6 +837,32 @@ class TestKafkaBackendPop:
     with pytest.raises(QueueError, match="ack"):
       backend.ack("testq")
 
+  def test_legacy_ack_commit_failure_keeps_record_retryable(self, mocker):
+    """A failed legacy commit must not turn a retry into an idempotent no-op."""
+    backend = KafkaBackend(KafkaSettings())
+    consumer = mocker.MagicMock()
+    consumer.commit.side_effect = [KafkaError("commit failed"), None]
+    record = mocker.MagicMock()
+    backend._consumer = consumer
+    backend._last_record = record
+
+    with pytest.raises(QueueError, match="ack"):
+      backend.ack("testq")
+
+    assert backend._last_record is record
+    backend.ack("testq")
+    assert consumer.commit.call_count == 2
+    assert backend._last_record is None
+
+  def test_ack_with_foreign_token_is_idempotent_noop(self, mocker):
+    """The public Any token boundary rejects foreign token shapes safely."""
+    backend = KafkaBackend(KafkaSettings())
+    backend._consumer = mocker.MagicMock()
+
+    backend.ack("testq", token=object())
+
+    backend._consumer.commit.assert_not_called()
+
 
 class TestKafkaBackendQueueLen:
   """Tests for queue_len method.
@@ -832,6 +887,46 @@ class TestKafkaBackendQueueLen:
     result = backend.queue_len("testq")
 
     assert result == 11  # (10-3) + (5-1) = 11
+
+  def test_queue_len_filters_foreign_topics_from_current_assignment(self, mocker):
+    """A rebalance overlap must not add another topic's lag to this queue."""
+    backend = KafkaBackend(KafkaSettings())
+    requested = TopicPartition("scrapy-testq", 0)
+    foreign = TopicPartition("scrapy-other", 0)
+    consumer = mocker.MagicMock()
+    consumer.assignment.return_value = {requested, foreign}
+    consumer.end_offsets.return_value = {requested: 10}
+    consumer.position.return_value = 4
+    backend._consumer = consumer
+
+    assert backend.queue_len("testq") == 6
+    consumer.end_offsets.assert_called_once_with({requested})
+    consumer.position.assert_called_once_with(requested)
+
+  def test_queue_len_uses_requested_topic_when_consumer_is_on_other_topic(
+    self, mocker
+  ):
+    """queue_len(B) must not report the currently subscribed topic A's lag."""
+    backend = KafkaBackend(KafkaSettings(group_id="lag-checker"))
+    current = TopicPartition("scrapy-current", 0)
+    requested = TopicPartition("scrapy-requested", 0)
+    active_consumer = mocker.MagicMock()
+    active_consumer.assignment.return_value = {current}
+    backend._consumer = active_consumer
+
+    temp_consumer = mocker.MagicMock()
+    temp_consumer.partitions_for_topic.return_value = {0}
+    temp_consumer.end_offsets.return_value = {requested: 12}
+    temp_consumer.position.return_value = 5
+    consumer_cls = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer",
+      return_value=temp_consumer,
+    )
+
+    assert backend.queue_len("requested") == 7
+    active_consumer.end_offsets.assert_not_called()
+    consumer_cls.assert_called_once()
+    temp_consumer.close.assert_called_once()
 
   def test_queue_len_creates_temp_consumer_with_confluent_security_config(self, mocker):
     """queue_len temporary consumer reuses Confluent bootstrap and security settings."""
@@ -877,14 +972,24 @@ class TestKafkaBackendQueueLen:
     assert backend.queue_len("testq") == 0
 
   def test_queue_len_returns_zero_when_no_assignment(self, mocker):
-    """queue_len returns 0 when consumer hasn't been assigned partitions yet."""
+    """A rebalance gap must fall back to a metadata consumer, not fake empty."""
     config = KafkaSettings()
     backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.assignment.return_value = set()
-    backend._consumer = mock_consumer
+    active_consumer = mocker.MagicMock()
+    active_consumer.assignment.return_value = set()
+    backend._consumer = active_consumer
+    tp = TopicPartition("scrapy-testq", 0)
+    probe_consumer = mocker.MagicMock()
+    probe_consumer.partitions_for_topic.return_value = {0}
+    probe_consumer.end_offsets.return_value = {tp: 12}
+    probe_consumer.position.return_value = 5
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer",
+      return_value=probe_consumer,
+    )
 
-    assert backend.queue_len("testq") == 0
+    assert backend.queue_len("testq") == 7
+    probe_consumer.close.assert_called_once()
 
   def test_queue_len_raises_on_kafka_error(self, mocker):
     """R-kqlen: queue_len must raise QueueError on KafkaError (not swallow to 0).
@@ -896,7 +1001,7 @@ class TestKafkaBackendQueueLen:
     config = KafkaSettings()
     backend = KafkaBackend(config)
     mock_consumer = mocker.MagicMock()
-    mock_consumer.assignment.return_value = {TopicPartition("t", 0)}
+    mock_consumer.assignment.return_value = {TopicPartition("scrapy-testq", 0)}
     mock_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
     backend._consumer = mock_consumer
 
@@ -1124,7 +1229,7 @@ class TestKafkaBackendPopWithAckConcurrency:
     backend = KafkaBackend(config)
     mock_consumer = mocker.MagicMock()
     mock_consumer.poll.side_effect = [
-      {TopicPartition("scrapy-testq", r.partition): [r]} for r in records
+      {TopicPartition(r.topic, r.partition): [r]} for r in records
     ] + [{}] * 5  # subsequent polls return empty
     # Kafka position() is the NEXT offset to fetch, not the first in-flight
     # record. The backend must seed its ack watermark from records as they are
@@ -1238,16 +1343,73 @@ class TestKafkaBackendPopWithAckConcurrency:
     mock_consumer.commit.assert_called_once_with()  # bare commit, no offset map
 
   def test_nack_does_not_commit_redeliver_semantics(self, mocker):
-    """(e) nack(token) does NOT commit — offset stays uncommitted → re-delivered on restart."""
+    """(e) nack(token) rewinds an assigned partition for in-session retry."""
     records = [self._record(mocker, 0, 0)]
     backend, mock_consumer = self._make_backend_with_records(mocker, records)
+    topic_partition = TopicPartition("scrapy-testq", 0)
+    mock_consumer.assignment.return_value = {topic_partition}
     _value, token = backend.pop_with_ack("testq")
 
     backend.nack("testq", token=token)
 
     mock_consumer.commit.assert_not_called()
+    mock_consumer.seek.assert_called_once_with(topic_partition, 0)
     # The offset stays in-flight so the watermark can never advance past it.
-    assert 0 in backend._in_flight[0]
+    assert 0 in backend._in_flight[("scrapy-testq", 0)]
+
+  def test_nack_keeps_offset_uncommitted_when_partition_is_not_assigned(self, mocker):
+    """A revoked partition cannot be sought; restart redelivery remains the fallback."""
+    records = [self._record(mocker, 0, 7)]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+    mock_consumer.assignment.return_value = set()
+    _value, token = backend.pop_with_ack("testq")
+
+    backend.nack("testq", token=token)
+
+    mock_consumer.seek.assert_not_called()
+    assert 7 in backend._in_flight[("scrapy-testq", 0)]
+
+  def test_nack_seek_failure_is_retryable(self, mocker):
+    """A broker/client seek failure surfaces while preserving in-flight state."""
+    records = [self._record(mocker, 0, 7)]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+    topic_partition = TopicPartition("scrapy-testq", 0)
+    mock_consumer.assignment.return_value = {topic_partition}
+    mock_consumer.seek.side_effect = KafkaError("seek failed")
+    _value, token = backend.pop_with_ack("testq")
+
+    with pytest.raises(QueueError, match="Failed to nack Kafka message"):
+      backend.nack("testq", token=token)
+
+    assert 7 in backend._in_flight[("scrapy-testq", 0)]
+
+  def test_stale_token_cannot_ack_redelivery_after_reconnect(self, mocker):
+    """An old consumer generation cannot commit a same-offset redelivery."""
+    old_record = self._record(mocker, 0, 0)
+    new_record = self._record(mocker, 0, 0)
+    old_consumer = mocker.MagicMock()
+    old_consumer.poll.return_value = {
+      TopicPartition("scrapy-testq", 0): [old_record]
+    }
+    new_consumer = mocker.MagicMock()
+    new_consumer.poll.return_value = {
+      TopicPartition("scrapy-testq", 0): [new_record]
+    }
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer",
+      side_effect=[old_consumer, new_consumer],
+    )
+    backend = KafkaBackend(KafkaSettings())
+
+    _old_value, old_token = backend.pop_with_ack("testq")
+    backend.disconnect()
+    _new_value, new_token = backend.pop_with_ack("testq")
+
+    backend.ack("testq", token=old_token)
+
+    new_consumer.commit.assert_not_called()
+    assert old_token != new_token
+    assert 0 in backend._in_flight[("scrapy-testq", 0)]
 
   def test_ack_idempotent_on_duplicate_token(self, mocker):
     """Acking the same token twice does not double-commit or advance past the run."""
@@ -1261,6 +1423,55 @@ class TestKafkaBackendPopWithAckConcurrency:
     backend.ack("testq", token=t0)  # duplicate — no-op (already discarded)
 
     assert mock_consumer.commit.call_count == first_commit_count
+
+  def test_same_partition_offsets_are_tracked_independently_per_topic(self, mocker):
+    """Ack state for one topic must not consume another topic's token."""
+    records = [
+      self._record(mocker, 0, 0, topic="scrapy-first"),
+      self._record(mocker, 0, 0, topic="scrapy-second"),
+    ]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+
+    _first_value, first_token = backend.pop_with_ack("first")
+    _second_value, second_token = backend.pop_with_ack("second")
+
+    backend.ack("first", token=first_token)
+    backend.ack("second", token=second_token)
+
+    assert mock_consumer.commit.call_count == 2
+    committed_partitions = [
+      next(iter(call.args[0])) for call in mock_consumer.commit.call_args_list
+    ]
+    assert committed_partitions == [
+      TopicPartition("scrapy-first", 0),
+      TopicPartition("scrapy-second", 0),
+    ]
+    assert [
+      next(iter(call.args[0].values())).offset
+      for call in mock_consumer.commit.call_args_list
+    ] == [1, 1]
+
+  def test_ack_retries_same_token_after_commit_failure(self, mocker):
+    """A failed broker commit must leave the token retryable."""
+    records = [self._record(mocker, 0, 0)]
+    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+    mock_consumer.commit.side_effect = [KafkaError("commit failed"), None]
+    _value, token = backend.pop_with_ack("testq")
+
+    with pytest.raises(QueueError, match="Failed to ack Kafka message"):
+      backend.ack("testq", token=token)
+
+    backend.ack("testq", token=token)
+    backend.ack("testq", token=token)
+
+    assert mock_consumer.commit.call_count == 2
+    first_commit = mock_consumer.commit.call_args_list[0].args[0]
+    retry_commit = mock_consumer.commit.call_args_list[1].args[0]
+    assert first_commit == retry_commit
+    topic_partition = ("scrapy-testq", 0)
+    assert topic_partition not in backend._in_flight
+    assert topic_partition not in backend._watermarks
+    assert topic_partition not in backend._high_water
 
 
 # ---------------------------------------------------------------------------
@@ -1290,14 +1501,13 @@ def test_redaction_module_is_shared_helper():
 
 
 class TestKafkaBackendPartitionPruning:
-  """R14-E MED: ``_in_flight``/``_watermarks``/``_high_water`` prune per-partition keys.
+  """R14-E MED: ack bookkeeping prunes per-topic-partition keys.
 
-  These dicts grow one key per partition ever popped; without pruning,
-  partition churn (topics with transient partitions, or long-running
-  multi-topic crawls) grows them unbounded. When a partition's in-flight
-  set empties (its watermark has caught up to the popped frontier), the
-  per-partition keys are stale and safe to drop — a fresh pop on the
-  same partition re-seeds them lazily.
+  These dicts grow one key per topic-partition ever popped; without pruning,
+  topic or partition churn grows them unbounded. When a topic-partition's
+  in-flight set empties (its watermark has caught up to the popped frontier),
+  its keys are stale and safe to drop. A fresh pop on the same topic-partition
+  re-seeds them lazily.
   """
 
   @staticmethod
@@ -1314,11 +1524,12 @@ class TestKafkaBackendPartitionPruning:
   def test_prunes_empty_partition_keys_on_ack(self, mocker):
     """When the last in-flight offset for a partition is acked, its keys are pruned."""
     backend, mock_consumer = self._make_backend(mocker)
+    topic_partition = ("scrapy-testq", 5)
     # Simulate one pop on partition 5 (a non-default partition to prove the
     # key is genuinely removed, not just the default 0).
-    backend._in_flight[5].add(100)
-    backend._high_water[5] = 101
-    backend._watermarks[5] = 100  # base == popped offset
+    backend._in_flight[topic_partition].add(100)
+    backend._high_water[topic_partition] = 101
+    backend._watermarks[topic_partition] = 100  # base == popped offset
 
     from scrapy_extension.backends.kafka import _KafkaAckToken
 
@@ -1327,19 +1538,20 @@ class TestKafkaBackendPartitionPruning:
 
     # The watermark advanced to 101 (high_water), so commit fired.
     mock_consumer.commit.assert_called_once()
-    # All three per-partition keys for partition 5 are now pruned.
-    assert 5 not in backend._in_flight, (
-      "_in_flight[5] not pruned after drain — partition-churn leak"
+    # All three per-topic-partition keys are now pruned.
+    assert topic_partition not in backend._in_flight, (
+      "topic-partition not pruned after drain — partition-churn leak"
     )
-    assert 5 not in backend._watermarks
-    assert 5 not in backend._high_water
+    assert topic_partition not in backend._watermarks
+    assert topic_partition not in backend._high_water
 
   def test_keeps_keys_when_partition_still_has_in_flight(self, mocker):
     """If a partition still has unacked offsets, its keys are retained."""
     backend, _mock_consumer = self._make_backend(mocker)
-    backend._in_flight[5].update({100, 101})
-    backend._high_water[5] = 102
-    backend._watermarks[5] = 100
+    topic_partition = ("scrapy-testq", 5)
+    backend._in_flight[topic_partition].update({100, 101})
+    backend._high_water[topic_partition] = 102
+    backend._watermarks[topic_partition] = 100
 
     from scrapy_extension.backends.kafka import _KafkaAckToken
 
@@ -1347,10 +1559,10 @@ class TestKafkaBackendPartitionPruning:
     backend.ack("testq", token=token)
 
     # Partition 5 still has offset 101 in-flight → keys retained.
-    assert 5 in backend._in_flight
-    assert 101 in backend._in_flight[5]
-    assert 5 in backend._watermarks
-    assert 5 in backend._high_water
+    assert topic_partition in backend._in_flight
+    assert 101 in backend._in_flight[topic_partition]
+    assert topic_partition in backend._watermarks
+    assert topic_partition in backend._high_water
 
   def test_multiple_partitions_prune_independently(self, mocker):
     """Partition churn across many partitions prunes each independently."""
@@ -1359,9 +1571,10 @@ class TestKafkaBackendPartitionPruning:
     backend, _mock_consumer = self._make_backend(mocker)
     # Seed 8 partitions, each with one in-flight offset, all at the same base.
     for p in range(8):
-      backend._in_flight[p].add(10)
-      backend._high_water[p] = 11
-      backend._watermarks[p] = 10
+      topic_partition = ("scrapy-testq", p)
+      backend._in_flight[topic_partition].add(10)
+      backend._high_water[topic_partition] = 11
+      backend._watermarks[topic_partition] = 10
 
     # Ack each — each partition drains and prunes.
     for p in range(8):

@@ -19,7 +19,3 @@ class QuotesProgrammaticSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Sp
     "socket_connect_timeout": 5.0,
     "retry_on_timeout": True,
   }
-
-  def __init__(self, **kwargs):
-    super().__init__(**kwargs)
-    self.setup_backend()

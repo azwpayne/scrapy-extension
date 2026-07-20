@@ -85,20 +85,31 @@ class TestPulsarErrorPaths:
     b, client = _connected(mocker)
     consumer = mocker.MagicMock()
     consumer.receive.return_value = _msg(mocker)
-    consumer.acknowledge.side_effect = RuntimeError("ack fail")
+    consumer.acknowledge.side_effect = [RuntimeError("ack fail"), None]
     client.subscribe.return_value = consumer
     b.pop("q")
-    with pytest.raises(QueueError):
+    with pytest.raises(QueueError) as exc_info:
       b.ack("q")
+    assert exc_info.value.operation == "ack"
+    assert b._last_msg is not None
+    b.ack("q")
+    assert consumer.acknowledge.call_count == 2
+    assert b._last_msg is None
 
-  def test_nack_swallows_failure(self, mocker) -> None:
+  def test_nack_failure_raises_queue_error_and_is_retryable(self, mocker) -> None:
     b, client = _connected(mocker)
     consumer = mocker.MagicMock()
     consumer.receive.return_value = _msg(mocker)
-    consumer.negative_acknowledge.side_effect = RuntimeError("nack fail")
+    consumer.negative_acknowledge.side_effect = [RuntimeError("nack fail"), None]
     client.subscribe.return_value = consumer
     b.pop("q")
-    b.nack("q")  # must not raise
+    with pytest.raises(QueueError) as exc_info:
+      b.nack("q")
+    assert exc_info.value.operation == "nack"
+    assert b._last_msg is not None
+    b.nack("q")
+    assert consumer.negative_acknowledge.call_count == 2
+    assert b._last_msg is None
 
   def test_disconnect_suppresses_close_errors(self, mocker) -> None:
     b, client = _connected(mocker)

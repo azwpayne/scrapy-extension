@@ -16,7 +16,10 @@ from typing import TYPE_CHECKING
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
 from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
-from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
+from scrapy_extension.dupefilter.filters.memory_filter import (
+  DEFAULT_MEMORY_MAXSIZE,
+  MemoryMembershipFilter,
+)
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import ConfigurationError
 
@@ -92,7 +95,7 @@ def build_membership_filter(
   connection_manager: ConnectionManager,
   *,
   key: str = "dupefilter",
-  memory_maxsize: int | None = None,
+  memory_maxsize: int | None = DEFAULT_MEMORY_MAXSIZE,
   bloom_capacity: int = 1_000_000,
   bloom_error_rate: float = 0.001,
   cuckoo_capacity: int = 1_000_000,
@@ -106,7 +109,8 @@ def build_membership_filter(
       connection_manager: Connection manager (used only by the ``set``
           strategy; in-memory strategies ignore it).
       key: Backend set name for the ``set`` strategy.
-      memory_maxsize: Optional LRU cap for the ``memory`` strategy.
+      memory_maxsize: LRU cap for the ``memory`` strategy. Defaults to
+          :data:`DEFAULT_MEMORY_MAXSIZE`; explicit ``None`` opts out.
       bloom_capacity: Expected item count for the ``bloom`` strategy.
       bloom_error_rate: Target false-positive rate for ``bloom``.
       cuckoo_capacity: Expected item count for the ``cuckoo`` strategy.

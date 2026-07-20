@@ -655,10 +655,18 @@ class TestBackendScheduler:
     )
     queue_ack_spy.assert_called_once_with(token="sig-tok")
 
+    # Successful ack consumes the token, so a later spider_error for the same
+    # response cannot issue a second terminal transition.
+    scheduler._on_spider_error(failure=None, response=mock_response, spider=mock_spider)
+    queue_nack_spy.assert_not_called()
+
+    failed_request = mocker.MagicMock()
+    failed_request.meta = {"_backend_ack_token": "err-tok"}
+    failed_response = mocker.MagicMock(request=failed_request)
     scheduler._on_spider_error(
-      failure=None, response=mock_response, spider=mock_spider
+      failure=None, response=failed_response, spider=mock_spider
     )
-    queue_nack_spy.assert_called_once_with(token="sig-tok")
+    queue_nack_spy.assert_called_once_with(token="err-tok")
 
   def test_connect_ack_signals_is_idempotent(self, mock_connection_manager, mocker):
     """R12: _connect_ack_signals short-circuits when already wired (line 136)."""
@@ -709,8 +717,10 @@ class TestBackendScheduler:
     ack_spy = mocker.patch.object(queue, "ack", side_effect=QueueError("ack failed"))
 
     # Must NOT propagate — the handler's try/except protects Scrapy's signal chain.
-    scheduler._on_response_received(response=None, request=None, spider=mock_spider)
-    ack_spy.assert_called_once()
+    request = mocker.MagicMock()
+    request.meta = {"_backend_ack_token": "tok"}
+    scheduler._on_response_received(response=None, request=request, spider=mock_spider)
+    ack_spy.assert_called_once_with(token="tok")
 
   def test_on_spider_error_noop_when_queue_none(self, mock_connection_manager, mocker):
     """R12: _on_spider_error returns early when _queue is None (line 176)."""
@@ -743,8 +753,11 @@ class TestBackendScheduler:
     assert queue is not None
     nack_spy = mocker.patch.object(queue, "nack", side_effect=QueueError("nack failed"))
 
-    scheduler._on_spider_error(failure=None, response=None, spider=mock_spider)
-    nack_spy.assert_called_once()
+    request = mocker.MagicMock()
+    request.meta = {"_backend_ack_token": "tok"}
+    response = mocker.MagicMock(request=request)
+    scheduler._on_spider_error(failure=None, response=response, spider=mock_spider)
+    nack_spy.assert_called_once_with(token="tok")
 
   def test_enqueue_request_enqueues_stats(self, mock_connection_manager, mock_spider):
     """Test enqueue_request increments stats on successful enqueue."""

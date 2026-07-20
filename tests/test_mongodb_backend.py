@@ -286,6 +286,33 @@ def test_mongodb_backend_set_len(mocker):
   )
 
 
+@pytest.mark.parametrize(
+  ("method", "driver_method"),
+  [
+    ("remove", "delete_one"),
+    ("contains", "find_one"),
+    ("set_len", "count_documents"),
+  ],
+)
+def test_mongodb_set_reads_wrap_pymongo_errors(mocker, method, driver_method):
+  from pymongo.errors import PyMongoError
+
+  backend = MongoDBBackend(MongoDBSettings())
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  collection = mocker.MagicMock()
+  backend._set_collection = collection
+  error = PyMongoError(f"{driver_method} failed")
+  getattr(collection, driver_method).side_effect = error
+
+  args = ("test_set", b"item") if method != "set_len" else ("test_set",)
+  with pytest.raises(BackendConnectionError) as exc_info:
+    getattr(backend, method)(*args)
+
+  assert exc_info.value.backend_type == "mongodb"
+  assert exc_info.value.__cause__ is error
+
+
 def test_mongodb_backend_clear_set(mocker):
   """Test MongoDB backend clear set."""
   config = MongoDBSettings()
@@ -361,16 +388,22 @@ def test_mongodb_backend_storage_ttl(mocker):
   assert result is None
 
 
-def test_mongodb_backend_storage_ttl_expired_returns_negative_one(mocker):
-  """#30: an expired doc (expireAt in the past) returns -1 per the
-  StorageBackend ttl() contract (None=no-TTL/missing, -1=expired), matching
-  ElasticSearch. MongoDB's TTL index normally auto-deletes expired docs so
-  this branch is rarely hit in production, but contract conformance matters
-  for callers + for a misconfigured/delayed TTL index.
+def test_mongodb_backend_storage_ttl_null_expiry_is_permanent(mocker):
+  """A persisted null expiry is the same permanent-value sentinel as absence."""
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._storage_collection = mock_collection
+  mock_collection.find_one.return_value = {"key": "k", "expireAt": None}
 
-  Pre-fix: ``return max(0, int(remaining))`` returned 0 for expired,
-  contradicting both the docstring ("-1 if expired") and the ABC contract.
-  """
+  assert backend.ttl("k") is None
+  mock_collection.delete_one.assert_not_called()
+
+
+def test_mongodb_backend_storage_ttl_expired_returns_none_and_reaps(mocker):
+  """Expired storage is absent after the backend's conditional lazy reap."""
   config = MongoDBSettings()
   backend = MongoDBBackend(config)
   mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
@@ -381,7 +414,30 @@ def test_mongodb_backend_storage_ttl_expired_returns_negative_one(mocker):
   past_time = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
   mock_collection.find_one.return_value = {"key": "k", "expireAt": past_time}
 
-  assert backend.ttl("k") == -1
+  assert backend.ttl("k") is None
+  mock_collection.delete_one.assert_called_once_with(
+    {"key": "k", "expireAt": past_time}
+  )
+
+
+def test_mongodb_backend_storage_ttl_reap_failure_still_returns_none(mocker):
+  """Cleanup is best effort; an expired value remains logically absent."""
+  from pymongo.errors import PyMongoError
+
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+  mock_collection = mocker.MagicMock()
+  backend._storage_collection = mock_collection
+  past_time = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
+  mock_collection.find_one.return_value = {"key": "k", "expireAt": past_time}
+  mock_collection.delete_one.side_effect = PyMongoError("cleanup unavailable")
+
+  assert backend.ttl("k") is None
+  mock_collection.delete_one.assert_called_once_with(
+    {"key": "k", "expireAt": past_time}
+  )
 
 
 # -----------------------------------------------------------------------------
@@ -405,6 +461,36 @@ def test_mongodb_backend_connect_connection_failure(mocker):
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
   assert exc_info.value.backend_type == "mongodb"
+  assert backend._client is None
+  assert backend._db is None
+  assert backend._queue_collection is None
+  assert backend._set_collection is None
+  assert backend._storage_collection is None
+  mock_instance.close.assert_called_once()
+
+
+def test_mongodb_backend_reconnects_after_failed_connect(mocker):
+  """A failed client must be discarded so a later connect can recover."""
+  from pymongo.errors import ConnectionFailure
+
+  backend = MongoDBBackend(MongoDBSettings())
+  failed_client = mocker.MagicMock()
+  failed_client.admin.command.side_effect = ConnectionFailure("network error")
+  healthy_client = mocker.MagicMock()
+  mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    side_effect=[failed_client, healthy_client],
+  )
+
+  with pytest.raises(BackendConnectionError):
+    backend.connect()
+  backend.connect()
+
+  assert backend._client is healthy_client
+  assert backend._queue_collection is not None
+  assert backend._set_collection is not None
+  assert backend._storage_collection is not None
+  assert backend.is_connected() is True
 
 
 def test_mongodb_backend_connect_generic_exception(mocker):
@@ -777,6 +863,75 @@ def test_mongodb_backend_retrieve_returns_none_when_not_found(mocker):
 
   result = backend.retrieve("missing_key")
   assert result is None
+
+
+def test_mongodb_backend_retrieve_treats_expired_document_as_missing(mocker):
+  """A delayed MongoDB TTL sweep must not expose expired storage data."""
+  backend, mock_collection = _storage_backend(mocker)
+  expired_at = datetime.now(tz=timezone.utc).replace(tzinfo=None) - timedelta(
+    seconds=60
+  )
+  mock_collection.find_one.return_value = {
+    "key": "expired_key",
+    "data": b"stale",
+    "expireAt": expired_at,
+  }
+
+  assert backend.retrieve("expired_key") is None
+
+
+def test_mongodb_backend_exists_treats_expired_document_as_missing(mocker):
+  """Existence follows the Storage contract, not TTL monitor timing."""
+  backend, mock_collection = _storage_backend(mocker)
+  expired_at = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
+  mock_collection.find_one.return_value = {
+    "_id": "expired-id",
+    "expireAt": expired_at,
+  }
+
+  assert backend.exists("expired_key") is False
+
+
+def test_mongodb_expired_reap_does_not_delete_a_concurrent_fresh_write(mocker):
+  """Lazy cleanup must compare the stale snapshot's expiry before deleting."""
+  backend, mock_collection = _storage_backend(mocker)
+  expired_at = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
+  fresh_expire_at = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+  current_document = {
+    "key": "race_key",
+    "data": b"stale",
+    "expireAt": expired_at,
+  }
+  read_count = 0
+
+  def find_one(_query, _projection=None):
+    nonlocal current_document, read_count
+    snapshot = dict(current_document) if current_document is not None else None
+    read_count += 1
+    if read_count == 1:
+      current_document = {
+        "key": "race_key",
+        "data": b"fresh",
+        "expireAt": fresh_expire_at,
+      }
+    return snapshot
+
+  def delete_one(query):
+    nonlocal current_document
+    if current_document is not None and all(
+      current_document.get(field) == value for field, value in query.items()
+    ):
+      current_document = None
+    return mocker.MagicMock(deleted_count=0)
+
+  mock_collection.find_one.side_effect = find_one
+  mock_collection.delete_one.side_effect = delete_one
+
+  assert backend.retrieve("race_key") is None
+  assert backend.retrieve("race_key") == b"fresh"
+  delete_filter = mock_collection.delete_one.call_args.args[0]
+  assert delete_filter["key"] == "race_key"
+  assert delete_filter["expireAt"] == expired_at
 
 
 def test_mongodb_backend_clear_storage_with_prefix(mocker):
@@ -1312,6 +1467,7 @@ def test_mongodb_valid_names_pass_validation(mocker):
   backend._queue_collection = mocker.MagicMock()
   backend._set_collection = mocker.MagicMock()
   backend._storage_collection = mocker.MagicMock()
+  backend._storage_collection.find_one.return_value = None
   # None of these should raise ValueError.
   backend.queue_len("scheduler:queue")
   backend.set_len("dedup:spider.name")

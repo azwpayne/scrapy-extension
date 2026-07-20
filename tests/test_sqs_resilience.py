@@ -30,7 +30,7 @@ from scrapy_extension.backends.sqs import (
   _SqsAckToken,
   _swallow,
 )
-from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.exceptions import ConfigurationError, QueueError
 from scrapy_extension.settings import SqsSettings
 
 
@@ -150,19 +150,19 @@ def test_track_in_flight_warns_once_on_overflow(caplog) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_receive_returns_none_for_message_without_receipt_handle(mocker) -> None:
-  """Line 407: an SQS message missing its ReceiptHandle cannot be acked, so
-  _receive treats it as "no usable message" (returns None body + receipt)
-  rather than base64-decoding a body it could never later delete."""
+def test_receive_raises_for_message_without_receipt_handle(mocker) -> None:
+  """A malformed delivery must not masquerade as an empty queue."""
   backend = _backend()
   mocker.patch.object(backend, "_queue_url", return_value="http://q-url")
   backend._client = mocker.MagicMock()
   backend._client.receive_message.return_value = {
     "Messages": [{"Body": base64.b64encode(b"x").decode()}]  # no ReceiptHandle
   }
-  _url, body, receipt = backend._receive("q", 0.0)
-  assert receipt is None
-  assert body is None
+  with pytest.raises(QueueError) as exc_info:
+    backend._receive("q", 0.0)
+
+  assert exc_info.value.operation == "pop"
+  assert "ReceiptHandle" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

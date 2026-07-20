@@ -23,6 +23,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from scrapy.http import Request
 
 from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.queue.queue import BackendQueue
@@ -146,6 +147,26 @@ def test_restore_snapshot_skips_when_retrieve_raises() -> None:
   )
 
 
+def test_restore_snapshot_delete_failure_does_not_crash_startup() -> None:
+  """A restored snapshot is consumed best-effort; delete failure is logged."""
+  source = _delay()
+  source.push("q", b"recover", delay=10.0)
+  state = source.snapshot()
+  storage = _storage(retrieve_return=state)
+  storage.delete.side_effect = RuntimeError("delete boom")
+  strategy = _delay()
+
+  BackendQueue(
+    connection_manager=_cm(storage=storage),
+    queue_name="q",
+    queue_strategy=strategy,
+    monitor=MagicMock(),
+  )
+
+  assert len(strategy._holding) == 1
+  storage.delete.assert_called_once_with("queue:snapshot:q")
+
+
 # ---------------------------------------------------------------------------
 # ack / nack with token (CONCURRENT_REQUESTS > 1 path)
 # ---------------------------------------------------------------------------
@@ -191,6 +212,55 @@ def test_pop_survives_monitor_pop_rate_failure() -> None:
   )
   # Must return None (empty), NOT raise the RuntimeError from on_pop_rate:
   assert bq.pop(timeout=0) is None
+
+
+def test_push_survives_monitor_failure_after_enqueue() -> None:
+  """Telemetry failure cannot turn a committed enqueue into caller failure."""
+  qb = MagicMock(name="QueueBackend")
+  monitor = MagicMock()
+  monitor.on_push.side_effect = RuntimeError("push monitor boom")
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb),
+    queue_name="q",
+    monitor=monitor,
+  )
+
+  bq.push(Request("https://example.com"))
+
+  qb.push.assert_called_once()
+
+
+def test_pop_survives_monitor_failure_after_atomic_pop() -> None:
+  """A monitor cannot discard an item already removed by an atomic backend."""
+  qb = MagicMock(name="QueueBackend")
+  monitor = MagicMock()
+  monitor.on_pop.side_effect = RuntimeError("pop monitor boom")
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb),
+    queue_name="q",
+    monitor=monitor,
+  )
+  request = Request("https://example.com")
+  qb.pop.return_value = bq._serializer.serialize(bq._request_to_dict(request))
+
+  restored = bq.pop()
+
+  assert restored is not None
+  assert restored.url == request.url
+
+
+def test_error_monitor_failure_does_not_mask_serialization_error() -> None:
+  """Error telemetry is secondary to the deterministic data-plane error."""
+  monitor = MagicMock()
+  monitor.on_error.side_effect = RuntimeError("error monitor boom")
+  bq = BackendQueue(
+    connection_manager=_cm(),
+    queue_name="q",
+    monitor=monitor,
+  )
+
+  with pytest.raises(SerializationError, match="Failed to serialize request"):
+    bq.push(Request("https://example.com", meta={"bad": object()}))
 
 
 # ---------------------------------------------------------------------------

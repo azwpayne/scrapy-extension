@@ -44,7 +44,7 @@ class KafkaSettings(BaseSettings):
   model_config = SettingsConfigDict(
     env_prefix="SCRAPY_KAFKA_",
     case_sensitive=False,
-    extra="ignore",
+    extra="forbid",
   )
 
   # === Mode Selection ===

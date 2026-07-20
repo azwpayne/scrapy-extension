@@ -35,7 +35,10 @@ from scrapy_extension.backends.base import (  # noqa: E402
   StorageBackend,
 )
 from scrapy_extension.backends.dynamodb import DynamoDBBackend  # noqa: E402
-from scrapy_extension.exceptions import BackendConnectionError  # noqa: E402
+from scrapy_extension.exceptions import (  # noqa: E402
+  BackendConnectionError,
+  ConfigurationError,
+)
 from scrapy_extension.exceptions.base import StorageError  # noqa: E402
 from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings  # noqa: E402
 
@@ -72,6 +75,15 @@ class TestDynamoDBBackendType:
 
 
 class TestDynamoDBConnect:
+  def test_unsupported_mode_is_configuration_error(self) -> None:
+    b = _make_backend()
+    b.config.mode = "unsupported"  # type: ignore[assignment]
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      b.connect()
+
+    assert exc_info.value.setting_name == "mode"
+
   def test_connect_loads_existing_table(self, mocker) -> None:
     b, table = _connected(mocker)
     table.load.assert_called_once()
@@ -121,6 +133,9 @@ class TestDynamoDBConnect:
     with pytest.raises(BackendConnectionError):
       b.connect()
     resource.create_table.assert_called_once()
+    assert b._resource is None
+    assert b._table is None
+    assert b.is_connected() is False
 
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
@@ -144,9 +159,35 @@ class TestDynamoDBStorageOps:
     assert item["value"] == b"value"
     assert "expire_at" in item
 
+  def test_store_with_ttl_uses_non_early_integer_epoch(self, mocker) -> None:
+    b, table = _connected(mocker)
+    mocker.patch(
+      "scrapy_extension.backends.dynamodb.time.time", return_value=1_000.25
+    )
+
+    b.store("key1", b"value", ttl=60)
+
+    expire_at = table.put_item.call_args.kwargs["Item"]["expire_at"]
+    assert type(expire_at) is int
+    assert expire_at == 1_061
+
   def test_retrieve_returns_value(self, mocker) -> None:
     b, table = _connected(mocker)
     table.get_item.return_value = {"Item": {"pk": "key1", "value": b"payload"}}
+    assert b.retrieve("key1") == b"payload"
+
+  def test_retrieve_converts_boto3_binary_to_bytes(self, mocker) -> None:
+    class _Boto3Binary:
+      value = b"payload"
+
+      def __bytes__(self) -> bytes:
+        return self.value
+
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "key1", "value": _Boto3Binary()}
+    }
+
     assert b.retrieve("key1") == b"payload"
 
   def test_retrieve_missing_returns_none(self, mocker) -> None:
@@ -215,6 +256,22 @@ class TestDynamoDBStorageOps:
     table.get_item.return_value = {"Item": {"pk": "k", "value": b"x"}}
     assert b.ttl("k") is None
 
+  def test_ttl_none_when_item_is_missing(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {}
+    assert b.ttl("missing") is None
+    table.delete_item.assert_not_called()
+
+  def test_ttl_none_with_null_expire_at(self, mocker) -> None:
+    """A persisted null expiry is the same permanent-value sentinel as absence."""
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": None}
+    }
+
+    assert b.ttl("k") is None
+    table.delete_item.assert_not_called()
+
   def test_ttl_lazy_deletes_expired_item_and_returns_none(self, mocker) -> None:
     # R-dynttl: symmetry with retrieve()/exists() — ttl() must lazy-reap
     # expired rows AND return None (consistent "expired = absent"), not return
@@ -264,6 +321,28 @@ class TestDynamoDBStorageOps:
     b.clear_storage()
     assert batch.delete_item.call_count == 2
 
+  def test_clear_storage_deletes_every_scan_page(self, mocker) -> None:
+    b, table = _connected(mocker)
+    page_cursor = {"pk": "tenant_a:first"}
+    table.scan.side_effect = [
+      {
+        "Items": [{"pk": "tenant_a:first"}],
+        "LastEvaluatedKey": page_cursor,
+      },
+      {"Items": [{"pk": "tenant_a:second"}]},
+    ]
+    batch = mocker.MagicMock()
+    table.batch_writer.return_value.__enter__.return_value = batch
+
+    b.clear_storage(prefix="tenant_a:")
+
+    assert [
+      delete_call.kwargs["Key"]
+      for delete_call in batch.delete_item.call_args_list
+    ] == [{"pk": "tenant_a:first"}, {"pk": "tenant_a:second"}]
+    assert table.scan.call_count == 2
+    assert table.scan.call_args_list[1].kwargs["ExclusiveStartKey"] == page_cursor
+
   def test_clear_storage_prefix_applies_filter_expression(self, mocker) -> None:
     """R-dynprefix: clear_storage(prefix) scopes the scan via FilterExpression.
 
@@ -290,8 +369,8 @@ class TestDynamoDBStorageOps:
 # ---------------------------------------------------------------------------
 # R14-A: StorageBackend error-contract uniformity.
 # DynamoDB storage ops must raise StorageError on operational failures
-# (throttling / throughput / limit). Only ResourceNotFoundException is a
-# genuine "missing" signal and may be swallowed (returns None/False).
+# (throttling / throughput / limit), including a vanished table. Missing
+# items are represented by successful responses without Item/Attributes.
 # ---------------------------------------------------------------------------
 
 
@@ -345,16 +424,29 @@ class TestDynamoDBStorageErrorContract:
     with pytest.raises(StorageError):
       b.clear_storage()
 
-  def test_delete_resource_not_found_returns_false(self, mocker) -> None:
-    """ResourceNotFoundException is a genuine 'missing' signal — keep swallowing."""
+  def test_delete_resource_not_found_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)
-    table.delete_item.side_effect = _make_client_error("ResourceNotFoundException")
-    assert b.delete("key1") is False
+    error = _make_client_error("ResourceNotFoundException")
+    table.delete_item.side_effect = error
 
-  def test_retrieve_resource_not_found_returns_none(self, mocker) -> None:
+    with pytest.raises(StorageError) as exc_info:
+      b.delete("key1")
+
+    assert exc_info.value.operation == "delete"
+    assert exc_info.value.key == "key1"
+    assert exc_info.value.__cause__ is error
+
+  def test_retrieve_resource_not_found_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)
-    table.get_item.side_effect = _make_client_error("ResourceNotFoundException")
-    assert b.retrieve("key1") is None
+    error = _make_client_error("ResourceNotFoundException")
+    table.get_item.side_effect = error
+
+    with pytest.raises(StorageError) as exc_info:
+      b.retrieve("key1")
+
+    assert exc_info.value.operation == "retrieve"
+    assert exc_info.value.key == "key1"
+    assert exc_info.value.__cause__ is error
 
   def test_storage_error_is_backend_error_subclass(self, mocker) -> None:
     from scrapy_extension.exceptions.base import BackendError

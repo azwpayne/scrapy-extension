@@ -3,14 +3,15 @@
 Backend priority support is inconsistent: Redis has ZADD/ZPOPMIN, MongoDB sorts
 via index, **SQS Standard has no priority**, Kafka uses partition. This strategy
 implements priority at the strategy layer by partitioning into N physical
-bucket-queues — ``<queue_name>:p<level>`` for ``level ∈ [0, levels)`` — so
-priority semantics are uniform across every backend, including those without
-native priority.
+bucket-queues for ``level ∈ [0, levels)`` — so
+priority semantics are uniform across backends that can isolate multiple
+physical queues. Kafka and RocketMQ are rejected because their bundled clients
+cannot preserve requested-topic isolation while scanning multiple buckets.
 
-Higher caller priority → lower level index → popped first (matches the project
-convention "priority: higher = more urgent"). The caller's float ``priority`` is
-clamped to ``[0.0, 1.0]`` and mapped via ``level = int((1.0 - p) * levels)``,
-clamped to ``[0, levels-1]``.
+Higher caller priority → lower level index → popped first (matches Scrapy's
+contract). Scrapy accepts arbitrary signed integer priorities and defaults to
+zero, so zero maps to the middle bucket; positive/negative values move toward
+the high/low end and saturate at the configured bounds.
 
 ``pop`` scans ``p0, p1, …, p(N-1)`` non-blocking and returns the first non-empty
 level's item. If all levels are empty AND ``timeout > 0``, one blocking pop on
@@ -23,26 +24,40 @@ All state lives backend-side (no in-process holding); ``snapshot`` returns
 
 from __future__ import annotations
 
-__all__ = ["DEFAULT_PRIORITY_LEVELS", "PriorityQueueStrategy"]
+__all__ = [
+  "DEFAULT_PRIORITY_LEVELS",
+  "MAX_PRIORITY_LEVELS",
+  "PriorityQueueStrategy",
+]
 
+import math
 from typing import TYPE_CHECKING
 
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies._names import (
+  ensure_fanout_backend_supported,
+  physical_strategy_queue_name,
+)
+from scrapy_extension.queue.strategies.base import (
+  QueueStrategy,
+  normalize_queue_timeout,
+)
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.connectors import ConnectionManager
 
 #: Default discrete priority-bucket count (high / normal / low).
 DEFAULT_PRIORITY_LEVELS: int = 3
+#: Hard cap on bucket fan-out (each pop/len/clear performs one RPC per bucket).
+MAX_PRIORITY_LEVELS: int = 256
 
 
 class PriorityQueueStrategy(QueueStrategy):
   """Strategy-layer priority via N physical bucket-queues.
 
-  Pushes route to ``<queue_name>:p<level>`` where ``level`` is derived from the
-  caller's float ``priority ∈ [0.0, 1.0]`` (higher → lower level index → popped
-  first). Pop scans levels high-priority-first. Works on every backend,
-  including those without native priority (SQS Standard, Kafka).
+  Pushes route to a stable physical bucket name where ``level`` is derived from
+  Scrapy's arbitrary signed integer priority (higher → lower level index →
+  popped first). Pop scans levels high-priority-first. Works on backends that
+  support isolated physical queues, including SQS Standard.
 
   Attributes:
       _levels: Number of discrete priority buckets.
@@ -58,23 +73,32 @@ class PriorityQueueStrategy(QueueStrategy):
 
     Args:
         connection_manager: Connection manager providing the QueueBackend.
-        levels: Number of discrete priority buckets. ``priority ∈ [0,1]`` is
-            mapped to ``[0, levels-1]``. Default 3 (high / normal / low).
+        levels: Number of discrete priority buckets centered around Scrapy's
+            default priority ``0``. Default 3 (positive / zero / negative).
 
     Raises:
-        ValueError: If ``levels < 1``.
+        ValueError: If ``levels`` is not an integer in the supported range.
     """
     super().__init__(connection_manager)
-    if levels < 1:
-      raise ValueError(f"levels must be >= 1, got {levels}")
+    ensure_fanout_backend_supported(connection_manager, strategy="priority")
+    if (
+      isinstance(levels, bool)
+      or not isinstance(levels, int)
+      or not 1 <= levels <= MAX_PRIORITY_LEVELS
+    ):
+      raise ValueError(
+        f"levels must be an integer in [1, {MAX_PRIORITY_LEVELS}], got {levels!r}"
+      )
     self._levels = levels
 
   def _level_for(self, priority: float) -> int:
-    """Map a caller priority float to a level index in ``[0, levels-1]``.
+    """Map a caller priority to a level index in ``[0, levels-1]``.
 
-    Higher priority → lower level index (popped first). Clamp to ``[0.0, 1.0]``
-    first so out-of-range callers (Scrapy allows any float) are handled
-    deterministically.
+    Higher priority → lower level index (popped first). Scrapy priorities are
+    signed integers with zero as the default. The finite bucket count preserves
+    that ordering monotonically and saturates values outside its representable
+    range. Direct API callers may supply finite fractional values; those are
+    rounded to the nearest bucket boundary.
 
     Args:
         priority: Caller priority (higher = more urgent).
@@ -82,9 +106,25 @@ class PriorityQueueStrategy(QueueStrategy):
     Returns:
         Level index in ``[0, levels-1]``.
     """
-    clamped = max(0.0, min(1.0, float(priority)))
-    level = int((1.0 - clamped) * self._levels)
+    center = self._levels // 2
+    if isinstance(priority, int):
+      level = center - priority
+    else:
+      numeric = float(priority)
+      if not math.isfinite(numeric):
+        raise ValueError(f"priority must be finite, got {priority!r}")
+      level = math.floor(center - numeric + 0.5)
     return min(self._levels - 1, max(0, level))
+
+  def _bucket_queue(self, queue_name: str, level: int) -> str:
+    """Return the stable, backlog-compatible name for one priority level."""
+    return physical_strategy_queue_name(
+      self._connection_manager,
+      queue_name=queue_name,
+      namespace="priority",
+      discriminator=str(level),
+      legacy_name=f"{queue_name}:p{level}",
+    )
 
   def push(
     self,
@@ -98,17 +138,16 @@ class PriorityQueueStrategy(QueueStrategy):
     """Push to the priority bucket selected by ``priority``.
 
     Args:
-        queue_name: The logical queue name (the strategy suffixes it).
+        queue_name: The logical queue name (the strategy derives a physical name).
         item: Serialized item bytes.
-        priority: Caller priority ``[0.0, 1.0]`` (higher = more urgent →
-            popped first). Out-of-range values clamp.
+        priority: Scrapy priority (higher = more urgent → popped first).
         delay: Ignored (priority strategy is not a delay queue).
         source: Ignored (priority strategy routes by priority, not source).
     """
     del delay, source
     level = self._level_for(priority)
     self._connection_manager.get_queue_backend().push(
-      f"{queue_name}:p{level}", item
+      self._bucket_queue(queue_name, level), item
     )
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
@@ -126,13 +165,14 @@ class PriorityQueueStrategy(QueueStrategy):
     Returns:
         The next highest-priority item, or None if all levels empty.
     """
+    timeout = normalize_queue_timeout(timeout)
     qb = self._connection_manager.get_queue_backend()
     for level in range(self._levels):
-      item = qb.pop(f"{queue_name}:p{level}", 0.0)
+      item = qb.pop(self._bucket_queue(queue_name, level), 0.0)
       if item is not None:
         return item
     if timeout > 0:
-      return qb.pop(f"{queue_name}:p0", timeout)
+      return qb.pop(self._bucket_queue(queue_name, 0), timeout)
     return None
 
   def pop_with_ack(
@@ -143,13 +183,14 @@ class PriorityQueueStrategy(QueueStrategy):
     so MQ backends paired with the priority strategy keep per-message ack
     correlation (previously the token was silently None).
     """
+    timeout = normalize_queue_timeout(timeout)
     qb = self._connection_manager.get_queue_backend()
     for level in range(self._levels):
-      data, token = qb.pop_with_ack(f"{queue_name}:p{level}", 0.0)
+      data, token = qb.pop_with_ack(self._bucket_queue(queue_name, level), 0.0)
       if data is not None:
         return (data, token)
     if timeout > 0:
-      return qb.pop_with_ack(f"{queue_name}:p0", timeout)
+      return qb.pop_with_ack(self._bucket_queue(queue_name, 0), timeout)
     return (None, None)
 
   def queue_len(self, queue_name: str) -> int:
@@ -162,7 +203,10 @@ class PriorityQueueStrategy(QueueStrategy):
         Total items across all ``N`` levels.
     """
     qb = self._connection_manager.get_queue_backend()
-    return sum(qb.queue_len(f"{queue_name}:p{level}") for level in range(self._levels))
+    return sum(
+      qb.queue_len(self._bucket_queue(queue_name, level))
+      for level in range(self._levels)
+    )
 
   def clear(self, queue_name: str) -> None:
     """Clear all priority buckets.
@@ -172,4 +216,4 @@ class PriorityQueueStrategy(QueueStrategy):
     """
     qb = self._connection_manager.get_queue_backend()
     for level in range(self._levels):
-      qb.clear_queue(f"{queue_name}:p{level}")
+      qb.clear_queue(self._bucket_queue(queue_name, level))

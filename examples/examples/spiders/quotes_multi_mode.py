@@ -21,6 +21,12 @@ CLUSTER_CONFIG = {
   "cluster_max_redirects": 5,
 }
 
+SELECTED_CONFIG = (
+  CLUSTER_CONFIG
+  if os.environ.get("SCRAPY_EXAMPLE_REDIS_MODE", "sentinel").lower() == "cluster"
+  else SENTINEL_CONFIG
+)
+
 
 class QuotesMultiModeSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
   name = "quotes_multi_mode"
@@ -28,8 +34,8 @@ class QuotesMultiModeSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spide
   start_urls = ["https://quotes.toscrape.com"]
 
   backend_type = BackendType.REDIS
-  backend_settings = SENTINEL_CONFIG
-
-  def __init__(self, **kwargs):
-    super().__init__(**kwargs)
-    self.setup_backend()
+  backend_settings = SELECTED_CONFIG
+  custom_settings = {
+    "SCRAPY_BACKEND_TYPE": "redis",
+    "SCRAPY_BACKEND_SETTINGS": SELECTED_CONFIG,
+  }

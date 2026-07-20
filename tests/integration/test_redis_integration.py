@@ -29,6 +29,8 @@ data don't interfere.
 from __future__ import annotations
 
 import os
+import threading
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -46,7 +48,7 @@ pytestmark = [
 ]
 
 
-def _settings_from_url(url: str):  # type: ignore[no-untyped-def]
+def _settings_from_url(url: str, *, namespace: str):  # type: ignore[no-untyped-def]
   """Build a RedisSettings from a redis:// URL via stdlib urlparse.
 
   Kept dependency-free (no redis-py ``parse_url``) so the module imports
@@ -70,6 +72,7 @@ def _settings_from_url(url: str):  # type: ignore[no-untyped-def]
     password=SecretStr(parsed.password) if parsed.password else None,
     socket_timeout=5.0,
     socket_connect_timeout=5.0,
+    namespace=namespace,
   )
 
 
@@ -78,7 +81,12 @@ def redis_backend():  # type: ignore[no-untyped-def]
   """Connect a RedisBackend once per module; disconnect on teardown."""
   from scrapy_extension.backends.redis import RedisBackend
 
-  backend = RedisBackend(_settings_from_url(os.environ["SCRAPY_TEST_REDIS_URL"]))
+  backend = RedisBackend(
+    _settings_from_url(
+      os.environ["SCRAPY_TEST_REDIS_URL"],
+      namespace=f"inttest-{uuid.uuid4().hex}",
+    )
+  )
   backend.connect()
   yield backend
   backend.disconnect()
@@ -190,3 +198,71 @@ def test_ttl_contract(redis_backend, unique_prefix):
   assert isinstance(remaining, int)
   assert 0 < remaining <= 300
   assert redis_backend.ttl(no_ttl) is None  # no TTL set → None, not -1
+
+
+def test_same_logical_name_coexists_across_domains(redis_backend, unique_prefix):
+  """Queue, set, and storage values with one logical name remain independent."""
+  logical_name = f"{unique_prefix}:shared"
+
+  try:
+    redis_backend.push(logical_name, b"queued")
+    assert redis_backend.add(logical_name, b"fingerprint") is True
+    redis_backend.store(logical_name, b"stored")
+
+    assert redis_backend.pop(logical_name) == b"queued"
+    assert redis_backend.contains(logical_name, b"fingerprint") is True
+    assert redis_backend.retrieve(logical_name) == b"stored"
+  finally:
+    redis_backend.clear_queue(logical_name)
+    redis_backend.clear_set(logical_name)
+    redis_backend.delete(logical_name)
+
+
+def test_blocking_pop_waits_for_delayed_atomic_push(redis_backend, unique_prefix):
+  """The deadline-polling path observes an item produced after pop starts."""
+  queue = f"{unique_prefix}:blocking"
+  producer_errors: list[BaseException] = []
+
+  def produce() -> None:
+    try:
+      time.sleep(0.1)
+      redis_backend.push(queue, b"delayed")
+    except BaseException as exc:  # pragma: no cover - asserted in parent thread
+      producer_errors.append(exc)
+
+  producer = threading.Thread(target=produce)
+  producer.start()
+  try:
+    assert redis_backend.pop(queue, timeout=1.0) == b"delayed"
+  finally:
+    producer.join(timeout=2.0)
+    redis_backend.clear_queue(queue)
+
+  assert producer.is_alive() is False
+  assert producer_errors == []
+
+
+def test_clear_storage_preserves_foreign_and_other_domain_keys(
+  redis_backend, unique_prefix
+):
+  """Owned storage cleanup must preserve shared-DB and backend queue/set keys."""
+  logical_name = f"{unique_prefix}:owned"
+  foreign_key = f"{unique_prefix}:foreign"
+  client = redis_backend.client
+
+  try:
+    client.set(foreign_key, b"keep")
+    redis_backend.push(logical_name, b"queued")
+    redis_backend.add(logical_name, b"fingerprint")
+    redis_backend.store(logical_name, b"stored")
+
+    redis_backend.clear_storage()
+
+    assert redis_backend.retrieve(logical_name) is None
+    assert redis_backend.queue_len(logical_name) == 1
+    assert redis_backend.contains(logical_name, b"fingerprint") is True
+    assert client.get(foreign_key) == b"keep"
+  finally:
+    redis_backend.clear_queue(logical_name)
+    redis_backend.clear_set(logical_name)
+    client.delete(foreign_key)

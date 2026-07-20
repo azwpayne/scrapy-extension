@@ -41,7 +41,7 @@ class PulsarSettings(BaseSettings):
   """
 
   model_config = SettingsConfigDict(
-    env_prefix="SCRAPY_PULSAR_", case_sensitive=False, extra="ignore"
+    env_prefix="SCRAPY_PULSAR_", case_sensitive=False, extra="forbid"
   )
 
   mode: PulsarMode = Field(

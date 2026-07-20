@@ -7,6 +7,7 @@ to Scrapy spiders, enabling distributed crawling capabilities.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from scrapy import Spider, signals
@@ -14,6 +15,9 @@ from scrapy import Spider, signals
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+  from scrapy.crawler import Crawler
+  from typing_extensions import Self
+
   from scrapy_extension.backends.base import BackendType
   from scrapy_extension.backends.connectors import ConnectionManager
   from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
@@ -95,6 +99,32 @@ class BackendSpiderMixin(Spider):
     self._queue: BackendQueue | None = None
     self._dupefilter: BackendDupeFilter | None = None
     self._scheduler: BackendScheduler | None = None
+    self._signals_connected = False
+    self._connected_signals: Any | None = None
+    # Component close hooks are user-extensible and may call close_backend()
+    # again. An RLock lets that re-entrant call observe the already-detached
+    # state and return instead of deadlocking the outer shutdown.
+    self._lifecycle_lock = threading.RLock()
+
+  @classmethod
+  def from_crawler(
+    cls,
+    crawler: Crawler,
+    *args: Any,
+    **kwargs: Any,
+  ) -> Self:
+    """Create the spider and finalize backend setup after crawler attachment.
+
+    Scrapy assigns ``crawler`` only after ``__init__`` returns. Performing the
+    final idempotent setup here guarantees lifecycle signals are available,
+    including for legacy subclasses that called :meth:`setup_backend` early in
+    ``__init__``. Subclasses with no ``backend_type`` remain ordinary spiders
+    until they opt into backend access explicitly.
+    """
+    spider = super().from_crawler(crawler, *args, **kwargs)
+    if spider.backend_type is not None:
+      spider.setup_backend()
+    return spider
 
   def setup_backend(self) -> ConnectionManager:
     """Initialize and return the connection manager.
@@ -112,38 +142,41 @@ class BackendSpiderMixin(Spider):
         RuntimeError: If backend_type is not set.
         ImportError: If required backend dependencies are not installed.
     """
-    if self._connection_manager is not None:
-      return self._connection_manager
+    with self._lifecycle_lock:
+      manager = self._connection_manager
+      acquired_here = False
+      if manager is None:
+        if self.backend_type is None:
+          msg = (
+            f"{self.__class__.__name__}.backend_type must be set. "
+            "Use BackendType.REDIS, BackendType.MONGODB, etc."
+          )
+          raise RuntimeError(msg)
 
-    if self.backend_type is None:
-      msg = (
-        f"{self.__class__.__name__}.backend_type must be set. "
-        "Use BackendType.REDIS, BackendType.MONGODB, etc."
-      )
-      raise RuntimeError(msg)
+        settings = self._build_backend_settings()
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    # Build settings dict from shortcut attributes
-    settings = self._build_backend_settings()
+        manager = ConnectionManager.get_manager(
+          backend_type=self.backend_type,
+          settings=settings,
+        )
+        self._connection_manager = manager
+        acquired_here = True
 
-    # Import here to avoid circular imports
-    from scrapy_extension.backends.connectors import ConnectionManager
+      try:
+        self._connect_signals()
+      except BaseException:
+        if acquired_here:
+          self._connection_manager = None
+          try:
+            manager.close()
+          except BaseException:
+            logger.exception(
+              "Failed to release ConnectionManager after signal wiring failure"
+            )
+        raise
 
-    # 2026-07-10 (DEEP-INSIGHT-2026-07-10 §C): acquire via the refcounted
-    # singleton registry rather than constructing directly. Direct
-    # construction bypasses the registry, defeating refcounting + LRU
-    # eviction and the co-located-sharing model (two components that should
-    # share one Redis would each build their own). ``close_backend()``'s
-    # ``close()`` is the paired release — it decrements ``_users``; only the
-    # last holder disconnects.
-    self._connection_manager = ConnectionManager.get_manager(
-      backend_type=self.backend_type,
-      settings=settings,
-    )
-
-    # Connect Scrapy signals for lifecycle management
-    self._connect_signals()
-
-    return self._connection_manager
+      return manager
 
   def _build_redis_settings(self) -> dict[str, Any]:
     """Build Redis-specific shortcut settings."""
@@ -256,9 +289,61 @@ class BackendSpiderMixin(Spider):
     Connects spider_opened signal to initialize backend connections
     and spider_closed signal to cleanup connections.
     """
-    if hasattr(self, "crawler") and self.crawler:
-      self.crawler.signals.connect(self._on_spider_opened, signals.spider_opened)
-      self.crawler.signals.connect(self._on_spider_closed, signals.spider_closed)
+    crawler = getattr(self, "crawler", None)
+    if not crawler:
+      return
+
+    signal_manager = crawler.signals
+    if self._signals_connected:
+      if self._connected_signals is signal_manager:
+        return
+      # A programmatic spider can be moved to a replacement crawler between
+      # setup calls. Detach the old dispatcher before wiring the new one so a
+      # stale spider_closed event cannot close the current manager generation.
+      previous_signal_manager = self._connected_signals
+      self._connected_signals = None
+      self._signals_connected = False
+      if previous_signal_manager is not None:
+        self._disconnect_lifecycle_signals(previous_signal_manager)
+
+    handlers = (
+      (self._on_spider_opened, signals.spider_opened),
+      (self._on_spider_closed, signals.spider_closed),
+    )
+    connected: list[tuple[Any, Any]] = []
+    try:
+      for handler, signal in handlers:
+        signal_manager.connect(handler, signal)
+        connected.append((handler, signal))
+    except BaseException:
+      self._disconnect_lifecycle_signals(
+        signal_manager,
+        handlers=tuple(reversed(connected)),
+      )
+      raise
+    self._connected_signals = signal_manager
+    self._signals_connected = True
+
+  def _disconnect_lifecycle_signals(
+    self,
+    signal_manager: Any,
+    *,
+    handlers: tuple[tuple[Any, Any], ...] | None = None,
+  ) -> None:
+    """Best-effort disconnect of mixin lifecycle handlers."""
+    targets = (
+      handlers
+      if handlers is not None
+      else (
+        (self._on_spider_opened, signals.spider_opened),
+        (self._on_spider_closed, signals.spider_closed),
+      )
+    )
+    for handler, signal in targets:
+      try:
+        signal_manager.disconnect(handler, signal)
+      except Exception:
+        logger.exception("Failed to disconnect backend lifecycle signal")
 
   def _on_spider_opened(self, spider: Spider) -> None:
     """Handle spider_opened signal.
@@ -266,8 +351,12 @@ class BackendSpiderMixin(Spider):
     Args:
         spider: The spider instance that was opened.
     """
-    if spider is self and self._connection_manager is not None:
-      self._connection_manager.connect()
+    if spider is not self:
+      return
+    with self._lifecycle_lock:
+      manager = self._connection_manager
+    if manager is not None:
+      manager.connect()
 
   def _on_spider_closed(self, spider: Spider, reason: str = "") -> None:
     """Handle spider_closed signal.
@@ -359,27 +448,27 @@ class BackendSpiderMixin(Spider):
     Raises:
         RuntimeError: If setup_backend() has not been called.
     """
-    if self._connection_manager is None:
-      msg = (
-        "setup_backend() must be called before get_queue(). "
-        f"Call setup_backend() in {self.__class__.__name__}.__init__()"
-      )
-      raise RuntimeError(msg)
+    with self._lifecycle_lock:
+      manager = self._connection_manager
+      if manager is None:
+        msg = (
+          "setup_backend() must be called before get_queue(). "
+          f"Call setup_backend() in {self.__class__.__name__}.__init__()"
+        )
+        raise RuntimeError(msg)
 
-    if self._queue is None:
-      from scrapy_extension.queue.queue import BackendQueue
+      if self._queue is None:
+        from scrapy_extension.queue.queue import BackendQueue
 
-      name = queue_name or f"{self.name}:queue"
-      self._queue = BackendQueue(
-        connection_manager=self._connection_manager,
-        queue_name=name,
-        spider=self,
-        queue_strategy=self._build_queue_strategy_from_settings(
-          self._connection_manager
-        ),
-      )
+        name = queue_name or f"{self.name}:queue"
+        self._queue = BackendQueue(
+          connection_manager=manager,
+          queue_name=name,
+          spider=self,
+          queue_strategy=self._build_queue_strategy_from_settings(manager),
+        )
 
-    return self._queue
+      return self._queue
 
   def get_dupefilter(self) -> BackendDupeFilter:
     """Get the backend dupefilter for this spider.
@@ -390,26 +479,29 @@ class BackendSpiderMixin(Spider):
     Raises:
         RuntimeError: If setup_backend() has not been called.
     """
-    if self._connection_manager is None:
-      msg = (
-        "setup_backend() must be called before get_dupefilter(). "
-        f"Call setup_backend() in {self.__class__.__name__}.__init__()"
-      )
-      raise RuntimeError(msg)
+    with self._lifecycle_lock:
+      manager = self._connection_manager
+      if manager is None:
+        msg = (
+          "setup_backend() must be called before get_dupefilter(). "
+          f"Call setup_backend() in {self.__class__.__name__}.__init__()"
+        )
+        raise RuntimeError(msg)
 
-    if self._dupefilter is None:
-      from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+      if self._dupefilter is None:
+        from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 
-      key = f"{self.name}:dupefilter"
-      self._dupefilter = BackendDupeFilter(
-        connection_manager=self._connection_manager,
-        key=key,
-        membership_filter=self._build_membership_filter_from_settings(
-          self._connection_manager, key
-        ),
-      )
+        key = f"{self.name}:dupefilter"
+        self._dupefilter = BackendDupeFilter(
+          connection_manager=manager,
+          key=key,
+          membership_filter=self._build_membership_filter_from_settings(
+            manager, key
+          ),
+          owns_connection_manager=False,
+        )
 
-    return self._dupefilter
+      return self._dupefilter
 
   def get_scheduler(self) -> BackendScheduler:
     """Get the backend scheduler for this spider.
@@ -420,22 +512,25 @@ class BackendSpiderMixin(Spider):
     Raises:
         RuntimeError: If setup_backend() has not been called.
     """
-    if self._connection_manager is None:
-      msg = (
-        "setup_backend() must be called before get_scheduler(). "
-        f"Call setup_backend() in {self.__class__.__name__}.__init__()"
-      )
-      raise RuntimeError(msg)
+    with self._lifecycle_lock:
+      manager = self._connection_manager
+      if manager is None:
+        msg = (
+          "setup_backend() must be called before get_scheduler(). "
+          f"Call setup_backend() in {self.__class__.__name__}.__init__()"
+        )
+        raise RuntimeError(msg)
 
-    if self._scheduler is None:
-      from scrapy_extension.schedule.scheduler import BackendScheduler
+      if self._scheduler is None:
+        from scrapy_extension.schedule.scheduler import BackendScheduler
 
-      self._scheduler = BackendScheduler(
-        connection_manager=self._connection_manager,
-        queue_key=f"{self.name}:queue",
-      )
+        self._scheduler = BackendScheduler(
+          connection_manager=manager,
+          queue_key=f"{self.name}:queue",
+          owns_connection_manager=False,
+        )
 
-    return self._scheduler
+      return self._scheduler
 
   def close_backend(self) -> None:
     """Cleanup backend connections.
@@ -444,15 +539,45 @@ class BackendSpiderMixin(Spider):
     all backend connections are properly released. It is automatically
     called when the spider_closed signal is received.
     """
-    # Close component references
-    self._queue = None
-    self._dupefilter = None
-    self._scheduler = None
+    with self._lifecycle_lock:
+      signal_manager = self._connected_signals
+      queue = self._queue
+      dupefilter = self._dupefilter
+      scheduler = self._scheduler
+      manager = self._connection_manager
 
-    # Close connection manager
-    if self._connection_manager is not None:
-      self._connection_manager.close()
+      # Clear shared state before invoking user-extensible close hooks so
+      # duplicate/re-entrant shutdown cannot release the manager twice.
+      self._connected_signals = None
+      self._signals_connected = False
+      self._queue = None
+      self._dupefilter = None
+      self._scheduler = None
       self._connection_manager = None
+
+      if signal_manager is not None:
+        self._disconnect_lifecycle_signals(signal_manager)
+
+      # Components borrow the mixin's single manager acquire, so each must
+      # quiesce its own resources without releasing the manager. The final
+      # manager close remains last, while strategies can still persist state.
+      for component, args, label in (
+        (scheduler, ("spider-mixin-close",), "scheduler"),
+        (queue, (), "queue"),
+        (dupefilter, ("spider-mixin-close",), "dupefilter"),
+      ):
+        if component is None:
+          continue
+        try:
+          component.close(*args)
+        except Exception:
+          logger.exception("Failed to close backend %s", label)
+
+      if manager is not None:
+        try:
+          manager.close()
+        except Exception:
+          logger.exception("Failed to close backend connection manager")
 
   @property
   def connection_manager(self) -> ConnectionManager:
@@ -464,10 +589,12 @@ class BackendSpiderMixin(Spider):
     Raises:
         RuntimeError: If setup_backend() has not been called.
     """
-    if self._connection_manager is None:
-      msg = (
-        "setup_backend() must be called before accessing connection_manager. "
-        f"Call setup_backend() in {self.__class__.__name__}.__init__()"
-      )
-      raise RuntimeError(msg)
-    return self._connection_manager
+    with self._lifecycle_lock:
+      manager = self._connection_manager
+      if manager is None:
+        msg = (
+          "setup_backend() must be called before accessing connection_manager. "
+          f"Call setup_backend() in {self.__class__.__name__}.__init__()"
+        )
+        raise RuntimeError(msg)
+      return manager

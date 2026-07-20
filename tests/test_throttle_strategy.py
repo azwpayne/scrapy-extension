@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from scrapy_extension.queue.strategies.factory import (
@@ -91,6 +93,69 @@ class TestThrottleQueueStrategy:
     mock_connection_manager.get_queue_backend().pop.return_value = b"x"
     assert strat.pop("q") == b"x"  # allowed (no prior successful pop)
 
+  def test_interval_starts_when_blocking_pop_succeeds(
+    self, mock_connection_manager
+  ) -> None:
+    """Backend wait time must not consume the post-success throttle interval."""
+    now = [100.0]
+    strat = ThrottleQueueStrategy(
+      mock_connection_manager, min_interval=5.0, clock=_clock(now)
+    )
+
+    def blocking_success(queue_name: str, timeout: float) -> bytes:
+      del queue_name, timeout
+      now[0] = 105.0
+      return b"a"
+
+    mock_connection_manager.get_queue_backend().pop.side_effect = blocking_success
+    assert strat.pop("q", timeout=5.0) == b"a"
+    assert strat.pop("q") is None
+    assert mock_connection_manager.get_queue_backend().pop.call_count == 1
+
+  def test_concurrent_pops_share_one_rate_gate(self, mock_connection_manager) -> None:
+    """Only one concurrent caller may pass a positive-interval rate gate."""
+    now = [100.0]
+    strat = ThrottleQueueStrategy(
+      mock_connection_manager, min_interval=5.0, clock=_clock(now)
+    )
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def controlled_pop(queue_name: str, timeout: float) -> bytes:
+      nonlocal calls
+      del queue_name, timeout
+      with calls_lock:
+        calls += 1
+        call_number = calls
+      if call_number == 1:
+        first_entered.set()
+        assert release_first.wait(timeout=2.0)
+      else:
+        second_entered.set()
+      return f"item-{call_number}".encode()
+
+    mock_connection_manager.get_queue_backend().pop.side_effect = controlled_pop
+    results: list[bytes | None] = []
+    first = threading.Thread(target=lambda: results.append(strat.pop("q")))
+    second = threading.Thread(target=lambda: results.append(strat.pop("q")))
+    first.start()
+    assert first_entered.wait(timeout=1.0)
+    second.start()
+    try:
+      assert not second_entered.wait(timeout=0.1)
+    finally:
+      release_first.set()
+      first.join(timeout=2.0)
+      second.join(timeout=2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert calls == 1
+    assert sorted(result for result in results if result is not None) == [b"item-1"]
+
   def test_push_delegates_to_backend(self, mock_connection_manager) -> None:
     now = [0.0]
     strat = ThrottleQueueStrategy(mock_connection_manager, clock=_clock(now))
@@ -114,6 +179,13 @@ class TestThrottleQueueStrategy:
   def test_invalid_interval_raises(self, mock_connection_manager) -> None:
     with pytest.raises(ValueError, match="min_interval"):
       ThrottleQueueStrategy(mock_connection_manager, min_interval=-1.0)
+
+  @pytest.mark.parametrize("min_interval", [True, float("nan"), float("inf")])
+  def test_non_finite_or_bool_interval_raises(
+    self, mock_connection_manager, min_interval: float
+  ) -> None:
+    with pytest.raises(ValueError, match="finite"):
+      ThrottleQueueStrategy(mock_connection_manager, min_interval=min_interval)
 
   # ----- R14-F MED: min_interval must be bounded -----
 

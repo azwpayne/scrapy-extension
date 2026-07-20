@@ -18,6 +18,7 @@ from scrapy_extension.exceptions.base import ConfigurationError
 # AWS region: two lowercase letters, hyphen, lowercase word, hyphen, digits.
 # Rejects typos like "us-eat-1" (the round-6 SPEC motivator).
 _AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+_DEFAULT_LOCAL_ENDPOINT = "http://localhost:4566"
 
 
 class DynamoDBMode(str, Enum):
@@ -42,7 +43,7 @@ class DynamoDBSettings(BaseSettings):
   """
 
   model_config = SettingsConfigDict(
-    env_prefix="SCRAPY_DYNAMODB_", case_sensitive=False, extra="ignore"
+    env_prefix="SCRAPY_DYNAMODB_", case_sensitive=False, extra="forbid"
   )
 
   mode: DynamoDBMode = Field(
@@ -54,7 +55,11 @@ class DynamoDBSettings(BaseSettings):
   )
   region_name: str = Field(default="us-east-1", description="AWS region")
   endpoint_url: str | None = Field(
-    default=None, description="Endpoint URL for LocalStack (standalone mode)"
+    default=None,
+    description=(
+      "Endpoint URL for LocalStack. STANDALONE defaults safely to the local "
+      "LocalStack edge endpoint; CLOUD may leave this unset for real AWS."
+    ),
   )
   aws_access_key_id: SecretStr | None = Field(
     default=None, description="AWS access key id (optional; IAM role otherwise)"
@@ -67,18 +72,23 @@ class DynamoDBSettings(BaseSettings):
   def _validate_endpoint_url_scheme(self) -> Self:
     """SEC-4: ``endpoint_url`` (when set) must be ``http://`` or ``https://``.
 
+    In STANDALONE mode, an unset endpoint is normalized to the loopback-only
+    LocalStack default so zero-config startup cannot silently target real AWS.
+    CLOUD deliberately preserves ``None`` for boto3's real-AWS endpoint chain.
+
     Catches typos and bare ``host:port`` values (e.g. ``localstack:8000``)
     that would otherwise fall through to boto3's default credential/endpoint
     chain (silent wrong target). ``http://`` is allowed — LocalStack and
-    compatible local emulators serve over plaintext. Unset is allowed (real
-    AWS via the default chain). Mirrors the SQS validator and the RabbitMQ
-    guest-guard pattern (raise, not warn).
+    compatible local emulators serve over plaintext. Mirrors the SQS validator
+    and the RabbitMQ guest-guard pattern (raise, not warn).
 
     Raises:
         ConfigurationError: if ``endpoint_url`` is set and does not start
             with ``http://`` or ``https://``.
     """
     if self.endpoint_url is None:
+      if self.mode == DynamoDBMode.STANDALONE:
+        self.endpoint_url = _DEFAULT_LOCAL_ENDPOINT
       return self
     lowered = self.endpoint_url.lower()
     if not (lowered.startswith("http://") or lowered.startswith("https://")):

@@ -20,6 +20,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import re
 import uuid
 from abc import ABC, abstractmethod
@@ -31,11 +32,16 @@ from typing import Any, Protocol
 
 from pydantic import SecretStr
 
-#: Sentinel marker emitted for ``bytes`` / ``bytearray`` on serialize so
-#: ``deserialize`` can reverse it unambiguously (see ``_decode_bytes_tag``).
-#: A bare base64 ``str`` would be indistinguishable from a caller's plain ASCII
-#: string that happens to be valid base64. ``"__b64__"`` is a reserved meta key.
+#: Legacy bytes marker retained for reading payloads written before the escaped
+#: codec. New writes use ``_CODEC_TAG`` and escape marker-shaped user dicts.
 _BYTES_TAG = "__b64__"
+
+# New bytes markers are escaped before JSON encoding so caller-owned dictionaries
+# can use any key/value shape without being retyped during deserialize.
+_CODEC_TAG = "__scrapy_extension_json_type__"
+_CODEC_DATA = "data"
+_CODEC_BYTES = "bytes"
+_CODEC_DICT = "dict"
 
 
 def _json_default(obj: object) -> object:
@@ -43,8 +49,8 @@ def _json_default(obj: object) -> object:
 
   Handles the types that appear in real-world ``request.meta``:
   - ``datetime`` / ``date`` → ISO 8601 string (round-trips via ``datetime.fromisoformat``)
-  - ``bytes`` / ``bytearray`` → tagged ``{"__b64__": "<ascii>"}`` marker
-    (reversed on deserialize by ``_decode_bytes_tag`` so ``bytes`` round-trips)
+  - ``bytes`` / ``bytearray`` → tagged base64 marker (the recursive codec
+    handles these before this fallback in normal ``JSONSerializer`` use)
   - ``Decimal`` → ``str`` (preserves exact decimal representation, avoids float drift)
   - ``UUID`` → ``str`` (canonical hex form)
   - ``set`` / ``frozenset`` → ``list`` (JSON has no set type; order undefined)
@@ -67,9 +73,10 @@ def _json_default(obj: object) -> object:
   if isinstance(obj, (datetime, date)):
     return obj.isoformat()
   if isinstance(obj, (bytes, bytearray)):
-    # Tagged marker (not a bare base64 str) so deserialize can reverse it
-    # without ambiguity — see _decode_bytes_tag and _BYTES_TAG.
-    return {_BYTES_TAG: base64.b64encode(bytes(obj)).decode("ascii")}
+    return {
+      _CODEC_TAG: _CODEC_BYTES,
+      _CODEC_DATA: base64.b64encode(bytes(obj)).decode("ascii"),
+    }
   if isinstance(obj, Decimal):
     return str(obj)
   if isinstance(obj, uuid.UUID):
@@ -97,23 +104,14 @@ def _json_default(obj: object) -> object:
 
 
 def _decode_bytes_tag(obj: object) -> object:
-  """``json.loads`` ``object_hook`` reversing the ``{"__b64__": ...}`` marker.
+  """Decode the legacy ``{"__b64__": ...}`` bytes marker when valid.
 
-  Pairs with ``_json_default``'s bytes branch so ``bytes`` round-trips through
-  serialize → deserialize (previously one-way: bytes were base64-encoded to a
-  ``str`` on serialize and never decoded back, silently corrupting any
-  ``bytes`` value nested in ``request.meta`` / ``cookies`` / ``cb_kwargs``).
-  A dict that is *exactly* ``{"__b64__": <str>}`` decodes to ``bytes``; every
-  other dict passes through untouched, so ordinary ASCII strings (even valid
-  base64) are never decoded.
-
-  ``"__b64__"`` is a reserved ``request.meta`` key: a caller dict that is
-  exactly ``{"__b64__": "..."}`` would also decode. This trade is deliberate
-  — a marker is the only unambiguous way to reverse bytes-without-repr, and
-  the reserved-key surface is negligible for crawl meta.
+  New writes use the escaped recursive codec. It wraps a caller-owned dict with
+  this exact shape, so new serialize → deserialize round trips cannot collide;
+  the legacy decoder remains solely for rolling-upgrade compatibility.
 
   Args:
-      obj: Each dict encountered during deserialization (bottom-up).
+      obj: A decoded JSON value.
 
   Returns:
       ``bytes`` for a tagged marker dict; the original dict otherwise.
@@ -122,7 +120,7 @@ def _decode_bytes_tag(obj: object) -> object:
     value = obj.get(_BYTES_TAG)
     if isinstance(value, str):
       try:
-        return base64.b64decode(value)
+        return base64.b64decode(value, validate=True)
       except (binascii.Error, ValueError):
         # A legitimately-stored dict shaped like {"__b64__": "<non-base64>"}
         # (a spider's own meta key, or a truncated/corrupt value) must NOT
@@ -131,6 +129,104 @@ def _decode_bytes_tag(obj: object) -> object:
         # of dropping the whole pop.
         pass
   return obj
+
+
+def _looks_like_codec_marker(obj: dict[object, object]) -> bool:
+  """Whether a caller-owned dict would collide with a supported wire marker."""
+  if len(obj) == 1 and isinstance(obj.get(_BYTES_TAG), str):
+    return True
+  return (
+    len(obj) == 2
+    and obj.get(_CODEC_TAG) in {_CODEC_BYTES, _CODEC_DICT}
+    and _CODEC_DATA in obj
+  )
+
+
+def _encode_json_value(obj: object) -> object:
+  """Recursively encode bytes while escaping marker-shaped caller dictionaries."""
+  if isinstance(obj, (bytes, bytearray)):
+    return {
+      _CODEC_TAG: _CODEC_BYTES,
+      _CODEC_DATA: base64.b64encode(bytes(obj)).decode("ascii"),
+    }
+  if isinstance(obj, dict):
+    for key in obj:
+      if not isinstance(key, str):
+        raise TypeError(
+          "JSON object keys must be strings, "
+          f"got {type(key).__name__}"
+        )
+    encoded = {key: _encode_json_value(value) for key, value in obj.items()}
+    if _looks_like_codec_marker(encoded):
+      return {
+        _CODEC_TAG: _CODEC_DICT,
+        _CODEC_DATA: list(encoded.items()),
+      }
+    return encoded
+  if isinstance(obj, (list, tuple)):
+    return [_encode_json_value(value) for value in obj]
+  if isinstance(obj, float) and not math.isfinite(obj):
+    raise ValueError(f"JSON numbers must be finite, got {obj!r}")
+  if obj is None or isinstance(obj, (str, int, float, bool)):
+    return obj
+  return _encode_json_value(_json_default(obj))
+
+
+def _decode_json_value(obj: object) -> object:
+  """Decode current markers and legacy bytes tags without dict collisions."""
+  if isinstance(obj, list):
+    return [_decode_json_value(value) for value in obj]
+  if not isinstance(obj, dict):
+    return obj
+
+  if (
+    len(obj) == 2
+    and obj.get(_CODEC_TAG) == _CODEC_DICT
+    and isinstance(obj.get(_CODEC_DATA), list)
+  ):
+    items = obj[_CODEC_DATA]
+    if all(
+      isinstance(pair, list)
+      and len(pair) == 2
+      and isinstance(pair[0], str)
+      for pair in items
+    ):
+      decoded: dict[str, object] = {}
+      for key, value in items:
+        if key in decoded:
+          raise ValueError(f"Duplicate escaped JSON object key: {key!r}")
+        decoded[key] = _decode_json_value(value)
+      return decoded
+
+  if (
+    len(obj) == 2
+    and obj.get(_CODEC_TAG) == _CODEC_BYTES
+    and isinstance(obj.get(_CODEC_DATA), str)
+  ):
+    try:
+      return base64.b64decode(obj[_CODEC_DATA], validate=True)
+    except (binascii.Error, ValueError):
+      pass
+
+  legacy = _decode_bytes_tag(obj)
+  if legacy is not obj:
+    return legacy
+  return {key: _decode_json_value(value) for key, value in obj.items()}
+
+
+def _reject_non_finite_json_constant(value: str) -> object:
+  """Reject Python's non-standard NaN/Infinity JSON extensions."""
+  raise ValueError(f"JSON numbers must be finite, got {value}")
+
+
+def _json_object_from_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+  """Build a JSON object while rejecting ambiguous duplicate member names."""
+  result: dict[str, object] = {}
+  for key, value in pairs:
+    if key in result:
+      raise ValueError(f"Duplicate JSON object key: {key!r}")
+    result[key] = value
+  return result
 
 
 def secret_value(s: SecretStr | str | None) -> str | None:
@@ -193,8 +289,9 @@ class JSONSerializer:
   def serialize(self, obj: object) -> bytes:
     """Serialize an object to JSON bytes.
 
-    Uses ``_json_default`` to handle common non-JSON-native types found in
-    Scrapy request dicts (datetime → ISO, bytes → tagged base64 marker).
+    Uses an escaped recursive codec plus ``_json_default`` for common
+    non-JSON-native types found in Scrapy request dicts (datetime → ISO,
+    bytes → tagged base64 marker).
     Truly unexpected types raise TypeError with a clear message — no silent
     ``str()`` coercion.
 
@@ -207,13 +304,17 @@ class JSONSerializer:
     Raises:
         TypeError: If the object contains types not handled by _json_default.
     """
-    return json.dumps(obj, default=_json_default).encode("utf-8")
+    return json.dumps(
+      _encode_json_value(obj),
+      default=_json_default,
+      allow_nan=False,
+    ).encode("utf-8")
 
   def deserialize(self, data: bytes) -> object:
     """Deserialize JSON bytes to an object.
 
-    Reverses the ``{"__b64__": ...}`` marker emitted for ``bytes`` on serialize
-    (via ``_decode_bytes_tag``) so ``bytes`` round-trips losslessly.
+    Reverses escaped current bytes markers and legacy ``{"__b64__": ...}``
+    markers. Marker-shaped caller dictionaries remain dictionaries.
 
     Args:
         data: The JSON bytes to deserialize.
@@ -221,7 +322,13 @@ class JSONSerializer:
     Returns:
         The deserialized object.
     """
-    return json.loads(data.decode("utf-8"), object_hook=_decode_bytes_tag)
+    return _decode_json_value(
+      json.loads(
+        data.decode("utf-8"),
+        parse_constant=_reject_non_finite_json_constant,
+        object_pairs_hook=_json_object_from_pairs,
+      )
+    )
 
 
 # Shared utilities for backends
@@ -244,6 +351,19 @@ def _validate_key_name(name: str, field_name: str = "name") -> None:
             f"Invalid {field_name}: {name!r}. "
             f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
         )
+
+
+def _validate_ttl(ttl: int | None) -> None:
+    """Validate the shared StorageBackend TTL input contract.
+
+    ``None`` is the permanent-value sentinel. Concrete TTLs are positive
+    integers; zero, negatives, floats, and bools otherwise diverge across
+    Redis, MongoDB, ElasticSearch, DynamoDB, and Memcached.
+    """
+    if ttl is None:
+        return
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        raise ValueError(f"ttl must be a positive integer or None, got {ttl!r}")
 
 
 def _hash_item(item: bytes) -> str:
@@ -669,7 +789,10 @@ class StorageBackend(ABC):
         key: The storage key.
 
     Returns:
-        Seconds remaining, None if no TTL, or -1 if expired.
+        Non-negative seconds remaining, or None when the key is missing,
+        has no TTL, or has already expired. A backend that cannot inspect
+        remaining TTL (for example Memcached) may also return None for a live
+        expiring key; callers must treat None as "no observable live TTL".
     """
 
   @abstractmethod

@@ -31,6 +31,34 @@ def test_rabbitmq_backend_connect(mocker):
   mock_instance.channel.assert_called_once()
 
 
+@pytest.mark.parametrize("mode", [RabbitMQMode.STANDALONE, RabbitMQMode.CLUSTER])
+def test_rabbitmq_channel_creation_failure_closes_connection(mocker, mode):
+  """A connection not yet published on the backend still needs cleanup."""
+  config = RabbitMQSettings(username="user", password="pass")
+  config.mode = mode
+  backend = RabbitMQBackend(config)
+  connection = mocker.MagicMock()
+  connection.channel.side_effect = pika.exceptions.AMQPError("channel failed")
+  mocker.patch("pika.BlockingConnection", return_value=connection)
+
+  with pytest.raises(BackendConnectionError):
+    backend.connect()
+
+  connection.close.assert_called_once()
+  assert backend._connection is None
+  assert backend._channel is None
+  assert backend._channel_session is None
+
+
+def test_rabbitmq_closed_channel_is_not_connected(mocker):
+  backend = RabbitMQBackend(RabbitMQSettings())
+  backend._connection = mocker.MagicMock(is_open=True)
+  backend._channel = mocker.MagicMock(is_open=False)
+
+  assert backend.is_connected() is False
+  assert backend.ping() is False
+
+
 def test_rabbitmq_backend_warns_when_ssl_disabled(mocker, caplog):
   """R2-B3: default ssl_enabled=False triggers a one-shot cleartext warning.
 
@@ -124,6 +152,94 @@ def test_rabbitmq_backend_push(mocker):
   call_kwargs = mock_channel.basic_publish.call_args[1]
   assert call_kwargs["routing_key"] == "test_queue"
   assert call_kwargs["body"] == b"test_item"
+  assert call_kwargs["mandatory"] is True
+
+
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {"mode": RabbitMQMode.STANDALONE},
+    {
+      "mode": RabbitMQMode.CLUSTER,
+      "cluster_nodes": ["rabbit-2:5672"],
+    },
+    {
+      "mode": RabbitMQMode.MIRRORED_QUEUES,
+      "ha_mode": "all",
+    },
+  ],
+)
+def test_rabbitmq_connect_enables_publisher_confirms_on_every_mode(
+  mocker, settings_kwargs
+):
+  """Every activated channel must synchronously confirm publishes."""
+  config = RabbitMQSettings(**settings_kwargs)
+  backend = RabbitMQBackend(config)
+  connection = mocker.MagicMock()
+  channel = mocker.MagicMock()
+  connection.channel.return_value = channel
+  mocker.patch("pika.BlockingConnection", return_value=connection)
+
+  backend.connect()
+
+  channel.confirm_delivery.assert_called_once_with()
+  assert backend._channel_session == (backend._channel_generation, channel)
+
+
+def test_rabbitmq_confirm_setup_failure_does_not_activate_channel(mocker):
+  """A channel without confirm mode is unusable and must be torn down."""
+  backend = RabbitMQBackend(RabbitMQSettings())
+  connection = mocker.MagicMock()
+  channel = mocker.MagicMock()
+  connection.channel.return_value = channel
+  channel.confirm_delivery.side_effect = pika.exceptions.AMQPError(
+    "confirm setup failed"
+  )
+  mocker.patch("pika.BlockingConnection", return_value=connection)
+
+  with pytest.raises(BackendConnectionError, match="Failed to connect to RabbitMQ"):
+    backend.connect()
+
+  channel.close.assert_called_once()
+  connection.close.assert_called_once()
+  assert backend._channel is None
+  assert backend._connection is None
+  assert backend._channel_session is None
+  assert backend._channel_generation == 0
+
+
+def test_rabbitmq_push_false_confirmation_raises_queue_error(mocker):
+  """A channel implementation returning False must not report publish success."""
+  backend = RabbitMQBackend(RabbitMQSettings())
+  channel = mocker.MagicMock()
+  channel.basic_publish.return_value = False
+  backend._activate_channel(mocker.MagicMock(), channel)
+
+  with pytest.raises(QueueError, match="not confirmed") as exc_info:
+    backend.push("test_queue", b"test_item")
+
+  assert exc_info.value.operation == "push"
+
+
+@pytest.mark.parametrize(
+  "publish_error",
+  [
+    pika.exceptions.UnroutableError([]),
+    pika.exceptions.NackError([]),
+  ],
+)
+def test_rabbitmq_push_confirm_failure_raises_queue_error(mocker, publish_error):
+  """Mandatory returns and broker nacks are failed pushes, never success."""
+  backend = RabbitMQBackend(RabbitMQSettings())
+  channel = mocker.MagicMock()
+  channel.basic_publish.side_effect = publish_error
+  backend._activate_channel(mocker.MagicMock(), channel)
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.push("test_queue", b"test_item")
+
+  assert exc_info.value.operation == "push"
+  assert exc_info.value.__cause__ is publish_error
 
 
 def test_rabbitmq_backend_push_clamps_negative_priority_to_zero(mocker):
@@ -246,11 +362,15 @@ def test_rabbitmq_backend_ack_raises_queue_error_on_amqp_error(mocker):
 
   backend.connect()
   backend._last_delivery_tag = 42
-  mock_channel.basic_ack.side_effect = AMQPError("ack failed")
+  mock_channel.basic_ack.side_effect = [AMQPError("ack failed"), None]
 
   with pytest.raises(QueueError, match="Failed to ack RabbitMQ message"):
     backend.ack("test_queue")
-  # finally still clears the tracked tag even on failure
+  assert backend._last_delivery_tag == 42
+
+  backend.ack("test_queue")
+
+  assert mock_channel.basic_ack.call_count == 2
   assert backend._last_delivery_tag is None
 
 
@@ -270,10 +390,15 @@ def test_rabbitmq_backend_nack_raises_queue_error_on_amqp_error(mocker):
 
   backend.connect()
   backend._last_delivery_tag = 99
-  mock_channel.basic_nack.side_effect = AMQPError("nack failed")
+  mock_channel.basic_nack.side_effect = [AMQPError("nack failed"), None]
 
   with pytest.raises(QueueError, match="Failed to nack RabbitMQ message"):
     backend.nack("test_queue")
+  assert backend._last_delivery_tag == 99
+
+  backend.nack("test_queue")
+
+  assert mock_channel.basic_nack.call_count == 2
   assert backend._last_delivery_tag is None
 
 
@@ -327,6 +452,26 @@ def test_rabbitmq_backend_pop_empty(mocker):
   result = backend.pop("test_queue")
 
   assert result is None
+
+
+def test_rabbitmq_positive_timeout_retries_until_message_arrives(mocker):
+  config = RabbitMQSettings()
+  backend = RabbitMQBackend(config)
+  connection = mocker.MagicMock(is_open=True)
+  channel = mocker.MagicMock(is_open=True)
+  connection.channel.return_value = channel
+  method = mocker.MagicMock(delivery_tag=5)
+  channel.basic_get.side_effect = [
+    (None, None, None),
+    (method, None, b"arrived"),
+  ]
+  mocker.patch("pika.BlockingConnection", return_value=connection)
+  backend.connect()
+
+  assert backend.pop("q", timeout=0.2) == b"arrived"
+
+  assert channel.basic_get.call_count == 2
+  connection.process_data_events.assert_called_once()
 
 
 def test_rabbitmq_backend_queue_len(mocker):
@@ -525,7 +670,7 @@ def test_rabbitmq_backend_get_ssl_verify_mode_default():
 
 
 def test_rabbitmq_backend_guest_credentials_non_standalone(mocker):
-  """Test BackendConnectionError (wrapping ConfigurationError) when guest credentials in non-standalone mode (lines 133-141)."""
+  """Invalid settings stay ConfigurationError rather than connection failure."""
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.CLUSTER
   config.username = "guest"
@@ -538,11 +683,10 @@ def test_rabbitmq_backend_guest_credentials_non_standalone(mocker):
   mock_instance.is_open = True
   mocker.patch("pika.BlockingConnection", return_value=mock_instance)
 
-  with pytest.raises(BackendConnectionError) as exc_info:
+  with pytest.raises(ConfigurationError) as exc_info:
     backend.connect()
-  # The original ConfigurationError is chained as __cause__
-  assert isinstance(exc_info.value.__cause__, ConfigurationError)
-  assert "guest/guest" in str(exc_info.value.__cause__)
+  assert exc_info.value.setting_name == "username/password"
+  assert "guest/guest" in str(exc_info.value)
 
 
 def test_rabbitmq_backend_mirrored_queues_ha_mode(mocker):
@@ -810,12 +954,15 @@ def test_rabbitmq_backend_queue_len_amqp_error(mocker):
 
 
 def test_rabbitmq_backend_clear_queue_no_channel():
-  """Test clear_queue returns early when channel is None (lines 447-448)."""
+  """A disconnected purge must not report success."""
   config = RabbitMQSettings()
   backend = RabbitMQBackend(config)
 
-  # Should not raise
-  backend.clear_queue("test_queue")
+  with pytest.raises(QueueError) as exc_info:
+    backend.clear_queue("test_queue")
+
+  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.operation == "clear_queue"
 
 
 def test_rabbitmq_backend_clear_queue_amqp_error(mocker):
@@ -842,6 +989,43 @@ def test_rabbitmq_backend_clear_queue_amqp_error(mocker):
   assert exc_info.value.queue_name == "test_queue"
   assert exc_info.value.operation == "clear_queue"
   assert "Purge failed" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("method", ["push", "pop", "queue_len", "clear_queue"])
+def test_rabbitmq_queue_methods_validate_name_before_driver_call(mocker, method):
+  backend = RabbitMQBackend(RabbitMQSettings())
+  channel = mocker.MagicMock()
+  backend._connection = mocker.MagicMock(is_open=True)
+  backend._channel = channel
+  backend._channel_session = (backend._channel_generation, channel)
+  args = ("bad name!", b"item") if method == "push" else ("bad name!",)
+
+  with pytest.raises(ValueError):
+    getattr(backend, method)(*args)
+
+  channel.queue_declare.assert_not_called()
+  channel.basic_get.assert_not_called()
+  channel.queue_purge.assert_not_called()
+
+
+def test_rabbitmq_token_terminal_transition_is_idempotent(mocker):
+  backend = RabbitMQBackend(RabbitMQSettings())
+  connection = mocker.MagicMock(is_open=True)
+  channel = mocker.MagicMock(is_open=True)
+  connection.channel.return_value = channel
+  method = mocker.MagicMock(delivery_tag=7)
+  channel.basic_get.return_value = (method, None, b"item")
+  mocker.patch("pika.BlockingConnection", return_value=connection)
+  backend.connect()
+  _body, token = backend.pop_with_ack("q")
+  assert token is not None
+
+  backend.ack("q", token=token)
+  backend.ack("q", token=token)
+  backend.nack("q", token=token)
+
+  channel.basic_ack.assert_called_once_with(delivery_tag=7, multiple=False)
+  channel.basic_nack.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1098,8 +1282,8 @@ def test_rabbitmq_backend_disconnect_only_connection(mocker):
 class TestRabbitMQBackendPopWithAckConcurrency:
   """Tier-2 Unit H: pop_with_ack + ack(token) correctness under CONCURRENT_REQUESTS>1.
 
-  Proves N concurrent pops return N distinct delivery tags and ack(token=tag)
-  basic_acks the RIGHT tag regardless of pop/ack order.
+  Proves N concurrent pops return N distinct ack tokens and ack(token)
+  basic_acks the RIGHT delivery tag regardless of pop/ack order.
   """
 
   @staticmethod
@@ -1129,7 +1313,10 @@ class TestRabbitMQBackendPopWithAckConcurrency:
 
     assert all(t is not None for t in tags)
     assert len(set(tags)) == 3
-    assert sorted(tags) == [10, 20, 30]
+    assert sorted(t.delivery_tag for t in tags if t is not None) == [10, 20, 30]
+    assert {t.channel_generation for t in tags if t is not None} == {
+      backend._channel_generation
+    }
 
   def test_ack_token_acks_right_tag_regardless_of_order(self, mocker):
     """(b) ack(token=tag_i) calls basic_ack(delivery_tag=tag_i) for the RIGHT tag, any order."""
@@ -1160,11 +1347,11 @@ class TestRabbitMQBackendPopWithAckConcurrency:
     _b1, t1 = backend.pop_with_ack("q")
     _b2, t2 = backend.pop_with_ack("q")
 
-    assert backend._in_flight_tags == {10, 20, 30}
+    assert {token.delivery_tag for token in backend._in_flight_tags} == {10, 20, 30}
     backend.ack("q", token=t1)
-    assert backend._in_flight_tags == {10, 30}
+    assert {token.delivery_tag for token in backend._in_flight_tags} == {10, 30}
     backend.ack("q", token=t0)
-    assert backend._in_flight_tags == {30}
+    assert {token.delivery_tag for token in backend._in_flight_tags} == {30}
     backend.ack("q", token=t2)
     assert backend._in_flight_tags == set()
 
@@ -1177,7 +1364,7 @@ class TestRabbitMQBackendPopWithAckConcurrency:
     backend.nack("q", token=token)
 
     mock_channel.basic_nack.assert_called_once_with(delivery_tag=42, requeue=True)
-    assert 42 not in backend._in_flight_tags
+    assert token not in backend._in_flight_tags
 
   def test_ack_token_none_legacy_fallback(self, mocker):
     """(e) ack(token=None) legacy fallback basic_acks the last-popped tag."""
@@ -1287,17 +1474,20 @@ def test_rabbitmq_in_flight_set_bounded(mocker, caplog):
   cap at ``_MAX_IN_FLIGHT`` and warn-once on overflow. The pop itself is
   never dropped — the message is still returned to the caller.
   """
-  from scrapy_extension.backends.rabbitmq import _MAX_IN_FLIGHT
+  from scrapy_extension.backends.rabbitmq import _MAX_IN_FLIGHT, _RabbitMQAckToken
 
   config = RabbitMQSettings()
   backend = RabbitMQBackend(config)
+  mock_channel = mocker.MagicMock()
+  backend._activate_channel(mocker.MagicMock(), mock_channel)
   # Simulate an already-saturated set.
-  backend._in_flight_tags = set(range(_MAX_IN_FLIGHT))
+  backend._in_flight_tags = {
+    _RabbitMQAckToken(tag, backend._channel_generation)
+    for tag in range(_MAX_IN_FLIGHT)
+  }
   assert not backend._in_flight_overflow_warned
 
   # Pop a fresh message — the new tag must NOT grow the set past the cap.
-  mock_channel = mocker.MagicMock()
-  backend._channel = mock_channel
   mock_method = mocker.MagicMock(delivery_tag=999_999)
   mock_channel.basic_get.return_value = (mock_method, mocker.MagicMock(), b"body")
 
@@ -1320,7 +1510,7 @@ def test_disconnect_clears_delivery_tag_state_and_in_flight_set():
   ``_in_flight_tags`` set so a reconnect cannot (a) reuse a stale delivery tag
   on the new channel via the legacy ack path (spurious QueueError /
   PRECONDITION_FAILED on basic_ack) or (b) leak the in-flight set across
-  reconnect cycles (unbounded ``set[int]`` growth for a long-running crawler
+  reconnect cycles (unbounded token-set growth for a long-running crawler
   that reconnects repeatedly). At-least-once is preserved either way — the
   broker requeues unacked messages on consumer disconnect — so this is
   correctness/hygiene, not a data-loss fix.
@@ -1333,7 +1523,11 @@ def test_disconnect_clears_delivery_tag_state_and_in_flight_set():
   backend._channel = MagicMock()
   backend._connection = MagicMock()
   backend._last_delivery_tag = 42
-  backend._in_flight_tags = {10, 20, 30}
+  from scrapy_extension.backends.rabbitmq import _RabbitMQAckToken
+
+  backend._in_flight_tags = {
+    _RabbitMQAckToken(tag, backend._channel_generation) for tag in (10, 20, 30)
+  }
 
   backend.disconnect()
 

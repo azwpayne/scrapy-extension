@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from elasticsearch import NotFoundError, RequestError, TransportError
+from elasticsearch import ApiError, NotFoundError, RequestError, TransportError
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
@@ -67,7 +67,8 @@ class TestConnection:
       indices=mocker.MagicMock(exists=mocker.MagicMock(return_value=True)),
     )
     mocker.patch(
-      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
     )
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -81,7 +82,8 @@ class TestConnection:
       indices=mocker.MagicMock(exists=mocker.MagicMock(return_value=True)),
     )
     mocker.patch(
-      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
     )
 
     backend = ElasticSearchBackend(
@@ -110,7 +112,8 @@ class TestConnection:
       indices=mocker.MagicMock(exists=mocker.MagicMock(return_value=True)),
     )
     mocker.patch(
-      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
     )
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -266,19 +269,15 @@ class TestQueue:
     with pytest.raises(QueueError):
       b.queue_len("q")
 
-  def test_set_len_error_returns_zero(self, mocker):
-    """R-es-qlen: set_len returns 0 on TransportError (diagnostic, redis parity).
+  def test_set_len_error_is_not_reported_as_empty(self, mocker):
+    from scrapy_extension.exceptions import BackendConnectionError
 
-    set_len is a diagnostic count (not safety-critical for idle detection), so
-    it returns 0 on error like Redis's ``set_len`` (``except RedisError: return
-    0``). The asymmetry with queue_len (which raises QueueError) is intentional:
-    the scheduler trusts ``len(queue)`` for idle/backpressure, but set_len is
-    observational. After ``_count``'s swallow was removed, set_len owns its own
-    except arm to preserve this contract.
-    """
     b = _mock_backend(mocker)
     b._client.count.side_effect = TransportError("err")
-    assert b.set_len("s") == 0
+    with pytest.raises(BackendConnectionError) as exc_info:
+      b.set_len("s")
+    assert exc_info.value.backend_type == "elasticsearch"
+    assert isinstance(exc_info.value.__cause__, TransportError)
 
   def test_clear_queue(self, mocker):
     b = _mock_backend(mocker)
@@ -323,10 +322,35 @@ class TestSetCore:
     b._client.delete.side_effect = _make_not_found_error()
     assert b.remove("s", b"item") is False
 
+  @pytest.mark.parametrize("error_type", [ApiError, TransportError])
+  def test_remove_wraps_backend_error(self, mocker, error_type):
+    from scrapy_extension.exceptions import BackendConnectionError
+
+    b = _mock_backend(mocker)
+    error = (
+      error_type("delete failed", mocker.MagicMock(status=500), {})
+      if error_type is ApiError
+      else error_type("delete failed")
+    )
+    b._client.delete.side_effect = error
+    with pytest.raises(BackendConnectionError) as exc_info:
+      b.remove("s", b"item")
+    assert exc_info.value.__cause__ is error
+
   def test_contains(self, mocker):
     b = _mock_backend(mocker)
     b._client.exists.return_value = True
     assert b.contains("s", b"item") is True
+
+  def test_contains_wraps_transport_error(self, mocker):
+    from scrapy_extension.exceptions import BackendConnectionError
+
+    b = _mock_backend(mocker)
+    error = TransportError("exists failed")
+    b._client.exists.side_effect = error
+    with pytest.raises(BackendConnectionError) as exc_info:
+      b.contains("s", b"item")
+    assert exc_info.value.__cause__ is error
 
   def test_set_len(self, mocker):
     b = _mock_backend(mocker)
@@ -381,9 +405,63 @@ class TestStorage:
     via expireAt). Pre-fix retrieve returned the expired doc's data verbatim."""
     b = _mock_backend(mocker)
     past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
-    b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
+    b._client.get.return_value = {
+      "_source": {"data": "ZGF0YQ==", "expireAt": past},
+      "_seq_no": 4,
+      "_primary_term": 2,
+    }
     assert b.retrieve("k") is None
-    b._client.delete.assert_called_once_with(index="scrapy_storage", id="k")
+    b._client.delete.assert_called_once_with(
+      index="scrapy_storage", id="k", if_seq_no=4, if_primary_term=2
+    )
+
+  def test_retrieve_expired_reap_cannot_delete_concurrent_fresh_write(self, mocker):
+    """Lazy expiry cleanup is conditional on the exact GET document version."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {
+      "_source": {"data": "ZGF0YQ==", "expireAt": past},
+      "_seq_no": 7,
+      "_primary_term": 3,
+    }
+
+    assert b.retrieve("k") is None
+    b._client.delete.assert_called_once_with(
+      index="scrapy_storage",
+      id="k",
+      if_seq_no=7,
+      if_primary_term=3,
+    )
+
+  def test_retrieve_expired_without_version_metadata_skips_unsafe_reap(self, mocker):
+    """Never fall back to deleting a key without optimistic concurrency data."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
+
+    assert b.retrieve("k") is None
+    b._client.delete.assert_not_called()
+
+  @pytest.mark.parametrize(
+    "source",
+    [
+      {},
+      {"data": 123},
+      {"data": "!!!!"},
+      {"data": "ZGF0YQ==", "expireAt": "not-a-date"},
+    ],
+  )
+  def test_retrieve_corrupt_document_is_storage_error(self, mocker, source):
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.get.return_value = {"_source": source}
+
+    with pytest.raises(StorageError) as exc_info:
+      b.retrieve("k")
+
+    assert exc_info.value.operation == "retrieve"
+    assert exc_info.value.key == "k"
 
   def test_delete(self, mocker):
     b = _mock_backend(mocker)
@@ -410,14 +488,22 @@ class TestStorage:
     DynamoDB exists contract: 'present AND not expired') AND is reaped."""
     b = _mock_backend(mocker)
     past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
-    b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
+    b._client.get.return_value = {
+      "_source": {"data": "ZGF0YQ==", "expireAt": past},
+      "_seq_no": 4,
+      "_primary_term": 2,
+    }
     assert b.exists("k") is False
-    b._client.delete.assert_called_once_with(index="scrapy_storage", id="k")
+    b._client.delete.assert_called_once_with(
+      index="scrapy_storage", id="k", if_seq_no=4, if_primary_term=2
+    )
 
-  def test_ttl_no_expire(self, mocker):
+  @pytest.mark.parametrize("expiry_fields", [{}, {"expireAt": None}])
+  def test_ttl_no_expire(self, mocker, expiry_fields):
     b = _mock_backend(mocker)
-    b._client.get.return_value = {"_source": {}}
+    b._client.get.return_value = {"_source": expiry_fields}
     assert b.ttl("k") is None
+    b._client.delete.assert_not_called()
 
   def test_ttl_with_expire(self, mocker):
     b = _mock_backend(mocker)
@@ -425,14 +511,40 @@ class TestStorage:
     b._client.get.return_value = {"_source": {"expireAt": future}}
     assert 3500 < b.ttl("k") <= 3600
 
-  def test_ttl_expired_returns_negative_and_reaps(self, mocker):
-    """R-esttl: ttl() reaps expired docs (storage hygiene) while preserving
-    the R48 contract (-1 = expired, distinct from None = absent)."""
+  def test_ttl_expired_returns_none_and_reaps(self, mocker):
+    """Expired storage is absent after optimistic lazy cleanup."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {
+      "_source": {"expireAt": past},
+      "_seq_no": 4,
+      "_primary_term": 2,
+    }
+    assert b.ttl("k") is None
+    b._client.delete.assert_called_once_with(
+      index="scrapy_storage", id="k", if_seq_no=4, if_primary_term=2
+    )
+
+  def test_ttl_expired_without_version_metadata_skips_unsafe_reap(self, mocker):
+    """Logical expiry must not trigger an unconditional concurrent-write race."""
     b = _mock_backend(mocker)
     past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
     b._client.get.return_value = {"_source": {"expireAt": past}}
-    assert b.ttl("k") == -1
-    b._client.delete.assert_called_once_with(index="scrapy_storage", id="k")
+
+    assert b.ttl("k") is None
+    b._client.delete.assert_not_called()
+
+  def test_ttl_malformed_expiry_is_storage_error(self, mocker):
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    b._client.get.return_value = {"_source": {"expireAt": "not-a-date"}}
+
+    with pytest.raises(StorageError) as exc_info:
+      b.ttl("k")
+
+    assert exc_info.value.operation == "ttl"
+    assert exc_info.value.key == "k"
 
   def test_ttl_not_found(self, mocker):
     """R48: a missing key returns None, not -1 (distinguish absent from expired).
@@ -514,6 +626,20 @@ class TestStorage:
     assert ei.value.key == "k"
     # The original TransportError is chained (not swallowed).
     assert isinstance(ei.value.__cause__, TransportError)
+
+  def test_store_wraps_api_error_as_storage_error(self, mocker):
+    from scrapy_extension.exceptions import StorageError
+
+    b = _mock_backend(mocker)
+    error = ApiError("cluster rejected write", mocker.MagicMock(status=500), {})
+    b._client.index.side_effect = error
+
+    with pytest.raises(StorageError) as exc_info:
+      b.store("k", b"data")
+
+    assert exc_info.value.operation == "store"
+    assert exc_info.value.key == "k"
+    assert exc_info.value.__cause__ is error
 
   def test_retrieve_wraps_transport_error_as_storage_error(self, mocker):
     from elasticsearch import TransportError
@@ -655,7 +781,8 @@ class TestClientProperty:
       indices=mocker.MagicMock(exists=mocker.MagicMock(return_value=False)),
     )
     mocker.patch(
-      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
     )
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -673,7 +800,8 @@ class TestEnsureIndices:
       ),
     )
     mocker.patch(
-      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
     )
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -690,7 +818,8 @@ class TestConnectionManager:
       indices=mocker.MagicMock(exists=mocker.MagicMock(return_value=True)),
     )
     mocker.patch(
-      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=mock_client
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
     )
 
     manager = ConnectionManager.get_manager(BackendType.ELASTICSEARCH)

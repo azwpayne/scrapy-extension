@@ -6,6 +6,7 @@ interception strategy is obsolete — these tests patch the top-level
 ``rocketmq.Producer`` / ``rocketmq.SimpleConsumer`` / etc. directly.
 """
 
+import threading
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -24,6 +25,7 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import RocketMQMode, RocketMQSettings
 
 # ---------------------------------------------------------------------------
@@ -129,6 +131,17 @@ def test_rocketmq_backend_disconnect() -> None:
   assert backend._consumer is None
 
 
+def test_locked_sdk_exposes_wait_and_lease_mutation_contracts() -> None:
+  """The backend relies on both APIs; catch dependency drift before runtime."""
+  from rocketmq import SimpleConsumer
+
+  consumer = object.__new__(SimpleConsumer)
+  consumer.await_duration = 0
+
+  assert consumer.await_duration == 0
+  assert callable(SimpleConsumer.change_invisible_duration)
+
+
 # ---------------------------------------------------------------------------
 # connect — success paths
 # ---------------------------------------------------------------------------
@@ -152,6 +165,11 @@ def test_connect_standalone_mode(mocker) -> None:
   assert backend._consumer is mock_consumer_cls.return_value
   mock_producer_cls.return_value.startup.assert_called_once()
   mock_consumer_cls.return_value.startup.assert_called_once()
+  mock_consumer_cls.assert_called_once_with(
+    mock_config_cls.return_value,
+    config.consumer_group,
+    await_duration=0,
+  )
   # ClientConfiguration receives endpoints=namesrv_address (now the gRPC proxy).
   assert mock_config_cls.call_args.kwargs["endpoints"] == config.namesrv_address
 
@@ -204,9 +222,18 @@ def test_connect_standalone_without_credentials(mocker) -> None:
 
 def test_connect_missing_package(mocker) -> None:
   """connect raises BackendConnectionError when the rocketmq import fails."""
+  import builtins
+
   config = RocketMQSettings()
   backend = RocketMQBackend(config)
-  mocker.patch("builtins.__import__", side_effect=ImportError("no rocketmq"))
+  real_import = builtins.__import__
+
+  def import_without_rocketmq(name, *args, **kwargs):
+    if name == "rocketmq":
+      raise ModuleNotFoundError("no rocketmq", name="rocketmq")
+    return real_import(name, *args, **kwargs)
+
+  mocker.patch("builtins.__import__", side_effect=import_without_rocketmq)
 
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
@@ -261,6 +288,23 @@ def test_connect_producer_startup_failure(mocker) -> None:
     backend.connect()
   assert "Failed to connect to RocketMQ" in str(exc_info.value)
   assert exc_info.value.backend_type == "rocketmq"
+  mock_producer_cls.return_value.shutdown.assert_called_once()
+  assert backend._producer is None
+  assert backend._consumer is None
+
+
+def test_connect_consumer_startup_failure_cleans_both_clients(mocker) -> None:
+  mock_producer_cls, mock_consumer_cls, *_ = _patch_rocketmq(mocker)
+  mock_consumer_cls.return_value.startup.side_effect = RuntimeError("consumer down")
+  backend = RocketMQBackend(RocketMQSettings())
+
+  with pytest.raises(BackendConnectionError):
+    backend.connect()
+
+  mock_consumer_cls.return_value.shutdown.assert_called_once()
+  mock_producer_cls.return_value.shutdown.assert_called_once()
+  assert backend._producer is None
+  assert backend._consumer is None
 
 
 def test_connect_unexpected_exception(mocker) -> None:
@@ -423,8 +467,10 @@ def test_pop_returns_message(mocker) -> None:
   result = backend.pop("my_queue")
 
   assert result == b"hello-world"
-  # apache receive(max_message_num, invisible_duration). Default invisible 15s.
-  mock_consumer.receive.assert_called_once_with(1, 15)
+  # Waiting and processing lease are independent: non-blocking pop uses an
+  # await duration of zero while the default processing lease is 300 seconds.
+  assert mock_consumer.await_duration == 0
+  mock_consumer.receive.assert_called_once_with(1, 300)
   mock_consumer.ack.assert_not_called()  # deferred-ack: no inline ack
 
 
@@ -437,36 +483,77 @@ def test_pop_returns_none_when_empty(mocker) -> None:
   mock_consumer.ack.assert_not_called()
 
 
-def test_pop_timeout_used_as_invisible_duration(mocker) -> None:
-  """pop passes the timeout (seconds) as the invisible_duration arg, clamped
-  to the apache broker's 10s floor (error 40011 below it)."""
+def test_pop_timeout_controls_await_duration_not_processing_lease(mocker) -> None:
+  """Queue ``timeout`` is a receive wait, never a processing lease."""
+  backend, _, mock_consumer, _ = _make_connected_backend(
+    mocker, invisible_duration=90
+  )
+  mock_consumer.receive.return_value = []
+
+  backend.pop("my_queue", timeout=20.0)
+
+  assert mock_consumer.await_duration == 20
+  mock_consumer.receive.assert_called_once_with(1, 90)
+
+
+def test_pop_fractional_timeout_rounds_up_to_sdk_second(mocker) -> None:
+  """The SDK duration is whole seconds; never return before a positive wait."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_consumer.receive.return_value = []
 
-  backend.pop("my_queue", timeout=20.0)  # above the floor → passed through
+  backend.pop("my_queue", timeout=0.1)
 
-  mock_consumer.receive.assert_called_once_with(1, 20)
-
-
-def test_pop_invisible_duration_clamped_to_broker_floor(mocker) -> None:
-  """A sub-floor timeout (the broker rejects <10s with error 40011) is clamped
-  to 10s so a 1s polling-style receive window still satisfies the broker."""
-  backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-  mock_consumer.receive.return_value = []
-
-  backend.pop("my_queue", timeout=1.0)  # below floor
-
-  mock_consumer.receive.assert_called_once_with(1, 10)
+  assert mock_consumer.await_duration == 1
+  mock_consumer.receive.assert_called_once_with(1, 300)
 
 
-def test_pop_zero_timeout_uses_default_invisible(mocker) -> None:
-  """pop with timeout=0 uses the default 15s invisible-duration."""
+def test_pop_zero_timeout_is_nonblocking_with_default_processing_lease(mocker) -> None:
+  """Scheduler ``timeout=0`` must not inherit the SDK's 20s long poll."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_consumer.receive.return_value = []
 
   backend.pop("my_queue", timeout=0.0)
 
-  mock_consumer.receive.assert_called_once_with(1, 15)
+  assert mock_consumer.await_duration == 0
+  mock_consumer.receive.assert_called_once_with(1, 300)
+
+
+def test_concurrent_pop_cannot_overwrite_another_calls_await_duration(mocker) -> None:
+  backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+  first_entered = threading.Event()
+  release_first = threading.Event()
+  observed: list[tuple[str, int]] = []
+
+  def receive(_max_messages: int, _lease: int) -> list[object]:
+    name = threading.current_thread().name
+    if name == "short-wait":
+      first_entered.set()
+      assert release_first.wait(timeout=2)
+    observed.append((name, mock_consumer.await_duration))
+    return []
+
+  mock_consumer.receive.side_effect = receive
+  short = threading.Thread(
+    target=backend.pop,
+    args=("my_queue", 1.0),
+    name="short-wait",
+  )
+  long = threading.Thread(
+    target=backend.pop,
+    args=("my_queue", 7.0),
+    name="long-wait",
+  )
+
+  short.start()
+  assert first_entered.wait(timeout=2)
+  long.start()
+  release_first.set()
+  short.join(timeout=2)
+  long.join(timeout=2)
+
+  assert not short.is_alive()
+  assert not long.is_alive()
+  assert observed == [("short-wait", 1), ("long-wait", 7)]
 
 
 def test_pop_receive_failure(mocker) -> None:
@@ -569,7 +656,9 @@ def test_pop_no_longer_inline_acks(mocker) -> None:
 
 
 def test_pop_with_ack_returns_body_and_token_no_ack(mocker) -> None:
-  """pop_with_ack returns (body, msg_token) and does NOT ack."""
+  """pop_with_ack returns an opaque generation token and does NOT ack."""
+  from scrapy_extension.backends.rocketmq import _RocketMQAckToken
+
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_msg = mocker.MagicMock()
   mock_msg.body = b"hello"
@@ -578,7 +667,9 @@ def test_pop_with_ack_returns_body_and_token_no_ack(mocker) -> None:
   body, token = backend.pop_with_ack("my_queue")
 
   assert body == b"hello"
-  assert token is mock_msg
+  assert isinstance(token, _RocketMQAckToken)
+  assert token.message is mock_msg
+  assert token.consumer is mock_consumer
   mock_consumer.ack.assert_not_called()
 
 
@@ -594,11 +685,14 @@ def test_pop_with_ack_empty_returns_none_none(mocker) -> None:
 
 
 def test_ack_with_token_acks_specific_message(mocker) -> None:
-  """ack(token=msg) acks the specific message (concurrent-ack correct)."""
+  """ack(token) acks the specific message (concurrent-ack correct)."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   msg_b = mocker.MagicMock(name="b")
+  msg_b.body = b"b"
+  mock_consumer.receive.return_value = [msg_b]
+  _body, token = backend.pop_with_ack("q")
 
-  backend.ack("q", token=msg_b)
+  backend.ack("q", token=token)
 
   mock_consumer.ack.assert_called_once_with(msg_b)
 
@@ -627,14 +721,111 @@ def test_ack_token_none_with_no_last_msg_is_noop(mocker) -> None:
   mock_consumer.ack.assert_not_called()
 
 
-def test_nack_does_not_ack(mocker) -> None:
-  """nack is a no-op — RocketMQ redelivers via the invisible-duration window."""
+def test_ack_token_is_idempotent(mocker) -> None:
+  backend, _, consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  consumer.receive.return_value = [message]
+  _body, token = backend.pop_with_ack("q")
+
+  backend.ack("q", token=token)
+  backend.ack("q", token=token)
+  backend.nack("q", token=token)
+
+  consumer.ack.assert_called_once_with(message)
+  consumer.change_invisible_duration.assert_not_called()
+
+
+def test_stale_token_does_not_ack_replacement_consumer(mocker) -> None:
+  backend, _, old_consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  old_consumer.receive.return_value = [message]
+  _body, token = backend.pop_with_ack("q")
+  backend.disconnect()
+  new_consumer = mocker.MagicMock(is_running=True)
+  backend._producer = mocker.MagicMock(is_running=True)
+  backend._consumer = new_consumer
+  backend._consumer_generation += 1
+
+  backend.ack("q", token=token)
+  backend.nack("q", token=token)
+
+  new_consumer.ack.assert_not_called()
+  new_consumer.change_invisible_duration.assert_not_called()
+
+
+def test_legacy_ack_failure_keeps_delivery_for_retry(mocker) -> None:
+  backend, _, consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  consumer.receive.return_value = [message]
+  consumer.ack.side_effect = [RuntimeError("ack failed"), None]
+  backend.pop("q")
+
+  with pytest.raises(QueueError):
+    backend.ack("q")
+  assert backend._last_msg is message
+
+  backend.ack("q")
+
+  assert consumer.ack.call_count == 2
+  assert backend._last_msg is None
+
+
+def test_nack_shortens_processing_lease_to_broker_floor(mocker) -> None:
+  """RocketMQ has no zero-delay nack; 10s is the broker minimum."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   msg = mocker.MagicMock()
+  msg.body = b"x"
+  mock_consumer.receive.return_value = [msg]
+  _body, token = backend.pop_with_ack("my_queue")
 
-  backend.nack("my_queue", token=msg)
+  backend.nack("my_queue", token=token)
 
   mock_consumer.ack.assert_not_called()
+  mock_consumer.change_invisible_duration.assert_called_once_with(msg, 10)
+
+
+def test_legacy_nack_shortens_lease_and_clears_last_message(mocker) -> None:
+  backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+  msg = mocker.MagicMock()
+  msg.body = b"payload"
+  mock_consumer.receive.return_value = [msg]
+  backend.pop("my_queue")
+
+  backend.nack("my_queue")
+
+  mock_consumer.change_invisible_duration.assert_called_once_with(msg, 10)
+  assert backend._last_msg is None
+
+
+def test_legacy_nack_failure_keeps_delivery_for_retry(mocker) -> None:
+  backend, _, consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  consumer.receive.return_value = [message]
+  consumer.change_invisible_duration.side_effect = [RuntimeError("nack failed"), None]
+  backend.pop("q")
+
+  with pytest.raises(QueueError):
+    backend.nack("q")
+  assert backend._last_msg is message
+
+  backend.nack("q")
+
+  assert consumer.change_invisible_duration.call_count == 2
+  assert backend._last_msg is None
+
+
+def test_nack_failure_raises_queue_error(mocker) -> None:
+  backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+  msg = mocker.MagicMock()
+  msg.body = b"x"
+  mock_consumer.receive.return_value = [msg]
+  _body, token = backend.pop_with_ack("my_queue")
+  mock_consumer.change_invisible_duration.side_effect = RuntimeError("renew failed")
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.nack("my_queue", token=token)
+
+  assert exc_info.value.operation == "nack"
 
 
 def test_rocketmq_requires_ack_class_attrs() -> None:
@@ -705,27 +896,45 @@ def test_is_connected_false_when_is_running_raises(mocker) -> None:
   assert backend.is_connected() is False
 
 
-def test_ensure_subscribed_swallows_subscribe_failure(mocker) -> None:
-  """_ensure_subscribed swallows a subscribe() failure (best-effort); the
-  subsequent receive() surfaces any real broker error."""
+def test_ensure_subscribed_surfaces_subscribe_failure(mocker) -> None:
+  """A subscription failure must not masquerade as an empty queue."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_consumer.subscribe.side_effect = RuntimeError("transient")
   mock_consumer.receive.return_value = []
 
-  # pop must NOT raise despite the subscribe failure — _ensure_subscribed
-  # caught it, and receive returned [].
-  assert backend.pop("flaky_queue") is None
+  with pytest.raises(QueueError) as exc_info:
+    backend.pop("flaky_queue")
+
+  assert exc_info.value.queue_name == "flaky_queue"
+  assert exc_info.value.operation == "pop"
+  mock_consumer.receive.assert_not_called()
 
 
 def test_ack_failure_raises_queue_error(mocker) -> None:
   """ack wraps a broker-side ack failure in QueueError(operation='ack')."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   msg = mocker.MagicMock()
+  msg.body = b"x"
+  mock_consumer.receive.return_value = [msg]
+  _body, token = backend.pop_with_ack("q")
   mock_consumer.ack.side_effect = OSError("broker gone")
 
   with pytest.raises(QueueError, match="Failed to ack RocketMQ message") as exc_info:
-    backend.ack("q", token=msg)
+    backend.ack("q", token=token)
   assert exc_info.value.operation == "ack"
+
+
+@pytest.mark.parametrize("method", ["push", "pop", "queue_len", "clear_queue"])
+def test_queue_methods_validate_names_before_driver_call(mocker, method) -> None:
+  backend, producer, consumer, _ = _make_connected_backend(mocker)
+  args = ("bad name!", b"x") if method == "push" else ("bad name!",)
+
+  with pytest.raises(ValueError):
+    getattr(backend, method)(*args)
+
+  producer.send.assert_not_called()
+  consumer.subscribe.assert_not_called()
+  consumer.receive.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -740,16 +949,12 @@ def _reset_queue_len_warned() -> None:
   rocketmq_module._queue_len_warned = False
 
 
-def test_queue_len_returns_zero_risk1() -> None:
-  """Risk 1: queue_len returns 0 (standardized) instead of raising.
-
-  Pre-fix: queue_len raised NotImplementedError — propagated uncaught through
-  ``BackendQueue._probe_depth`` and could crash the pop / has_pending_requests
-  loop. Post-fix: returns 0 uniformly with Kafka/Pulsar/SQS + warns once.
-  """
+def test_queue_len_reports_unsupported_risk1() -> None:
+  """Unsupported depth must not masquerade as a confirmed empty queue."""
   _reset_queue_len_warned()
   backend = RocketMQBackend(RocketMQSettings())
-  assert backend.queue_len("test_queue") == 0
+  with pytest.raises(NotImplementedError, match="broker-side depth RPC"):
+    backend.queue_len("test_queue")
 
 
 def test_queue_len_warns_once_risk1(caplog) -> None:
@@ -761,11 +966,29 @@ def test_queue_len_warns_once_risk1(caplog) -> None:
   with caplog.at_level(
     logging.WARNING, logger="scrapy_extension.backends.rocketmq"
   ):
-    backend.queue_len("test_queue")  # 1st call -> warns
-    backend.queue_len("test_queue")  # 2nd call -> suppressed (warn-once)
+    for _ in range(2):
+      with pytest.raises(NotImplementedError):
+        backend.queue_len("test_queue")
   warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
   assert len(warnings) == 1
   assert "unsupported" in warnings[0].message
+
+
+def test_unsupported_depth_keeps_scheduler_conservative() -> None:
+  _reset_queue_len_warned()
+  backend = RocketMQBackend(RocketMQSettings())
+  queue = MagicMock(name="BackendQueue")
+  queue.__len__.side_effect = lambda: backend.queue_len("test_queue")
+  queue.pop.return_value = None
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    backpressure_pause_at=1,
+  )
+  scheduler._queue = queue
+
+  assert scheduler.has_pending_requests() is True
+  assert scheduler.next_request() is None
+  queue.pop.assert_called_once_with(timeout=0)
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +1065,7 @@ def test_rocketmq_settings_defaults() -> None:
   assert settings.storage_topic_prefix == "scrapy-storage"
   assert settings.max_message_size == 1024 * 1024
   assert settings.send_timeout == 3000
+  assert settings.invisible_duration == 300
 
 
 def test_rocketmq_settings_custom_values() -> None:
@@ -854,6 +1078,7 @@ def test_rocketmq_settings_custom_values() -> None:
     consumer_group="my-consumer",
     producer_group="my-producer",
     topic_prefix="my-queue",
+    invisible_duration=600,
   )
   assert settings.mode == RocketMQMode.CLUSTER
   assert settings.namesrv_address == "rocketmq-cluster:9876"
@@ -861,6 +1086,22 @@ def test_rocketmq_settings_custom_values() -> None:
   assert settings.access_key.get_secret_value() == "mykey"
   assert settings.secret_key is not None
   assert settings.secret_key.get_secret_value() == "mysecret"
+  assert settings.invisible_duration == 600
+
+
+@pytest.mark.parametrize("duration", [0, 1, 9, 43_201])
+def test_rocketmq_invisible_duration_rejects_outside_broker_range(
+  duration: int,
+) -> None:
+  with pytest.raises(ValueError, match="invisible_duration"):
+    RocketMQSettings(invisible_duration=duration)
+
+
+@pytest.mark.parametrize("duration", [10, 43_200])
+def test_rocketmq_invisible_duration_accepts_broker_boundaries(
+  duration: int,
+) -> None:
+  assert RocketMQSettings(invisible_duration=duration).invisible_duration == duration
 
 
 def test_rocketmq_mode_enum_values() -> None:

@@ -348,6 +348,48 @@ class TestSignalPassthrough:
     assert b.state is BreakerState.CLOSED
 
 
+class TestCountedFailureContract:
+  def test_non_counted_exception_does_not_trip_or_reset_failures(self):
+    from scrapy_extension.exceptions import BackendError, QueueError
+
+    b = CircuitBreaker(
+      "backend",
+      failure_threshold=2,
+      failure_exceptions=(BackendError,),
+    )
+    with pytest.raises(QueueError):
+      b.call(lambda: (_ for _ in ()).throw(QueueError("broker down")))
+    assert b.failure_count == 1
+
+    with pytest.raises(ValueError):
+      b.call(lambda: (_ for _ in ()).throw(ValueError("bad key")))
+
+    assert b.state is BreakerState.CLOSED
+    assert b.failure_count == 1
+
+  def test_non_counted_half_open_exception_releases_probe_slot(self):
+    from scrapy_extension.exceptions import BackendError, QueueError
+
+    clock = FakeClock()
+    b = CircuitBreaker(
+      "backend",
+      failure_threshold=1,
+      reset_timeout=5,
+      time_fn=clock,
+      failure_exceptions=(BackendError,),
+    )
+    with pytest.raises(QueueError):
+      b.call(lambda: (_ for _ in ()).throw(QueueError("broker down")))
+    clock.advance(5)
+
+    with pytest.raises(ValueError):
+      b.call(lambda: (_ for _ in ()).throw(ValueError("bad key")))
+
+    assert b.state is BreakerState.HALF_OPEN
+    assert b.call(_ok) == "ok"
+    assert b.state is BreakerState.CLOSED
+
+
 # ---------------------------------------------------------------------------
 # Thread-safety: concurrent call() under failures must not corrupt state
 # ---------------------------------------------------------------------------

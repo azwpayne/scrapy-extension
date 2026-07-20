@@ -15,7 +15,7 @@ from scrapy_extension.backends.base import (
   StorageBackend,
 )
 from scrapy_extension.backends.connectors import ConnectionManager
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, QueueError
 
 
 # --- SDK stubs for backends whose optional deps are absent in the test env ---
@@ -41,7 +41,17 @@ def _ensure_sdk_stub(module_dotted: str, attrs: dict[str, object] | None = None)
 
 
 _ensure_sdk_stub("pulsar", {"Client": MagicMock(name="PulsarClient")})
-_ensure_sdk_stub("boto3")
+# Later SQS/DynamoDB test modules use ``sys.modules.setdefault`` during
+# collection and patch these canonical attributes. An attribute-less stub here
+# survived into those modules and made their tests order-dependent. Keep the
+# optional-dependency stub, but expose the same surface they patch.
+_ensure_sdk_stub(
+  "boto3",
+  {
+    "client": MagicMock(name="boto3.client"),
+    "resource": MagicMock(name="boto3.resource"),
+  },
+)
 _ensure_sdk_stub("pymemcache")
 _ensure_sdk_stub("pymemcache.client")
 _ensure_sdk_stub("pymemcache.client.base", {"Client": MagicMock(name="MemcachedClient")})
@@ -111,6 +121,110 @@ class TestConnectionManagerCreateBackend:
 
     mock_kafka_backend.assert_called_once()
     assert backend == mock_backend
+
+  def test_create_backend_strips_internal_queue_scope(self, mocker):
+    """Registry-only queue scope must never reach backend settings models."""
+    from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
+
+    settings_cls = mocker.patch("scrapy_extension.settings.KafkaSettings")
+    settings_obj = mocker.MagicMock(name="KafkaSettings")
+    settings_cls.return_value = settings_obj
+    backend_cls = mocker.patch("scrapy_extension.backends.kafka.KafkaBackend")
+    manager = ConnectionManager(
+      BackendType.KAFKA,
+      {
+        "bootstrap_servers": "broker:9092",
+        _CONNECTION_MANAGER_SCOPE_KEY: "queue-a",
+      },
+    )
+
+    manager._create_backend()
+
+    settings_cls.assert_called_once_with(bootstrap_servers="broker:9092")
+    backend_cls.assert_called_once_with(settings_obj)
+
+  def test_create_backend_strips_direct_manager_retry_controls(self, mocker):
+    """Public manager retry controls must not enter strict backend models."""
+    settings_cls = mocker.patch("scrapy_extension.settings.RedisSettings")
+    settings_obj = mocker.MagicMock(name="RedisSettings")
+    settings_cls.return_value = settings_obj
+    backend_cls = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
+    manager = ConnectionManager(
+      BackendType.REDIS,
+      {
+        "host": "redis.internal",
+        "retry_attempts": 0,
+        "retry_delay": 0.25,
+      },
+    )
+
+    manager._create_backend()
+
+    settings_cls.assert_called_once_with(host="redis.internal")
+    backend_cls.assert_called_once_with(settings_obj)
+
+  def test_direct_rabbit_retry_delay_remains_backend_specific(self, mocker):
+    """Rabbit's colliding retry_delay field must not drive manager backoff."""
+    settings_cls = mocker.patch("scrapy_extension.settings.RabbitMQSettings")
+    settings_cls.model_fields = {
+      "username": object(),
+      "password": object(),
+      "retry_delay": object(),
+    }
+    settings_obj = mocker.MagicMock(name="RabbitMQSettings")
+    settings_cls.return_value = settings_obj
+    backend_cls = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
+    manager = ConnectionManager(
+      BackendType.RABBITMQ,
+      {
+        "username": "crawler",
+        "password": "secret",
+        "retry_attempts": 0,
+        "retry_delay": 7,
+      },
+    )
+
+    manager._create_backend()
+
+    settings_cls.assert_called_once_with(
+      username="crawler",
+      password="secret",
+      retry_delay=7,
+    )
+    backend_cls.assert_called_once_with(settings_obj)
+    assert manager._retry_policy() == (0, 1.0)
+
+  def test_direct_rabbit_manager_retry_aliases_are_independent(self, mocker):
+    """Direct callers can configure outer retries despite Rabbit collisions."""
+    settings_cls = mocker.patch("scrapy_extension.settings.RabbitMQSettings")
+    settings_cls.model_fields = {
+      "username": object(),
+      "password": object(),
+      "retry_delay": object(),
+    }
+    settings_obj = mocker.MagicMock(name="RabbitMQSettings")
+    settings_cls.return_value = settings_obj
+    backend_cls = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
+    manager = ConnectionManager(
+      BackendType.RABBITMQ,
+      {
+        "username": "crawler",
+        "password": "secret",
+        "retry_delay": 7,
+        "manager_retry_attempts": 2,
+        "manager_retry_delay": 0.25,
+      },
+    )
+
+    manager._create_backend()
+
+    settings_cls.assert_called_once_with(
+      username="crawler",
+      password="secret",
+      retry_delay=7,
+    )
+    backend_cls.assert_called_once_with(settings_obj)
+    assert manager._retry_policy() == (2, 0.25)
 
   def test_create_backend_rabbitmq(self, mocker):
     """Test _create_backend creates RabbitMQBackend correctly."""
@@ -234,8 +348,8 @@ class TestConnectionManagerRetryLogic:
     with pytest.raises(BackendConnectionError) as exc_info:
       manager.connect()
 
-    assert "Failed to connect after 3 attempts" in str(exc_info.value)
-    assert mock_create_backend.call_count == 3
+    assert "Failed to connect after 4 attempts" in str(exc_info.value)
+    assert mock_create_backend.call_count == 4
 
   def test_connect_retry_success_on_first_attempt(self, mocker):
     """Test connect succeeds on first attempt without retries."""
@@ -1062,7 +1176,7 @@ class TestCircuitBreakerWiringEnabled:
       assert wrapped is not fake_qb
 
       # Trip the breaker via the wrapped hot-path op.
-      with pytest.raises(RuntimeError):
+      with pytest.raises(QueueError):
         wrapped.push("q", b"x")
 
       from scrapy_extension.backends.circuit_breaker import (
@@ -1090,7 +1204,7 @@ class TestCircuitBreakerWiringEnabled:
       wrapped = manager.get_queue_backend()
 
       # Trip via push.
-      with pytest.raises(RuntimeError):
+      with pytest.raises(QueueError):
         wrapped.push("q", b"x")
 
       # Non-network methods still work — they're forwarded, not breaker-wrapped.
@@ -1120,10 +1234,10 @@ class TestCircuitBreakerWiringEnabled:
       manager._backend = fake
       qb = manager.get_queue_backend()
       # Trip via queue.
-      fake.push = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+      fake.push = lambda *a, **k: (_ for _ in ()).throw(QueueError("x"))
       # Re-wrap to capture the failing push (proxy snapshots at construction).
       qb = manager.get_queue_backend()
-      with pytest.raises(RuntimeError):
+      with pytest.raises(QueueError):
         qb.push("q", b"x")
       # The shared breaker is now OPEN.
       assert manager._breaker is not None
@@ -1172,7 +1286,7 @@ class _FakeRedisQueueBackend(QueueBackend):
 
 class _FailingRedisQueueBackend(_FakeRedisQueueBackend):
   def push(self, queue_name, item, priority=0.0) -> None:
-    raise RuntimeError("backend on fire")
+    raise QueueError("backend on fire", queue_name=queue_name, operation="push")
 
 
 class _FakeRedisAllBackend(QueueBackend, SetBackend, StorageBackend):
@@ -1233,4 +1347,3 @@ class _FakeRedisAllBackend(QueueBackend, SetBackend, StorageBackend):
     return None
 
   def clear_storage(self, prefix=None) -> None: ...
-

@@ -8,6 +8,7 @@ import pytest
 from hypothesis import HealthCheck, Verbosity, given, settings
 from hypothesis import strategies as st
 
+from scrapy_extension.dupefilter.filters.base import FilterFull
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 
 
@@ -100,6 +101,24 @@ class TestCuckooMembershipFilterOps:
     with pytest.raises(RuntimeError, match="[Ff]ull"):
       for i in range(1000):
         flt.add(f"x-{i}".encode())
+
+  def test_filter_full_preserves_existing_membership(self) -> None:
+    flt = CuckooMembershipFilter(capacity=8, error_rate=0.01)
+    flt._rng = random.Random(0)  # noqa: SLF001 - deterministic kick path
+    existing = [f"x-{i}".encode() for i in range(flt.capacity)]
+    for item in existing:
+      assert flt.add(item) is True
+    overflow = f"x-{flt.capacity}".encode()
+    assert overflow not in flt
+    count_before = len(flt)
+
+    with pytest.raises(FilterFull):
+      flt.add(overflow)
+
+    assert len(flt) == count_before
+    missing = [item for item in existing if item not in flt]
+    assert not missing, f"failed insertion lost existing items: {missing!r}"
+    assert overflow not in flt
 
   def test_false_positive_rate_bounded(self) -> None:
     """FP rate stays within a generous multiple of target (seeded)."""

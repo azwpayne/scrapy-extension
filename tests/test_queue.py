@@ -1,11 +1,14 @@
 """Tests for BackendQueue component."""
 
+import math
 from typing import Any, cast
 
 import pytest
 from scrapy import Spider
-from scrapy.http import Request
+from scrapy.http import JsonRequest, Request
+from scrapy.utils.request import request_from_dict
 
+from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 
@@ -183,7 +186,28 @@ class TestBackendQueueRequestToDict:
     )
     result = queue._request_to_dict(request)
 
-    assert result["headers"] == {"Content-Type": "application/json"}
+    assert result["headers"] == {"Content-Type": [b"application/json"]}
+
+  def test_multiple_header_values_round_trip_without_being_joined(
+    self, mock_connection_manager
+  ):
+    """Repeated headers are ordered values, not one comma-joined value."""
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+    request = Request(
+      url="https://example.com",
+      headers={"Set-Cookie": [b"a=1", b"b=2"]},
+    )
+
+    request_dict = queue._request_to_dict(request)
+    wire = queue._serializer.serialize(request_dict)
+    recovered = cast("dict[str, Any]", queue._serializer.deserialize(wire))
+    queue._decode_body(recovered)
+    restored = request_from_dict(recovered)
+
+    assert restored.headers.getlist("Set-Cookie") == [b"a=1", b"b=2"]
 
   def test_request_to_dict_with_cookies(self, mock_connection_manager, mock_spider):
     """Test request with cookies."""
@@ -324,43 +348,39 @@ class TestBackendQueueRequestToDict:
 
     assert result["flags"] == ["flag1", "flag2"]
 
-  def test_request_to_dict_with_callback(self, mock_connection_manager, mock_spider):
+  def test_request_to_dict_with_callback(self, mock_connection_manager):
     """Test request with callback function name captured."""
+    spider = _QueueTestSpider()
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
       queue_name="test_queue",
-      spider=mock_spider,
+      spider=spider,
     )
-
-    def my_callback(response):
-      pass
 
     request = Request(
       url="https://example.com",
-      callback=my_callback,
+      callback=spider.parse_item,
     )
     result = queue._request_to_dict(request)
 
-    assert result["callback"] == "my_callback"
+    assert result["callback"] == "parse_item"
 
-  def test_request_to_dict_with_errback(self, mock_connection_manager, mock_spider):
+  def test_request_to_dict_with_errback(self, mock_connection_manager):
     """Test request with errback function name captured."""
+    spider = _QueueTestSpider()
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
       queue_name="test_queue",
-      spider=mock_spider,
+      spider=spider,
     )
-
-    def my_errback(failure):
-      pass
 
     request = Request(
       url="https://example.com",
-      errback=my_errback,
+      errback=spider.handle_failure,
     )
     result = queue._request_to_dict(request)
 
-    assert result["errback"] == "my_errback"
+    assert result["errback"] == "handle_failure"
 
   def test_request_to_dict_empty_body(self, mock_connection_manager, mock_spider):
     """Test request with empty body."""
@@ -398,6 +418,59 @@ class TestBackendQueuePush:
     # Data should be bytes (serialized)
     assert isinstance(call_args[0][1], bytes)
     assert call_args[0][2] == 5.0
+
+  def test_push_rejects_callback_that_cannot_be_restored(
+    self, mock_connection_manager
+  ):
+    """A callback not bound to the queue spider must fail before enqueue."""
+    spider = _QueueTestSpider()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+    )
+
+    def foreign_callback(response):
+      return response
+
+    with pytest.raises(SerializationError, match="instance method"):
+      queue.push(Request("https://example.com", callback=foreign_callback))
+
+    mock_connection_manager.get_queue_backend().push.assert_not_called()
+
+  def test_push_pop_preserves_request_subclass(
+    self, mock_connection_manager, mocker
+  ):
+    """The serialized envelope retains Scrapy's request class discriminator."""
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    request = JsonRequest("https://example.com", data={"x": 1})
+
+    queue.push(request)
+    strategy.pop_with_ack.return_value = (strategy.push.call_args.args[1], None)
+
+    restored = queue.pop()
+    assert isinstance(restored, JsonRequest)
+
+  def test_push_rejects_unallowlisted_request_subclass_before_enqueue(
+    self, mock_connection_manager
+  ):
+    class CustomRequest(Request):
+      pass
+
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+
+    with pytest.raises(SerializationError, match="request class"):
+      queue.push(CustomRequest("https://example.com"))
+
+    mock_connection_manager.get_queue_backend().push.assert_not_called()
 
   def test_push_with_default_priority(self, mock_connection_manager, mock_spider):
     """Test push uses default priority of 0.0."""
@@ -473,6 +546,16 @@ class TestBackendQueuePush:
       for w in caught
     ), f"Expected a legacy-body DeprecationWarning, got: {caught}"
 
+  def test_versioned_body_rejects_corrupt_base64_without_legacy_fallback(self):
+    """A damaged current-format body must not be mistaken for legacy UTF-8."""
+    request_dict = {
+      "body": "YW!j",
+      "_scrapy_extension_body_codec": "base64-v1",
+    }
+
+    with pytest.raises(SerializationError, match="Invalid base64 body"):
+      BackendQueue._decode_body(request_dict)
+
   def test_decode_body_structural_corruption_still_raises(self):
     """D1: a lone surrogate (neither base64 nor UTF-8-encodable) still raises.
 
@@ -520,6 +603,164 @@ class TestBackendQueuePush:
       queue.push(request)
 
     assert exc_info.value is backend_error
+
+  def test_push_replacement_acks_consumed_delivery_token_after_enqueue(
+    self, mock_connection_manager, mock_spider, mocker
+  ):
+    """A retry/redirect replacement must terminate its original MQ delivery."""
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      queue_strategy=strategy,
+    )
+    request = Request(
+      url="https://example.com/retry",
+      meta={"_backend_ack_token": "old-token", "keep": True},
+    )
+
+    queue.push(request)
+
+    strategy.push.assert_called_once()
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
+
+  def test_push_failure_keeps_original_delivery_unacked(
+    self, mock_connection_manager, mock_spider, mocker
+  ):
+    """The original delivery remains recoverable until replacement enqueue commits."""
+    strategy = mocker.MagicMock()
+    strategy.push.side_effect = QueueError("push failed")
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      queue_strategy=strategy,
+    )
+    request = Request(
+      url="https://example.com/retry",
+      meta={"_backend_ack_token": "old-token"},
+    )
+
+    with pytest.raises(QueueError, match="push failed"):
+      queue.push(request)
+
+    mock_connection_manager.get_queue_backend().ack.assert_not_called()
+    assert request.meta["_backend_ack_token"] == "old-token"
+
+  @pytest.mark.parametrize(
+    "delay",
+    ["not-a-number", -1, float("nan"), float("inf"), float("-inf")],
+  )
+  def test_push_rejects_invalid_delay_without_mutating_meta(
+    self, mock_connection_manager, mocker, delay
+  ):
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    request = Request(
+      "https://example.com",
+      meta={"delay": delay, "source": "feed-a"},
+    )
+
+    with pytest.raises(QueueError, match="delay"):
+      queue.push(request)
+
+    if isinstance(delay, float) and math.isnan(delay):
+      assert math.isnan(request.meta["delay"])
+    else:
+      assert request.meta["delay"] == delay
+    assert request.meta["source"] == "feed-a"
+    strategy.push.assert_not_called()
+
+  def test_push_failure_preserves_routing_meta_for_retry(
+    self, mock_connection_manager, mocker
+  ):
+    strategy = mocker.MagicMock()
+    strategy.push.side_effect = QueueError("backend down")
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    request = Request(
+      "https://example.com",
+      meta={"delay": 5.0, "source": "feed-a"},
+    )
+
+    with pytest.raises(QueueError, match="backend down"):
+      queue.push(request)
+
+    assert request.meta["delay"] == 5.0
+    assert request.meta["source"] == "feed-a"
+
+  def test_invalid_replacement_serialization_terminates_old_delivery(
+    self, mock_connection_manager
+  ):
+    request = Request(
+      "https://example.com",
+      meta={"_backend_ack_token": "old-token", "bad": object()},
+    )
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+
+    with pytest.raises(SerializationError):
+      queue.push(request)
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
+
+  def test_invalid_replacement_delay_terminates_old_delivery(
+    self, mock_connection_manager
+  ):
+    request = Request(
+      "https://example.com",
+      meta={"_backend_ack_token": "old-token", "delay": "invalid"},
+    )
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+
+    with pytest.raises(QueueError, match="delay"):
+      queue.push(request)
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
+
+  def test_oversize_replacement_terminates_old_delivery(
+    self, mock_connection_manager
+  ):
+    request = Request(
+      "https://example.com",
+      body=b"x" * 256,
+      meta={"_backend_ack_token": "old-token"},
+    )
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      max_item_bytes=64,
+    )
+
+    with pytest.raises(SerializationError, match="exceeds max_item_bytes"):
+      queue.push(request)
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
 
   # ----- R14-F HIGH: retry + delay/source storm prevention -----
 
@@ -622,6 +863,31 @@ class TestBackendQueuePush:
       "retry re-push forwarded delay again — retry+delay storm not prevented"
     )
 
+  def test_push_pop_round_trip_does_not_restore_consumed_routing_meta(
+    self, mock_connection_manager, mock_spider, mocker
+  ):
+    """Consumed routing controls must not survive in the persisted request."""
+    mock_strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      queue_strategy=mock_strategy,
+    )
+    request = Request(
+      url="https://example.com",
+      meta={"delay": 10.0, "source": "feed-A", "keep": "value"},
+    )
+
+    queue.push(request)
+    persisted = mock_strategy.push.call_args.args[1]
+    mock_strategy.pop_with_ack.return_value = (persisted, None)
+
+    restored = queue.pop()
+
+    assert restored is not None
+    assert restored.meta == {"keep": "value"}
+
 
 class TestBackendQueuePop:
   """Test pop method."""
@@ -649,6 +915,31 @@ class TestBackendQueuePop:
     assert result is not None
     assert result.callback == spider.parse_item
     assert result.errback == spider.handle_failure
+
+  def test_pop_rejects_callable_attribute_that_is_not_bound_spider_method(
+    self, mock_connection_manager, mocker
+  ):
+    spider = _QueueTestSpider()
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    payload = queue._request_to_dict(Request("https://example.com"))
+    payload["callback"] = "__class__"
+    strategy.pop_with_ack.return_value = (
+      JSONSerializer().serialize(payload),
+      "token-1",
+    )
+
+    with pytest.raises(SerializationError, match="instance method"):
+      queue.pop()
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
 
   def test_pop_roundtrips_binary_body_without_corruption(self, mock_connection_manager):
     """Test pop preserves arbitrary binary request bodies."""
@@ -710,6 +1001,23 @@ class TestBackendQueuePop:
 
     assert result is None
 
+  def test_pop_terminates_empty_payload_with_delivery_token(
+    self, mock_connection_manager, mocker
+  ):
+    """Kafka tombstones and equivalent empty deliveries cannot pin in-flight state."""
+    strategy = mocker.MagicMock()
+    strategy.pop_with_ack.return_value = (None, "tombstone-token")
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+
+    assert queue.pop() is None
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="tombstone-token"
+    )
+
   def test_pop_deserializes_and_returns_request(self, mock_connection_manager, mock_spider):
     """Test pop deserializes data and returns Request object."""
     mock_connection_manager.get_queue_backend().pop.return_value = (
@@ -761,6 +1069,157 @@ class TestBackendQueuePop:
     assert exc_info.value.serializer == "json"
     assert exc_info.value.data == b"invalid json"
 
+  def test_pop_acks_and_drops_token_when_deserialization_fails(
+    self, mock_connection_manager, mock_spider, mocker
+  ):
+    """An unrecoverable MQ payload is terminated instead of poison-looped."""
+    strategy = mocker.MagicMock()
+    strategy.pop_with_ack.return_value = (b"invalid json", "token-1")
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      queue_strategy=strategy,
+    )
+
+    with pytest.raises(SerializationError):
+      queue.pop()
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
+    mock_connection_manager.get_queue_backend().nack.assert_not_called()
+
+  def test_pop_records_poison_drop_stat(
+    self, mock_connection_manager, mocker
+  ):
+    strategy = mocker.MagicMock()
+    strategy.pop_with_ack.return_value = (b"invalid json", "token-1")
+    spider = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+
+    with pytest.raises(SerializationError):
+      queue.pop()
+
+    spider.crawler.stats.inc_value.assert_any_call(
+      "scheduler/queue/poison_dropped"
+    )
+
+  def test_pop_rejects_oversize_backend_payload_before_deserializing(
+    self, mock_connection_manager, mocker
+  ):
+    """The receive path enforces the same byte cap as enqueue."""
+    strategy = mocker.MagicMock()
+    strategy.pop_with_ack.return_value = (b"{" + b"x" * 128, "token-1")
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+      max_item_bytes=64,
+    )
+    deserialize = mocker.spy(queue._serializer, "deserialize")
+
+    with pytest.raises(SerializationError, match="exceeds max_item_bytes"):
+      queue.pop()
+
+    deserialize.assert_not_called()
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
+
+  @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+      ("dont_filter", "false"),
+      ("flags", "admin"),
+      ("method", 123),
+      ("meta", [["depth", 1]]),
+    ],
+  )
+  def test_pop_rejects_wrong_typed_request_fields(
+    self, mock_connection_manager, mocker, field, value
+  ):
+    strategy = mocker.MagicMock()
+    payload = {
+      "url": "https://example.com",
+      "callback": None,
+      "errback": None,
+      "method": "GET",
+      "headers": {},
+      "body": None,
+      "cookies": {},
+      "meta": {},
+      "cb_kwargs": {},
+      "encoding": "utf-8",
+      "priority": 0,
+      "dont_filter": False,
+      "flags": [],
+    }
+    payload[field] = value
+    strategy.pop_with_ack.return_value = (
+      JSONSerializer().serialize(payload),
+      "token-1",
+    )
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+
+    with pytest.raises(SerializationError, match=field):
+      queue.pop()
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
+
+  def test_pop_rejects_forged_request_class_without_dynamic_loading(
+    self, mock_connection_manager, mocker
+  ):
+    strategy = mocker.MagicMock()
+    payload = {
+      "url": "https://example.com",
+      "callback": None,
+      "errback": None,
+      "method": "GET",
+      "headers": {},
+      "body": None,
+      "cookies": {},
+      "meta": {},
+      "cb_kwargs": {},
+      "encoding": "utf-8",
+      "priority": 0,
+      "dont_filter": False,
+      "flags": [],
+      "_class": "builtins.dict",
+    }
+    strategy.pop_with_ack.return_value = (
+      JSONSerializer().serialize(payload),
+      "token-1",
+    )
+    dynamic_loader = mocker.patch(
+      "scrapy.utils.request.load_object",
+      side_effect=AssertionError("untrusted dynamic load"),
+    )
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+
+    with pytest.raises(SerializationError, match="request class"):
+      queue.pop()
+
+    dynamic_loader.assert_not_called()
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
+
 
 class TestBackendQueueLen:
   """Test __len__ method."""
@@ -798,6 +1257,25 @@ class TestBackendQueueClear:
     mock_connection_manager.get_queue_backend().clear_queue.assert_called_once_with(
       "test_queue"
     )
+
+  def test_clear_invalidates_cached_nonzero_depth(
+    self, mock_connection_manager, mock_spider
+  ):
+    backend = mock_connection_manager.get_queue_backend()
+    backend.queue_len.return_value = 7
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+      depth_sample_every=100,
+    )
+    assert len(queue) == 7
+
+    backend.queue_len.return_value = 0
+    queue.clear()
+
+    assert len(queue) == 0
+    assert backend.queue_len.call_count == 2
 
 
 class TestBackendQueueMaxItemBytes:

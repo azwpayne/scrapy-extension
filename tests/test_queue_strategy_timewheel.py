@@ -18,12 +18,17 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import threading
 from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
 
-from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
+from scrapy_extension.queue.strategies.time_wheel import (
+  MAX_WHEEL_SIZE,
+  TimeWheelQueueStrategy,
+)
 
 
 def _strategy(
@@ -32,6 +37,7 @@ def _strategy(
   ticks_per_second: float = 1.0,
   clock_value: float = 100.0,
   default_delay: float = 0.0,
+  wall_clock_value: float = 1_000.0,
 ) -> tuple[TimeWheelQueueStrategy, MagicMock, list]:
   """Build a strategy with a mocked CM + frozen clock."""
   clock_state = [clock_value]
@@ -45,6 +51,7 @@ def _strategy(
     ticks_per_second=ticks_per_second,
     default_delay=default_delay,
     clock=lambda: clock_state[0],
+    wall_clock=lambda: wall_clock_value,
   )
   return s, qb, clock_state
 
@@ -87,11 +94,12 @@ def test_push_long_delay_goes_to_overflow_heap():
   assert s._overflow[0][2] == b"long"
 
 
-def test_push_negative_delay_clamped_to_zero_live():
-  """Negative delay is treated as 0 (live now)."""
+def test_push_negative_delay_is_rejected():
+  """Direct strategy calls follow BackendQueue's non-negative contract."""
   s, qb, _ = _strategy()
-  s.push("q", b"x", delay=-5.0)
-  qb.push.assert_called_once_with("q", b"x", 0.0)
+  with pytest.raises(ValueError, match="delay must be >= 0"):
+    s.push("q", b"x", delay=-5.0)
+  qb.push.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +129,39 @@ def test_pop_does_not_drain_future_held_items():
   qb.push.assert_not_called()  # nothing drained
 
 
+def test_sub_tick_delay_releases_on_next_tick_not_after_full_rotation():
+  """A fractional ready time must be assigned to the next drainable tick."""
+  s, qb, clock = _strategy(
+    wheel_size=60,
+    ticks_per_second=1.0,
+    clock_value=100.2,
+  )
+  s.push("q", b"soon", delay=0.2)  # ready_at=100.4
+
+  clock[0] = 100.5
+  s.pop("q")
+  qb.push.assert_not_called()
+
+  clock[0] = 101.0
+  s.pop("q")
+  qb.push.assert_called_once_with("q", b"soon", 0.0)
+
+
+def test_negative_monotonic_epoch_uses_floor_for_tick_boundary():
+  """Monotonic epochs are arbitrary; negative fractional ticks stay valid."""
+  s, qb, clock = _strategy(
+    wheel_size=60,
+    ticks_per_second=1.0,
+    clock_value=-0.2,
+  )
+  s.push("q", b"soon", delay=0.1)  # ready_at=-0.1, next tick is 0
+
+  clock[0] = 0.0
+  s.pop("q")
+
+  qb.push.assert_called_once_with("q", b"soon", 0.0)
+
+
 def test_pop_drains_overflow_when_due():
   """Long-delay overflow items drain when ready_at <= now."""
   s, qb, clock = _strategy(wheel_size=60, clock_value=100.0)
@@ -128,6 +169,190 @@ def test_pop_drains_overflow_when_due():
   clock[0] = 225.0  # past ready
   s.pop("q")
   qb.push.assert_called_once_with("q", b"long", 0.0)
+
+
+def test_failed_wheel_drain_keeps_due_item_for_retry():
+  """A transient live-queue push failure must not discard a wheel item."""
+  s, qb, clock = _strategy(wheel_size=60, clock_value=100.0)
+  s.push("q", b"retry-me", delay=1.0)
+  clock[0] = 101.0
+  qb.push.side_effect = [RuntimeError("temporary"), None]
+
+  with pytest.raises(RuntimeError, match="temporary"):
+    s.pop("q")
+  assert sum(len(slot) for slot in s._wheel) == 1
+
+  s.pop("q")
+  assert sum(len(slot) for slot in s._wheel) == 0
+  assert qb.push.call_count == 2
+
+
+def test_failed_overflow_drain_keeps_due_item_for_retry():
+  """Overflow entries follow the same commit-after-live-push rule."""
+  s, qb, clock = _strategy(wheel_size=10, clock_value=0.0)
+  s.push("q", b"retry-overflow", delay=20.0)
+  clock[0] = 20.0
+  qb.push.side_effect = [RuntimeError("temporary"), None]
+
+  with pytest.raises(RuntimeError, match="temporary"):
+    s.pop("q")
+  assert len(s._overflow) == 1
+
+  s.pop("q")
+  assert len(s._overflow) == 0
+  assert qb.push.call_count == 2
+
+
+def test_concurrent_pops_submit_due_overflow_item_exactly_once():
+  """Two drainers must not both publish the same uncommitted heap head."""
+  s, qb, clock = _strategy(wheel_size=10, clock_value=0.0)
+  s.push("q", b"once", delay=20.0)
+  clock[0] = 20.0
+  first_push_entered = threading.Event()
+  release_first_push = threading.Event()
+  second_push_entered = threading.Event()
+  call_lock = threading.Lock()
+  push_calls = 0
+  errors: list[BaseException] = []
+
+  def blocking_push(*_args):
+    nonlocal push_calls
+    with call_lock:
+      push_calls += 1
+      call_number = push_calls
+    if call_number == 1:
+      first_push_entered.set()
+      if not release_first_push.wait(timeout=2.0):
+        raise AssertionError("first backend push was not released")
+    else:
+      second_push_entered.set()
+
+  qb.push.side_effect = blocking_push
+
+  def pop() -> None:
+    try:
+      s.pop("q")
+    except BaseException as exc:
+      errors.append(exc)
+
+  first = threading.Thread(target=pop, daemon=True)
+  second = threading.Thread(target=pop, daemon=True)
+  first.start()
+  assert first_push_entered.wait(timeout=2.0)
+  second.start()
+  second_push_entered.wait(timeout=0.25)
+  release_first_push.set()
+  first.join(timeout=2.0)
+  second.join(timeout=2.0)
+
+  assert not first.is_alive()
+  assert not second.is_alive()
+  assert errors == []
+  assert push_calls == 1
+  assert s._overflow == []
+
+
+def test_concurrent_push_cannot_be_cleared_between_slot_copy_and_clear():
+  """A push racing a drain must remain held instead of being silently lost."""
+  s, qb, clock = _strategy(wheel_size=4, clock_value=0.0)
+  s.push("q", b"due", delay=1.0)
+  clock[0] = 1.0
+  snapshot_captured = threading.Event()
+  release_snapshot = threading.Event()
+  append_completed = threading.Event()
+  errors: list[BaseException] = []
+
+  class PausingDeque(deque):
+    def __iter__(self):
+      snapshot = tuple(super().__iter__())
+      snapshot_captured.set()
+      if not release_snapshot.wait(timeout=2.0):
+        raise AssertionError("slot snapshot was not released")
+      return iter(snapshot)
+
+    def append(self, value):
+      super().append(value)
+      append_completed.set()
+
+  s._wheel[1] = PausingDeque(s._wheel[1])
+
+  def pop() -> None:
+    try:
+      s.pop("q")
+    except BaseException as exc:
+      errors.append(exc)
+
+  def push() -> None:
+    try:
+      # ready_at=5, the same physical slot currently being drained.
+      s.push("q", b"future", delay=4.0)
+    except BaseException as exc:
+      errors.append(exc)
+
+  pop_thread = threading.Thread(target=pop, daemon=True)
+  push_thread = threading.Thread(target=push, daemon=True)
+  pop_thread.start()
+  assert snapshot_captured.wait(timeout=2.0)
+  push_thread.start()
+  append_completed.wait(timeout=0.25)
+  release_snapshot.set()
+  pop_thread.join(timeout=2.0)
+  push_thread.join(timeout=2.0)
+
+  assert not pop_thread.is_alive()
+  assert not push_thread.is_alive()
+  assert errors == []
+  held = [entry for slot in s._wheel for entry in slot]
+  assert held == [(5.0, b"future", 0.0)]
+  qb.push.assert_called_once_with("q", b"due", 0.0)
+
+
+def test_snapshot_cannot_duplicate_overflow_item_during_live_publish():
+  """Snapshot must observe either side of a drain commit, never both."""
+  s, qb, clock = _strategy(wheel_size=10, clock_value=0.0)
+  s.push("q", b"moving", delay=20.0)
+  clock[0] = 20.0
+  publish_entered = threading.Event()
+  release_publish = threading.Event()
+  snapshot_done = threading.Event()
+  snapshots: list[bytes | None] = []
+  errors: list[Exception] = []
+
+  def blocking_push(*_args):
+    publish_entered.set()
+    if not release_publish.wait(timeout=2.0):
+      raise AssertionError("backend publish was not released")
+
+  qb.push.side_effect = blocking_push
+
+  def pop() -> None:
+    try:
+      s.pop("q")
+    except Exception as exc:
+      errors.append(exc)
+
+  def snapshot() -> None:
+    try:
+      snapshots.append(s.snapshot())
+    except Exception as exc:
+      errors.append(exc)
+    finally:
+      snapshot_done.set()
+
+  pop_thread = threading.Thread(target=pop, daemon=True)
+  snapshot_thread = threading.Thread(target=snapshot, daemon=True)
+  pop_thread.start()
+  assert publish_entered.wait(timeout=2.0)
+  snapshot_thread.start()
+  assert not snapshot_done.wait(timeout=0.25)
+  release_publish.set()
+  pop_thread.join(timeout=2.0)
+  snapshot_thread.join(timeout=2.0)
+
+  assert not pop_thread.is_alive()
+  assert not snapshot_thread.is_alive()
+  assert errors == []
+  assert snapshots == [None]
 
 
 def test_pop_returns_live_item_after_drain():
@@ -208,9 +433,9 @@ def test_wrap_around_drains_correct_slot():
 
 def test_queue_len_sums_live_wheel_overflow():
   s, qb, clock = _strategy(wheel_size=60, clock_value=100.0)
-  s.push("q", b"a", delay=10.0)   # wheel
+  s.push("q", b"a", delay=10.0)  # wheel
   s.push("q", b"b", delay=100.0)  # overflow
-  qb.queue_len.return_value = 5   # live
+  qb.queue_len.return_value = 5  # live
   total = s.queue_len("q")
   assert total == 5 + 1 + 1
 
@@ -242,12 +467,26 @@ def test_snapshot_serializes_wheel_and_overflow():
   blob = s.snapshot()
   assert blob is not None
   data = json.loads(blob.decode())
-  assert data["version"] == 1
+  assert data["version"] == 2
   assert data["strategy"] == "time_wheel"
+  assert data["snapshot_wall_time"] == 1_000.0
   assert len(data["slots_flat"]) == 1  # one wheel item
   assert base64.b64decode(data["slots_flat"][0]["item_b64"]) == b"wheel-item"
   assert len(data["overflow"]) == 1
   assert base64.b64decode(data["overflow"][0]["item_b64"]) == b"overflow-item"
+
+
+def test_snapshot_restore_preserves_overflow_heap_stable_order():
+  source, _, _ = _strategy(wheel_size=10, clock_value=0.0)
+  for index, delay in enumerate((20.0, 21.0, 21.0, 20.0)):
+    source.push("q", str(index).encode(), delay=delay)
+  expected = [entry[2] for entry in sorted(source._overflow)]
+
+  restored, _, _ = _strategy(wheel_size=10, clock_value=0.0)
+  restored.restore(source.snapshot())
+  actual = [entry[2] for entry in sorted(restored._overflow)]
+
+  assert actual == expected
 
 
 def test_restore_round_trip_rebuilds_state():
@@ -257,7 +496,7 @@ def test_restore_round_trip_rebuilds_state():
   route to overflow so they drain on the next pop.
   """
   s1, _, clock = _strategy(wheel_size=60, clock_value=100.0)
-  s1.push("q", b"w", delay=5.0, priority=2.0)   # ready_at=105 (future at restore)
+  s1.push("q", b"w", delay=5.0, priority=2.0)  # ready_at=105 (future at restore)
   s1.push("q", b"o", delay=100.0, priority=1.0)  # ready_at=200 (overflow)
   blob = s1.snapshot()
 
@@ -267,6 +506,107 @@ def test_restore_round_trip_rebuilds_state():
   # at slot 105 % 60 = 45; the overflow item (ready_at=200) stays in overflow.
   assert sum(len(slot) for slot in s2._wheel) == 1
   assert len(s2._overflow) == 1
+
+
+def test_restore_atomically_replaces_existing_state_and_is_idempotent():
+  source, _, _ = _strategy(clock_value=100.0)
+  source.push("q", b"snapshot-item", delay=2.0)
+  blob = source.snapshot()
+
+  restored, _, _ = _strategy(clock_value=100.0)
+  restored.push("q", b"stale-local-item", delay=1.0)
+  restored.restore(blob)
+  restored.restore(blob)
+
+  held = [entry for slot in restored._wheel for entry in slot]
+  assert held == [(102.0, b"snapshot-item", 0.0)]
+  assert restored._overflow == []
+
+
+def test_restore_rebases_deadlines_across_monotonic_epoch_and_downtime():
+  source, _, _ = _strategy(
+    wheel_size=60,
+    clock_value=5_000.0,
+    wall_clock_value=10_000.0,
+  )
+  source.push("q", b"w", delay=20.0)
+  blob = source.snapshot()
+
+  clock = [2.0]
+  manager = MagicMock()
+  backend = manager.get_queue_backend.return_value
+  restored = TimeWheelQueueStrategy(
+    manager,
+    wheel_size=60,
+    clock=lambda: clock[0],
+    wall_clock=lambda: 10_005.0,
+  )
+  restored.restore(blob)
+
+  entries = [entry for slot in restored._wheel for entry in slot]
+  assert entries == [(17.0, b"w", 0.0)]
+  clock[0] = 16.9
+  restored.pop("q")
+  backend.push.assert_not_called()
+  clock[0] = 17.0
+  restored.pop("q")
+  backend.push.assert_called_once_with("q", b"w", 0.0)
+
+
+def test_restore_v1_deadline_is_due_instead_of_cross_boot_stall():
+  blob = json.dumps(
+    {
+      "version": 1,
+      "strategy": "time_wheel",
+      "slots_flat": [
+        {
+          "ready_at": 999_999.0,
+          "item_b64": base64.b64encode(b"legacy").decode(),
+          "priority": 0.0,
+        }
+      ],
+      "overflow": [],
+    }
+  ).encode()
+  restored, _, clock = _strategy(clock_value=3.0)
+
+  restored.restore(blob)
+
+  assert restored._overflow[0][0] == clock[0]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_restore_expired_items_preserve_original_deadline_order(version):
+  deadline_field = "ready_at" if version == 1 else "remaining"
+  data = {
+    "version": version,
+    "strategy": "time_wheel",
+    "slots_flat": [
+      {
+        deadline_field: 10.0 if version == 2 else 200.0,
+        "item_b64": base64.b64encode(b"later").decode(),
+        "priority": 0.0,
+      }
+    ],
+    "overflow": [
+      {
+        deadline_field: 5.0 if version == 2 else 100.0,
+        "item_b64": base64.b64encode(b"earlier").decode(),
+        "priority": 0.0,
+      }
+    ],
+  }
+  if version == 2:
+    data["snapshot_wall_time"] = 1_000.0
+  restored, qb, _ = _strategy(
+    clock_value=50.0,
+    wall_clock_value=1_020.0,
+  )
+
+  restored.restore(json.dumps(data).encode())
+  restored.pop("q")
+
+  assert [call.args[1] for call in qb.push.call_args_list] == [b"earlier", b"later"]
 
 
 def test_restore_none_is_noop():
@@ -290,6 +630,24 @@ def test_restore_unknown_format_skipped():
   assert len(s._overflow) == 0
 
 
+@pytest.mark.parametrize("field", ["slots_flat", "overflow"])
+def test_restore_non_list_collection_is_skipped_without_crashing(field):
+  s, _, _ = _strategy()
+  data = {
+    "version": 2,
+    "strategy": "time_wheel",
+    "snapshot_wall_time": 1_000.0,
+    "slots_flat": [],
+    "overflow": [],
+  }
+  data[field] = 42
+
+  s.restore(json.dumps(data).encode())
+
+  assert all(not slot for slot in s._wheel)
+  assert s._overflow == []
+
+
 # ---------------------------------------------------------------------------
 # config validation
 # ---------------------------------------------------------------------------
@@ -299,6 +657,17 @@ def test_wheel_size_zero_raises():
   cm = MagicMock()
   with pytest.raises(ValueError, match="wheel_size must be >= 1"):
     TimeWheelQueueStrategy(cm, wheel_size=0)
+
+
+@pytest.mark.parametrize("wheel_size", [True, 1.5])
+def test_wheel_size_requires_integer(wheel_size):
+  with pytest.raises(ValueError, match="wheel_size must be >= 1"):
+    TimeWheelQueueStrategy(MagicMock(), wheel_size=wheel_size)
+
+
+def test_wheel_size_rejects_eager_allocation_above_guard():
+  with pytest.raises(ValueError, match=f"wheel_size must be <= {MAX_WHEEL_SIZE}"):
+    TimeWheelQueueStrategy(MagicMock(), wheel_size=MAX_WHEEL_SIZE + 1)
 
 
 def test_ticks_per_second_zero_raises():
@@ -311,3 +680,69 @@ def test_negative_default_delay_raises():
   cm = MagicMock()
   with pytest.raises(ValueError, match="default_delay must be >= 0"):
     TimeWheelQueueStrategy(cm, default_delay=-1.0)
+
+
+@pytest.mark.parametrize("ticks_per_second", [math.nan, math.inf])
+def test_non_finite_ticks_per_second_raises(ticks_per_second):
+  with pytest.raises(ValueError, match="ticks_per_second must be finite"):
+    TimeWheelQueueStrategy(MagicMock(), ticks_per_second=ticks_per_second)
+
+
+@pytest.mark.parametrize(
+  ("field", "kwargs"),
+  [
+    ("wheel_size", {"wheel_size": True}),
+    ("ticks_per_second", {"ticks_per_second": True}),
+    ("default_delay", {"default_delay": True}),
+  ],
+)
+def test_bool_constructor_numbers_are_rejected(field, kwargs):
+  with pytest.raises(ValueError, match=field):
+    TimeWheelQueueStrategy(MagicMock(), **kwargs)
+
+
+def test_ticks_per_second_rejects_infinite_wheel_duration():
+  with pytest.raises(ValueError, match="wheel duration must be finite"):
+    TimeWheelQueueStrategy(MagicMock(), ticks_per_second=5e-324)
+
+
+@pytest.mark.parametrize("default_delay", [math.nan, math.inf])
+def test_non_finite_default_delay_raises(default_delay):
+  with pytest.raises(ValueError, match="default_delay must be finite"):
+    TimeWheelQueueStrategy(MagicMock(), default_delay=default_delay)
+
+
+@pytest.mark.parametrize("delay", [True, math.nan, math.inf])
+def test_push_rejects_non_finite_delay(delay):
+  s, qb, _ = _strategy()
+
+  with pytest.raises(ValueError, match="delay must be finite"):
+    s.push("q", b"never", delay=delay)
+
+  qb.push.assert_not_called()
+  assert all(not slot for slot in s._wheel)
+  assert s._overflow == []
+
+
+@pytest.mark.parametrize("priority", [math.nan, math.inf, -math.inf])
+def test_push_rejects_non_finite_priority(priority):
+  s, qb, _ = _strategy()
+
+  with pytest.raises(ValueError, match="priority must be finite"):
+    s.push("q", b"blocked", priority=priority, delay=1.0)
+
+  qb.push.assert_not_called()
+  assert all(not slot for slot in s._wheel)
+  assert s._overflow == []
+
+
+def test_non_finite_runtime_clock_preserves_held_state():
+  s, qb, clock = _strategy(clock_value=0.0)
+  s.push("q", b"held", delay=1.0)
+  clock[0] = math.inf
+
+  with pytest.raises(ValueError, match="clock must return a finite value"):
+    s.pop("q")
+
+  qb.push.assert_not_called()
+  assert sum(len(slot) for slot in s._wheel) == 1

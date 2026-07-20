@@ -30,6 +30,11 @@ class StorageStrategy(ABC):
   pipeline retains ownership of the backend lifecycle.
   """
 
+  #: True when the strategy emits ``Monitor.on_store`` at its actual durable
+  #: write boundary. Buffering strategies override this so the pipeline does
+  #: not report volatile acceptance as persistence.
+  emits_store_events = False
+
   @abstractmethod
   def store(
     self,

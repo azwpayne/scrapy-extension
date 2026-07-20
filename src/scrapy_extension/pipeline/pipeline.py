@@ -6,15 +6,19 @@ This module provides a Scrapy item pipeline using backend storage interfaces.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from scrapy_extension.backends.base import JSONSerializer
+from itemadapter import ItemAdapter, is_item
+
+from scrapy_extension.backends.base import JSONSerializer, _validate_key_name
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   BackendError,
+  ConfigurationError,
   SerializationError,
 )
 from scrapy_extension.monitor.base import Monitor, NullMonitor
@@ -25,6 +29,7 @@ from scrapy_extension.storage.strategies import (
 from scrapy_extension.storage.strategies.passthrough import (
   PassthroughStorageStrategy,
 )
+from scrapy_extension.utils._config import parse_float_setting, parse_int_setting
 
 if TYPE_CHECKING:
   from scrapy import Item, Spider
@@ -109,6 +114,7 @@ class BackendPipeline:
             ``pipeline/store_count`` stat is default-on. Emitted hooks are
             additive — existing component stats untouched.
     """
+    _validate_key_name(key_prefix, "key_prefix")
     self.connection_manager = connection_manager
     self.key_prefix = key_prefix
     self.ttl = ttl
@@ -120,6 +126,14 @@ class BackendPipeline:
     self._consecutive_storage_errors = 0
     self._storage_supported: bool | None = None
     self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
+    self._manager_released = False
+    self._lifecycle_lock = threading.Lock()
+    self._opened = False
+    self._opened_spider: Spider | None = None
+    self._closed = False
+    set_monitor = getattr(self.storage_strategy, "set_monitor", None)
+    if callable(set_monitor):
+      set_monitor(self._monitor)
 
   @cached_property
   def _serializer(self) -> JSONSerializer:
@@ -158,35 +172,105 @@ class BackendPipeline:
       backend_type=backend_type,
       settings=backend_settings,
     )
-    storage_strategy_name = settings.get("SCRAPY_STORAGE_STRATEGY", "passthrough")
-    # Risk 2: thread the crash-before-flush loss-window cap through to the
-    # batched strategy (None = disabled = pre-Risk-2 behavior; passthrough
-    # ignores it).
-    raw_age = settings.get("SCRAPY_STORAGE_BUFFER_MAX_AGE_S")
-    buffer_max_age_s = float(raw_age) if raw_age is not None else None
-    storage_strategy = create_storage_strategy(
-      storage_strategy_name, max_buffer_age_s=buffer_max_age_s
-    )
-    raw_max_errors = settings.get("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS")
-    # Risk 5: default to a sane ceiling (DEFAULT_MAX_STORAGE_ERRORS) when unset
-    # so a persistent outage surfaces instead of being silently swallowed. An
-    # explicit int from settings still wins; ``None`` (infinite swallow) is
-    # reachable only via the constructor kwarg, not via the env var.
-    max_storage_errors = (
-      int(raw_max_errors)
-      if raw_max_errors is not None
-      else DEFAULT_MAX_STORAGE_ERRORS
-    )
-    return cls(
-      connection_manager=manager,
-      key_prefix=settings.get("SCRAPY_PIPELINE_KEY_PREFIX", "items"),
-      ttl=settings.getint("SCRAPY_PIPELINE_TTL", 0) or None,
-      max_item_bytes=settings.getint(
-        "SCRAPY_PIPELINE_MAX_ITEM_BYTES", DEFAULT_PIPELINE_MAX_ITEM_BYTES
-      ),
-      storage_strategy=storage_strategy,
-      max_storage_errors=max_storage_errors,
-    )
+    try:
+      storage_strategy_name = settings.get(
+        "SCRAPY_STORAGE_STRATEGY", "passthrough"
+      )
+      # Risk 2: thread the crash-before-flush loss-window cap through to the
+      # batched strategy (None = disabled = pre-Risk-2 behavior; passthrough
+      # ignores it).
+      raw_age = settings.get("SCRAPY_STORAGE_BUFFER_MAX_AGE_S")
+      buffer_max_age_s = (
+        parse_float_setting(
+          raw_age,
+          "SCRAPY_STORAGE_BUFFER_MAX_AGE_S",
+          minimum=0.0,
+          minimum_exclusive=True,
+        )
+        if raw_age is not None
+        else None
+      )
+      try:
+        storage_strategy = create_storage_strategy(
+          storage_strategy_name,
+          max_buffer_age_s=buffer_max_age_s,
+        )
+      except ConfigurationError as exc:
+        if exc.setting_name != "storage_strategy":
+          raise
+        raise ConfigurationError(
+          str(exc),
+          setting_name="SCRAPY_STORAGE_STRATEGY",
+          setting_value=storage_strategy_name,
+        ) from exc
+      except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigurationError(
+          f"Invalid SCRAPY_STORAGE_STRATEGY configuration: {exc}",
+          setting_name="SCRAPY_STORAGE_STRATEGY",
+          setting_value=storage_strategy_name,
+        ) from exc
+      raw_max_errors = settings.get("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS")
+      # Risk 5: default to a sane ceiling (DEFAULT_MAX_STORAGE_ERRORS) when unset
+      # so a persistent outage surfaces instead of being silently swallowed. An
+      # explicit int from settings still wins; ``None`` (infinite swallow) is
+      # reachable only via the constructor kwarg, not via the env var.
+      max_storage_errors = (
+        parse_int_setting(
+          raw_max_errors,
+          "SCRAPY_PIPELINE_MAX_STORAGE_ERRORS",
+          minimum=0,
+        )
+        if raw_max_errors is not None
+        else DEFAULT_MAX_STORAGE_ERRORS
+      )
+      ttl_raw = settings.get("SCRAPY_PIPELINE_TTL", 0)
+      ttl = parse_int_setting(
+        ttl_raw,
+        "SCRAPY_PIPELINE_TTL",
+        minimum=0,
+      )
+      max_item_bytes = parse_int_setting(
+        settings.get(
+          "SCRAPY_PIPELINE_MAX_ITEM_BYTES",
+          DEFAULT_PIPELINE_MAX_ITEM_BYTES,
+        ),
+        "SCRAPY_PIPELINE_MAX_ITEM_BYTES",
+        minimum=1,
+      )
+      key_prefix = settings.get("SCRAPY_PIPELINE_KEY_PREFIX", "items")
+      if not isinstance(key_prefix, str):
+        raise ConfigurationError(
+          f"SCRAPY_PIPELINE_KEY_PREFIX must be a string, got {key_prefix!r}.",
+          setting_name="SCRAPY_PIPELINE_KEY_PREFIX",
+          setting_value=key_prefix,
+        )
+      try:
+        _validate_key_name(key_prefix, "SCRAPY_PIPELINE_KEY_PREFIX")
+      except ValueError as exc:
+        raise ConfigurationError(
+          str(exc),
+          setting_name="SCRAPY_PIPELINE_KEY_PREFIX",
+          setting_value=key_prefix,
+        ) from exc
+      return cls(
+        connection_manager=manager,
+        key_prefix=key_prefix,
+        ttl=ttl or None,
+        max_item_bytes=max_item_bytes,
+        storage_strategy=storage_strategy,
+        max_storage_errors=max_storage_errors,
+      )
+    except BaseException:
+      # A successful get_manager() is an acquire. No partially-built component
+      # exists to own that reference, so the factory must release it here even
+      # for cancellation-style BaseException subclasses.
+      try:
+        manager.close()
+      except BaseException:
+        logger.exception(
+          "Failed to release ConnectionManager after pipeline factory failure"
+        )
+      raise
 
   @classmethod
   def from_crawler(cls, crawler: Crawler) -> BackendPipeline:
@@ -205,21 +289,35 @@ class BackendPipeline:
         A new BackendPipeline instance.
     """
     pipeline = cls.from_settings(crawler.settings)
-    # Default-on observability — mirrors the dupefilter wiring. Only override
-    # when no explicit monitor was provided (operators passing a custom monitor
-    # via from_settings win over the default).
-    stats = getattr(crawler, "stats", None)
-    if stats is not None and isinstance(pipeline._monitor, NullMonitor):
-      from scrapy_extension.monitor import ScrapyStatsMonitor
+    try:
+      # Default-on observability — mirrors the dupefilter wiring. Only override
+      # when no explicit monitor was provided (operators passing a custom monitor
+      # via from_settings win over the default).
+      stats = getattr(crawler, "stats", None)
+      if stats is not None and isinstance(pipeline._monitor, NullMonitor):
+        from scrapy_extension.monitor import ScrapyStatsMonitor
 
-      pipeline._monitor = ScrapyStatsMonitor(stats)
-    # Risk 2: share the pipeline's monitor with the storage strategy so
-    # ``on_buffer_depth`` (batched) emits through the same collector. No-op
-    # for strategies without a ``set_monitor`` hook (passthrough).
-    set_monitor = getattr(pipeline.storage_strategy, "set_monitor", None)
-    if callable(set_monitor):
-      set_monitor(pipeline._monitor)
-    return pipeline
+        pipeline._monitor = ScrapyStatsMonitor(stats)
+      # Risk 2: share the pipeline's monitor with the storage strategy so
+      # ``on_buffer_depth`` (batched) emits through the same collector. No-op
+      # for strategies without a ``set_monitor`` hook (passthrough).
+      set_monitor = getattr(pipeline.storage_strategy, "set_monitor", None)
+      if callable(set_monitor):
+        set_monitor(pipeline._monitor)
+      return pipeline
+    except BaseException:
+      try:
+        pipeline._close_after_factory_failure()
+      except BaseException:
+        logger.exception(
+          "Failed to close pipeline after crawler factory failure"
+        )
+      raise
+
+  def _close_after_factory_failure(self) -> None:
+    """Close a constructed pipeline when ``from_crawler`` cannot return it."""
+    with self._lifecycle_lock:
+      self._close_locked()
 
   def open_spider(self, spider: Spider) -> None:
     """Called when a spider opens.
@@ -235,30 +333,45 @@ class BackendPipeline:
     Args:
         spider: The spider instance.
     """
-    try:
-      self.connection_manager.get_storage_backend()
-      self._storage_supported = True
-    except NotImplementedError:
-      self._storage_supported = False
-      logger.warning(
-        "Backend %s does not support storage. "
-        "Pipeline will be a no-op — items will not be persisted.",
-        self.connection_manager.backend_type,
-      )
-    except BackendConnectionError as exc:
-      # Transient startup blip — ``ConnectionManager.backend`` lazy-connects
-      # on first access (connectors.py), so a backend that is briefly
-      # unreachable raises here. Do NOT abort the crawl and do NOT permanently
-      # disable storage — leave _storage_supported as None so process_item
-      # retries lazily per item. Narrowed to BackendConnectionError (per review)
-      # so genuine programming/config errors still fail fast at startup.
-      logger.warning(
-        "Storage backend %s not reachable at spider open: %s. Pipeline "
-        "will retry storage lazily on each item.",
-        self.connection_manager.backend_type,
-        exc,
-      )
-    logger.info("Pipeline opened for spider %s", spider.name)
+    with self._lifecycle_lock:
+      if self._closed:
+        raise RuntimeError("pipeline is closed")
+      if self._opened:
+        if spider is self._opened_spider:
+          return
+        raise RuntimeError("pipeline is already open for a different spider")
+      try:
+        _validate_key_name(spider.name, "spider.name")
+        self.storage_strategy.open()
+        try:
+          self.connection_manager.get_storage_backend()
+          self._storage_supported = True
+        except NotImplementedError:
+          self._storage_supported = False
+          logger.warning(
+            "Backend %s does not support storage. "
+            "Pipeline will be a no-op — items will not be persisted.",
+            self.connection_manager.backend_type,
+          )
+        except BackendConnectionError as exc:
+          logger.warning(
+            "Storage backend %s not reachable at spider open: %s. Pipeline "
+            "will retry storage lazily on each item.",
+            self.connection_manager.backend_type,
+            exc,
+          )
+      except BaseException:
+        # An open failure is terminal: no Scrapy close callback is guaranteed
+        # after component startup aborts, so roll back both child resources and
+        # the factory's manager acquire here.
+        try:
+          self._close_locked()
+        except BaseException:
+          logger.exception("Pipeline cleanup failed during open rollback")
+        raise
+      self._opened = True
+      self._opened_spider = spider
+      logger.info("Pipeline opened for spider %s", spider.name)
 
   def close_spider(self, spider: Spider) -> None:
     """Called when a spider closes.
@@ -270,6 +383,16 @@ class BackendPipeline:
         spider: The spider instance.
     """
     logger.info("Pipeline closed for spider %s", spider.name)
+    with self._lifecycle_lock:
+      self._close_locked()
+
+  def _close_locked(self) -> None:
+    """Release one pipeline lifecycle while ``_lifecycle_lock`` is held."""
+    if self._closed:
+      return
+    self._closed = True
+    self._opened = False
+    self._opened_spider = None
     try:
       self.storage_strategy.close()
     finally:
@@ -277,14 +400,23 @@ class BackendPipeline:
       # flush raised (batched partial-flush, backend error). Without this, a
       # failed close leaks one socket/fd per spider-close-under-error on
       # long-running Scrapyd deploys.
-      try:
-        self.connection_manager.close()
-      except Exception:
-        # Don't mask the original flush error (if any) — log and continue so
-        # the exception propagating from the try block is what callers see.
-        logger.exception("connection_manager.close() failed during teardown")
+      if not self._manager_released:
+        self._manager_released = True
+        try:
+          self.connection_manager.close()
+        except BaseException:
+          # Never mask a strategy flush/open/factory error. When manager close
+          # is the only failure, shutdown remains best-effort as before.
+          logger.exception("connection_manager.close() failed during teardown")
 
   def process_item(self, item: Item, spider: Spider) -> Item:
+    """Process one item while excluding concurrent terminal teardown."""
+    with self._lifecycle_lock:
+      if self._closed:
+        raise RuntimeError("pipeline is closed")
+      return self._process_item_unlocked(item, spider)
+
+  def _process_item_unlocked(self, item: Item, spider: Spider) -> Item:
     """Process and store an item.
 
     Best-effort: catches storage errors so a temporary backend failure
@@ -304,7 +436,21 @@ class BackendPipeline:
       return item
 
     key = self._generate_item_key(spider)
-    data = self._serialize_item(item)
+    try:
+      data = self._serialize_item(item)
+    except SerializationError:
+      raise
+    except Exception as e:
+      self._inc_stat(spider, "pipeline/serialization_errors")
+      try:
+        self._monitor.on_error("store", e)
+      except Exception:  # noqa: BLE001 - telemetry cannot mask serialization
+        logger.debug("monitor.on_error(store) raised; ignored", exc_info=True)
+      raise SerializationError(
+        f"Failed to serialize item: {e}",
+        data=item,
+        serializer="json",
+      ) from e
 
     # D2: reject oversize payloads loudly (DoS guard). Unlike a transient
     # storage error (swallowed below to keep the spider alive), this is a
@@ -348,10 +494,15 @@ class BackendPipeline:
             f"(last error on key {key!r}: {e})"
           ) from e
       return item
-    # Success: reset the consecutive counter and emit the on_store hook
-    # (failure path does not emit — it has its own stat, pipeline/storage_errors).
+    # Strategy acceptance resets the consecutive error counter. Direct
+    # strategies emit on_store here; buffering strategies emit it only when
+    # their later durable backend write succeeds.
     self._consecutive_storage_errors = 0
-    self._monitor.on_store(key)
+    if not self.storage_strategy.emits_store_events:
+      try:
+        self._monitor.on_store(key)
+      except Exception:  # noqa: BLE001 - storage has already succeeded
+        logger.debug("monitor.on_store raised; ignored", exc_info=True)
     logger.debug("Stored item: %s", key)
     return item
 
@@ -372,7 +523,10 @@ class BackendPipeline:
     crawler = getattr(spider, "crawler", None)
     stats = getattr(crawler, "stats", None) if crawler is not None else None
     if stats is not None:
-      stats.inc_value(stat_name)
+      try:
+        stats.inc_value(stat_name)
+      except Exception:  # noqa: BLE001 - stats cannot mask the pipeline result
+        logger.debug("stats.inc_value(%s) raised; ignored", stat_name, exc_info=True)
 
 
   def _generate_item_key(self, spider: Spider) -> str:
@@ -384,7 +538,7 @@ class BackendPipeline:
     Returns:
         A unique storage key.
     """
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     unique_id = uuid.uuid4().hex[:8]
     return f"{self.key_prefix}:{spider.name}:{timestamp}:{unique_id}"
 
@@ -397,7 +551,9 @@ class BackendPipeline:
     Returns:
         Serialized item bytes.
     """
-    item_dict = dict(item) if hasattr(item, "__iter__") else {"data": str(item)}
+    if not is_item(item):
+      raise TypeError(f"Unsupported pipeline item type: {type(item).__name__}")
+    item_dict = ItemAdapter(item).asdict()
     return self._serializer.serialize(item_dict)
 
   def _store_item(self, key: str, data: bytes) -> None:

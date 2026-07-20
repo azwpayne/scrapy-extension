@@ -44,7 +44,7 @@
 `base.py:344, 418, 447` group RocketMQ with "atomic-pop backends (Redis, MongoDB, ElasticSearch, RocketMQ)". `rocketmq.py:66` sets `requires_ack = True` and `:67` `supports_concurrent_ack = True` — it is deferred-ack. Anyone reasoning from the docstring will mis-model RocketMQ's delivery semantics. Fix the docstrings.
 
 ### F3 — RabbitMQ retry-count multiplication  · **MEDIUM (resilience)**
-`rabbitmq.py:235-236` passes pika's `connection_attempts`/`retry_delay` *inside* `ConnectionManager`'s own `retry_attempts` loop. Effective TCP attempts ≈ product, not sum (`retry_attempts=3` → up to 9 attempts under default pika). Surprising blast under network partitions.
+`rabbitmq.py:235-236` passes pika's `connection_attempts`/`retry_delay` *inside* `ConnectionManager`'s own retry loop. Effective TCP attempts are approximately a product, not a sum (`retry_attempts=3` means one initial attempt plus three retries, or up to 12 TCP attempts under default pika). Surprising blast under network partitions.
 
 ### F4 — Backpressure gauge vs throttle knob are two mechanisms  · **MEDIUM (observability)**
 `stats.py:136-139` emits `queue/backpressure` as a gauge; its docstring (`stats.py:131`) explicitly states "Observability only — no throttling". Actual throttling is the scheduler's `backpressure_pause_at`/`resume_at` hysteresis gate (`scheduler.py:94-103`). Verified bifurcation. (The synthesis claimed "no doc cross-reference in code" — `stats.py:131` *does* disclaim; the synthesis overstated this nuance.)

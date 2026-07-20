@@ -48,6 +48,8 @@ class BatchedStorageStrategy(StorageStrategy):
       pending: Count of items currently buffered (not yet flushed).
   """
 
+  emits_store_events = True
+
   def __init__(
     self,
     threshold: int = DEFAULT_BATCH_THRESHOLD,
@@ -84,6 +86,11 @@ class BatchedStorageStrategy(StorageStrategy):
     self.max_buffer_age_s = max_buffer_age_s
     self._buffer: list[tuple[str, bytes, int | None]] = []
     self._lock = threading.Lock()
+    # Serializes the complete snapshot/write/requeue transaction. The buffer
+    # lock alone cannot make close wait for a threshold flush after that flush
+    # has detached its batch and started writing outside _lock.
+    self._flush_lock = threading.Lock()
+    self._closed = False
     self._last_backend: StorageBackend | None = None
     self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
     # Risk 2: oldest-buffered-item timestamp (monotonic) + flusher lifecycle.
@@ -112,6 +119,20 @@ class BatchedStorageStrategy(StorageStrategy):
     """
     self._monitor = monitor
 
+  def _emit_buffer_depth(self, depth: int) -> None:
+    """Publish the buffer gauge without allowing telemetry into the data path."""
+    try:
+      self._monitor.on_buffer_depth(depth)
+    except Exception:  # noqa: BLE001 - monitor must never crash storage
+      logger.debug("on_buffer_depth hook raised", exc_info=True)
+
+  def _emit_error(self, operation: str, error: Exception) -> None:
+    """Publish an error without allowing telemetry to stop retry processing."""
+    try:
+      self._monitor.on_error(operation, error)
+    except Exception:  # noqa: BLE001 - monitor must never crash storage
+      logger.debug("on_error hook raised", exc_info=True)
+
   def store(
     self,
     storage_backend: StorageBackend,
@@ -121,17 +142,11 @@ class BatchedStorageStrategy(StorageStrategy):
   ) -> None:
     """Buffer one item; auto-flush when the buffer reaches the threshold.
 
-    Always succeeds in buffering the item (the at-least-once guarantee). A
-    threshold-triggered flush that fails mid-batch is swallowed — the
-    un-written tail is re-enqueued by ``_flush_to`` (which already logged the
-    partial) and retried by the next flush / the age-flusher. Propagating a
-    threshold-flush failure would storm ``BackendPipeline.process_item``'s
-    ``max_storage_errors`` breaker per incoming item during a sustained outage
-    → ``BackendError`` kills the spider → buffered tail lost (crash-before-flush)
-    = data loss. Escalation for sustained-outage-with-Batched moves to the
-    ``on_buffer_depth`` monitor hook (emitted per store). Explicit
-    :meth:`flush` / :meth:`close` STILL propagate a flush failure so teardown
-    callers see it.
+    Buffering is at-least-once for backend exceptions: ``_flush_to`` restores
+    the unwritten tail before re-raising. Threshold-triggered failures propagate
+    so ``BackendPipeline`` records a real persistence failure and its
+    ``max_storage_errors`` guard remains effective; returning success here would
+    emit ``on_store`` for data that exists only in volatile memory.
 
     Args:
         storage_backend: The StorageBackend to flush to.
@@ -141,6 +156,8 @@ class BatchedStorageStrategy(StorageStrategy):
     """
     flush_now = False
     with self._lock:
+      if self._closed:
+        raise RuntimeError("batched storage strategy is closed")
       self._buffer.append((key, value, ttl))
       self._last_backend = storage_backend
       if self._oldest_ts is None:
@@ -151,24 +168,10 @@ class BatchedStorageStrategy(StorageStrategy):
     # on_buffer_depth is a no-op under NullMonitor; emit outside the lock and
     # guard it so a misbehaving monitor can never crash the store path
     # (matches the BLE001-guard convention used across the codebase).
-    try:
-      self._monitor.on_buffer_depth(depth)
-    except Exception:  # noqa: BLE001 — monitor must never crash store
-      logger.debug("on_buffer_depth hook raised", exc_info=True)
-    if flush_now:
-      try:
-        self._flush_to(storage_backend)
-      except Exception:  # noqa: BLE001 — _flush_to logged + re-enqueued; see R-pipe-1
-        # R-pipe-1 (option A): the threshold flush failed but the item passed
-        # to THIS store() is safely buffered (at-least-once). Do NOT
-        # propagate — surfacing a flush failure as a store failure would storm
-        # the pipeline's max_storage_errors breaker per incoming item during a
-        # sustained outage, killing the spider and losing the buffered tail
-        # (crash-before-flush) = data loss. Escalation for sustained outages
-        # moves to the on_buffer_depth monitor hook (emitted above). Explicit
-        # flush()/close() still raise so teardown callers see the failure.
-        pass  # nosec B110 — intentional swallow (R-pipe-1, documented above)
+    self._emit_buffer_depth(depth)
     self._ensure_flusher()
+    if flush_now:
+      self._flush_to(storage_backend)
 
   def flush(self) -> None:
     """Flush any buffered items to the last-seen backend.
@@ -188,6 +191,8 @@ class BatchedStorageStrategy(StorageStrategy):
     draining, so ``BackendPipeline.close_spider`` does not tear down the
     backend connection while the daemon flusher is mid-``store``.
     """
+    with self._lock:
+      self._closed = True
     self._stop.set()
     flusher = self._flusher
     if flusher is not None and flusher.is_alive():
@@ -215,6 +220,11 @@ class BatchedStorageStrategy(StorageStrategy):
     level) — that is a separate failure mode requiring durable buffering.
     Risk 2's ``max_buffer_age_s`` bounds (but does not eliminate) that window.
     """
+    with self._flush_lock:
+      self._flush_to_serialized(storage_backend)
+
+  def _flush_to_serialized(self, storage_backend: StorageBackend) -> None:
+    """Run one flush while the caller owns ``_flush_lock``."""
     with self._lock:
       batch = list(self._buffer)
       self._buffer = []
@@ -237,13 +247,23 @@ class BatchedStorageStrategy(StorageStrategy):
           # it gives the retried tail a fresh age budget.
           if self._buffer:
             self._oldest_ts = time.monotonic()
+          requeued_depth = len(self._buffer)
         logger.warning(
           "batched flush partial: %d/%d items written, %d re-enqueued",
           i,
           len(batch),
           len(batch) - i,
         )
+        self._emit_buffer_depth(requeued_depth)
         raise
+      try:
+        self._monitor.on_store(key)
+      except Exception:  # noqa: BLE001 - persistence already succeeded
+        logger.debug("on_store hook raised", exc_info=True)
+    if batch:
+      with self._lock:
+        remaining_depth = len(self._buffer)
+      self._emit_buffer_depth(remaining_depth)
 
   def _ensure_flusher(self) -> None:
     """Start the age-based background flusher (Risk 2), exactly once.
@@ -267,7 +287,7 @@ class BatchedStorageStrategy(StorageStrategy):
     if self.max_buffer_age_s is None:
       return
     with self._lock:
-      if self._flusher is not None:
+      if self._closed or self._flusher is not None:
         return
       flusher = threading.Thread(
         target=self._age_flush_loop,
@@ -307,9 +327,10 @@ class BatchedStorageStrategy(StorageStrategy):
       if need_flush:
         try:
           self._flush_to(backend)
-        except Exception:  # noqa: BLE001 — _flush_to logs + re-raises; keep
+        except Exception as exc:  # noqa: BLE001 — keep retry loop alive
           # the loop alive so a transient outage doesn't disable the flusher
-          # (the store error is already counted via the caller's stat path).
+          # and report a failure that has no synchronous pipeline caller.
+          self._emit_error("store", exc)
           logger.warning(
             "age-based flush failed; will retry next cycle (loss window "
             "may grow until the backend recovers)"

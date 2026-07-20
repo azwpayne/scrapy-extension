@@ -1,826 +1,438 @@
 # Scrapy Extension Examples
 
-Representative examples for [scrapy-extension](../README.md) — distributed crawling with pluggable backends. Runnable spiders cover the common full and queue-only paths; newer/partial backends (Pulsar, SQS, Memcached, DynamoDB) are documented as settings recipes in the root README and runbook rather than dedicated spiders.
+Runnable examples for
+[scrapy-extension](https://github.com/azwpayne/scrapy-extension). The example
+project enables the extension components globally with Redis as their default
+backend. Individual spiders use `custom_settings` where a different component
+topology is required.
 
 ## Prerequisites
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) or pip
-- At least one backend running locally (Redis by default)
+- Redis for the default scheduler, distributed deduplication, and item storage
+- The backend named by the spider you run
 
 ```bash
-# Quick Redis setup (Docker)
-docker run -d -p 6379:6379 redis:7
-
-# Or install locally
-# brew install redis && redis-server
-```
-
-## Quick Start
-
-```bash
-# Install the package (from repo root)
+# From the repository root
 uv sync
+docker run -d --name scrapy-redis -p 6379:6379 redis:7-alpine
 
-# Run the Redis example
 cd examples
+scrapy list
 scrapy crawl quotes_redis
 ```
 
-## Project Structure
+## How Configuration Is Split
 
+There are two independent configuration paths:
+
+1. `BackendSpiderMixin.backend_type` and `backend_settings` configure the
+   spider's direct `ConnectionManager` access.
+2. `SCRAPY_QUEUE_BACKEND_*`, `SCRAPY_SET_BACKEND_*`, and
+   `SCRAPY_STORAGE_BACKEND_*` configure the Scheduler, DupeFilter, and Pipeline.
+
+A mixin class attribute does not retarget those Scrapy components. The bundled
+Kafka and RabbitMQ spiders therefore select their queue backend with
+`custom_settings` and keep Redis for distributed deduplication and storage.
+Normal Scrapy construction automatically calls the mixin's idempotent setup
+from `from_crawler()`; do not call `setup_backend()` in a spider `__init__`.
+
+Backend type precedence for components is:
+
+```text
+Scrapy component setting > Scrapy global setting >
+environment component setting > environment global setting > redis
 ```
-examples/
-├── scrapy.cfg                  # Scrapy project config
-├── examples/
-│   ├── __init__.py
-│   ├── items.py                # QuoteItem definition
-│   ├── settings.py             # Backend-enabled Scrapy settings
-│   ├── middlewares.py          # Default spider/downloader middlewares
-│   ├── pipelines.py            # Pipeline examples (standard + BackendPipeline)
-│   └── spiders/
-│       ├── quotes_redis.py               # Redis backend spider
-│       ├── quotes_mongodb.py             # MongoDB backend spider
-│       ├── quotes_kafka.py               # Kafka backend spider (queue only)
-│       ├── quotes_rabbitmq.py            # RabbitMQ backend spider (queue only)
-│       ├── quotes_elasticsearch.py       # ElasticSearch backend spider
-│       ├── quotes_programmatic.py        # Programmatic settings configuration
-│       ├── quotes_multi_mode.py          # Redis Sentinel/Cluster modes
-│       ├── quotes_connection_manager.py  # Low-level ConnectionManager API
-│       ├── quotes.py                     # Basic Scrapy spider (no backend)
-│       └── quotes_crawl.py              # Basic CrawlSpider (no backend)
-└── README.md
-```
+
+For backend fields, an explicit nested Scrapy dictionary wins over flat Scrapy
+settings, which win over environment variables and model defaults. Thus an
+environment variable does not override a value already present in
+`settings.py`, `custom_settings`, or a `-s` command-line setting.
 
 ## Backend Capabilities
 
-| Backend       | Queue | Set (Dedup) | Storage | Modes                                           |
-|---------------|-------|-------------|---------|-------------------------------------------------|
-| Redis         | Yes   | Yes         | Yes     | standalone, master_slave, sentinel, cluster     |
-| MongoDB       | Yes   | Yes         | Yes     | standalone, replica_set, sharded_cluster, atlas|
-| Kafka         | Yes   | No          | No      | standalone, cluster, confluent                  |
-| RabbitMQ      | Yes   | No          | No      | standalone, cluster, mirrored_queues           |
-| ElasticSearch | Yes   | Yes         | Yes     | standalone, cloud                               |
-| RocketMQ      | Yes   | Guard       | Guard   | standalone, cluster, cloud                      |
-| Pulsar        | Yes   | No          | No      | standalone, cluster                             |
-| SQS           | Yes   | No          | No      | standalone (LocalStack), cloud (AWS)            |
-| Memcached     | No    | No          | Yes     | standalone                                      |
-| DynamoDB      | No    | No          | Yes     | standalone (LocalStack), cloud (AWS)            |
+| Backend | Queue | Set | Storage | Modes |
+|---|---:|---:|---:|---|
+| Redis | yes | yes | yes | standalone, master_slave, sentinel, cluster |
+| MongoDB | yes | yes | yes | standalone, replica_set, sharded_cluster, atlas |
+| Kafka | yes | no | no | standalone, cluster, confluent |
+| RabbitMQ | yes | no | no | standalone, cluster, mirrored_queues |
+| ElasticSearch | yes | yes | yes | standalone, cloud |
+| RocketMQ | yes | no | no | standalone, cluster, cloud |
+| Pulsar | yes | no | no | standalone, cluster |
+| SQS | yes | no | no | standalone (LocalStack), cloud (AWS) |
+| Memcached | no | no | yes | standalone |
+| DynamoDB | no | no | yes | standalone (LocalStack), cloud (AWS) |
 
-- **Yes** — fully implemented
-- **No** — not available; selecting the backend for that component fails capability validation
-- **Guard** — rejected at config time (`ConfigurationError`); guard classes fail fast if bypassed
+Selecting a backend for an unsupported component raises `ConfigurationError`
+at startup. The table describes interface support, not every optional
+operation: Pulsar and RocketMQ cannot report queue depth, SQS depth is
+approximate, and Memcached cannot prefix-clear keys. A server-wide Memcached
+clear is disabled unless `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`.
 
-**Kafka, RabbitMQ, Pulsar, SQS**: Queue-only. For dedup/storage, use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB.
-**RocketMQ**: Queue functional via the Apache gRPC client. Set/Storage are guarded — pair with a full-featured backend.
+Queue-only backends should normally be deployed as a hybrid:
 
----
+```python
+SCRAPY_QUEUE_BACKEND_TYPE = "kafka"       # or rabbitmq/pulsar/sqs/rocketmq
+SCRAPY_SET_BACKEND_TYPE = "redis"
+SCRAPY_STORAGE_BACKEND_TYPE = "redis"
+```
 
-## 1. Redis Backend (`quotes_redis`)
+A local `memory`, `bloom`, or `cuckoo` dedup strategy can run without a Set
+backend, but it does not deduplicate across workers.
 
-Full-featured distributed crawling using Redis. Demonstrates `BackendSpiderMixin` with
-scheduler, dupefilter, and item pipeline all backed by Redis.
+## Example Inventory
+
+| Spider | Demonstrates |
+|---|---|
+| `quotes_redis` | Redis for all three extension components |
+| `quotes_mongodb` | MongoDB for all three components |
+| `quotes_kafka` | Kafka queue plus Redis set/storage |
+| `quotes_rabbitmq` | RabbitMQ queue plus Redis set/storage |
+| `quotes_elasticsearch` | ElasticSearch for all three components |
+| `quotes_programmatic` | Mixin `backend_settings` for direct manager access |
+| `quotes_multi_mode` | Selectable Redis Sentinel or Cluster config |
+| `quotes_connection_manager` | Low-level manager and capability accessors |
+| `quotes`, `quotes_crawl` | Plain Scrapy scheduler/dupefilter, no extension pipeline |
+
+## Redis (`quotes_redis`)
 
 ```bash
-docker run -d --name redis -p 6379:6379 redis:7-alpine
 scrapy crawl quotes_redis
 ```
 
-### Configuration Options
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SCRAPY_REDIS_HOST` | `localhost` | Redis hostname |
-| `SCRAPY_REDIS_PORT` | `6379` | Redis port |
-| `SCRAPY_REDIS_DB` | `0` | Redis database number |
-| `SCRAPY_REDIS_PASSWORD` | _(none)_ | Authentication password |
-| `SCRAPY_REDIS_MODE` | `standalone` | `standalone`, `master_slave`, `sentinel`, `cluster` |
-
-### Redis Deployment Modes
-
-**Standalone (default)** — single Redis node:
-
-```bash
-export SCRAPY_REDIS_MODE=standalone
-export SCRAPY_REDIS_HOST=localhost
-export SCRAPY_REDIS_PORT=6379
-```
-
-**Master-Slave with Read Replicas:**
+Common settings:
 
 ```python
+SCRAPY_REDIS_MODE = "standalone"
+SCRAPY_REDIS_HOST = "localhost"
+SCRAPY_REDIS_PORT = 6379
+SCRAPY_REDIS_DB = 0
+SCRAPY_REDIS_NAMESPACE = "quotes-dev"
+# SCRAPY_REDIS_USERNAME = "crawler"
+# SCRAPY_REDIS_PASSWORD = "secret"
+```
+
+Every deployment sharing a Redis database should have a distinct namespace.
+The default is `scrapy-extension`; it separates queue/set/storage domains but
+does not distinguish two applications. New namespaced keys do not fall back to
+the legacy unnamespaced layout. Drain or migrate persistent deployments before
+upgrading; see the
+[migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md).
+
+Deployment modes:
+
+```python
+# Master/replicas
 SCRAPY_REDIS_MODE = "master_slave"
-SCRAPY_REDIS_HOST = "master.redis.com"
-SCRAPY_REDIS_REPLICAS = ["replica1.redis.com:6379", "replica2.redis.com:6379"]
+SCRAPY_REDIS_HOST = "master.redis.internal"
+SCRAPY_REDIS_REPLICAS = ["replica1:6379", "replica2:6379"]
 SCRAPY_REDIS_READ_FROM_REPLICAS = True
-```
 
-**Sentinel (High Availability):**
-
-```python
+# Sentinel
 SCRAPY_REDIS_MODE = "sentinel"
-SCRAPY_REDIS_SENTINELS = ["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"]
+SCRAPY_REDIS_SENTINELS = ["sentinel1:26379", "sentinel2:26379"]
 SCRAPY_REDIS_SENTINEL_MASTER_NAME = "mymaster"
-SCRAPY_REDIS_PASSWORD = "redis_secret"
-```
 
-**Redis Cluster (Sharding):**
-
-```python
+# Cluster
 SCRAPY_REDIS_MODE = "cluster"
-SCRAPY_REDIS_CLUSTER_STARTUP_NODES = ["node1:7000", "node2:7000", "node3:7000"]
+SCRAPY_REDIS_CLUSTER_STARTUP_NODES = ["node1:7000", "node2:7000"]
 SCRAPY_REDIS_CLUSTER_MAX_REDIRECTS = 5
+
+# TLS fields use these exact names
+SCRAPY_REDIS_SSL_ENABLED = True
+SCRAPY_REDIS_SSL_CAFILE = "/etc/ssl/redis-ca.pem"
+SCRAPY_REDIS_SSL_CHECK_HOSTNAME = True
 ```
 
-### Spider Code
+The mixin spider needs only the backend declaration:
 
 ```python
-import scrapy
-
-from examples.items import QuotesParsingMixin
-from scrapy_extension import BackendSpiderMixin, BackendType
-
-
 class QuotesRedisSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
     name = "quotes_redis"
     backend_type = BackendType.REDIS
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.setup_backend()
 ```
 
-### Common Errors
-
-**Connection refused** — Redis not running:
+## MongoDB (`quotes_mongodb`)
 
 ```bash
-docker start redis
-redis-cli ping  # should return PONG
-```
-
-**Authentication failure** — wrong password:
-
-```bash
-export SCRAPY_REDIS_PASSWORD="your_password"
-```
-
----
-
-## 2. MongoDB Backend (`quotes_mongodb`)
-
-Uses MongoDB for distributed crawling with full Queue + Set + Storage support.
-
-```bash
-docker run -d --name mongodb -p 27017:27017 mongo:7
+docker run -d --name scrapy-mongo -p 27017:27017 mongo:7
 scrapy crawl quotes_mongodb
 ```
 
-### Configuration Options
-
-| Attribute | Env Variable | Default | Description |
-|-----------|-------------|---------|-------------|
-| `mongodb_uri` | `SCRAPY_MONGO_URI` | `mongodb://localhost:27017` | Connection URI |
-| `mongodb_db` | `SCRAPY_MONGO_DATABASE` | `scrapy_extension` | Database name |
-| `mongodb_queue_collection` | `SCRAPY_MONGO_QUEUE_COLLECTION` | `queues` | Queue collection |
-| `mongodb_set_collection` | `SCRAPY_MONGO_SET_COLLECTION` | `sets` | Deduplication set collection |
-| `mongodb_storage_collection` | `SCRAPY_MONGO_STORAGE_COLLECTION` | `storage` | Key-value storage collection |
-
-### MongoDB-Specific Modes
-
-**REPLICA_SET:**
+The spider's `custom_settings` sets `SCRAPY_BACKEND_TYPE=mongodb`, so Queue,
+Set, and Storage all use MongoDB. Configure modes through Scrapy settings, not
+ad-hoc spider attributes:
 
 ```python
-from scrapy_extension.settings import MongoDBMode
+SCRAPY_MONGO_MODE = "standalone"
+SCRAPY_MONGO_URI = "mongodb://localhost:27017"
+SCRAPY_MONGO_DATABASE = "scrapy_quotes"
 
-backend_type = BackendType.MONGODB
-mongodb_uri = "mongodb://rs1:27017,rs2:27017,rs3:27017"
-mongodb_mode = MongoDBMode.REPLICA_SET
-mongodb_replica_set_name = "myReplicaSet"
-mongodb_read_preference = "secondary"
+# Replica set
+SCRAPY_MONGO_MODE = "replica_set"
+SCRAPY_MONGO_URI = "mongodb://rs1:27017,rs2:27017,rs3:27017"
+SCRAPY_MONGO_REPLICA_SET_NAME = "crawler-rs"
+SCRAPY_MONGO_READ_PREFERENCE = "secondary"
+
+# Sharded cluster
+SCRAPY_MONGO_MODE = "sharded_cluster"
+SCRAPY_MONGO_MONGOS_ROUTERS = ["mongos1:27017", "mongos2:27017"]
+
+# Atlas requires an explicit SRV URI
+SCRAPY_MONGO_MODE = "atlas"
+SCRAPY_MONGO_URI = "mongodb+srv://cluster.example.net/scrapy"
 ```
 
-**SHARDED_CLUSTER:**
+Prefer `SCRAPY_MONGO_USERNAME` and `SCRAPY_MONGO_PASSWORD` over embedding
+credentials in the plain-string URI, and never log the full URI.
 
-```python
-from scrapy_extension.settings import MongoDBMode
+## Kafka (`quotes_kafka`)
 
-mongodb_mode = MongoDBMode.SHARDED_CLUSTER
-mongodb_mongos_routers = ["mongos1:27017", "mongos2:27017"]
-```
-
-**ATLAS (TLS enabled automatically):**
-
-```python
-from scrapy_extension.settings import MongoDBMode
-
-mongodb_mode = MongoDBMode.ATLAS
-mongodb_uri = "mongodb+srv://<atlas-cluster>/?retryWrites=true"
-```
-
-### Common Errors
-
-**Connection refused:**
+Kafka is queue-only. The example selects Kafka only for the queue and uses
+Redis for Set and Storage:
 
 ```bash
-docker ps | grep mongodb
-# or
-pgrep -a mongo
-```
-
-**Authentication failed** — check URI format:
-
-```python
-mongodb_uri = "mongodb://user:password@localhost:27017"
-mongodb_auth_source = "admin"
-```
-
----
-
-## 3. Kafka Backend (`quotes_kafka`)
-
-Uses Kafka for distributed request queuing. **Queue-only** — no Set (dedup) or Storage support.
-
-```bash
-# Start Zookeeper and Kafka
-docker run -d --name zookeeper -p 2181:2181 confluentinc/cp-zookeeper:7.5.0
-docker run -d --name kafka -p 9092:9092 --link zookeeper \
-  -e KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
-  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  wurstmeister/kafka:3.6.0
-
 scrapy crawl quotes_kafka
 ```
 
-### Configuration Options
+```python
+SCRAPY_QUEUE_BACKEND_TYPE = "kafka"
+SCRAPY_KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+SCRAPY_KAFKA_GROUP_ID = "scrapy-extension"
+SCRAPY_SET_BACKEND_TYPE = "redis"
+SCRAPY_STORAGE_BACKEND_TYPE = "redis"
+```
 
-| Setting | Env Variable | Default | Description |
-|---------|-------------|---------|-------------|
-| `bootstrap_servers` | `SCRAPY_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker address |
-| `group_id` | `SCRAPY_KAFKA_GROUP_ID` | `scrapy-extension` | Consumer group ID |
-| `max_priority_partitions` | `SCRAPY_KAFKA_MAX_PRIORITY_PARTITIONS` | `10` | Priority partitions |
-| `retention_ms` | `SCRAPY_KAFKA_RETENTION_MS` | `604800000` | Retention time (7 days) |
-
-### Kafka Modes
-
-**Confluent Cloud (SASL/SSL):**
+Confluent Cloud uses SASL/SSL settings:
 
 ```python
 SCRAPY_KAFKA_MODE = "confluent"
-SCRAPY_KAFKA_CONFLUENT_BOOTSTRAP_SERVERS = "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
-SCRAPY_KAFKA_CONFLUENT_API_KEY = "your_api_key"
-SCRAPY_KAFKA_CONFLUENT_API_SECRET = "your_api_secret"
+SCRAPY_KAFKA_CONFLUENT_BOOTSTRAP_SERVERS = "pkc.example:9092"
+SCRAPY_KAFKA_CONFLUENT_API_KEY = "api-key"
+SCRAPY_KAFKA_CONFLUENT_API_SECRET = "api-secret"
 ```
 
-### Important Limitation
+Do not select `priority` or `work_stealing` with Kafka; both strategies are
+rejected because one logical queue fans out to physical topics that the
+consumer cannot isolate safely.
 
-Kafka only implements `QueueBackend`. For deduplication, pair with Redis or MongoDB, or use Scrapy's built-in `RFPDupeFilter`.
+## RabbitMQ (`quotes_rabbitmq`)
 
-### Common Errors
-
-**Connection refused** — verify Kafka is running:
-
-```bash
-nc -zv localhost 9092
-docker logs kafka
-```
-
-**TopicAlreadyExistsError** — this is expected; the backend catches it and continues.
-
----
-
-## 4. RabbitMQ Backend (`quotes_rabbitmq`)
-
-Uses RabbitMQ for distributed request queuing. **Queue-only** — no Set or Storage support.
+RabbitMQ is queue-only. The example uses its queue with Redis Set/Storage:
 
 ```bash
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker run -d --name scrapy-rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 scrapy crawl quotes_rabbitmq
 ```
 
-### Configuration Options
-
-| Setting | Env Variable | Default | Description |
-|---------|-------------|---------|-------------|
-| `rabbitmq_url` | `SCRAPY_RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` | Connection URL |
-| `SCRAPY_RABBITMQ_MAX_PRIORITY` | `255` | Max priority (1-255) |
-| `SCRAPY_RABBITMQ_DURABLE` | `True` | Durable queues |
-
-### RabbitMQ Modes
-
-**MIRRORED_QUEUES (HA):**
+Use either a URL containing credentials or explicit required username/password
+fields:
 
 ```python
-from scrapy_extension.settings import RabbitMQMode
+SCRAPY_QUEUE_BACKEND_TYPE = "rabbitmq"
+SCRAPY_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 
-rabbitmq_settings = {
-    "mode": RabbitMQMode.MIRRORED_QUEUES,
-    "cluster_nodes": ["rabbit1:5672", "rabbit2:5672", "rabbit3:5672"],
-    "ha_mode": "all",
-}
+# Equivalent explicit form
+# SCRAPY_RABBITMQ_HOST = "localhost"
+# SCRAPY_RABBITMQ_PORT = 5672
+# SCRAPY_RABBITMQ_USERNAME = "guest"
+# SCRAPY_RABBITMQ_PASSWORD = "guest"
+# SCRAPY_RABBITMQ_VIRTUAL_HOST = "/"
+
+SCRAPY_SET_BACKEND_TYPE = "redis"
+SCRAPY_STORAGE_BACKEND_TYPE = "redis"
 ```
 
-### Common Errors
-
-**Queue with x-max-priority not available** — queue was declared without priority support. Delete and recreate the queue, or use a different queue name.
-
-**Connection refused:**
-
-```bash
-docker start rabbitmq
-docker logs rabbitmq
-```
-
----
-
-## 5. RocketMQ Backend
-
-> **Note:** No example spider provided. Configure RocketMQ directly in your project's `settings.py`:
+Mirrored queue settings use real Scrapy keys:
 
 ```python
-SCRAPY_BACKEND_TYPE = "rocketmq"
+SCRAPY_RABBITMQ_MODE = "mirrored_queues"
+SCRAPY_RABBITMQ_CLUSTER_NODES = ["rabbit2:5672", "rabbit3:5672"]
+SCRAPY_RABBITMQ_HA_MODE = "all"
+```
+
+Publishing uses confirms plus mandatory routing. An unroutable or negatively
+acknowledged publish raises instead of returning success.
+
+## RocketMQ Recipe
+
+RocketMQ is queue-only and connects to a RocketMQ 5 gRPC proxy, not the legacy
+NameServer protocol port:
+
+```python
+SCRAPY_QUEUE_BACKEND_TYPE = "rocketmq"
 SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
+SCRAPY_ROCKETMQ_INVISIBLE_DURATION = 300
+SCRAPY_SET_BACKEND_TYPE = "redis"
+SCRAPY_STORAGE_BACKEND_TYPE = "redis"
 ```
 
-**Queue-only** — no Set or Storage support.
+`invisible_duration` is 10..43200 seconds. The extension does not renew the
+lease; set it above the maximum time from queue pop to downloader response.
+Nack uses RocketMQ's 10-second minimum. Queue depth is unavailable, so
+depth-driven backpressure and queue-depth metrics cannot operate. `priority`
+and `work_stealing` are rejected for the same consumer-isolation reason as
+Kafka.
+
+## ElasticSearch (`quotes_elasticsearch`)
 
 ```bash
-# Start a RocketMQ broker with the gRPC proxy enabled.
-# The extension connects to the proxy endpoint (default localhost:8081),
-# not the legacy NameServer-only port (9876).
-docker run -d --name rocketmq -p 8081:8081 apache/rocketmq:5.3.2 sh mqbroker --enable-proxy
-```
-
-### Configuration Options
-
-| Setting | Env Variable | Default | Description |
-|---------|-------------|---------|-------------|
-| `namesrv_address` | `SCRAPY_ROCKETMQ_NAMESRV_ADDRESS` | `localhost:8081` | RocketMQ gRPC proxy endpoint (`host:port`) |
-| `access_key` | `SCRAPY_ROCKETMQ_ACCESS_KEY` | — | Alibaba Cloud access key |
-| `secret_key` | `SCRAPY_ROCKETMQ_SECRET_KEY` | — | Alibaba Cloud secret key |
-| `consumer_group` | `SCRAPY_ROCKETMQ_CONSUMER_GROUP` | `scrapy-extension-consumer` | Consumer group |
-| `producer_group` | `SCRAPY_ROCKETMQ_PRODUCER_GROUP` | `scrapy-extension-producer` | Producer group |
-| `send_timeout` | `SCRAPY_ROCKETMQ_SEND_TIMEOUT` | `3000` | Send timeout in ms |
-
-### RocketMQ Modes
-
-**Standalone (default):**
-
-```python
-SCRAPY_BACKEND_TYPE = "rocketmq"
-SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
-```
-
-**Alibaba Cloud RocketMQ:**
-
-```python
-SCRAPY_ROCKETMQ_MODE = "cloud"
-SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "your-rocketmq-proxy.example.com:8081"
-SCRAPY_ROCKETMQ_ACCESS_KEY = "your_access_key"
-SCRAPY_ROCKETMQ_SECRET_KEY = "your_secret_key"
-```
-
-### Important Limitations
-
-RocketMQ implements `QueueBackend` fully. `SetBackend` and `StorageBackend` are **guarded**: selecting RocketMQ for dedup or storage is rejected at config time with `ConfigurationError`, and guard classes fail fast if the capability gate is bypassed.
-
-For deduplication and storage, pair RocketMQ queueing with Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB via the per-component backend settings.
-
-### Common Errors
-
-**Connection refused** — verify RocketMQ is running:
-
-```bash
-docker ps | grep rocketmq
-nc -zv localhost 8081
-```
-
-**Authentication failed** — check access_key and secret_key for cloud mode:
-
-```bash
-export SCRAPY_ROCKETMQ_ACCESS_KEY="your_access_key"
-export SCRAPY_ROCKETMQ_SECRET_KEY="your_secret_key"
-```
-
----
-
-## 6. ElasticSearch Backend (`quotes_elasticsearch`)
-
-Full-featured distributed crawling using ElasticSearch. Supports Queue + Set + Storage.
-
-```bash
-docker run -d --name elasticsearch -p 9200:9200 \
+docker run -d --name scrapy-elastic -p 9200:9200 \
   -e discovery.type=single-node \
   -e xpack.security.enabled=false \
   elasticsearch:8.12.0
-
 scrapy crawl quotes_elasticsearch
 ```
 
-### Configuration Options
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SCRAPY_ELASTICSEARCH_MODE` | `standalone` | `standalone` or `cloud` |
-| `SCRAPY_ELASTICSEARCH_HOSTS` | `http://localhost:9200` | Comma-separated host URLs |
-| `SCRAPY_ELASTICSEARCH_CLOUD_ID` | — | Elastic Cloud identifier |
-| `SCRAPY_ELASTICSEARCH_API_KEY` | — | API key authentication |
-| `SCRAPY_ELASTICSEARCH_QUEUE_INDEX` | `scrapy_queue` | Queue index name |
-| `SCRAPY_ELASTICSEARCH_SET_INDEX` | `scrapy_set` | Dedup index name |
-| `SCRAPY_ELASTICSEARCH_STORAGE_INDEX` | `scrapy_storage` | Storage index name |
-
-### Cloud Mode
-
-```bash
-export SCRAPY_ELASTICSEARCH_MODE=cloud
-export SCRAPY_ELASTICSEARCH_CLOUD_ID=your_cloud_id
-export SCRAPY_ELASTICSEARCH_API_KEY=your_api_key
+```python
+SCRAPY_ELASTICSEARCH_MODE = "standalone"
+SCRAPY_ELASTICSEARCH_HOSTS = ["http://localhost:9200"]
 ```
 
-### Common Errors
-
-**Connection refused** — verify ElasticSearch is running:
+Pydantic list environment values must be JSON, not comma-separated text:
 
 ```bash
-curl http://localhost:9200
+export SCRAPY_ELASTICSEARCH_HOSTS='["https://es1.example:9200","https://es2.example:9200"]'
 ```
 
-**Authentication failure** — ensure credentials are set:
-
-```bash
-export SCRAPY_ELASTICSEARCH_API_KEY=your_api_key
-```
-
----
-
-## 7. Programmatic Configuration (`quotes_programmatic`)
-
-Configures the backend entirely within the spider class using `backend_settings` dict,
-instead of `settings.py`. Useful for multi-tenant crawlers or testing against
-different backends without modifying project files.
-
-```bash
-scrapy crawl quotes_programmatic
-```
-
-### When to Use
-
-| Approach | Use Case |
-|---------|---------|
-| `settings.py` | Project-wide defaults, single backend per deployment |
-| `backend_settings` | Multi-tenant crawlers, testing, different configs per spider |
-
-### All Redis `backend_settings` Fields
+Cloud mode:
 
 ```python
-backend_settings = {
-    # Connection
-    "host": "localhost",
-    "port": 6379,
-    "db": 0,
-    "password": None,
-
-    # Timeouts
-    "socket_timeout": 30.0,
-    "socket_connect_timeout": 5.0,
-
-    # Retry
-    "retry_on_timeout": True,
-
-    # Optional
-    # "mode": "STANDALONE",
-    # "ssl": False,
-    # "ssl_cert_reqs": "required",
-}
+SCRAPY_ELASTICSEARCH_MODE = "cloud"
+SCRAPY_ELASTICSEARCH_CLOUD_ID = "deployment:encoded-value"
+SCRAPY_ELASTICSEARCH_API_KEY = "api-key"
 ```
 
-### Multi-Tenant Example
+Credential-bearing standalone connections over cleartext `http://` fail
+configuration validation. Use HTTPS and certificate verification.
+
+## Programmatic Mixin Configuration (`quotes_programmatic`)
+
+`backend_settings` configures direct mixin access. It does not replace the
+project's Scheduler/DupeFilter/Pipeline settings.
 
 ```python
-class TenantASpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
-    name = "tenant_a"
+class TenantSpider(BackendSpiderMixin, scrapy.Spider):
+    name = "tenant"
     backend_type = BackendType.REDIS
-    backend_settings = {"host": "redis-a.internal", "db": 0}
-
-class TenantBSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
-    name = "tenant_b"
-    backend_type = BackendType.REDIS
-    backend_settings = {"host": "redis-b.internal", "db": 0}
+    backend_settings = {
+        "host": "redis.internal",
+        "port": 6379,
+        "db": 0,
+        "namespace": "tenant-a",
+        "ssl_enabled": True,
+        "ssl_cafile": "/etc/ssl/redis-ca.pem",
+    }
 ```
 
-### Common Errors
-
-**`AttributeError: 'XSpider' object has no attribute 'setup_backend'`** — must call
-`self.setup_backend()` in `__init__`.
-
-**Spiders sharing the same Redis instance** — use distinct `db` values to isolate:
-`backend_settings = {"db": 0}` vs `backend_settings = {"db": 1}`.
-
----
-
-## 8. Multi-Mode Deployment (`quotes_multi_mode`)
-
-Demonstrates Redis Sentinel (high availability) and Cluster (sharding) configurations.
-
-```bash
-# Requires Redis Sentinel or Cluster running
-scrapy crawl quotes_multi_mode
-```
-
-### Sentinel Mode (HA with Automatic Failover)
+Scrapy-created spiders initialize this automatically. Direct construction is a
+different lifecycle and must be explicit:
 
 ```python
-SENTINEL_CONFIG = {
-    "mode": "sentinel",
-    "sentinels": ["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"],
-    "sentinel_master_name": "mymaster",
-    "sentinel_password": os.environ.get("REDIS_SENTINEL_PASSWORD", "changeme"),
-    "password": os.environ.get("REDIS_PASSWORD", "changeme"),
-    "db": 0,
-}
-```
-
-### Cluster Mode (Horizontal Sharding)
-
-```python
-CLUSTER_CONFIG = {
-    "mode": "cluster",
-    "cluster_startup_nodes": ["node1:7000", "node2:7000", "node3:7000"],
-    "password": os.environ.get("REDIS_PASSWORD", None),
-    "cluster_max_redirects": 5,
-}
-```
-
-### Docker Compose for Local Sentinel Testing
-
-```yaml
-services:
-  redis-master:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --requirepass masterpass
-
-  sentinel1:
-    image: redis:7-alpine
-    ports:
-      - "26379:26379"
-    command: |
-      redis-sentinel --sentinel announce-ip sentinel1 \
-        --sentinel monitor mymaster redis-master 6379 2 \
-        --sentinel down-after-milliseconds mymaster 5000 \
-        --sentinel failover-timeout mymaster 10000 \
-        --sentinel auth-pass mymaster masterpass
-```
-
-### Common Errors
-
-**`MasterNotFoundError: No master found`** — Sentinel cannot reach the master.
-Check master container logs and network connectivity.
-
-**`ClusterDownError: Cluster is not initialized`** — run cluster creation command
-before use.
-
----
-
-## 9. ConnectionManager API (`quotes_connection_manager`)
-
-Low-level approach using `ConnectionManager` directly instead of `BackendSpiderMixin`.
-Shows how to use `QueueBackend`, `SetBackend`, and `StorageBackend` interfaces
-programmatically for custom deduplication and storage logic.
-
-```bash
-scrapy crawl quotes_connection_manager
-```
-
-### When to Use
-
-| Aspect | `BackendSpiderMixin` | `ConnectionManager` |
-|--------|---------------------|---------------------|
-| Best for | Standard crawl workflows | Custom dedup, custom storage keys, multi-backend coordination |
-| Boilerplate | Less | More |
-| Flexibility | Fixed component roles | Full control |
-
-### Key API Patterns
-
-**Singleton manager access:**
-
-```python
-self._manager = ConnectionManager.get_manager(
-    backend_type=BackendType.REDIS,
-    settings={"host": "localhost", "port": 6379, "db": 0},
-)
-```
-
-**Backend interface accessors:**
-
-```python
-queue_backend = self._manager.get_queue_backend()    # push, pop, queue_len
-set_backend = self._manager.get_set_backend()       # add, contains, remove
-storage_backend = self._manager.get_storage_backend() # store, retrieve, delete
-```
-
-**Capability guard (queue-only backends do not support Set/Storage; RocketMQ set/storage fail fast at config time):**
-
-```python
+spider = TenantSpider()
 try:
-    set_backend = self._manager.get_set_backend()
-except (NotImplementedError, ConfigurationError):
-    set_backend = None
+    manager = spider.setup_backend()
+    storage = manager.get_storage_backend()
+    storage.store("probe", b"ok")
+finally:
+    spider.close_backend()
 ```
 
-**from_crawler() factory for signal registration:**
+Do not reuse a namespace between tenants. A Redis database number alone is not
+portable isolation for Cluster deployments.
 
-```python
-@classmethod
-def from_crawler(cls, crawler, *args, **kwargs):
-    spider = super().from_crawler(crawler, *args, **kwargs)
-    crawler.signals.connect(spider._on_spider_closed, signals.spider_closed)
-    return spider
-```
+## Redis Multi-Mode (`quotes_multi_mode`)
 
-**Spider-identity guard in signal handlers:**
-
-```python
-def _on_spider_closed(self, spider, reason=""):
-    if spider is self:
-        self._manager.close()
-```
-
-### Custom Deduplication Example
-
-```python
-def parse(self, response):
-    queue_backend = self._manager.get_queue_backend()
-    set_backend = self._get_set_backend()
-
-    for quote in response.css("div.quote"):
-        item_key = f"quote:{quote_author}:{content_hash}"
-
-        # Atomic dedup — False means already existed
-        if set_backend is not None and not set_backend.add("seen_quotes", item_key.encode()):
-            continue  # already scraped
-
-        queue_backend.push("quote_queue", item_key.encode(), priority=0.0)
-        yield item
-```
-
-### Common Errors
-
-**Connection refused** — verify Redis is running: `redis-cli ping`
-
-**Duplicate items despite deduplication** — verify the set key is consistent across
-spider restarts. Redis keys persist between runs; flush with `redis-cli FLUSHDB`
-for fresh state.
-
----
-
-## 10. Basic Spiders (`quotes`, `quotes_crawl`)
-
-Reference implementations without the scrapy-extension backend. Useful for
-understanding Scrapy fundamentals before adding distributed components.
-
-### QuotesSpider (Plain Spider)
+The example selects Sentinel by default and Cluster when requested:
 
 ```bash
-cd examples
-scrapy crawl quotes -o quotes.json
+SCRAPY_EXAMPLE_REDIS_MODE=sentinel scrapy crawl quotes_multi_mode
+SCRAPY_EXAMPLE_REDIS_MODE=cluster scrapy crawl quotes_multi_mode
 ```
+
+Its selected dictionary is applied both to the mixin and to
+`SCRAPY_BACKEND_SETTINGS`, so the extension components use the same topology.
+Use `cluster_startup_nodes`, not `startup_nodes`.
+
+## Low-Level ConnectionManager (`quotes_connection_manager`)
+
+Each successful registry acquisition owns exactly one release:
 
 ```python
-import scrapy
-from examples.items import QuoteItem
-
-class QuotesSpider(scrapy.Spider):
-    name = "quotes"
-    allowed_domains = ["quotes.toscrape.com"]
-    start_urls = ["https://quotes.toscrape.com"]
-
-    def parse(self, response):
-        for quote in response.css("div.quote"):
-            item = QuoteItem()
-            item["text"] = quote.css("span.text::text").get()
-            item["author"] = quote.css("small.author::text").get()
-            item["tags"] = quote.css("div.tags a.tag::text").getall()
-            yield item
-
-        next_page = response.css("li.next a::attr(href)").get()
-        if next_page:
-            yield response.follow(next_page, self.parse)
+manager = ConnectionManager.get_manager(
+    backend_type=BackendType.REDIS,
+    settings={"host": "localhost", "port": 6379, "namespace": "manual"},
+)
+try:
+    queue = manager.get_queue_backend()
+    seen = manager.get_set_backend()
+    storage = manager.get_storage_backend()
+finally:
+    manager.close()
 ```
 
-### QuotesCrawlSpider (Rule-Based Spider)
+Managers with the same backend type and normalized settings share a raw
+connection through reference counting. Calling `close()` twice for one
+acquisition can release another holder's reference; pair each acquisition with
+exactly one `close()`, normally in `finally`. Accessing an unsupported
+capability raises `NotImplementedError`; configuration-time component binding
+normally catches the same mismatch earlier as `ConfigurationError`.
+
+The example spider wires its own close signal because it acquires the manager
+directly. The mixin already performs that signal wiring and should not be wired
+again.
+
+## Plain Scrapy Spiders
+
+`quotes` and `quotes_crawl` override the example project's global components:
 
 ```bash
-scrapy crawl quotes_crawl -o quotes_crawl.json
+scrapy crawl quotes -O quotes.json
+scrapy crawl quotes_crawl -O quotes-crawl.json
 ```
 
-```python
-from scrapy.linkextractors import LinkExtractor
-from scrapy.spiders import CrawlSpider, Rule
-
-class QuotesCrawlSpider(CrawlSpider):
-    name = "quotes_crawl"
-    allowed_domains = ["quotes.toscrape.com"]
-    start_urls = ["https://quotes.toscrape.com"]
-
-    rules = (Rule(LinkExtractor(allow=r"/page/\d+"), callback="parse_item", follow=True),)
-
-    def parse_item(self, response):
-        for quote in response.css("div.quote"):
-            yield {
-                "text": quote.css("span.text::text").get(),
-                "author": quote.css("small.author::text").get(),
-                "tags": quote.css("div.tags a.tag::text").getall(),
-            }
-```
-
-### Spider vs CrawlSpider
-
-| Aspect | Spider | CrawlSpider |
-|--------|--------|------------|
-| Link following | Manual via `response.follow()` | Automatic via `Rule` objects |
-| Pagination | Explicit conditional in `parse()` | Declared as pattern in `LinkExtractor` |
-| Callback naming | Any method name | Cannot be named `parse` (reserved) |
-| Flexibility | Full control | Rule-based |
-
-### Adding scrapy-extension to Either
-
-Enable in `settings.py`:
-
-```python
-SCHEDULER = "scrapy_extension.schedule.scheduler.BackendScheduler"
-DUPEFILTER_CLASS = "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter"
-ITEM_PIPELINES = {"scrapy_extension.pipeline.pipeline.BackendPipeline": 300}
-SCRAPY_BACKEND_TYPE = "redis"
-```
-
-### Common Errors
-
-**`AllowedDomains list accepts only domains, not URLs`**:
-
-```python
-# Wrong:
-allowed_domains = ["https://quotes.toscrape.com"]
-# Correct:
-allowed_domains = ["quotes.toscrape.com"]
-```
-
-**`CrawlSpider callback cannot be named 'parse'`** — use `parse_item` or any other name.
-
----
-
-## Configuration
-
-### settings.py (Recommended)
-
-The default `settings.py` uses Redis. To switch backends:
-
-```python
-SCRAPY_BACKEND_TYPE = "redis"    # Default
-SCRAPY_BACKEND_TYPE = "mongodb"
-SCRAPY_BACKEND_TYPE = "kafka"    # Queue only
-SCRAPY_BACKEND_TYPE = "rabbitmq" # Queue only
-SCRAPY_BACKEND_TYPE = "elasticsearch"
-```
-
-### Environment Variables
-
-All settings can be overridden via environment variables:
-
-```bash
-export SCRAPY_BACKEND_TYPE=redis
-export SCRAPY_REDIS_HOST=localhost
-export SCRAPY_REDIS_PORT=6379
-```
-
-### Programmatic (Per-Spider)
-
-```python
-class MySpider(BackendSpiderMixin, scrapy.Spider):
-    backend_type = BackendType.REDIS
-    backend_settings = {"host": "localhost", "port": 6379, "db": 0}
-```
-
----
+They use Scrapy's standard scheduler and `RFPDupeFilter` and disable the
+extension item pipeline. They are useful controls when diagnosing whether a
+failure is in the target site, Scrapy, or a backend integration.
 
 ## Troubleshooting
 
-**`RuntimeError: setup_backend() must be called`**
-→ Ensure `self.setup_backend()` is called in `__init__` before accessing backend
-components.
+**Backend did not change after exporting an environment variable**
 
-**`BackendConnectionError`**
-→ Verify the backend is running and accessible. Check host/port in settings.
-
-**`NotImplementedError` for `get_set_backend()` or `get_storage_backend()`**
-→ Kafka and RabbitMQ only support Queue operations. Use Redis, MongoDB, or
-ElasticSearch for full features.
-
-**Spider not found**
-→ Run from the `examples/` directory, not the repo root:
+Inspect the spider's `custom_settings` and project `settings.py`. Explicit
+Scrapy values have higher precedence. Override them with Scrapy's command-line
+priority, for example:
 
 ```bash
-cd examples && scrapy list
+scrapy crawl quotes_redis -s SCRAPY_REDIS_NAMESPACE=one-off-test
+```
+
+**Queue-only backend fails capability validation**
+
+Bind only `SCRAPY_QUEUE_BACKEND_TYPE` to Kafka, RabbitMQ, Pulsar, SQS, or
+RocketMQ. Keep a set-capable backend for the default distributed dedup strategy
+and a storage-capable backend for the pipeline, or replace/disable those
+components intentionally.
+
+**`ValidationError` versus `ConfigurationError`**
+
+Pydantic field type, range, enum, and extra-field failures raise
+`ValidationError`. Unknown adapter keys, unsupported component capabilities,
+and cross-field project constraints raise `ConfigurationError`.
+
+**A renamed Redis deployment starts empty**
+
+The current namespace layout intentionally does not read old unnamespaced keys.
+Do not use `FLUSHDB` as a migration tool on a shared database. Follow the
+[migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md).
+
+**Spider not found**
+
+Run commands from the example Scrapy project:
+
+```bash
+cd examples
+scrapy list
 ```
