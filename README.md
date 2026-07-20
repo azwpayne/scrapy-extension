@@ -652,4 +652,4 @@ Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomiz
 
 ## License
 
-MIT — see [LICENSE](https://github.com/azwpayne/scrapy-extension/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/azwpayne/scrapy-extension/blob/main/.github/LICENSE).
