@@ -81,7 +81,22 @@ class TestKafkaLiterals:
   )
   def test_security_protocol_accepts_valid(self, value: str) -> None:
     """All four documented kafka-python security protocols stay valid."""
-    assert KafkaSettings(security_protocol=value).security_protocol == value
+    authentication = (
+      {
+        "sasl_mechanism": "PLAIN",
+        "sasl_username": "user",
+        "sasl_password": "secret",
+      }
+      if value.startswith("SASL_")
+      else {}
+    )
+    assert (
+      KafkaSettings(
+        security_protocol=value,  # type: ignore[arg-type]
+        **authentication,
+      ).security_protocol
+      == value
+    )
 
   def test_sasl_mechanism_rejects_lowercase(self) -> None:
     """`sasl_mechanism="plain"` silently fails auth today — must reject."""
@@ -93,22 +108,23 @@ class TestKafkaLiterals:
     with pytest.raises(ValidationError):
       KafkaSettings(sasl_mechanism="SCRAM-SH-256")  # type: ignore[arg-type]
 
-  @pytest.mark.parametrize(
-    "value",
-    ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "GSSAPI", "OAUTHBEARER"],
-  )
-  def test_sasl_mechanism_accepts_valid(self, value: str) -> None:
-    """All documented kafka-python SASL mechanisms stay valid.
-
-    ``security_protocol='SASL_SSL'`` is co-supplied so this isolates the
-    Literal type check (SV1) from the cross-field SASL-protocol coherence
-    rule (SV3-1) which would otherwise reject a lone ``sasl_mechanism``.
-    """
+  @pytest.mark.parametrize("value", ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"])
+  def test_password_sasl_mechanism_accepts_complete_credentials(
+    self, value: str
+  ) -> None:
+    """Password mechanisms remain valid with their required credential pair."""
     s = KafkaSettings(
       security_protocol="SASL_SSL",  # type: ignore[arg-type]
       sasl_mechanism=value,
+      sasl_username="user",
+      sasl_password="secret",  # type: ignore[arg-type]
     )
     assert s.sasl_mechanism == value
+
+  def test_gssapi_mechanism_accepts_ambient_kerberos_credentials(self) -> None:
+    """GSSAPI uses the process Kerberos context, not the PLAIN pair."""
+    s = KafkaSettings(security_protocol="SASL_SSL", sasl_mechanism="GSSAPI")
+    assert s.sasl_mechanism == "GSSAPI"
 
   def test_compression_type_rejects_typo(self) -> None:
     """`"snapy"` typo must reject (currently surfaces at producer create)."""
@@ -420,6 +436,26 @@ class TestKafkaModeConditional:
       )
     assert exc_info.value.setting_name == "confluent_api_secret"
 
+  @pytest.mark.parametrize(
+    ("api_key", "api_secret", "setting_name"),
+    [
+      (" ", "secret", "confluent_api_key"),
+      ("key", "\t", "confluent_api_secret"),
+      (" ", "\n", "confluent_api_key"),
+    ],
+  )
+  def test_confluent_rejects_blank_credentials(
+    self, api_key: str, api_secret: str, setting_name: str
+  ) -> None:
+    """Explicit whitespace cannot downgrade Confluent to SDK PLAINTEXT defaults."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        mode=KafkaMode.CONFLUENT,
+        confluent_api_key=api_key,  # type: ignore[arg-type]
+        confluent_api_secret=api_secret,  # type: ignore[arg-type]
+      )
+    assert exc_info.value.setting_name == setting_name
+
   def test_confluent_accepts_key_and_secret(self) -> None:
     """CONFLUENT + key + secret is valid (the intended Confluent Cloud path)."""
     s = KafkaSettings(
@@ -428,6 +464,15 @@ class TestKafkaModeConditional:
       confluent_api_secret="secret",  # type: ignore[arg-type]
     )
     assert s.confluent_api_key is not None
+
+  def test_non_confluent_rejects_ignored_confluent_credentials(self) -> None:
+    """Dedicated cloud credentials cannot be silently ignored in another mode."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        confluent_api_key="key",  # type: ignore[arg-type]
+        confluent_api_secret="secret",  # type: ignore[arg-type]
+      )
+    assert exc_info.value.setting_name == "mode"
 
 
 class TestRabbitMQModeConditional:
@@ -741,6 +786,57 @@ class TestSV3KafkaSaslRequiresSaslProtocol:
       sasl_password="secret",  # type: ignore[arg-type]
     )
     assert s.security_protocol == "SASL_SSL"
+
+  def test_sasl_protocol_requires_explicit_mechanism(self) -> None:
+    """The SDK default is not an authentication policy."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(security_protocol="SASL_SSL")
+    assert exc_info.value.setting_name == "sasl_mechanism"
+
+  @pytest.mark.parametrize("mechanism", ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"])
+  @pytest.mark.parametrize(
+    ("username", "password", "setting_name"),
+    [
+      (None, "secret", "sasl_username"),
+      ("user", None, "sasl_password"),
+      (" ", "secret", "sasl_username"),
+      ("user", "\t", "sasl_password"),
+    ],
+  )
+  def test_password_mechanism_rejects_partial_or_blank_pair(
+    self,
+    mechanism: str,
+    username: str | None,
+    password: str | None,
+    setting_name: str,
+  ) -> None:
+    """PLAIN and SCRAM never silently omit incomplete credentials."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        security_protocol="SASL_SSL",
+        sasl_mechanism=mechanism,
+        sasl_username=username,
+        sasl_password=password,  # type: ignore[arg-type]
+      )
+    assert exc_info.value.setting_name == setting_name
+
+  def test_gssapi_rejects_ignored_plain_credentials(self) -> None:
+    """Mechanism-inconsistent fields must not create a false auth belief."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        security_protocol="SASL_SSL",
+        sasl_mechanism="GSSAPI",
+        sasl_username="ignored-user",
+        sasl_password="ignored-secret",  # type: ignore[arg-type]
+      )
+    assert exc_info.value.setting_name == "sasl_username"
+    assert "ignored-secret" not in str(exc_info.value)
+
+  def test_oauthbearer_rejected_without_token_provider_support(self) -> None:
+    """Advertised OAuth without a provider would fail later inside the SDK."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(security_protocol="SASL_SSL", sasl_mechanism="OAUTHBEARER")
+    assert exc_info.value.setting_name == "sasl_mechanism"
 
   def test_no_sasl_with_plaintext_accepted(self) -> None:
     """No SASL fields + ``PLAINTEXT`` → valid (the default unauthenticated)."""

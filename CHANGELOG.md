@@ -57,6 +57,13 @@ upgrading.
   against the replacement topic. It now fails before admin I/O; perform a
   stopped, operator-controlled drain/reset instead. Topic creation also checks
   the admin response's per-topic error code before caching success.
+- **Kafka authentication is now mechanism-complete.** SASL transports require
+  an explicit mechanism; PLAIN/SCRAM require a non-empty username/password
+  pair, while GSSAPI preserves ambient Kerberos and rejects ignored PLAIN
+  fields. OAUTHBEARER now fails fast because no token-provider setting exists.
+  Empty Confluent keys/secrets can no longer fall through to SDK plaintext
+  defaults, credentials in non-Confluent modes are no longer silently ignored,
+  and post-construction credential mutation is rechecked before client I/O.
 - **RabbitMQ `clear_queue()` now rejects in-flight deliveries.** Rabbit's purge
   excludes unacknowledged messages, which could previously be nacked after a
   successful clear and resurrect pre-clear work. Exact per-queue pending counts

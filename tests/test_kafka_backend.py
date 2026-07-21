@@ -172,21 +172,61 @@ class TestKafkaBackendBuildCommonConfig:
     assert result["ssl_keyfile"] == "/path/to/keyfile"
     assert result["ssl_check_hostname"] is True
 
-  def test_build_common_config_with_sasl_ssl_partial(self):
-    """Test config building with SASL/SSL but missing some credentials."""
+  def test_build_common_config_with_gssapi(self):
+    """Ambient Kerberos auth still emits the selected SDK mechanism."""
     config = KafkaSettings(
       security_protocol="SASL_SSL",
-      sasl_mechanism="PLAIN",
-      # sasl_username and sasl_password not set
+      sasl_mechanism="GSSAPI",
     )
     backend = KafkaBackend(config)
 
     result = backend._build_common_config()
 
     assert result["security_protocol"] == "SASL_SSL"
-    assert "sasl_mechanism" not in result
+    assert result["sasl_mechanism"] == "GSSAPI"
     assert "sasl_plain_username" not in result
     assert "sasl_plain_password" not in result
+
+  def test_connect_revalidates_mutated_sasl_password_before_sdk_io(self, mocker):
+    """A valid model cannot be downgraded after backend construction."""
+    config = KafkaSettings(
+      security_protocol="SASL_SSL",
+      sasl_mechanism="PLAIN",
+      sasl_username="user",
+      sasl_password="secret",
+    )
+    backend = KafkaBackend(config)
+    config.sasl_password = " "  # type: ignore[assignment]
+    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert exc_info.value.setting_name == "sasl_password"
+    producer.assert_not_called()
+    admin.assert_not_called()
+
+  def test_connect_revalidates_mutated_confluent_secret_before_sdk_io(
+    self, mocker
+  ):
+    """A blank post-construction cloud secret cannot select PLAINTEXT."""
+    config = KafkaSettings(
+      mode=KafkaMode.CONFLUENT,
+      confluent_api_key="key",
+      confluent_api_secret="secret",
+    )
+    backend = KafkaBackend(config)
+    config.confluent_api_secret = ""  # type: ignore[assignment]
+    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert exc_info.value.setting_name == "confluent_api_secret"
+    producer.assert_not_called()
+    admin.assert_not_called()
 
   def test_build_common_config_ssl_no_cafile(self):
     """Test config building with SSL but no CA file."""

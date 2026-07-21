@@ -43,7 +43,6 @@ from scrapy_extension.backends.base import (
     BackendType,
     QueueBackend,
     _get_mode_text,
-    secret_value,
 )
 from scrapy_extension.exceptions import (
     BackendConnectionError,
@@ -51,6 +50,7 @@ from scrapy_extension.exceptions import (
     QueueError,
 )
 from scrapy_extension.settings import KafkaMode
+from scrapy_extension.settings.kafka import validate_kafka_authentication
 
 # Topic name validation pattern - only allow alphanumeric, dots, underscores, hyphens
 # Uses \Z instead of $ to match only at absolute end of string (not before trailing newline)
@@ -335,6 +335,9 @@ class KafkaBackend(Backend, QueueBackend):
         setting_name="mode",
         setting_value=self.config.mode,
       )
+    # Pydantic models are mutable after construction. Revalidate auth before
+    # any SDK object can observe a post-construction downgrade.
+    self._validated_authentication()
     try:
       if self.config.mode == KafkaMode.STANDALONE:
         self._connect_standalone()
@@ -387,6 +390,9 @@ class KafkaBackend(Backend, QueueBackend):
     Returns:
         Dictionary of Kafka client configuration options.
     """
+    mechanism, username, password, _api_key, _api_secret = (
+      self._validated_authentication()
+    )
     config: dict[str, Any] = {
       "acks": self.config.acks,
       "retries": self.config.retries,
@@ -401,14 +407,11 @@ class KafkaBackend(Backend, QueueBackend):
     if self.config.security_protocol != "PLAINTEXT":
       config["security_protocol"] = self.config.security_protocol
 
-      if (
-        self.config.sasl_mechanism
-        and self.config.sasl_username
-        and self.config.sasl_password
-      ):
-        config["sasl_mechanism"] = self.config.sasl_mechanism
-        config["sasl_plain_username"] = self.config.sasl_username
-        config["sasl_plain_password"] = _RedactedStr(secret_value(self.config.sasl_password))
+      if mechanism is not None:
+        config["sasl_mechanism"] = mechanism
+      if username is not None and password is not None:
+        config["sasl_plain_username"] = username
+        config["sasl_plain_password"] = _RedactedStr(password)
 
       if self.config.ssl_cafile:
         config["ssl_cafile"] = self.config.ssl_cafile
@@ -420,6 +423,20 @@ class KafkaBackend(Backend, QueueBackend):
 
     return config
 
+  def _validated_authentication(
+    self,
+  ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """Revalidate and extract the current mechanism-aware credentials."""
+    return validate_kafka_authentication(
+      self.config.mode,
+      self.config.security_protocol,
+      self.config.sasl_mechanism,
+      self.config.sasl_username,
+      self.config.sasl_password,
+      self.config.confluent_api_key,
+      self.config.confluent_api_secret,
+    )
+
   def _bootstrap_servers(self) -> str:
     """Return bootstrap servers for the current Kafka mode."""
     if self.config.mode == KafkaMode.CLUSTER and self.config.cluster_brokers:
@@ -430,17 +447,16 @@ class KafkaBackend(Backend, QueueBackend):
 
   def _build_client_security_config(self) -> dict[str, Any]:
     """Build consumer/admin-safe security config without producer-only args."""
+    _mechanism, _username, _password, api_key, api_secret = (
+      self._validated_authentication()
+    )
     if self.config.mode == KafkaMode.CONFLUENT:
-      if self.config.confluent_api_key and self.config.confluent_api_secret:
+      if api_key is not None and api_secret is not None:
         return {
           "security_protocol": "SASL_SSL",
           "sasl_mechanism": "PLAIN",
-          "sasl_plain_username": _RedactedStr(
-            secret_value(self.config.confluent_api_key)
-          ),
-          "sasl_plain_password": _RedactedStr(
-            secret_value(self.config.confluent_api_secret)
-          ),
+          "sasl_plain_username": _RedactedStr(api_key),
+          "sasl_plain_password": _RedactedStr(api_secret),
         }
 
     common_config = self._build_common_config()

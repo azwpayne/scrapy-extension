@@ -20,7 +20,11 @@ from scrapy_extension.backends.kafka import (
   _KafkaAckToken,
   _validate_topic_name,
 )
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 from scrapy_extension.settings import KafkaMode, KafkaSettings
 
 
@@ -373,20 +377,19 @@ def test_queue_len_raises_on_temp_consumer_kafka_error(mocker) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_client_security_config_confluent_without_keys_falls_through(mocker) -> None:
-  """Line 268->280: CONFLUENT mode WITHOUT both confluent_api_key +
-  confluent_api_secret falls through the SASL_SSL branch to the
-  common-config subset (a half-configured CONFLUENT backend must not
-  hand the consumer a partial SASL dict)."""
+def test_build_client_security_config_confluent_without_keys_fails_closed(mocker) -> None:
+  """A mutated half-configured Confluent backend cannot fall back to plaintext."""
   backend = _backend()
   backend.config.mode = KafkaMode.CONFLUENT  # confluent keys stay None (default)
-  mocker.patch.object(
+  common_config = mocker.patch.object(
     backend, "_build_common_config", return_value={"security_protocol": "PLAINTEXT"}
   )
-  result = backend._build_client_security_config()
-  # Fell through to the common-config subset, NOT the SASL_SSL dict:
-  assert result == {"security_protocol": "PLAINTEXT"}
-  assert "sasl_plain_password" not in result
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend._build_client_security_config()
+
+  assert exc_info.value.setting_name == "confluent_api_key"
+  common_config.assert_not_called()
 
 
 def test_pop_with_ack_returns_none_tuple_when_queue_empty(mocker) -> None:

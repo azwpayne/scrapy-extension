@@ -130,6 +130,13 @@ SCRAPY_BACKEND_TYPE = "kafka"
 SCRAPY_KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 ```
 
+Kafka authentication is mechanism-aware and fails before client I/O when it is
+incomplete. `PLAIN` and `SCRAM-SHA-*` require a non-empty username/password
+pair; `GSSAPI` uses the ambient Kerberos context and must not carry the ignored
+PLAIN pair. `OAUTHBEARER` is rejected because this backend does not expose the
+token-provider object required by kafka-python. Confluent mode requires a
+non-empty API key and secret and always builds a `SASL_SSL` client.
+
 ### RabbitMQ (standalone, cluster, mirrored_queues)
 
 ```python

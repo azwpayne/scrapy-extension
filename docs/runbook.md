@@ -259,6 +259,13 @@ Common causes (round-9 SV1–SV5 close all of these):
 | "endpoint_url must be http:// or https://" | LocalStack/AWS endpoint scheme (SEC-4) | `settings/{sqs,dynamodb}.py` |
 | "aws_access_key_id and aws_secret_access_key must both be set" | Half-configured AWS creds | `settings/{sqs,dynamodb}.py` (config-time), `backends/connectors.py` (connect-time SEC-7) |
 
+For Kafka, diagnose SASL failures by mechanism rather than assuming every mode
+uses a username/password pair. PLAIN and SCRAM require both non-empty fields;
+GSSAPI obtains credentials from the process Kerberos context. OAUTHBEARER is
+not configurable through this backend. Confluent mode requires its dedicated
+non-empty API key and secret. Validation errors name fields but never include
+credential values.
+
 If the error is in a backend's `from_settings` / `from_crawler` factory,
 check `backends/connectors.py:resolve_backend_config` — it resolves
 per-component config and is the single chokepoint for the fallback chain.

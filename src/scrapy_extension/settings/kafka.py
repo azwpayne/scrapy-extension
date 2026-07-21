@@ -29,6 +29,153 @@ class KafkaMode(str, Enum):
   CONFLUENT = "confluent"
 
 
+_KAFKA_SECURITY_PROTOCOLS = frozenset(
+  {"PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"}
+)
+_PASSWORD_SASL_MECHANISMS = frozenset(
+  {"PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"}
+)
+
+
+def _kafka_credential_value(value: object, field_name: str) -> str | None:
+  """Return a non-empty credential without retaining it in failures."""
+  if value is None:
+    return None
+  if isinstance(value, SecretStr):
+    raw_value = value.get_secret_value()
+  elif isinstance(value, str):
+    raw_value = value
+  else:
+    raise ConfigurationError(
+      f"{field_name} must be a string when explicitly configured.",
+      setting_name=field_name,
+    )
+  if not raw_value.strip():
+    raise ConfigurationError(
+      f"{field_name} must be non-empty when explicitly configured.",
+      setting_name=field_name,
+    )
+  return raw_value
+
+
+def validate_kafka_authentication(
+  mode: object,
+  security_protocol: object,
+  sasl_mechanism: object,
+  sasl_username: object,
+  sasl_password: object,
+  confluent_api_key: object,
+  confluent_api_secret: object,
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+  """Validate one mechanism-aware Kafka authentication value set.
+
+  The raw values returned here are intended only for immediate SDK config
+  construction. Callers retaining them must use a repr-redacting wrapper.
+  Invalid credentials are never attached to the raised exception.
+  """
+  if security_protocol not in _KAFKA_SECURITY_PROTOCOLS:
+    raise ConfigurationError(
+      "security_protocol must be a supported Kafka protocol.",
+      setting_name="security_protocol",
+    )
+  protocol = str(security_protocol)
+  sasl_fields_set = (
+    sasl_username is not None
+    or sasl_password is not None
+    or sasl_mechanism is not None
+  )
+  sasl_enabled = protocol.startswith("SASL_")
+  if sasl_fields_set and not sasl_enabled:
+    raise ConfigurationError(
+      (
+        "SASL credentials (sasl_username / sasl_password / sasl_mechanism) "
+        "require a 'SASL_'-prefixed security_protocol "
+        "('SASL_PLAINTEXT' or 'SASL_SSL'); kafka-python silently ignores "
+        "the SASL fields otherwise (auth never attempted). "
+        f"Got security_protocol={protocol!r}."
+      ),
+      setting_name="security_protocol",
+      setting_value=protocol,
+    )
+
+  mechanism: str | None = None
+  username: str | None = None
+  password: str | None = None
+  if sasl_enabled:
+    if not isinstance(sasl_mechanism, str) or not sasl_mechanism:
+      raise ConfigurationError(
+        "A SASL security_protocol requires an explicit sasl_mechanism.",
+        setting_name="sasl_mechanism",
+      )
+    mechanism = sasl_mechanism
+    if mechanism in _PASSWORD_SASL_MECHANISMS:
+      username = _kafka_credential_value(sasl_username, "sasl_username")
+      if username is None:
+        raise ConfigurationError(
+          f"{mechanism} authentication requires sasl_username.",
+          setting_name="sasl_username",
+        )
+      password = _kafka_credential_value(sasl_password, "sasl_password")
+      if password is None:
+        raise ConfigurationError(
+          f"{mechanism} authentication requires sasl_password.",
+          setting_name="sasl_password",
+        )
+    elif mechanism == "GSSAPI":
+      if sasl_username is not None or sasl_password is not None:
+        raise ConfigurationError(
+          "GSSAPI uses ambient Kerberos credentials; sasl_username and "
+          "sasl_password would be ignored.",
+          setting_name=(
+            "sasl_username" if sasl_username is not None else "sasl_password"
+          ),
+        )
+    elif mechanism == "OAUTHBEARER":
+      raise ConfigurationError(
+        "OAUTHBEARER is unsupported because this backend does not expose the "
+        "token-provider object required by kafka-python.",
+        setting_name="sasl_mechanism",
+      )
+    else:
+      raise ConfigurationError(
+        "sasl_mechanism must be supported by this Kafka backend.",
+        setting_name="sasl_mechanism",
+      )
+
+  key: str | None = None
+  secret: str | None = None
+  confluent_fields_set = (
+    confluent_api_key is not None or confluent_api_secret is not None
+  )
+  if mode == KafkaMode.CONFLUENT:
+    missing = []
+    if confluent_api_key is None:
+      missing.append("confluent_api_key")
+    if confluent_api_secret is None:
+      missing.append("confluent_api_secret")
+    if missing:
+      fields = " and ".join(missing)
+      raise ConfigurationError(
+        (
+          f"Kafka CONFLUENT mode requires '{fields}' to be set. "
+          "Without them the client could fall back to an unauthenticated "
+          "SDK transport."
+        ),
+        setting_name=missing[0],
+      )
+    key = _kafka_credential_value(confluent_api_key, "confluent_api_key")
+    secret = _kafka_credential_value(
+      confluent_api_secret, "confluent_api_secret"
+    )
+  elif confluent_fields_set:
+    raise ConfigurationError(
+      "Confluent API credentials require mode='confluent'; other modes ignore them.",
+      setting_name="mode",
+    )
+
+  return mechanism, username, password, key, secret
+
+
 class KafkaSettings(BaseSettings):
   """Kafka-specific settings for all deployment modes.
 
@@ -223,76 +370,15 @@ class KafkaSettings(BaseSettings):
   )
 
   @model_validator(mode="after")
-  def _validate_sasl_requires_sasl_protocol(self) -> KafkaSettings:
-    """SV3-1 (H): SASL fields set → ``security_protocol`` must start with ``SASL_``.
-
-    kafka-python only consults ``sasl_username`` / ``sasl_password`` /
-    ``sasl_mechanism`` when ``security_protocol`` is ``SASL_PLAINTEXT`` or
-    ``SASL_SSL``. With any other protocol (``PLAINTEXT`` / ``SSL``) the SASL
-    fields are silently ignored — the operator believes auth is enforced
-    while the broker never sees an authentication attempt. This is a silent
-    auth-bypass footgun; fail-fast at config time.
-
-    Mirrors the Confluent-mode validator (raise, not warn — deterministic +
-    the project's ``error::UserWarning`` filter makes warn-by-default risky).
-
-    Raises:
-        ConfigurationError: if any SASL field is set and ``security_protocol``
-            does not start with ``SASL_``.
-    """
-    sasl_fields_set = (
-      self.sasl_username is not None
-      or self.sasl_password is not None
-      or self.sasl_mechanism is not None
+  def _validate_authentication(self) -> KafkaSettings:
+    """Fail fast on incomplete or mechanism-inconsistent authentication."""
+    validate_kafka_authentication(
+      self.mode,
+      self.security_protocol,
+      self.sasl_mechanism,
+      self.sasl_username,
+      self.sasl_password,
+      self.confluent_api_key,
+      self.confluent_api_secret,
     )
-    if sasl_fields_set and not self.security_protocol.startswith("SASL_"):
-      raise ConfigurationError(
-        (
-          "SASL credentials (sasl_username / sasl_password / sasl_mechanism) "
-          "require a 'SASL_'-prefixed security_protocol "
-          "('SASL_PLAINTEXT' or 'SASL_SSL'); kafka-python silently ignores "
-          "the SASL fields otherwise (auth never attempted). "
-          f"Got security_protocol={self.security_protocol!r}."
-        ),
-        setting_name="security_protocol",
-        setting_value=self.security_protocol,
-      )
-    return self
-
-  @model_validator(mode="after")
-  def _validate_confluent_requirements(self) -> KafkaSettings:
-    """SV2: CONFLUENT mode requires API key + secret.
-
-    Without ``confluent_api_key`` + ``confluent_api_secret``, the connect
-    path silently falls back to ``bootstrap_servers`` (default
-    ``localhost:9092``) with PLAINTEXT — the operator asked for Confluent
-    Cloud but the client never reaches it, surfacing as an opaque connection
-    timeout against localhost. ``confluent_bootstrap_servers`` is NOT
-    required because some operators reuse the global ``bootstrap_servers``
-    for the Confluent broker list; the API key/secret are the unambiguous
-    Confluent intent signal.
-
-    Raises:
-        ConfigurationError: if CONFLUENT mode is selected without the API
-            key/secret pair.
-    """
-    if self.mode != KafkaMode.CONFLUENT:
-      return self
-    missing = []
-    if self.confluent_api_key is None:
-      missing.append("confluent_api_key")
-    if self.confluent_api_secret is None:
-      missing.append("confluent_api_secret")
-    if missing:
-      fields = " and ".join(missing)
-      raise ConfigurationError(
-        (
-          f"Kafka CONFLUENT mode requires '{fields}' to be set. "
-          "Without them the client silently falls back to PLAINTEXT "
-          "localhost (bootstrap_servers default), never reaching Confluent "
-          "Cloud. If you intend SASL/SSL against a non-Confluent broker, "
-          "use STANDALONE or CLUSTER mode with the SASL_* settings."
-        ),
-        setting_name=missing[0],
-      )
     return self

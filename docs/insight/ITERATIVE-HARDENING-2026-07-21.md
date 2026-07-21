@@ -184,10 +184,14 @@ speculative work.
   incomplete RocketMQ key pairs without retaining secret values.
 - [x] **SEC-01B2A — Pulsar credential completeness.** Reject blank explicit
   tokens and service-URL userinfo without retaining their values.
+- [x] **SEC-01B2B-K — Kafka credential completeness.** Require an explicit SASL
+  mechanism, complete non-empty PLAIN/SCRAM pairs and Confluent key pairs,
+  preserve ambient GSSAPI, and reject unsupported OAUTH configuration instead
+  of silently omitting authentication.
 - [ ] **SEC-01B2B — remaining broker credential completeness.** Reject empty
   explicit secrets, URL/URI userinfo, and mechanism-inconsistent authentication
-  for Kafka, MongoDB, and Elasticsearch. Preserve valid mechanism-specific
-  modes rather than requiring a universal username/password pair.
+  for MongoDB and Elasticsearch. Preserve valid mechanism-specific modes rather
+  than requiring a universal username/password pair.
 - [x] **SEC-02A — AWS cloud transport.** Reject URL userinfo and explicit
   plaintext SQS/DynamoDB endpoints in cloud mode while retaining HTTP support
   for explicit standalone LocalStack-compatible endpoints.
@@ -247,6 +251,11 @@ speculative work.
 - [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
   default noreply mode so storage mutation success is based on a parsed server
   response rather than an unconfirmed socket write.
+- [ ] **BACKEND-07 — confirmed Kafka/MongoDB mutations.** Reject Kafka `acks=0`
+  and MongoDB unacknowledged write concerns so public queue/set/storage success
+  cannot mean only a local socket-buffer handoff. Wire Kafka's advertised topic
+  durability settings into creation and reject internally inconsistent
+  replication/min-ISR configurations.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -904,3 +913,23 @@ the rationale. All 49 local Memcached tests passed on Python 3.10 and 3.14 with
 one real-service test explicitly skipped; the full Python 3.10 suite passed
 3,136 tests with 45 documented skips. Ruff, strict mypy, and patch integrity
 remained green.
+
+### I25 — Kafka mechanism-aware authentication completeness
+
+Twenty-one initial RED outcomes showed that SASL transports accepted no
+mechanism, PLAIN/SCRAM accepted partial or whitespace-only credentials,
+GSSAPI was never passed to the SDK, and OAUTHBEARER was advertised without the
+required token-provider surface. Empty Confluent key pairs passed settings
+validation and then missed the truthy builder branch, allowing kafka-python's
+default plaintext configuration. A model mutated after construction could take
+the same downgrade path before client creation.
+
+A shared mechanism-aware validator now runs at settings construction and again
+at every SDK-config boundary. PLAIN and SCRAM require complete non-empty pairs;
+GSSAPI preserves ambient Kerberos and rejects ignored PLAIN fields;
+OAUTHBEARER fails explicitly until a provider surface exists. Confluent
+credentials are complete, non-empty, and exclusive to Confluent mode, and both
+cloud credentials plus password values are repr-redacted in SDK dictionaries.
+All 370 related tests passed on Python 3.10 and 3.14 with two real-broker tests
+explicitly skipped; the full Python 3.10 suite passed 3,156 tests with 45
+documented skips. Ruff, strict mypy, and patch integrity remained green.

@@ -270,6 +270,13 @@ replacement topic. Stop all producers and consumers, drain or delete the topic
 with Kafka's operator tooling, verify cluster metadata convergence, and choose
 an intentional consumer-group offset policy before restarting.
 
+Kafka SASL validation is now mechanism-specific. `SASL_*` without a mechanism,
+incomplete or blank PLAIN/SCRAM credentials, GSSAPI combined with ignored
+PLAIN fields, and blank Confluent keys/secrets all fail before SDK I/O.
+GSSAPI continues to use the ambient Kerberos context. OAUTHBEARER configurations
+must migrate to a supported mechanism or a separately managed client because
+this backend does not expose kafka-python's required token-provider object.
+
 RabbitMQ `clear_queue()` now fails with `QueueError` when the target queue has
 an unacknowledged local delivery. RabbitMQ purge only removes ready messages;
 allowing a later nack would otherwise resurrect work from before the clear.
