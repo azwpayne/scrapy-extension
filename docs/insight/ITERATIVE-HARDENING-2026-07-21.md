@@ -208,10 +208,13 @@ speculative work.
   asynchronous clear implementation with an explicit unsupported boundary.
   RUN-08 already supplies the cross-backend-incarnation fence; it does not make
   two deliveries of the same offset distinguishable.
-- [ ] **BACKEND-04 — broker terminal and clear semantics.** Make direct
-  Pulsar/SQS token settlement one-shot and retryable, and specify honest
-  lifecycle barriers for RabbitMQ in-flight deliveries and SQS's asynchronous
-  purge window.
+- [x] **BACKEND-04A — SQS terminal settlement.** Make direct SQS ack tokens
+  one-shot across ack/nack, preserve retryability after broker/disconnect
+  failures, and keep the token path independent of the legacy receipt slot.
+- [ ] **BACKEND-04B — remaining terminal and clear semantics.** Make direct
+  Pulsar token settlement one-shot and retryable, and specify honest lifecycle
+  barriers for RabbitMQ in-flight deliveries and SQS's asynchronous purge
+  window.
 - [x] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
@@ -691,3 +694,22 @@ with the new topic. Operators must quiesce and reset Kafka deliberately. The 12
 exact boundary tests passed on Python 3.14, 302 related Kafka/queue-strategy
 tests passed on Python 3.10, and the full suite passed 3,046 tests with 44
 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I17a — SQS single-outcome acknowledgement tokens
+
+Nine initial RED outcomes showed that the same SQS receipt token could issue
+duplicate deletes, execute both ack and nack, or silently become locally
+settled while the client was disconnected. An untracked token produced after
+the diagnostic cap had the same correctness gap, broker failures were not
+explicitly represented as a retryable token state, and token-aware pops also
+populated the legacy last-receipt slot.
+
+Each token now owns a lock-protected `pending -> settling -> acked|nacked`
+state machine. The lock spans its broker call, so concurrent ack/nack callers
+observe one final outcome; a failed call restores `pending`, retains diagnostic
+tracking, and can be retried. Settlement while disconnected raises a typed
+error instead of claiming success. Correctness lives on the token even when
+the bounded diagnostic set overflows, and `pop_with_ack()` no longer creates a
+second legacy path to the same receipt. All 99 SQS contract tests passed on
+Python 3.10 and 3.14, and the full suite passed 3,053 tests with 44 documented
+skips. Ruff, strict mypy, and patch integrity remained green.

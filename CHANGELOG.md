@@ -57,6 +57,12 @@ upgrading.
   against the replacement topic. It now fails before admin I/O; perform a
   stopped, operator-controlled drain/reset instead. Topic creation also checks
   the admin response's per-topic error code before caching success.
+- **SQS acknowledgement tokens now have one terminal outcome.** Repeating a
+  direct token ack/nack, or invoking the opposite action after success, no
+  longer issues another broker call. Broker and disconnect failures keep the
+  token retryable and raise `QueueError`; token-aware pops no longer populate
+  the legacy last-receipt slot. Direct callers that relied on disconnected
+  settlement being a silent success must now retry after reconnection.
 - **Malformed broker payloads are terminally consumed.** When deserialization
   deterministically fails and an ack token exists, `BackendQueue` attempts to
   ack/drop the delivery, increments `scheduler/queue/poison_dropped`, and still

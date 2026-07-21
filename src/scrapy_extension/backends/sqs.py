@@ -26,6 +26,8 @@ import hashlib
 import logging
 import math
 import re
+import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -136,7 +138,12 @@ class _SqsAckToken:
       receipt_handle: The SQS ReceiptHandle of the popped message.
   """
 
-  __slots__ = ("queue_url", "receipt_handle")
+  __slots__ = (
+    "_settlement_lock",
+    "_settlement_state",
+    "queue_url",
+    "receipt_handle",
+  )
 
   def __init__(self, queue_url: str, receipt_handle: str) -> None:
     """Initialize the token.
@@ -147,6 +154,38 @@ class _SqsAckToken:
     """
     self.queue_url = queue_url
     self.receipt_handle = receipt_handle
+    self._settlement_lock = threading.Lock()
+    self._settlement_state = "pending"
+
+  def _settle(
+    self, terminal_state: str, operation: Callable[[], None]
+  ) -> bool:
+    """Run exactly one terminal broker operation for this delivery.
+
+    The per-token lock remains held across the broker call. A competing ack
+    or nack therefore observes either the restored ``pending`` state after a
+    failure (and may retry) or the final terminal state after success. It can
+    never report a no-op success while another settlement is still uncertain.
+
+    Args:
+        terminal_state: State to publish after a successful broker operation.
+        operation: Broker operation to execute while the token is claimed.
+
+    Returns:
+        True when this call performed and completed the broker operation;
+        False when the token was already terminal.
+    """
+    with self._settlement_lock:
+      if self._settlement_state != "pending":
+        return False
+      self._settlement_state = "settling"
+      completed = False
+      try:
+        operation()
+        completed = True
+      finally:
+        self._settlement_state = terminal_state if completed else "pending"
+      return True
 
   def __eq__(self, other: object) -> bool:
     if not isinstance(other, _SqsAckToken):
@@ -201,6 +240,7 @@ class SqsBackend(Backend, QueueBackend):
     self._client: Any = None
     self._queue_urls: dict[str, str] = {}
     self._in_flight: set[_SqsAckToken] = set()
+    self._in_flight_lock = threading.Lock()
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
     self._last_receipt: tuple[str, str] | None = None
@@ -252,8 +292,9 @@ class SqsBackend(Backend, QueueBackend):
         self._client.close()
       self._client = None
     self._queue_urls.clear()
-    self._in_flight.clear()
-    self._last_receipt = None
+    with self._in_flight_lock:
+      self._in_flight.clear()
+      self._last_receipt = None
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
@@ -414,9 +455,6 @@ class SqsBackend(Backend, QueueBackend):
       return (None, None)
     token = _SqsAckToken(queue_url=url, receipt_handle=receipt)
     self._track_in_flight(token)
-    # Keep _last_receipt in sync so the legacy ack(token=None) path stays
-    # usable for callers that don't thread the token through.
-    self._last_receipt = (url, receipt)
     return (body, token)
 
   def _track_in_flight(self, token: _SqsAckToken) -> None:
@@ -433,18 +471,57 @@ class SqsBackend(Backend, QueueBackend):
     Args:
         token: The :class:`_SqsAckToken` to track.
     """
-    if len(self._in_flight) < _MAX_IN_FLIGHT:
-      self._in_flight.add(token)
+    with self._in_flight_lock:
+      if len(self._in_flight) < _MAX_IN_FLIGHT:
+        self._in_flight.add(token)
+        return
+      if not self._in_flight_overflow_warned:
+        self._in_flight_overflow_warned = True
+        logger.warning(
+          "SQS in-flight ack-token set at cap (%d) — further unacked pops "
+          "will not be tracked in the diagnostic set. This indicates slow "
+          "acks or an ack leak; the broker still tracks receipt handles "
+          "so ack correctness is unaffected.",
+          _MAX_IN_FLIGHT,
+        )
+
+  def _settle_token(self, token: _SqsAckToken, *, action: str) -> None:
+    """Settle ``token`` once, restoring it to retryable state on failure."""
+
+    def broker_operation() -> None:
+      client = self._client
+      if client is None:
+        raise QueueError(
+          f"Cannot {action} SQS message while backend is disconnected.",
+          operation=action,
+        )
+      try:
+        if action == "ack":
+          client.delete_message(
+            QueueUrl=token.queue_url, ReceiptHandle=token.receipt_handle
+          )
+        elif action == "nack":
+          client.change_message_visibility(
+            QueueUrl=token.queue_url,
+            ReceiptHandle=token.receipt_handle,
+            VisibilityTimeout=0,
+          )
+        else:  # pragma: no cover - private helper has two fixed callers
+          raise ValueError(f"Unsupported SQS settlement action: {action}")
+      except QueueError:
+        raise
+      except Exception as e:
+        raise QueueError(
+          f"Failed to {action} SQS message.", operation=action
+        ) from e
+
+    terminal_state = "acked" if action == "ack" else "nacked"
+    if not token._settle(terminal_state, broker_operation):
       return
-    if not self._in_flight_overflow_warned:
-      self._in_flight_overflow_warned = True
-      logger.warning(
-        "SQS in-flight ack-token set at cap (%d) — further unacked pops "
-        "will not be tracked in the diagnostic set. This indicates slow "
-        "acks or an ack leak; the broker still tracks receipt handles "
-        "so ack correctness is unaffected.",
-        _MAX_IN_FLIGHT,
-      )
+    with self._in_flight_lock:
+      self._in_flight.discard(token)
+      if self._last_receipt == (token.queue_url, token.receipt_handle):
+        self._last_receipt = None
 
   def _receive(
     self, queue_name: str, timeout: float
@@ -547,23 +624,7 @@ class SqsBackend(Backend, QueueBackend):
     """
     del queue_name
     if isinstance(token, _SqsAckToken):
-      if self._client is None:
-        self._in_flight.discard(token)
-        if self._last_receipt == (token.queue_url, token.receipt_handle):
-          self._last_receipt = None
-        return
-      try:
-        self._client.delete_message(
-          QueueUrl=token.queue_url, ReceiptHandle=token.receipt_handle
-        )
-      except Exception as e:
-        raise QueueError(f"Failed to ack SQS message: {e}", operation="ack") from e
-      else:
-        self._in_flight.discard(token)
-        # Keep _last_receipt coherent if the legacy slot pointed at the
-        # same handle (single-process sanity; harmless otherwise).
-        if self._last_receipt == (token.queue_url, token.receipt_handle):
-          self._last_receipt = None
+      self._settle_token(token, action="ack")
       return
     if token is not None:
       # A token from another backend/generation must never fall through and
@@ -595,21 +656,7 @@ class SqsBackend(Backend, QueueBackend):
     """
     del queue_name
     if isinstance(token, _SqsAckToken):
-      try:
-        if self._client is not None:
-          self._client.change_message_visibility(
-            QueueUrl=token.queue_url,
-            ReceiptHandle=token.receipt_handle,
-            VisibilityTimeout=0,
-          )
-      except Exception as e:
-        raise QueueError(
-          f"Failed to nack SQS message: {e}", operation="nack"
-        ) from e
-      else:
-        self._in_flight.discard(token)
-        if self._last_receipt == (token.queue_url, token.receipt_handle):
-          self._last_receipt = None
+      self._settle_token(token, action="nack")
       return
     if token is not None:
       return

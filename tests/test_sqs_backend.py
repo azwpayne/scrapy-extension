@@ -7,6 +7,7 @@ Injects a mock ``boto3`` into ``sys.modules`` and patches ``boto3.client``
 from __future__ import annotations
 
 import sys
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -549,6 +550,10 @@ class TestSqsPopWithAck:
     assert token.receipt_handle == "rh-1"
     # Token tracked in the diagnostic in-flight set.
     assert token in b._in_flight
+    # The token-aware path must not populate the legacy single-slot receipt.
+    # Otherwise a later ack(token=None) could settle this delivery a second
+    # time after its token was nacked or acknowledged.
+    assert b._last_receipt is None
 
   def test_pop_with_ack_empty_returns_none_none(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -635,6 +640,80 @@ class TestSqsRealInFlightAck:
     with pytest.raises(QueueError):
       b.ack("q", token=tok)
 
+  def test_failed_ack_is_retryable_then_becomes_one_shot(self, mocker) -> None:
+    token = _SqsAckToken("https://sqs/test", "rh-1")
+    b, client = _connected(mocker)
+    b._track_in_flight(token)
+    client.delete_message.side_effect = [RuntimeError("temporary"), None]
+
+    with pytest.raises(QueueError):
+      b.ack("q", token=token)
+    assert token in b._in_flight
+
+    b.ack("q", token=token)
+    b.ack("q", token=token)
+
+    assert client.delete_message.call_count == 2
+    assert token not in b._in_flight
+
+  def test_ack_then_nack_has_exactly_one_terminal_broker_call(self, mocker) -> None:
+    token = _SqsAckToken("https://sqs/test", "rh-1")
+    b, client = _connected(mocker)
+    b._track_in_flight(token)
+
+    b.ack("q", token=token)
+    b.nack("q", token=token)
+
+    client.delete_message.assert_called_once()
+    client.change_message_visibility.assert_not_called()
+
+  def test_untracked_token_is_still_one_shot(self, mocker) -> None:
+    """Diagnostic-set overflow must not weaken settlement correctness."""
+    token = _SqsAckToken("https://sqs/test", "rh-overflow")
+    b, client = _connected(mocker)
+    assert token not in b._in_flight
+
+    b.ack("q", token=token)
+    b.ack("q", token=token)
+
+    client.delete_message.assert_called_once()
+
+  def test_concurrent_ack_and_nack_claim_only_one_terminal_action(
+    self, mocker
+  ) -> None:
+    token = _SqsAckToken("https://sqs/test", "rh-race")
+    b, client = _connected(mocker)
+    entered_delete = threading.Event()
+    release_delete = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_delete(**_kwargs) -> None:
+      entered_delete.set()
+      assert release_delete.wait(timeout=2)
+
+    def run(operation) -> None:
+      try:
+        operation("q", token=token)
+      except BaseException as exc:  # pragma: no cover - asserted below
+        errors.append(exc)
+
+    client.delete_message.side_effect = blocking_delete
+    ack_thread = threading.Thread(target=run, args=(b.ack,))
+    nack_thread = threading.Thread(target=run, args=(b.nack,))
+
+    ack_thread.start()
+    assert entered_delete.wait(timeout=2)
+    nack_thread.start()
+    release_delete.set()
+    ack_thread.join(timeout=2)
+    nack_thread.join(timeout=2)
+
+    assert not ack_thread.is_alive()
+    assert not nack_thread.is_alive()
+    assert errors == []
+    client.delete_message.assert_called_once()
+    client.change_message_visibility.assert_not_called()
+
 
 class TestSqsRealNack:
   def test_nack_with_token_requeues_immediately_and_discards_from_in_flight(
@@ -670,6 +749,32 @@ class TestSqsRealNack:
 
     assert exc_info.value.operation == "nack"
     assert token in b._in_flight
+
+  def test_failed_nack_is_retryable_then_becomes_one_shot(self, mocker) -> None:
+    token = _SqsAckToken("https://sqs/test", "rh-1")
+    b, client = _connected(mocker)
+    b._track_in_flight(token)
+    client.change_message_visibility.side_effect = [RuntimeError("temporary"), None]
+
+    with pytest.raises(QueueError):
+      b.nack("q", token=token)
+    assert token in b._in_flight
+
+    b.nack("q", token=token)
+    b.nack("q", token=token)
+
+    assert client.change_message_visibility.call_count == 2
+    assert token not in b._in_flight
+
+  def test_nack_then_ack_has_exactly_one_terminal_broker_call(self, mocker) -> None:
+    token = _SqsAckToken("https://sqs/test", "rh-1")
+    b, client = _connected(mocker)
+
+    b.nack("q", token=token)
+    b.ack("q", token=token)
+
+    client.change_message_visibility.assert_called_once()
+    client.delete_message.assert_not_called()
 
 
 class TestSqsCrashMidAck:

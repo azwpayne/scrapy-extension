@@ -12,7 +12,7 @@ floor. Every gap was a real documented contract with no direct test:
 - disconnect() idempotency when never connected.
 - ``_track_in_flight`` warn-once overflow (bounded diagnostic set).
 - ``_receive`` tolerating a malformed message (no ReceiptHandle).
-- ack-with-token no-op when the client is gone (TOCTOU).
+- ack/nack-with-token failures when the client is gone remain retryable.
 - nack-with-token clearing the legacy ``_last_receipt`` slot when it matches.
 - ``_swallow`` actually suppressing + logging a cleanup exception.
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -170,15 +171,30 @@ def test_receive_raises_for_message_without_receipt_handle(mocker) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ack_with_token_is_noop_when_client_is_none() -> None:
-  """Line 443: ack(token=...) when the client is None (concurrent disconnect
-  / never connected) silently returns rather than ``AttributeError``-ing on
-  ``None.delete_message()``."""
+def test_ack_with_token_client_none_raises_and_remains_retryable() -> None:
+  """A disconnect is transient, not proof that broker settlement succeeded."""
   backend = _backend()
   backend._client = None
   token = _SqsAckToken("u", "r")
-  backend.ack("q", token=token)  # must not raise
-  assert token not in backend._in_flight  # still discarded from the diagnostic set
+  backend._track_in_flight(token)
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.ack("q", token=token)
+
+  assert exc_info.value.operation == "ack"
+  assert token in backend._in_flight
+
+
+def test_nack_with_token_client_none_raises_and_remains_retryable() -> None:
+  backend = _backend()
+  token = _SqsAckToken("u", "r")
+  backend._track_in_flight(token)
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.nack("q", token=token)
+
+  assert exc_info.value.operation == "nack"
+  assert token in backend._in_flight
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +207,7 @@ def test_nack_with_token_clears_matching_legacy_last_receipt() -> None:
   points at the same handle — keeps the legacy single-pop slot coherent with
   the per-message token path (single-process sanity)."""
   backend = _backend()
+  backend._client = MagicMock()
   token = _SqsAckToken("u-1", "rh-1")
   backend._last_receipt = ("u-1", "rh-1")  # legacy slot matches the token
   backend.nack("q", token=token)
@@ -204,6 +221,7 @@ def test_nack_with_token_keeps_nonmatching_legacy_last_receipt() -> None:
   clears the legacy slot (the token path and legacy path are independent
   except for the single-process coherence optimization)."""
   backend = _backend()
+  backend._client = MagicMock()
   token = _SqsAckToken("u-new", "rh-new")
   backend._last_receipt = ("u-other", "rh-other")  # different handle
   backend.nack("q", token=token)
