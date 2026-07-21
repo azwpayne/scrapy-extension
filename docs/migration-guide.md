@@ -298,6 +298,12 @@ isolated trusted-network deployment. Loopback hosts remain unchanged. Before
 upgrading a remote deployment, verify network isolation/firewall policy and add
 the opt-in; otherwise migrate the storage role to a TLS-capable backend.
 
+All Memcached mutations now wait for a server reply. This can add one response
+read to `store`, `delete`, and `clear_storage`, but prevents pymemcache's default
+`noreply` mode from reporting an unconfirmed command as successful. Revisit
+latency budgets rather than restoring noreply: the StorageBackend contract uses
+the return boundary as the write result.
+
 ## Validation and Rollback
 
 Before opening traffic, verify:

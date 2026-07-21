@@ -8,6 +8,7 @@ the dependency installed, then patches the backend's captured
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import traceback
 import types
@@ -99,7 +100,9 @@ class TestMemcachedConnect:
 
   def test_connect_creates_client_and_stats(self, mocker) -> None:
     b, client = _connected(mocker)
-    memcached_mod.MemcachedClient.assert_called_once_with(("localhost", 11211))
+    memcached_mod.MemcachedClient.assert_called_once_with(
+      ("localhost", 11211), default_noreply=False
+    )
     client.stats.assert_called_once()
     assert b.is_connected() is True
 
@@ -108,7 +111,9 @@ class TestMemcachedConnect:
 
     b.connect()
 
-    memcached_mod.MemcachedClient.assert_called_once_with(("localhost", 11211))
+    memcached_mod.MemcachedClient.assert_called_once_with(
+      ("localhost", 11211), default_noreply=False
+    )
     client.stats.assert_called_once_with()
 
   def test_connect_does_not_publish_client_before_probe_succeeds(self, mocker) -> None:
@@ -173,7 +178,7 @@ class TestMemcachedConnect:
     )
     client = mocker.MagicMock(name="client")
 
-    def mutate_after_construction(_endpoint):
+    def mutate_after_construction(_endpoint, **_kwargs):
       settings.host = "attacker.internal"
       settings.port = 22122
       settings.allow_remote_plaintext = False
@@ -188,7 +193,9 @@ class TestMemcachedConnect:
 
     backend.connect()
 
-    client_factory.assert_called_once_with(("cache.internal", 11211))
+    client_factory.assert_called_once_with(
+      ("cache.internal", 11211), default_noreply=False
+    )
     assert backend._connection_snapshot is not None
     assert backend._connection_snapshot.host == "cache.internal"
     assert backend._connection_snapshot.port == 11211
@@ -247,6 +254,27 @@ class TestMemcachedConnect:
     client.close.assert_called_once()
     assert b.is_connected() is False
     assert b._connection_snapshot is None
+
+
+def test_locked_pymemcache_requires_explicit_reply_confirmation() -> None:
+  """Pin the SDK default that makes backend-side opt-out load-bearing."""
+  script = "\n".join(
+    (
+      "import inspect",
+      "from pymemcache.client.base import Client",
+      "parameter = inspect.signature(Client).parameters['default_noreply']",
+      "assert parameter.default is True",
+    )
+  )
+
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
 
 
 class TestMemcachedStorageOps:

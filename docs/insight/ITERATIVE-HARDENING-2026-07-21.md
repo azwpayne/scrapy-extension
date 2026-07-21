@@ -244,6 +244,9 @@ speculative work.
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
   message limit before issuing network calls.
+- [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
+  default noreply mode so storage mutation success is based on a parsed server
+  response rather than an unconfirmed socket write.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -883,3 +886,21 @@ remote connection emits an operator warning. All 430 related tests passed on
 Python 3.10 and 3.14 with one real-service test explicitly skipped; the full
 Python 3.10 suite passed 3,135 tests with 45 documented skips. Ruff, strict
 mypy, and patch integrity remained green.
+
+### I24 — Memcached confirmed mutation boundary
+
+Three initial RED assertions proved that every client generation inherited
+pymemcache's `default_noreply=True`. Inspection of the locked pymemcache 4.0.0
+constructor and storage command path confirmed that this mode returns success
+for set, delete, and flush immediately after writing the command, without
+reading the server's `STORED`, `DELETED`, or error response.
+
+Every client generation now opts into `default_noreply=False`, making a normal
+StorageBackend mutation return contingent on a parsed server response. The
+remaining transport-exception boundary is documented as ambiguous and callers
+are directed toward idempotent keys and values. A subprocess sentinel pins the
+real installed SDK default so a dependency change cannot silently invalidate
+the rationale. All 49 local Memcached tests passed on Python 3.10 and 3.14 with
+one real-service test explicitly skipped; the full Python 3.10 suite passed
+3,136 tests with 45 documented skips. Ruff, strict mypy, and patch integrity
+remained green.

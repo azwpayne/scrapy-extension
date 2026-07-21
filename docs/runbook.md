@@ -152,6 +152,11 @@ and booleans raise `ValueError` so all backends behave consistently. The Scrapy
 pipeline keeps its setting-level compatibility rule:
 `SCRAPY_PIPELINE_TTL = 0` is normalized to `None` before storage.
 
+Memcached clients run with `default_noreply=False`; a successful mutation has
+parsed the server's response rather than merely written a command to the socket.
+An exception is still an ambiguous transport outcome, so retry callers should
+use idempotent values/keys.
+
 ## Safe clearing
 
 - Redis clear operations scan only `<namespace>:storage:*`; they never issue

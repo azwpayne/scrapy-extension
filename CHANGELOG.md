@@ -119,6 +119,12 @@ upgrading.
   isolated trusted network. Connection values are revalidated into one
   immutable snapshot, a client is not published until `stats()` succeeds,
   repeated connect is idempotent, and startup errors suppress driver text.
+- **Memcached mutations now wait for server replies.** pymemcache defaults to
+  `default_noreply=True`, which reports `True` after sending a command without
+  reading `STORED`, `DELETED`, or an error. The backend now constructs every
+  client generation with `default_noreply=False`, so store/delete/global-clear
+  success reflects a parsed server response; ambiguous transport failures raise
+  the existing typed storage error.
 - **Authenticated RocketMQ connections now require TLS.** New setting
   `SCRAPY_ROCKETMQ_TLS_ENABLED` is passed to both the Producer and
   SimpleConsumer gRPC clients. Any explicit access/secret key must be a complete

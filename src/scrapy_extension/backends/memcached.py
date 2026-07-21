@@ -123,7 +123,14 @@ class MemcachedBackend(Backend, StorageBackend):
       snapshot = self._capture_connection_snapshot()
       candidate: Any = None
       try:
-        candidate = MemcachedClient((snapshot.host, snapshot.port))
+        # pymemcache defaults ``default_noreply=True``. In that mode set,
+        # delete, and flush can return success after only writing the command
+        # to the socket; the server's STORED/DELETED/error response is never
+        # read. StorageBackend success is a commit boundary, so require replies
+        # for every mutating operation on this client generation.
+        candidate = MemcachedClient(
+          (snapshot.host, snapshot.port), default_noreply=False
+        )
         candidate.stats()
       except Exception:
         if candidate is not None:
