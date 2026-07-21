@@ -146,7 +146,7 @@ and booleans raise `ValueError` so all backends behave consistently. The Scrapy
 pipeline keeps its setting-level compatibility rule:
 `SCRAPY_PIPELINE_TTL = 0` is normalized to `None` before storage.
 
-## Safe storage clearing
+## Safe clearing
 
 - Redis clear operations scan only `<namespace>:storage:*`; they never issue
   `FLUSHDB` or `FLUSHALL`.
@@ -155,6 +155,10 @@ pipeline keeps its setting-level compatibility rule:
   `NotImplementedError`; `clear_storage(None)` also raises unless
   `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`. Enabling it issues server-wide
   `flush_all`, so use it only on a dedicated instance.
+- Kafka queue clear is deliberately unsupported. Do not automate topic
+  delete/recreate through the crawler: stop all producers/consumers, use Kafka
+  operator tooling, wait for metadata convergence, and explicitly reset or
+  replace the consumer group before resuming.
 
 ## Ack and durability matrix
 

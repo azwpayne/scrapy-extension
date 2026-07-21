@@ -280,6 +280,12 @@ See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/m
 
 **Kafka, RabbitMQ, Pulsar, SQS**: Queue-only. For deduplication and storage, use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB.
 
+**Kafka clear limitation**: `clear_queue()` raises `NotImplementedError`.
+Deleting and recreating a topic is asynchronous and can reuse consumer-group
+offsets, so it cannot provide the queue abstraction's safe-clear boundary.
+Stop producers/consumers and use an operator-controlled Kafka maintenance or
+drain workflow instead.
+
 **RocketMQ**: Queue is functional. Set/Storage are rejected at config time (`ConfigurationError`) — pair with a full-featured backend (Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB) for dedup/storage.
 
 **Memcached, DynamoDB**: Storage-only (key-value with TTL). Pair with a queue-capable backend for request distribution.

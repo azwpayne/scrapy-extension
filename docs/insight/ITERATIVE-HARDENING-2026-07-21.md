@@ -202,15 +202,16 @@ speculative work.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
-- [ ] **BACKEND-01 — Kafka consumer generations.** Fence tokens by assignment
+- [x] **BACKEND-01 — Kafka consumer generations.** Fence tokens by assignment
   epoch and unique delivery attempt within one backend instance, invalidate on
-  rebalance/nack/clear, validate admin responses, and wait for topic deletion
-  before recreation. RUN-08 already supplies the cross-backend-incarnation
-  fence; it does not make two deliveries of the same offset distinguishable.
+  rebalance/nack, validate per-topic admin responses, and replace the unsafe
+  asynchronous clear implementation with an explicit unsupported boundary.
+  RUN-08 already supplies the cross-backend-incarnation fence; it does not make
+  two deliveries of the same offset distinguishable.
 - [ ] **BACKEND-04 — broker terminal and clear semantics.** Make direct
-  Kafka/Pulsar/SQS token settlement one-shot and retryable, and specify honest
-  lifecycle barriers for Kafka topic recreation, RabbitMQ in-flight deliveries,
-  and SQS's asynchronous purge window.
+  Pulsar/SQS token settlement one-shot and retryable, and specify honest
+  lifecycle barriers for RabbitMQ in-flight deliveries and SQS's asynchronous
+  purge window.
 - [x] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
@@ -670,3 +671,23 @@ the fix chooses duplicate redelivery over skipping work. Token-based pops no
 longer populate the legacy bare-commit slot. All 135 related tests passed on
 Python 3.10 and 3.14, and the full suite passed 3,042 tests with 44 documented
 skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I16b — Kafka admin outcomes and honest clear capability
+
+Six RED regressions showed that the locked Kafka admin client returns
+per-topic create failures inside a response object, while the backend cached
+the topic as successfully created. Thrown create errors were only logged, so a
+push could continue after its prerequisite failed. The clear path issued an
+asynchronous delete and immediately recreated the same name, reporting success
+without a propagation barrier and retaining consumer-group offset ambiguity.
+
+Topic creation now requires exactly one well-formed response entry for the
+requested topic and accepts only broker success or already-exists; every other
+code becomes a typed push error before the known-topic cache is updated. A
+disconnect invalidates that cache. Kafka `clear_queue()` now fails before admin
+I/O with an explicit `NotImplementedError`: delete/recreate cannot prove that
+work accepted after return survives or that old group offsets are compatible
+with the new topic. Operators must quiesce and reset Kafka deliberately. The 12
+exact boundary tests passed on Python 3.14, 302 related Kafka/queue-strategy
+tests passed on Python 3.10, and the full suite passed 3,046 tests with 44
+documented skips. Ruff, strict mypy, and patch integrity remained green.

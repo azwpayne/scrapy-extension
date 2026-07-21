@@ -51,6 +51,12 @@ upgrading.
   delivery attempt. A late callback holding the old token can no longer commit
   a same-offset redelivery, and token-based pop no longer populates the legacy
   bare-commit slot.
+- **Kafka `clear_queue()` is explicitly unsupported.** The former asynchronous
+  topic delete/immediate recreate sequence could report success before deletion
+  propagated, delete newly accepted work, or reuse old consumer-group offsets
+  against the replacement topic. It now fails before admin I/O; perform a
+  stopped, operator-controlled drain/reset instead. Topic creation also checks
+  the admin response's per-topic error code before caching success.
 - **Malformed broker payloads are terminally consumed.** When deserialization
   deterministically fails and an ack token exists, `BackendQueue` attempts to
   ack/drop the delivery, increments `scheduler/queue/poison_dropped`, and still

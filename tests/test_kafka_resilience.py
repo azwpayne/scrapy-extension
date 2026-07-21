@@ -138,14 +138,23 @@ def test_ack_token_is_noop_when_consumer_is_none() -> None:
   backend._ack_token(_KafkaAckToken(partition=0, offset=1, topic="t"))  # must not raise
 
 
-def test_clear_queue_raises_when_admin_client_is_none() -> None:
-  """Lines 804-805: clear_queue with no admin client (never connected /
-  concurrent disconnect) → BackendConnectionError rather than
-  ``None.delete_topics()``."""
+def test_clear_queue_fails_closed_even_without_admin_client() -> None:
+  """Kafka clear is unsupported instead of reporting an unsafe reset."""
   backend = _backend()
   backend._admin_client = None
-  with pytest.raises(BackendConnectionError, match="admin client is None"):
+  with pytest.raises(NotImplementedError, match="Kafka"):
     backend.clear_queue("q")
+
+
+def test_disconnect_invalidates_known_topic_cache(mocker) -> None:
+  backend = _backend()
+  backend._producer = mocker.MagicMock()
+  backend._admin_client = mocker.MagicMock()
+  backend._known_topics.add("scrapy-stale")
+
+  backend.disconnect()
+
+  assert backend._known_topics == set()
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,14 @@ prior tokens before the new assignment can be settled. Code that directly
 calls `pop_with_ack()` must retain and return the exact token, rather than
 reconstructing one from topic/partition/offset.
 
+Kafka `clear_queue()` now raises `NotImplementedError`. The previous
+delete-and-immediately-recreate sequence was not a completion barrier: topic
+deletion propagates asynchronously, newly accepted records can race the old
+delete, and a reused consumer group can carry incompatible offsets into the
+replacement topic. Stop all producers and consumers, drain or delete the topic
+with Kafka's operator tooling, verify cluster metadata convergence, and choose
+an intentional consumer-group offset policy before restarting.
+
 Memcached cannot enumerate keys for prefix deletion. Prefix clear is always
 unsupported, and global `clear_storage(None)` is disabled unless
 `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`. That flag issues server-wide

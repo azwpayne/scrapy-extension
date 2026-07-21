@@ -338,6 +338,9 @@ class TestKafkaBackendPushPriorityMapping:
     mock_producer.send.return_value = mock_future
     backend._producer = mock_producer
     backend._admin_client = mocker.MagicMock()
+    backend._admin_client.create_topics.return_value.topic_errors = [
+      ("scrapy-test-queue", 0, None)
+    ]
 
     backend.push("test-queue", b"item", priority=-3)
 
@@ -470,6 +473,9 @@ class TestKafkaBackendEnsureTopicExists:
     backend = KafkaBackend(config)
 
     mock_admin = mocker.MagicMock()
+    mock_admin.create_topics.return_value.topic_errors = [
+      ("scrapy-newqueue", 0, None)
+    ]
     backend._admin_client = mock_admin
 
     backend._ensure_topic_exists("newqueue")
@@ -497,8 +503,8 @@ class TestKafkaBackendEnsureTopicExists:
     # Should still add to known topics
     assert "scrapy-existingqueue" in backend._known_topics
 
-  def test_ensure_topic_exists_handles_kafka_error_on_create(self, mocker):
-    """Test _ensure_topic_exists logs warning on KafkaError."""
+  def test_ensure_topic_exists_surfaces_kafka_error_on_create(self, mocker):
+    """A thrown admin failure must prevent a success-shaped push path."""
     config = KafkaSettings()
     backend = KafkaBackend(config)
 
@@ -506,8 +512,48 @@ class TestKafkaBackendEnsureTopicExists:
     mock_admin.create_topics.side_effect = KafkaError("Create failed")
     backend._admin_client = mock_admin
 
-    # Should not raise, just log warning
-    backend._ensure_topic_exists("failedqueue")
+    with pytest.raises(QueueError) as exc_info:
+      backend._ensure_topic_exists("failedqueue")
+
+    assert exc_info.value.operation == "push"
+    assert "scrapy-failedqueue" not in backend._known_topics
+
+  def test_ensure_topic_exists_rejects_per_topic_error_response(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [
+      ("scrapy-denied", 29, "authorization failed")
+    ]
+    backend._admin_client = admin
+
+    with pytest.raises(QueueError) as exc_info:
+      backend._ensure_topic_exists("denied")
+
+    assert exc_info.value.operation == "push"
+    assert "scrapy-denied" not in backend._known_topics
+
+  def test_ensure_topic_exists_accepts_already_exists_response(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [
+      ("scrapy-existing", 36, "already exists")
+    ]
+    backend._admin_client = admin
+
+    backend._ensure_topic_exists("existing")
+
+    assert "scrapy-existing" in backend._known_topics
+
+  def test_ensure_topic_exists_rejects_malformed_response(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = []
+    backend._admin_client = admin
+
+    with pytest.raises(QueueError, match="response"):
+      backend._ensure_topic_exists("missing")
+
+    assert "scrapy-missing" not in backend._known_topics
 
 
 class TestKafkaBackendPush:
@@ -525,6 +571,7 @@ class TestKafkaBackendPush:
 
     mock_admin = mocker.MagicMock()
     backend._admin_client = mock_admin
+    backend._known_topics.add("scrapy-testq")
 
     backend.push("testq", b"item_data", priority=5.0)
 
@@ -546,6 +593,7 @@ class TestKafkaBackendPush:
 
     mock_admin = mocker.MagicMock()
     backend._admin_client = mock_admin
+    backend._known_topics.add("scrapy-testq")
 
     # Priority 255 should be clamped to 9 (max_priority_partitions - 1)
     backend.push("testq", b"item", priority=255.0)
@@ -564,6 +612,7 @@ class TestKafkaBackendPush:
 
     mock_admin = mocker.MagicMock()
     backend._admin_client = mock_admin
+    backend._known_topics.add("scrapy-testq")
 
     with pytest.raises(QueueError) as exc_info:
       backend.push("testq", b"item")
@@ -1038,38 +1087,25 @@ class TestKafkaBackendQueueLen:
 class TestKafkaBackendClearQueue:
   """Tests for clear_queue method."""
 
-  def test_clear_queue_success(self, mocker):
-    """Test clear_queue deletes and recreates topic."""
+  def test_clear_queue_is_explicitly_unsupported_without_admin_io(self, mocker):
+    """Delete/recreate cannot satisfy a linearizable distributed clear."""
     config = KafkaSettings()
     backend = KafkaBackend(config)
 
     mock_admin = mocker.MagicMock()
     backend._admin_client = mock_admin
 
-    backend.clear_queue("testq")
-
-    mock_admin.delete_topics.assert_called_once_with(["scrapy-testq"])
-    mock_admin.create_topics.assert_called_once()
-    call_args = mock_admin.create_topics.call_args
-    new_topic = call_args[0][0][0]
-    assert isinstance(new_topic, NewTopic)
-    assert new_topic.name == "scrapy-testq"
-
-  def test_clear_queue_handles_kafka_error(self, mocker):
-    """R-clearq: clear_queue raises QueueError on KafkaError (not log + swallow).
-
-    Parity with rabbitmq clear_queue (#69) and kafka queue_len (#68).
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-
-    mock_admin = mocker.MagicMock()
-    mock_admin.delete_topics.side_effect = KafkaError("Delete failed")
-    backend._admin_client = mock_admin
-
-    with pytest.raises(QueueError) as exc_info:
+    with pytest.raises(NotImplementedError, match="Kafka"):
       backend.clear_queue("testq")
-    assert exc_info.value.operation == "clear_queue"
+
+    mock_admin.delete_topics.assert_not_called()
+    mock_admin.create_topics.assert_not_called()
+
+  def test_clear_queue_still_validates_name_before_unsupported(self):
+    backend = KafkaBackend(KafkaSettings())
+
+    with pytest.raises(ValueError, match="Invalid topic"):
+      backend.clear_queue("bad queue")
 
 
 class TestKafkaBackendBackendType:
@@ -1123,6 +1159,9 @@ def test_kafka_backend_push(mocker):
     return_value=mock_admin_client_instance,
   )
   mock_admin_client_instance.list_topics.return_value = []
+  mock_admin_client_instance.create_topics.return_value.topic_errors = [
+    ("scrapy-test_queue", 0, None)
+  ]
   mock_future = mocker.MagicMock()
   mock_producer_instance.send.return_value = mock_future
 

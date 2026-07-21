@@ -532,6 +532,7 @@ class KafkaBackend(Backend, QueueBackend):
       self._assignment_epoch += 1
       self._subscribed_topic = None
       self._clear_delivery_state_locked()
+      self._known_topics.clear()
 
     for client in (producer, consumer, admin_client):
       if client is not None:
@@ -582,6 +583,7 @@ class KafkaBackend(Backend, QueueBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
+        QueueError: If Kafka rejects creation or returns a malformed response.
     """
     _validate_topic_name(queue_name)
     topic_name = f"scrapy-{queue_name}"
@@ -599,7 +601,12 @@ class KafkaBackend(Backend, QueueBackend):
       if self._admin_client is None:
         msg = "KafkaBackend not connected: admin client is None"
         raise BackendConnectionError(msg, backend_type="kafka")
-      self._admin_client.create_topics([new_topic])
+      response = self._admin_client.create_topics([new_topic])
+      self._validate_topic_creation_response(
+        response,
+        topic_name=topic_name,
+        queue_name=queue_name,
+      )
       self._known_topics.add(topic_name)
       logger.debug("Created Kafka topic: %s", topic_name)
     except TopicAlreadyExistsError:
@@ -607,7 +614,45 @@ class KafkaBackend(Backend, QueueBackend):
       self._known_topics.add(topic_name)
       logger.debug("Kafka topic already exists: %s", topic_name)
     except KafkaError as e:
-      logger.warning("Failed to create topic %s: %s", topic_name, e)
+      msg = f"Failed to create Kafka topic {topic_name}."
+      raise QueueError(
+        msg,
+        queue_name=queue_name,
+        operation="push",
+      ) from e
+
+  @staticmethod
+  def _validate_topic_creation_response(
+    response: Any,
+    *,
+    topic_name: str,
+    queue_name: str,
+  ) -> None:
+    """Reject per-topic broker errors returned outside the exception path."""
+    topic_errors = getattr(response, "topic_errors", None)
+    if not isinstance(topic_errors, (list, tuple)):
+      msg = "Kafka create-topics response has no valid topic_errors list."
+      raise QueueError(msg, queue_name=queue_name, operation="push")
+
+    matching_entries: list[tuple[Any, ...]] = []
+    for entry in topic_errors:
+      if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+        msg = "Kafka create-topics response contains a malformed topic entry."
+        raise QueueError(msg, queue_name=queue_name, operation="push")
+      if entry[0] == topic_name:
+        matching_entries.append(tuple(entry))
+    if len(matching_entries) != 1:
+      msg = "Kafka create-topics response did not identify the requested topic."
+      raise QueueError(msg, queue_name=queue_name, operation="push")
+
+    error_code = matching_entries[0][1]
+    if isinstance(error_code, bool) or not isinstance(error_code, int):
+      msg = "Kafka create-topics response contains an invalid error code."
+      raise QueueError(msg, queue_name=queue_name, operation="push")
+    if error_code in (0, TopicAlreadyExistsError.errno):
+      return
+    msg = f"Kafka broker rejected topic creation (error code {error_code})."
+    raise QueueError(msg, queue_name=queue_name, operation="push")
 
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
@@ -1027,29 +1072,19 @@ class KafkaBackend(Backend, QueueBackend):
     return cast(int, total)
 
   def clear_queue(self, queue_name: str) -> None:
-    """Clear all items from queue.
+    """Reject Kafka clear because delete/recreate is not linearizable.
 
     Args:
         queue_name: Name of the queue.
 
     Raises:
         ValueError: If queue_name contains invalid characters.
-        QueueError: If the topic delete/recreate fails at the Kafka layer.
+        NotImplementedError: Always, after validating ``queue_name``.
     """
     _validate_topic_name(queue_name)
-    try:
-      topic_name = f"scrapy-{queue_name}"
-      if self._admin_client is None:
-        msg = "KafkaBackend not connected: admin client is None"
-        raise BackendConnectionError(msg, backend_type="kafka")
-      self._admin_client.delete_topics([topic_name])
-      # Recreate topic
-      new_topic = NewTopic(
-        name=topic_name,
-        num_partitions=self.config.max_priority_partitions,
-        replication_factor=self.config.replication_factor,
-      )
-      self._admin_client.create_topics([new_topic])
-    except KafkaError as e:
-      msg = f"Failed to clear queue {queue_name}: {e}"
-      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
+    raise NotImplementedError(
+      "Kafka clear_queue is unsupported: asynchronous topic delete/recreate "
+      "cannot preserve active consumer-group offsets or protect messages "
+      "accepted after clear returns. Stop and drain the queue with an "
+      "operator-controlled Kafka maintenance workflow instead."
+    )
