@@ -16,6 +16,7 @@ import logging
 import re
 import threading
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -235,6 +236,7 @@ class KafkaBackend(Backend, QueueBackend):
     self.config = config
     self._producer: KafkaProducer | None = None
     self._consumer: KafkaConsumer | None = None
+    self._consumer_auto_offset_reset: str | None = None
     # The same topic/partition/offset may be delivered again after reconnect.
     # Generation-scoped tokens keep late completions from touching that new
     # delivery on the replacement consumer.
@@ -569,6 +571,7 @@ class KafkaBackend(Backend, QueueBackend):
       # later consumer generation.
       self._producer = None
       self._consumer = None
+      self._consumer_auto_offset_reset = None
       self._admin_client = None
       self._consumer_generation += 1
       self._assignment_epoch += 1
@@ -971,10 +974,11 @@ class KafkaBackend(Backend, QueueBackend):
 
       # Create consumer if not exists
       if self._consumer is None:
+        auto_offset_reset = self.config.auto_offset_reset
         consumer = KafkaConsumer(
           bootstrap_servers=self._bootstrap_servers(),
           group_id=self.config.group_id,
-          auto_offset_reset=self.config.auto_offset_reset,
+          auto_offset_reset=auto_offset_reset,
           enable_auto_commit=False,
           auto_commit_interval_ms=self.config.auto_commit_interval_ms,
           max_poll_records=self.config.max_poll_records,
@@ -984,6 +988,7 @@ class KafkaBackend(Backend, QueueBackend):
         if consumer is not None:
           self._consumer_generation += 1
           self._consumer = consumer
+          self._consumer_auto_offset_reset = auto_offset_reset
 
       if self._consumer is None:
         msg = "KafkaBackend not connected: consumer is None"
@@ -1198,34 +1203,46 @@ class KafkaBackend(Backend, QueueBackend):
             re-election, coordinator error).
 
     Note:
-        This is eventually consistent and should be used for monitoring only.
+        This is a conservative consumer-group lag snapshot. It includes
+        fetched but uncommitted records and is safe for pending-work checks,
+        though concurrent broker activity can change immediately afterward.
     """
     _validate_topic_name(queue_name)
     topic_name = f"scrapy-{queue_name}"
-    if self._consumer is not None:
-      try:
-        assignment = self._consumer.assignment()
-        topic_assignment = {tp for tp in assignment if tp.topic == topic_name}
-        if topic_assignment:
-          end_offsets = self._consumer.end_offsets(topic_assignment)
-          total = sum(
-            max(0, end_offsets[tp] - self._consumer.position(tp))
-            for tp in topic_assignment
-          )
-          return cast(int, total)
-      except KafkaError as e:
-        msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
-        raise QueueError(
-          msg,
-          queue_name=queue_name,
-          operation="queue_len",
-        ) from e
+    # KafkaConsumer is explicitly not thread-safe. Keep assignment, group
+    # offset, and watermark calls in the same transaction as poll/ack/nack and
+    # disconnect, and capture the handle once for the whole calculation.
+    with self._delivery_lock:
+      consumer = self._consumer
+      if consumer is not None:
+        try:
+          assignment = consumer.assignment()
+          topic_assignment = {tp for tp in assignment if tp.topic == topic_name}
+          if topic_assignment:
+            auto_offset_reset = (
+              self._consumer_auto_offset_reset or self.config.auto_offset_reset
+            )
+            return self._consumer_group_lag(
+              consumer,
+              topic_assignment,
+              queue_name=queue_name,
+              auto_offset_reset=auto_offset_reset,
+            )
+        except KafkaError as e:
+          msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
+          raise QueueError(
+            msg,
+            queue_name=queue_name,
+            operation="queue_len",
+          ) from e
 
     temp_consumer: KafkaConsumer | None = None
     try:
+      auto_offset_reset = self.config.auto_offset_reset
       temp_consumer = KafkaConsumer(
         bootstrap_servers=self._bootstrap_servers(),
         group_id=self.config.group_id,
+        auto_offset_reset=auto_offset_reset,
         enable_auto_commit=False,
         **self._build_client_security_config(),
       )
@@ -1234,10 +1251,11 @@ class KafkaBackend(Backend, QueueBackend):
         return 0
       assignment = {TopicPartition(topic_name, partition) for partition in partitions}
       temp_consumer.assign(list(assignment))
-      end_offsets = temp_consumer.end_offsets(list(assignment))
-      total = sum(
-        max(0, end_offsets[tp] - temp_consumer.position(tp))
-        for tp in assignment
+      total = self._consumer_group_lag(
+        temp_consumer,
+        assignment,
+        queue_name=queue_name,
+        auto_offset_reset=auto_offset_reset,
       )
     except KafkaError as e:
       msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
@@ -1250,7 +1268,76 @@ class KafkaBackend(Backend, QueueBackend):
       if temp_consumer is not None:
         with contextlib.suppress(Exception):
           temp_consumer.close()
-    return cast(int, total)
+    return total
+
+  def _consumer_group_lag(
+    self,
+    consumer: Any,
+    assignment: set[TopicPartition],
+    *,
+    queue_name: str,
+    auto_offset_reset: str,
+  ) -> int:
+    """Return conservative group lag for one topic-partition assignment."""
+
+    def offset(
+      values: Mapping[TopicPartition, Any],
+      topic_partition: TopicPartition,
+      label: str,
+    ) -> int:
+      value = values.get(topic_partition)
+      if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise QueueError(
+          f"Kafka returned an invalid {label} offset.",
+          queue_name=queue_name,
+          operation="queue_len",
+        )
+      return value
+
+    end_offsets = consumer.end_offsets(assignment)
+    beginning_offsets = consumer.beginning_offsets(assignment)
+    if not isinstance(end_offsets, Mapping) or not isinstance(
+      beginning_offsets, Mapping
+    ):
+      raise QueueError(
+        "Kafka returned invalid offset metadata.",
+        queue_name=queue_name,
+        operation="queue_len",
+      )
+
+    total = 0
+    for topic_partition in assignment:
+      end = offset(end_offsets, topic_partition, "end")
+      beginning = offset(beginning_offsets, topic_partition, "beginning")
+      committed = consumer.committed(topic_partition)
+      if committed is None:
+        if auto_offset_reset == "earliest":
+          start = beginning
+        elif auto_offset_reset == "latest":
+          start = end
+        else:
+          raise QueueError(
+            "Kafka consumer group has no committed offset and "
+            "auto_offset_reset='none'.",
+            queue_name=queue_name,
+            operation="queue_len",
+          )
+      elif (
+        isinstance(committed, bool)
+        or not isinstance(committed, int)
+        or committed < 0
+      ):
+        raise QueueError(
+          "Kafka returned an invalid committed offset.",
+          queue_name=queue_name,
+          operation="queue_len",
+        )
+      else:
+        # Retention may have advanced the log start beyond an old committed
+        # offset. Do not count records that no longer exist.
+        start = max(beginning, committed)
+      total += max(0, end - start)
+    return total
 
   def clear_queue(self, queue_name: str) -> None:
     """Reject Kafka clear because delete/recreate is not linearizable.

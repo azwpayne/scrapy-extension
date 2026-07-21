@@ -261,6 +261,12 @@ speculative work.
 - [x] **BACKEND-07B — confirmed MongoDB mutations.** Reject unacknowledged write
   concerns so queue/set/storage success cannot mean only a local socket-buffer
   handoff.
+- [x] **BACKEND-08A — conservative Kafka consumer-group lag.** Base depth on
+  committed offsets, apply the configured reset policy for fresh groups, and
+  serialize metadata calls with poll/settlement on the non-thread-safe client.
+- [ ] **BACKEND-08B — broker-safe logical queue names.** Map supported logical
+  names such as `q:{spider}` and overlong values to stable Kafka/RocketMQ
+  physical resources while preserving already-valid legacy names.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -997,3 +1003,22 @@ successful server reply. All 63 related tests passed on Python 3.10 and 3.14
 with one real-Memcached test explicitly skipped; the full Python 3.10 suite
 passed 3,204 tests with 45 documented skips. Ruff, strict mypy, and patch
 integrity remained green.
+
+### I29 — Kafka conservative consumer-group backlog
+
+Six RED outcomes across two evidence batches showed that a fresh consumer group
+could report zero depth despite an existing earliest-policy backlog, live depth
+used the consumer's fetched position instead of its committed checkpoint, and
+metadata calls could overlap `poll()` on kafka-python's non-thread-safe
+consumer. A settings mutation after lazy consumer creation could also make
+depth apply a different reset policy from the generation that would consume it.
+
+Queue depth now computes conservative group lag from committed offsets and log
+boundaries. A missing commit uses the captured generation policy: earliest uses
+the beginning, latest uses the end, and none raises a typed queue error instead
+of manufacturing zero. All live consumer metadata calls share the existing
+delivery lock with poll and settlement; temporary consumers receive the policy
+explicitly. A real-service integration regression covers depth before the first
+poll. All 474 related tests passed on Python 3.10 and 3.14 with three broker
+tests explicitly skipped; the full Python 3.10 suite passed 3,210 tests with 46
+documented skips. Ruff, strict mypy, and patch integrity remained green.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from threading import Event, Thread
+
 import pytest
 from kafka import TopicPartition
 from kafka.admin import NewTopic
@@ -1131,8 +1133,125 @@ class TestKafkaBackendQueueLen:
   """Tests for queue_len method.
 
   R3-G4: queue_len now reuses the existing consumer instead of creating a
-  temporary one per call. Uses end_offsets - position for lag calculation.
+  temporary one per call. Uses end offsets minus committed group offsets.
   """
+
+  @pytest.mark.parametrize(
+    ("auto_offset_reset", "expected"), [("earliest", 7), ("latest", 0)]
+  )
+  def test_fresh_group_uses_configured_offset_reset_for_backlog(
+    self, mocker, auto_offset_reset: str, expected: int
+  ) -> None:
+    backend = KafkaBackend(
+      KafkaSettings(auto_offset_reset=auto_offset_reset)  # type: ignore[arg-type]
+    )
+    tp = TopicPartition("scrapy-cold", 0)
+    consumer = mocker.MagicMock()
+    consumer.partitions_for_topic.return_value = {0}
+    consumer.end_offsets.return_value = {tp: 10}
+    consumer.beginning_offsets.return_value = {tp: 3}
+    consumer.committed.return_value = None
+    # Pin the pre-fix false-zero path: SDK default latest initializes position
+    # at end when auto_offset_reset is omitted from the temporary consumer.
+    consumer.position.return_value = 10
+    consumer_cls = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+    )
+
+    assert backend.queue_len("cold") == expected
+    assert consumer_cls.call_args.kwargs["auto_offset_reset"] == auto_offset_reset
+
+  def test_fresh_group_with_none_offset_policy_fails_closed(self, mocker) -> None:
+    backend = KafkaBackend(KafkaSettings(auto_offset_reset="none"))
+    tp = TopicPartition("scrapy-cold", 0)
+    consumer = mocker.MagicMock()
+    consumer.partitions_for_topic.return_value = {0}
+    consumer.end_offsets.return_value = {tp: 10}
+    consumer.beginning_offsets.return_value = {tp: 3}
+    consumer.committed.return_value = None
+    consumer.position.return_value = 10
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+    )
+
+    with pytest.raises(QueueError) as exc_info:
+      backend.queue_len("cold")
+
+    assert exc_info.value.queue_name == "cold"
+    assert exc_info.value.operation == "queue_len"
+
+  def test_live_consumer_depth_uses_committed_not_fetched_position(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    tp = TopicPartition("scrapy-testq", 0)
+    consumer = mocker.MagicMock()
+    consumer.assignment.return_value = {tp}
+    consumer.end_offsets.return_value = {tp: 10}
+    consumer.beginning_offsets.return_value = {tp: 0}
+    consumer.committed.return_value = 3
+    consumer.position.return_value = 8
+    backend._consumer = consumer
+
+    assert backend.queue_len("testq") == 7
+
+  def test_live_consumer_depth_keeps_its_creation_offset_policy(self, mocker):
+    config = KafkaSettings(auto_offset_reset="earliest")
+    backend = KafkaBackend(config)
+    tp = TopicPartition("scrapy-testq", 0)
+    consumer = mocker.MagicMock()
+    consumer.poll.return_value = {}
+    consumer.assignment.return_value = {tp}
+    consumer.end_offsets.return_value = {tp: 10}
+    consumer.beginning_offsets.return_value = {tp: 3}
+    consumer.committed.return_value = None
+    consumer_cls = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+    )
+
+    assert backend.pop("testq") is None
+    config.auto_offset_reset = "latest"
+
+    assert backend.queue_len("testq") == 7
+    assert consumer_cls.call_args.kwargs["auto_offset_reset"] == "earliest"
+
+  def test_queue_len_serializes_with_consumer_poll(self, mocker) -> None:
+    backend = KafkaBackend(KafkaSettings())
+    topic = "scrapy-testq"
+    tp = TopicPartition(topic, 0)
+    consumer = mocker.MagicMock()
+    poll_entered = Event()
+    release_poll = Event()
+    assignment_entered = Event()
+
+    def blocking_poll(**_kwargs):
+      poll_entered.set()
+      assert release_poll.wait(timeout=2.0)
+      return {}
+
+    def observed_assignment():
+      assignment_entered.set()
+      return {tp}
+
+    consumer.poll.side_effect = blocking_poll
+    consumer.assignment.side_effect = observed_assignment
+    consumer.end_offsets.return_value = {tp: 5}
+    consumer.beginning_offsets.return_value = {tp: 0}
+    consumer.committed.return_value = 0
+    backend._consumer = consumer
+    backend._subscribed_topic = topic
+    results: list[int] = []
+
+    pop_thread = Thread(target=lambda: backend.pop("testq", timeout=1.0))
+    len_thread = Thread(target=lambda: results.append(backend.queue_len("testq")))
+    pop_thread.start()
+    assert poll_entered.wait(timeout=2.0)
+    len_thread.start()
+    overlapped = assignment_entered.wait(timeout=0.2)
+    release_poll.set()
+    pop_thread.join(timeout=2.0)
+    len_thread.join(timeout=2.0)
+
+    assert overlapped is False
+    assert results == [5]
 
   def test_queue_len_returns_lag_from_consumer(self, mocker):
     """queue_len returns sum(end_offset - position) across assigned partitions."""
@@ -1144,7 +1263,8 @@ class TestKafkaBackendQueueLen:
     mock_consumer = mocker.MagicMock()
     mock_consumer.assignment.return_value = {tp0, tp1}
     mock_consumer.end_offsets.return_value = {tp0: 10, tp1: 5}
-    mock_consumer.position.side_effect = lambda tp: {tp0: 3, tp1: 1}[tp]
+    mock_consumer.beginning_offsets.return_value = {tp0: 0, tp1: 0}
+    mock_consumer.committed.side_effect = lambda tp: {tp0: 3, tp1: 1}[tp]
     backend._consumer = mock_consumer
 
     result = backend.queue_len("testq")
@@ -1159,12 +1279,13 @@ class TestKafkaBackendQueueLen:
     consumer = mocker.MagicMock()
     consumer.assignment.return_value = {requested, foreign}
     consumer.end_offsets.return_value = {requested: 10}
-    consumer.position.return_value = 4
+    consumer.beginning_offsets.return_value = {requested: 0}
+    consumer.committed.return_value = 4
     backend._consumer = consumer
 
     assert backend.queue_len("testq") == 6
     consumer.end_offsets.assert_called_once_with({requested})
-    consumer.position.assert_called_once_with(requested)
+    consumer.committed.assert_called_once_with(requested)
 
   def test_queue_len_uses_requested_topic_when_consumer_is_on_other_topic(
     self, mocker
@@ -1180,7 +1301,8 @@ class TestKafkaBackendQueueLen:
     temp_consumer = mocker.MagicMock()
     temp_consumer.partitions_for_topic.return_value = {0}
     temp_consumer.end_offsets.return_value = {requested: 12}
-    temp_consumer.position.return_value = 5
+    temp_consumer.beginning_offsets.return_value = {requested: 0}
+    temp_consumer.committed.return_value = 5
     consumer_cls = mocker.patch(
       "scrapy_extension.backends.kafka.KafkaConsumer",
       return_value=temp_consumer,
@@ -1207,7 +1329,8 @@ class TestKafkaBackendQueueLen:
     mock_consumer = mocker.MagicMock()
     mock_consumer.partitions_for_topic.return_value = {0}
     mock_consumer.end_offsets.return_value = {tp: 8}
-    mock_consumer.position.return_value = 3
+    mock_consumer.beginning_offsets.return_value = {tp: 0}
+    mock_consumer.committed.return_value = 3
     consumer_cls = mocker.patch(
       "scrapy_extension.backends.kafka.KafkaConsumer",
       return_value=mock_consumer,
@@ -1230,7 +1353,8 @@ class TestKafkaBackendQueueLen:
     config = KafkaSettings()
     backend = KafkaBackend(config)
     backend._consumer = None
-    mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
+    consumer = mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
+    consumer.return_value.partitions_for_topic.return_value = None
 
     assert backend.queue_len("testq") == 0
 
@@ -1245,7 +1369,8 @@ class TestKafkaBackendQueueLen:
     probe_consumer = mocker.MagicMock()
     probe_consumer.partitions_for_topic.return_value = {0}
     probe_consumer.end_offsets.return_value = {tp: 12}
-    probe_consumer.position.return_value = 5
+    probe_consumer.beginning_offsets.return_value = {tp: 0}
+    probe_consumer.committed.return_value = 5
     mocker.patch(
       "scrapy_extension.backends.kafka.KafkaConsumer",
       return_value=probe_consumer,

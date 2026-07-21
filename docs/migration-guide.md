@@ -286,6 +286,14 @@ alter an existing topic. Existing partition, replication, retention, and
 minimum-ISR policy is verified, and a mismatch blocks publication until it is
 reconciled with broker tooling.
 
+Kafka `queue_len()` now returns consumer-group lag from committed offsets, not
+the current process's fetched position. It can therefore be larger while
+records are in flight and not yet acknowledged. Fresh groups use
+`auto_offset_reset`: `earliest` includes existing backlog, `latest` starts at
+the end, and `none` raises `QueueError` when no committed offset exists. Callers
+must not convert that error to zero; scheduler pending detection deliberately
+stays conservative.
+
 MongoDB `w=0` and negative write concerns are no longer accepted because an
 unacknowledged PyMongo result cannot satisfy queue, set, or storage mutation
 success. Use a positive integer or `"majority"`; custom replica-set tag names

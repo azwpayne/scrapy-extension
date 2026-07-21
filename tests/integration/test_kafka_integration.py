@@ -23,6 +23,8 @@ What's pinned
 -------------
 - ``test_push_pop_round_trip_with_ack`` — N in → N out, no loss, each acked
   (commit). The poll-loop handles the consumer-group join latency.
+- ``test_cold_start_depth_sees_existing_backlog`` — a fresh group with the
+  default earliest reset reports pre-existing records before its first poll.
 - ``test_ack_idempotent_when_no_pending`` — R11: ack/nack with no tracked
   record is a safe no-op.
 
@@ -133,6 +135,16 @@ def test_push_pop_round_trip_with_ack(kafka_backend, unique_prefix):
 
   assert len(received) == n
   assert set(received) == set(sent)
+
+
+def test_cold_start_depth_sees_existing_backlog(kafka_backend, unique_prefix):
+  """Fresh earliest groups must not turn a pre-existing backlog into false 0."""
+  queue = f"{unique_prefix}-cold-depth"
+  sent = [b"cold-0", b"cold-1", b"cold-2"]
+  for item in sent:
+    kafka_backend.push(queue, item, priority=0.0)
+
+  assert kafka_backend.queue_len(queue) == len(sent)
 
 
 def test_ack_idempotent_when_no_pending(kafka_backend, unique_prefix):

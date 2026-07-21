@@ -150,6 +150,13 @@ not mutated automatically; the backend verifies their partition, replication,
 retention, and minimum-ISR policy and refuses a mismatch until it is reconciled
 with Kafka operator tooling.
 
+`queue_len()` reports conservative consumer-group lag. It uses committed
+offsets rather than the local fetch position, so fetched-but-unacknowledged
+records remain pending. For a fresh group, `auto_offset_reset="earliest"`
+counts existing backlog, `"latest"` begins at the end, and `"none"` fails
+instead of returning a false zero. Consumer metadata calls are serialized with
+poll and settlement because KafkaConsumer is not thread-safe.
+
 ### RabbitMQ (standalone, cluster, mirrored_queues)
 
 ```python

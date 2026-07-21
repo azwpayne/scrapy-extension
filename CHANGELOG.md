@@ -78,6 +78,12 @@ upgrading.
   queue priority maps directly to physical partitions. Existing topics remain
   operator-managed; their policy is verified and a mismatch fails instead of
   being silently reconfigured or ignored.
+- **Kafka queue depth now measures consumer-group backlog conservatively.** It
+  subtracts committed offsets rather than fetched positions, so in-flight
+  unacknowledged records remain pending. A fresh group follows the configured
+  `auto_offset_reset`: `earliest` sees existing records, `latest` begins at the
+  end, and `none` raises instead of faking an empty queue. Depth metadata calls
+  are serialized with poll/ack/nack on the non-thread-safe consumer.
 - **MongoDB mutations now require an acknowledged write concern.** `w=0`,
   negative or boolean values, and unsupported write-concern strings fail at
   settings construction and again before client I/O. Supported values are a

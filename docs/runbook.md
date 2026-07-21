@@ -280,6 +280,12 @@ Reconcile that drift out of band. Keep
 `num_partitions == max_priority_partitions` because priority is the physical
 partition index.
 
+Kafka depth is consumer-group lag (`end - committed`), not local fetch lag.
+Fetched but unacknowledged records still count. A new group with `earliest`
+must see pre-existing backlog; `latest` intentionally starts at the end; `none`
+without a committed offset is an operator error and raises. Never translate a
+depth exception into zero, because the scheduler uses zero as an idle signal.
+
 MongoDB push, set, and storage mutation success requires an acknowledged write
 concern. The backend supports positive integer `w` values and `"majority"`;
 `w=0` is never a valid throughput shortcut. A write-concern timeout limits how
