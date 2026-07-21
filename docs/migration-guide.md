@@ -329,6 +329,14 @@ read to `store`, `delete`, and `clear_storage`, but prevents pymemcache's defaul
 latency budgets rather than restoring noreply: the StorageBackend contract uses
 the return boundary as the write result.
 
+Shared Memcached backend instances now serialize all operations on their single
+pymemcache protocol socket, including health checks and disconnect. Applications
+that previously relied on concurrent calls over one client should budget for a
+single in-flight operation per generation. `allow_flush_all` now accepts only a
+real boolean (or canonical `true`/`false` environment text), is captured at
+connect, and cannot be enabled by mutating settings afterward. A false flush
+reply is an error rather than successful completion.
+
 ## Validation and Rollback
 
 Before opening traffic, verify:

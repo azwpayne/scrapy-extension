@@ -155,7 +155,9 @@ pipeline keeps its setting-level compatibility rule:
 Memcached clients run with `default_noreply=False`; a successful mutation has
 parsed the server's response rather than merely written a command to the socket.
 An exception is still an ambiguous transport outcome, so retry callers should
-use idempotent values/keys.
+use idempotent values/keys. The ordinary pymemcache client has one protocol
+socket, so this backend serializes storage calls, health probes, and disconnect;
+expect one in-flight operation per connected backend generation.
 
 ## Safe clearing
 
@@ -165,7 +167,9 @@ use idempotent values/keys.
 - Memcached cannot enumerate or prefix-delete keys. Any non-`None` prefix raises
   `NotImplementedError`; `clear_storage(None)` also raises unless
   `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`. Enabling it issues server-wide
-  `flush_all`, so use it only on a dedicated instance.
+  `flush_all`, so use it only on a dedicated instance. Permission comes from
+  the immutable connected-generation snapshot, and the server must reply with
+  success; changing the settings object after connect cannot authorize it.
 - Kafka queue clear is deliberately unsupported. Do not automate topic
   delete/recreate through the crawler: stop all producers/consumers, use Kafka
   operator tooling, wait for metadata convergence, and explicitly reset or

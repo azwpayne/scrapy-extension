@@ -87,6 +87,21 @@ class TestMemcachedBackendType:
     assert s.allow_remote_plaintext is False
     assert s.allow_flush_all is False
 
+  @pytest.mark.parametrize("allow_flush_all", [1, 0, "yes", None])
+  def test_allow_flush_all_requires_exact_boolean(self, allow_flush_all) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedSettings(allow_flush_all=allow_flush_all)
+    assert exc_info.value.setting_name == "allow_flush_all"
+
+  @pytest.mark.parametrize(
+    ("env_value", "expected"), [("true", True), ("false", False)]
+  )
+  def test_allow_flush_all_accepts_canonical_environment_boolean(
+    self, monkeypatch, env_value: str, expected: bool
+  ) -> None:
+    monkeypatch.setenv("SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL", env_value)
+    assert MemcachedSettings().allow_flush_all is expected
+
 
 class TestMemcachedConnect:
   def test_unsupported_mode_is_configuration_error(self) -> None:
@@ -172,6 +187,19 @@ class TestMemcachedConnect:
     assert exc_info.value.setting_name == "port"
     client.assert_not_called()
 
+  def test_connect_revalidates_mutated_flush_permission_before_sdk_io(
+    self, mocker
+  ) -> None:
+    settings = MemcachedSettings()
+    settings.allow_flush_all = "yes"  # type: ignore[assignment]
+    client = mocker.patch.object(memcached_mod, "MemcachedClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_flush_all"
+    client.assert_not_called()
+
   def test_connect_retains_one_preconstruction_snapshot(self, mocker) -> None:
     settings = MemcachedSettings(
       host="cache.internal", allow_remote_plaintext=True
@@ -200,6 +228,43 @@ class TestMemcachedConnect:
     assert backend._connection_snapshot.host == "cache.internal"
     assert backend._connection_snapshot.port == 11211
     assert backend._connection_snapshot.allow_remote_plaintext is True
+
+  def test_disconnect_returns_and_fences_in_progress_connect_probe(
+    self, mocker
+  ) -> None:
+    stats_entered = Event()
+    release_stats = Event()
+    disconnect_returned = Event()
+    client = mocker.MagicMock(name="client")
+
+    def blocking_stats():
+      stats_entered.set()
+      assert release_stats.wait(timeout=2.0)
+
+    client.stats.side_effect = blocking_stats
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    backend = _make_backend()
+
+    connect_thread = Thread(target=backend.connect)
+    connect_thread.start()
+    assert stats_entered.wait(timeout=2.0)
+
+    def disconnect() -> None:
+      backend.disconnect()
+      disconnect_returned.set()
+
+    disconnect_thread = Thread(target=disconnect)
+    disconnect_thread.start()
+    returned_during_probe = disconnect_returned.wait(timeout=2.0)
+    release_stats.set()
+    connect_thread.join(timeout=2.0)
+    disconnect_thread.join(timeout=2.0)
+
+    assert returned_during_probe is True
+    assert not connect_thread.is_alive()
+    assert not disconnect_thread.is_alive()
+    assert backend.is_connected() is False
+    client.close.assert_called_once()
 
   def test_startup_error_traceback_does_not_echo_driver_text(self, mocker) -> None:
     secret = "memcached-driver-secret"
@@ -278,6 +343,122 @@ def test_locked_pymemcache_requires_explicit_reply_confirmation() -> None:
 
 
 class TestMemcachedStorageOps:
+  def test_single_socket_operations_do_not_overlap(self, mocker) -> None:
+    backend, client = _connected(mocker)
+    get_entered = Event()
+    release_get = Event()
+    store_attempted = Event()
+    set_entered = Event()
+    errors: list[BaseException] = []
+
+    def blocking_get(_key):
+      get_entered.set()
+      assert release_get.wait(timeout=2.0)
+      return b"value"
+
+    def observed_set(*_args, **_kwargs):
+      set_entered.set()
+      return True
+
+    client.get.side_effect = blocking_get
+    client.set.side_effect = observed_set
+
+    def retrieve() -> None:
+      try:
+        backend.retrieve("read-key")
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    def store() -> None:
+      store_attempted.set()
+      try:
+        backend.store("write-key", b"value")
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    retrieve_thread = Thread(target=retrieve)
+    store_thread = Thread(target=store)
+    retrieve_thread.start()
+    assert get_entered.wait(timeout=2.0)
+    store_thread.start()
+    assert store_attempted.wait(timeout=2.0)
+    overlapped = set_entered.wait(timeout=0.2)
+    release_get.set()
+    retrieve_thread.join(timeout=2.0)
+    store_thread.join(timeout=2.0)
+
+    assert overlapped is False
+    assert set_entered.is_set()
+    assert errors == []
+
+  def test_ping_does_not_overlap_storage_operation(self, mocker) -> None:
+    backend, client = _connected(mocker)
+    stats_entered = Event()
+    release_stats = Event()
+    retrieve_attempted = Event()
+    get_entered = Event()
+
+    def blocking_stats():
+      stats_entered.set()
+      assert release_stats.wait(timeout=2.0)
+      return {}
+
+    def observed_get(_key):
+      get_entered.set()
+      return b"value"
+
+    client.stats.side_effect = blocking_stats
+    client.get.side_effect = observed_get
+    ping_thread = Thread(target=backend.ping)
+
+    def retrieve() -> None:
+      retrieve_attempted.set()
+      backend.retrieve("key")
+
+    retrieve_thread = Thread(target=retrieve)
+    ping_thread.start()
+    assert stats_entered.wait(timeout=2.0)
+    retrieve_thread.start()
+    assert retrieve_attempted.wait(timeout=2.0)
+    overlapped = get_entered.wait(timeout=0.2)
+    release_stats.set()
+    ping_thread.join(timeout=2.0)
+    retrieve_thread.join(timeout=2.0)
+
+    assert overlapped is False
+    assert get_entered.is_set()
+
+  def test_disconnect_waits_for_active_storage_operation(self, mocker) -> None:
+    backend, client = _connected(mocker)
+    get_entered = Event()
+    release_get = Event()
+    disconnect_returned = Event()
+
+    def blocking_get(_key):
+      get_entered.set()
+      assert release_get.wait(timeout=2.0)
+      return b"value"
+
+    client.get.side_effect = blocking_get
+    retrieve_thread = Thread(target=lambda: backend.retrieve("key"))
+
+    def disconnect() -> None:
+      backend.disconnect()
+      disconnect_returned.set()
+
+    disconnect_thread = Thread(target=disconnect)
+    retrieve_thread.start()
+    assert get_entered.wait(timeout=2.0)
+    disconnect_thread.start()
+    returned_during_operation = disconnect_returned.wait(timeout=0.2)
+    release_get.set()
+    retrieve_thread.join(timeout=2.0)
+    disconnect_thread.join(timeout=2.0)
+
+    assert returned_during_operation is False
+    assert backend.is_connected() is False
+    client.close.assert_called_once()
+
   def test_store_sets_with_ttl(self, mocker) -> None:
     b, client = _connected(mocker)
     b.store("key1", b"value", ttl=60)
@@ -330,10 +511,49 @@ class TestMemcachedStorageOps:
   def test_clear_storage_flushes_all_when_explicitly_enabled(self, mocker) -> None:
     b = _make_backend(allow_flush_all=True)
     client = mocker.MagicMock()
+    client.flush_all.return_value = True
     mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
     b.connect()
     b.clear_storage()
     client.flush_all.assert_called_once()
+
+  def test_clear_storage_uses_connected_generation_permission(self, mocker) -> None:
+    settings = MemcachedSettings(allow_flush_all=True)
+    backend = MemcachedBackend(settings)
+    client = mocker.MagicMock()
+    client.flush_all.return_value = True
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    backend.connect()
+    settings.allow_flush_all = False
+
+    backend.clear_storage()
+
+    client.flush_all.assert_called_once()
+
+  def test_mutation_cannot_enable_flush_for_connected_generation(self, mocker) -> None:
+    settings = MemcachedSettings()
+    backend = MemcachedBackend(settings)
+    client = mocker.MagicMock()
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    backend.connect()
+    settings.allow_flush_all = "yes"  # type: ignore[assignment]
+
+    with pytest.raises(NotImplementedError, match="allow_flush_all"):
+      backend.clear_storage()
+
+    client.flush_all.assert_not_called()
+
+  def test_clear_storage_rejected_reply_raises_storage_error(self, mocker) -> None:
+    backend = _make_backend(allow_flush_all=True)
+    client = mocker.MagicMock()
+    client.flush_all.return_value = False
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    backend.connect()
+
+    with pytest.raises(StorageError) as exc_info:
+      backend.clear_storage()
+
+    assert exc_info.value.operation == "clear_storage"
 
   def test_clear_storage_rejects_global_flush_by_default(self, mocker) -> None:
     b, client = _connected(mocker)

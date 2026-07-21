@@ -289,11 +289,15 @@ Memcached traffic in this backend is unauthenticated and unencrypted. Loopback
 hosts work by default; any remote host fails at startup unless
 `ALLOW_REMOTE_PLAINTEXT=True` explicitly accepts that trusted-network risk.
 Mutating operations disable pymemcache's `noreply` default and wait for the
-server response before reporting StorageBackend success.
+server response before reporting StorageBackend success. Because the ordinary
+pymemcache client owns one request/response socket, all operations and teardown
+are serialized so concurrent callers cannot consume one another's replies.
 Memcached cannot enumerate or prefix-delete application keys. Consequently,
 `clear_storage(prefix=...)` is unsupported and `clear_storage(None)` raises by
 default. Enabling `ALLOW_FLUSH_ALL` permits a server-wide destructive flush and
-is appropriate only for a dedicated Memcached instance.
+is appropriate only for a dedicated Memcached instance. That permission is
+captured by the connected client generation; later settings mutation cannot
+enable a flush, and the server must return an explicit successful reply.
 
 ### DynamoDB (standalone=LocalStack, cloud=AWS, NoSQL KV)
 

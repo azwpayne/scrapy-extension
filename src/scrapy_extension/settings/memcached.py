@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from ipaddress import ip_address
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
@@ -100,6 +100,27 @@ def validate_memcached_connection(
   return mode, normalized_host, port, allow_remote_plaintext
 
 
+def validate_memcached_flush_policy(allow_flush_all: object) -> bool:
+  """Require an explicit boolean for the destructive server-wide permission."""
+  if not isinstance(allow_flush_all, bool):
+    raise ConfigurationError(
+      "allow_flush_all must be a boolean.",
+      setting_name="allow_flush_all",
+    )
+  return allow_flush_all
+
+
+def normalize_memcached_flush_setting(allow_flush_all: object) -> bool:
+  """Parse canonical environment booleans without accepting broad coercions."""
+  if isinstance(allow_flush_all, str):
+    normalized = allow_flush_all.strip().lower()
+    if normalized == "true":
+      return True
+    if normalized == "false":
+      return False
+  return validate_memcached_flush_policy(allow_flush_all)
+
+
 class MemcachedSettings(BaseSettings):
   """Memcached-specific settings (key-value cache / NoSQL).
 
@@ -142,6 +163,12 @@ class MemcachedSettings(BaseSettings):
     ),
   )
 
+  @field_validator("allow_flush_all", mode="before")
+  @classmethod
+  def _validate_flush_permission_type(cls, value: object) -> bool:
+    """Prevent permissive bool coercion for a destructive capability."""
+    return normalize_memcached_flush_setting(value)
+
   @model_validator(mode="after")
   def _validate_connection(self) -> Self:
     """Normalize the host and enforce the trusted-network boundary."""
@@ -151,4 +178,5 @@ class MemcachedSettings(BaseSettings):
       self.port,
       self.allow_remote_plaintext,
     )
+    validate_memcached_flush_policy(self.allow_flush_all)
     return self

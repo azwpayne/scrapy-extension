@@ -251,6 +251,10 @@ speculative work.
 - [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
   default noreply mode so storage mutation success is based on a parsed server
   response rather than an unconfirmed socket write.
+- [x] **BACKEND-06B — Memcached single-socket lifecycle.** Serialize SDK
+  request/response transactions and published-client teardown, fence private
+  connection probes across disconnect, snapshot the destructive flush
+  capability, and reject non-successful flush replies.
 - [x] **BACKEND-07A — confirmed Kafka publication.** Reject Kafka `acks=0`,
   apply advertised retention/min-ISR settings to new topics, and reject
   inconsistent replication, ISR, and partition-count policy.
@@ -972,3 +976,24 @@ construction, and immediately before SDK I/O, with credential-free errors.
 All 452 related tests passed on Python 3.10 and 3.14 with six real-MongoDB tests
 explicitly skipped; the full Python 3.10 suite passed 3,190 tests with 45
 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I28 — Memcached single-socket and flush generation safety
+
+Twelve RED outcomes across two evidence batches reproduced four concrete
+failures: ordinary client calls overlapped on one response socket; disconnect
+during a private `stats()` probe returned before that candidate was later
+published; post-connect settings mutation could authorize server-wide flush;
+and a false flush reply was reported as success. Strict boolean validation also
+initially broke canonical `true`/`false` environment text, which the second RED
+batch pinned before implementation was finalized.
+
+All published-client SDK transactions now share a non-reentrant operation lock.
+Disconnect fences private connect attempts with a lifecycle generation so it
+returns without waiting for an unbounded probe and stale candidates close
+instead of resurrecting. The destructive flush capability is normalized only
+from booleans or canonical environment text, captured in the immutable
+connection snapshot, and revalidated before SDK I/O; clear requires an exact
+successful server reply. All 63 related tests passed on Python 3.10 and 3.14
+with one real-Memcached test explicitly skipped; the full Python 3.10 suite
+passed 3,204 tests with 45 documented skips. Ruff, strict mypy, and patch
+integrity remained green.

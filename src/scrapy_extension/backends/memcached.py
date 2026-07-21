@@ -47,6 +47,7 @@ from scrapy_extension.settings import MemcachedMode
 from scrapy_extension.settings.memcached import (
   is_memcached_loopback,
   validate_memcached_connection,
+  validate_memcached_flush_policy,
 )
 
 if TYPE_CHECKING:
@@ -63,6 +64,7 @@ class _MemcachedConnectionSnapshot:
   host: str
   port: int
   allow_remote_plaintext: bool
+  allow_flush_all: bool
 
 
 class MemcachedBackend(Backend, StorageBackend):
@@ -88,8 +90,13 @@ class MemcachedBackend(Backend, StorageBackend):
     self.config = config
     self._client: Any = None
     self._connection_snapshot: _MemcachedConnectionSnapshot | None = None
+    # pymemcache's ordinary Client owns one request/response socket and is not
+    # thread-safe. Serialize every SDK transaction with connect/disconnect so
+    # replies cannot cross-wire and teardown cannot race an active operation.
+    self._operation_lock = Lock()
     self._connect_lock = Lock()
     self._lifecycle_lock = Lock()
+    self._lifecycle_generation = 0
 
   def _capture_connection_snapshot(self) -> _MemcachedConnectionSnapshot:
     """Capture and revalidate every value used by one connect attempt."""
@@ -99,11 +106,15 @@ class MemcachedBackend(Backend, StorageBackend):
       self.config.port,
       self.config.allow_remote_plaintext,
     )
+    allow_flush_all = validate_memcached_flush_policy(
+      self.config.allow_flush_all
+    )
     return _MemcachedConnectionSnapshot(
       mode=mode,
       host=host,
       port=port,
       allow_remote_plaintext=allow_remote,
+      allow_flush_all=allow_flush_all,
     )
 
   def connect(self) -> None:
@@ -120,6 +131,7 @@ class MemcachedBackend(Backend, StorageBackend):
       with self._lifecycle_lock:
         if self._client is not None:
           return
+        generation = self._lifecycle_generation
       snapshot = self._capture_connection_snapshot()
       candidate: Any = None
       try:
@@ -139,12 +151,18 @@ class MemcachedBackend(Backend, StorageBackend):
         raise BackendConnectionError(
           "Failed to connect to Memcached.", backend_type="memcached"
         ) from None
-      with self._lifecycle_lock:
-        # ``_connect_lock`` serializes connect attempts; the lifecycle lock
-        # publishes the successfully probed client and its exact settings as
-        # one generation for concurrent health/disconnect readers.
-        self._client = candidate
-        self._connection_snapshot = snapshot
+      with self._operation_lock:
+        with self._lifecycle_lock:
+          # A concurrent disconnect fences this private probe by advancing the
+          # lifecycle generation. Never resurrect a client after teardown.
+          publish = generation == self._lifecycle_generation
+          if publish:
+            self._client = candidate
+            self._connection_snapshot = snapshot
+      if not publish:
+        with _swallow():
+          candidate.close()
+        return
       if not is_memcached_loopback(snapshot.host):
         logger.warning(
           "Remote Memcached plaintext was explicitly enabled for %s:%d; "
@@ -158,17 +176,20 @@ class MemcachedBackend(Backend, StorageBackend):
 
   def disconnect(self) -> None:
     """Close the Memcached client."""
-    with self._lifecycle_lock:
-      client = self._client
-      self._client = None
-      self._connection_snapshot = None
-    if client is not None:
-      with _swallow():
-        client.close()
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        self._lifecycle_generation += 1
+        client = self._client
+        self._client = None
+        self._connection_snapshot = None
+      if client is not None:
+        with _swallow():
+          client.close()
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
-    return self._client is not None
+    with self._lifecycle_lock:
+      return self._client is not None
 
   def ping(self) -> bool:
     """Check Memcached health via stats().
@@ -176,13 +197,16 @@ class MemcachedBackend(Backend, StorageBackend):
     Returns:
         True if stats() succeeds.
     """
-    if self._client is None:
-      return False
-    try:
-      self._client.stats()
-      return True
-    except Exception:
-      return False
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        client = self._client
+      if client is None:
+        return False
+      try:
+        client.stats()
+        return True
+      except Exception:
+        return False
 
   @property
   def backend_type(self) -> BackendType:
@@ -205,11 +229,14 @@ class MemcachedBackend(Backend, StorageBackend):
     """
     _validate_key_name(key, "key")
     _validate_ttl(ttl)
-    try:
-      stored = self._client.set(key, data, expire=0 if ttl is None else ttl)
-    except Exception as e:
-      msg = f"Failed to store key {key!r} in Memcached: {e}"
-      raise StorageError(msg, operation="store", key=key) from e
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        client = self._client
+      try:
+        stored = client.set(key, data, expire=0 if ttl is None else ttl)
+      except Exception as e:
+        msg = f"Failed to store key {key!r} in Memcached: {e}"
+        raise StorageError(msg, operation="store", key=key) from e
     if stored is not True:
       raise StorageError(
         f"Memcached rejected the write for key {key!r}",
@@ -232,11 +259,14 @@ class MemcachedBackend(Backend, StorageBackend):
             silently swallowed to ``return None``).
     """
     _validate_key_name(key, "key")
-    try:
-      return cast("bytes | None", self._client.get(key))
-    except Exception as e:
-      msg = f"Failed to retrieve key {key!r} from Memcached: {e}"
-      raise StorageError(msg, operation="retrieve", key=key) from e
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        client = self._client
+      try:
+        return cast("bytes | None", client.get(key))
+      except Exception as e:
+        msg = f"Failed to retrieve key {key!r} from Memcached: {e}"
+        raise StorageError(msg, operation="retrieve", key=key) from e
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -253,11 +283,14 @@ class MemcachedBackend(Backend, StorageBackend):
             silently swallowed to ``return False``).
     """
     _validate_key_name(key, "key")
-    try:
-      return bool(self._client.delete(key))
-    except Exception as e:
-      msg = f"Failed to delete key {key!r} in Memcached: {e}"
-      raise StorageError(msg, operation="delete", key=key) from e
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        client = self._client
+      try:
+        return bool(client.delete(key))
+      except Exception as e:
+        msg = f"Failed to delete key {key!r} in Memcached: {e}"
+        raise StorageError(msg, operation="delete", key=key) from e
 
   def exists(self, key: str) -> bool:
     """Check if a key exists.
@@ -274,11 +307,14 @@ class MemcachedBackend(Backend, StorageBackend):
             silently swallowed to ``return False``).
     """
     _validate_key_name(key, "key")
-    try:
-      return self._client.get(key) is not None
-    except Exception as e:
-      msg = f"Failed to check existence of key {key!r} in Memcached: {e}"
-      raise StorageError(msg, operation="exists", key=key) from e
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        client = self._client
+      try:
+        return client.get(key) is not None
+      except Exception as e:
+        msg = f"Failed to check existence of key {key!r} in Memcached: {e}"
+        raise StorageError(msg, operation="exists", key=key) from e
 
   def ttl(self, key: str) -> int | None:
     """Return None — Memcached does not expose remaining TTL.
@@ -316,17 +352,27 @@ class MemcachedBackend(Backend, StorageBackend):
         "Memcached flush_all does not support prefix scoping; pass "
         "prefix=None only when a server-wide flush is explicitly acceptable."
       )
-    if not self.config.allow_flush_all:
-      raise NotImplementedError(
-        "Memcached clear_storage would flush every key on the server. Set "
-        "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=true (allow_flush_all=True) only "
-        "for a dedicated cache where that destructive scope is intended."
-      )
-    try:
-      self._client.flush_all()
-    except Exception as e:
-      msg = f"Failed to flush Memcached: {e}"
-      raise StorageError(msg, operation="clear_storage", key=None) from e
+    with self._operation_lock:
+      with self._lifecycle_lock:
+        client = self._client
+        snapshot = self._connection_snapshot
+      if snapshot is None or not snapshot.allow_flush_all:
+        raise NotImplementedError(
+          "Memcached clear_storage would flush every key on the server. Set "
+          "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=true (allow_flush_all=True) only "
+          "for a dedicated cache where that destructive scope is intended."
+        )
+      try:
+        flushed = client.flush_all()
+      except Exception as e:
+        msg = f"Failed to flush Memcached: {e}"
+        raise StorageError(msg, operation="clear_storage", key=None) from e
+      if flushed is not True:
+        raise StorageError(
+          "Memcached rejected the server-wide flush.",
+          operation="clear_storage",
+          key=None,
+        )
 
 
 class _swallow:

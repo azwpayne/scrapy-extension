@@ -33,6 +33,12 @@ upgrading.
   `NotImplementedError` unless `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`.
   Prefix clearing remains unsupported. Enabling the flag issues server-wide
   `flush_all` and is intended only for dedicated instances.
+- **Memcached client operations are now single-socket safe.** Storage calls,
+  health probes, and disconnect are serialized around pymemcache's ordinary
+  client so concurrent callers cannot consume each other's responses. A
+  disconnect fences an in-progress private connection probe, preventing later
+  resurrection. `allow_flush_all` is an exact, connection-generation-scoped
+  capability, and a non-successful flush reply raises `StorageError`.
 - **Unknown bundled-backend settings now fail fast.** Nested extras and typoed
   flat/environment names under a selected backend prefix raise
   `ConfigurationError` (with a nearest-name suggestion) instead of silently
