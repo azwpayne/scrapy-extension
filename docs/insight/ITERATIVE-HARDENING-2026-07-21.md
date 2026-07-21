@@ -306,7 +306,7 @@ speculative work.
   endpoints and sanitize direct settings-validation failures so an endpoint
   cannot retain or disclose embedded credentials. Unsupported settings must
   not remain accepted no-ops.
-- [ ] **DEP-01 — pyasn1 advisory refresh.** Move the transitive lock from
+- [x] **DEP-01 — pyasn1 advisory refresh.** Move the transitive lock from
   pyasn1 0.6.3 to a fixed compatible release, verify the
   Scrapy/service-identity dependency chain, and retain the separately
   documented no-fix Scrapy advisory rather than conflating it with
@@ -1611,3 +1611,29 @@ integrity remained green. The dependency audit separately found two newly
 published, fix-available pyasn1 0.6.3 advisories plus the already documented
 no-fix Scrapy advisory; the pyasn1 refresh is therefore bounded as I43 rather
 than mixed into this Redis atomic commit.
+
+### I43 — pyasn1 decoder advisory floor
+
+The post-I42 dependency audit found pyasn1 0.6.3 in Scrapy's
+service-identity TLS chain. `uv audit --locked` reported the quadratic
+OBJECT IDENTIFIER and unbounded REAL decoder advisories; upstream 0.6.4 also
+fixes an unbounded long-form tag decoder flaw whose OSV package name was
+misspelled and therefore absent from the scanner result. A lock-only update
+would not constrain downstream wheel resolution: service-identity has no
+pyasn1 floor, while pyasn1-modules permits vulnerable releases from 0.6.1.
+
+The specification therefore adds the narrow core runtime constraint
+`pyasn1>=0.6.4,<0.7` and refreshes only pyasn1 in the lock. This remains inside
+pyasn1-modules' supported range and protects both the repository environment
+and downstream installers. The changelog and security policy record all three
+decoder CVEs and retain the unrelated Scrapy advisory's reviewed no-fix/false-
+positive exception.
+
+The resolver changed only pyasn1 0.6.3 to 0.6.4. The locked audit then reported
+only the documented Scrapy record. A wheel built through an sdist contained
+`Requires-Dist: pyasn1>=0.6.4,<0.7`; a fresh Python 3.10 environment installed
+that wheel with pyasn1 0.6.4 and imported the package successfully. Python
+3.10 and 3.14 full suites each passed 3,542 tests with 46 documented skips.
+Ruff, strict mypy, configured Bandit, lockfile validation, and patch integrity
+remained green. The next release-procedure and backend findings stay outside
+this dependency-only atomic iteration.

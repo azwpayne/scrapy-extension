@@ -164,6 +164,12 @@ Two bundled backends currently carry supply-chain caveats:
 
 ### Dependency-audit exception
 
+The core dependency floor requires `pyasn1>=0.6.4,<0.7`, excluding
+CVE-2026-59884/59885/59886 from Scrapy's service-identity TLS path. At the time
+of this update, OSV misspells the package name for CVE-2026-59884, so a clean
+scanner result for that one advisory is not sufficient without the explicit
+version floor.
+
 The locked dependency graph contains Scrapy 2.17.0 and setuptools 83.0.0.
 `uv audit --locked` still reports `PYSEC-2017-83` for Scrapy because the PyPA
 record has no fixed-version event. The reviewed

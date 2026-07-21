@@ -501,6 +501,11 @@ upgrading.
 
 ### Fixed
 
+- The core Scrapy TLS identity dependency now requires `pyasn1>=0.6.4,<0.7`,
+  excluding the long-form tag, OBJECT IDENTIFIER, and REAL decoder
+  resource-exhaustion flaws reported against 0.6.3. The locked graph upgrades
+  only pyasn1; the separate historical Scrapy advisory still has no fixed
+  release.
 - Redis Sentinel no longer forwards TLS-only keywords into a plaintext
   discovered-master pool. Non-TLS Sentinel generations can now construct their
   real redis-py managed data connection across the supported 7.3–8.x range;
