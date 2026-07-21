@@ -625,8 +625,12 @@ class TestKafkaBackendPop:
 
     # subscribe called exactly twice (once per distinct topic), not 3 times.
     assert mock_consumer.subscribe.call_count == 2
-    mock_consumer.subscribe.assert_any_call(["scrapy-queue_a"])
-    mock_consumer.subscribe.assert_any_call(["scrapy-queue_b"])
+    mock_consumer.subscribe.assert_any_call(
+      ["scrapy-queue_a"], listener=backend._rebalance_listener
+    )
+    mock_consumer.subscribe.assert_any_call(
+      ["scrapy-queue_b"], listener=backend._rebalance_listener
+    )
 
   def test_pop_does_not_warn_on_concurrent_pops(self, mocker, caplog):
     """Tier-2 Unit H: the single-slot defect warning is GONE.
@@ -1424,8 +1428,8 @@ class TestKafkaBackendPopWithAckConcurrency:
 
     assert mock_consumer.commit.call_count == first_commit_count
 
-  def test_same_partition_offsets_are_tracked_independently_per_topic(self, mocker):
-    """Ack state for one topic must not consume another topic's token."""
+  def test_subscription_switch_fences_prior_topic_token(self, mocker):
+    """A single consumer cannot settle a token from its revoked topic."""
     records = [
       self._record(mocker, 0, 0, topic="scrapy-first"),
       self._record(mocker, 0, 0, topic="scrapy-second"),
@@ -1438,18 +1442,15 @@ class TestKafkaBackendPopWithAckConcurrency:
     backend.ack("first", token=first_token)
     backend.ack("second", token=second_token)
 
-    assert mock_consumer.commit.call_count == 2
+    assert mock_consumer.commit.call_count == 1
     committed_partitions = [
       next(iter(call.args[0])) for call in mock_consumer.commit.call_args_list
     ]
-    assert committed_partitions == [
-      TopicPartition("scrapy-first", 0),
-      TopicPartition("scrapy-second", 0),
-    ]
+    assert committed_partitions == [TopicPartition("scrapy-second", 0)]
     assert [
       next(iter(call.args[0].values())).offset
       for call in mock_consumer.commit.call_args_list
-    ] == [1, 1]
+    ] == [1]
 
   def test_ack_retries_same_token_after_commit_failure(self, mocker):
     """A failed broker commit must leave the token retryable."""

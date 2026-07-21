@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 import pytest
+from kafka import TopicPartition
 from kafka.errors import KafkaError
 
 from scrapy_extension.backends.kafka import (
@@ -26,6 +27,15 @@ from scrapy_extension.settings import KafkaMode, KafkaSettings
 def _backend() -> KafkaBackend:
   """Constructed-but-not-connected backend (clients are None)."""
   return KafkaBackend(KafkaSettings())
+
+
+def _record(mocker, topic: str, offset: int = 0, partition: int = 0):
+  record = mocker.MagicMock()
+  record.topic = topic
+  record.partition = partition
+  record.offset = offset
+  record.value = b"payload"
+  return record
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +79,12 @@ def test_ack_token_eq_true_for_equal_tokens_and_hash_stable() -> None:
     _KafkaAckToken(partition=0, offset=1, topic="t", consumer_generation=1)
     != a
   )
+  assert _KafkaAckToken(
+    partition=0,
+    offset=1,
+    topic="t",
+    delivery_attempt=1,
+  ) != a
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +213,117 @@ def test_nack_with_non_kafka_token_is_a_silent_noop() -> None:
   backend._in_flight = defaultdict(set)
   backend.nack("q", token="some-legacy-opaque-token")  # must not raise
   assert backend._in_flight == {}  # nothing added
+
+
+def test_nack_redelivery_gets_new_attempt_and_old_token_cannot_commit(
+  mocker,
+) -> None:
+  backend = _backend()
+  topic = "scrapy-q"
+  tp = TopicPartition(topic, 0)
+  consumer = mocker.MagicMock()
+  consumer.assignment.return_value = {tp}
+  consumer.poll.side_effect = [
+    {tp: [_record(mocker, topic)]},
+    {tp: [_record(mocker, topic)]},
+  ]
+  backend._consumer = consumer
+
+  _, old_token = backend.pop_with_ack("q")
+  backend.nack("q", token=old_token)
+  _, new_token = backend.pop_with_ack("q")
+
+  assert old_token != new_token
+  backend.ack("q", token=old_token)
+  consumer.commit.assert_not_called()
+  backend.ack("q", token=new_token)
+  consumer.commit.assert_called_once()
+
+
+def test_nack_success_is_terminal_but_seek_failure_is_retryable(mocker) -> None:
+  backend = _backend()
+  topic = "scrapy-q"
+  tp = TopicPartition(topic, 0)
+  consumer = mocker.MagicMock()
+  consumer.assignment.return_value = {tp}
+  consumer.poll.return_value = {tp: [_record(mocker, topic)]}
+  consumer.seek.side_effect = [KafkaError("seek failed"), None]
+  backend._consumer = consumer
+  _, token = backend.pop_with_ack("q")
+
+  with pytest.raises(QueueError, match="nack"):
+    backend.nack("q", token=token)
+  backend.nack("q", token=token)
+  backend.nack("q", token=token)
+  backend.ack("q", token=token)
+
+  assert consumer.seek.call_count == 2
+  consumer.commit.assert_not_called()
+
+
+def test_partition_revocation_fences_old_assignment_token(mocker) -> None:
+  backend = _backend()
+  topic = "scrapy-q"
+  tp = TopicPartition(topic, 0)
+  consumer = mocker.MagicMock()
+  consumer.assignment.return_value = {tp}
+  consumer.poll.side_effect = [
+    {tp: [_record(mocker, topic)]},
+    {tp: [_record(mocker, topic)]},
+  ]
+  backend._consumer = consumer
+
+  _, old_token = backend.pop_with_ack("q")
+  listener = consumer.subscribe.call_args.kwargs["listener"]
+  listener.on_partitions_revoked([tp])
+  listener.on_partitions_assigned([tp])
+  _, new_token = backend.pop_with_ack("q")
+
+  assert old_token != new_token
+  backend.ack("q", token=old_token)
+  consumer.commit.assert_not_called()
+  backend.ack("q", token=new_token)
+  consumer.commit.assert_called_once()
+
+
+def test_subscription_change_fences_prior_topic_token(mocker) -> None:
+  backend = _backend()
+  topic_a = "scrapy-a"
+  topic_b = "scrapy-b"
+  tp_a = TopicPartition(topic_a, 0)
+  tp_b = TopicPartition(topic_b, 0)
+  consumer = mocker.MagicMock()
+  consumer.assignment.return_value = {tp_a, tp_b}
+  consumer.poll.side_effect = [
+    {tp_a: [_record(mocker, topic_a)]},
+    {tp_b: [_record(mocker, topic_b)]},
+  ]
+  backend._consumer = consumer
+
+  _, old_token = backend.pop_with_ack("a")
+  _, current_token = backend.pop_with_ack("b")
+
+  assert old_token != current_token
+  backend.ack("a", token=old_token)
+  consumer.commit.assert_not_called()
+  backend.ack("b", token=current_token)
+  consumer.commit.assert_called_once()
+
+
+def test_token_nack_cannot_be_followed_by_legacy_bare_commit(mocker) -> None:
+  backend = _backend()
+  topic = "scrapy-q"
+  tp = TopicPartition(topic, 0)
+  consumer = mocker.MagicMock()
+  consumer.assignment.return_value = {tp}
+  consumer.poll.return_value = {tp: [_record(mocker, topic)]}
+  backend._consumer = consumer
+  _, token = backend.pop_with_ack("q")
+
+  backend.nack("q", token=token)
+  backend.ack("q")
+
+  consumer.commit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,11 @@ upgrading.
   backends' single consumers cannot isolate a scan to one strategy-created
   physical topic; the previous combinations could rebalance, consume from the
   wrong topic, or invalidate ack correlation.
+- **Kafka acknowledgement tokens are assignment- and attempt-scoped.** A
+  rebalance, topic subscription switch, or successful nack fences the prior
+  delivery attempt. A late callback holding the old token can no longer commit
+  a same-offset redelivery, and token-based pop no longer populates the legacy
+  bare-commit slot.
 - **Malformed broker payloads are terminally consumed.** When deserialization
   deterministically fails and an ack token exists, `BackendQueue` attempts to
   ack/drop the delivery, increments `scheduler/queue/poison_dropped`, and still

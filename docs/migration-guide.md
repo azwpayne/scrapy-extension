@@ -226,6 +226,14 @@ extension does not renew them. Set the lease above the maximum time from pop to
 Scrapy downloader response. SQS nack makes a message immediately visible;
 RocketMQ nack uses its 10-second minimum delay.
 
+Kafka tokens now include the consumer generation, partition-assignment epoch,
+and a unique delivery attempt. Nacking an assigned record seeks it for retry
+and permanently retires that attempt; a subsequent delivery of the same offset
+gets a distinct token. Rebalance callbacks and subscription changes fence all
+prior tokens before the new assignment can be settled. Code that directly
+calls `pop_with_ack()` must retain and return the exact token, rather than
+reconstructing one from topic/partition/offset.
+
 Memcached cannot enumerate keys for prefix deletion. Prefix clear is always
 unsupported, and global `clear_storage(None)` is disabled unless
 `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`. That flag issues server-wide

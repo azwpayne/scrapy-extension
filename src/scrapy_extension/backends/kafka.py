@@ -14,13 +14,19 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
-    from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+    from kafka import (
+      ConsumerRebalanceListener,
+      KafkaConsumer,
+      KafkaProducer,
+      TopicPartition,
+    )
     from kafka.admin import KafkaAdminClient, NewTopic
     from kafka.errors import KafkaError, TopicAlreadyExistsError
     from kafka.structs import OffsetAndMetadata
@@ -88,9 +94,18 @@ class _KafkaAckToken:
       topic: The topic the record was consumed from (needed to build a
           ``TopicPartition`` for the watermark commit).
       consumer_generation: Consumer lifecycle generation that delivered it.
+      assignment_epoch: Subscription/rebalance epoch that delivered it.
+      delivery_attempt: Unique identity for this concrete delivery attempt.
   """
 
-  __slots__ = ("consumer_generation", "offset", "partition", "topic")
+  __slots__ = (
+    "assignment_epoch",
+    "consumer_generation",
+    "delivery_attempt",
+    "offset",
+    "partition",
+    "topic",
+  )
 
   def __init__(
     self,
@@ -98,6 +113,8 @@ class _KafkaAckToken:
     offset: int,
     topic: str,
     consumer_generation: int = 0,
+    assignment_epoch: int = 0,
+    delivery_attempt: int = 0,
   ) -> None:
     """Initialize the token.
 
@@ -106,11 +123,15 @@ class _KafkaAckToken:
         offset: Record offset within the partition.
         topic: The topic the record was consumed from.
         consumer_generation: Consumer lifecycle generation that delivered it.
+        assignment_epoch: Subscription/rebalance epoch that delivered it.
+        delivery_attempt: Unique attempt within this backend instance.
     """
     self.partition = partition
     self.offset = offset
     self.topic = topic
     self.consumer_generation = consumer_generation
+    self.assignment_epoch = assignment_epoch
+    self.delivery_attempt = delivery_attempt
 
   def __eq__(self, other: object) -> bool:
     if not isinstance(other, _KafkaAckToken):
@@ -120,18 +141,46 @@ class _KafkaAckToken:
       and self.offset == other.offset
       and self.topic == other.topic
       and self.consumer_generation == other.consumer_generation
+      and self.assignment_epoch == other.assignment_epoch
+      and self.delivery_attempt == other.delivery_attempt
     )
 
   def __hash__(self) -> int:
     return hash(
-      (self.partition, self.offset, self.topic, self.consumer_generation)
+      (
+        self.partition,
+        self.offset,
+        self.topic,
+        self.consumer_generation,
+        self.assignment_epoch,
+        self.delivery_attempt,
+      )
     )
 
   def __repr__(self) -> str:
     return (
       f"_KafkaAckToken(topic={self.topic!r}, partition={self.partition}, "
-      f"offset={self.offset}, consumer_generation={self.consumer_generation})"
+      f"offset={self.offset}, consumer_generation={self.consumer_generation}, "
+      f"assignment_epoch={self.assignment_epoch}, "
+      f"delivery_attempt={self.delivery_attempt})"
     )
+
+
+class _KafkaRebalanceListener(
+  ConsumerRebalanceListener  # type: ignore[misc]
+):
+  """Fence delivery tokens whenever Kafka changes partition ownership."""
+
+  __slots__ = ("_backend",)
+
+  def __init__(self, backend: KafkaBackend) -> None:
+    self._backend = backend
+
+  def on_partitions_revoked(self, revoked: Any) -> None:
+    self._backend._on_assignment_changed(revoked)
+
+  def on_partitions_assigned(self, assigned: Any) -> None:
+    self._backend._on_assignment_changed(assigned)
 
 
 class KafkaBackend(Backend, QueueBackend):
@@ -142,10 +191,11 @@ class KafkaBackend(Backend, QueueBackend):
   Does NOT implement SetBackend or StorageBackend.
 
   Ack capability: ``requires_ack=True``, ``supports_concurrent_ack=True``.
-  Kafka pops carry an ack token (topic, partition, offset) tracked in a
-  per-topic-partition in-flight set; :meth:`ack` commits the contiguous
-  low-watermark for that topic-partition. N pops before any ack no longer
-  overwrite a single slot — ack is correct under ``CONCURRENT_REQUESTS > 1``.
+  Kafka pops carry an ack token with consumer generation, assignment epoch,
+  and unique delivery-attempt identity. A per-topic-partition in-flight set
+  lets :meth:`ack` commit only the contiguous low-watermark. Rebalances,
+  subscription changes, and nacks fence prior attempts, so a late completion
+  cannot commit a redelivery of the same offset.
 
   Attributes:
       config: KafkaSettings instance with connection parameters.
@@ -181,6 +231,14 @@ class KafkaBackend(Backend, QueueBackend):
     # Generation-scoped tokens keep late completions from touching that new
     # delivery on the replacement consumer.
     self._consumer_generation = 0
+    # Kafka may redeliver the same topic/partition/offset within one consumer
+    # generation after seek or rebalance. Epoch + attempt identity prevents a
+    # late completion for the old delivery from committing its replacement.
+    self._delivery_lock = threading.RLock()
+    self._assignment_epoch = 0
+    self._next_delivery_attempt = 0
+    self._active_attempts: dict[tuple[str, int, int], int] = {}
+    self._rebalance_listener = _KafkaRebalanceListener(self)
     # Legacy single-slot for the ``ack(token=None)`` fallback path. Kept so
     # external callers that pop() then ack() without a token still work.
     self._last_record: Any = None
@@ -207,6 +265,55 @@ class KafkaBackend(Backend, QueueBackend):
     # (R7). Avoids a redundant subscribe() on every pop of the same queue
     # (Scrapy's next_request pops the same queue every tick). R2-E3.
     self._subscribed_topic: str | None = None
+
+  def _clear_delivery_state_locked(self) -> None:
+    """Drop local delivery state while ``_delivery_lock`` is held."""
+    self._last_record = None
+    self._in_flight.clear()
+    self._watermarks.clear()
+    self._high_water.clear()
+    self._active_attempts.clear()
+
+  def _advance_assignment_epoch_locked(self) -> None:
+    """Fence every token from the prior subscription/assignment epoch."""
+    self._assignment_epoch += 1
+    self._clear_delivery_state_locked()
+
+  def _on_assignment_changed(self, partitions: Any) -> None:
+    """Rebalance-listener callback; duplicates are safer than stale commits."""
+    del partitions
+    with self._delivery_lock:
+      self._advance_assignment_epoch_locked()
+
+  @staticmethod
+  def _attempt_key(token: _KafkaAckToken) -> tuple[str, int, int]:
+    return (token.topic, token.partition, token.offset)
+
+  def _token_is_active_locked(self, token: _KafkaAckToken) -> bool:
+    """Return whether ``token`` still owns its exact delivery attempt."""
+    if (
+      token.consumer_generation != self._consumer_generation
+      or token.assignment_epoch != self._assignment_epoch
+    ):
+      return False
+    attempt = self._active_attempts.get(self._attempt_key(token))
+    if attempt is not None:
+      return attempt == token.delivery_attempt
+    # Compatibility for direct construction of this private token in older
+    # callers/tests. Real tokens emitted by pop_with_ack always have a
+    # positive unique attempt and therefore never take this branch.
+    topic_partition = (token.topic, token.partition)
+    in_flight = self._in_flight.get(topic_partition)
+    return (
+      token.delivery_attempt == 0
+      and in_flight is not None
+      and token.offset in in_flight
+    )
+
+  def _finish_attempt_locked(self, token: _KafkaAckToken) -> None:
+    key = self._attempt_key(token)
+    if self._active_attempts.get(key) == token.delivery_attempt:
+      self._active_attempts.pop(key, None)
 
   def connect(self) -> None:
     """Establish connection to Kafka based on deployment mode.
@@ -410,22 +517,21 @@ class KafkaBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Close Kafka connection."""
-    producer = self._producer
-    consumer = self._consumer
-    admin_client = self._admin_client
+    with self._delivery_lock:
+      producer = self._producer
+      consumer = self._consumer
+      admin_client = self._admin_client
 
-    # Invalidate state before closing handles. A close failure cannot leave a
-    # half-connected backend, and a late completion cannot be redirected to a
-    # later consumer generation.
-    self._producer = None
-    self._consumer = None
-    self._admin_client = None
-    self._consumer_generation += 1
-    self._subscribed_topic = None
-    self._last_record = None
-    self._in_flight.clear()
-    self._watermarks.clear()
-    self._high_water.clear()
+      # Invalidate state before closing handles. A close failure cannot leave a
+      # half-connected backend, and a late completion cannot be redirected to a
+      # later consumer generation.
+      self._producer = None
+      self._consumer = None
+      self._admin_client = None
+      self._consumer_generation += 1
+      self._assignment_epoch += 1
+      self._subscribed_topic = None
+      self._clear_delivery_state_locked()
 
     for client in (producer, consumer, admin_client):
       if client is not None:
@@ -554,11 +660,12 @@ class KafkaBackend(Backend, QueueBackend):
         QueueError: If the pop operation fails.
         ValueError: If queue_name contains invalid characters.
     """
-    record = self._poll_record(queue_name, timeout)
-    if record is None:
-      return None
-    self._last_record = record
-    return cast(bytes, record.value)
+    with self._delivery_lock:
+      record = self._poll_record(queue_name, timeout)
+      if record is None:
+        return None
+      self._last_record = record
+      return cast(bytes, record.value)
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
@@ -582,32 +689,38 @@ class KafkaBackend(Backend, QueueBackend):
     Raises:
         QueueError: If the pop operation fails.
     """
-    record = self._poll_record(queue_name, timeout)
-    if record is None:
-      return (None, None)
-    token = _KafkaAckToken(
-      partition=record.partition,
-      offset=record.offset,
-      topic=record.topic,
-      consumer_generation=self._consumer_generation,
-    )
-    topic_partition = (record.topic, record.partition)
-    # KafkaConsumer.position(tp) points at the NEXT record to fetch after a
-    # poll, so it cannot seed the lowest unprocessed offset. Capture the first
-    # record actually handed to the application instead; this is the commit
-    # watermark base for the current in-flight cohort on this topic-partition.
-    self._watermarks.setdefault(topic_partition, record.offset)
-    self._in_flight[topic_partition].add(record.offset)
-    # Track the pop frontier so the watermark walk terminates at the highest
-    # popped offset (+1) on this topic-partition — never walks into
-    # not-yet-popped offsets and never runs away on an empty in-flight set.
-    self._high_water[topic_partition] = max(
-      self._high_water.get(topic_partition, 0), record.offset + 1
-    )
-    # Keep _last_record in sync so the legacy ack(token=None) path stays
-    # usable for callers that don't thread the token through.
-    self._last_record = record
-    return (record.value, token)
+    with self._delivery_lock:
+      record = self._poll_record(queue_name, timeout)
+      if record is None:
+        return (None, None)
+      self._next_delivery_attempt += 1
+      token = _KafkaAckToken(
+        partition=record.partition,
+        offset=record.offset,
+        topic=record.topic,
+        consumer_generation=self._consumer_generation,
+        assignment_epoch=self._assignment_epoch,
+        delivery_attempt=self._next_delivery_attempt,
+      )
+      topic_partition = (record.topic, record.partition)
+      # KafkaConsumer.position(tp) points at the NEXT record to fetch after a
+      # poll, so it cannot seed the lowest unprocessed offset. Capture the first
+      # record actually handed to the application instead; this is the commit
+      # watermark base for the current in-flight cohort on this topic-partition.
+      self._watermarks.setdefault(topic_partition, record.offset)
+      self._in_flight[topic_partition].add(record.offset)
+      self._active_attempts[self._attempt_key(token)] = token.delivery_attempt
+      # Track the pop frontier so the watermark walk terminates at the highest
+      # popped offset (+1) on this topic-partition — never walks into
+      # not-yet-popped offsets and never runs away on an empty in-flight set.
+      self._high_water[topic_partition] = max(
+        self._high_water.get(topic_partition, 0), record.offset + 1
+      )
+      # Token and legacy settlement modes must not share a bare-commit slot.
+      # Otherwise nack(token) followed by ack(token=None) can commit the nacked
+      # offset through KafkaConsumer.commit().
+      self._last_record = None
+      return (record.value, token)
 
   def _poll_record(self, queue_name: str, timeout: float) -> Any:
     """Poll a single record from ``queue_name``; return None if empty.
@@ -653,7 +766,11 @@ class KafkaBackend(Backend, QueueBackend):
       # idempotent on unchanged topics, but skipping the redundant call avoids
       # needless subscription-state work on every pop of the same queue (R2-E3).
       if self._subscribed_topic != topic_name:
-        self._consumer.subscribe([topic_name])
+        with self._delivery_lock:
+          self._advance_assignment_epoch_locked()
+          self._consumer.subscribe(
+            [topic_name], listener=self._rebalance_listener
+          )
         self._subscribed_topic = topic_name
 
       # Poll for messages
@@ -702,16 +819,17 @@ class KafkaBackend(Backend, QueueBackend):
         return
       self._ack_token(token)
       return
-    # Legacy path: commit the last-popped record wholesale.
-    if self._consumer is None or self._last_record is None:
-      return
-    try:
-      self._consumer.commit()
-    except KafkaError as e:
-      msg = f"Failed to ack Kafka message: {e}"
-      raise QueueError(msg, operation="ack") from e
-    else:
-      self._last_record = None
+    with self._delivery_lock:
+      # Legacy path: commit the last-popped record wholesale.
+      if self._consumer is None or self._last_record is None:
+        return
+      try:
+        self._consumer.commit()
+      except KafkaError as e:
+        msg = f"Failed to ack Kafka message: {e}"
+        raise QueueError(msg, operation="ack") from e
+      else:
+        self._last_record = None
 
   def _ack_token(self, token: _KafkaAckToken) -> None:
     """Record ``token`` completed and commit its topic-partition's watermark.
@@ -735,17 +853,17 @@ class KafkaBackend(Backend, QueueBackend):
     already removed the second time, so the watermark doesn't advance
     further and no duplicate commit fires).
     """
+    with self._delivery_lock:
+      self._ack_token_locked(token)
+
+  def _ack_token_locked(self, token: _KafkaAckToken) -> None:
+    """Implement exact-attempt acknowledgement under ``_delivery_lock``."""
     consumer = self._consumer
-    if (
-      consumer is None
-      or token.consumer_generation != self._consumer_generation
-    ):
+    if consumer is None or not self._token_is_active_locked(token):
       return
     partition = token.partition
     topic_partition = (token.topic, partition)
     in_flight = self._in_flight.get(topic_partition)
-    # Idempotent guard: a duplicate, stale, or foreign token must not create
-    # topic-partition state or advance a commit cursor.
     if in_flight is None or token.offset not in in_flight:
       return
     in_flight.remove(token.offset)
@@ -775,6 +893,7 @@ class KafkaBackend(Backend, QueueBackend):
         raise QueueError(msg, operation="ack") from e
       else:
         self._watermarks[topic_partition] = watermark
+    self._finish_attempt_locked(token)
     # R14-E: prune bookkeeping when a topic-partition drains.
     # ``_in_flight``/``_watermarks``/``_high_water`` grow one key per
     # topic-partition ever popped; without pruning, topic/partition churn
@@ -807,38 +926,36 @@ class KafkaBackend(Backend, QueueBackend):
             ``None`` for the legacy last-record path.
     """
     del queue_name
-    consumer = self._consumer
-    if token is not None:
-      if (
-        not isinstance(token, _KafkaAckToken)
-        or consumer is None
-        or token.consumer_generation != self._consumer_generation
-      ):
+    with self._delivery_lock:
+      consumer = self._consumer
+      if token is not None:
+        if (
+          not isinstance(token, _KafkaAckToken)
+          or consumer is None
+          or not self._token_is_active_locked(token)
+        ):
+          return
+        tp = TopicPartition(token.topic, token.partition)
+        try:
+          if tp in consumer.assignment():
+            consumer.seek(tp, token.offset)
+        except KafkaError as e:
+          msg = f"Failed to nack Kafka message: {e}"
+          raise QueueError(msg, operation="nack") from e
+        self._finish_attempt_locked(token)
         return
-      topic_partition = (token.topic, token.partition)
-      in_flight = self._in_flight.get(topic_partition)
-      if in_flight is None or token.offset not in in_flight:
+
+      record = self._last_record
+      if consumer is None or record is None:
         return
-      tp = TopicPartition(token.topic, token.partition)
+      tp = TopicPartition(record.topic, record.partition)
       try:
         if tp in consumer.assignment():
-          consumer.seek(tp, token.offset)
+          consumer.seek(tp, record.offset)
       except KafkaError as e:
         msg = f"Failed to nack Kafka message: {e}"
         raise QueueError(msg, operation="nack") from e
-      return
-
-    record = self._last_record
-    if consumer is None or record is None:
-      return
-    tp = TopicPartition(record.topic, record.partition)
-    try:
-      if tp in consumer.assignment():
-        consumer.seek(tp, record.offset)
-    except KafkaError as e:
-      msg = f"Failed to nack Kafka message: {e}"
-      raise QueueError(msg, operation="nack") from e
-    self._last_record = None
+      self._last_record = None
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.

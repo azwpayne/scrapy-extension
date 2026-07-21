@@ -649,3 +649,24 @@ fields. The RocketMQ-focused set passed on Python 3.10 and 3.14, 377 related
 settings/mixin/optional-dependency tests passed, and the full suite passed 3,037
 tests with 44 documented skips. Ruff, strict mypy, and patch integrity remained
 green.
+
+### I16a — Kafka assignment and delivery-attempt fencing
+
+Five RED state-machine regressions reproduced two loss paths inside one Kafka
+consumer generation. After a nack/seek, a same-offset redelivery produced an
+equal token, so the first request's late success could commit the replacement.
+A token pop also populated the legacy `_last_record` slot, allowing a later
+bare `ack()` to commit immediately after token nack. Subscription changes and
+partition revocation had no epoch boundary or rebalance listener.
+
+Tokens now include consumer generation, assignment epoch, and a monotonically
+unique delivery-attempt identity. The backend registers Kafka's rebalance
+listener, fences all local delivery state before subscription changes and on
+both revoke/assign callbacks, and records the currently active attempt for each
+topic/partition/offset. Ack and nack serialize through one lifecycle lock;
+successful nack retires the attempt while seek failure leaves it retryable.
+The offset remains in the watermark gap until a new attempt is delivered, so
+the fix chooses duplicate redelivery over skipping work. Token-based pops no
+longer populate the legacy bare-commit slot. All 135 related tests passed on
+Python 3.10 and 3.14, and the full suite passed 3,042 tests with 44 documented
+skips. Ruff, strict mypy, and patch integrity remained green.
