@@ -784,7 +784,7 @@ class TestR14DObservability:
     assert stats.get_value("backend/disconnect_count") is None
 
   def test_on_retry_emitted_on_connect_failure(self, mocker):
-    """ConnectionManager.connect emits on_retry before each backoff sleep."""
+    """ConnectionManager.connect emits one on_retry for each backoff."""
     from scrapy_extension.backends.connectors import ConnectionManager
 
     manager = ConnectionManager("redis", {"retry_attempts": 3, "retry_delay": 0})

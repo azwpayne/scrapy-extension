@@ -264,7 +264,7 @@ def test_T2_connect_all_attempts_fail_raises(patch_sleep_random):
 
 
 def test_T3_connect_emits_on_retry_monitor(patch_sleep_random):
-  """T3: on_retry monitor hook fires before each backoff sleep (1-based retry index)."""
+  """T3: on_retry records each 1-based retry after the serialized transaction."""
   retries: list[tuple[str, int]] = []
 
   class Recorder:

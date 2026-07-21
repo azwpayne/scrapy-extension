@@ -638,6 +638,146 @@ class TestConnectionManagerIsConnected:
     backend.is_connected.assert_called_once_with()
 
 
+class TestConnectionManagerMonitorReentrancy:
+  """Lifecycle callbacks are user code and must run outside manager locks."""
+
+  def test_on_connect_can_reenter_connect_without_connect_lock(self, mocker):
+    manager = ConnectionManager("redis", {"retry_attempts": 0})
+    backend = mocker.MagicMock(name="backend")
+    backend.is_connected.return_value = True
+    mocker.patch.object(manager, "_create_backend", return_value=backend)
+    lock_states: list[bool] = []
+    reentries: list[object] = []
+
+    class _Monitor:
+      def on_connect(self, backend_type: str) -> None:
+        del backend_type
+        held = manager._connect_lock.locked()
+        lock_states.append(held)
+        if not held:
+          manager.connect()
+          reentries.append(manager._backend)
+
+      def on_disconnect(self, backend_type: str, reason: object) -> None:
+        del backend_type, reason
+
+      def on_retry(self, backend_type: str, attempt: int) -> None:
+        del backend_type, attempt
+
+    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+
+    manager.connect()
+
+    assert lock_states == [False]
+    assert reentries == [backend]
+    backend.connect.assert_called_once_with()
+
+  def test_on_retry_can_reenter_after_serialized_transaction(self, mocker):
+    manager = ConnectionManager(
+      "redis",
+      {"retry_attempts": 1, "retry_delay": 0},
+    )
+    failed = mocker.MagicMock(name="failed")
+    failed.connect.side_effect = OSError("temporary")
+    recovered = mocker.MagicMock(name="recovered")
+    recovered.is_connected.return_value = True
+    mocker.patch.object(manager, "_create_backend", side_effect=[failed, recovered])
+    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    lock_states: list[bool] = []
+    reentries: list[object] = []
+
+    class _Monitor:
+      def on_connect(self, backend_type: str) -> None:
+        del backend_type
+
+      def on_disconnect(self, backend_type: str, reason: object) -> None:
+        del backend_type, reason
+
+      def on_retry(self, backend_type: str, attempt: int) -> None:
+        del backend_type, attempt
+        held = manager._connect_lock.locked()
+        lock_states.append(held)
+        if not held:
+          manager.connect()
+          reentries.append(manager._backend)
+
+    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+
+    manager.connect()
+
+    assert lock_states == [False]
+    assert reentries == [recovered]
+    assert failed.connect.call_count == recovered.connect.call_count == 1
+
+  def test_reconnect_disconnect_hook_runs_after_connect_lock_release(self, mocker):
+    manager = ConnectionManager("redis", {"retry_attempts": 0})
+    stale = mocker.MagicMock(name="stale")
+    stale.is_connected.return_value = False
+    replacement = mocker.MagicMock(name="replacement")
+    replacement.is_connected.return_value = True
+    manager._backend = stale
+    mocker.patch.object(manager, "_create_backend", return_value=replacement)
+    lock_states: list[bool] = []
+    reentries: list[object] = []
+
+    class _Monitor:
+      def on_connect(self, backend_type: str) -> None:
+        del backend_type
+
+      def on_disconnect(self, backend_type: str, reason: object) -> None:
+        del backend_type, reason
+        held = manager._connect_lock.locked()
+        lock_states.append(held)
+        if not held:
+          manager.connect()
+          reentries.append(manager._backend)
+
+      def on_retry(self, backend_type: str, attempt: int) -> None:
+        del backend_type, attempt
+
+    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+
+    manager.connect()
+
+    assert lock_states == [False]
+    assert reentries == [replacement]
+    stale.disconnect.assert_called_once_with()
+    replacement.connect.assert_called_once_with()
+
+  def test_close_disconnect_hook_can_reenter_backend_without_state_lock(self, mocker):
+    manager = ConnectionManager("redis")
+    backend = mocker.MagicMock(name="backend")
+    manager._backend = backend
+    lock_states: list[bool] = []
+    terminal_errors: list[BackendConnectionError] = []
+
+    class _Monitor:
+      def on_connect(self, backend_type: str) -> None:
+        del backend_type
+
+      def on_disconnect(self, backend_type: str, reason: object) -> None:
+        del backend_type, reason
+        held = manager._lock.locked()
+        lock_states.append(held)
+        if not held:
+          try:
+            _ = manager.backend
+          except BackendConnectionError as exc:
+            terminal_errors.append(exc)
+
+      def on_retry(self, backend_type: str, attempt: int) -> None:
+        del backend_type, attempt
+
+    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+
+    manager.close()
+
+    assert lock_states == [False]
+    assert len(terminal_errors) == 1
+    assert "released" in str(terminal_errors[0])
+    backend.disconnect.assert_called_once_with()
+
+
 class TestConnectionManagerGetBackendInterface:
   """Tests for get_queue_backend, get_set_backend, get_storage_backend."""
 

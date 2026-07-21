@@ -152,7 +152,7 @@ speculative work.
   backend value before returning from a lazy accessor, reject `None` snapshots,
   make `is_connected()` single-read, and disconnect falsey third-party backend
   implementations during close.
-- [ ] **RUN-10 — monitor callback lock isolation.** Dispatch connect, retry, and
+- [x] **RUN-10 — monitor callback lock isolation.** Dispatch connect, retry, and
   disconnect monitor hooks outside manager locks so a re-entrant observer
   cannot self-deadlock or publish a competing connection transaction.
 - [ ] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
@@ -435,3 +435,23 @@ identity against `None` rather than truthiness. The four regressions passed on
 Python 3.10 and 3.14, 182 connection/breaker tests passed, and the full suite
 passed 2,947 tests with 44 documented skips. Ruff and strict mypy remained
 green.
+
+### I12b — re-entrant lifecycle monitor isolation
+
+Four regressions showed every lifecycle hook executing while a manager lock was
+held: connect success, retry, and stale-generation disconnect ran under the
+non-reentrant `_connect_lock`, while final disconnect ran under `_lock`. A
+monitor that called back into `connect()` or `backend` could therefore block its
+own thread forever; swallowing callback exceptions cannot recover a deadlock.
+
+Connection transactions now record ordered monitor events while serialized and
+dispatch them only after `_connect_lock` is released. Retry observations are
+therefore delivered after the transaction rather than during its backoff sleep,
+without changing their count or order. Final close marks the manager retired,
+detaches its handle, and resets its breaker under `_lock`, then performs network
+disconnect and the lifecycle callback outside both manager and registry locks.
+Re-entry consequently observes either the healthy completed generation or a
+typed released-manager error. The four lock-state/re-entry regressions and three
+callback-failure checks passed on Python 3.14; 243 related tests and the full
+Python 3.10 suite passed, the latter with 2,951 tests and 44 documented skips.
+Ruff and strict mypy remained green.

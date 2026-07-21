@@ -67,6 +67,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MonitorEvent = tuple[str, tuple[Any, ...]]
+
 _BUNDLED_BACKEND_TYPES: frozenset[str] = frozenset(
   backend_type.value for backend_type in BackendType
 )
@@ -972,11 +974,19 @@ class ConnectionManager:
         ValidationError: If backend-specific Pydantic settings are invalid.
         ImportError: If the selected backend's optional dependency is missing.
     """
-    with self._connect_lock:
-      self._connect_with_retries()
+    monitor_events: list[_MonitorEvent] = []
+    try:
+      with self._connect_lock:
+        self._connect_with_retries(monitor_events)
+    finally:
+      # Monitor implementations are user-extensible and may call back into
+      # the manager. Dispatch only after the complete connection transaction
+      # releases ``_connect_lock``; otherwise on_connect/on_retry/on_disconnect
+      # can self-deadlock on a same-thread re-entrant connect().
+      self._dispatch_monitor_events(monitor_events)
 
-  def _connect_with_retries(self) -> None:
-    """Run one serialized connection transaction for :meth:`connect`."""
+  def _connect_with_retries(self, monitor_events: list[_MonitorEvent]) -> None:
+    """Run one serialized transaction and record deferred monitor events."""
     stale_backend: Backend | None = None
     while True:
       with self._lock:
@@ -1031,7 +1041,9 @@ class ConnectionManager:
         stale_backend.disconnect()
       except Exception as exc:
         logger.warning("Error disconnecting stale backend: %s", exc)
-      self._notify_monitor("on_disconnect", str(self.backend_type), None)
+      monitor_events.append(
+        ("on_disconnect", (str(self.backend_type), None))
+      )
 
     retry_attempts, retry_delay = self._retry_policy()
     total_attempts = retry_attempts + 1
@@ -1062,18 +1074,18 @@ class ConnectionManager:
         if retired:
           break
         if attempt < retry_attempts:
-          # R14-D: emit on_retry before each exponential-backoff sleep so a
-          # flapping backend surfaces as ``backend/retry_count``. ``attempt``
-          # here is the 0-based just-failed index; the retry is 1-based
-          # (attempt+1 = first retry = second overall attempt). No-op on the
-          # default NullMonitor.
-          self._notify_monitor("on_retry", str(self.backend_type), attempt + 1)
+          # Record each retry while its transaction is serialized. User
+          # callbacks are dispatched only after ``_connect_lock`` is released;
+          # ``attempt`` here is the 0-based just-failed index, so the public
+          # retry number is 1-based.
+          monitor_events.append(
+            ("on_retry", (str(self.backend_type), attempt + 1))
+          )
           time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
       else:
         logger.debug("Connected to %s", self.backend_type)
-        # R14-D: emit on_connect on the success path so ``backend/connect_count``
-        # reflects successful connections. No-op on the default NullMonitor.
-        self._notify_monitor("on_connect", str(self.backend_type))
+        # Preserve transaction order, then dispatch outside ``_connect_lock``.
+        monitor_events.append(("on_connect", (str(self.backend_type),)))
         return
 
     if last_exception is not None:
@@ -1255,6 +1267,7 @@ class ConnectionManager:
     if not is_last_holder:
       return
 
+    backend: Backend | None
     with self._lock:
       # Make the final release terminal before inspecting the backend. A
       # connection attempt runs backend.connect() outside this lock; when it
@@ -1263,29 +1276,8 @@ class ConnectionManager:
       # assignment, an in-flight connect can resurrect an evicted manager and
       # leak an unowned connection.
       self._retired = True
-      if self._backend is not None:
-        try:
-          self._backend.disconnect()
-          logger.debug("Disconnected from %s", self.backend_type)
-        except Exception as e:
-          # Broad catch — mirrors R25-A1's connect-path cleanup
-          # (contextlib.suppress(Exception)). Disconnecting a possibly-broken
-          # backend can raise anything: an OSError from the socket layer that
-          # the backend's own disconnect didn't self-suppress, or a
-          # backend-specific error. close() must still complete registry
-          # eviction (above) — never propagate out of the close chain.
-          logger.warning("Error during disconnect: %s", e)
-        finally:
-          self._backend = None
-        # R14-D: emit on_disconnect so ``backend/disconnect_count`` reflects
-        # teardowns. ``reason`` is not available at this layer (the Scrapy
-        # engine close reason lives in the scheduler/pipeline that owns the
-        # manager), so ``None`` is passed — the lifecycle hook fires
-        # regardless. No-op on the default NullMonitor. Inside the non-null
-        # backend block so a no-op close (already disconnected) does not
-        # double-count. Truthiness is deliberately irrelevant: third-party
-        # backends may validly define ``__bool__`` or ``__len__``.
-        self._notify_monitor("on_disconnect", str(self.backend_type), None)
+      backend = self._backend
+      self._backend = None
       # R14-E: reset the circuit breaker so a manager that reconnects after
       # teardown (or an orphan-evicted manager re-created from the same
       # settings) does not inherit a stale OPEN state from the prior
@@ -1293,6 +1285,25 @@ class ConnectionManager:
       # was never constructed (disabled).
       if self._breaker is not None:
         self._breaker.reset()
+
+    if backend is None:
+      return
+    try:
+      # Network teardown must not hold manager state while it blocks. The
+      # handle was already detached under ``_lock``, so no accessor can publish
+      # it as live during disconnect.
+      backend.disconnect()
+      logger.debug("Disconnected from %s", self.backend_type)
+    except Exception as e:
+      # Broad catch — mirrors R25-A1's connect-path cleanup. Registry eviction
+      # and state detachment are already complete, so teardown errors remain
+      # observable without breaking the caller's close chain.
+      logger.warning("Error during disconnect: %s", e)
+
+    # Lifecycle callbacks are user code. Dispatch after both registry and
+    # manager locks are released so re-entry observes the terminal state and
+    # receives a typed error instead of self-deadlocking.
+    self._notify_monitor("on_disconnect", str(self.backend_type), None)
 
   @classmethod
   def clear_registry(cls) -> None:
@@ -1345,6 +1356,11 @@ class ConnectionManager:
       getattr(self._monitor, hook_name)(*args)
     except Exception:
       logger.debug("Monitor.%s raised; ignored", hook_name, exc_info=True)
+
+  def _dispatch_monitor_events(self, events: list[_MonitorEvent]) -> None:
+    """Dispatch ordered lifecycle events after manager locks are released."""
+    for hook_name, args in events:
+      self._notify_monitor(hook_name, *args)
 
   @property
   def backend(self) -> Backend:
