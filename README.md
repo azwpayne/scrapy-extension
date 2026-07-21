@@ -151,7 +151,18 @@ SCRAPY_BACKEND_TYPE = "rocketmq"
 # The broker must run with --enable-proxy (apache rocketmq-python-client 5.1.1).
 SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
 SCRAPY_ROCKETMQ_INVISIBLE_DURATION = 300
+
+# Required for cloud mode and for every authenticated connection.
+SCRAPY_ROCKETMQ_TLS_ENABLED = True
+SCRAPY_ROCKETMQ_ACCESS_KEY = "your-access-key"
+SCRAPY_ROCKETMQ_SECRET_KEY = "your-secret-key"
 ```
+
+RocketMQ accepts an anonymous standalone/cluster connection with TLS either on
+or off. Once either credential is configured, both must be non-empty and TLS is
+mandatory. Cloud mode always requires the complete credential pair and TLS.
+This policy protects both the gRPC message body and the SDK's authentication
+metadata; use anonymous plaintext only for an explicitly trusted local broker.
 
 <details><summary><b>Topic creation — required setup</b> (the first push otherwise fails)</summary>
 

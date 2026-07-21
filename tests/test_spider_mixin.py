@@ -816,12 +816,24 @@ class TestBuildBackendSettings:
       rocketmq_namesrv_address = "rmq:9876"
       rocketmq_access_key = "AK"
       rocketmq_secret_key = "SK"
+      rocketmq_tls_enabled = True
 
     spider = TestSpider()
     result = spider._build_backend_settings()
     assert result["namesrv_address"] == "rmq:9876"
     assert result["access_key"] == "AK"
     assert result["secret_key"] == "SK"
+    assert result["tls_enabled"] is True
+
+  def test_rocketmq_tls_false_is_not_dropped(self):
+    """An explicit false value remains distinct from an unset shortcut."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ROCKETMQ
+      rocketmq_tls_enabled = False
+
+    assert TestSpider()._build_backend_settings() == {"tls_enabled": False}
 
   def test_rocketmq_namesrv_address_only(self):
     """namesrv set, access/secret unset → only namesrv shortcut present.

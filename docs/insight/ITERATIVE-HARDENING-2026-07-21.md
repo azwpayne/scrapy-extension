@@ -626,3 +626,26 @@ per-worker ownership remains required to prevent two live workers from sharing
 one checkpoint. The exact regression passed on Python 3.10 and 3.14, all 310
 snapshot/queue/strategy tests passed, and the full suite passed 3,024 tests with
 44 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I13b — RocketMQ authenticated transport and connection snapshots
+
+Twelve initial RED regressions and one locked-SDK signature smoke established
+that the RocketMQ 5.x Producer and SimpleConsumer both defaulted to plaintext,
+cloud accepted missing credentials, partial/blank keys silently became
+anonymous `Credentials()`, and one connection attempt could combine settings
+read at different times. Constructor arguments and outward startup errors also
+exposed raw credential values.
+
+`tls_enabled` now reaches both SDK constructors. Anonymous standalone/cluster
+connections may explicitly choose TLS or plaintext, while every authenticated
+connection requires a complete non-empty key pair and TLS; cloud requires that
+authenticated-TLS combination. Settings validation and connect-time validation
+share the same policy. A connection captures endpoint, credentials, timeout,
+consumer group, and TLS once before importing or constructing the SDK and uses
+only those values for the attempt. SDK-bound credentials use the shared
+repr-redacting string wrapper, public startup failures omit driver text, and
+the spider mixin exposes the TLS shortcut alongside the existing RocketMQ
+fields. The RocketMQ-focused set passed on Python 3.10 and 3.14, 377 related
+settings/mixin/optional-dependency tests passed, and the full suite passed 3,037
+tests with 44 documented skips. Ruff, strict mypy, and patch integrity remained
+green.

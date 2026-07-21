@@ -49,6 +49,24 @@ before client construction. Cluster discovery uses one prefix:
 `pulsar://broker-one:6650,pulsar://broker-two:6650` is rejected at startup
 because the SDK interprets the second prefix as an invalid hostname.
 
+## RocketMQ Authenticated TLS
+
+RocketMQ now exposes `SCRAPY_ROCKETMQ_TLS_ENABLED`. Set it to `True` on both
+cloud and authenticated standalone/cluster deployments:
+
+```python
+SCRAPY_ROCKETMQ_TLS_ENABLED = True
+SCRAPY_ROCKETMQ_ACCESS_KEY = "..."
+SCRAPY_ROCKETMQ_SECRET_KEY = "..."
+```
+
+The access and secret keys must be supplied together and neither may be empty
+or whitespace-only. Cloud mode refuses to start without this complete pair and
+TLS. Anonymous standalone/cluster connections remain compatible with the
+previous plaintext default, but should be limited to trusted local networks.
+The TLS flag targets the RocketMQ 5.x gRPC proxy and is propagated separately
+to both SDK client constructors; it is not a `ClientConfiguration` option.
+
 ## Redis Physical-Key Layout
 
 Redis now maps each logical name into a configured namespace and separates the

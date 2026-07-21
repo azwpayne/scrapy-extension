@@ -90,6 +90,7 @@ class BackendSpiderMixin(Spider):
   rocketmq_namesrv_address: str | None = None
   rocketmq_access_key: str | None = None
   rocketmq_secret_key: str | None = None
+  rocketmq_tls_enabled: bool | None = None
 
   def __init__(self, **kwargs: Any) -> None:
     """Initialize the mixin.
@@ -251,6 +252,8 @@ class BackendSpiderMixin(Spider):
       shortcuts["access_key"] = self.rocketmq_access_key
     if self.rocketmq_secret_key is not None:
       shortcuts["secret_key"] = self.rocketmq_secret_key
+    if self.rocketmq_tls_enabled is not None:
+      shortcuts["tls_enabled"] = self.rocketmq_tls_enabled
     return shortcuts
 
   # Map of backend value -> shortcut-settings builder. Extracted as a

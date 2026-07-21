@@ -32,19 +32,19 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
+from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
   QueueBackend,
   _validate_key_name,
-  secret_value,
 )
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   ConfigurationError,
   QueueError,
 )
-from scrapy_extension.settings import RocketMQMode
+from scrapy_extension.settings.rocketmq import validate_rocketmq_connection
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import RocketMQSettings
@@ -129,6 +129,23 @@ class RocketMQBackend(Backend, QueueBackend):
         is missing.
       ConfigurationError: If configuration is invalid.
     """
+    mode = self.config.mode
+    namesrv_address = self.config.namesrv_address
+    access_key = self.config.access_key
+    secret_key = self.config.secret_key
+    consumer_group = self.config.consumer_group
+    send_timeout = self.config.send_timeout
+    tls_enabled = self.config.tls_enabled
+    _, namesrv_address, key_text, secret_text, tls_enabled = (
+      validate_rocketmq_connection(
+        mode,
+        namesrv_address,
+        access_key,
+        secret_key,
+        tls_enabled,
+      )
+    )
+
     try:
       from rocketmq import ClientConfiguration, Credentials, Producer, SimpleConsumer
     except ImportError as e:
@@ -137,28 +154,11 @@ class RocketMQBackend(Backend, QueueBackend):
       msg = f"rocketmq-python-client not installed: {e}"
       raise BackendConnectionError(msg, backend_type="rocketmq") from e
 
-    if self.config.mode not in (
-      RocketMQMode.STANDALONE,
-      RocketMQMode.CLUSTER,
-      RocketMQMode.CLOUD,
-    ):
-      try:
-        mode_text = str(self.config.mode)
-      except (TypeError, ValueError):
-        mode_text = getattr(self.config.mode, "value", repr(self.config.mode))
-      msg = f"Unsupported RocketMQ mode: {mode_text}"
-      raise ConfigurationError(
-        msg, setting_name="mode", setting_value=self.config.mode
-      )
-
     try:
       # Credentials: empty Credentials() for no-auth (the broker fixture runs
       # with auth disabled); Credentials(ak, sk) when both are provided.
-      if self.config.access_key and self.config.secret_key:
-        credentials = Credentials(
-          secret_value(self.config.access_key),
-          secret_value(self.config.secret_key),
-        )
+      if key_text is not None and secret_text is not None:
+        credentials = Credentials(_redact(key_text), _redact(secret_text))
       else:
         credentials = Credentials()
 
@@ -167,17 +167,17 @@ class RocketMQBackend(Backend, QueueBackend):
       # compatibility; the value must point at the broker's gRPC proxy, NOT the
       # legacy NameServer (9876). The broker must run with ``--enable-proxy``.
       request_timeout = (
-        self.config.send_timeout // 1000
-        if self.config.send_timeout >= 1000
+        send_timeout // 1000
+        if send_timeout >= 1000
         else 3
       )
       config_obj = ClientConfiguration(
-        endpoints=self.config.namesrv_address,
+        endpoints=namesrv_address,
         credentials=credentials,
         request_timeout=request_timeout,
       )
 
-      self._producer = Producer(config_obj)
+      self._producer = Producer(config_obj, tls_enable=tls_enabled)
       if self._producer is None:
         msg = "RocketMQBackend producer initialization returned None"
         raise BackendConnectionError(msg, backend_type="rocketmq")
@@ -187,7 +187,10 @@ class RocketMQBackend(Backend, QueueBackend):
       # defaults await_duration to 20 seconds, so initialize it explicitly to
       # zero; each receive updates the public property from that pop's timeout.
       self._consumer = SimpleConsumer(
-        config_obj, self.config.consumer_group, await_duration=0
+        config_obj,
+        consumer_group,
+        await_duration=0,
+        tls_enable=tls_enabled,
       )
       if self._consumer is None:
         msg = "RocketMQBackend consumer initialization returned None"
@@ -195,15 +198,13 @@ class RocketMQBackend(Backend, QueueBackend):
       self._consumer.startup()
       self._consumer_generation += 1
 
-      logger.debug(
-        "Connected to RocketMQ proxy at %s", self.config.namesrv_address
-      )
+      logger.debug("Connected to RocketMQ proxy at %s", namesrv_address)
     except BackendConnectionError:
       self._abort_partial_connect()
       raise
     except Exception as e:
       self._abort_partial_connect()
-      msg = f"Failed to connect to RocketMQ: {e}"
+      msg = "Failed to connect to RocketMQ."
       raise BackendConnectionError(msg, backend_type="rocketmq") from e
 
   def _abort_partial_connect(self) -> None:

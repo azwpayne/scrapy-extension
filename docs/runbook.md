@@ -386,6 +386,13 @@ the sensitive field in application code before enqueue/store. Avoid credentials
 inside plain MongoDB/other DSN strings because caller logging or settings reprs
 can expose them.
 
+For RocketMQ, set `SCRAPY_ROCKETMQ_TLS_ENABLED=True` whenever access/secret
+credentials are configured; cloud mode requires that combination. Anonymous
+standalone/cluster plaintext remains available only for explicitly trusted
+local deployments. Both producer and consumer use the same captured TLS,
+endpoint, credential, timeout, and consumer-group snapshot for each connection
+attempt.
+
 ## Cutting a release
 
 High-level release flow (a dedicated `docs/release-runbook.md` does not yet

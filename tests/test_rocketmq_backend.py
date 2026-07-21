@@ -144,7 +144,10 @@ def test_locked_sdk_exposes_wait_and_lease_mutation_contracts(tmp_path: Path) ->
   """Check the real SDK surface without importing its file logger in pytest."""
   script = "\n".join(
     (
-      "from rocketmq import SimpleConsumer",
+      "from inspect import signature",
+      "from rocketmq import Producer, SimpleConsumer",
+      "assert 'tls_enable' in signature(Producer).parameters",
+      "assert 'tls_enable' in signature(SimpleConsumer).parameters",
       "consumer = object.__new__(SimpleConsumer)",
       "consumer.await_duration = 0",
       "assert consumer.await_duration == 0",
@@ -193,6 +196,11 @@ def test_connect_standalone_mode(mocker) -> None:
     mock_config_cls.return_value,
     config.consumer_group,
     await_duration=0,
+    tls_enable=False,
+  )
+  mock_producer_cls.assert_called_once_with(
+    mock_config_cls.return_value,
+    tls_enable=False,
   )
   # ClientConfiguration receives endpoints=namesrv_address (now the gRPC proxy).
   assert mock_config_cls.call_args.kwargs["endpoints"] == config.namesrv_address
@@ -218,12 +226,32 @@ def test_connect_cloud_mode_with_credentials(mocker) -> None:
     mode=RocketMQMode.CLOUD,
     access_key=SecretStr("my-access-key"),
     secret_key=SecretStr("my-secret-key"),
+    tls_enabled=True,
   )
   backend = RocketMQBackend(config)
 
   backend.connect()
 
   mock_credentials_cls.assert_called_once_with("my-access-key", "my-secret-key")
+
+
+def test_connect_redacts_credentials_at_sdk_boundary(mocker) -> None:
+  (_, _, _, _, mock_credentials_cls) = _patch_rocketmq(mocker)
+  backend = RocketMQBackend(
+    RocketMQSettings(
+      access_key=SecretStr("my-access-key"),
+      secret_key=SecretStr("my-secret-key"),
+      tls_enabled=True,
+    )
+  )
+
+  backend.connect()
+
+  sdk_access_key, sdk_secret_key = mock_credentials_cls.call_args.args
+  assert str(sdk_access_key) == "my-access-key"
+  assert str(sdk_secret_key) == "my-secret-key"
+  assert repr(sdk_access_key) == "<redacted>"
+  assert repr(sdk_secret_key) == "<redacted>"
 
 
 def test_connect_standalone_without_credentials(mocker) -> None:
@@ -237,6 +265,148 @@ def test_connect_standalone_without_credentials(mocker) -> None:
   # Credentials() is always constructed (empty for no-auth); it's the apache
   # no-auth pattern. Assert it was called with no positional args.
   mock_credentials_cls.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+  ("access_key", "secret_key", "setting_name"),
+  (
+    (SecretStr(""), SecretStr("secret"), "access_key"),
+    (SecretStr("key"), SecretStr(" "), "secret_key"),
+    (SecretStr("do-not-leak"), None, "secret_key"),
+    (None, SecretStr("do-not-leak"), "access_key"),
+  ),
+)
+def test_settings_reject_empty_or_partial_credentials_without_leaking(
+  access_key,
+  secret_key,
+  setting_name,
+) -> None:
+  with pytest.raises(ConfigurationError) as exc_info:
+    RocketMQSettings(access_key=access_key, secret_key=secret_key)
+
+  assert exc_info.value.setting_name == setting_name
+  assert "do-not-leak" not in str(exc_info.value)
+  assert "do-not-leak" not in repr(exc_info.value.setting_value)
+
+
+def test_cloud_mode_requires_credentials() -> None:
+  with pytest.raises(ConfigurationError) as exc_info:
+    RocketMQSettings(mode=RocketMQMode.CLOUD, tls_enabled=True)
+
+  assert exc_info.value.setting_name == "access_key"
+
+
+def test_cloud_mode_requires_tls() -> None:
+  with pytest.raises(ConfigurationError) as exc_info:
+    RocketMQSettings(
+      mode=RocketMQMode.CLOUD,
+      access_key=SecretStr("key"),
+      secret_key=SecretStr("secret"),
+      tls_enabled=False,
+    )
+
+  assert exc_info.value.setting_name == "tls_enabled"
+
+
+@pytest.mark.parametrize(
+  "mode", (RocketMQMode.STANDALONE, RocketMQMode.CLUSTER)
+)
+def test_credentials_require_tls_in_every_mode(mode: RocketMQMode) -> None:
+  with pytest.raises(ConfigurationError) as exc_info:
+    RocketMQSettings(
+      mode=mode,
+      access_key=SecretStr("key"),
+      secret_key=SecretStr("do-not-leak"),
+      tls_enabled=False,
+    )
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert "do-not-leak" not in str(exc_info.value)
+
+
+def test_connect_propagates_tls_to_both_sdk_clients(mocker) -> None:
+  mock_producer_cls, mock_consumer_cls, _, mock_config_cls, _ = _patch_rocketmq(
+    mocker
+  )
+  config = RocketMQSettings(tls_enabled=True)
+  backend = RocketMQBackend(config)
+
+  backend.connect()
+
+  mock_producer_cls.assert_called_once_with(
+    mock_config_cls.return_value,
+    tls_enable=True,
+  )
+  mock_consumer_cls.assert_called_once_with(
+    mock_config_cls.return_value,
+    config.consumer_group,
+    await_duration=0,
+    tls_enable=True,
+  )
+
+
+def test_connect_revalidates_mutated_cloud_security_before_sdk_io(mocker) -> None:
+  mock_producer_cls, mock_consumer_cls, _, mock_config_cls, _ = _patch_rocketmq(
+    mocker
+  )
+  config = RocketMQSettings()
+  backend = RocketMQBackend(config)
+  config.mode = RocketMQMode.CLOUD
+
+  with pytest.raises(ConfigurationError, match="access_key"):
+    backend.connect()
+
+  mock_config_cls.assert_not_called()
+  mock_producer_cls.assert_not_called()
+  mock_consumer_cls.assert_not_called()
+
+
+def test_connect_uses_one_validated_settings_snapshot(mocker) -> None:
+  (
+    mock_producer_cls,
+    mock_consumer_cls,
+    _,
+    mock_config_cls,
+    mock_credentials_cls,
+  ) = _patch_rocketmq(mocker)
+  config = RocketMQSettings(
+    namesrv_address="original:8081",
+    access_key=SecretStr("original-key"),
+    secret_key=SecretStr("original-secret"),
+    consumer_group="original-consumer",
+    send_timeout=5_000,
+    tls_enabled=True,
+  )
+  backend = RocketMQBackend(config)
+
+  credentials_obj = MagicMock(name="Credentials")
+
+  def mutate_after_credentials(*_args):
+    config.namesrv_address = "mutated:8081"
+    config.consumer_group = "mutated-consumer"
+    config.send_timeout = 1_000
+    config.tls_enabled = False
+    return credentials_obj
+
+  mock_credentials_cls.side_effect = mutate_after_credentials
+
+  backend.connect()
+
+  assert mock_config_cls.call_args.kwargs == {
+    "endpoints": "original:8081",
+    "credentials": credentials_obj,
+    "request_timeout": 5,
+  }
+  mock_producer_cls.assert_called_once_with(
+    mock_config_cls.return_value,
+    tls_enable=True,
+  )
+  mock_consumer_cls.assert_called_once_with(
+    mock_config_cls.return_value,
+    "original-consumer",
+    await_duration=0,
+    tls_enable=True,
+  )
 
 
 # ---------------------------------------------------------------------------
@@ -340,12 +510,15 @@ def test_connect_unexpected_exception(mocker) -> None:
     _,
     _,
   ) = _patch_rocketmq(mocker)
-  mock_producer_cls.return_value.startup.side_effect = RuntimeError("unexpected")
+  mock_producer_cls.return_value.startup.side_effect = RuntimeError(
+    "do-not-leak"
+  )
   backend = RocketMQBackend(RocketMQSettings())
 
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
   assert "Failed to connect to RocketMQ" in str(exc_info.value)
+  assert "do-not-leak" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +1263,7 @@ def test_rocketmq_settings_defaults() -> None:
   assert settings.max_message_size == 1024 * 1024
   assert settings.send_timeout == 3000
   assert settings.invisible_duration == 300
+  assert settings.tls_enabled is False
 
 
 def test_rocketmq_settings_custom_values() -> None:
@@ -1099,6 +1273,7 @@ def test_rocketmq_settings_custom_values() -> None:
     namesrv_address="rocketmq-cluster:9876",
     access_key=SecretStr("mykey"),
     secret_key=SecretStr("mysecret"),
+    tls_enabled=True,
     consumer_group="my-consumer",
     producer_group="my-producer",
     topic_prefix="my-queue",
@@ -1144,8 +1319,14 @@ def test_rocketmq_settings_env_prefix(monkeypatch) -> None:
 
 def test_rocketmq_settings_cloud_mode() -> None:
   """Test RocketMQSettings cloud mode defaults."""
-  settings = RocketMQSettings(mode=RocketMQMode.CLOUD)
+  settings = RocketMQSettings(
+    mode=RocketMQMode.CLOUD,
+    access_key=SecretStr("key"),
+    secret_key=SecretStr("secret"),
+    tls_enabled=True,
+  )
   assert settings.mode == RocketMQMode.CLOUD
+  assert settings.tls_enabled is True
 
 
 def test_rocketmq_settings_none_keys() -> None:

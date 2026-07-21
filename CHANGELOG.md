@@ -74,6 +74,13 @@ upgrading.
   escape hatch. Service URLs are normalized to the SDK's case-sensitive scheme
   and single-prefix cluster syntax; see
   [`docs/migration-guide.md`](docs/migration-guide.md).
+- **Authenticated RocketMQ connections now require TLS.** New setting
+  `SCRAPY_ROCKETMQ_TLS_ENABLED` is passed to both the Producer and
+  SimpleConsumer gRPC clients. Any explicit access/secret key must be a complete
+  non-empty pair and implies TLS; cloud mode always requires both credentials
+  and TLS. Connection setup now revalidates one coherent value snapshot and
+  redacts SDK-bound credentials and public startup failures. Anonymous
+  standalone/cluster deployments retain the existing plaintext default.
 - **Redis `ssl_enabled=True` now requires `ssl_cafile`.** `RedisSettings(
   ssl_enabled=True)` rejects a missing `ssl_cafile` (round-9c SV3-3). TLS
   without a pinned CA is vulnerable to MITM; operators who previously relied
