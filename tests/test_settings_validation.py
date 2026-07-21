@@ -475,6 +475,38 @@ class TestKafkaModeConditional:
     assert exc_info.value.setting_name == "mode"
 
 
+class TestKafkaDeliveryPolicy:
+  """Kafka queue success requires broker-confirmed, coherent topic policy."""
+
+  @pytest.mark.parametrize("acks", [0, -1, True, "0", "leader"])
+  def test_unconfirmed_or_unsupported_acks_rejected(self, acks: object) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(acks=acks)  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "acks"
+
+  @pytest.mark.parametrize(
+    ("acks", "expected"), [(1, 1), ("1", 1), ("all", "all")]
+  )
+  def test_confirmed_acks_values_remain_valid(
+    self, acks: int | str, expected: int | str
+  ) -> None:
+    assert KafkaSettings(acks=acks).acks == expected
+
+  def test_integer_acks_can_be_loaded_from_environment(self, monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_KAFKA_ACKS", "1")
+    assert KafkaSettings().acks == 1
+
+  def test_min_insync_replicas_cannot_exceed_replication_factor(self) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(replication_factor=2, min_insync_replicas=3)
+    assert exc_info.value.setting_name == "min_insync_replicas"
+
+  def test_partition_settings_cannot_disagree(self) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(num_partitions=3, max_priority_partitions=4)
+    assert exc_info.value.setting_name == "num_partitions"
+
+
 class TestRabbitMQModeConditional:
   """RabbitMQSettings SV2 CLUSTER/MIRRORED_QUEUES validators."""
 

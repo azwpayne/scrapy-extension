@@ -277,6 +277,15 @@ GSSAPI continues to use the ambient Kerberos context. OAUTHBEARER configurations
 must migrate to a supported mechanism or a separately managed client because
 this backend does not expose kafka-python's required token-provider object.
 
+Kafka `acks=0` is no longer accepted: it completes after a socket-buffer write
+and cannot satisfy the queue commit boundary. Select `acks=1` or preferably
+`"all"`. `num_partitions` and `max_priority_partitions` must now be equal, and
+`min_insync_replicas` cannot exceed `replication_factor`. These retention and
+minimum-ISR values are applied when the extension creates a topic; it does not
+alter an existing topic. Existing partition, replication, retention, and
+minimum-ISR policy is verified, and a mismatch blocks publication until it is
+reconciled with broker tooling.
+
 RabbitMQ `clear_queue()` now fails with `QueueError` when the target queue has
 an unacknowledged local delivery. RabbitMQ purge only removes ready messages;
 allowing a later nack would otherwise resurrect work from before the clear.

@@ -137,6 +137,14 @@ PLAIN pair. `OAUTHBEARER` is rejected because this backend does not expose the
 token-provider object required by kafka-python. Confluent mode requires a
 non-empty API key and secret and always builds a `SASL_SSL` client.
 
+Queue publication accepts only broker-confirmed `acks=1` or `acks="all"`
+(default). New topics receive the configured retention and minimum in-sync
+replica policy. Because priorities map directly to partitions,
+`NUM_PARTITIONS` and `MAX_PRIORITY_PARTITIONS` must match. Existing topics are
+not mutated automatically; the backend verifies their partition, replication,
+retention, and minimum-ISR policy and refuses a mismatch until it is reconciled
+with Kafka operator tooling.
+
 ### RabbitMQ (standalone, cluster, mirrored_queues)
 
 ```python

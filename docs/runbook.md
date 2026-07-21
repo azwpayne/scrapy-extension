@@ -266,6 +266,15 @@ not configurable through this backend. Confluent mode requires its dedicated
 non-empty API key and secret. Validation errors name fields but never include
 credential values.
 
+Kafka push success requires `acks=1` or `acks="all"`; `acks=0` is rejected
+because no broker receipt exists. The backend passes `retention.ms` and
+`min.insync.replicas` only when it creates a topic. A TopicAlreadyExists result
+does not authorize the crawler to alter broker policy: it verifies partition
+count, replication factor, retention, and minimum ISR, then fails on drift.
+Reconcile that drift out of band. Keep
+`num_partitions == max_priority_partitions` because priority is the physical
+partition index.
+
 If the error is in a backend's `from_settings` / `from_crawler` factory,
 check `backends/connectors.py:resolve_backend_config` — it resolves
 per-component config and is the single chokepoint for the fallback chain.

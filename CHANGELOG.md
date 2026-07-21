@@ -64,6 +64,14 @@ upgrading.
   Empty Confluent keys/secrets can no longer fall through to SDK plaintext
   defaults, credentials in non-Confluent modes are no longer silently ignored,
   and post-construction credential mutation is rechecked before client I/O.
+- **Kafka queue publication now requires broker acknowledgement.** `acks=0`
+  and unsupported acknowledgement values fail before SDK I/O; use `1` or the
+  reliable default `"all"`. Newly created topics now receive the configured
+  `retention.ms` and `min.insync.replicas`, invalid min-ISR/replication pairs
+  fail fast, and the two public partition-count settings must agree because
+  queue priority maps directly to physical partitions. Existing topics remain
+  operator-managed; their policy is verified and a mismatch fails instead of
+  being silently reconfigured or ignored.
 - **RabbitMQ `clear_queue()` now rejects in-flight deliveries.** Rabbit's purge
   excludes unacknowledged messages, which could previously be nacked after a
   successful clear and resurrect pre-clear work. Exact per-queue pending counts

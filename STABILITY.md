@@ -90,7 +90,7 @@ release.
 | Redis | Yes | Yes | Yes | Stable — full | Namespaced queue/set/storage physical domains; atomic Lua queue operations; 4 modes. Legacy unnamespaced keys require explicit migration. |
 | MongoDB | Yes | Yes | Yes | Stable — full | TLS/auth; 4 modes (standalone, replica_set, sharded_cluster, atlas). |
 | ElasticSearch | Yes | Yes | Yes | Stable — full | 2 modes (standalone, cloud). |
-| Kafka | Yes | No | No | Stable — queue-only | Mechanism-aware SASL/SSL (PLAIN, SCRAM, ambient GSSAPI; OAUTH provider unsupported); concurrent-safe per-message topic/partition/offset tokens. `priority`/`work_stealing` strategies are rejected. |
+| Kafka | Yes | No | No | Stable — queue-only | Mechanism-aware SASL/SSL (PLAIN, SCRAM, ambient GSSAPI; OAUTH provider unsupported); broker-confirmed sends (`acks=1/all`) and configured new-topic retention/min-ISR; concurrent-safe per-message topic/partition/offset tokens. `priority`/`work_stealing` strategies are rejected. |
 | RabbitMQ | Yes | No | No | Stable — queue-only | Priority queues; per-message channel-generation tokens; mandatory synchronous publisher confirms. HA policy remains operator-managed. |
 | Pulsar | Yes | No | No | Stable — queue-only | Topic-bound concurrent ack tokens. Queue depth and purge require an admin API and are unsupported here. |
 | SQS | Yes | No | No | Stable — queue-only | Standard queues; LocalStack + AWS; per-message receipt tokens; approximate depth; finite visibility lease without auto-renewal. |

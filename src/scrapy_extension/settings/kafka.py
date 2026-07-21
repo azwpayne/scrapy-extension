@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
@@ -174,6 +174,57 @@ def validate_kafka_authentication(
     )
 
   return mechanism, username, password, key, secret
+
+
+def _kafka_policy_int(value: object, field_name: str, minimum: int) -> int:
+  """Return a bounded policy integer, rejecting bools after model mutation."""
+  if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    raise ConfigurationError(
+      f"{field_name} must be an integer greater than or equal to {minimum}.",
+      setting_name=field_name,
+    )
+  return value
+
+
+def validate_kafka_delivery_policy(
+  acks: object,
+  max_priority_partitions: object,
+  num_partitions: object,
+  replication_factor: object,
+  retention_ms: object,
+  min_insync_replicas: object,
+) -> tuple[int | str, int, int, int, int]:
+  """Validate the broker-confirmed enqueue and new-topic durability policy."""
+  if isinstance(acks, bool) or acks not in (1, "all"):
+    raise ConfigurationError(
+      "Kafka QueueBackend requires acks=1 or acks='all'; acks=0 cannot "
+      "confirm broker acceptance.",
+      setting_name="acks",
+    )
+  normalized_acks: int | str = acks
+  priority_partitions = _kafka_policy_int(
+    max_priority_partitions, "max_priority_partitions", 1
+  )
+  configured_partitions = _kafka_policy_int(
+    num_partitions, "num_partitions", 1
+  )
+  if configured_partitions != priority_partitions:
+    raise ConfigurationError(
+      "num_partitions and max_priority_partitions must match because Kafka "
+      "priority values map directly to physical partitions.",
+      setting_name="num_partitions",
+    )
+  replicas = _kafka_policy_int(replication_factor, "replication_factor", 1)
+  retention = _kafka_policy_int(retention_ms, "retention_ms", 0)
+  min_isr = _kafka_policy_int(
+    min_insync_replicas, "min_insync_replicas", 1
+  )
+  if min_isr > replicas:
+    raise ConfigurationError(
+      "min_insync_replicas cannot exceed replication_factor.",
+      setting_name="min_insync_replicas",
+    )
+  return normalized_acks, priority_partitions, replicas, retention, min_isr
 
 
 class KafkaSettings(BaseSettings):
@@ -369,6 +420,18 @@ class KafkaSettings(BaseSettings):
     description="Minimum in-sync replicas for producer acks",
   )
 
+  @field_validator("acks", mode="before")
+  @classmethod
+  def _reject_boolean_acks(cls, value: object) -> object:
+    """Normalize env text while preventing bool-to-int coercion."""
+    if isinstance(value, bool):
+      raise ConfigurationError(
+        "Kafka acks must be 1 or 'all', not a boolean.", setting_name="acks"
+      )
+    if value == "1":
+      return 1
+    return value
+
   @model_validator(mode="after")
   def _validate_authentication(self) -> KafkaSettings:
     """Fail fast on incomplete or mechanism-inconsistent authentication."""
@@ -380,5 +443,18 @@ class KafkaSettings(BaseSettings):
       self.sasl_password,
       self.confluent_api_key,
       self.confluent_api_secret,
+    )
+    return self
+
+  @model_validator(mode="after")
+  def _validate_delivery_policy(self) -> KafkaSettings:
+    """Require confirmed sends and a coherent new-topic durability policy."""
+    validate_kafka_delivery_policy(
+      self.acks,
+      self.max_priority_partitions,
+      self.num_partitions,
+      self.replication_factor,
+      self.retention_ms,
+      self.min_insync_replicas,
     )
     return self

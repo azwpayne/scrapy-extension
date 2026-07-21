@@ -27,7 +27,12 @@ try:
       KafkaProducer,
       TopicPartition,
     )
-    from kafka.admin import KafkaAdminClient, NewTopic
+    from kafka.admin import (
+      ConfigResource,
+      ConfigResourceType,
+      KafkaAdminClient,
+      NewTopic,
+    )
     from kafka.errors import KafkaError, TopicAlreadyExistsError
     from kafka.structs import OffsetAndMetadata
 except ImportError as e:
@@ -50,7 +55,10 @@ from scrapy_extension.exceptions import (
     QueueError,
 )
 from scrapy_extension.settings import KafkaMode
-from scrapy_extension.settings.kafka import validate_kafka_authentication
+from scrapy_extension.settings.kafka import (
+  validate_kafka_authentication,
+  validate_kafka_delivery_policy,
+)
 
 # Topic name validation pattern - only allow alphanumeric, dots, underscores, hyphens
 # Uses \Z instead of $ to match only at absolute end of string (not before trailing newline)
@@ -260,6 +268,7 @@ class KafkaBackend(Backend, QueueBackend):
     self._admin_client: KafkaAdminClient | None = None
     # Cache known topics to avoid repeated existence checks
     self._known_topics: set[str] = set()
+    self._known_topic_policies: dict[str, tuple[int, int, int, int]] = {}
     # Topic the consumer is currently subscribed to, so pop() only
     # re-subscribes when it changes — mirrors RocketMQ's _ensure_subscribed
     # (R7). Avoids a redundant subscribe() on every pop of the same queue
@@ -338,6 +347,7 @@ class KafkaBackend(Backend, QueueBackend):
     # Pydantic models are mutable after construction. Revalidate auth before
     # any SDK object can observe a post-construction downgrade.
     self._validated_authentication()
+    self._validated_delivery_policy()
     try:
       if self.config.mode == KafkaMode.STANDALONE:
         self._connect_standalone()
@@ -393,8 +403,11 @@ class KafkaBackend(Backend, QueueBackend):
     mechanism, username, password, _api_key, _api_secret = (
       self._validated_authentication()
     )
+    acks, _partitions, _replicas, _retention, _min_isr = (
+      self._validated_delivery_policy()
+    )
     config: dict[str, Any] = {
-      "acks": self.config.acks,
+      "acks": acks,
       "retries": self.config.retries,
       "batch_size": self.config.batch_size,
       "linger_ms": self.config.linger_ms,
@@ -435,6 +448,19 @@ class KafkaBackend(Backend, QueueBackend):
       self.config.sasl_password,
       self.config.confluent_api_key,
       self.config.confluent_api_secret,
+    )
+
+  def _validated_delivery_policy(
+    self,
+  ) -> tuple[int | str, int, int, int, int]:
+    """Revalidate broker acknowledgement and topic durability settings."""
+    return validate_kafka_delivery_policy(
+      self.config.acks,
+      self.config.max_priority_partitions,
+      self.config.num_partitions,
+      self.config.replication_factor,
+      self.config.retention_ms,
+      self.config.min_insync_replicas,
     )
 
   def _bootstrap_servers(self) -> str:
@@ -549,6 +575,7 @@ class KafkaBackend(Backend, QueueBackend):
       self._subscribed_topic = None
       self._clear_delivery_state_locked()
       self._known_topics.clear()
+      self._known_topic_policies.clear()
 
     for client in (producer, consumer, admin_client):
       if client is not None:
@@ -603,32 +630,52 @@ class KafkaBackend(Backend, QueueBackend):
     """
     _validate_topic_name(queue_name)
     topic_name = f"scrapy-{queue_name}"
+    _acks, partitions, replicas, retention, min_isr = (
+      self._validated_delivery_policy()
+    )
+    policy = (partitions, replicas, retention, min_isr)
 
     # Skip if topic is already known to exist
     if topic_name in self._known_topics:
+      cached_policy = self._known_topic_policies.get(topic_name)
+      # A missing private cache entry supports older direct tests/callers that
+      # pre-populate _known_topics. Production-created entries always carry a
+      # policy and are rechecked if live settings change.
+      if cached_policy is None or cached_policy == policy:
+        return
+      self._validate_existing_topic_policy(
+        topic_name=topic_name,
+        queue_name=queue_name,
+        partitions=partitions,
+        replicas=replicas,
+        retention=retention,
+        min_isr=min_isr,
+      )
+      self._known_topic_policies[topic_name] = policy
       return
 
+    created = False
     try:
       new_topic = NewTopic(
         name=topic_name,
-        num_partitions=self.config.max_priority_partitions,
-        replication_factor=self.config.replication_factor,
+        num_partitions=partitions,
+        replication_factor=replicas,
+        topic_configs={
+          "min.insync.replicas": str(min_isr),
+          "retention.ms": str(retention),
+        },
       )
       if self._admin_client is None:
         msg = "KafkaBackend not connected: admin client is None"
         raise BackendConnectionError(msg, backend_type="kafka")
       response = self._admin_client.create_topics([new_topic])
-      self._validate_topic_creation_response(
+      created = self._validate_topic_creation_response(
         response,
         topic_name=topic_name,
         queue_name=queue_name,
       )
-      self._known_topics.add(topic_name)
-      logger.debug("Created Kafka topic: %s", topic_name)
     except TopicAlreadyExistsError:
-      # Topic already exists - this is expected
-      self._known_topics.add(topic_name)
-      logger.debug("Kafka topic already exists: %s", topic_name)
+      created = False
     except KafkaError as e:
       msg = f"Failed to create Kafka topic {topic_name}."
       raise QueueError(
@@ -636,6 +683,30 @@ class KafkaBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="push",
       ) from e
+    if not created:
+      try:
+        self._validate_existing_topic_policy(
+          topic_name=topic_name,
+          queue_name=queue_name,
+          partitions=partitions,
+          replicas=replicas,
+          retention=retention,
+          min_isr=min_isr,
+        )
+      except KafkaError as e:
+        msg = f"Failed to inspect existing Kafka topic {topic_name}."
+        raise QueueError(
+          msg,
+          queue_name=queue_name,
+          operation="push",
+        ) from e
+    self._known_topics.add(topic_name)
+    self._known_topic_policies[topic_name] = policy
+    logger.debug(
+      "%s Kafka topic: %s",
+      "Created" if created else "Verified existing",
+      topic_name,
+    )
 
   @staticmethod
   def _validate_topic_creation_response(
@@ -643,8 +714,8 @@ class KafkaBackend(Backend, QueueBackend):
     *,
     topic_name: str,
     queue_name: str,
-  ) -> None:
-    """Reject per-topic broker errors returned outside the exception path."""
+  ) -> bool:
+    """Return whether Kafka created the topic; reject malformed failures."""
     topic_errors = getattr(response, "topic_errors", None)
     if not isinstance(topic_errors, (list, tuple)):
       msg = "Kafka create-topics response has no valid topic_errors list."
@@ -665,10 +736,104 @@ class KafkaBackend(Backend, QueueBackend):
     if isinstance(error_code, bool) or not isinstance(error_code, int):
       msg = "Kafka create-topics response contains an invalid error code."
       raise QueueError(msg, queue_name=queue_name, operation="push")
-    if error_code in (0, TopicAlreadyExistsError.errno):
-      return
+    if error_code == 0:
+      return True
+    if error_code == TopicAlreadyExistsError.errno:
+      return False
     msg = f"Kafka broker rejected topic creation (error code {error_code})."
     raise QueueError(msg, queue_name=queue_name, operation="push")
+
+  def _validate_existing_topic_policy(
+    self,
+    *,
+    topic_name: str,
+    queue_name: str,
+    partitions: int,
+    replicas: int,
+    retention: int,
+    min_isr: int,
+  ) -> None:
+    """Fail closed when an existing topic contradicts queue durability.
+
+    Existing topics remain operator-managed: this method never alters broker
+    state. It verifies the fields whose mismatch would make accepted public
+    settings a silent no-op.
+    """
+    admin = self._admin_client
+    if admin is None:
+      msg = "KafkaBackend not connected: admin client is None"
+      raise BackendConnectionError(msg, backend_type="kafka")
+
+    def policy_error() -> QueueError:
+      return QueueError(
+        "Existing Kafka topic policy does not match the configured queue policy.",
+        queue_name=queue_name,
+        operation="push",
+      )
+
+    descriptions = admin.describe_topics([topic_name])
+    if not isinstance(descriptions, (list, tuple)):
+      raise policy_error()
+    matching = [
+      entry
+      for entry in descriptions
+      if isinstance(entry, dict) and entry.get("topic") == topic_name
+    ]
+    if len(matching) != 1:
+      raise policy_error()
+    description = matching[0]
+    if description.get("error_code") != 0:
+      raise policy_error()
+    partition_entries = description.get("partitions")
+    if not isinstance(partition_entries, (list, tuple)) or len(
+      partition_entries
+    ) != partitions:
+      raise policy_error()
+    for entry in partition_entries:
+      if not isinstance(entry, dict):
+        raise policy_error()
+      assigned_replicas = entry.get("replicas")
+      if not isinstance(assigned_replicas, (list, tuple)) or len(
+        assigned_replicas
+      ) != replicas:
+        raise policy_error()
+
+    resource = ConfigResource(
+      ConfigResourceType.TOPIC,
+      topic_name,
+      configs={"retention.ms": None, "min.insync.replicas": None},
+    )
+    responses = admin.describe_configs([resource])
+    if not isinstance(responses, (list, tuple)):
+      raise policy_error()
+    resources: list[tuple[Any, ...]] = []
+    for response in responses:
+      response_resources = getattr(response, "resources", None)
+      if not isinstance(response_resources, (list, tuple)):
+        raise policy_error()
+      for entry in response_resources:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 5:
+          raise policy_error()
+        if entry[3] == topic_name:
+          resources.append(tuple(entry))
+    if len(resources) != 1 or resources[0][0] != 0:
+      raise policy_error()
+    config_entries = resources[0][4]
+    if not isinstance(config_entries, (list, tuple)):
+      raise policy_error()
+    actual: dict[str, str] = {}
+    for entry in config_entries:
+      if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+        raise policy_error()
+      name, value = entry[0], entry[1]
+      if isinstance(name, str) and isinstance(value, str):
+        actual[name] = value
+    expected = {
+      "retention.ms": str(retention),
+      "min.insync.replicas": str(min_isr),
+    }
+    if any(actual.get(name) != value for name, value in expected.items()):
+      raise policy_error()
 
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:

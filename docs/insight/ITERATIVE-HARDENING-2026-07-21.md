@@ -251,11 +251,12 @@ speculative work.
 - [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
   default noreply mode so storage mutation success is based on a parsed server
   response rather than an unconfirmed socket write.
-- [ ] **BACKEND-07 — confirmed Kafka/MongoDB mutations.** Reject Kafka `acks=0`
-  and MongoDB unacknowledged write concerns so public queue/set/storage success
-  cannot mean only a local socket-buffer handoff. Wire Kafka's advertised topic
-  durability settings into creation and reject internally inconsistent
-  replication/min-ISR configurations.
+- [x] **BACKEND-07A — confirmed Kafka publication.** Reject Kafka `acks=0`,
+  apply advertised retention/min-ISR settings to new topics, and reject
+  inconsistent replication, ISR, and partition-count policy.
+- [ ] **BACKEND-07B — confirmed MongoDB mutations.** Reject unacknowledged write
+  concerns so queue/set/storage success cannot mean only a local socket-buffer
+  handoff.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -932,4 +933,25 @@ credentials are complete, non-empty, and exclusive to Confluent mode, and both
 cloud credentials plus password values are repr-redacted in SDK dictionaries.
 All 370 related tests passed on Python 3.10 and 3.14 with two real-broker tests
 explicitly skipped; the full Python 3.10 suite passed 3,156 tests with 45
+documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I26 — Kafka confirmed publication and topic durability
+
+Eighteen RED outcomes across three evidence batches showed that `acks=0` and
+unsupported acknowledgement values were accepted as successful queue writes,
+while the public retention, minimum-ISR, and general partition settings were
+ignored during topic creation. Invalid ISR/replication combinations passed,
+TopicAlreadyExists cached success without inspecting real broker policy, the
+integer acknowledgement value could not be supplied through an environment
+variable, and a valid policy mutation bypassed the bare known-topic cache.
+
+Kafka queue publication now accepts only broker-confirmed `acks=1` or
+`acks="all"`, with exact environment text `"1"` normalized safely and booleans
+rejected. New topics receive explicit retention and minimum-ISR config;
+replication, ISR, and the two partition-count settings are validated as one
+policy. Existing topics are never altered implicitly: their metadata and
+selected config are read and a mismatch fails before publication. The cache is
+policy-aware, so a changed valid policy is reverified rather than ignored. All
+387 related tests passed on Python 3.10 and 3.14 with two real-broker tests
+explicitly skipped; the full Python 3.10 suite passed 3,173 tests with 45
 documented skips. Ruff, strict mypy, and patch integrity remained green.

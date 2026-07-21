@@ -125,6 +125,20 @@ class TestKafkaBackendConnect:
     # No leak: the partially-assigned producer was closed before nulling.
     mock_producer.close.assert_called_once()
 
+  def test_connect_rejects_mutated_unconfirmed_acks_before_sdk_io(self, mocker):
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    config.acks = 0
+    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert exc_info.value.setting_name == "acks"
+    producer.assert_not_called()
+    admin.assert_not_called()
+
 
 class TestKafkaBackendBuildCommonConfig:
   """Tests for _build_common_config method."""
@@ -527,6 +541,81 @@ class TestKafkaBackendEnsureTopicExists:
     assert new_topic.name == "scrapy-newqueue"
     assert "scrapy-newqueue" in backend._known_topics
 
+  def test_ensure_topic_exists_applies_configured_durability(self, mocker):
+    config = KafkaSettings(
+      max_priority_partitions=7,
+      num_partitions=7,
+      replication_factor=3,
+      min_insync_replicas=2,
+      retention_ms=123456,
+    )
+    backend = KafkaBackend(config)
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [("scrapy-durable", 0, None)]
+    backend._admin_client = admin
+
+    backend._ensure_topic_exists("durable")
+
+    new_topic = admin.create_topics.call_args.args[0][0]
+    assert new_topic.num_partitions == 7
+    assert new_topic.replication_factor == 3
+    assert new_topic.topic_configs == {
+      "min.insync.replicas": "2",
+      "retention.ms": "123456",
+    }
+
+  def test_known_topic_still_revalidates_mutated_policy(self, mocker):
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    backend._known_topics.add("scrapy-known")
+    config.min_insync_replicas = 2
+    admin = mocker.MagicMock()
+    backend._admin_client = admin
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend._ensure_topic_exists("known")
+
+    assert exc_info.value.setting_name == "min_insync_replicas"
+    admin.create_topics.assert_not_called()
+
+  def test_known_topic_rechecks_valid_policy_change(self, mocker):
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [("scrapy-known", 0, None)]
+    backend._admin_client = admin
+    backend._ensure_topic_exists("known")
+
+    config.retention_ms = 123
+    admin.describe_topics.return_value = [
+      {
+        "error_code": 0,
+        "topic": "scrapy-known",
+        "partitions": [
+          {"partition": partition, "replicas": [0]} for partition in range(10)
+        ],
+      }
+    ]
+    config_response = mocker.MagicMock()
+    config_response.resources = [
+      (
+        0,
+        None,
+        2,
+        "scrapy-known",
+        [
+          ("retention.ms", "123", False, False, False),
+          ("min.insync.replicas", "1", False, False, False),
+        ],
+      )
+    ]
+    admin.describe_configs.return_value = [config_response]
+
+    backend._ensure_topic_exists("known")
+
+    admin.create_topics.assert_called_once()
+    admin.describe_topics.assert_called_once_with(["scrapy-known"])
+
   def test_ensure_topic_exists_handles_topic_already_exists(self, mocker):
     """Test _ensure_topic_exists handles TopicAlreadyExistsError gracefully."""
     config = KafkaSettings()
@@ -537,11 +626,15 @@ class TestKafkaBackendEnsureTopicExists:
       "Topic already exists"
     )
     backend._admin_client = mock_admin
+    validate_policy = mocker.patch.object(
+      backend, "_validate_existing_topic_policy"
+    )
 
     backend._ensure_topic_exists("existingqueue")
 
     # Should still add to known topics
     assert "scrapy-existingqueue" in backend._known_topics
+    validate_policy.assert_called_once()
 
   def test_ensure_topic_exists_surfaces_kafka_error_on_create(self, mocker):
     """A thrown admin failure must prevent a success-shaped push path."""
@@ -579,10 +672,87 @@ class TestKafkaBackendEnsureTopicExists:
       ("scrapy-existing", 36, "already exists")
     ]
     backend._admin_client = admin
+    validate_policy = mocker.patch.object(
+      backend, "_validate_existing_topic_policy"
+    )
 
     backend._ensure_topic_exists("existing")
 
     assert "scrapy-existing" in backend._known_topics
+    validate_policy.assert_called_once()
+
+  def test_existing_topic_matching_policy_is_accepted(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [
+      ("scrapy-existing", 36, "already exists")
+    ]
+    admin.describe_topics.return_value = [
+      {
+        "error_code": 0,
+        "topic": "scrapy-existing",
+        "partitions": [
+          {"partition": partition, "replicas": [0]} for partition in range(10)
+        ],
+      }
+    ]
+    config_response = mocker.MagicMock()
+    config_response.resources = [
+      (
+        0,
+        None,
+        2,
+        "scrapy-existing",
+        [
+          ("retention.ms", "604800000", False, False, False),
+          ("min.insync.replicas", "1", False, False, False),
+        ],
+      )
+    ]
+    admin.describe_configs.return_value = [config_response]
+    backend._admin_client = admin
+
+    backend._ensure_topic_exists("existing")
+
+    assert "scrapy-existing" in backend._known_topics
+    admin.describe_topics.assert_called_once_with(["scrapy-existing"])
+    admin.describe_configs.assert_called_once()
+
+  def test_existing_topic_policy_mismatch_fails_before_cache(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [
+      ("scrapy-drifted", 36, "already exists")
+    ]
+    admin.describe_topics.return_value = [
+      {
+        "error_code": 0,
+        "topic": "scrapy-drifted",
+        "partitions": [
+          {"partition": partition, "replicas": [0]} for partition in range(10)
+        ],
+      }
+    ]
+    config_response = mocker.MagicMock()
+    config_response.resources = [
+      (
+        0,
+        None,
+        2,
+        "scrapy-drifted",
+        [
+          ("retention.ms", "604800000", False, False, False),
+          ("min.insync.replicas", "2", False, False, False),
+        ],
+      )
+    ]
+    admin.describe_configs.return_value = [config_response]
+    backend._admin_client = admin
+
+    with pytest.raises(QueueError, match="policy"):
+      backend._ensure_topic_exists("drifted")
+
+    assert "scrapy-drifted" not in backend._known_topics
 
   def test_ensure_topic_exists_rejects_malformed_response(self, mocker):
     backend = KafkaBackend(KafkaSettings())
