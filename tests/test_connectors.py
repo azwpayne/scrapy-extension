@@ -437,6 +437,18 @@ class TestConnectionManagerClose:
     # Should not raise
     manager.close()
 
+  def test_close_disconnects_falsey_third_party_backend(self, mocker):
+    """Backend truthiness must not decide whether a live handle is released."""
+    backend = mocker.MagicMock()
+    backend.__bool__.return_value = False
+    manager = ConnectionManager(BackendType.REDIS)
+    manager._backend = backend
+
+    manager.close()
+
+    backend.disconnect.assert_called_once_with()
+    assert manager._backend is None
+
 
 class TestConnectionManagerBackendProperty:
   """Tests for backend property with double-checked locking."""
@@ -530,6 +542,55 @@ class TestConnectionManagerBackendProperty:
     # get_manager), but clear anyway to match the file's isolation pattern.
     ConnectionManager.clear_registry()
 
+  def test_backend_returns_one_captured_post_connect_value(self, mocker):
+    """A state change between the final guard and return cannot publish None."""
+
+    class _ChangingReadManager(ConnectionManager):
+      def __init__(self) -> None:
+        self._race_armed = False
+        self._race_reads = 0
+        super().__init__(BackendType.REDIS)
+
+      def __getattribute__(self, name):
+        value = super().__getattribute__(name)
+        if name != "_backend":
+          return value
+        if not object.__getattribute__(self, "_race_armed"):
+          return value
+        reads = object.__getattribute__(self, "_race_reads") + 1
+        object.__setattr__(self, "_race_reads", reads)
+        # Model reconnect detaching the published generation after the final
+        # non-null guard but before a second expression reads it for return.
+        return None if reads >= 3 else value
+
+    manager = _ChangingReadManager()
+    backend = mocker.MagicMock(name="published-backend")
+
+    def publish_backend() -> None:
+      manager._backend = backend
+      manager._race_reads = 0
+      manager._race_armed = True
+
+    mocker.patch.object(manager, "connect", side_effect=publish_backend)
+
+    assert manager.backend is backend
+
+  def test_snapshot_rejects_null_backend_even_when_manager_state_matches(self):
+    """A violated backend-property contract must raise, never form a None proxy."""
+
+    class _NullBackendManager(ConnectionManager):
+      @property
+      def backend(self):
+        return None
+
+      def _get_breaker(self):
+        return None
+
+    manager = _NullBackendManager(BackendType.REDIS)
+
+    with pytest.raises(BackendConnectionError, match="did not produce a backend"):
+      manager._get_backend_breaker_snapshot()
+
 
 class TestConnectionManagerIsConnected:
   """Tests for is_connected method."""
@@ -551,6 +612,30 @@ class TestConnectionManagerIsConnected:
 
     assert manager.is_connected() is True
     mock_backend.is_connected.assert_called_once()
+
+  def test_is_connected_uses_one_backend_read(self, mocker):
+    """Concurrent detach cannot turn the second attribute read into None."""
+
+    class _ChangingReadManager(ConnectionManager):
+      def __init__(self) -> None:
+        self._backend_reads = 0
+        super().__init__(BackendType.REDIS)
+
+      def __getattribute__(self, name):
+        value = super().__getattribute__(name)
+        if name != "_backend":
+          return value
+        reads = object.__getattribute__(self, "_backend_reads") + 1
+        object.__setattr__(self, "_backend_reads", reads)
+        return None if reads >= 2 else value
+
+    manager = _ChangingReadManager()
+    backend = mocker.MagicMock()
+    backend.is_connected.return_value = True
+    manager._backend = backend
+
+    assert manager.is_connected() is True
+    backend.is_connected.assert_called_once_with()
 
 
 class TestConnectionManagerGetBackendInterface:

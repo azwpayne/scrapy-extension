@@ -1263,7 +1263,7 @@ class ConnectionManager:
       # assignment, an in-flight connect can resurrect an evicted manager and
       # leak an unowned connection.
       self._retired = True
-      if self._backend:
+      if self._backend is not None:
         try:
           self._backend.disconnect()
           logger.debug("Disconnected from %s", self.backend_type)
@@ -1281,9 +1281,10 @@ class ConnectionManager:
         # teardowns. ``reason`` is not available at this layer (the Scrapy
         # engine close reason lives in the scheduler/pipeline that owns the
         # manager), so ``None`` is passed — the lifecycle hook fires
-        # regardless. No-op on the default NullMonitor. Inside the ``if
-        # self._backend`` block so a no-op close (already disconnected) does
-        # not double-count.
+        # regardless. No-op on the default NullMonitor. Inside the non-null
+        # backend block so a no-op close (already disconnected) does not
+        # double-count. Truthiness is deliberately irrelevant: third-party
+        # backends may validly define ``__bool__`` or ``__len__``.
         self._notify_monitor("on_disconnect", str(self.backend_type), None)
       # R14-E: reset the circuit breaker so a manager that reconnects after
       # teardown (or an orphan-evicted manager re-created from the same
@@ -1422,18 +1423,7 @@ class ConnectionManager:
       self.connect()
     except BaseException as e:  # noqa: BLE001 - re-signal to all waiters
       connect_error = e
-    if connect_error is None and self._backend is None:
-      # Defensive: connect() should either set _backend (success) or raise.
-      # If we land here, connect() returned without connecting and without
-      # raising — that is a contract violation, not a user input problem.
-      # The explicit guard (rather than ``assert``) keeps the check live
-      # under ``python -O`` and produces a clear, typed error instead of a
-      # bare AssertionError.
-      msg = "connect() did not produce a backend"
-      connect_error = BackendConnectionError(
-        msg, backend_type=str(self.backend_type)
-      )
-
+    published_backend: Backend | None = None
     with self._lock:
       # A final-holder close can win after connect() publishes a backend but
       # before this owner fans the result out. close() has already detached
@@ -1444,6 +1434,17 @@ class ConnectionManager:
           "ConnectionManager was released while connecting",
           backend_type=str(self.backend_type),
         )
+      if connect_error is None:
+        # Capture the published handle exactly once under the same state lock
+        # used by reconnect/close. Returning a second ``self._backend`` read
+        # allowed reconnect to detach it after a non-null guard, leaking None
+        # through this property and into interface-proxy construction.
+        published_backend = self._backend
+        if published_backend is None:
+          connect_error = BackendConnectionError(
+            "connect() did not produce a backend",
+            backend_type=str(self.backend_type),
+          )
       attempt.error = connect_error
       self._connecting = False
       attempt.event.set()
@@ -1451,13 +1452,12 @@ class ConnectionManager:
     if connect_error is not None:
       raise connect_error
 
-    # ``connect_error`` is None only when connect() populated _backend. Keep
-    # an explicit runtime guard so that contract remains true under future
-    # refactors as well as in the static type system.
-    if self._backend is None:
+    # Keep the local-value guard explicit so the contract remains true under
+    # future refactors and ``python -O`` as well as in the static type system.
+    if published_backend is None:
       msg = "connect() did not produce a backend"
       raise BackendConnectionError(msg, backend_type=str(self.backend_type))
-    return self._backend
+    return published_backend
 
   def is_connected(self) -> bool:
     """Check if backend is connected.
@@ -1465,9 +1465,10 @@ class ConnectionManager:
     Returns:
         True if connected, False otherwise.
     """
-    if self._backend is None:
+    backend = self._backend
+    if backend is None:
       return False
-    return self._backend.is_connected()
+    return backend.is_connected()
 
   def _get_breaker(self) -> CircuitBreaker | None:
     """Lazily resolve the per-manager circuit breaker from env settings.
@@ -1549,6 +1550,14 @@ class ConnectionManager:
     """
     while True:
       backend = self.backend
+      if backend is None:
+        # Defense in depth for subclasses/test doubles that violate the
+        # property contract. Never accept ``None is self._backend`` as a
+        # coherent generation and build a misleading NoneType proxy error.
+        raise BackendConnectionError(
+          "connect() did not produce a backend",
+          backend_type=str(self.backend_type),
+        )
       breaker = self._get_breaker()
       with self._lock:
         if self._retired:

@@ -148,7 +148,7 @@ speculative work.
   terminal, a broker failure remains retryable, concurrent terminal paths are
   serialized, and custom deferred-ack strategies returning raw tokens fail
   closed before processing.
-- [ ] **RUN-09 — accessor and close publication safety.** Capture one non-null
+- [x] **RUN-09 — accessor and close publication safety.** Capture one non-null
   backend value before returning from a lazy accessor, reject `None` snapshots,
   make `is_connected()` single-read, and disconnect falsey third-party backend
   implementations during close.
@@ -415,3 +415,23 @@ queue/strategy/scheduler tests passed on Python 3.10, and the full suite passed
 iteration closes cross-manager-generation mis-acknowledgement; Kafka's
 same-instance rebalance and same-offset delivery-attempt fencing remains
 BACKEND-01.
+
+### I12a — connection publication and falsey-close safety
+
+Four regressions reproduced independent double-read and truthiness failures.
+After a successful lazy connect, the owner checked `self._backend` for non-null
+and then returned a second read that reconnect could already have detached;
+`is_connected()` had the same check-then-dereference shape. A `None` result
+could then satisfy snapshot identity as `None is self._backend` and surface as
+a misleading `NotImplementedError`. Separately, `close()` treated a valid
+third-party backend whose `__bool__` returned false as absent and leaked its
+connection.
+
+The owner now captures its published backend once under the manager state lock,
+fans that exact value out to waiters, and returns only the local value. Snapshot
+construction rejects a violated null-backend contract with
+`BackendConnectionError`; `is_connected()` uses one local read; close tests
+identity against `None` rather than truthiness. The four regressions passed on
+Python 3.10 and 3.14, 182 connection/breaker tests passed, and the full suite
+passed 2,947 tests with 44 documented skips. Ruff and strict mypy remained
+green.
