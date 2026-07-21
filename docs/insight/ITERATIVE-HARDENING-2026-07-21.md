@@ -1,11 +1,11 @@
 # Iterative hardening programme — 2026-07-21
 
-This document is the executable result of an eight-reader parallel audit of
-architecture, backend correctness, runtime lifecycle, tests/CI, public API and
-typing, security/configuration, release documentation, and independent bug
-hunting. It is maintainer planning evidence, not a promise that every item is
-already fixed. Public behaviour remains defined by `README.md`, `STABILITY.md`,
-and the package API.
+This document is the executable result of successive eight-reader parallel
+audits of architecture, backend correctness, runtime lifecycle, tests/CI,
+public API and typing, security/configuration, release documentation, and
+independent bug hunting. It is maintainer planning evidence, not a promise that
+every item is already fixed. Public behaviour remains defined by `README.md`,
+`STABILITY.md`, and the package API.
 
 ## Spec
 
@@ -91,10 +91,11 @@ global gates, then perform a fresh audit before selecting the next item.
 | I7 | Close simple runtime failure-boundary gaps | breaker-open queue/dedup paths degrade safely; explicit reconnect works |
 | I8 | Preserve the replacement enqueue commit boundary | a source-ack failure cannot reject a committed replacement or undo dedup |
 | I9 | Repair the Pulsar TLS client contract | real SDK keyword smoke passes; hostname validation is explicit and secure by default |
-| I10 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
-| I11 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements never acknowledge early |
-| I12 | Repair backend-specific P1 correctness | Kafka assignment epochs, ES contention, DynamoDB consistent reads |
-| I13 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
+| I10 | Make connection-generation proxy snapshots coherent | an accessor returns complete old or new backend/breaker state, never a mixed pair |
+| I11 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
+| I12 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements never acknowledge early |
+| I13 | Repair backend-specific P1 correctness | consumer token incarnations, ES contention, DynamoDB consistent reads |
+| I14 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -134,6 +135,11 @@ speculative work.
   a failed queue push only when that exact request check created a reservation;
   transient reconnect failures must remain scheduler-safe on poll and depth
   paths.
+- [x] **RUN-07 — coherent connection-generation snapshots.** Replace backend
+  and breaker generation state under one lock, then validate both identities
+  before constructing queue, set, or storage proxies. A reconnect race may
+  return a complete old or new generation, never a mixed proxy through which a
+  retired backend can trip the live breaker.
 - [ ] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
   acquisition for crawler-owned construction, and use an unshareable fallback
   for unresolved direct construction, so Kafka and RocketMQ consumers are not
@@ -158,10 +164,12 @@ speculative work.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
-- [ ] **BACKEND-01 — Kafka token generations.** Fence acknowledgement tokens by
-  backend incarnation, assignment epoch, and delivery attempt; invalidate them
-  on rebalance, nack, and clear. Validate admin responses and wait for topic
-  deletion before recreation.
+- [ ] **BACKEND-01 — consumer token generations.** Bind every deferred-ack token
+  to the backend instance that issued it so a token popped before manager
+  replacement cannot acknowledge a delivery on the replacement. For Kafka,
+  additionally fence by assignment epoch and delivery attempt, invalidate on
+  rebalance/nack/clear, validate admin responses, and wait for topic deletion
+  before recreation.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -333,3 +341,17 @@ forwarded explicitly. Service URLs are canonicalized to the SDK grammar, and a
 subprocess contract test pins the real SDK signature. Nineteen focused tests
 passed on Python 3.10 and 3.14; 280 related settings/backend tests and the full
 2,932-test suite with 44 skips passed, followed by Ruff and strict mypy.
+
+### I10 — coherent connection-generation proxy snapshots
+
+A deterministic regression forced reconnect to replace manager state between
+an accessor's backend and breaker reads. The prior implementation returned a
+proxy over the retired backend but the live generation's breaker, so a late old
+failure could still open the replacement circuit despite I7's distinct breaker
+objects. Reconnect now detaches the backend and advances its breaker under one
+state lock. Queue, set, and storage accessors share a read-then-validate loop
+that performs connection and settings work outside that lock, then accepts the
+pair only when both identities still match manager state. The regression first
+failed by returning the retired payload and now passes on Python 3.10 and 3.14;
+143 connection/breaker tests and the full 2,933-test suite with 44 skips passed,
+followed by Ruff and strict mypy.

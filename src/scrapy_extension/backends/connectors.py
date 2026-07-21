@@ -1016,6 +1016,13 @@ class ConnectionManager:
         if connected:
           return
         self._backend = None
+        # Backend and breaker form one connection generation. Replace the
+        # breaker while holding the same state lock that detaches the backend
+        # so interface accessors can validate a coherent pair. Performing this
+        # later, after disconnect(), exposes ``None/old-breaker`` and then
+        # ``replacement/old-breaker`` windows to racing accessors.
+        if self._breaker is not None:
+          self._breaker = self._breaker.new_generation()
         stale_backend = backend
         break
 
@@ -1025,12 +1032,6 @@ class ConnectionManager:
       except Exception as exc:
         logger.warning("Error disconnecting stale backend: %s", exc)
       self._notify_monitor("on_disconnect", str(self.backend_type), None)
-      # Proxies bind both backend and breaker at construction. A retained old
-      # proxy can finish after reconnect; resetting the SAME breaker lets that
-      # late outcome trip the replacement backend. Give each connection
-      # generation a distinct breaker so old calls can only mutate old state.
-      if self._breaker is not None:
-        self._breaker = self._breaker.new_generation()
 
     retry_attempts, retry_delay = self._retry_policy()
     total_attempts = retry_attempts + 1
@@ -1526,6 +1527,38 @@ class ConnectionManager:
       self._breaker_configured = True
       return self._breaker
 
+  def _get_backend_breaker_snapshot(
+    self,
+  ) -> tuple[Backend, CircuitBreaker | None]:
+    """Return a coherent backend/circuit-breaker generation snapshot.
+
+    Accessors cannot simply read :attr:`backend` and then ``_breaker``: a
+    reconnect may replace both between those reads, producing a proxy that
+    binds a retired backend to the live generation's breaker. Read both
+    outside ``_lock`` (``backend`` may connect and ``_get_breaker`` may load
+    settings), then validate their identities together under ``_lock``. A
+    concurrent generation change makes the loop retry; the result is always
+    either the complete old generation or the complete replacement.
+
+    Returns:
+        The backend and breaker belonging to one connection generation.
+
+    Raises:
+        BackendConnectionError: If the manager is released while taking the
+            snapshot.
+    """
+    while True:
+      backend = self.backend
+      breaker = self._get_breaker()
+      with self._lock:
+        if self._retired:
+          raise BackendConnectionError(
+            "Cannot access a released ConnectionManager",
+            backend_type=str(self.backend_type),
+          )
+        if backend is self._backend and breaker is self._breaker:
+          return backend, breaker
+
   def get_queue_backend(self) -> QueueBackend:
     """Get the queue backend interface.
 
@@ -1538,11 +1571,10 @@ class ConnectionManager:
     Returns:
         The QueueBackend interface of the backend.
     """
-    backend = self.backend
+    backend, breaker = self._get_backend_breaker_snapshot()
     if not isinstance(backend, QueueBackend):
       msg = f"Backend {backend.__class__.__name__} does not support queue operations"
       raise NotImplementedError(msg)
-    breaker = self._get_breaker()
     if breaker is None:
       return backend
     from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
@@ -1560,11 +1592,10 @@ class ConnectionManager:
     Returns:
         The SetBackend interface of the backend.
     """
-    backend = self.backend
+    backend, breaker = self._get_backend_breaker_snapshot()
     if not isinstance(backend, SetBackend):
       msg = f"Backend {backend.__class__.__name__} does not support set operations"
       raise NotImplementedError(msg)
-    breaker = self._get_breaker()
     if breaker is None:
       return backend
     from scrapy_extension.backends.circuit_breaker import wrap_set_backend
@@ -1583,11 +1614,10 @@ class ConnectionManager:
     Returns:
         The StorageBackend interface of the backend.
     """
-    backend = self.backend
+    backend, breaker = self._get_backend_breaker_snapshot()
     if not isinstance(backend, StorageBackend):
       msg = f"Backend {backend.__class__.__name__} does not support storage operations"
       raise NotImplementedError(msg)
-    breaker = self._get_breaker()
     if breaker is None:
       return backend
     from scrapy_extension.backends.circuit_breaker import wrap_storage_backend

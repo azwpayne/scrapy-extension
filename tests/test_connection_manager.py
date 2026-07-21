@@ -442,6 +442,10 @@ def test_reconnect_isolates_breaker_from_retired_backend_failures(mocker):
   manager._breaker = retired_breaker
   manager._breaker_configured = True
   retired_proxy = manager.get_queue_backend()
+  breaker_during_disconnect: list[CircuitBreaker | None] = []
+  retired.disconnect_mock.side_effect = lambda: breaker_during_disconnect.append(
+    manager._breaker
+  )
 
   replacement = _QueueBackend("replacement-backend")
   replacement.pop_mock.return_value = b"fresh"
@@ -452,6 +456,7 @@ def test_reconnect_isolates_breaker_from_retired_backend_failures(mocker):
   replacement_proxy = manager.get_queue_backend()
 
   assert manager._breaker is not retired_breaker
+  assert breaker_during_disconnect == [manager._breaker]
   retired.pop_mock.side_effect = QueueError("late retired failure")
   with pytest.raises(QueueError, match="late retired failure"):
     retired_proxy.pop("queue")
@@ -460,6 +465,94 @@ def test_reconnect_isolates_breaker_from_retired_backend_failures(mocker):
   assert manager._breaker is not None
   assert manager._breaker.state is BreakerState.CLOSED
   assert replacement_proxy.pop("queue") == b"fresh"
+  replacement.pop_mock.assert_called_once_with("queue", 0.0)
+
+
+def test_get_queue_backend_retries_mixed_reconnect_generation(mocker):
+  """An accessor must never pair an old backend with a new breaker.
+
+  Reconnect replaces ``_backend`` and starts a fresh breaker generation.  If
+  that replacement lands between the accessor's backend read and breaker
+  read, independently reading the two fields constructs a mixed proxy.  A
+  late failure from the retired backend would then trip the live generation's
+  breaker.  Force that exact interleaving and require the accessor to retry
+  until both objects come from one coherent manager snapshot.
+  """
+  from scrapy_extension.backends.base import Backend, QueueBackend
+  from scrapy_extension.backends.circuit_breaker import CircuitBreaker
+  from scrapy_extension.exceptions import BackendError
+
+  class _QueueBackend(Backend, QueueBackend):
+    def __init__(self, payload: bytes) -> None:
+      self.payload = payload
+      self.pop_mock = mocker.Mock(return_value=payload)
+
+    @property
+    def backend_type(self) -> BackendType:
+      return BackendType.REDIS
+
+    def connect(self) -> None:
+      return None
+
+    def disconnect(self) -> None:
+      return None
+
+    def is_connected(self) -> bool:
+      return True
+
+    def ping(self) -> bool:
+      return True
+
+    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+      del queue_name, item, priority
+
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+      return self.pop_mock(queue_name, timeout)
+
+    def queue_len(self, queue_name: str) -> int:
+      del queue_name
+      return 0
+
+    def clear_queue(self, queue_name: str) -> None:
+      del queue_name
+
+  manager = ConnectionManager(BackendType.REDIS)
+  retired = _QueueBackend(b"retired")
+  replacement = _QueueBackend(b"fresh")
+  retired_breaker = CircuitBreaker(
+    "retired-generation",
+    failure_exceptions=(BackendError,),
+  )
+  replacement_breaker = CircuitBreaker(
+    "replacement-generation",
+    failure_exceptions=(BackendError,),
+  )
+  manager._backend = retired
+  manager._breaker = retired_breaker
+  manager._breaker_configured = True
+
+  swapped = False
+
+  def swap_generation_during_breaker_read() -> CircuitBreaker:
+    nonlocal swapped
+    if not swapped:
+      with manager._lock:
+        manager._backend = replacement
+        manager._breaker = replacement_breaker
+      swapped = True
+    assert manager._breaker is not None
+    return manager._breaker
+
+  mocker.patch.object(
+    manager,
+    "_get_breaker",
+    side_effect=swap_generation_during_breaker_read,
+  )
+
+  proxy = manager.get_queue_backend()
+
+  assert proxy.pop("queue") == b"fresh"
+  retired.pop_mock.assert_not_called()
   replacement.pop_mock.assert_called_once_with("queue", 0.0)
 
 
