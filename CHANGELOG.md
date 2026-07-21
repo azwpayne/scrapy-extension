@@ -344,6 +344,11 @@ upgrading.
 
 ### Changed
 
+- SQS and DynamoDB region validation now accepts the multi-label region
+  identifiers used by GovCloud, ISO, and the European Sovereign Cloud.
+  Validation remains an ASCII structural check rather than a frozen
+  service-region allowlist, so same-shaped unknown names are still resolved by
+  the SDK/service endpoint.
 - All password/secret fields migrated to `pydantic.SecretStr`.
   `repr(settings)` shows `**********`; raw value only via
   `.get_secret_value()` via the `secret_value()` helper.
@@ -419,6 +424,12 @@ upgrading.
 
 ### Fixed
 
+- DynamoDB `delete()` now distinguishes an absent item from a malformed
+  `DeleteItem(ALL_OLD)` response. Only a complete old item carrying the
+  requested table partition key reports `True`; malformed service/emulator
+  responses raise `StorageError(operation="delete", key=...)`. SDK diagnostic
+  text remains available through `__cause__` without being copied into the
+  public error message.
 - Third-party backend discovery now validates that entry-point names equal
   descriptor `backend_type` values, validates both dotted class paths, and
   rejects all duplicate third-party names. Broken/conflicting plugins are

@@ -390,13 +390,33 @@ DynamoDB Scan still has no cross-process snapshot isolation.
 DynamoDB clear no longer delegates persistent `UnprocessedItems` to boto3's
 unbounded `BatchWriter` exit loop. Each 25-item batch now has eight
 application-level BatchWriteItem submissions and bounded full-jitter sleeps. A
-Scan/BatchWrite failure, malformed response, repeated cursor, or exhausted batch raises
-`StorageError(operation="clear_storage", key=None)` instead of hanging or
-claiming success. This is intentionally non-transactional: earlier deletes may
-already be committed, no rollback occurs, and retrying starts a new convergent
-clear. Operators requiring an empty result must stop all external writers for
-the whole operation. Botocore's own retries/timeouts are a separate inner
-budget, so the per-batch limit is not a wire-attempt or global shutdown bound.
+Scan/BatchWrite failure, malformed response, repeated cursor, or exhausted
+batch raises `StorageError(operation="clear_storage", key=None)` instead of
+hanging or claiming success. This is intentionally non-transactional: earlier
+deletes may already be committed, no rollback occurs, and retrying starts a new
+convergent clear. Operators requiring an empty result must stop all external
+writers for the whole operation. Botocore's own retries/timeouts are a separate
+inner budget, so the per-batch limit is not a wire-attempt or global shutdown
+bound.
+
+The shared SQS/DynamoDB region check now accepts multi-label region identifiers
+used across AWS partitions, such as `us-gov-west-1`, `us-iso-east-1`, and
+`eusc-de-east-1`. Deployments previously blocked by the old three-label regex
+can remove workarounds. This remains structural validation, not an availability
+allowlist; a same-shaped typo or unsupported service/region pair still fails at
+the SDK/service boundary.
+
+DynamoDB `delete()` now validates the `DeleteItem(ALL_OLD)` result. Missing
+`Attributes` still means the item did not exist and returns `False`; a complete
+old item with the requested partition key returns `True`. Non-standard mocks,
+proxies, or emulators that return malformed or mismatched `Attributes` now
+raise `StorageError(operation="delete", key=...)` instead of producing a bare
+shape error or an unreliable boolean. Update test doubles to reproduce the AWS
+envelope (`{"Attributes": {"pk": requested_key, ...}}`).
+SDK-call failures also stop copying driver diagnostics into
+`str(StorageError)`; inspect the original `__cause__` only in a protected error
+channel. Code that parsed provider text from the public message must switch to
+typed operation/key handling.
 
 ## Validation and Rollback
 

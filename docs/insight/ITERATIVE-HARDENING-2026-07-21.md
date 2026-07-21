@@ -316,7 +316,7 @@ speculative work.
   eight application-level BatchWriteItem submissions per batch with bounded
   exponential jitter, strict sent-subset response validation,
   pagination-cycle detection, and a typed partial-clear failure.
-- [ ] **BACKEND-03D — remaining DynamoDB response/region contracts.** Accept
+- [x] **BACKEND-03D — remaining DynamoDB response/region contracts.** Accept
   valid multi-segment AWS regions such as GovCloud, revalidate them at connect,
   and reject malformed delete responses through `StorageError`.
 - [ ] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
@@ -1229,3 +1229,47 @@ related connector and DynamoDB tests passed with one real-service integration
 test explicitly skipped. The final Python 3.10 suite passed 3,299 tests with 46
 documented skips. Ruff, strict mypy, Bandit, lockfile validation, and patch
 integrity remained green.
+
+### I35 — AWS partition regions and DynamoDB delete responses
+
+The specification split two remaining protocol boundaries from the larger SDK
+ownership work. First, SQS and DynamoDB must accept the lowercase ASCII,
+hyphen-delimited region identifiers used by every locked boto3 partition while
+remaining a structural validator, not a static availability allowlist. Both
+connect paths must revalidate mutated settings before SDK construction and
+freeze the accepted value into the new generation. Second,
+`DeleteItem(ReturnValues="ALL_OLD")` must map no `Attributes` to `False`, a
+complete old item with the exact string `pk` requested to `True`, and every
+malformed/mismatched envelope to typed `StorageError(operation="delete",
+key=...)`. Failures must not copy response payloads or SDK diagnostics into
+their text or `StorageError` domain fields, while real SDK failures preserve
+their original `__cause__`. Traceback frame locals remain outside that
+redaction boundary and must be handled as sensitive diagnostics.
+
+Twenty initial RED outcomes exposed the old three-label regex across GovCloud,
+ISO/ISO-B/ISO-E/ISO-F, and EUSC settings and showed that malformed delete
+responses either returned an unreliable boolean or escaped the storage-error
+contract. The implementation replaced that regex with an ASCII structural
+grammar, kept exact validation at settings and connection boundaries, and
+added generation-freeze regressions for SQS and DynamoDB. Delete response
+interpretation now runs after the SDK exception boundary and fails closed on an
+empty old item, a missing/wrong/non-string partition key, or a non-mapping
+shape. This table-specific semantic check is intentional: botocore's generic
+`AttributeMap` model is permissive, but AWS says an existing deletion returns
+the entire old item and this backend's table schema requires string `pk`.
+Top-level response metadata remains accepted.
+
+The task also removed raw driver text from the public DynamoDB delete error,
+added message/domain-field payload and driver secret-marker regressions,
+documented the region and delete migration/operations contract, and retained
+the original chained-cause identity.
+Fan-out probes accepted all 46 SQS/DynamoDB regions exposed by locked botocore
+1.43.34 across eight partitions and found no new deterministic ordering issue
+in the legacy fake-boto3 test seams. An isolated real boto3 Resource/Stubber
+regression pins the response-transformer boundary from wire `{"S": "key"}` to
+the native string validated by the backend, including the missing-item path.
+
+All 457 focused settings/SQS/DynamoDB tests passed on Python 3.10. The full
+Python 3.10 and 3.14 suites each passed 3,354 tests with 46 documented skips.
+Ruff, strict mypy, Bandit, lockfile validation, and patch integrity remained
+green.

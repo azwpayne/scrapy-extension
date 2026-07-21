@@ -747,11 +747,11 @@ class TestAwsRegionNameFormat:
   """SQS + DynamoDB ``region_name`` SV4 regex guard.
 
   Catches structural typos (missing parts, wrong casing, extra suffixes,
-  empty). Note: the chosen regex ``^[a-z]{2}-[a-z]+-\\d+$`` cannot catch
-  same-shape word typos like ``us-eat-1`` (intended ``us-east-1``) because
-  ``eat`` is also valid ``[a-z]+`` — that requires a known-region allowlist,
-  which is out of SV4 scope (and would break on new AWS regions). The cases
-  below are the genuine structural catches.
+  empty) while allowing the variable label counts used by GovCloud, ISO, and
+  EUSC. The structural grammar cannot catch same-shape word typos like
+  ``us-eat-1`` (intended ``us-east-1``); that requires a known-region
+  allowlist, which is deliberately out of scope because it would reject future
+  launches until this package updated.
   """
 
   @pytest.mark.parametrize(
@@ -774,6 +774,31 @@ class TestAwsRegionNameFormat:
       DynamoDBSettings(region_name=bad_region)  # type: ignore[arg-type]
     assert exc_info.value.setting_name == "region_name"
 
+  @pytest.mark.parametrize("settings_type", [SqsSettings, DynamoDBSettings])
+  @pytest.mark.parametrize(
+    "bad_region",
+    [
+      "us--gov-west-1",
+      "-us-gov-west-1",
+      "us-gov-west-",
+      "us-gov-west-one",
+      "us-gov-west-1-extra",
+      "US-gov-west-1",
+      "us_gov_west_1",
+      "us-east-\u0661",
+      "u-east-1",
+      "a-b-1",
+      "aws-global",
+    ],
+  )
+  def test_partition_region_rejects_malformed_ascii_structure(
+    self, settings_type: type[Any], bad_region: str
+  ) -> None:
+    """Reject malformed labels and Unicode lookalikes for both backends."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      settings_type(region_name=bad_region)
+    assert exc_info.value.setting_name == "region_name"
+
   @pytest.mark.parametrize(
     "good_region",
     ["us-east-1", "us-west-2", "ap-southeast-2", "eu-central-1", "me-central-1"],
@@ -790,6 +815,26 @@ class TestAwsRegionNameFormat:
     """Valid AWS region names stay accepted."""
     assert (
       DynamoDBSettings(region_name=good_region).region_name == good_region
+    )
+
+  @pytest.mark.parametrize("settings_type", [SqsSettings, DynamoDBSettings])
+  @pytest.mark.parametrize(
+    "partition_region",
+    [
+      "us-gov-west-1",
+      "us-iso-east-1",
+      "us-isob-west-1",
+      "eu-isoe-west-1",
+      "us-isof-south-1",
+      "eusc-de-east-1",
+    ],
+  )
+  def test_aws_partition_regions_are_not_rejected(
+    self, settings_type: type[Any], partition_region: str
+  ) -> None:
+    """Accept valid multi-segment regions across AWS partitions."""
+    assert settings_type(region_name=partition_region).region_name == (
+      partition_region
     )
 
 

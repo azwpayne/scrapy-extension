@@ -88,13 +88,12 @@ class SqsSettings(BaseSettings):
 
   @model_validator(mode="after")
   def _validate_region_name_format(self) -> Self:
-    """SV4: ``region_name`` must match the AWS region pattern.
+    """SV4: ``region_name`` must match the AWS structural grammar.
 
-    Catches typos like ``"us-eat-1"`` (should be ``"us-east-1"``) that would
-    otherwise surface as an opaque ``InvalidLocationConstraint`` / endpoint
-    resolution failure inside boto3 at the first API call. The pattern is
-    deliberately permissive on the middle word (regions like
-    ``"me-central-1"``, ``"ap-southeast-3"`` are valid).
+    Rejects malformed casing, separators, and suffixes before boto3 I/O while
+    accepting multi-label partitions such as GovCloud, ISO, and EUSC. It is
+    intentionally not a known-region allowlist, so same-shape word typos remain
+    the SDK/service's responsibility.
 
     Raises:
         ConfigurationError: if ``region_name`` does not match the AWS region

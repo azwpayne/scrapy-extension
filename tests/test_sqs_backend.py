@@ -97,6 +97,49 @@ class TestSqsConnect:
     assert kwargs["region_name"] == "us-east-1"
     assert b.is_connected() is True
 
+  @pytest.mark.parametrize(
+    "region_name", ["us-gov-west-1", "eusc-de-east-1"]
+  )
+  def test_connect_accepts_valid_partition_region_mutation(
+    self, mocker, region_name: str
+  ) -> None:
+    b = _make_backend()
+    b.config.region_name = region_name
+    client_factory = mocker.patch.object(
+      boto3, "client", return_value=mocker.MagicMock()
+    )
+
+    b.connect()
+
+    assert client_factory.call_args.kwargs["region_name"] == region_name
+    assert b._generation is not None
+    assert b._generation.snapshot.region_name == region_name
+
+  def test_live_generation_freezes_region_until_reconnect(self, mocker) -> None:
+    b = _make_backend(region_name="us-gov-west-1")
+    client_a = mocker.MagicMock(name="client-a")
+    client_b = mocker.MagicMock(name="client-b")
+    client_factory = mocker.patch.object(
+      boto3, "client", side_effect=[client_a, client_b]
+    )
+
+    b.connect()
+    b.config.region_name = "eusc-de-east-1"
+    b.connect()
+
+    assert client_factory.call_count == 1
+    assert b._generation is not None
+    assert b._generation.snapshot.region_name == "us-gov-west-1"
+
+    b.disconnect()
+    b.connect()
+
+    assert client_factory.call_count == 2
+    assert client_factory.call_args.kwargs["region_name"] == "eusc-de-east-1"
+    assert b._generation is not None
+    assert b._generation.snapshot.region_name == "eusc-de-east-1"
+    client_a.close.assert_called_once_with()
+
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
     mocker.patch.object(boto3, "client", side_effect=RuntimeError("boom"))

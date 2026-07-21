@@ -347,6 +347,27 @@ def test_connect_revalidates_mutated_region_before_boto3(mocker) -> None:
   factory.assert_not_called()
 
 
+@pytest.mark.parametrize(
+  "region_name", ["us-gov-east-1", "eusc-de-east-1"]
+)
+def test_connect_accepts_valid_multi_segment_region_mutation(
+  mocker, region_name: str
+) -> None:
+  backend = _backend()
+  backend.config.region_name = region_name
+  resource, _table = _resource(mocker)
+  session_factory, factory = _patch_resource(
+    mocker, return_value=resource
+  )
+
+  backend.connect()
+
+  session_factory.assert_called_once_with()
+  assert factory.call_args.kwargs["region_name"] == region_name
+  assert backend._generation is not None
+  assert backend._generation.snapshot.region_name == region_name
+
+
 def test_each_candidate_uses_a_private_boto3_session(mocker) -> None:
   backend = _backend()
   resource, table = _resource(mocker)

@@ -289,6 +289,12 @@ visibility lease is not auto-renewed; size it above the maximum expected
 pop-to-downloader-response time. Explicit nack makes the message immediately
 visible (`VisibilityTimeout=0`).
 
+Region names use a future-compatible ASCII structural check. Multi-label region
+identifiers used across AWS partitions, such as `us-gov-west-1`,
+`us-iso-east-1`, and `eusc-de-east-1`, are accepted; this package does not
+freeze a region allowlist, so the SDK/service endpoint still decides whether a
+structurally valid name supports SQS.
+
 An SQS connection is an immutable client generation: credentials, endpoint,
 region, queue prefix, visibility timeout, QueueUrl cache, and receipt tokens do
 not cross a reconnect boundary. Calling `connect()` while already connected is
@@ -336,7 +342,9 @@ SCRAPY_DYNAMODB_ENDPOINT_URL = "http://localhost:4566"  # optional standalone ov
 ```
 
 As with SQS, standalone mode defaults to loopback LocalStack. Set mode to
-`cloud` and leave `endpoint_url` unset for real AWS.
+`cloud` and leave `endpoint_url` unset for real AWS. The same multi-label
+region grammar accepts GovCloud, ISO, and EUSC identifiers without claiming
+that DynamoDB is available in every structurally valid region.
 
 DynamoDB gives every connection candidate a private boto3 Session and publishes
 the prepared Session/Resource/Table set as one generation. A live `connect()`
@@ -356,6 +364,11 @@ raise `StorageError` and may leave a partial clear. The method does not roll
 back accepted deletes. Stop external writers before a deterministic maintenance
 clear: even a successful strongly consistent Scan is not a cross-page snapshot
 and cannot prove the table stayed empty.
+
+`delete()` returns `False` only when `DeleteItem(ALL_OLD)` omits `Attributes`,
+which is AWS's missing-item result. A present old item must contain the exact
+string partition key requested; malformed proxy, emulator, or SDK responses
+raise typed `StorageError` rather than being mistaken for deletion success.
 
 See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/main/examples) for representative spiders and deployment-mode recipes (Sentinel, Cluster, Atlas, Confluent, etc).
 

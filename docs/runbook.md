@@ -318,6 +318,13 @@ visibility changes with an explicit `disconnect()` / `connect()` sequence;
 receipt tokens from the retired generation are locally stale and must never be
 replayed through the replacement client.
 
+SQS and DynamoDB region names accept lowercase ASCII, hyphen-delimited,
+multi-label forms used across AWS partitions and ending in a numeric label (for
+example `us-gov-west-1` and `eusc-de-east-1`). A `ConfigurationError` naming
+`region_name` indicates a structural problem such as casing, an empty label, an
+underscore, or a non-ASCII digit. A structurally valid but unknown region is
+intentionally left for the SDK/service endpoint to diagnose.
+
 RabbitMQ publishes a connection and prepared channel as one generation. A live
 `connect()` is intentionally idempotent; roll queue-policy or endpoint changes
 with `disconnect()` / `connect()`. Disconnect detaches the current generation
@@ -357,6 +364,19 @@ after fixing the cause, rerun it as a new idempotent convergence pass rather
 than attempting rollback. Never call `disconnect()` re-entrantly from a
 synchronous logging hook or signal handler; schedule teardown on another
 thread.
+
+A DynamoDB `StorageError` whose public message says the `DeleteItem` response
+was malformed means the deletion result is uncertain: do not reinterpret it as
+"item absent" or retry a non-idempotent surrounding workflow blindly. Verify
+that any LocalStack version, proxy, emulator, or test double returns no
+`Attributes` for a missing key and the complete old item (including matching
+string `pk`) for an existing key. This malformed-response error copies the
+response into neither its message nor its `StorageError` domain fields and has
+no chained cause; inspect protected proxy/emulator/service telemetry. A Python
+traceback can still retain input values in frame locals, so treat traceback and
+error-report attachments as sensitive. A separate SDK-call `StorageError`
+keeps the original SDK exception as `__cause__` while omitting its text
+publicly.
 
 Every successful `ConnectionManager.get_manager()` acquisition must be paired
 with exactly one `close()`. The registry is reference-counted; releasing the

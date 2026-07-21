@@ -579,6 +579,29 @@ class DynamoDBBackend(Backend, StorageBackend):
     return item
 
   @staticmethod
+  def _response_deleted(response: Any, key: str) -> bool:
+    """Interpret one structurally valid DeleteItem ``ALL_OLD`` response."""
+    malformed = StorageError(
+      "DynamoDB returned a malformed DeleteItem response",
+      operation="delete",
+      key=key,
+    )
+    if not isinstance(response, dict):
+      raise malformed
+    attributes = response.get("Attributes", _MISSING)
+    if attributes is _MISSING:
+      return False
+    # ALL_OLD returns the entire deleted item. This backend's table has one
+    # required string partition key, so a success mapping must identify the
+    # exact item requested rather than merely contain an Attributes field.
+    if not isinstance(attributes, dict):
+      raise malformed
+    returned_key = attributes.get("pk", _MISSING)
+    if not isinstance(returned_key, str) or returned_key != key:
+      raise malformed
+    return True
+
+  @staticmethod
   def _validated_expiry(
     item: dict[str, Any], operation: str, key: str
   ) -> tuple[Any, float] | None:
@@ -723,9 +746,11 @@ class DynamoDBBackend(Backend, StorageBackend):
       try:
         resp = table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
       except Exception as e:
-        msg = f"Failed to delete key {key!r} in DynamoDB: {e}"
+        # Preserve the SDK exception as the cause without copying its message:
+        # endpoint URLs and provider diagnostics can contain operator secrets.
+        msg = f"Failed to delete key {key!r} in DynamoDB"
         raise StorageError(msg, operation="delete", key=key) from e
-      return "Attributes" in resp
+      return self._response_deleted(resp, key)
 
   def exists(self, key: str) -> bool:
     """Check if a key exists and is not expired.

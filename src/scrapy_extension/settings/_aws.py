@@ -9,7 +9,13 @@ from pydantic import SecretStr
 
 from scrapy_extension.exceptions import ConfigurationError
 
-_AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+# AWS partition region identifiers are not all three labels: GovCloud/ISO use
+# four (``us-gov-west-1``), while the European Sovereign Cloud starts with a
+# longer label (``eusc-de-east-1``). Validate the stable structural grammar
+# without a frozen region allowlist that would reject future launches.
+_AWS_REGION_PATTERN = re.compile(
+  r"^[a-z][a-z0-9]+(?:-[a-z][a-z0-9]*)+-[0-9]+$"
+)
 
 
 def validate_aws_region_name(region_name: object) -> str:
@@ -19,8 +25,9 @@ def validate_aws_region_name(region_name: object) -> str:
   ):
     raise ConfigurationError(
       (
-        "region_name must match the AWS region pattern "
-        "'<aa>-<region>-<n>' (e.g. 'us-east-1', 'ap-southeast-2'). "
+        "region_name must be a lowercase, hyphen-delimited AWS region "
+        "identifier ending in a numeric label (e.g. 'us-east-1', "
+        "'us-gov-west-1', 'eusc-de-east-1'). "
         f"Got region_name={region_name!r}."
       ),
       setting_name="region_name",

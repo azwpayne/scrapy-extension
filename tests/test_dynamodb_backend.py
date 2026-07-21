@@ -7,7 +7,9 @@ against a fake Table.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -301,10 +303,135 @@ class TestDynamoDBStorageOps:
       Key={"pk": "key1"}, ReturnValues="ALL_OLD"
     )
 
-  def test_delete_missing_returns_false(self, mocker) -> None:
+  @pytest.mark.parametrize(
+    "response", [{}, {"ResponseMetadata": {"HTTPStatusCode": 200}}]
+  )
+  def test_delete_missing_returns_false(self, mocker, response: Any) -> None:
     b, table = _connected(mocker)
-    table.delete_item.return_value = {}
+    table.delete_item.return_value = response
     assert b.delete("key1") is False
+
+  def test_delete_accepts_old_item_with_extra_response_metadata(
+    self, mocker
+  ) -> None:
+    b, table = _connected(mocker)
+    table.delete_item.return_value = {
+      "Attributes": {"pk": "key1", "value": b"payload"},
+      "ConsumedCapacity": {"CapacityUnits": 1.0},
+      "ResponseMetadata": {"HTTPStatusCode": 200},
+    }
+
+    assert b.delete("key1") is True
+
+  def test_real_resource_transforms_delete_response_before_validation(
+    self,
+  ) -> None:
+    """Pin the locked boto3 Resource response-transformer seam."""
+    script = "\n".join(
+      (
+        "import boto3",
+        "from botocore.stub import Stubber",
+        "from scrapy_extension.backends.dynamodb import DynamoDBBackend",
+        "resource = boto3.session.Session().resource(",
+        "  'dynamodb', region_name='us-east-1',",
+        "  endpoint_url='http://localhost:4566',",
+        "  aws_access_key_id='x', aws_secret_access_key='y',",
+        ")",
+        "client = resource.meta.client",
+        "table = resource.Table('scrapy-extension')",
+        "expected = {",
+        "  'TableName': 'scrapy-extension',",
+        "  'Key': {'pk': 'key1'},",
+        "  'ReturnValues': 'ALL_OLD',",
+        "}",
+        "wire_old = {'Attributes': {",
+        "  'pk': {'S': 'key1'}, 'value': {'B': b'payload'},",
+        "}}",
+        "with Stubber(client) as stubber:",
+        "  stubber.add_response('delete_item', wire_old, expected)",
+        "  stubber.add_response('delete_item', {}, expected)",
+        "  deleted = table.delete_item(",
+        "    Key={'pk': 'key1'}, ReturnValues='ALL_OLD'",
+        "  )",
+        "  missing = table.delete_item(",
+        "    Key={'pk': 'key1'}, ReturnValues='ALL_OLD'",
+        "  )",
+        "  stubber.assert_no_pending_responses()",
+        "assert deleted['Attributes']['pk'] == 'key1'",
+        "assert DynamoDBBackend._response_deleted(deleted, 'key1') is True",
+        "assert DynamoDBBackend._response_deleted(missing, 'key1') is False",
+      )
+    )
+
+    result = subprocess.run(
+      [sys.executable, "-c", script],
+      capture_output=True,
+      text=True,
+      check=False,
+      timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+  @pytest.mark.parametrize(
+    "response",
+    [
+      None,
+      [],
+      "not-a-response",
+      {"Attributes": None},
+      {"Attributes": []},
+      {"Attributes": "not-a-map"},
+      {"Attributes": {}},
+      {"Attributes": {"value": b"missing-pk"}},
+      {"Attributes": {"pk": 1}},
+      {"Attributes": {"pk": "different-key"}},
+    ],
+  )
+  def test_delete_rejects_malformed_response_as_storage_error(
+    self, mocker, response: Any
+  ) -> None:
+    b, table = _connected(mocker)
+    table.delete_item.return_value = response
+
+    with pytest.raises(StorageError, match="malformed") as exc_info:
+      b.delete("key1")
+
+    assert exc_info.value.operation == "delete"
+    assert exc_info.value.key == "key1"
+    assert exc_info.value.__cause__ is None
+
+  def test_delete_malformed_response_does_not_copy_payload_to_public_fields(
+    self, mocker
+  ) -> None:
+    marker = "operator-secret-in-delete-response"
+    b, table = _connected(mocker)
+    table.delete_item.return_value = {
+      "Attributes": {"pk": "different-key", "diagnostic": marker}
+    }
+
+    with pytest.raises(StorageError) as exc_info:
+      b.delete("key1")
+
+    error = exc_info.value
+    assert marker not in str(error)
+    assert marker not in repr(vars(error))
+    assert error.operation == "delete"
+    assert error.key == "key1"
+    assert error.__cause__ is None
+
+  def test_delete_rejects_non_string_partition_key_with_spoofed_equality(
+    self, mocker
+  ) -> None:
+    class _EqualKey:
+      def __eq__(self, other: object) -> bool:
+        return other == "key1"
+
+    b, table = _connected(mocker)
+    table.delete_item.return_value = {"Attributes": {"pk": _EqualKey()}}
+
+    with pytest.raises(StorageError, match="malformed"):
+      b.delete("key1")
 
   def test_exists_true_for_current(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -543,6 +670,24 @@ class TestDynamoDBStorageErrorContract:
       b.delete("key1")
     assert exc_info.value.operation == "delete"
     assert exc_info.value.key == "key1"
+
+  def test_delete_sdk_failure_preserves_cause_without_copying_message(
+    self, mocker
+  ) -> None:
+    marker = "operator-secret-in-sdk-diagnostic"
+    b, table = _connected(mocker)
+    failure = RuntimeError(f"request failed at https://user:{marker}@host")
+    table.delete_item.side_effect = failure
+
+    with pytest.raises(StorageError) as exc_info:
+      b.delete("key1")
+
+    error = exc_info.value
+    assert marker not in str(error)
+    assert marker not in repr(vars(error))
+    assert error.operation == "delete"
+    assert error.key == "key1"
+    assert error.__cause__ is failure
 
   def test_store_provisioned_throughput_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)
