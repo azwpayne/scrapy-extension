@@ -394,8 +394,12 @@ class TestSqsLenClear:
 
   def test_clear_purges_queue(self, mocker) -> None:
     b, client = _connected(mocker)
+    sleep = mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+
     b.clear_queue("queue1")
+
     client.purge_queue.assert_called_once_with(QueueUrl="https://sqs/test")
+    sleep.assert_called_once_with(60.0)
 
   def test_clear_queue_raises_on_purge_error(self, mocker) -> None:
     """R-clearq: clear_queue raises QueueError on purge failure (not log + swallow).
@@ -405,9 +409,212 @@ class TestSqsLenClear:
     """
     b, client = _connected(mocker)
     client.purge_queue.side_effect = RuntimeError("purge boom")
+    sleep = mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+
     with pytest.raises(QueueError) as exc_info:
       b.clear_queue("queue1")
+
     assert exc_info.value.operation == "clear_queue"
+    sleep.assert_called_once_with(60.0)
+
+  def test_clear_waits_full_window_after_a_slow_purge_call(self, mocker) -> None:
+    b, _ = _connected(mocker)
+    sleep = mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+
+    b.clear_queue("queue1")
+
+    sleep.assert_called_once_with(60.0)
+
+  def test_clear_fences_tokens_delivered_before_the_purge(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "eA==", "ReceiptHandle": "rh-before-clear"}]
+    }
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+    _, token = b.pop_with_ack("queue1")
+
+    b.clear_queue("queue1")
+    b.ack("queue1", token=token)
+    b.nack("queue1", token=token)
+
+    client.delete_message.assert_not_called()
+    client.change_message_visibility.assert_not_called()
+    assert token not in b._in_flight
+
+  def test_ambiguous_purge_failure_still_fences_old_tokens(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "eA==", "ReceiptHandle": "rh-before-clear"}]
+    }
+    _, token = b.pop_with_ack("queue1")
+    client.purge_queue.side_effect = RuntimeError("response lost")
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+
+    with pytest.raises(QueueError):
+      b.clear_queue("queue1")
+    b.ack("queue1", token=token)
+
+    client.delete_message.assert_not_called()
+    assert token not in b._in_flight
+
+  def test_delivery_after_clear_uses_the_new_epoch_and_can_ack(self, mocker) -> None:
+    b, client = _connected(mocker)
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+    b.clear_queue("queue1")
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "eA==", "ReceiptHandle": "rh-after-clear"}]
+    }
+
+    _, token = b.pop_with_ack("queue1")
+    b.ack("queue1", token=token)
+
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/test", ReceiptHandle="rh-after-clear"
+    )
+
+  def test_clear_retires_only_the_target_queues_tokens(self, mocker) -> None:
+    urls = {"qA": "https://sqs/qA-url", "qB": "https://sqs/qB-url"}
+    b, client = _connected_multi_queue(mocker, urls)
+    client.receive_message.side_effect = [
+      {"Messages": [{"Body": "YQ==", "ReceiptHandle": "rh-a"}]},
+      {"Messages": [{"Body": "Yg==", "ReceiptHandle": "rh-b"}]},
+    ]
+    _, token_a = b.pop_with_ack("qA")
+    _, token_b = b.pop_with_ack("qB")
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep")
+
+    b.clear_queue("qA")
+    b.ack("qA", token=token_a)
+    b.ack("qB", token=token_b)
+
+    assert token_a not in b._in_flight
+    assert token_b not in b._in_flight
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/qB-url", ReceiptHandle="rh-b"
+    )
+
+  def test_same_queue_push_waits_for_the_purge_barrier(self, mocker) -> None:
+    b, client = _connected(mocker)
+    sleep_entered = threading.Event()
+    release_sleep = threading.Event()
+    push_reached_lifecycle = threading.Event()
+    errors: list[BaseException] = []
+    original_queue_lifecycle = b._queue_lifecycle
+
+    def blocking_sleep(_seconds: float) -> None:
+      sleep_entered.set()
+      assert release_sleep.wait(timeout=2)
+
+    def observed_queue_lifecycle(queue_url: str):
+      if threading.current_thread().name == "sqs-test-push":
+        push_reached_lifecycle.set()
+      return original_queue_lifecycle(queue_url)
+
+    def run(operation) -> None:
+      try:
+        operation()
+      except BaseException as exc:  # pragma: no cover - asserted below
+        errors.append(exc)
+
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep", side_effect=blocking_sleep)
+    mocker.patch.object(b, "_queue_lifecycle", side_effect=observed_queue_lifecycle)
+    clear_thread = threading.Thread(
+      target=run, args=(lambda: b.clear_queue("queue1"),)
+    )
+    push_thread = threading.Thread(
+      target=run,
+      args=(lambda: b.push("queue1", b"after-clear"),),
+      name="sqs-test-push",
+    )
+
+    clear_thread.start()
+    assert sleep_entered.wait(timeout=2)
+    push_thread.start()
+    assert push_reached_lifecycle.wait(timeout=2)
+    client.send_message.assert_not_called()
+    release_sleep.set()
+    clear_thread.join(timeout=2)
+    push_thread.join(timeout=2)
+
+    assert not clear_thread.is_alive()
+    assert not push_thread.is_alive()
+    assert errors == []
+    client.send_message.assert_called_once()
+
+  def test_same_queue_normal_operations_remain_concurrent(self, mocker) -> None:
+    """A long poll must not hold the destructive-clear barrier exclusively."""
+    b, client = _connected(mocker)
+    receive_entered = threading.Event()
+    release_receive = threading.Event()
+    send_called = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_receive(**_kwargs):
+      receive_entered.set()
+      assert release_receive.wait(timeout=2)
+      return {}
+
+    def observed_send(**_kwargs) -> None:
+      send_called.set()
+
+    def run(operation) -> None:
+      try:
+        operation()
+      except BaseException as exc:  # pragma: no cover - asserted below
+        errors.append(exc)
+
+    client.receive_message.side_effect = blocking_receive
+    client.send_message.side_effect = observed_send
+    pop_thread = threading.Thread(target=run, args=(lambda: b.pop("queue1"),))
+    push_thread = threading.Thread(
+      target=run, args=(lambda: b.push("queue1", b"concurrent"),)
+    )
+
+    pop_thread.start()
+    assert receive_entered.wait(timeout=2)
+    push_thread.start()
+    try:
+      assert send_called.wait(timeout=1)
+    finally:
+      release_receive.set()
+    pop_thread.join(timeout=2)
+    push_thread.join(timeout=2)
+
+    assert not pop_thread.is_alive()
+    assert not push_thread.is_alive()
+    assert errors == []
+
+  def test_clear_of_one_queue_does_not_block_another_queue(self, mocker) -> None:
+    urls = {"qA": "https://sqs/qA-url", "qB": "https://sqs/qB-url"}
+    b, client = _connected_multi_queue(mocker, urls)
+    sleep_entered = threading.Event()
+    release_sleep = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_sleep(_seconds: float) -> None:
+      sleep_entered.set()
+      assert release_sleep.wait(timeout=2)
+
+    def clear_queue() -> None:
+      try:
+        b.clear_queue("qA")
+      except BaseException as exc:  # pragma: no cover - asserted below
+        errors.append(exc)
+
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep", side_effect=blocking_sleep)
+    clear_thread = threading.Thread(target=clear_queue)
+
+    clear_thread.start()
+    assert sleep_entered.wait(timeout=2)
+    b.push("qB", b"independent")
+    client.send_message.assert_called_once_with(
+      QueueUrl="https://sqs/qB-url", MessageBody="aW5kZXBlbmRlbnQ="
+    )
+    release_sleep.set()
+    clear_thread.join(timeout=2)
+
+    assert not clear_thread.is_alive()
+    assert errors == []
 
 
 def _connected_multi_queue(mocker, urls: dict[str, str]):
@@ -511,8 +718,12 @@ class TestSqsAckToken:
   correctness). It is the SQS analog of Kafka's ``_KafkaAckToken``."""
 
   def test_token_is_hashable_and_equality_compares_fields(self) -> None:
-    t1 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
-    t2 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
+    t1 = _SqsAckToken(
+      queue_url="https://sqs/qA", receipt_handle="rh-1", queue_epoch=1
+    )
+    t2 = _SqsAckToken(
+      queue_url="https://sqs/qA", receipt_handle="rh-1", queue_epoch=2
+    )
     t3 = _SqsAckToken(queue_url="https://sqs/qB", receipt_handle="rh-1")
     t4 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-2")
     assert t1 == t2

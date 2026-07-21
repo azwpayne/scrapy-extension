@@ -27,7 +27,9 @@ import logging
 import math
 import re
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -66,6 +68,10 @@ logger = logging.getLogger(__name__)
 
 # SQS caps WaitTimeSeconds at 20.
 _MAX_WAIT_SECONDS = 20
+
+# PurgeQueue is asynchronous. AWS documents that both old messages and messages
+# sent after the API call can be deleted for up to 60 seconds.
+_SQS_PURGE_WINDOW_SECONDS = 60.0
 
 # Standard queue names accept only these characters and at most 80 of them.
 _SQS_QUEUE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -122,6 +128,52 @@ def _physical_queue_name(prefix: str, queue_name: str) -> str:
 _MAX_IN_FLIGHT = 10_000
 
 
+class _SqsQueueLifecycle:
+  """Shared-operation/exclusive-clear barrier for one physical queue."""
+
+  __slots__ = ("_active_operations", "_clearing", "_condition", "epoch")
+
+  def __init__(self) -> None:
+    self._condition = threading.Condition()
+    self._active_operations = 0
+    self._clearing = False
+    self.epoch = 0
+
+  @contextmanager
+  def operation(self) -> Iterator[int]:
+    """Enter a normal operation, waiting only for a destructive clear."""
+    with self._condition:
+      while self._clearing:
+        self._condition.wait()
+      self._active_operations += 1
+      epoch = self.epoch
+    try:
+      yield epoch
+    finally:
+      with self._condition:
+        self._active_operations -= 1
+        if self._active_operations == 0:
+          self._condition.notify_all()
+
+  @contextmanager
+  def destructive_operation(self) -> Iterator[int]:
+    """Exclude normal operations, advance the epoch, and hold the barrier."""
+    with self._condition:
+      while self._clearing:
+        self._condition.wait()
+      self._clearing = True
+      while self._active_operations:
+        self._condition.wait()
+      self.epoch += 1
+      epoch = self.epoch
+    try:
+      yield epoch
+    finally:
+      with self._condition:
+        self._clearing = False
+        self._condition.notify_all()
+
+
 class _SqsAckToken:
   """Opaque ack token carrying the (queue_url, receipt_handle) of a popped msg.
 
@@ -141,19 +193,28 @@ class _SqsAckToken:
   __slots__ = (
     "_settlement_lock",
     "_settlement_state",
+    "queue_epoch",
     "queue_url",
     "receipt_handle",
   )
 
-  def __init__(self, queue_url: str, receipt_handle: str) -> None:
+  def __init__(
+    self,
+    queue_url: str,
+    receipt_handle: str,
+    *,
+    queue_epoch: int | None = None,
+  ) -> None:
     """Initialize the token.
 
     Args:
         queue_url: The QueueUrl the message was popped from.
         receipt_handle: The SQS ReceiptHandle identifying the message.
+        queue_epoch: The queue lifecycle epoch that issued the delivery.
     """
     self.queue_url = queue_url
     self.receipt_handle = receipt_handle
+    self.queue_epoch = queue_epoch
     self._settlement_lock = threading.Lock()
     self._settlement_state = "pending"
 
@@ -239,11 +300,14 @@ class SqsBackend(Backend, QueueBackend):
     self.config = config
     self._client: Any = None
     self._queue_urls: dict[str, str] = {}
+    self._queue_lifecycles: dict[str, _SqsQueueLifecycle] = {}
+    self._queue_lifecycles_lock = threading.Lock()
     self._in_flight: set[_SqsAckToken] = set()
     self._in_flight_lock = threading.Lock()
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
     self._last_receipt: tuple[str, str] | None = None
+    self._last_receipt_epoch: int | None = None
 
   def connect(self) -> None:
     """Create the boto3 SQS client.
@@ -287,6 +351,11 @@ class SqsBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Close the SQS client."""
+    with self._queue_lifecycles_lock:
+      lifecycles = tuple(self._queue_lifecycles.values())
+    for lifecycle in lifecycles:
+      with lifecycle.destructive_operation():
+        pass
     if self._client is not None:
       with _swallow():
         self._client.close()
@@ -295,6 +364,7 @@ class SqsBackend(Backend, QueueBackend):
     with self._in_flight_lock:
       self._in_flight.clear()
       self._last_receipt = None
+      self._last_receipt_epoch = None
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
@@ -354,6 +424,15 @@ class SqsBackend(Backend, QueueBackend):
     self._queue_urls[queue_name] = url
     return cast(str, url)
 
+  def _queue_lifecycle(self, queue_url: str) -> _SqsQueueLifecycle:
+    """Return the stable lifecycle state for a physical SQS queue URL."""
+    with self._queue_lifecycles_lock:
+      lifecycle = self._queue_lifecycles.get(queue_url)
+      if lifecycle is None:
+        lifecycle = _SqsQueueLifecycle()
+        self._queue_lifecycles[queue_url] = lifecycle
+      return lifecycle
+
   # QueueBackend implementation
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Send ``item`` to the SQS queue (priority ignored).
@@ -383,15 +462,17 @@ class SqsBackend(Backend, QueueBackend):
         operation="push",
       )
     url = self._queue_url(queue_name, operation="push")
-    try:
-      body = base64.b64encode(item).decode("ascii")
-      self._client.send_message(QueueUrl=url, MessageBody=body)
-    except Exception as e:
-      raise QueueError(
-        f"Failed to push to SQS queue {queue_name}: {e}",
-        queue_name=queue_name,
-        operation="push",
-      ) from e
+    lifecycle = self._queue_lifecycle(url)
+    with lifecycle.operation():
+      try:
+        body = base64.b64encode(item).decode("ascii")
+        self._client.send_message(QueueUrl=url, MessageBody=body)
+      except Exception as e:
+        raise QueueError(
+          f"Failed to push to SQS queue {queue_name}: {e}",
+          queue_name=queue_name,
+          operation="push",
+        ) from e
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Receive one message from the SQS queue.
@@ -414,7 +495,9 @@ class SqsBackend(Backend, QueueBackend):
         QueueError: If the receive fails.
         ValueError: If queue_name contains invalid characters.
     """
-    url, body, receipt = self._receive(queue_name, timeout)
+    url, body, receipt, _epoch, _token = self._receive(
+      queue_name, timeout, record_legacy=True
+    )
     if body is None:
       return None
     # Track the URL the message arrived FROM, so legacy ack deletes the
@@ -422,7 +505,6 @@ class SqsBackend(Backend, QueueBackend):
     # receipt is non-None when body is non-None (invariant from _receive);
     # bandit B101 accepted — invariant check, not a security control.
     assert receipt is not None  # noqa: S101  # nosec B101
-    self._last_receipt = (url, receipt)
     return body
 
   def pop_with_ack(
@@ -450,11 +532,11 @@ class SqsBackend(Backend, QueueBackend):
         QueueError: If the receive fails.
         ValueError: If queue_name contains invalid characters.
     """
-    url, body, receipt = self._receive(queue_name, timeout)
-    if body is None or receipt is None:
+    _url, body, _receipt, _epoch, token = self._receive(
+      queue_name, timeout, issue_token=True
+    )
+    if body is None or token is None:
       return (None, None)
-    token = _SqsAckToken(queue_url=url, receipt_handle=receipt)
-    self._track_in_flight(token)
     return (body, token)
 
   def _track_in_flight(self, token: _SqsAckToken) -> None:
@@ -471,6 +553,17 @@ class SqsBackend(Backend, QueueBackend):
     Args:
         token: The :class:`_SqsAckToken` to track.
     """
+    if token.queue_epoch is not None:
+      lifecycle = self._queue_lifecycle(token.queue_url)
+      with lifecycle.operation() as current_epoch:
+        if token.queue_epoch != current_epoch:
+          return
+        self._add_in_flight(token)
+      return
+    self._add_in_flight(token)
+
+  def _add_in_flight(self, token: _SqsAckToken) -> None:
+    """Add a current token to the bounded diagnostic set."""
     with self._in_flight_lock:
       if len(self._in_flight) < _MAX_IN_FLIGHT:
         self._in_flight.add(token)
@@ -515,17 +608,30 @@ class SqsBackend(Backend, QueueBackend):
           f"Failed to {action} SQS message.", operation=action
         ) from e
 
-    terminal_state = "acked" if action == "ack" else "nacked"
-    if not token._settle(terminal_state, broker_operation):
-      return
-    with self._in_flight_lock:
-      self._in_flight.discard(token)
-      if self._last_receipt == (token.queue_url, token.receipt_handle):
-        self._last_receipt = None
+    lifecycle = self._queue_lifecycle(token.queue_url)
+    with lifecycle.operation() as current_epoch:
+      is_stale = (
+        token.queue_epoch is not None and token.queue_epoch != current_epoch
+      )
+      if is_stale:
+        token._settle("cleared", lambda: None)
+      else:
+        terminal_state = "acked" if action == "ack" else "nacked"
+        token._settle(terminal_state, broker_operation)
+      with self._in_flight_lock:
+        self._in_flight.discard(token)
+        if self._last_receipt == (token.queue_url, token.receipt_handle):
+          self._last_receipt = None
+          self._last_receipt_epoch = None
 
   def _receive(
-    self, queue_name: str, timeout: float
-  ) -> tuple[str, bytes | None, str | None]:
+    self,
+    queue_name: str,
+    timeout: float,
+    *,
+    record_legacy: bool = False,
+    issue_token: bool = False,
+  ) -> tuple[str, bytes | None, str | None, int, _SqsAckToken | None]:
     """Fetch one message from ``queue_name``; shared by pop and pop_with_ack.
 
     Args:
@@ -533,65 +639,71 @@ class SqsBackend(Backend, QueueBackend):
         timeout: Seconds to long-poll (capped at 20; 0 = short poll).
 
     Returns:
-        ``(queue_url, body, receipt_handle)``. ``body`` and
-        ``receipt_handle`` are both ``None`` when the queue is empty; when
-        a message arrived both are non-None (invariant relied on by
-        :meth:`pop`).
+        ``(queue_url, body, receipt_handle, queue_epoch, token)``. ``body``
+        and ``receipt_handle`` are both ``None`` when the queue is empty.
+        ``token`` is populated only when ``issue_token`` is true.
 
     Raises:
         QueueError: If the receive fails at the SQS layer.
         ValueError: If queue_name contains invalid characters.
     """
     url = self._queue_url(queue_name, operation="pop")
-    try:
-      wait = min(math.ceil(timeout), _MAX_WAIT_SECONDS) if timeout > 0 else 0
-      resp = self._client.receive_message(
-        QueueUrl=url,
-        MaxNumberOfMessages=1,
-        WaitTimeSeconds=wait,
-        VisibilityTimeout=self.config.visibility_timeout,
-      )
-    except Exception as e:
-      raise QueueError(
-        f"Failed to pop from SQS queue {queue_name}: {e}",
-        queue_name=queue_name,
-        operation="pop",
-      ) from e
-    messages = resp.get("Messages") or []
-    if not messages:
-      return (url, None, None)
-    msg = messages[0]
-    receipt = msg.get("ReceiptHandle")
-    if not isinstance(receipt, str) or not receipt:
-      raise QueueError(
-        f"Malformed SQS message in queue {queue_name}: missing ReceiptHandle",
-        queue_name=queue_name,
-        operation="pop",
-      )
-    raw_body = msg.get("Body")
-    try:
-      if not isinstance(raw_body, str) or not raw_body:
-        raise ValueError("message body is missing or empty")
-      body = base64.b64decode(raw_body, validate=True)
-    except (binascii.Error, TypeError, ValueError) as e:
-      # The queue contract requires base64. These exact bytes cannot become
-      # valid on retry, so leaving the message invisible and redelivering it
-      # forever creates a poison loop before BackendQueue can obtain an ack
-      # token. Best-effort delete terminates the unrecoverable delivery; if the
-      # delete fails, SQS retains it and normal redrive/visibility semantics
-      # still apply. Preserve the decode error as the public cause either way.
+    lifecycle = self._queue_lifecycle(url)
+    with lifecycle.operation() as epoch:
       try:
-        self._client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
-      except Exception:  # noqa: BLE001 - preserve the decode failure below
-        logger.exception(
-          "Failed to delete malformed SQS message from queue %r", queue_name
+        wait = min(math.ceil(timeout), _MAX_WAIT_SECONDS) if timeout > 0 else 0
+        resp = self._client.receive_message(
+          QueueUrl=url,
+          MaxNumberOfMessages=1,
+          WaitTimeSeconds=wait,
+          VisibilityTimeout=self.config.visibility_timeout,
         )
-      raise QueueError(
-        f"Invalid base64 body in SQS queue {queue_name}: {e}",
-        queue_name=queue_name,
-        operation="pop",
-      ) from e
-    return (url, body, receipt)
+      except Exception as e:
+        raise QueueError(
+          f"Failed to pop from SQS queue {queue_name}: {e}",
+          queue_name=queue_name,
+          operation="pop",
+        ) from e
+      messages = resp.get("Messages") or []
+      if not messages:
+        return (url, None, None, epoch, None)
+      msg = messages[0]
+      receipt = msg.get("ReceiptHandle")
+      if not isinstance(receipt, str) or not receipt:
+        raise QueueError(
+          f"Malformed SQS message in queue {queue_name}: missing ReceiptHandle",
+          queue_name=queue_name,
+          operation="pop",
+        )
+      raw_body = msg.get("Body")
+      try:
+        if not isinstance(raw_body, str) or not raw_body:
+          raise ValueError("message body is missing or empty")
+        body = base64.b64decode(raw_body, validate=True)
+      except (binascii.Error, TypeError, ValueError) as e:
+        # This exact body cannot become valid on retry. Best-effort deletion
+        # terminates the poison delivery; failure leaves normal redrive intact.
+        try:
+          self._client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
+        except Exception:  # noqa: BLE001 - preserve the decode failure below
+          logger.exception(
+            "Failed to delete malformed SQS message from queue %r", queue_name
+          )
+        raise QueueError(
+          f"Invalid base64 body in SQS queue {queue_name}: {e}",
+          queue_name=queue_name,
+          operation="pop",
+        ) from e
+      if record_legacy:
+        self._last_receipt = (url, receipt)
+        self._last_receipt_epoch = epoch
+      token: _SqsAckToken | None = None
+      if issue_token:
+        token = _SqsAckToken(
+          queue_url=url, receipt_handle=receipt, queue_epoch=epoch
+        )
+        self._add_in_flight(token)
+      return (url, body, receipt, epoch, token)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Delete a popped message so it isn't redelivered.
@@ -630,16 +742,7 @@ class SqsBackend(Backend, QueueBackend):
       # A token from another backend/generation must never fall through and
       # accidentally acknowledge the legacy last-receipt slot.
       return
-    # Legacy path: ack the tracked last-popped receipt.
-    if self._client is None or self._last_receipt is None:
-      return
-    url, receipt = self._last_receipt
-    try:
-      self._client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
-    except Exception as e:
-      raise QueueError(f"Failed to ack SQS message: {e}", operation="ack") from e
-    else:
-      self._last_receipt = None
+    self._settle_legacy_receipt(action="ack")
 
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Make a popped message immediately visible for re-delivery.
@@ -660,19 +763,44 @@ class SqsBackend(Backend, QueueBackend):
       return
     if token is not None:
       return
-    if self._client is None or self._last_receipt is None:
+    self._settle_legacy_receipt(action="nack")
+
+  def _settle_legacy_receipt(self, *, action: str) -> None:
+    """Settle the legacy single receipt without crossing a clear epoch."""
+    last_receipt = self._last_receipt
+    if last_receipt is None:
       return
-    url, receipt = self._last_receipt
-    try:
-      self._client.change_message_visibility(
-        QueueUrl=url,
-        ReceiptHandle=receipt,
-        VisibilityTimeout=0,
-      )
-    except Exception as e:
-      raise QueueError(f"Failed to nack SQS message: {e}", operation="nack") from e
-    else:
-      self._last_receipt = None
+    url, receipt = last_receipt
+    lifecycle = self._queue_lifecycle(url)
+    with lifecycle.operation() as current_epoch:
+      if self._last_receipt != last_receipt:
+        return
+      if (
+        self._last_receipt_epoch is not None
+        and self._last_receipt_epoch != current_epoch
+      ):
+        self._last_receipt = None
+        self._last_receipt_epoch = None
+        return
+      client = self._client
+      if client is None:
+        return
+      try:
+        if action == "ack":
+          client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
+        else:
+          client.change_message_visibility(
+            QueueUrl=url,
+            ReceiptHandle=receipt,
+            VisibilityTimeout=0,
+          )
+      except Exception as e:
+        raise QueueError(
+          f"Failed to {action} SQS message: {e}", operation=action
+        ) from e
+      else:
+        self._last_receipt = None
+        self._last_receipt_epoch = None
 
   def queue_len(self, queue_name: str) -> int:
     """Return the approximate total pending message count for the queue.
@@ -693,39 +821,70 @@ class SqsBackend(Backend, QueueBackend):
             and lose the backpressure signal. Mirrors the Redis R-qlen contract.
     """
     url = self._queue_url(queue_name, operation="queue_len")
-    try:
-      resp = self._client.get_queue_attributes(
-        QueueUrl=url, AttributeNames=list(_QUEUE_DEPTH_ATTRIBUTES)
-      )
-      attributes = resp["Attributes"]
-      return sum(int(attributes[name]) for name in _QUEUE_DEPTH_ATTRIBUTES)
-    except Exception as e:
-      # R-sqs-qlen: do NOT swallow to 0. The scheduler trusts ``len(queue)``
-      # for has_pending_requests / the backpressure gate; a swallowed 0 during
-      # an SQS blip triggers premature idle/CloseSpider and loses the
-      # backpressure signal at the worst moment. Wrap as QueueError (matches
-      # Redis R-qlen + SQS push/pop); the scheduler's next_request handles
-      # QueueError from ``len(self._queue)`` (returns None safely).
-      raise QueueError(
-        str(e), queue_name=queue_name, operation="queue_len"
-      ) from e
+    lifecycle = self._queue_lifecycle(url)
+    with lifecycle.operation():
+      try:
+        resp = self._client.get_queue_attributes(
+          QueueUrl=url, AttributeNames=list(_QUEUE_DEPTH_ATTRIBUTES)
+        )
+        attributes = resp["Attributes"]
+        return sum(int(attributes[name]) for name in _QUEUE_DEPTH_ATTRIBUTES)
+      except Exception as e:
+        # Do NOT swallow to 0: the scheduler trusts this value as a pending-work
+        # signal, so a false empty result can trigger premature spider closure.
+        raise QueueError(
+          str(e), queue_name=queue_name, operation="queue_len"
+        ) from e
+
+  def _retire_queue_deliveries(self, queue_url: str) -> None:
+    """Remove local receipt diagnostics invalidated by a destructive clear."""
+    with self._in_flight_lock:
+      retired = {
+        token for token in self._in_flight if token.queue_url == queue_url
+      }
+      self._in_flight.difference_update(retired)
+      if self._last_receipt is not None and self._last_receipt[0] == queue_url:
+        self._last_receipt = None
+        self._last_receipt_epoch = None
 
   def clear_queue(self, queue_name: str) -> None:
-    """Purge the SQS queue.
+    """Purge the SQS queue and wait out AWS's destructive async window.
+
+    AWS documents that PurgeQueue can keep deleting old and newly sent
+    messages for up to 60 seconds. This method holds a per-queue lifecycle
+    lock and does not report success (or a possibly ambiguous failure) until
+    that full window has elapsed. Push/pop/depth/settlement operations for the
+    same physical queue wait behind the barrier; unrelated queues remain live.
 
     Args:
         queue_name: Name of the queue.
 
     Raises:
         ValueError: If queue_name contains invalid characters.
-        QueueError: If the purge fails at the SQS layer.
+        QueueError: If the purge fails at the SQS layer, after conservatively
+            waiting out the window in case the request reached AWS.
     """
     url = self._queue_url(queue_name, operation="clear_queue")
-    try:
-      self._client.purge_queue(QueueUrl=url)
-    except Exception as e:
-      msg = f"Failed to purge SQS queue {queue_name}: {e}"
-      raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
+    lifecycle = self._queue_lifecycle(url)
+    with lifecycle.destructive_operation():
+      self._retire_queue_deliveries(url)
+      purge_error: Exception | None = None
+      try:
+        self._client.purge_queue(QueueUrl=url)
+      except Exception as e:
+        # The request may have reached AWS even when the response was lost.
+        # Fence operations for the full window before surfacing the ambiguity.
+        purge_error = e
+      # Start the full safety interval after the RPC returns. Service-side
+      # acceptance can happen at any point during a slow request, so subtracting
+      # client-call latency would provide a weaker boundary.
+      time.sleep(_SQS_PURGE_WINDOW_SECONDS)
+      if purge_error is not None:
+        raise QueueError(
+          f"Failed to purge SQS queue {queue_name}.",
+          queue_name=queue_name,
+          operation="clear_queue",
+        ) from purge_error
 
 
 class _swallow:

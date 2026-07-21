@@ -159,6 +159,9 @@ pipeline keeps its setting-level compatibility rule:
   delete/recreate through the crawler: stop all producers/consumers, use Kafka
   operator tooling, wait for metadata convergence, and explicitly reset or
   replace the consumer group before resuming.
+- SQS queue clear is synchronous at the library boundary but takes at least 60
+  seconds after the PurgeQueue RPC. Budget that interval in maintenance and
+  shutdown deadlines. Same-queue traffic waits; unrelated SQS queues continue.
 
 ## Ack and durability matrix
 

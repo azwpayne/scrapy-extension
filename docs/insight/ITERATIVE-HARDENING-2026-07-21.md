@@ -211,10 +211,12 @@ speculative work.
 - [x] **BACKEND-04A — SQS terminal settlement.** Make direct SQS ack tokens
   one-shot across ack/nack, preserve retryability after broker/disconnect
   failures, and keep the token path independent of the legacy receipt slot.
-- [ ] **BACKEND-04B — remaining terminal and clear semantics.** Make direct
-  Pulsar token settlement one-shot and retryable, and specify honest lifecycle
-  barriers for RabbitMQ in-flight deliveries and SQS's asynchronous purge
-  window.
+- [x] **BACKEND-04B — SQS clear barrier.** Fence old delivery epochs and hold an
+  exclusive per-queue barrier for the full asynchronous PurgeQueue window,
+  including ambiguous failures, without serializing ordinary queue operations.
+- [ ] **BACKEND-04C — remaining terminal and clear semantics.** Make direct
+  Pulsar token settlement one-shot and retryable, and specify an honest
+  lifecycle barrier for RabbitMQ in-flight deliveries.
 - [x] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
@@ -713,3 +715,24 @@ the bounded diagnostic set overflows, and `pop_with_ack()` no longer creates a
 second legacy path to the same receipt. All 99 SQS contract tests passed on
 Python 3.10 and 3.14, and the full suite passed 3,053 tests with 44 documented
 skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I17b — SQS asynchronous purge barrier
+
+Seven initial RED outcomes plus one second-order concurrency regression proved
+that `clear_queue()` returned as soon as the PurgeQueue RPC did, even though
+AWS can continue deleting both old and newly sent messages for 60 seconds. A
+lost response also surfaced immediately despite ambiguous service acceptance,
+pre-clear tokens remained locally active, and a first locking design made a
+normal long poll block same-queue producers.
+
+Each physical queue now has a shared-operation/exclusive-clear barrier and a
+monotonic lifecycle epoch. Ordinary push, pop, depth, and settlement operations
+remain concurrent; clear first excludes them, advances the epoch, retires only
+that queue's local receipts, calls PurgeQueue, and waits a full 60 seconds after
+the RPC returns. The same wait applies before an ambiguous failure is raised.
+Operations on other queues remain live, stale tokens perform no broker call,
+and post-clear tokens use the new epoch normally. This follows AWS's current
+[PurgeQueue contract](https://docs.aws.amazon.com/boto3/latest/reference/services/sqs/client/purge_queue.html).
+All 107 SQS contract tests passed on Python 3.10 and 3.14, and the full suite
+passed 3,061 tests with 44 documented skips. Ruff, strict mypy, and patch
+integrity remained green.

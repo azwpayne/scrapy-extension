@@ -144,6 +144,7 @@ class TestSqsErrorPaths:
     """R-clearq: clear_queue raises QueueError on purge failure (not swallow)."""
     b, client = _connected(mocker)
     client.purge_queue.side_effect = RuntimeError("purge fail")
+    mocker.patch("scrapy_extension.backends.sqs.time.sleep")
     with pytest.raises(QueueError) as exc_info:
       b.clear_queue("q")
     assert exc_info.value.operation == "clear_queue"

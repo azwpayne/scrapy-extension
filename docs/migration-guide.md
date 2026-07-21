@@ -242,6 +242,14 @@ replacement topic. Stop all producers and consumers, drain or delete the topic
 with Kafka's operator tooling, verify cluster metadata convergence, and choose
 an intentional consumer-group offset policy before restarting.
 
+SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
+after PurgeQueue returns. AWS documents that the asynchronous purge can delete
+messages sent during that interval, so returning earlier was not a safe clear
+boundary. Other SQS queues remain usable. An exception whose request acceptance
+is ambiguous is raised only after the same safety window, and tokens delivered
+before the clear are fenced. Increase caller/shutdown timeouts that previously
+assumed SQS clear returned immediately.
+
 Memcached cannot enumerate keys for prefix deletion. Prefix clear is always
 unsupported, and global `clear_storage(None)` is disabled unless
 `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`. That flag issues server-wide
