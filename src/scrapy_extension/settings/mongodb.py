@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +17,40 @@ from typing_extensions import Self
 from scrapy_extension.exceptions.base import ConfigurationError
 
 _VALID_MONGO_SCHEMES: tuple[str, ...] = ("mongodb://", "mongodb+srv://")
+
+
+def validate_mongodb_collection_domains(
+  queue_collection: object,
+  set_collection: object,
+  storage_collection: object,
+) -> tuple[str, str, str]:
+  """Require one physical collection per public capability domain.
+
+  A storage-wide clear deletes every non-marker document. Sharing its
+  collection with queue or set documents would therefore delete data owned by
+  another capability. The same boundary also prevents incompatible unique
+  indexes from being installed on one mixed-schema collection.
+  """
+  collection_names = (
+    queue_collection,
+    set_collection,
+    storage_collection,
+  )
+  if not all(type(name) is str for name in collection_names):
+    raise ConfigurationError(
+      "MongoDB capability collection names must be built-in strings.",
+      setting_name="collection_names",
+    )
+  validated_names = cast(tuple[str, str, str], collection_names)
+  if len(set(validated_names)) != len(validated_names):
+    raise ConfigurationError(
+      (
+        "MongoDB queue, set, and storage capability domains must use "
+        "distinct physical collection names."
+      ),
+      setting_name="collection_names",
+    )
+  return validated_names
 
 
 def validate_mongodb_write_concern(
@@ -320,6 +354,16 @@ class MongoDBSettings(BaseSettings):
   def _validate_write_concern(self) -> Self:
     """Require a server-acknowledged public mutation boundary."""
     validate_mongodb_write_concern(self.w, self.w_timeout_ms)
+    return self
+
+  @model_validator(mode="after")
+  def _validate_collection_domains(self) -> Self:
+    """Keep queue, set, and storage documents in isolated collections."""
+    validate_mongodb_collection_domains(
+      self.queue_collection,
+      self.set_collection,
+      self.storage_collection,
+    )
     return self
 
   @model_validator(mode="after")

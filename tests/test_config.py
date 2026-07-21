@@ -137,6 +137,41 @@ class TestMongoDBSettings:
     assert settings.uri == "mongodb://custom:27017"
     assert settings.database == "custom_db"
 
+  @pytest.mark.parametrize(
+    ("queue_collection", "set_collection", "storage_collection"),
+    [
+      ("tenant_queue_set_marker", "tenant_queue_set_marker", "storage"),
+      ("tenant_queue_storage_marker", "sets", "tenant_queue_storage_marker"),
+      ("queues", "tenant_set_storage_marker", "tenant_set_storage_marker"),
+    ],
+  )
+  def test_collection_capability_domains_must_be_physically_distinct(
+    self,
+    queue_collection,
+    set_collection,
+    storage_collection,
+  ):
+    """Queue, set, and storage clears must never share one collection."""
+    from scrapy_extension.settings import MongoDBSettings
+
+    markers = {
+      queue_collection,
+      set_collection,
+      storage_collection,
+    } - {"queues", "sets", "storage"}
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(
+        queue_collection=queue_collection,
+        set_collection=set_collection,
+        storage_collection=storage_collection,
+      )
+
+    assert exc_info.value.setting_name == "collection_names"
+    for marker in markers:
+      assert marker not in str(exc_info.value)
+      assert marker not in repr(exc_info.value)
+
 
 def test_kafka_settings_defaults():
   from scrapy_extension.settings import KafkaSettings

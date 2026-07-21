@@ -455,6 +455,24 @@ These rules are rechecked immediately before client construction, so code that
 mutates a settings model after construction must update it to a supported value
 before reconnecting.
 
+MongoDB queue, set, and storage collection names must now be pairwise distinct.
+Before upgrading a deployment that reused one collection, stop every writer,
+back up the database, classify the mixed documents by their capability schema,
+and create three empty destination collections. Do not rename or reuse the old
+mixed collection: its queue, set-uniqueness, storage-key, and TTL indexes stay
+attached and can reject otherwise valid documents from a different domain.
+Configure
+`SCRAPY_MONGO_QUEUE_COLLECTION`, `SCRAPY_MONGO_SET_COLLECTION`, and
+`SCRAPY_MONGO_STORAGE_COLLECTION` with the new distinct names, let the backend
+install each marker and the domain-specific indexes before importing business
+documents, then import only the corresponding queue, set (including dedup
+fingerprints), or storage documents and verify the resulting indexes before
+opening writers. Do not run
+`clear_storage(None)` against the old mixed collection: it preserves only the
+reserved capability-domain marker and would also remove queue and set
+documents. Keep the marker in each new collection; deleting it removes the
+cross-component/process ownership fence until the next successful connection.
+
 RabbitMQ `clear_queue()` now fails with `QueueError` when the target queue has
 an unacknowledged local delivery. RabbitMQ purge only removes ready messages;
 allowing a later nack would otherwise resurrect work from before the clear.

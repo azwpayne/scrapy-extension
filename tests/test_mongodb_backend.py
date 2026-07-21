@@ -5,7 +5,34 @@ import pytest
 from scrapy_extension.backends.mongodb import MongoDBBackend
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.exceptions.base import StorageError
-from scrapy_extension.settings import MongoDBSettings
+from scrapy_extension.settings import MongoDBMode, MongoDBSettings
+
+
+class _IdentityString(str):
+  """A text value whose Python equality does not reflect MongoDB identity."""
+
+  __hash__ = object.__hash__
+
+  def __eq__(self, other):
+    return self is other
+
+
+class _UnhashableString(str):
+  """A text value that makes an unguarded set-based validator raise."""
+
+  __hash__ = None
+
+
+class _Cursor:
+  """Small cursor double that preserves the driver's ``limit`` seam."""
+
+  def __init__(self, documents):
+    self._documents = documents
+    self.limits = []
+
+  def limit(self, limit):
+    self.limits.append(limit)
+    return iter(self._documents[:limit])
 
 
 def test_mongodb_backend_connect(mocker):
@@ -36,6 +63,395 @@ def test_mongodb_connect_rejects_mutated_unacknowledged_w_before_sdk_io(mocker):
   assert exc_info.value.setting_name == "w"
   assert "do-not-leak" not in str(exc_info.value)
   client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("field", "peer_field"),
+  [
+    ("queue_collection", "set_collection"),
+    ("queue_collection", "storage_collection"),
+    ("set_collection", "storage_collection"),
+  ],
+)
+def test_mongodb_connect_rejects_mutated_collection_collision_before_sdk_io(
+  mocker,
+  field,
+  peer_field,
+):
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  marker = "tenant_mutated_collection_marker"
+  setattr(config, field, marker)
+  setattr(config, peer_field, marker)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "collection_names"
+  assert marker not in str(exc_info.value)
+  assert marker not in repr(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize("name_type", [_IdentityString, _UnhashableString])
+def test_mongodb_connect_rejects_non_builtin_collection_names_before_sdk_io(
+  mocker,
+  name_type,
+):
+  config = MongoDBSettings()
+  config.queue_collection = name_type("tenant_subclass_marker")
+  config.storage_collection = name_type("tenant_subclass_marker")
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "collection_names"
+  assert "tenant_subclass_marker" not in str(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {},
+    {"mode": MongoDBMode.REPLICA_SET, "replica_set_name": "rs0"},
+    {"mode": MongoDBMode.SHARDED_CLUSTER},
+    {
+      "mode": MongoDBMode.ATLAS,
+      "uri": "mongodb+srv://cluster.example.mongodb.net",
+    },
+  ],
+  ids=["standalone", "replica-set", "sharded-cluster", "atlas"],
+)
+def test_mongodb_connect_binds_validated_collection_snapshot_across_ping_mutation(
+  mocker,
+  settings_kwargs,
+):
+  config = MongoDBSettings(**settings_kwargs)
+  backend = MongoDBBackend(config)
+  client = mocker.MagicMock()
+  database = mocker.MagicMock()
+  collections = {
+    "queues": mocker.MagicMock(),
+    "sets": mocker.MagicMock(),
+    "storage": mocker.MagicMock(),
+  }
+  client.__getitem__.return_value = database
+  database.__getitem__.side_effect = collections.__getitem__
+
+  def mutate_after_first_sdk_io(_command):
+    config.storage_collection = config.queue_collection
+
+  client.admin.command.side_effect = mutate_after_first_sdk_io
+  mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    return_value=client,
+  )
+
+  backend.connect()
+
+  assert backend._queue_collection is collections["queues"]
+  assert backend._set_collection is collections["sets"]
+  assert backend._storage_collection is collections["storage"]
+
+
+def test_mongodb_connect_rejects_cross_instance_collection_domain_collision(mocker):
+  """Per-component settings cannot claim one physical collection twice."""
+  from pymongo.errors import DuplicateKeyError
+
+  shared_name = "tenant_cross_component_marker"
+  queue_config = MongoDBSettings(
+    queue_collection=shared_name,
+    set_collection="queue_component_sets",
+    storage_collection="queue_component_storage",
+  )
+  set_config = MongoDBSettings(
+    queue_collection="set_component_queues",
+    set_collection=shared_name,
+    storage_collection="set_component_storage",
+  )
+  claims: dict[str, str] = {}
+  collections: dict[str, object] = {}
+
+  def get_collection(name):
+    if name in collections:
+      return collections[name]
+    collection = mocker.MagicMock()
+
+    def claim(document):
+      domain = document["scrapy_extension_capability_domain"][0]["domain"]
+      existing = claims.get(name)
+      if existing is None:
+        claims[name] = domain
+      else:
+        raise DuplicateKeyError("domain marker already exists")
+
+    collection.insert_one.side_effect = claim
+    collection.with_options.return_value = collection
+    collection.find.side_effect = lambda *_args, **_kwargs: _Cursor(
+      [
+        {
+          "scrapy_extension_capability_domain": [
+            {"domain": claims[name]}
+          ]
+        }
+      ]
+      if name in claims
+      else []
+    )
+    collections[name] = collection
+    return collection
+
+  database = mocker.MagicMock()
+  database.__getitem__.side_effect = get_collection
+  queue_client = mocker.MagicMock()
+  queue_client.__getitem__.return_value = database
+  set_client = mocker.MagicMock()
+  set_client.__getitem__.return_value = database
+  client_factory = mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    side_effect=[queue_client, set_client],
+  )
+
+  MongoDBBackend(queue_config).connect()
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBBackend(set_config).connect()
+
+  assert exc_info.value.setting_name == "collection_names"
+  assert shared_name not in str(exc_info.value)
+  assert client_factory.call_count == 2
+  assert collections[shared_name].create_index.call_count == 1
+  set_client.close.assert_called_once()
+
+
+def test_mongodb_collection_domain_claim_accepts_same_domain_insert_race(mocker):
+  """A same-domain concurrent marker insert is idempotent, not a conflict."""
+  from pymongo.errors import DuplicateKeyError
+
+  collection = mocker.MagicMock()
+  collection.find.side_effect = [
+    _Cursor([]),
+    _Cursor(
+      [
+        {
+          "scrapy_extension_capability_domain": [
+            {"domain": "queue"}
+          ]
+        }
+      ]
+    ),
+  ]
+  collection.insert_one.side_effect = DuplicateKeyError(
+    "concurrent marker winner"
+  )
+
+  MongoDBBackend._claim_collection_domain(collection, "queue")
+
+  collection.insert_one.assert_called_once()
+  assert collection.find.call_count == 2
+  collection.update_one.assert_not_called()
+
+
+def test_mongodb_collection_domain_claim_requires_majority_visible_race_winner(
+  mocker,
+):
+  """A local-only duplicate cannot be accepted as a durable domain fence."""
+  from pymongo.errors import DuplicateKeyError
+
+  conflict = DuplicateKeyError("winner is not majority visible")
+  collection = mocker.MagicMock()
+  collection.find.side_effect = [_Cursor([]), _Cursor([])]
+  collection.insert_one.side_effect = conflict
+
+  with pytest.raises(BackendConnectionError) as exc_info:
+    MongoDBBackend._claim_collection_domain(collection, "queue")
+
+  assert exc_info.value.__cause__ is conflict
+
+
+@pytest.mark.parametrize(
+  "marker_value",
+  [
+    ["queue", "storage"],
+    {"queue": True},
+    1,
+    None,
+  ],
+  ids=["array", "object", "integer", "null"],
+)
+def test_mongodb_collection_domain_claim_rejects_malformed_marker_envelope(
+  mocker,
+  marker_value,
+):
+  collection = mocker.MagicMock()
+  collection.find.return_value = _Cursor(
+    [{"scrapy_extension_capability_domain": marker_value}]
+  )
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBBackend._claim_collection_domain(collection, "queue")
+
+  assert exc_info.value.setting_name == "collection_names"
+  collection.insert_one.assert_not_called()
+
+
+def test_mongodb_collection_domain_claim_rejects_duplicate_sharded_markers(mocker):
+  """Scatter-gather reads fail closed if a legacy shard split duplicated _id."""
+  collection = mocker.MagicMock()
+  cursor = _Cursor(
+    [
+      {"scrapy_extension_capability_domain": [{"domain": "queue"}]},
+      {"scrapy_extension_capability_domain": [{"domain": "storage"}]},
+    ]
+  )
+  collection.find.return_value = cursor
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBBackend._claim_collection_domain(collection, "queue")
+
+  assert exc_info.value.setting_name == "collection_names"
+  collection.insert_one.assert_not_called()
+  assert cursor.limits == [2]
+
+
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {"mode": MongoDBMode.REPLICA_SET, "replica_set_name": "rs0"},
+    {"mode": MongoDBMode.SHARDED_CLUSTER},
+    {
+      "mode": MongoDBMode.ATLAS,
+      "uri": "mongodb+srv://cluster.example.mongodb.net",
+    },
+  ],
+  ids=["replica-set", "sharded-cluster", "atlas"],
+)
+def test_mongodb_replicated_marker_fence_uses_majority_without_upgrading_business_writes(
+  mocker,
+  settings_kwargs,
+):
+  config = MongoDBSettings(
+    **settings_kwargs,
+    w=1,
+    journal=True,
+    w_timeout_ms=321,
+  )
+  backend = MongoDBBackend(config)
+  client = mocker.MagicMock()
+  database = mocker.MagicMock()
+  collections = {
+    "queues": mocker.MagicMock(),
+    "sets": mocker.MagicMock(),
+    "storage": mocker.MagicMock(),
+  }
+  marker_collections = {}
+  for name, collection in collections.items():
+    marker_collection = mocker.MagicMock()
+    marker_collection.find.return_value = _Cursor([])
+    collection.with_options.return_value = marker_collection
+    marker_collections[name] = marker_collection
+  database.__getitem__.side_effect = collections.__getitem__
+  client.__getitem__.return_value = database
+  client_factory = mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    return_value=client,
+  )
+
+  backend.connect()
+
+  assert client_factory.call_args.kwargs["w"] == 1
+  assert backend._queue_collection is collections["queues"]
+  assert backend._set_collection is collections["sets"]
+  assert backend._storage_collection is collections["storage"]
+  for name, collection in collections.items():
+    options = collection.with_options.call_args.kwargs
+    assert options["read_preference"].name == "Primary"
+    assert options["read_concern"].document == {"level": "majority"}
+    assert options["write_concern"].document == {
+      "wtimeout": 321,
+      "j": True,
+      "w": "majority",
+    }
+    marker = marker_collections[name].insert_one.call_args.args[0]
+    assert marker["scrapy_extension_capability_domain"] == [
+      {"domain": name.removesuffix("s")}
+    ]
+
+
+def test_mongodb_standalone_marker_fence_does_not_request_replica_concerns():
+  options = MongoDBBackend._marker_collection_options(
+    MongoDBMode.STANDALONE,
+    journal=True,
+    w_timeout_ms=321,
+  )
+
+  assert set(options) == {"read_preference"}
+  assert options["read_preference"].name == "Primary"
+
+
+def test_mongodb_collection_domain_claim_preserves_unrelated_unique_conflict(mocker):
+  """A non-marker unique-index collision is not misreported as domain reuse."""
+  from pymongo.errors import DuplicateKeyError
+
+  conflict = DuplicateKeyError("legacy key_1 collision")
+  collection = mocker.MagicMock()
+  collection.find.return_value = _Cursor([])
+  collection.insert_one.side_effect = conflict
+
+  with pytest.raises(BackendConnectionError) as exc_info:
+    MongoDBBackend._claim_collection_domain(collection, "storage")
+
+  assert exc_info.value.__cause__ is conflict
+  assert "legacy key_1 collision" not in str(exc_info.value)
+
+
+def test_mongodb_connect_cleans_half_initialized_handles_after_base_exception(
+  mocker,
+):
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  interruption = KeyboardInterrupt("stop during domain claim")
+  client = mocker.MagicMock()
+  client.close.side_effect = SystemExit("secondary close interruption")
+  database = mocker.MagicMock()
+  queue_collection = mocker.MagicMock()
+  set_collection = mocker.MagicMock()
+  storage_collection = mocker.MagicMock()
+  collections = {
+    "queues": queue_collection,
+    "sets": set_collection,
+    "storage": storage_collection,
+  }
+  for collection in collections.values():
+    collection.with_options.return_value = collection
+    collection.find.return_value = _Cursor([])
+  set_collection.insert_one.side_effect = interruption
+  set_collection.update_one.side_effect = interruption
+  database.__getitem__.side_effect = collections.__getitem__
+  client.__getitem__.return_value = database
+  mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    return_value=client,
+  )
+  log = mocker.patch(
+    "scrapy_extension.backends.mongodb.logger.debug",
+    side_effect=RuntimeError("cleanup logger failed"),
+  )
+
+  with pytest.raises(KeyboardInterrupt) as exc_info:
+    backend.connect()
+
+  assert exc_info.value is interruption
+  assert backend._client is None
+  assert backend._db is None
+  assert backend._queue_collection is None
+  assert backend._set_collection is None
+  assert backend._storage_collection is None
+  client.close.assert_called_once()
+  log.assert_called_once()
 
 
 def test_mongodb_backend_disconnect(mocker):
@@ -653,7 +1069,10 @@ def test_mongodb_backend_initialize_collections_raises_when_client_none():
   # _client is None by default
 
   with pytest.raises(BackendConnectionError) as exc_info:
-    backend._initialize_collections()
+    backend._initialize_collections(
+      "scrapy_extension",
+      ("queues", "sets", "storage"),
+    )
   assert "MongoDB client not initialized" in str(exc_info.value)
 
 
@@ -967,7 +1386,9 @@ def test_mongodb_backend_clear_storage_with_prefix(mocker):
 
 
 def test_mongodb_backend_clear_storage_without_prefix(mocker):
-  """Test clear_storage deletes all when prefix is None."""
+  """A storage-wide clear preserves the physical-domain ownership marker."""
+  from scrapy_extension.backends.mongodb import _CAPABILITY_DOMAIN_MARKER_ID
+
   config = MongoDBSettings()
   backend = MongoDBBackend(config)
 
@@ -978,10 +1399,10 @@ def test_mongodb_backend_clear_storage_without_prefix(mocker):
 
   backend.clear_storage(prefix=None)
 
-  # Verify delete_many was called with empty filter
+  # Every storage document is deleted while the domain claim remains durable.
   call_args = mock_collection.delete_many.call_args
   filter_doc = call_args[0][0]
-  assert filter_doc == {}
+  assert filter_doc == {"_id": {"$ne": _CAPABILITY_DOMAIN_MARKER_ID}}
 
 
 def test_mongodb_clear_storage_prefix_wraps_pymongo_error(mocker):

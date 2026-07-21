@@ -12,14 +12,17 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
-  from pymongo import ASCENDING, MongoClient
+  from pymongo import ASCENDING, MongoClient, ReadPreference
   from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
+  from pymongo.read_concern import ReadConcern
+  from pymongo.write_concern import WriteConcern
 except ImportError as e:
   if not _is_missing_optional_dependency(e, "pymongo"):
     raise
@@ -46,7 +49,10 @@ from scrapy_extension.exceptions import (
 )
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
-from scrapy_extension.settings.mongodb import validate_mongodb_write_concern
+from scrapy_extension.settings.mongodb import (
+  validate_mongodb_collection_domains,
+  validate_mongodb_write_concern,
+)
 
 if TYPE_CHECKING:
   from pymongo.collection import Collection
@@ -55,6 +61,9 @@ if TYPE_CHECKING:
   from scrapy_extension.settings import MongoDBSettings
 
 logger = logging.getLogger(__name__)
+
+_CAPABILITY_DOMAIN_MARKER_ID = "scrapy-extension:capability-domain:v1"
+_CAPABILITY_DOMAIN_MARKER_FIELD = "scrapy_extension_capability_domain"
 
 
 class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
@@ -112,53 +121,74 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If the connection cannot be established.
         ConfigurationError: If the configuration is invalid for the mode.
     """
-    if self.config.mode not in (
+    mode = self.config.mode
+    if mode not in (
       MongoDBMode.STANDALONE,
       MongoDBMode.REPLICA_SET,
       MongoDBMode.SHARDED_CLUSTER,
       MongoDBMode.ATLAS,
     ):
       try:
-        mode_text = str(self.config.mode)
+        mode_text = str(mode)
       except (TypeError, ValueError):
-        mode_text = getattr(self.config.mode, "value", repr(self.config.mode))
+        mode_text = getattr(mode, "value", repr(mode))
       msg = f"Unsupported MongoDB mode: {mode_text}"
       raise ConfigurationError(
         msg,
         setting_name="mode",
-        setting_value=self.config.mode,
+        setting_value=mode,
       )
     # Settings models remain mutable after construction. Recheck before any
-    # client construction so a live mutation cannot downgrade public writes
-    # to an unacknowledged socket handoff.
-    self._validated_write_concern()
+    # client construction so a live mutation cannot merge capability domains
+    # or downgrade public writes to an unacknowledged socket handoff.
+    collection_names = validate_mongodb_collection_domains(
+      self.config.queue_collection,
+      self.config.set_collection,
+      self.config.storage_collection,
+    )
+    database = self.config.database
+    _, w_timeout_ms = self._validated_write_concern()
+    marker_options = self._marker_collection_options(
+      mode,
+      journal=self.config.journal,
+      w_timeout_ms=w_timeout_ms,
+    )
     try:
-      if self.config.mode == MongoDBMode.STANDALONE:
-        self._connect_standalone()
-      elif self.config.mode == MongoDBMode.REPLICA_SET:
-        self._connect_replica_set()
-      elif self.config.mode == MongoDBMode.SHARDED_CLUSTER:
-        self._connect_sharded_cluster()
+      if mode == MongoDBMode.STANDALONE:
+        self._connect_standalone(database, collection_names, marker_options)
+      elif mode == MongoDBMode.REPLICA_SET:
+        self._connect_replica_set(database, collection_names, marker_options)
+      elif mode == MongoDBMode.SHARDED_CLUSTER:
+        self._connect_sharded_cluster(database, collection_names, marker_options)
       else:
-        self._connect_atlas()
-      logger.debug("Connected to MongoDB in %s mode", self.config.mode.value)
+        self._connect_atlas(database, collection_names, marker_options)
+      logger.debug("Connected to MongoDB in %s mode", mode.value)
     except ConnectionFailure as e:
-      self._discard_client()
-      msg = f"Failed to connect to MongoDB ({self.config.mode.value}): {e}"
+      self._discard_client(suppress_process_control=True)
+      msg = f"Failed to connect to MongoDB ({mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="mongodb",
       ) from e
+    except BackendConnectionError:
+      self._discard_client(suppress_process_control=True)
+      raise
+    except ConfigurationError:
+      self._discard_client(suppress_process_control=True)
+      raise
     except Exception as e:
-      self._discard_client()
+      self._discard_client(suppress_process_control=True)
       # Unexpected errors (e.g., RuntimeError from mocking in tests)
-      msg = f"Failed to connect to MongoDB ({self.config.mode.value}): {e}"
+      msg = f"Failed to connect to MongoDB ({mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="mongodb",
       ) from e
+    except BaseException:
+      self._discard_client(suppress_process_control=True)
+      raise
 
-  def _discard_client(self) -> None:
+  def _discard_client(self, *, suppress_process_control: bool = False) -> None:
     """Clear all handles and best-effort close the current client."""
     client = self._client
     self._client = None
@@ -170,7 +200,22 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       try:
         client.close()
       except Exception:
-        logger.debug("Failed to close MongoDB client", exc_info=True)
+        try:
+          logger.debug("Failed to close MongoDB client", exc_info=True)
+        except BaseException:
+          if not suppress_process_control:
+            raise
+      except BaseException:
+        if not suppress_process_control:
+          raise
+        try:
+          logger.debug(
+            "Process-control interruption while closing failed MongoDB client",
+            exc_info=True,
+          )
+        except BaseException:
+          # Failed-connect cleanup must never replace the original exception.
+          pass
 
   def _build_client_kwargs(self) -> dict[str, Any]:
     """Build common MongoDB client kwargs.
@@ -270,28 +315,178 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     return self._read_preference
 
-  def _initialize_collections(self) -> None:
+  def _initialize_collections(
+    self,
+    database: str,
+    collection_names: tuple[str, str, str],
+    marker_options: Mapping[str, Any] | None = None,
+  ) -> None:
     """Initialize database and create indexes."""
     if self._client is None:
       msg = "MongoDB client not initialized"
       raise BackendConnectionError(msg, backend_type="mongodb")
     # Initialize database and collections
-    self._db = self._client[self.config.database]
-    self._queue_collection = self._db[self.config.queue_collection]
-    self._set_collection = self._db[self.config.set_collection]
-    self._storage_collection = self._db[self.config.storage_collection]
+    queue_collection, set_collection, storage_collection = collection_names
+    self._db = self._client[database]
+    self._queue_collection = self._db[queue_collection]
+    self._set_collection = self._db[set_collection]
+    self._storage_collection = self._db[storage_collection]
+
+    if marker_options is None:
+      _, w_timeout_ms = self._validated_write_concern()
+      marker_options = self._marker_collection_options(
+        self.config.mode,
+        journal=self.config.journal,
+        w_timeout_ms=w_timeout_ms,
+      )
+    self._claim_collection_domains(marker_options)
 
     # Create indexes
     self._create_indexes()
 
-  def _connect_standalone(self) -> None:
+  def _claim_collection_domains(
+    self,
+    marker_options: Mapping[str, Any],
+  ) -> None:
+    """Claim each physical collection for exactly one capability domain."""
+    if (
+      self._queue_collection is None
+      or self._set_collection is None
+      or self._storage_collection is None
+    ):
+      msg = "Collections not initialized: cannot claim capability domains"
+      raise BackendConnectionError(msg, backend_type="mongodb")
+    claims = (
+      (self._queue_collection, "queue"),
+      (self._set_collection, "set"),
+      (self._storage_collection, "storage"),
+    )
+    for collection, domain in claims:
+      marker_collection = collection.with_options(**marker_options)
+      self._claim_collection_domain(marker_collection, domain)
+
+  @staticmethod
+  def _marker_collection_options(
+    mode: MongoDBMode,
+    *,
+    journal: bool | None,
+    w_timeout_ms: int | None,
+  ) -> dict[str, Any]:
+    """Build an isolated durability policy for capability-domain markers."""
+    options: dict[str, Any] = {"read_preference": ReadPreference.PRIMARY}
+    if mode == MongoDBMode.STANDALONE:
+      return options
+
+    write_concern_kwargs: dict[str, Any] = {"w": "majority"}
+    if journal is not None:
+      write_concern_kwargs["j"] = journal
+    if w_timeout_ms is not None:
+      write_concern_kwargs["wtimeout"] = w_timeout_ms
+    options["read_concern"] = ReadConcern("majority")
+    options["write_concern"] = WriteConcern(**write_concern_kwargs)
+    return options
+
+  @staticmethod
+  def _claim_collection_domain(
+    collection: Collection[dict[str, Any]],
+    domain: str,
+  ) -> None:
+    """Atomically install or confirm one collection's domain marker."""
+    exists, existing_domain = MongoDBBackend._read_collection_domain_marker(
+      collection
+    )
+    if exists:
+      MongoDBBackend._require_matching_collection_domain(existing_domain, domain)
+      return
+
+    marker = {
+      "_id": _CAPABILITY_DOMAIN_MARKER_ID,
+      # Domain-dependent data is deliberately below an array boundary. A
+      # sharded collection cannot use a multikey index as its shard-key index,
+      # so a valid shard key either sees identical fixed/missing values for all
+      # contenders (routing them together) or rejects this insert fail-closed.
+      # This preserves the fixed-_id mutex even when _id is not the shard key.
+      _CAPABILITY_DOMAIN_MARKER_FIELD: [{"domain": domain}],
+    }
+    try:
+      collection.insert_one(marker)
+    except DuplicateKeyError as conflict:
+      exists, existing_domain = MongoDBBackend._read_collection_domain_marker(
+        collection
+      )
+      if not exists:
+        raise BackendConnectionError(
+          "Failed to install the MongoDB capability-domain marker.",
+          backend_type="mongodb",
+        ) from conflict
+      MongoDBBackend._require_matching_collection_domain(existing_domain, domain)
+
+  @staticmethod
+  def _read_collection_domain_marker(
+    collection: Collection[dict[str, Any]],
+  ) -> tuple[bool, object]:
+    """Read at most two markers so a poisoned sharded state fails closed."""
+    markers = list(
+      collection.find(
+        {"_id": _CAPABILITY_DOMAIN_MARKER_ID},
+        {_CAPABILITY_DOMAIN_MARKER_FIELD: 1},
+      ).limit(2)
+    )
+    if len(markers) > 1:
+      raise ConfigurationError(
+        "A MongoDB physical collection has conflicting domain markers.",
+        setting_name="collection_names",
+      )
+    marker = markers[0] if markers else None
+    # A real PyMongo Collection configured by this backend returns ``dict`` or
+    # ``None``. Treat a non-mapping test double as inconclusive/absent: the
+    # subsequent insert is still authoritative and a real existing marker
+    # forces DuplicateKey plus a second primary read before acceptance.
+    if marker is None or not isinstance(marker, Mapping):
+      return False, None
+    return True, marker.get(_CAPABILITY_DOMAIN_MARKER_FIELD)
+
+  @staticmethod
+  def _require_matching_collection_domain(
+    existing_domain: object,
+    requested_domain: str,
+  ) -> None:
+    """Accept only the exact one-element ownership envelope."""
+    if (
+      type(existing_domain) is list
+      and len(existing_domain) == 1
+      and type(existing_domain[0]) is dict
+      and set(existing_domain[0]) == {"domain"}
+      and type(existing_domain[0]["domain"]) is str
+      and existing_domain[0]["domain"] == requested_domain
+    ):
+      return
+    raise ConfigurationError(
+      (
+        "A MongoDB physical collection is already claimed by another or "
+        "malformed scrapy-extension capability domain."
+      ),
+      setting_name="collection_names",
+    )
+
+  def _connect_standalone(
+    self,
+    database: str,
+    collection_names: tuple[str, str, str],
+    marker_options: Mapping[str, Any],
+  ) -> None:
     """Connect to standalone MongoDB instance."""
     kwargs = self._build_client_kwargs()
     self._client = MongoClient(self.config.uri, **kwargs)
     self._client.admin.command("ping")
-    self._initialize_collections()
+    self._initialize_collections(database, collection_names, marker_options)
 
-  def _connect_replica_set(self) -> None:
+  def _connect_replica_set(
+    self,
+    database: str,
+    collection_names: tuple[str, str, str],
+    marker_options: Mapping[str, Any],
+  ) -> None:
     """Connect to MongoDB replica set.
 
     Uses replica_set_name if provided, otherwise uses URI.
@@ -302,7 +497,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self.config.replica_set_members:
       # Build connection string with replica set members
       members = ",".join(self.config.replica_set_members)
-      uri = f"mongodb://{members}/{self.config.database}"
+      uri = f"mongodb://{members}/{database}"
       if self.config.replica_set_name:
         uri += f"?replicaSet={self.config.replica_set_name}"
     else:
@@ -313,9 +508,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     self._client = MongoClient(uri, **kwargs)
     self._client.admin.command("ping")
-    self._initialize_collections()
+    self._initialize_collections(database, collection_names, marker_options)
 
-  def _connect_sharded_cluster(self) -> None:
+  def _connect_sharded_cluster(
+    self,
+    database: str,
+    collection_names: tuple[str, str, str],
+    marker_options: Mapping[str, Any],
+  ) -> None:
     """Connect to MongoDB sharded cluster.
 
     Connects via mongos routers.
@@ -325,16 +525,21 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self.config.mongos_routers:
       # Use mongos routers as connection points
       routers = ",".join(self.config.mongos_routers)
-      uri = f"mongodb://{routers}/{self.config.database}"
+      uri = f"mongodb://{routers}/{database}"
       self._client = MongoClient(uri, **kwargs)
     else:
       # Fall back to provided URI
       self._client = MongoClient(self.config.uri, **kwargs)
 
     self._client.admin.command("ping")
-    self._initialize_collections()
+    self._initialize_collections(database, collection_names, marker_options)
 
-  def _connect_atlas(self) -> None:
+  def _connect_atlas(
+    self,
+    database: str,
+    collection_names: tuple[str, str, str],
+    marker_options: Mapping[str, Any],
+  ) -> None:
     """Connect to MongoDB Atlas.
 
     Uses standard Atlas connection string with TLS enabled.
@@ -346,7 +551,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     self._client = MongoClient(self.config.uri, **kwargs)
     self._client.admin.command("ping")
-    self._initialize_collections()
+    self._initialize_collections(database, collection_names, marker_options)
 
   def _create_indexes(self) -> None:
     """Create necessary indexes for collections.
@@ -920,7 +1125,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         raise StorageError(msg, operation="clear_storage", key=None) from e
     else:
       try:
-        self._storage_collection.delete_many({})
+        self._storage_collection.delete_many(
+          {"_id": {"$ne": _CAPABILITY_DOMAIN_MARKER_ID}}
+        )
       except PyMongoError as e:
         msg = f"Failed to clear MongoDB storage: {e}"
         raise StorageError(msg, operation="clear_storage", key=None) from e

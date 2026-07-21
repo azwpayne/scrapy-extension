@@ -102,6 +102,9 @@ global gates, then perform a fresh audit before selecting the next item.
 | I41 | Remove outcome-ambiguous redis-py command retries | a response timeout cannot replay queue push/pop Lua mutations |
 | I42 | Make Redis deployment-mode settings truthful to redis-py | unsupported Cluster knobs and primary-only master-slave semantics fail or document explicitly |
 | I43 | Remove fix-available pyasn1 advisories from the locked dependency graph | `uv audit --locked` reports neither pyasn1 advisory and compatibility gates remain green |
+| I44 | Isolate duplicate-filter telemetry from durable decisions | observer failures cannot strand a committed fingerprint or deadlock lifecycle work |
+| I45 | Bind each batched-storage entry to its caller's backend capability | every drain preserves per-entry routing, order, TTL, and retry-tail ownership |
+| I46 | Isolate MongoDB queue/set/storage physical collections | local collisions fail before SDK I/O; majority-durable, shard-safe markers reject cross-instance reuse |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -175,6 +178,31 @@ speculative work.
 - [ ] **RUN-15 — stateful registry callables.** Fail closed for closures, bound
   methods, partials, and callable objects that cannot have a stable explicit
   settings identity; type/name-only digests must not merge tenant credentials.
+- [ ] **RUN-16 — immutable manager registry identity.** Freeze backend type,
+  normalized settings, and the registry key at manager construction so public
+  settings mutation cannot reroute reconnects or leave a retired manager under
+  its original key.
+- [ ] **RUN-17 — deferred replacement ACK retry ownership.** Preserve an
+  actionable retry owner when a streamed errback replacement commits but the
+  source acknowledgement fails before or after the group is sealed.
+- [ ] **RUN-18 — retryable process-control queue shutdown.** Publish terminal
+  queue, scheduler, and spider-mixin close state only after owned resources are
+  released; retain unfinished ownership after `BaseException` for a later close.
+- [ ] **RUN-19 — duplicate-filter introspection isolation.** Once add/seen and
+  reservation state are decided, treat saturation/capacity/length diagnostics
+  as best-effort telemetry that cannot change control flow or strand rollback.
+- [ ] **QUEUE-01 — process-control-safe time-wheel drain.** Restore the exact
+  failing item and unattempted slot tail in order before propagating a
+  `BaseException`; never requeue the successful prefix.
+- [ ] **ACK-PLUGIN-02 — truthful deferred-ack plugin capability.** Require a
+  `requires_ack` backend to override pop-with-token, ack, and nack, and reject a
+  delivered item with no token at runtime.
+- [ ] **OBS-01 — truthful queue-stall telemetry.** Count failed pop attempts and
+  errors, expose attempt freshness, and stop promising that an event-driven
+  rate gauge decays without another event.
+- [ ] **DOC-DEDUP-01 — bounded no-false-negative promise.** Limit the Cuckoo
+  guarantee to fingerprints successfully inserted before full degradation and
+  document that overflow requests can pass repeatedly.
 - [x] **STORAGE-01 — batched backend ownership.** Carry each buffered storage
   entry's backend through threshold, age, close, and partial-failure flushes so
   sharing a batch strategy cannot write an earlier entry to the later caller's
@@ -189,6 +217,9 @@ speculative work.
   failing backend-bound tail before propagating `BaseException`, and keep
   observer dispatch outside the detached-batch transaction so an observer
   cannot strand unattempted entries.
+- [ ] **STORAGE-05 — generation-aware buffered routes.** Preserve stable
+  manager/tenant affinity while resolving a buffered entry through the current
+  connection generation, so an old retired proxy cannot poison a retry tail.
 - [x] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
   calls so a failure from an older CLOSED generation cannot reopen a breaker
   that has since completed an OPEN → HALF_OPEN → CLOSED recovery.
@@ -239,6 +270,17 @@ speculative work.
   and hostname verification whenever a token is configured.
 - [x] **SEC-02B2B2 — Memcached transport boundary.** Define and enforce an
   explicit trusted-network boundary for remote Memcached.
+- [ ] **SEC-02B2B3 — authenticated Kafka transport.** Require password-based
+  SASL to use `SASL_SSL` with hostname verification, reject ignored TLS
+  material, and require client certificate/key pairs.
+- [ ] **SEC-02C-R — authenticated Redis transport.** Require remote password
+  authentication, including Sentinel and Cluster data paths, to use verified
+  TLS while preserving explicit loopback development configurations.
+- [ ] **SEC-02C-E — authenticated Elasticsearch transport.** Require HTTPS and
+  certificate verification whenever API-key or basic authentication is used.
+- [ ] **SEC-02C-M — authenticated MongoDB transport.** Evaluate actual URI
+  endpoints and forbid invalid-certificate TLS for remote authenticated nodes,
+  including standalone mode.
 - [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
   endpoint and credential fields at connect time and use one captured set of
   connection values, so construction-time mutation and validation/use races
@@ -264,6 +306,9 @@ speculative work.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
+- [ ] **MONGO-TLS-01 — truthful client certificate contract.** Replace the
+  unsupported independent certificate/key interpretation with PyMongo's one
+  combined certificate-and-private-key PEM setting and an explicit migration.
 - [x] **BACKEND-01 — Kafka consumer generations.** Fence tokens by assignment
   epoch and unique delivery attempt within one backend instance, invalidate on
   rebalance/nack, validate per-topic admin responses, and replace the unsafe
@@ -276,6 +321,9 @@ speculative work.
 - [x] **BACKEND-04B — SQS clear barrier.** Fence old delivery epochs and hold an
   exclusive per-queue barrier for the full asynchronous PurgeQueue window,
   including ambiguous failures, without serializing ordinary queue operations.
+- [ ] **BACKEND-04B2 — interruption-safe SQS purge fence.** Once PurgeQueue may
+  have been accepted, retain the per-queue safety deadline across
+  `BaseException`, disconnect, and reconnect before admitting new messages.
 - [x] **BACKEND-04C1 — RabbitMQ clear lifecycle.** Track exact per-queue pending
   deliveries, keep token and legacy settlement paths independent, and reject a
   purge that could be followed by an old delivery's nack/requeue.
@@ -292,12 +340,24 @@ speculative work.
   request/response transactions and published-client teardown, fence private
   connection probes across disconnect, snapshot the destructive flush
   capability, and reject non-successful flush replies.
+- [ ] **BACKEND-11 — finite Memcached I/O deadlines.** Add strictly positive
+  connect and socket timeouts to the validated generation snapshot so a silent
+  peer cannot hold the single protocol lock and shutdown forever.
 - [x] **BACKEND-07A — confirmed Kafka publication.** Reject Kafka `acks=0`,
   apply advertised retention/min-ISR settings to new topics, and reject
   inconsistent replication, ISR, and partition-count policy.
 - [x] **BACKEND-07B — confirmed MongoDB mutations.** Reject unacknowledged write
   concerns so queue/set/storage success cannot mean only a local socket-buffer
   handoff.
+- [x] **BACKEND-10M — MongoDB capability-domain isolation.** Require queue,
+  set, and storage collection names to be pairwise distinct at settings
+  construction and again from one immutable connect snapshot before SDK I/O;
+  persist a majority-durable, shard-safe domain marker so independent
+  component/process configurations cannot make storage clear or indexing cross
+  capability domains.
+- [ ] **BACKEND-10E — Elasticsearch capability-domain isolation.** Require
+  queue, set, and storage indices to be pairwise distinct at construction and
+  connect-time revalidation before an unfiltered storage clear can cross domains.
 - [ ] **BACKEND-07C — primary MongoDB reads.** Require primary reads for queue,
   set, and storage contracts so lagging replicas cannot report false emptiness
   or violate read-your-confirmed-write behavior.
@@ -386,6 +446,9 @@ speculative work.
 - [x] **BACKEND-03D — remaining DynamoDB response/region contracts.** Accept
   valid multi-segment AWS regions such as GovCloud, revalidate them at connect,
   and reject malformed delete responses through `StorageError`.
+- [ ] **BACKEND-03E — outcome-truthful DynamoDB delete.** Disable hidden SDK
+  replay for result-sensitive DeleteItem so a lost success response cannot be
+  retried as missing and returned as `False`; surface ambiguity as StorageError.
 - [x] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
   text: `_RedactedStr` protects `repr`, while ordinary string operations expose
   the underlying value required by SDK authentication.
@@ -417,6 +480,17 @@ correctness work:
   traceback on every scheduler heartbeat;
 - align examples, release runbook commands, plugin example semantics, and
   remaining historical-document links with current behaviour.
+- make the integration opt-in gate independent of benchmark-plugin branches;
+  add the global opt-in to every published integration command; isolate Redis
+  Cluster unit tests from DNS under pytest-socket 0.8; replace Dependabot's
+  orphan npm lane with the repository's `uv` ecosystem;
+- align MongoDB timeout lower bounds with PyMongo, pass a configured RocketMQ
+  payload ceiling, bind Kafka publication waiting to its generation deadline,
+  and make the spider-mixin scheduler honor its configured queue strategy;
+- sanitize wrong-type secret validation, exact-match public key grammars,
+  strictly parse remaining broker endpoints, remove plugin exception text from
+  default discovery logs, and clean a half-built backend after process-control
+  interruption without masking the original exception.
 
 ### Evidence policy
 
@@ -1786,3 +1860,62 @@ and patch integrity remained green. The six-way post-implementation review
 found one over-broad changelog compatibility quantifier; after limiting it to
 calls that supply the same backend capability, every reviewer reported no
 remaining I45 blocker.
+
+### I46 — MongoDB capability-domain collection isolation
+
+Seven fresh audits covered MongoDB settings, physical schema, clear/index
+semantics, mutable connect configuration, replicated/sharded behavior, tests,
+security, and migration documentation. They confirmed that queue, set, and
+storage could independently point at one physical collection. An unfiltered
+storage clear could then delete queue work and dedup fingerprints, while the
+three incompatible index families could reject otherwise valid documents. A
+constructor-only comparison would not cover separately configured components,
+processes, or settings mutated before reconnect.
+
+The locked specification has two fences. First, the three names must be exact
+built-in strings and pairwise distinct both during settings construction and
+from one immutable pre-I/O connect snapshot; errors are static and never echo
+collection names. Second, each physical collection is claimed by a reserved
+`scrapy-extension:capability-domain:v1` document before domain indexes are
+installed. A same-domain claim is idempotent, another or malformed domain fails
+closed, an unrelated unique-index conflict retains its original cause, and
+`clear_storage(None)` deletes every non-marker document while preserving the
+fence. Half-initialized clients clear every published handle and close exactly
+once on `Exception` or process-control interruption without allowing close or
+diagnostic failures to replace the original exception.
+
+Replicated claims deliberately do not inherit ordinary `w=1`: replica-set,
+sharded, and Atlas marker views force primary plus majority read concern and
+majority write concern while inheriting only the configured journal and timeout
+options. Duplicate-key recovery accepts only a majority-visible winner. For
+sharded collections, `_id` uniqueness alone is not cluster-global when `_id`
+is not the shard key. The only domain-dependent marker value therefore lives
+below an array boundary: a valid shard key either observes identical
+fixed/missing values and routes every contender to one shard, or attempts to
+observe an array descendant and rejects the insert. A scatter-gather
+`find({_id: ...}).limit(2)` also rejects any historical duplicate-marker state.
+
+The initial local validation group produced six deterministic RED failures; the
+persistent cross-instance marker group produced eight; and the final durability,
+sharding, and cleanup group produced eleven failures among thirteen controls.
+Thirteen new test functions, with pairwise/mode/malformed parameterization,
+cover construction and mutation collisions, malicious string subclasses,
+ping-time snapshot races, cross-instance ownership, same-domain insert races,
+majority invisibility, malformed and duplicate markers, unrelated unique
+conflicts, all deployment concerns, storage clear, and nested process-control
+cleanup. A reviewer corrected the cursor double so `limit(1)` now makes the
+critical duplicate-marker regression fail rather than pass accidentally.
+
+The final adversarial review used a temporary MongoDB 8.3.3 two-shard cluster.
+It confirmed that even a numeric dotted shard key ending below the ownership
+array rejects the marker, that two cross-shard documents with the same `_id`
+are both returned by the production-shaped limited scatter read, and that a
+normal sharded claim leaves one durable marker while another domain is denied.
+All temporary processes were stopped. Two four-worker randomized focused runs
+passed 444 and 445 tests. Python 3.10 and 3.14 each collected 3,644 tests and
+passed 3,598 with 46 documented skips and the same three master-slave warnings.
+Whole-project Ruff, strict mypy over 76 source files, configured Bandit over
+23,720 lines, lock validation, dependency audit, sdist/wheel build, and patch
+integrity all passed. After majority durability, shard routing, cleanup logging,
+documentation, and the cursor false-positive were corrected, three independent
+final reviewers reported no remaining I46 finding.

@@ -225,6 +225,15 @@ MongoDB mutations use an acknowledged write concern. Set `SCRAPY_MONGO_W` to
 a positive integer or `"majority"` (recommended for replicated durability);
 `0`, negative values, booleans, and custom tag strings are rejected before
 client I/O. `SCRAPY_MONGO_W_TIMEOUT_MS`, when set, must be non-negative.
+`SCRAPY_MONGO_QUEUE_COLLECTION`, `SCRAPY_MONGO_SET_COLLECTION`, and
+`SCRAPY_MONGO_STORAGE_COLLECTION` must name three distinct physical
+collections. A storage-wide clear deletes every non-marker document, so a
+local collision is rejected at construction and again before client I/O. Each
+collection also carries a reserved `scrapy-extension:capability-domain:v1`
+ownership marker; this rejects cross-component or cross-process attempts to
+reuse the same physical collection for another capability. Replica-set,
+sharded, and Atlas marker claims use isolated primary/majority read and
+majority write concerns even when ordinary business writes use `w=1`.
 
 ### Kafka (standalone, cluster, confluent)
 

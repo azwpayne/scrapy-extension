@@ -149,6 +149,17 @@ upgrading.
   settings construction and again before client I/O. Supported values are a
   positive integer or `"majority"`; numeric environment text is normalized to
   an integer. Negative and boolean write timeouts are also rejected.
+- **MongoDB capability domains now require distinct collections.** Queue, set,
+  and storage collection names must be pairwise distinct at settings
+  construction and are revalidated from one immutable per-connect snapshot
+  before client I/O. Each physical collection receives a durable reserved
+  capability-domain marker, so independently configured components and
+  processes cannot claim the same collection for different roles. Replicated
+  marker claims use an isolated primary/majority read and majority write fence,
+  independent of the business write concern. A storage-wide clear preserves
+  that marker but deletes every other document; an old mixed collection could
+  therefore lose queue or set documents (including dedup fingerprints) and
+  must be split before upgrading.
 - **RabbitMQ `clear_queue()` now rejects in-flight deliveries.** Rabbit's purge
   excludes unacknowledged messages, which could previously be nacked after a
   successful clear and resurrect pre-clear work. Exact per-queue pending counts

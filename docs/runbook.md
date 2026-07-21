@@ -337,6 +337,7 @@ Common causes (round-9 SV1–SV5 close all of these):
 | "Authenticated Pulsar connections require … verification" | Token auth attempted with plaintext or a TLS verification escape hatch | `settings/pulsar.py`; fix the broker CA/hostname and keep both validation flags secure |
 | "Remote Memcached uses an unauthenticated plaintext protocol" | A non-loopback Memcached host lacks an explicit trusted-network decision | Prefer a TLS-capable storage backend, or set `SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=True` only behind an isolated private firewall |
 | "MongoDB mutations require an acknowledged write concern" | `SCRAPY_MONGO_W` is zero, negative, boolean, or unsupported text | Use a positive integer or `majority`; prefer `majority` for replicated durability |
+| "MongoDB ... capability domains must use distinct physical collection names" | Two of the queue, set, and storage collection settings resolve to the same MongoDB collection | Stop writers, split or migrate the mixed documents into three collections, then configure distinct names |
 | "endpoint_url must be http:// or https://" | LocalStack/AWS endpoint scheme (SEC-4) | `settings/{sqs,dynamodb}.py` |
 | "aws_access_key_id and aws_secret_access_key must both be set" | Half-configured AWS creds | `settings/{sqs,dynamodb}.py` (config-time), `backends/connectors.py` (connect-time SEC-7) |
 
@@ -367,6 +368,25 @@ concern. The backend supports positive integer `w` values and `"majority"`;
 `w=0` is never a valid throughput shortcut. A write-concern timeout limits how
 long acknowledgement may wait but does not turn a timeout into success. Treat
 the resulting exception as outcome-ambiguous and retry only idempotent work.
+
+Keep MongoDB queue, set, and storage documents in three distinct collections.
+`clear_storage(None)` intentionally deletes every non-marker document in the
+storage collection; sharing that collection with another capability would make
+an ordinary storage clear destructive across domains. The same separation
+avoids installing incompatible unique indexes on mixed document schemas. A
+reserved `_id="scrapy-extension:capability-domain:v1"` document records the
+role durably and is preserved by storage clear, so separately configured
+components or processes fail closed if they attempt a cross-domain reuse.
+Replica-set, sharded, and Atlas claims force primary/majority reads and
+majority writes for this marker even when business writes use `w=1`. The
+ownership value sits below an array boundary so a valid shard key either routes
+all contenders together or rejects the marker as multikey; a scatter read also
+rejects any historical duplicate marker state.
+When repairing a legacy mixed collection, do not rename or reuse it as one of
+the three destinations: its queue, set-uniqueness, storage-key, and TTL indexes
+remain attached. Back it up, create three empty collections, let the backend
+create each domain's indexes, import only that domain's documents, and verify
+the resulting indexes before opening writers.
 
 If the error is in a backend's `from_settings` / `from_crawler` factory,
 check `backends/connectors.py:resolve_backend_config` — it resolves
