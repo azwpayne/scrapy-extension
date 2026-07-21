@@ -230,7 +230,7 @@ speculative work.
 - [x] **BACKEND-04C1 — RabbitMQ clear lifecycle.** Track exact per-queue pending
   deliveries, keep token and legacy settlement paths independent, and reject a
   purge that could be followed by an old delivery's nack/requeue.
-- [ ] **BACKEND-04C2 — Pulsar terminal settlement.** Make direct Pulsar token
+- [x] **BACKEND-04C2 — Pulsar terminal settlement.** Make direct Pulsar token
   settlement one-shot across ack/nack and retryable after client failures.
 - [x] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
   stable AWS-compatible names without changing already-valid names, and enforce
@@ -814,3 +814,22 @@ push/pop/ack/nack/depth/purge operations, and two deterministic thread tests
 prove both clear-before-pop and pop-before-clear orderings. All 231 related tests
 passed on Python 3.10 and 3.14; the full Python 3.10 suite passed 3,104 tests
 with 45 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I21 — Pulsar terminal token settlement
+
+Eight initial RED regressions showed that one Pulsar delivery token could issue
+multiple broker operations: duplicate ACKs, ACK followed by NACK, NACK followed
+by ACK, and concurrent opposite actions all remained live after an earlier
+success. An ACK exception also removed the token from diagnostic in-flight
+tracking despite the delivery remaining unsettled, while `pop_with_ack()`
+populated the legacy last-message slot and exposed a second settlement path.
+
+Each token now owns a settlement lock and an explicit pending/settling/terminal
+state. The lock spans the broker call, success publishes exactly one terminal
+ACK/NACK outcome, and an exception restores `pending` so the same token can be
+retried. Stale generations retire locally without touching a replacement
+consumer, and the diagnostic set has its own lock for free-threaded-safe
+tracking. Token-aware pops no longer write the legacy slot. All 83 local Pulsar
+tests passed on Python 3.10 and 3.14 with the real-broker test explicitly
+skipped; the full Python 3.10 suite passed 3,110 tests with 45 documented skips.
+Ruff, strict mypy, and patch integrity remained green.

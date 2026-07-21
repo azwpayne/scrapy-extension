@@ -70,6 +70,12 @@ upgrading.
   token retryable and raise `QueueError`; token-aware pops no longer populate
   the legacy last-receipt slot. Direct callers that relied on disconnected
   settlement being a silent success must now retry after reconnection.
+- **Pulsar acknowledgement tokens now have one terminal outcome.** A successful
+  direct token ack or nack suppresses every later terminal action, including a
+  concurrent opposite action. Client failures raise `QueueError` but restore
+  the token to a retryable state and retain diagnostic in-flight tracking.
+  Token-aware pops no longer populate the legacy last-message slot; callers
+  using `pop_with_ack()` must settle the returned token explicitly.
 - **SQS `clear_queue()` is now a real completion barrier and takes at least 60
   seconds.** AWS PurgeQueue can keep deleting newly sent messages during that
   window, so same-queue operations wait while clear is active; unrelated queues

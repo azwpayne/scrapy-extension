@@ -306,6 +306,12 @@ requeued the old deliveries. Operations and purge are serialized at the channel
 boundary, while in-flight deliveries on unrelated queues do not block the
 target clear.
 
+**Pulsar token settlement**: each token returned by `pop_with_ack()` accepts
+one successful ACK or NACK. Repeating that action—or racing it with the
+opposite action—does not issue another broker call. A client failure raises
+`QueueError` and leaves the same token retryable. The token path is independent
+of the legacy `pop()` / tokenless settlement slot.
+
 **SQS clear barrier**: `clear_queue()` waits at least 60 seconds after the
 PurgeQueue RPC because AWS may delete messages sent during that asynchronous
 window. Operations on the same physical queue wait behind the barrier; other

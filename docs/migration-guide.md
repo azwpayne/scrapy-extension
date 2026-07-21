@@ -250,6 +250,12 @@ prior tokens before the new assignment can be settled. Code that directly
 calls `pop_with_ack()` must retain and return the exact token, rather than
 reconstructing one from topic/partition/offset.
 
+Pulsar tokens now allow exactly one successful terminal action across ACK and
+NACK, including concurrent calls. A client exception leaves the same token
+retryable. `pop_with_ack()` no longer also populates the legacy tokenless slot,
+so direct integrations must retain and settle the returned token; code that
+intentionally uses tokenless settlement must continue to call `pop()`.
+
 Kafka `clear_queue()` now raises `NotImplementedError`. The previous
 delete-and-immediately-recreate sequence was not a completion barrier: topic
 deletion propagates asynchronously, newly accepted records can race the old

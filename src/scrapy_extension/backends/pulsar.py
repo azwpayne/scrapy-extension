@@ -18,6 +18,7 @@ API verified against the pulsar-client sync Python client:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -84,7 +85,13 @@ class _PulsarAckToken:
           tokens use its identity to reject stale tokens after reconnect.
   """
 
-  __slots__ = ("consumer", "message_id", "topic")
+  __slots__ = (
+    "_settlement_lock",
+    "_settlement_state",
+    "consumer",
+    "message_id",
+    "topic",
+  )
 
   def __init__(self, message_id: Any, topic: str, consumer: Any = None) -> None:
     """Initialize the token.
@@ -98,6 +105,38 @@ class _PulsarAckToken:
     self.message_id = message_id
     self.topic = topic
     self.consumer = consumer
+    self._settlement_lock = Lock()
+    self._settlement_state = "pending"
+
+  def _settle(
+    self, terminal_state: str, operation: Callable[[], None]
+  ) -> bool:
+    """Run one terminal broker action, restoring retryability on failure.
+
+    The token lock covers the broker call. A competing ack or nack therefore
+    observes either the restored ``pending`` state after an exception or the
+    published terminal state after success; it can never race a still-uncertain
+    settlement.
+
+    Args:
+        terminal_state: State to publish after ``operation`` succeeds.
+        operation: Broker action to execute while this token is claimed.
+
+    Returns:
+        True when this call completed the broker action; False when another
+        successful action had already made the token terminal.
+    """
+    with self._settlement_lock:
+      if self._settlement_state != "pending":
+        return False
+      self._settlement_state = "settling"
+      completed = False
+      try:
+        operation()
+        completed = True
+      finally:
+        self._settlement_state = terminal_state if completed else "pending"
+      return True
 
   def __eq__(self, other: object) -> bool:
     if not isinstance(other, _PulsarAckToken):
@@ -203,9 +242,11 @@ class PulsarBackend(Backend, QueueBackend):
   ``msg.message_id()``) tracked in the in-flight set; :meth:`ack` /
   :meth:`nack` use the token to ack the *specific* message — correct under
   ``CONCURRENT_REQUESTS > 1`` (N pops before any ack no longer overwrite a
-  single slot). The in-flight set is diagnostic (leak detection / monitoring)
-  since Pulsar acks each message independently. The legacy ``pop()`` /
-  ``ack(token=None)`` path tracks ``_last_msg`` for backward compatibility.
+  single slot). Each token permits one successful ack or nack; client failures
+  leave it retryable, and competing terminal actions are serialized. The
+  in-flight set is diagnostic (leak detection / monitoring) since Pulsar acks
+  each message independently. The legacy ``pop()`` / ``ack(token=None)`` path
+  separately tracks ``_last_msg`` for backward compatibility.
 
   Attributes:
       config: PulsarSettings instance.
@@ -249,6 +290,7 @@ class PulsarBackend(Backend, QueueBackend):
     # watermark commit), so the set is for leak detection / monitoring —
     # mirrors RabbitMQ's ``_in_flight_tags``.
     self._in_flight: set[_PulsarAckToken] = set()
+    self._in_flight_lock = Lock()
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
 
@@ -320,7 +362,8 @@ class PulsarBackend(Backend, QueueBackend):
       self._client = None
       self._last_msg = None
       self._last_delivery = None
-      self._in_flight.clear()
+      with self._in_flight_lock:
+        self._in_flight.clear()
     for consumer in consumers.values():
       with _suppress_pulsar_errors():
         consumer.close()
@@ -471,7 +514,8 @@ class PulsarBackend(Backend, QueueBackend):
     :meth:`ack` can ``acknowledge`` the *specific* message — correct under
     ``CONCURRENT_REQUESTS > 1`` (no single-slot overwrite, no message
     lost/skipped). Pulsar's Shared subscription is natively per-message, so
-    the token carries exactly what ``consumer.acknowledge`` needs.
+    the token carries exactly what ``consumer.acknowledge`` needs. This token
+    path does not populate the legacy last-message settlement slot.
 
     Args:
         queue_name: Name of the queue.
@@ -496,10 +540,6 @@ class PulsarBackend(Backend, QueueBackend):
       consumer=consumer,
     )
     self._track_in_flight(token)
-    # Keep _last_msg in sync so the legacy ack(token=None) path stays
-    # usable for callers that don't thread the token through.
-    self._last_msg = msg
-    self._last_delivery = (consumer, msg)
     return (_message_bytes(msg), token)
 
   def _track_in_flight(self, token: _PulsarAckToken) -> None:
@@ -516,18 +556,19 @@ class PulsarBackend(Backend, QueueBackend):
     Args:
         token: The :class:`_PulsarAckToken` to track.
     """
-    if len(self._in_flight) < _MAX_IN_FLIGHT:
-      self._in_flight.add(token)
-      return
-    if not self._in_flight_overflow_warned:
-      self._in_flight_overflow_warned = True
-      logger.warning(
-        "Pulsar in-flight ack-token set at cap (%d) — further unacked "
-        "pops will not be tracked in the diagnostic set. This indicates "
-        "slow acks or an ack leak; the broker still tracks message_ids "
-        "so ack correctness is unaffected.",
-        _MAX_IN_FLIGHT,
-      )
+    with self._in_flight_lock:
+      if len(self._in_flight) < _MAX_IN_FLIGHT:
+        self._in_flight.add(token)
+        return
+      if not self._in_flight_overflow_warned:
+        self._in_flight_overflow_warned = True
+        logger.warning(
+          "Pulsar in-flight ack-token set at cap (%d) — further unacked "
+          "pops will not be tracked in the diagnostic set. This indicates "
+          "slow acks or an ack leak; the broker still tracks message_ids "
+          "so ack correctness is unaffected.",
+          _MAX_IN_FLIGHT,
+        )
 
   def _receive(self, queue_name: str, timeout: float) -> tuple[Any, Any]:
     """Receive one message and return it with the consumer that delivered it.
@@ -578,7 +619,9 @@ class PulsarBackend(Backend, QueueBackend):
     With a ``token`` (the scheduler path under ``CONCURRENT_REQUESTS > 1``):
     ``consumer.acknowledge(token.message_id)`` the specific message and
     remove the token from the in-flight set. Order-independent — ack the
-    right message regardless of pop/ack interleaving.
+    right message regardless of pop/ack interleaving. A successful ack is
+    terminal across later ack/nack calls; a client exception raises
+    :class:`QueueError` and leaves the token retryable.
 
     Without a ``token`` (legacy single-pop caller): ``acknowledge`` the
     tracked ``_last_msg``. Only correct for ``CONCURRENT_REQUESTS=1`` —
@@ -619,21 +662,27 @@ class PulsarBackend(Backend, QueueBackend):
   def _ack_token(self, token: _PulsarAckToken) -> None:
     """Ack the specific message identified by ``token``.
 
-    Pulsar's ack is per-message (not a watermark commit like Kafka), so this
-    is a single ``acknowledge(message_id)`` call. Idempotent at the broker:
-    re-acking an already-acked message_id is a no-op server-side; the
-    in-flight ``discard`` is always safe.
+    Pulsar's ack is per-message (not a watermark commit like Kafka). The
+    token's settlement lock guarantees that a successful ack is the only
+    terminal broker action, while a client exception restores the token to
+    its retryable pending state.
     """
     consumer = self._consumer_for_token(token)
     if consumer is None:
-      self._in_flight.discard(token)
+      token._settle("stale", lambda: None)
+      self._discard_in_flight(token)
       return
-    try:
-      consumer.acknowledge(token.message_id)
-    except Exception as e:
-      raise QueueError(f"Failed to ack Pulsar message: {e}", operation="ack") from e
-    finally:
-      self._in_flight.discard(token)
+
+    def acknowledge() -> None:
+      try:
+        consumer.acknowledge(token.message_id)
+      except Exception as e:
+        raise QueueError(
+          f"Failed to ack Pulsar message: {e}", operation="ack"
+        ) from e
+
+    token._settle("acked", acknowledge)
+    self._discard_in_flight(token)
 
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Negative-acknowledge a popped message for re-delivery.
@@ -642,7 +691,8 @@ class PulsarBackend(Backend, QueueBackend):
     if the client supports it, scheduling the specific message for
     immediate re-delivery; otherwise no-op (the message stays unacked and
     is redelivered on the unacked-timeout / consumer restart —
-    at-least-once). Either way the token is removed from the in-flight set.
+    at-least-once). Success is terminal across later ack/nack calls and removes
+    the token from the in-flight set; a client exception leaves it retryable.
 
     Without a ``token`` (legacy): nack the tracked ``_last_msg``.
 
@@ -680,18 +730,31 @@ class PulsarBackend(Backend, QueueBackend):
       self._last_delivery = None
 
   def _nack_token(self, token: _PulsarAckToken) -> None:
-    """Nack the specific message identified by ``token``."""
+    """Nack one token exactly once, retaining it after client failure."""
     consumer = self._consumer_for_token(token)
-    try:
-      nack = getattr(consumer, "negative_acknowledge", None)
-      if callable(nack):
-        nack(token.message_id)
-      # else: leave unacked -> redelivered on timeout / restart
-    except Exception as e:
-      raise QueueError(
-        f"Failed to nack Pulsar message: {e}", operation="nack"
-      ) from e
-    else:
+    if consumer is None:
+      token._settle("stale", lambda: None)
+      self._discard_in_flight(token)
+      return
+
+    def negative_acknowledge() -> None:
+      try:
+        nack = getattr(consumer, "negative_acknowledge", None)
+        if callable(nack):
+          nack(token.message_id)
+        # Older clients without the method leave the message unacked for
+        # timeout/restart redelivery; accepting nack is still terminal locally.
+      except Exception as e:
+        raise QueueError(
+          f"Failed to nack Pulsar message: {e}", operation="nack"
+        ) from e
+
+    token._settle("nacked", negative_acknowledge)
+    self._discard_in_flight(token)
+
+  def _discard_in_flight(self, token: _PulsarAckToken) -> None:
+    """Remove a terminal token from the bounded diagnostic set."""
+    with self._in_flight_lock:
       self._in_flight.discard(token)
 
   def _consumer_for_token(self, token: _PulsarAckToken) -> Any:

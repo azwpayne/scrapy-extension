@@ -679,8 +679,8 @@ class TestPulsarRealAck:
     consumer.acknowledge.assert_called_once_with(msg_id)
     assert b._in_flight == set()
 
-  def test_ack_with_token_idempotent_re_ack(self, mocker) -> None:
-    """Re-acking a discarded token is a safe no-op on the in-flight set."""
+  def test_ack_with_token_is_one_shot(self, mocker) -> None:
+    """A successful token ack performs exactly one broker operation."""
     msg = mocker.MagicMock()
     msg.data.return_value = b"x"
     msg.message_id.return_value = mocker.MagicMock()
@@ -689,11 +689,140 @@ class TestPulsarRealAck:
     b, _ = _connected(mocker, subscribe=consumer)
     _, token = b.pop_with_ack("q")
     b.ack("q", token=token)
-    # Second ack on the same token — acknowledge fires again (Pulsar ack is
-    # idempotent at the broker) but the in-flight set stays empty.
     b.ack("q", token=token)
-    assert consumer.acknowledge.call_count == 2
+    assert consumer.acknowledge.call_count == 1
     assert b._in_flight == set()
+
+  def test_ack_then_nack_has_one_terminal_broker_call(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+
+    b.ack("q", token=token)
+    b.nack("q", token=token)
+
+    consumer.acknowledge.assert_called_once_with(token.message_id)
+    consumer.negative_acknowledge.assert_not_called()
+
+  def test_nack_then_ack_has_one_terminal_broker_call(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+
+    b.nack("q", token=token)
+    b.ack("q", token=token)
+
+    consumer.negative_acknowledge.assert_called_once_with(token.message_id)
+    consumer.acknowledge.assert_not_called()
+
+  def test_failed_ack_is_retryable_then_terminal(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    consumer.acknowledge.side_effect = [RuntimeError("ack failed"), None]
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+
+    with pytest.raises(QueueError, match="Failed to ack Pulsar message"):
+      b.ack("q", token=token)
+    assert token in b._in_flight
+
+    b.ack("q", token=token)
+    b.nack("q", token=token)
+
+    assert consumer.acknowledge.call_count == 2
+    consumer.negative_acknowledge.assert_not_called()
+    assert token not in b._in_flight
+
+  def test_failed_nack_is_retryable_then_terminal(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    consumer.negative_acknowledge.side_effect = [RuntimeError("nack failed"), None]
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+
+    with pytest.raises(QueueError, match="Failed to nack Pulsar message"):
+      b.nack("q", token=token)
+    assert token in b._in_flight
+
+    b.nack("q", token=token)
+    b.ack("q", token=token)
+
+    assert consumer.negative_acknowledge.call_count == 2
+    consumer.acknowledge.assert_not_called()
+    assert token not in b._in_flight
+
+  def test_concurrent_ack_and_nack_claim_one_terminal_action(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    ack_entered = Event()
+    release_ack = Event()
+
+    def blocking_ack(_message_id) -> None:
+      ack_entered.set()
+      assert release_ack.wait(timeout=2.0)
+
+    consumer.acknowledge.side_effect = blocking_ack
+    b, _ = _connected(mocker, subscribe=consumer)
+    _, token = b.pop_with_ack("q")
+    errors: list[BaseException] = []
+
+    def settle(action) -> None:
+      try:
+        action("q", token=token)
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    ack_thread = Thread(target=settle, args=(b.ack,))
+    nack_thread = Thread(target=settle, args=(b.nack,))
+    ack_thread.start()
+    assert ack_entered.wait(timeout=2.0)
+    nack_thread.start()
+    nack_thread.join(timeout=0.2)
+    settlement_was_serialized = nack_thread.is_alive()
+    release_ack.set()
+    ack_thread.join(timeout=2.0)
+    nack_thread.join(timeout=2.0)
+
+    assert settlement_was_serialized
+    assert not ack_thread.is_alive()
+    assert not nack_thread.is_alive()
+    assert errors == []
+    consumer.acknowledge.assert_called_once_with(token.message_id)
+    consumer.negative_acknowledge.assert_not_called()
+
+  def test_token_pop_does_not_populate_legacy_settlement_slot(self, mocker) -> None:
+    msg = mocker.MagicMock()
+    msg.data.return_value = b"x"
+    msg.message_id.return_value = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.receive.return_value = msg
+    b, _ = _connected(mocker, subscribe=consumer)
+
+    _, token = b.pop_with_ack("q")
+
+    assert b._last_msg is None
+    assert b._last_delivery is None
+    b.ack("q", token=token)
+    b.nack("q")
+    consumer.acknowledge.assert_called_once_with(token.message_id)
+    consumer.negative_acknowledge.assert_not_called()
 
   def test_nack_with_token_calls_negative_acknowledge(self, mocker) -> None:
     msg = mocker.MagicMock()
@@ -720,6 +849,8 @@ class TestPulsarRealAck:
     b, _ = _connected(mocker, subscribe=consumer)
     _, token = b.pop_with_ack("q")
     b.nack("q", token=token)  # must not raise
+    b.ack("q", token=token)
+    consumer.acknowledge.assert_not_called()
     assert b._in_flight == set()
 
   def test_crash_mid_ack_leaves_messages_in_flight(self, mocker) -> None:
