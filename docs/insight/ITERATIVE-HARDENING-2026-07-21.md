@@ -102,7 +102,7 @@ speculative work.
 
 ### Active P0/P1 tasks
 
-- [ ] **PKG-01 — canonical release artifacts.** Move `CHANGELOG.md`,
+- [x] **PKG-01 — canonical release artifacts.** Move `CHANGELOG.md`,
   `CONTRIBUTING.md`, `LICENSE`, `SECURITY.md`, and `STABILITY.md` back to the
   root; restore all public links; assert wheel/sdist contents and metadata.
 - [ ] **TEST-01 — complete test dependency group.** Add direct test dependencies
@@ -174,3 +174,15 @@ old behaviour (where applicable), passes after the change, and the relevant
 global gates stay green. External integration items remain explicitly
 "unverified locally" unless a real broker or cloud service was exercised; mocks
 must not be described as end-to-end evidence.
+
+## Resolution log
+
+### I1 — canonical release artifacts
+
+Restored the five standard files to the repository root and restored the README
+licence link. `uv build --clear` produced both formats; the sdist contains all
+five files, the wheel contains `dist-info/licenses/LICENSE` and `py.typed`, and
+its metadata reports the MIT licence and Python `>=3.10`. A fresh Python 3.10
+environment installed only the built wheel and imported version `0.1.0` from
+`site-packages`. The repository suite then passed with 2,905 tests and 44
+documented skips using an isolated home directory.
