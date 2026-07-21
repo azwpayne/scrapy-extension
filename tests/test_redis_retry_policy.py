@@ -17,7 +17,7 @@ from redis.cluster import (
   RedisCluster as SdkRedisCluster,
 )
 from redis.connection import Connection
-from redis.exceptions import AuthenticationError
+from redis.exceptions import AuthenticationError, ClusterError, MovedError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
 from redis.sentinel import (
@@ -111,6 +111,31 @@ class _CommittedThenResponseLostConnection(Connection):
 
   def disconnect(self, *args, **kwargs) -> None:
     type(self).disconnect_calls += 1
+
+  def should_reconnect(self) -> bool:
+    return False
+
+
+class _AlwaysMovedConnection(Connection):
+  """Hermetic Redis wire seam that returns MOVED for every command."""
+
+  commands: ClassVar[list[tuple[Any, ...]]] = []
+  moved_slot: ClassVar[int] = 0
+
+  def connect(self) -> None:
+    return None
+
+  def can_read(self, timeout: float = 0) -> bool:
+    return False
+
+  def send_command(self, *args, **kwargs) -> None:
+    type(self).commands.append(args)
+
+  def read_response(self, *args, **kwargs):
+    raise MovedError(f"{type(self).moved_slot} cluster-a:6379")
+
+  def disconnect(self, *args, **kwargs) -> None:
+    return None
 
   def should_reconnect(self) -> bool:
     return False
@@ -410,6 +435,7 @@ def test_real_sdk_honors_captured_policy_without_deprecated_argument_warning(
   try:
     pool_retry = sdk_client.connection_pool.connection_kwargs["retry"]
     _assert_no_ambiguous_replay(pool_retry)
+    assert sdk_client.connection_pool.max_connections == 2**31
   finally:
     sdk_client.close()
 
@@ -509,6 +535,64 @@ def test_real_cluster_script_transport_does_not_replay_after_lost_response(
     backend.disconnect()
 
   assert len(sdk_clients) == 1
+
+
+@pytest.mark.parametrize(
+  ("cluster_max_redirects", "expected_follow_ups"),
+  [(0, 0), (2, 2)],
+)
+def test_real_cluster_max_redirects_bounds_consecutive_moved_follow_ups(
+  mocker,
+  cluster_max_redirects: int,
+  expected_follow_ups: int,
+) -> None:
+  """Exercise the real RedisCluster MOVED loop without network access."""
+  _AlwaysMovedConnection.commands = []
+  mocker.patch.object(NodesManager, "initialize", autospec=True)
+  mocker.patch.object(CommandsParser, "initialize", autospec=True)
+
+  def real_cluster_factory(**kwargs):
+    client = SdkRedisCluster(**kwargs)
+    node = ClusterNode("cluster-a", 6379, server_type="primary")
+    node.redis_connection = client.nodes_manager.create_redis_node(
+      node.host, node.port
+    )
+    node.redis_connection.connection_pool.connection_class = (
+      _AlwaysMovedConnection
+    )
+    slot = client.keyslot(b"{scrapy-extension:queue:queue}:items")
+    _AlwaysMovedConnection.moved_slot = slot
+    client.nodes_manager.nodes_cache = {node.name: node}
+    client.nodes_manager.slots_cache = {slot: [node]}
+    client.nodes_manager.default_node = node
+    client.ping = lambda: True  # type: ignore[method-assign]
+    return client
+
+  mocker.patch(
+    "scrapy_extension.backends.redis.RedisCluster",
+    side_effect=real_cluster_factory,
+  )
+  backend = RedisBackend(
+    RedisSettings(
+      mode=RedisMode.CLUSTER,
+      cluster_startup_nodes=["cluster-a:6379"],
+      cluster_max_redirects=cluster_max_redirects,
+    )
+  )
+
+  try:
+    backend.connect()
+    with pytest.raises(QueueError) as exc_info:
+      backend.push("queue", b"payload")
+  finally:
+    backend.disconnect()
+
+  assert isinstance(exc_info.value.__cause__, ClusterError)
+  assert all(
+    command[0] in {"EVALSHA", "EVAL"}
+    for command in _AlwaysMovedConnection.commands
+  )
+  assert len(_AlwaysMovedConnection.commands) - 1 == expected_follow_ups
 
 
 def test_real_sentinel_master_transport_does_not_replay_lost_response(

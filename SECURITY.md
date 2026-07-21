@@ -101,6 +101,8 @@ before any network call. Each guard raises `ConfigurationError` with
 | SEC-4 | `settings/{sqs,dynamodb}.py` `_validate_endpoint_url_scheme` | `endpoint_url` without `http://` or `https://` scheme |
 | SV4 | `settings/{mongodb,pulsar,rocketmq,elasticsearch,sqs,dynamodb}.py` | malformed URLs / missing scheme on host fields |
 | SV3 | `settings/{kafka,pulsar,redis,mongodb,elasticsearch,sqs,dynamodb}.py` | cross-field auth/transport incoherence — e.g. SASL username without password, TLS cert without key, mismatched auth mode |
+| Redis endpoint boundary | `settings/redis.py` | URI/userinfo, path/query/fragment, control/whitespace, malformed DNS/IP, or invalid port in a scalar/node address; raw address is omitted from the error |
+| Redis TLS intent | `settings/redis.py` | CA/client-certificate/key material supplied while TLS is disabled; the backend never silently chooses plaintext or auto-enables TLS |
 | trusted network | `settings/memcached.py` | non-loopback unauthenticated plaintext without explicit `allow_remote_plaintext=True` acknowledgement |
 | SEC-7 | `backends/connectors.py` connect path | AWS credential XOR — half-configured `aws_access_key_id` / `aws_secret_access_key` caught before connect |
 | round-9 | `settings/{sqs,dynamodb}.py` `_validate_aws_credentials_both_or_neither` | both-or-neither AWS credential enforcement at config time (config-path sibling of SEC-7's connect-path check) |

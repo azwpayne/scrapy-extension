@@ -62,6 +62,20 @@ upgrading.
   request after a timeout when enabled. This Retry policy does not retry
   authentication failures, although Sentinel may continue to another
   configured endpoint; manager-level connection attempts remain separate.
+- **Redis deployment-mode inputs now match effective SDK behavior.** Cluster
+  rejects `db != 0` instead of silently using DB0. `master_slave` remains only
+  as a deprecated primary-only alias; its historical `replicas` and
+  `read_from_replicas` inputs are deprecated and now require empty/false rather
+  than pretending to route stale reads. Redis node lists accept only strict
+  `host:port` / `[IPv6]:port` syntax; scalar ports reject coercive bool, float,
+  bytes, sign, separator, and whitespace forms; and ambiguous legacy numeric
+  IPv4 spellings must be written as canonical dotted quads. Scheme, userinfo,
+  path, query, and control-character forms fail without retaining the address.
+  Non-selected topology inputs, the historical `masters` input, and Cluster
+  redirect budgets above 100 now fail instead of being ignored. Supplying TLS
+  certificate material while TLS is disabled also fails instead of silently
+  opening plaintext. See the migration guide before carrying an old mode
+  configuration into the next pre-1.0 minor release.
 - **Storage TTL inputs and results are uniform across all five backends.** Direct
   `StorageBackend.store` calls accept only `None` or a positive integer number
   of seconds; zero, negatives, floats, and booleans now raise `ValueError`.
@@ -487,6 +501,25 @@ upgrading.
 
 ### Fixed
 
+- Redis Sentinel no longer forwards TLS-only keywords into a plaintext
+  discovered-master pool. Non-TLS Sentinel generations can now construct their
+  real redis-py managed data connection across the supported 7.3–8.x range;
+  TLS still selects the managed SSL connection and forwards the complete trust
+  bundle to both control and data planes.
+- Redis Cluster now maps the redis-py `RedisClusterException` hierarchy (which
+  is separate from `RedisError`) into the existing health/queue/set/storage
+  contracts. Public operation messages no longer copy driver, command,
+  response, or payload text; protected diagnostics can inspect the original
+  data-plane exception through `__cause__`.
+- `cluster_max_redirects` now controls the instance-local redis-py protocol
+  continuation budget (initial attempt plus the configured MOVED/ASK/TRYAGAIN
+  follow-ups) without changing the zero-replay transport policy. Opt-in
+  `decode_responses` now uses lossless surrogate escaping so arbitrary binary
+  queue/storage values round-trip instead of failing after an atomic pop has
+  already removed the message.
+- An unset Redis per-pool connection limit now maps to the stable redis-py 7.3
+  effectively-unbounded value instead of inheriting redis-py 8's new default
+  cap of 100.
 - Pulsar `consumer_type="Key_Shared"` now maps to the real Python SDK member
   `ConsumerType.KeyShared`; permissive whole-module mocks had fabricated the
   misspelled attribute and hidden the production failure. Tests now retain the

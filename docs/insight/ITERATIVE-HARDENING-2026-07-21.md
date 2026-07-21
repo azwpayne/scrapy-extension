@@ -101,6 +101,7 @@ global gates, then perform a fresh audit before selecting the next item.
 | I40 | Give Redis operations immutable leased client generations | no operation or queued connect intent can cross teardown; Sentinel resources close |
 | I41 | Remove outcome-ambiguous redis-py command retries | a response timeout cannot replay queue push/pop Lua mutations |
 | I42 | Make Redis deployment-mode settings truthful to redis-py | unsupported Cluster knobs and primary-only master-slave semantics fail or document explicitly |
+| I43 | Remove fix-available pyasn1 advisories from the locked dependency graph | `uv audit --locked` reports neither pyasn1 advisory and compatibility gates remain green |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -296,7 +297,7 @@ speculative work.
   twice or consume a second item. Define the migration semantics of the public
   `retry_on_timeout` setting instead of forwarding a deprecated flag that
   redis-py 8 does not honor as false.
-- [ ] **BACKEND-09B — truthful Redis mode/SDK parameters.** Finish aligning
+- [x] **BACKEND-09B — truthful Redis mode/SDK parameters.** Finish aligning
   Sentinel and Cluster construction with supported redis-py parameters, reject
   Cluster database selections the server ignores, and resolve the advertised
   master-slave replica-read settings that currently route every operation to
@@ -305,6 +306,11 @@ speculative work.
   endpoints and sanitize direct settings-validation failures so an endpoint
   cannot retain or disclose embedded credentials. Unsupported settings must
   not remain accepted no-ops.
+- [ ] **DEP-01 — pyasn1 advisory refresh.** Move the transitive lock from
+  pyasn1 0.6.3 to a fixed compatible release, verify the
+  Scrapy/service-identity dependency chain, and retain the separately
+  documented no-fix Scrapy advisory rather than conflating it with
+  fix-available findings.
 - [ ] **CONCURRENCY-01F — Kafka client generations.** Publish producer, admin,
   consumer, validated settings, and topic-policy caches as one generation;
   failed candidates must not clear a healthy generation.
@@ -1550,3 +1556,58 @@ the final review found no remaining reproducible P0/P1/P2 in I41. Deployment
 mode truthfulness, typed Cluster exceptions, Cluster DB/redirect controls,
 primary-only master-slave behavior, and endpoint/userinfo hardening remain the
 bounded I42 scope.
+
+### I42 — Redis deployment-mode truth and SDK boundaries
+
+Eight independent pre-implementation audits covered Sentinel and Cluster SDK
+contracts, endpoint security, master-slave semantics, public errors, tests,
+compatibility, and documentation. The first 72 focused contract tests produced
+61 deterministic failures and 11 controls. They reproduced a plaintext
+Sentinel discovered-master pool crash, silent Cluster DB selection, an unused
+redirect setting, raw Cluster exceptions, userinfo and ambiguous endpoint
+acceptance, bracketed IPv6 reaching DNS, unsupported replica-read claims,
+plaintext TLS-intent drift, and destructive-pop decode failure.
+
+Redis now accepts three effective topologies plus a deprecated primary-only
+`master_slave` alias. Non-empty replica inputs, non-selected topology intent,
+the rejected `masters` tombstone, and Cluster DB values other than zero fail
+before SDK I/O. Hosts, scalar ports, and node lists share a strict value-free
+grammar: URI/userinfo/path/control forms, coercive port shapes, malformed
+environment JSON, and legacy numeric IPv4 spellings cannot survive validation
+or mutation revalidation. Bracketed IPv6 is normalized before the SDK, and the
+Cluster scalar-host fallback preserves the required brackets only while
+formatting the intermediate endpoint.
+
+Sentinel emits TLS-only arguments only for TLS pools and keeps control/data
+credentials separate. An unset per-pool connection limit is normalized to the
+redis-py 7.3 effectively-unbounded value rather than redis-py 8's changed
+default of 100. Cluster is DB0-only, and its configured redirect follow-up
+budget maps to the instance-local `RedisClusterRequestTTL` without changing
+the zero-replay transport policy. Real redis-py connection seams prove that
+zero and two configured redirects yield exactly zero and two MOVED follow-ups.
+
+Every bundled operation now maps `RedisError`, the parallel
+`RedisClusterException` hierarchy, and pool `ChildDeadlockedError` into the
+existing health/queue/set/storage contracts. Public messages remain static;
+the protected data-plane cause retains SDK detail. Opt-in response decoding
+uses `surrogateescape` in both directions, so arbitrary binary queue and
+storage values remain byte-identical even after an atomic pop. Generic startup
+failures and settings-validation failures are raised outside raw exception
+handlers, leaving no credential-bearing context chain.
+
+Eight implementation reviewers found and closed the scalar IPv6 fallback,
+strict scalar-port and numeric-host gaps, cross-mode no-ops, `masters`
+direct/environment/mutation paths, per-pool default drift, pool deadlock
+exception, dynamic non-SDK messages, warning timing, malformed environment
+JSON retention, and migration-document omissions. The final independent
+review reported no remaining reproducible P0/P1/P2 in I42.
+
+The isolated redis-py 7.3.0 compatibility run passed 768 Redis/settings tests,
+including real Sentinel pools, real Cluster routing, retries, generations, and
+all public backend interfaces. Python 3.10 and 3.14 full suites each passed
+3,542 tests with 46 documented skips. The two-worker Redis canary passed 138
+tests. Ruff, strict mypy, configured Bandit, lockfile validation, and patch
+integrity remained green. The dependency audit separately found two newly
+published, fix-available pyasn1 0.6.3 advisories plus the already documented
+no-fix Scrapy advisory; the pyasn1 refresh is therefore bounded as I43 rather
+than mixed into this Redis atomic commit.

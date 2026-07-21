@@ -54,7 +54,7 @@ environment variable does not override a value already present in
 
 | Backend | Queue | Set | Storage | Modes |
 |---|---:|---:|---:|---|
-| Redis | yes | yes | yes | standalone, master_slave, sentinel, cluster |
+| Redis | yes | yes | yes | standalone, sentinel, cluster; deprecated primary-only `master_slave` alias |
 | MongoDB | yes | yes | yes | standalone, replica_set, sharded_cluster, atlas |
 | Kafka | yes | no | no | standalone, cluster, confluent |
 | RabbitMQ | yes | no | no | standalone, cluster, mirrored_queues |
@@ -124,11 +124,10 @@ upgrading; see the
 Deployment modes:
 
 ```python
-# Master/replicas
-SCRAPY_REDIS_MODE = "master_slave"
-SCRAPY_REDIS_HOST = "master.redis.internal"
-SCRAPY_REDIS_REPLICAS = ["replica1:6379", "replica2:6379"]
-SCRAPY_REDIS_READ_FROM_REPLICAS = True
+# One static primary (the old master_slave spelling is a deprecated
+# primary-only alias and does not support replica reads)
+SCRAPY_REDIS_MODE = "standalone"
+SCRAPY_REDIS_HOST = "primary.redis.internal"
 
 # Sentinel
 SCRAPY_REDIS_MODE = "sentinel"
@@ -138,6 +137,7 @@ SCRAPY_REDIS_SENTINEL_MASTER_NAME = "mymaster"
 # Cluster
 SCRAPY_REDIS_MODE = "cluster"
 SCRAPY_REDIS_CLUSTER_STARTUP_NODES = ["node1:7000", "node2:7000"]
+SCRAPY_REDIS_DB = 0  # Redis Cluster supports DB0 only
 SCRAPY_REDIS_CLUSTER_MAX_REDIRECTS = 5
 
 # TLS fields use these exact names
@@ -145,6 +145,11 @@ SCRAPY_REDIS_SSL_ENABLED = True
 SCRAPY_REDIS_SSL_CAFILE = "/etc/ssl/redis-ca.pem"
 SCRAPY_REDIS_SSL_CHECK_HOSTNAME = True
 ```
+
+Redis addresses must be bare scalar hosts or `host:port` / `[IPv6]:port` list
+entries; put credentials in their dedicated fields. TLS certificate material
+requires `SSL_ENABLED=True`. Sentinel control credentials are independent from
+the discovered Redis master's credentials, so configure both when necessary.
 
 The mixin spider needs only the backend declaration:
 

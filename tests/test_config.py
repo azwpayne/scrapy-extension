@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from scrapy_extension.backends.base import BackendType
+from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.settings import RedisSettings, Settings
 
 
@@ -71,10 +72,10 @@ class TestRedisSettings:
 
   def test_port_validation(self):
     """Test port validation."""
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigurationError):
       RedisSettings(port=0)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigurationError):
       RedisSettings(port=70000)
 
   def test_password_optional(self):

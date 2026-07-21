@@ -251,7 +251,10 @@ Components accept `monitor: Monitor = NullMonitor()` and call hooks: `on_queue_d
 
 Cross-validation: `_validate_backpressure_thresholds` (round-4 BP-1) — pause/resume non-negative, resume ≤ pause.
 
-Per-backend settings modules: `redis.py` (4 modes), `mongodb.py` (4 modes), `kafka.py` (3), `rabbitmq.py` (3), `elasticsearch.py` (2), `rocketmq.py` (3), `pulsar.py` (2), `sqs.py` (2), `memcached.py` (1), `dynamodb.py` (2).
+Per-backend settings modules: `redis.py` (3 effective topologies plus one
+deprecated primary-only compatibility alias), `mongodb.py` (4 modes),
+`kafka.py` (3), `rabbitmq.py` (3), `elasticsearch.py` (2), `rocketmq.py` (3),
+`pulsar.py` (2), `sqs.py` (2), `memcached.py` (1), `dynamodb.py` (2).
 
 ---
 

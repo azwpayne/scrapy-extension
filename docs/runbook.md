@@ -159,15 +159,44 @@ response loss can hide one already-consumed item; zero replay only prevents
 consuming a second item inside the same SDK call. Server-confirmed
 non-execution paths such as NOSCRIPT and Cluster MOVED/ASK/TRYAGAIN may still
 continue within the SDK. ClusterDown and SlotNotCovered fail fast because
-redis-py couples them to the same outer count as transport retries; recover
-through a later visible caller/manager connection attempt. Reconcile through
-application identities or domain state before retrying mutations. Remove the
+redis-py couples them to the same outer count as transport retries. An
+uncovered slot found during initial routing may not refresh on another ordinary
+call; explicitly `disconnect()` / `connect()` to construct a fresh Cluster
+topology. Reconcile through application identities or domain state before
+retrying mutations. Remove the
 deprecated `SCRAPY_REDIS_RETRY_ON_TIMEOUT` input; both values are retained only
 for config compatibility and have no data-plane effect. The similarly named
 Sentinel setting is separate and permits at most one immediate retry per
 read-only control request after a timeout. This Retry policy does not retry
 authentication failures, although Sentinel may continue to another configured
 endpoint; it does not replace manager-level connection attempts.
+
+Redis mode diagnostics:
+
+- Cluster runs only database zero. If `ConfigurationError.setting_name ==
+  "db"`, set `SCRAPY_REDIS_DB=0` and use a unique namespace or separate
+  Cluster for isolation; the old backend already discarded non-zero DB values.
+- `master_slave` is a deprecated primary-only alias. Remove `REPLICAS` and
+  `READ_FROM_REPLICAS`, then select `standalone` for the same behavior or
+  Sentinel for discovery/failover.
+- `cluster_max_redirects` is a 0–100 per-command protocol continuation budget,
+  separate from transport retry. Repeated MOVED/ASK/TRYAGAIN exhausting it
+  surfaces a typed backend error; do not increase it to mask a persistently
+  inconsistent topology.
+- Redis addresses are bare hosts plus separate ports, or list entries in
+  `host:port` / `[IPv6]:port` form. Split URI userinfo into the dedicated
+  username/password fields. Configuration errors intentionally omit the raw
+  endpoint.
+- `masters` is a rejected historical tombstone. Replace it with
+  `cluster_startup_nodes` and select Cluster mode. Topology nodes and
+  non-default controls for a different selected mode are rejected rather than
+  ignored.
+- A CA/certificate/key with TLS disabled is an intent conflict. Enable TLS or
+  remove the material; do not rely on automatic protocol selection.
+- Sentinel control and data credentials do not fall back to one another. With
+  S Sentinel addresses, capacity for `max_connections=N` is up to S control
+  pools plus one data pool, each capped at N. An unset limit is normalized to
+  the effectively-unbounded value `2**31` on every pool.
 
 ## Storage TTL semantics (expired = absent)
 
@@ -297,6 +326,12 @@ Common causes (round-9 SV1–SV5 close all of these):
 | "SASL username without password" / "TLS cert without key" | Cross-field auth incoherence (SV3) | `settings/{kafka,pulsar,redis,mongodb,elasticsearch,sqs,dynamodb}.py` |
 | "must start with a valid scheme" / "missing scheme" | Malformed host URL (SV4) | `settings/{mongodb,pulsar,rocketmq,elasticsearch,sqs,dynamodb}.py` |
 | "must be >= 0" / "must be a positive integer" | Unbounded-int / empty-string gap (SV5) | `settings/{memcached,redis,rabbitmq,base}.py` |
+| "Redis setting … contains an invalid address" | Redis URI/userinfo, malformed DNS/IP, unbracketed list IPv6, or invalid port | Use a bare scalar host or `host:port` / `[IPv6]:port` list entry; keep credentials separate |
+| "Redis setting 'masters' is unsupported" | Historical Cluster seed input was supplied | Replace it with `cluster_startup_nodes` and select Cluster mode |
+| "Redis setting … requires mode=…" | A non-default Sentinel/Cluster control belongs to another selected topology | Remove the unused setting or select the matching mode |
+| "Redis Cluster supports only database 0" | Cluster was configured with a non-zero DB that older code silently dropped | Set DB0 and isolate with `SCRAPY_REDIS_NAMESPACE` or another Cluster |
+| "Redis replica routing is unsupported" | Deprecated master-slave replica-read input is non-empty/true | Remove the replica fields; use standalone or Sentinel |
+| "Redis TLS certificate settings require ssl_enabled=True" | Certificate intent would otherwise open plaintext | Enable Redis TLS explicitly or remove all TLS material |
 | "tls_allow_invalid_certificates=True disables certificate verification" | Insecure TLS in production mode (SEC-2) | `settings/mongodb.py` |
 | "credentials over cleartext http://" | ES cloud creds over http (SEC-3) | `settings/elasticsearch.py` |
 | "Authenticated Pulsar connections require … verification" | Token auth attempted with plaintext or a TLS verification escape hatch | `settings/pulsar.py`; fix the broker CA/hostname and keep both validation flags secure |

@@ -363,8 +363,9 @@ class TestRedisHostBounds:
 
   def test_host_rejects_empty_string(self) -> None:
     """`host=""` must reject."""
-    with pytest.raises(ValidationError):
+    with pytest.raises(ConfigurationError) as exc_info:
       RedisSettings(host="")
+    assert exc_info.value.setting_name == "host"
 
 
 class TestRabbitMQHostBounds:

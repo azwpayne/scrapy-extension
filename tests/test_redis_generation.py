@@ -244,10 +244,13 @@ def test_connect_sanitizes_mutated_sentinel_validator_context(mocker) -> None:
   with pytest.raises(ConfigurationError) as exc_info:
     RedisBackend(settings).connect()
 
-  assert exc_info.value.setting_name == "sentinel_master_name"
+  # Endpoint grammar is validated before mode-required fields, so the secret-
+  # bearing address is rejected at the earliest boundary.
+  assert exc_info.value.setting_name == "sentinels"
   assert marker not in str(exc_info.value)
   assert marker not in repr(exc_info.value.setting_value)
   assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   constructor.assert_not_called()
 
 

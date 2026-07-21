@@ -3,7 +3,7 @@
 This module provides a Redis-based implementation of the backend interfaces
 for distributed crawling, supporting multiple deployment modes:
 - Standalone: Single Redis instance
-- Master-Slave: Read replicas with write to master
+- Master-Slave: Deprecated primary-only compatibility alias
 - Sentinel: High availability with automatic failover
 - Cluster: Redis Cluster with automatic sharding
 """
@@ -30,7 +30,11 @@ try:
   from redis import Redis
   from redis.backoff import NoBackoff
   from redis.cluster import ClusterNode, RedisCluster
-  from redis.exceptions import RedisError
+  from redis.exceptions import (
+    ChildDeadlockedError,
+    RedisClusterException,
+    RedisError,
+  )
   from redis.exceptions import TimeoutError as RedisTimeoutError
   from redis.retry import Retry
   from redis.sentinel import Sentinel
@@ -58,17 +62,28 @@ from scrapy_extension.exceptions import (
   StorageError,
 )
 from scrapy_extension.settings import RedisMode
-from scrapy_extension.settings.redis import RedisSettings
+from scrapy_extension.settings.redis import (
+  RedisSettings,
+  format_redis_endpoint,
+  parse_redis_endpoint,
+)
 
 logger = logging.getLogger(__name__)
 
 _REDIS_FIELD_ADAPTERS: dict[str, TypeAdapter[Any]] = {
   name: TypeAdapter(field.rebuild_annotation())
   for name, field in RedisSettings.model_fields.items()
+  if name != "masters"
 }
 
 _BLOCKING_POP_POLL_INTERVAL = 0.05
 _SENTINEL_CONTROL_RETRIES = 1
+_REDIS_EFFECTIVELY_UNBOUNDED_CONNECTIONS = 2**31
+_REDIS_OPERATION_ERRORS = (
+  RedisError,
+  RedisClusterException,
+  ChildDeadlockedError,
+)
 
 _POP_LUA = """
 local popped = redis.call('ZPOPMIN', KEYS[1])
@@ -138,9 +153,8 @@ class _RedisConnectionSnapshot:
   username: str | None
   socket_timeout: float | None
   socket_connect_timeout: float | None
-  max_connections: int | None
+  max_connections: int
   decode_responses: bool
-  replicas: tuple[str, ...]
   sentinel_nodes: tuple[tuple[str, int], ...]
   sentinel_master_name: str
   sentinel_username: str | None
@@ -184,12 +198,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   ``<namespace>:storage:crawl`` keys. This prevents Redis WRONGTYPE failures
   and cross-interface deletion when one backend instance serves all roles.
 
-  Supports standalone, master-slave, sentinel, and cluster deployment modes.
+  Supports standalone, Sentinel, and Cluster deployment modes. The historical
+  master-slave spelling is a deprecated primary-only compatibility alias.
 
   Attributes:
       config: RedisSettings instance with connection parameters.
       _client: The Redis client instance (None until connected).
-      _master_client: The master Redis client for master-slave mode.
+      _master_client: Compatibility reference to the primary/Sentinel master.
       _sentinel: Sentinel instance for sentinel mode.
   """
 
@@ -214,6 +229,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # caller that constructs RedisSettings inline could disclose literals.
         stacklevel=1,
       )
+    self._master_slave_warning_emitted = False
     self._connect_lock = threading.Lock()
     self._connect_local = threading.local()
     self._generation_condition = threading.Condition()
@@ -233,67 +249,70 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     values: tuple[str, ...], *, setting_name: str
   ) -> tuple[tuple[str, int], ...]:
     """Parse configured ``host:port`` values without exposing raw endpoints."""
-    nodes: list[tuple[str, int]] = []
-    try:
-      for value in values:
-        host, port_text = value.rsplit(":", 1)
-        port = int(port_text)
-        if not host or not 1 <= port <= 65535:
-          raise ValueError
-        nodes.append((host, port))
-    except (TypeError, ValueError):
-      raise BackendConnectionError(
-        f"Invalid Redis {setting_name} address.", backend_type="redis"
-      ) from None
-    return tuple(nodes)
+    return tuple(
+      parse_redis_endpoint(value, setting_name=setting_name, index=index)
+      for index, value in enumerate(values)
+    )
 
   def _capture_connection_plan(
     self,
   ) -> tuple[_RedisConnectionSnapshot, Any, Any]:
     """Copy and revalidate every value consumed by one connect attempt."""
     raw_values = self.config.__dict__.copy()
+    if raw_values.get("masters") is not None:
+      raise ConfigurationError(
+        "Redis setting 'masters' is unsupported; use cluster_startup_nodes.",
+        setting_name="masters",
+      )
     canonical_values: dict[str, Any] = {}
+    invalid_setting: str | None = None
     for setting_name, adapter in _REDIS_FIELD_ADAPTERS.items():
       try:
         canonical_values[setting_name] = adapter.validate_python(
           raw_values.get(setting_name), strict=True
         )
       except ValidationError:
-        raise ConfigurationError(
-          f"Invalid Redis setting '{setting_name}'.",
-          setting_name=setting_name,
-        ) from None
+        invalid_setting = setting_name
+        break
+    if invalid_setting is not None:
+      raise ConfigurationError(
+        f"Invalid Redis setting '{invalid_setting}'.",
+        setting_name=invalid_setting,
+      )
+
+    validated: RedisSettings | None = None
+    validation_setting: str | None = None
     try:
       validated = RedisSettings.model_validate(
         canonical_values, strict=True
       )
     except ConfigurationError as exc:
-      setting_name = exc.setting_name or "redis"
-      raise ConfigurationError(
-        f"Invalid Redis setting '{setting_name}'.",
-        setting_name=setting_name,
-      ) from None
+      validation_setting = exc.setting_name or "redis"
     except ValidationError as exc:
       errors = exc.errors()
       location = errors[0].get("loc", ()) if errors else ()
-      setting_name = str(location[0]) if location else "redis"
+      validation_setting = str(location[0]) if location else "redis"
+    if validation_setting is not None:
       raise ConfigurationError(
-        f"Invalid Redis setting '{setting_name}'.",
-        setting_name=setting_name,
-      ) from None
+        f"Invalid Redis setting '{validation_setting}'.",
+        setting_name=validation_setting,
+      )
+    assert validated is not None
 
     sentinel_nodes: tuple[tuple[str, int], ...] = ()
     if validated.mode == RedisMode.SENTINEL:
       sentinel_nodes = self._parse_nodes(
-        tuple(validated.sentinels), setting_name="sentinel"
+        tuple(validated.sentinels), setting_name="sentinels"
       )
     cluster_nodes: tuple[tuple[str, int], ...] = ()
     if validated.mode == RedisMode.CLUSTER:
       configured_nodes = tuple(validated.cluster_startup_nodes)
       if not configured_nodes:
-        configured_nodes = (f"{validated.host}:{validated.port}",)
+        configured_nodes = (
+          format_redis_endpoint(validated.host, validated.port),
+        )
       cluster_nodes = self._parse_nodes(
-        configured_nodes, setting_name="cluster startup-node"
+        configured_nodes, setting_name="cluster_startup_nodes"
       )
 
     snapshot = _RedisConnectionSnapshot(
@@ -305,9 +324,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       username=validated.username,
       socket_timeout=validated.socket_timeout,
       socket_connect_timeout=validated.socket_connect_timeout,
-      max_connections=validated.max_connections,
+      max_connections=(
+        validated.max_connections
+        if validated.max_connections is not None
+        else _REDIS_EFFECTIVELY_UNBOUNDED_CONNECTIONS
+      ),
       decode_responses=validated.decode_responses,
-      replicas=tuple(validated.replicas),
       sentinel_nodes=sentinel_nodes,
       sentinel_master_name=validated.sentinel_master_name,
       sentinel_username=validated.sentinel_username,
@@ -338,12 +360,29 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       ):
         raise _RedisConnectCancelled
 
+  def _warn_if_deprecated_mode(self, mode: RedisMode) -> None:
+    """Warn once when a validated connection plan actually uses the alias."""
+    if mode != RedisMode.MASTER_SLAVE or self._master_slave_warning_emitted:
+      return
+    warnings.warn(
+      (
+        "Redis master_slave mode is a deprecated primary-only compatibility "
+        "alias; it provides no replica reads, discovery, or failover. Use "
+        "standalone for a static primary or Sentinel for high availability."
+      ),
+      FutureWarning,
+      # Static library attribution prevents inline endpoint/credential
+      # literals from being rendered as warning source text.
+      stacklevel=1,
+    )
+    self._master_slave_warning_emitted = True
+
   @staticmethod
   def _base_client_kwargs(
     snapshot: _RedisConnectionSnapshot, password: Any
   ) -> dict[str, Any]:
     """Return shared SDK kwargs for one validated candidate."""
-    return {
+    kwargs: dict[str, Any] = {
       "host": snapshot.host,
       "port": snapshot.port,
       "db": snapshot.db,
@@ -354,7 +393,23 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "retry": _new_no_replay_retry(),
       "max_connections": snapshot.max_connections,
       "decode_responses": snapshot.decode_responses,
-      "ssl": snapshot.ssl_enabled,
+    }
+    kwargs.update(RedisBackend._response_decode_kwargs(snapshot))
+    kwargs.update(RedisBackend._tls_client_kwargs(snapshot))
+    return kwargs
+
+  @staticmethod
+  def _response_decode_kwargs(snapshot: _RedisConnectionSnapshot) -> dict[str, str]:
+    """Make opt-in response decoding lossless for byte-oriented contracts."""
+    return {"encoding_errors": "surrogateescape"} if snapshot.decode_responses else {}
+
+  @staticmethod
+  def _tls_client_kwargs(snapshot: _RedisConnectionSnapshot) -> dict[str, Any]:
+    """Return TLS-only SDK kwargs, or no transport kwargs for plaintext."""
+    if not snapshot.ssl_enabled:
+      return {}
+    return {
+      "ssl": True,
       "ssl_ca_certs": snapshot.ssl_cafile,
       "ssl_certfile": snapshot.ssl_certfile,
       "ssl_keyfile": snapshot.ssl_keyfile,
@@ -416,12 +471,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             snapshot.sentinel_retry_on_timeout
           ),
           "max_connections": snapshot.max_connections,
-          "ssl": snapshot.ssl_enabled,
-          "ssl_ca_certs": snapshot.ssl_cafile,
-          "ssl_certfile": snapshot.ssl_certfile,
-          "ssl_keyfile": snapshot.ssl_keyfile,
-          "ssl_check_hostname": snapshot.ssl_check_hostname,
         }
+        sentinel_kwargs.update(self._tls_client_kwargs(snapshot))
         if sentinel_password is not None:
           sentinel_kwargs["password"] = sentinel_password
         if snapshot.sentinel_username is not None:
@@ -446,11 +497,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           retry=_new_no_replay_retry(),
           max_connections=snapshot.max_connections,
           decode_responses=snapshot.decode_responses,
-          ssl=snapshot.ssl_enabled,
-          ssl_ca_certs=snapshot.ssl_cafile,
-          ssl_certfile=snapshot.ssl_certfile,
-          ssl_keyfile=snapshot.ssl_keyfile,
-          ssl_check_hostname=snapshot.ssl_check_hostname,
+          **self._response_decode_kwargs(snapshot),
+          **self._tls_client_kwargs(snapshot),
         )
         client = master_client
         self._raise_if_connect_cancelled(request_epoch)
@@ -459,21 +507,32 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           ClusterNode(host=host, port=port)  # type: ignore[no-untyped-call]
           for host, port in snapshot.cluster_nodes
         ]
-        client = RedisCluster(
-          startup_nodes=nodes,
-          password=password,
-          username=snapshot.username,
-          socket_timeout=snapshot.socket_timeout,
-          socket_connect_timeout=snapshot.socket_connect_timeout,
-          retry=_new_no_replay_retry(),
-          max_connections=snapshot.max_connections,
-          decode_responses=snapshot.decode_responses,
-          require_full_coverage=(not snapshot.cluster_skip_full_coverage_check),
-          ssl=snapshot.ssl_enabled,
-          ssl_ca_certs=snapshot.ssl_cafile,
-          ssl_certfile=snapshot.ssl_certfile,
-          ssl_keyfile=snapshot.ssl_keyfile,
-          ssl_check_hostname=snapshot.ssl_check_hostname,
+        cluster_kwargs: dict[str, Any] = {
+          "startup_nodes": nodes,
+          "password": password,
+          "username": snapshot.username,
+          "socket_timeout": snapshot.socket_timeout,
+          "socket_connect_timeout": snapshot.socket_connect_timeout,
+          "retry": _new_no_replay_retry(),
+          "max_connections": snapshot.max_connections,
+          "decode_responses": snapshot.decode_responses,
+          "require_full_coverage": (
+            not snapshot.cluster_skip_full_coverage_check
+          ),
+        }
+        cluster_kwargs.update(self._response_decode_kwargs(snapshot))
+        cluster_kwargs.update(self._tls_client_kwargs(snapshot))
+        client = RedisCluster(**cluster_kwargs)
+        if not hasattr(client, "RedisClusterRequestTTL"):
+          raise BackendConnectionError(
+            "Installed redis-py lacks the required Cluster redirect control.",
+            backend_type="redis",
+          )
+        # redis-py's loop budget includes the initial command attempt. Keep
+        # this override instance-local so independent backends cannot affect
+        # each other, and do not touch the separate transport Retry policy.
+        client.RedisClusterRequestTTL = (
+          snapshot.cluster_max_redirects + 1
         )
         self._raise_if_connect_cancelled(request_epoch)
       else:  # pragma: no cover - RedisSettings validation owns this branch
@@ -543,6 +602,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           if self._generation is not None:
             return True
         snapshot, password, sentinel_password = self._capture_connection_plan()
+        self._warn_if_deprecated_mode(snapshot.mode)
+        startup_error: BackendConnectionError | None = None
         try:
           self._build_and_publish_generation(
             snapshot, password, sentinel_password, request_epoch
@@ -558,16 +619,15 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           with self._generation_condition:
             if request_epoch != self._lifecycle_epoch or self._disconnecting:
               return False
-          raise BackendConnectionError(
+          startup_error = BackendConnectionError(
             f"Failed to connect to Redis ({snapshot.mode.value})",
             backend_type="redis",
-          ) from None
-        logger.debug("Connected to Redis in %s mode", snapshot.mode.value)
-        if snapshot.mode == RedisMode.MASTER_SLAVE and snapshot.replicas:
-          logger.debug(
-            "Configured %d replicas; current backend routing remains primary-only",
-            len(snapshot.replicas),
           )
+        if startup_error is not None:
+          # Raise outside the driver exception handler so sanitized startup
+          # errors do not retain credentials/endpoints through __context__.
+          raise startup_error
+        logger.debug("Connected to Redis in %s mode", snapshot.mode.value)
         return True
     finally:
       self._connect_local.depth = previous_depth
@@ -764,7 +824,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       try:
         result = generation.client.ping()
         return bool(result) if result is not None else False
-      except RedisError:
+      except _REDIS_OPERATION_ERRORS:
         return False
 
   @property
@@ -886,10 +946,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           keys=[queue_key, payload_key, counter_key],
           args=[member_uuid, -priority, item],
         )
-      except RedisError as e:
-        msg = f"Failed to push to queue {queue_name}: {e}"
+      except _REDIS_OPERATION_ERRORS as e:
         raise QueueError(
-          msg,
+          "Redis queue push failed.",
           queue_name=queue_name,
           operation="push",
         ) from e
@@ -938,9 +997,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       payload_key = self._payload_key(queue_name, namespace=namespace)
       try:
         pop_script = self._register_script(generation.client, _POP_LUA)
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         raise QueueError(
-          f"Failed to pop from queue {queue_name}: {e}",
+          "Redis queue pop failed.",
           queue_name=queue_name,
           operation="pop",
         ) from e
@@ -955,7 +1014,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           return item
         if generation.retired.is_set():
           raise QueueError(
-            f"Redis disconnected while waiting to pop from queue {queue_name}",
+            "Redis disconnected while waiting to pop from a queue.",
             queue_name=queue_name,
             operation="pop",
           )
@@ -964,7 +1023,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           return None
         if generation.retired.wait(min(_BLOCKING_POP_POLL_INTERVAL, remaining)):
           raise QueueError(
-            f"Redis disconnected while waiting to pop from queue {queue_name}",
+            "Redis disconnected while waiting to pop from a queue.",
             queue_name=queue_name,
             operation="pop",
           )
@@ -979,10 +1038,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """Atomically remove one queue member and its sidecar payload."""
     try:
       result = pop_script(keys=[queue_key, payload_key])
-    except RedisError as e:
-      msg = f"Failed to pop from queue {queue_name}: {e}"
+    except _REDIS_OPERATION_ERRORS as e:
       raise QueueError(
-        msg,
+        "Redis queue pop failed.",
         queue_name=queue_name,
         operation="pop",
       ) from e
@@ -996,11 +1054,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # non-list result is treated as corruption (defensive — the script
     # always returns a list now, but a future edit could regress).
     if not isinstance(result, list) or len(result) < 2:
-      msg = (
-        f"Corrupt pop result from {queue_name}: expected a 2-element "
-        f"[status, payload] list, got {type(result).__name__}: {result!r}"
+      raise QueueError(
+        "Malformed Redis pop response.",
+        queue_name=queue_name,
+        operation="pop",
       )
-      raise QueueError(msg, queue_name=queue_name, operation="pop")
     status = result[0]
     detail = result[1]
     if status == 0:
@@ -1008,14 +1066,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if status == 1:
       # decode_responses=True returns str; normalize to bytes for the queue contract.
       if isinstance(detail, str):
-        return detail.encode("utf-8")
+        return detail.encode("utf-8", errors="surrogateescape")
       if isinstance(detail, (bytes, bytearray)):
         return bytes(detail)
-      msg = (
-        f"Corrupt payload from {queue_name}: expected bytes/str but got "
-        f"{type(detail).__name__}"
+      raise QueueError(
+        "Redis pop payload has an invalid type.",
+        queue_name=queue_name,
+        operation="pop",
       )
-      raise QueueError(msg, queue_name=queue_name, operation="pop")
     if status == 2:
       # A stale ZSET member without its sidecar payload can be discarded. The
       # script removed it atomically; the next blocking poll can make progress.
@@ -1026,11 +1084,11 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
       return None
     # status == 3 (or any unexpected status) is structural corruption.
-    msg = (
-      f"Structural corruption on queue {queue_name}: {detail}. The ZSET "
-      f"and payload hash are in an unexpected state."
+    raise QueueError(
+      "Redis pop reported structural corruption.",
+      queue_name=queue_name,
+      operation="pop",
     )
-    raise QueueError(msg, queue_name=queue_name, operation="pop")
 
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
@@ -1053,10 +1111,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         return cast(  # type: ignore[redundant-cast]
           "int", generation.client.zcard(queue_key)
         )
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         # Do not conflate an empty queue with a backend failure. The scheduler
         # trusts this result for pending-work and backpressure decisions.
-        raise QueueError(str(e), queue_name=queue_name, operation="queue_len") from e
+        raise QueueError(
+          "Redis queue length read failed.",
+          queue_name=queue_name,
+          operation="queue_len",
+        ) from e
 
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
@@ -1079,9 +1141,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       counter_key = self._counter_key(queue_name, namespace=namespace)
       try:
         generation.client.delete(queue_key, payload_key, counter_key)
-      except RedisError as e:
-        msg = f"Failed to clear queue {queue_name}: {e}"
-        raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
+      except _REDIS_OPERATION_ERRORS as e:
+        raise QueueError(
+          "Redis queue clear failed.",
+          queue_name=queue_name,
+          operation="clear_queue",
+        ) from e
 
   # SetBackend implementation using Redis Sets
   def add(self, set_name: str, item: bytes) -> bool:
@@ -1102,10 +1167,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       set_key = self._set_key(set_name, namespace=generation.snapshot.namespace)
       try:
         return generation.client.sadd(set_key, item) == 1
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         # Wrap so BackendDupeFilter can degrade to not-seen during an outage.
         raise BackendConnectionError(
-          f"Redis set add failed for {set_name!r}: {e}", backend_type="redis"
+          "Redis set add failed.", backend_type="redis"
         ) from e
 
   def remove(self, set_name: str, item: bytes) -> bool:
@@ -1127,9 +1192,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       set_key = self._set_key(set_name, namespace=generation.snapshot.namespace)
       try:
         return generation.client.srem(set_key, item) == 1
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         raise BackendConnectionError(
-          f"Redis set remove failed for {set_name!r}: {e}",
+          "Redis set remove failed.",
           backend_type="redis",
         ) from e
 
@@ -1152,9 +1217,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       set_key = self._set_key(set_name, namespace=generation.snapshot.namespace)
       try:
         result = generation.client.sismember(set_key, cast("str", item))
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         raise BackendConnectionError(
-          f"Redis set contains failed for {set_name!r}: {e}",
+          "Redis set membership check failed.",
           backend_type="redis",
         ) from e
       return bool(result)
@@ -1179,9 +1244,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         return cast(  # type: ignore[redundant-cast]
           "int", generation.client.scard(set_key)
         )
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         raise BackendConnectionError(
-          f"Redis set length failed for {set_name!r}: {e}",
+          "Redis set length read failed.",
           backend_type="redis",
         ) from e
 
@@ -1201,10 +1266,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       set_key = self._set_key(set_name, namespace=generation.snapshot.namespace)
       try:
         generation.client.delete(set_key)
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         # A swallowed clear hides a failed dedup reset and stale fingerprints.
         raise BackendConnectionError(
-          f"Redis set clear failed for {set_name!r}: {e}",
+          "Redis set clear failed.",
           backend_type="redis",
         ) from e
 
@@ -1234,16 +1299,16 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           stored = generation.client.setex(storage_key, ttl, data)
         else:
           stored = generation.client.set(storage_key, data)
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         # Do not swallow: the pipeline must count and escalate storage loss.
         raise StorageError(
-          f"Failed to store key {key!r} in Redis: {e}",
+          "Redis storage write failed.",
           operation="store",
           key=key,
         ) from e
       if stored is False or stored is None:
         raise StorageError(
-          f"Redis rejected the write for key {key!r}",
+          "Redis rejected a storage write.",
           operation="store",
           key=key,
         )
@@ -1266,15 +1331,21 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       storage_key = self._storage_key(key, namespace=generation.snapshot.namespace)
       try:
         result = generation.client.get(storage_key)
-      except RedisError as e:
-        msg = f"Failed to retrieve key {key!r} from Redis: {e}"
-        raise StorageError(msg, operation="retrieve", key=key) from e
+      except _REDIS_OPERATION_ERRORS as e:
+        raise StorageError(
+          "Redis storage read failed.", operation="retrieve", key=key
+        ) from e
       if result is None:
         return None
       if isinstance(result, bytes):
         return result
-      # redis-py may return str for string values in some modes.
-      return str(result).encode()
+      if isinstance(result, str):
+        return result.encode("utf-8", errors="surrogateescape")
+      raise StorageError(
+        "Redis storage read returned an invalid response type.",
+        operation="retrieve",
+        key=key,
+      )
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -1294,9 +1365,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       storage_key = self._storage_key(key, namespace=generation.snapshot.namespace)
       try:
         return generation.client.delete(storage_key) == 1
-      except RedisError as e:
-        msg = f"Failed to delete key {key!r} from Redis: {e}"
-        raise StorageError(msg, operation="delete", key=key) from e
+      except _REDIS_OPERATION_ERRORS as e:
+        raise StorageError(
+          "Redis storage delete failed.", operation="delete", key=key
+        ) from e
 
   def exists(self, key: str) -> bool:
     """Check if key exists.
@@ -1316,9 +1388,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       storage_key = self._storage_key(key, namespace=generation.snapshot.namespace)
       try:
         return generation.client.exists(storage_key) == 1
-      except RedisError as e:
-        msg = f"Failed to check existence of key {key!r} in Redis: {e}"
-        raise StorageError(msg, operation="exists", key=key) from e
+      except _REDIS_OPERATION_ERRORS as e:
+        raise StorageError(
+          "Redis storage existence check failed.", operation="exists", key=key
+        ) from e
 
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
@@ -1340,9 +1413,10 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         result = cast(  # type: ignore[redundant-cast]
           "int", generation.client.ttl(storage_key)
         )
-      except RedisError as e:
-        msg = f"Failed to read TTL of key {key!r} in Redis: {e}"
-        raise StorageError(msg, operation="ttl", key=key) from e
+      except _REDIS_OPERATION_ERRORS as e:
+        raise StorageError(
+          "Redis storage TTL read failed.", operation="ttl", key=key
+        ) from e
       # -2 = no key, -1 = no TTL, >= 0 = remaining seconds.
       return None if result < 0 else result
 
@@ -1376,7 +1450,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       try:
         for physical_key in generation.client.scan_iter(match=pattern):
           generation.client.delete(physical_key)
-      except RedisError as e:
+      except _REDIS_OPERATION_ERRORS as e:
         raise StorageError(
           "Redis storage clear failed and may be partially complete.",
           operation="clear_storage",

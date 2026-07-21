@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import traceback
+from typing import Any
 
 import pytest
 from pydantic import SecretStr
+from redis.sentinel import (
+  Sentinel as SdkSentinel,
+)
+from redis.sentinel import (
+  SentinelManagedConnection,
+  SentinelManagedSSLConnection,
+)
 
 from scrapy_extension.backends.redis import RedisBackend
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
@@ -53,6 +61,115 @@ def _connect_with_captured_sentinel(mocker, settings: RedisSettings):
   backend = RedisBackend(settings)
   backend.connect()
   return backend, master, captured
+
+
+@pytest.mark.parametrize("tls_enabled", [False, True], ids=["plain", "tls"])
+def test_real_sentinel_master_pool_constructs_the_selected_transport(
+  mocker, tls_enabled: bool
+) -> None:
+  """The discovered-master pool must be constructible in both TLS modes."""
+  captured: dict[str, Any] = {}
+
+  def factory(*args, **kwargs):
+    captured["constructor_kwargs"] = kwargs
+    sentinel = SdkSentinel(*args, **kwargs)
+    real_master_for = sentinel.master_for
+
+    def master_for(*master_args, **master_kwargs):
+      captured["master_kwargs"] = master_kwargs
+      master = real_master_for(*master_args, **master_kwargs)
+      captured["data_pool"] = master.connection_pool
+      master.ping = lambda: True
+      return master
+
+    sentinel.master_for = master_for
+    return sentinel
+
+  mocker.patch(
+    "scrapy_extension.backends.redis.Sentinel",
+    side_effect=factory,
+  )
+  settings_kwargs: dict[str, Any] = {
+    "mode": RedisMode.SENTINEL,
+    "sentinels": ["sentinel.internal:26379"],
+    "max_connections": 3,
+  }
+  if tls_enabled:
+    settings_kwargs.update(
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
+      ssl_certfile="/tls/client.pem",
+      ssl_keyfile="/tls/client.key",
+    )
+  backend = RedisBackend(RedisSettings(**settings_kwargs))
+  connection = None
+  try:
+    backend.connect()
+    pool = captured["data_pool"]
+    connection = pool.make_connection()
+    expected_type = (
+      SentinelManagedSSLConnection if tls_enabled else SentinelManagedConnection
+    )
+    assert isinstance(connection, expected_type)
+
+    tls_keys = {
+      "ssl",
+      "ssl_ca_certs",
+      "ssl_certfile",
+      "ssl_keyfile",
+      "ssl_check_hostname",
+    }
+    master_kwargs = captured["master_kwargs"]
+    control_kwargs = captured["constructor_kwargs"]["sentinel_kwargs"]
+    if tls_enabled:
+      assert master_kwargs["ssl"] is True
+      assert master_kwargs["ssl_ca_certs"] == "/tls/ca.pem"
+      assert control_kwargs["ssl"] is True
+      assert control_kwargs["ssl_ca_certs"] == "/tls/ca.pem"
+    else:
+      assert tls_keys.isdisjoint(master_kwargs)
+      assert tls_keys.isdisjoint(control_kwargs)
+  finally:
+    if connection is not None:
+      connection.disconnect()
+    backend.disconnect()
+
+
+def test_sentinel_unset_connection_limit_remains_effectively_unbounded(
+  mocker,
+) -> None:
+  captured: dict[str, Any] = {}
+
+  def factory(*args, **kwargs):
+    sentinel = SdkSentinel(*args, **kwargs)
+    captured["control_pool"] = sentinel.sentinels[0].connection_pool
+    real_master_for = sentinel.master_for
+
+    def master_for(*master_args, **master_kwargs):
+      master = real_master_for(*master_args, **master_kwargs)
+      captured["data_pool"] = master.connection_pool
+      master.ping = lambda: True
+      return master
+
+    sentinel.master_for = master_for
+    return sentinel
+
+  mocker.patch(
+    "scrapy_extension.backends.redis.Sentinel",
+    side_effect=factory,
+  )
+  backend = RedisBackend(
+    RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel.internal:26379"],
+    )
+  )
+  try:
+    backend.connect()
+    assert captured["control_pool"].max_connections == 2**31
+    assert captured["data_pool"].max_connections == 2**31
+  finally:
+    backend.disconnect()
 
 
 def test_sentinel_control_plane_inherits_tls_and_socket_policy(mocker) -> None:

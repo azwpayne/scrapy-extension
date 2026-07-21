@@ -208,10 +208,12 @@ failure may follow a committed first attempt, and no automatic rollback or
 reconciliation is possible. Server-confirmed non-execution paths such as
 NOSCRIPT and Cluster MOVED/ASK/TRYAGAIN can still continue safely. redis-py
 couples ClusterDown/SlotNotCovered recovery to the same outer retry count, so
-those two Cluster errors now fail fast; a later caller or manager attempt is
-visible and rebuilds topology independently. Do not blindly repeat queue
-push/pop operations; use an application operation ID, deduplication, or
-domain-specific reconciliation where loss/duplication is unacceptable.
+those two Cluster errors now fail fast. An uncovered slot discovered before
+command routing is not guaranteed to refresh on another ordinary call; use an
+explicit `disconnect()` / `connect()` to build a fresh topology generation.
+Do not blindly repeat queue push/pop operations; use an application operation
+ID, deduplication, or domain-specific reconciliation where loss/duplication is
+unacceptable.
 
 The separate `sentinel_retry_on_timeout` setting remains active only for
 read-only Sentinel discovery. When true, it permits at most one immediate SDK
@@ -220,6 +222,49 @@ authentication failures. Sentinel may still continue discovery against another
 configured endpoint, and the setting does not limit ConnectionManager
 connection attempts. No Redis key migration is required for this policy
 change.
+
+## Redis Deployment Modes and Endpoint Grammar
+
+Redis configuration now distinguishes three effective topologies from the
+deprecated `master_slave` compatibility alias:
+
+| Previous configuration | Current contract | Migration action |
+|------------------------|------------------|------------------|
+| `mode="master_slave"` with no effective replica routing | primary-only deprecated alias | Change to `standalone` for the same runtime behavior. |
+| non-empty `replicas` or `read_from_replicas=True` | rejected unsupported intent | Remove both fields. Use Sentinel for primary discovery/failover; true eventual-consistency replica reads require a custom backend/policy. |
+| Cluster `db > 0` | rejected; Redis Cluster supports DB0 only | Set `db=0` and isolate with `namespace` or a separate Cluster. The old backend already discarded the configured DB and used DB0, so do not assume data exists in DB N. |
+| URI/userinfo node such as `redis://user:pass@host:6379` | rejected without echoing the value | Put the bare host/port and `username`/`password` in separate fields. Use `[IPv6]:port` in endpoint lists. |
+| CA/certificate/key with `ssl_enabled=False` | rejected | Enable TLS explicitly or remove the unused material; the backend never auto-enables a protocol. |
+| `masters` input | rejected tombstone instead of ignored/echoed | Replace it with `cluster_startup_nodes` and select `mode="cluster"`. |
+| topology nodes or non-default controls for a different selected mode | rejected instead of ignored | Remove them or select the matching `sentinel` / `cluster` mode. |
+| `cluster_max_redirects > 100` | rejected | Reduce it to 100 or less and diagnose persistent redirection/topology churn instead of masking it with an unbounded loop. |
+| scalar port as bool/float/bytes/signed/whitespace text | rejected | Use an integer or unsigned ASCII decimal text from 1 through 65535. |
+| legacy numeric IPv4 such as `127.1`, `2130706433`, or `0x7f000001` | rejected | Write the canonical dotted quad, for example `127.0.0.1`. |
+
+Active endpoint lists (`sentinels` and `cluster_startup_nodes`) accept ASCII
+DNS/IPv4 `host:port` or `[IPv6]:port`, with a port from 1 through 65535. The
+deprecated `replicas` field rejects every non-empty value because replica
+routing is unsupported. Scalar `host` accepts a bare DNS name, canonical IPv4,
+or IPv6 address. Schemes, userinfo, paths, queries, fragments,
+whitespace/control characters, raw Unicode hostnames, and non-ASCII port
+digits fail during model construction and are rechecked before SDK I/O after
+mutation.
+
+`cluster_max_redirects` remains active: 0 means no protocol follow-up after the
+initial command, and N permits at most N MOVED/ASK/TRYAGAIN continuations. It
+does not alter the zero-replay transport Retry object. Cluster and Sentinel
+SDK failures now surface through the existing package exception types; callers
+that caught raw `RedisClusterException` should catch `BackendError` (or the
+specific `QueueError`, `BackendConnectionError`, or `StorageError`) instead.
+The original data-plane SDK error is retained only as `__cause__`, so treat a
+full chained traceback as sensitive diagnostics.
+
+Sentinel control credentials (`sentinel_username` / `sentinel_password`) never
+fall back to data-plane `username` / `password`; configure both pairs when the
+same identity is required on both planes. `max_connections` is a per-pool cap:
+S Sentinel endpoints create S control pools plus one discovered-master data
+pool. No Redis key or wire-data migration is required solely for these mode,
+endpoint, error, or binary-decoding changes.
 
 ## Queued-Request Wire Format
 

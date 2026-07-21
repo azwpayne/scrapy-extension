@@ -60,17 +60,16 @@ SCRAPY_BACKEND_TYPE = "redis"
 # =============================================================================
 # Redis Configuration (Default)
 # =============================================================================
-# Supports modes: standalone (default), master_slave, sentinel, cluster
+# Effective modes: standalone (default), sentinel, cluster.
+# master_slave is a deprecated primary-only alias with no replica routing.
 
 SCRAPY_REDIS_HOST = "localhost"
 SCRAPY_REDIS_PORT = 6379
 SCRAPY_REDIS_DB = 0
 # SCRAPY_REDIS_PASSWORD = "secret"  # Optional
 
-# --- Redis Master-Slave Mode ---
-# SCRAPY_REDIS_MODE = "master_slave"
-# SCRAPY_REDIS_REPLICAS = ["replica1.redis.com:6379", "replica2.redis.com:6379"]
-# SCRAPY_REDIS_READ_FROM_REPLICAS = True
+# For one static primary, keep standalone and set HOST/PORT. Use Sentinel for
+# discovery/failover; replica-read configuration is intentionally unsupported.
 
 # --- Redis Sentinel Mode (High Availability) ---
 # SCRAPY_REDIS_MODE = "sentinel"
@@ -82,6 +81,7 @@ SCRAPY_REDIS_DB = 0
 # --- Redis Cluster Mode ---
 # SCRAPY_REDIS_MODE = "cluster"
 # SCRAPY_REDIS_CLUSTER_STARTUP_NODES = ["node1:7000", "node2:7000", "node3:7000"]
+# SCRAPY_REDIS_DB = 0  # Cluster supports DB0 only; use namespace for isolation
 # SCRAPY_REDIS_CLUSTER_MAX_REDIRECTS = 5
 
 # =============================================================================

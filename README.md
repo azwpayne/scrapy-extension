@@ -92,7 +92,7 @@ environment prefix fail fast instead of silently falling back to a default.
 Those project checks raise `ConfigurationError`; Pydantic type/range/enum
 failures raise `ValidationError`.
 
-### Redis (standalone, master_slave, sentinel, cluster)
+### Redis (standalone, sentinel, cluster; deprecated master_slave alias)
 
 ```python
 SCRAPY_BACKEND_TYPE = "redis"
@@ -107,6 +107,38 @@ deliberately no fallback to the legacy unnamespaced layout because that could
 read or delete another application's keys in a shared database. Persistent
 deployments must drain or explicitly migrate the old keys before upgrading;
 see the [migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md#redis-physical-key-layout).
+
+Redis topology settings are deliberately explicit:
+
+| Mode | Effective topology | Required limits |
+|------|--------------------|-----------------|
+| `standalone` | one static primary at `host:port` | `db >= 0` |
+| `master_slave` | deprecated primary-only alias of `standalone` | `replicas=[]`; `read_from_replicas=False`; no discovery, load balancing, replica reads, or failover |
+| `sentinel` | Sentinel-discovered primary | non-empty `sentinels` and `sentinel_master_name`; data and control credentials are configured separately |
+| `cluster` | redis-py Cluster discovery/sharding | `db=0`; startup seeds are optional and otherwise fall back to `host:port` |
+
+The historical replica fields never routed reads. They now reject non-empty/
+true values instead of silently accepting unsupported intent, and the first
+validated connection that uses the `master_slave` alias emits `FutureWarning`;
+use `standalone` for one static primary or Sentinel for discovery and failover.
+Redis replication is
+asynchronous, so suddenly enabling the old default would also make queue-depth,
+deduplication, and storage reads stale.
+
+`SCRAPY_REDIS_CLUSTER_MAX_REDIRECTS` (default 5, range 0–100) controls each
+Cluster client's own MOVED/ASK/TRYAGAIN continuation budget. It does not enable
+transport retry: the initial attempt is separate, and the data-plane
+`Retry` count remains zero. Cluster supports database zero only; use the Redis
+namespace or a separate Cluster for isolation.
+
+Hosts are bare ASCII DNS names, canonical IPv4 addresses, or IPv6 addresses.
+Active Sentinel and Cluster list entries use `host:port` or `[IPv6]:port`; the
+deprecated replica list must remain empty. Scalar ports accept integers or
+ASCII decimal text only. URI schemes, userinfo, paths, queries, fragments,
+whitespace/control characters, non-ASCII port digits, and legacy numeric IPv4
+spellings fail before SDK construction without echoing the address.
+Non-selected topology nodes and non-default mode controls fail rather than
+being ignored.
 
 Redis connections are immutable generations. While a generation is published,
 `connect()` is an idempotent no-op; it is not a health probe. Every bundled
@@ -141,9 +173,12 @@ deduplicate at the application boundary.
 
 redis-py uses the same Cluster outer-retry count for transport failures and
 ClusterDown/SlotNotCovered responses. Setting that count to zero therefore
-also makes those two topology failures fail fast; MOVED/ASK/TRYAGAIN routing is
-unchanged. A later caller or ConnectionManager attempt can rebuild topology,
-but it is a new, visible attempt rather than a hidden command replay.
+also makes those two topology failures fail fast; MOVED/ASK/TRYAGAIN routing
+uses the separately bounded protocol continuation budget above. A slot missing
+during initial target selection is not guaranteed to refresh topology on a
+later ordinary command. After a typed topology failure, explicitly
+`disconnect()` / `connect()` to build a fresh generation; reconcile an
+outcome-ambiguous mutation before repeating it.
 
 `SCRAPY_REDIS_RETRY_ON_TIMEOUT` remains accepted with its historical default
 for configuration compatibility, but is deprecated and neither value enables
@@ -161,7 +196,22 @@ discovery and the discovered master. Configure `SCRAPY_REDIS_SSL_CAFILE`; when
 using mTLS, provide `SCRAPY_REDIS_SSL_CERTFILE` and
 `SCRAPY_REDIS_SSL_KEYFILE` together. Hostname verification remains enabled by
 default. This is one transport policy—there is no silent plaintext Sentinel
-control-plane fallback.
+control-plane fallback. Supplying any CA/certificate/key path while TLS is
+disabled is rejected rather than silently opening a plaintext connection.
+`sentinel_username` / `sentinel_password` authenticate only the discovery
+plane; `username` / `password` authenticate only the discovered data plane,
+with no fallback between them. With S Sentinel addresses, `max_connections` is
+a per-pool cap across S control pools plus one data pool, not a generation-wide
+total. An unset limit is normalized to the redis-py 7.3 effectively-unbounded
+value (`2**31`) so upgrading to redis-py 8 does not silently introduce its new
+100-connection default.
+
+Bundled queue and storage APIs remain byte-oriented. If
+`SCRAPY_REDIS_DECODE_RESPONSES=True`, redis-py receives `surrogateescape` and
+the backend losslessly converts decoded strings back to bytes, including
+non-UTF-8 payloads consumed by atomic Lua pop. Public typed operation errors do
+not copy redis-py exception or response text; the original data-plane SDK
+exception remains available as `__cause__` for protected diagnostics.
 
 ### MongoDB (standalone, replica_set, sharded_cluster, atlas)
 
@@ -446,7 +496,7 @@ See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/m
 
 | Backend       | Queue | Set | Storage | Modes                                        |
 |---------------|-------|-----|---------|----------------------------------------------|
-| Redis         | Yes   | Yes | Yes     | standalone, master_slave, sentinel, cluster  |
+| Redis         | Yes   | Yes | Yes     | standalone, sentinel, cluster; deprecated primary-only `master_slave` alias |
 | MongoDB       | Yes   | Yes | Yes     | standalone, replica_set, sharded_cluster, atlas |
 | ElasticSearch | Yes   | Yes | Yes     | standalone, cloud                            |
 | Kafka         | Yes   | No  | No      | standalone, cluster, confluent               |
@@ -839,7 +889,7 @@ See the [examples guide](https://github.com/azwpayne/scrapy-extension/blob/main/
 | `quotes_kafka` | Kafka | High-throughput streaming (queue only) |
 | `quotes_rabbitmq` | RabbitMQ | Priority queues, HA (queue only) |
 | `quotes_elasticsearch` | ElasticSearch | Full-text search storage |
-| `quotes_multi_mode` | All | Multi-mode configurations |
+| `quotes_multi_mode` | Redis | Sentinel and Cluster configurations |
 | `quotes_connection_manager` | All | Direct `ConnectionManager` API |
 | `quotes_programmatic` | Redis | Per-spider `backend_settings` dict |
 | `quotes_crawl` | None | CrawlSpider variant |
@@ -851,6 +901,8 @@ See the [examples guide](https://github.com/azwpayne/scrapy-extension/blob/main/
 - **Key name validation**: validated against `^[a-zA-Z0-9._:-]+$`
 - **Topic name validation**: Kafka topics validated against `^[a-zA-Z0-9._-]+$`
 - **Input sanitization**: all user-provided queue/set names validated before use
+- **Redis endpoint isolation**: credentials belong in dedicated fields; node
+  addresses reject URI/userinfo and normalize bracketed IPv6 before SDK use
 - **No code execution**: JSON serialization only — never pickle or eval
 
 JSON safety is not confidentiality. Request metadata, request bodies, and

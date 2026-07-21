@@ -18,6 +18,7 @@ CLUSTER_CONFIG = {
   "mode": "cluster",
   "cluster_startup_nodes": ["node1:7000", "node2:7000", "node3:7000"],
   "password": os.environ.get("REDIS_PASSWORD", None),
+  "db": 0,
   "cluster_max_redirects": 5,
 }
 
