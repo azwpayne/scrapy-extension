@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -108,8 +109,318 @@ class TestSqsConnect:
     client.close.assert_called_once()
     assert b.is_connected() is False
 
+  def test_repeated_connect_is_idempotent_and_keeps_generation_cache(
+    self, mocker
+  ) -> None:
+    b = _make_backend()
+    client_a = mocker.MagicMock(name="client-a")
+    client_a.get_queue_url.return_value = {"QueueUrl": "https://sqs/a/q"}
+    client_b = mocker.MagicMock(name="client-b")
+    client_b.get_queue_url.return_value = {"QueueUrl": "https://sqs/b/q"}
+    client_factory = mocker.patch.object(
+      boto3, "client", side_effect=[client_a, client_b]
+    )
+
+    b.connect()
+    b.push("q", b"first")
+    b.connect()
+    b.push("q", b"second")
+
+    assert client_factory.call_count == 1
+    assert b._client is client_a
+    client_a.get_queue_url.assert_called_once_with(QueueName="scrapy-q")
+    assert client_a.send_message.call_count == 2
+    client_b.send_message.assert_not_called()
+
+  def test_connected_generation_keeps_operational_settings_snapshot(
+    self, mocker
+  ) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {}
+    b.config.queue_name_prefix = "mutated-"
+    b.config.visibility_timeout = 1
+
+    b.push("q", b"payload")
+    assert b.pop("q") is None
+
+    client.get_queue_url.assert_called_once_with(QueueName="scrapy-q")
+    assert client.receive_message.call_args.kwargs["VisibilityTimeout"] == 300
+
+    b.disconnect()
+    client_b = mocker.MagicMock(name="client-b")
+    client_b.get_queue_url.return_value = {"QueueUrl": "https://sqs/b/q"}
+    client_b.receive_message.return_value = {}
+    mocker.patch.object(boto3, "client", return_value=client_b)
+    b.connect()
+    b.push("q", b"replacement")
+    assert b.pop("q") is None
+
+    client_b.get_queue_url.assert_called_once_with(QueueName="mutated-q")
+    assert client_b.receive_message.call_args.kwargs["VisibilityTimeout"] == 1
+
+  def test_disconnect_during_client_construction_cannot_resurrect(
+    self, mocker
+  ) -> None:
+    b = _make_backend()
+    candidate = mocker.MagicMock(name="candidate")
+    construction_entered = threading.Event()
+    release_construction = threading.Event()
+    disconnect_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def construct(_service: str, **_kwargs):
+      construction_entered.set()
+      assert release_construction.wait(timeout=2.0)
+      return candidate
+
+    def run(operation) -> None:
+      try:
+        operation()
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    def disconnect() -> None:
+      try:
+        b.disconnect()
+      finally:
+        disconnect_finished.set()
+
+    mocker.patch.object(boto3, "client", side_effect=construct)
+    connect_thread = threading.Thread(target=run, args=(b.connect,))
+    disconnect_thread = threading.Thread(target=disconnect)
+    connect_thread.start()
+    assert construction_entered.wait(timeout=2.0)
+    disconnect_thread.start()
+    returned_during_construction = disconnect_finished.wait(timeout=0.2)
+    release_construction.set()
+    connect_thread.join(timeout=2.0)
+    disconnect_thread.join(timeout=2.0)
+
+    assert returned_during_construction is False
+    assert errors == []
+    assert b.is_connected() is False
+    candidate.close.assert_called_once()
+
+  def test_disconnect_waits_for_in_progress_queue_resolution(self, mocker) -> None:
+    b = _make_backend()
+    client = mocker.MagicMock()
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    disconnect_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_lookup(**_kwargs):
+      lookup_entered.set()
+      assert release_lookup.wait(timeout=2.0)
+      return {"QueueUrl": "https://sqs/a/q"}
+
+    def push() -> None:
+      try:
+        b.push("q", b"payload")
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    def disconnect() -> None:
+      try:
+        b.disconnect()
+      finally:
+        disconnect_finished.set()
+
+    client.get_queue_url.side_effect = blocking_lookup
+    mocker.patch.object(boto3, "client", return_value=client)
+    b.connect()
+    push_thread = threading.Thread(target=push)
+    disconnect_thread = threading.Thread(target=disconnect)
+    push_thread.start()
+    assert lookup_entered.wait(timeout=2.0)
+    disconnect_thread.start()
+    returned_during_lookup = disconnect_finished.wait(timeout=0.2)
+    release_lookup.set()
+    push_thread.join(timeout=2.0)
+    disconnect_thread.join(timeout=2.0)
+
+    assert returned_during_lookup is False
+    assert not push_thread.is_alive()
+    assert not disconnect_thread.is_alive()
+    assert errors == []
+    client.send_message.assert_called_once()
+
+  def test_client_close_is_a_continuous_teardown_barrier(self, mocker) -> None:
+    b, client = _connected(mocker)
+    b.push("q", b"seed")
+    client.send_message.reset_mock()
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    push_started = threading.Event()
+    push_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_close() -> None:
+      close_entered.set()
+      assert release_close.wait(timeout=2.0)
+
+    def push() -> None:
+      push_started.set()
+      try:
+        b.push("q", b"during-close")
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+      finally:
+        push_finished.set()
+
+    client.close.side_effect = blocking_close
+    disconnect_thread = threading.Thread(target=b.disconnect)
+    push_thread = threading.Thread(target=push)
+    disconnect_thread.start()
+    assert close_entered.wait(timeout=2.0)
+    push_thread.start()
+    assert push_started.wait(timeout=2.0)
+    assert push_finished.wait(timeout=0.5)
+    release_close.set()
+    disconnect_thread.join(timeout=2.0)
+    push_thread.join(timeout=2.0)
+
+    assert not disconnect_thread.is_alive()
+    assert not push_thread.is_alive()
+    client.send_message.assert_not_called()
+    assert len(errors) == 1
+    assert isinstance(errors[0], QueueError)
+
+  def test_token_from_retired_generation_never_settles_on_replacement(
+    self, mocker
+  ) -> None:
+    b, client_a = _connected(mocker)
+    client_a.receive_message.return_value = {
+      "Messages": [{"Body": "eA==", "ReceiptHandle": "receipt-a"}]
+    }
+    _body, token = b.pop_with_ack("q")
+    b.disconnect()
+    client_b = mocker.MagicMock(name="client-b")
+    mocker.patch.object(boto3, "client", return_value=client_b)
+    b.connect()
+
+    b.ack("q", token=token)
+    b.nack("q", token=token)
+
+    client_b.delete_message.assert_not_called()
+    client_b.change_message_visibility.assert_not_called()
+    assert token._settlement_state == "stale"
+
+  def test_disconnect_waits_for_admitted_token_settlement(self, mocker) -> None:
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "eA==", "ReceiptHandle": "receipt-a"}]
+    }
+    _body, token = b.pop_with_ack("q")
+    ack_entered = threading.Event()
+    release_ack = threading.Event()
+    disconnect_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_delete(**_kwargs) -> None:
+      ack_entered.set()
+      assert release_ack.wait(timeout=2.0)
+
+    def run_ack() -> None:
+      try:
+        b.ack("q", token=token)
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    def disconnect() -> None:
+      try:
+        b.disconnect()
+      finally:
+        disconnect_finished.set()
+
+    client.delete_message.side_effect = blocking_delete
+    ack_thread = threading.Thread(target=run_ack)
+    disconnect_thread = threading.Thread(target=disconnect)
+    ack_thread.start()
+    assert ack_entered.wait(timeout=2.0)
+    disconnect_thread.start()
+    returned_during_ack = disconnect_finished.wait(timeout=0.2)
+    release_ack.set()
+    ack_thread.join(timeout=2.0)
+    disconnect_thread.join(timeout=2.0)
+
+    assert returned_during_ack is False
+    assert errors == []
+    client.delete_message.assert_called_once()
+    client.close.assert_called_once()
+
+  def test_slow_queue_resolution_does_not_block_other_queue_ack(
+    self, mocker
+  ) -> None:
+    b = _make_backend()
+    client = mocker.MagicMock()
+    q_a_lookup_entered = threading.Event()
+    release_q_a_lookup = threading.Event()
+    ack_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def resolve(*, QueueName):  # noqa: N803 - boto3 keyword
+      if QueueName == "scrapy-qA":
+        q_a_lookup_entered.set()
+        assert release_q_a_lookup.wait(timeout=2.0)
+        return {"QueueUrl": "https://sqs/qA"}
+      return {"QueueUrl": "https://sqs/qB"}
+
+    def push_q_a() -> None:
+      try:
+        b.push("qA", b"payload")
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    def ack_q_b(token) -> None:
+      try:
+        b.ack("qB", token=token)
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+      finally:
+        ack_finished.set()
+
+    client.get_queue_url.side_effect = resolve
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "eA==", "ReceiptHandle": "receipt-b"}]
+    }
+    mocker.patch.object(boto3, "client", return_value=client)
+    b.connect()
+    _body, token = b.pop_with_ack("qB")
+    push_thread = threading.Thread(target=push_q_a)
+    ack_thread = threading.Thread(target=ack_q_b, args=(token,))
+
+    push_thread.start()
+    assert q_a_lookup_entered.wait(timeout=2.0)
+    ack_thread.start()
+    ack_completed_while_q_a_was_blocked = ack_finished.wait(timeout=0.5)
+    release_q_a_lookup.set()
+    push_thread.join(timeout=2.0)
+    ack_thread.join(timeout=2.0)
+
+    assert ack_completed_while_q_a_was_blocked is True
+    assert errors == []
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/qB", ReceiptHandle="receipt-b"
+    )
+
 
 class TestSqsPushPop:
+  def test_disconnected_push_preserves_queue_context(self) -> None:
+    b = _make_backend()
+
+    with pytest.raises(QueueError) as exc_info:
+      b.push("queue1", b"payload")
+
+    assert exc_info.value.operation == "push"
+    assert exc_info.value.queue_name == "queue1"
+
+  def test_invalid_queue_name_precedes_disconnected_state(self) -> None:
+    b = _make_backend()
+
+    with pytest.raises(ValueError, match="queue_name"):
+      b.push("", b"payload")
+
   def test_push_resolves_url_and_sends_b64(self, mocker) -> None:
     b, client = _connected(mocker)
     b.push("queue1", b"payload")
@@ -259,7 +570,8 @@ class TestSqsPushPop:
     client = mocker.MagicMock()
     client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
     client.receive_message.return_value = {}
-    b._client = client
+    mocker.patch.object(boto3, "client", return_value=client)
+    b.connect()
 
     b.pop("queue1", timeout=7.0)
 
@@ -499,16 +811,16 @@ class TestSqsLenClear:
     release_sleep = threading.Event()
     push_reached_lifecycle = threading.Event()
     errors: list[BaseException] = []
-    original_queue_lifecycle = b._queue_lifecycle
+    original_queue_lifecycle = b._queue_lifecycle_for_generation
 
     def blocking_sleep(_seconds: float) -> None:
       sleep_entered.set()
       assert release_sleep.wait(timeout=2)
 
-    def observed_queue_lifecycle(queue_url: str):
+    def observed_queue_lifecycle(generation, queue_url: str):
       if threading.current_thread().name == "sqs-test-push":
         push_reached_lifecycle.set()
-      return original_queue_lifecycle(queue_url)
+      return original_queue_lifecycle(generation, queue_url)
 
     def run(operation) -> None:
       try:
@@ -517,7 +829,11 @@ class TestSqsLenClear:
         errors.append(exc)
 
     mocker.patch("scrapy_extension.backends.sqs.time.sleep", side_effect=blocking_sleep)
-    mocker.patch.object(b, "_queue_lifecycle", side_effect=observed_queue_lifecycle)
+    mocker.patch.object(
+      b,
+      "_queue_lifecycle_for_generation",
+      side_effect=observed_queue_lifecycle,
+    )
     clear_thread = threading.Thread(
       target=run, args=(lambda: b.clear_queue("queue1"),)
     )
@@ -711,6 +1027,61 @@ class TestSqsAckCorrectQueueUrl:
       QueueUrl="https://sqs/qB-url", ReceiptHandle="rh-b"
     )
 
+  def test_stale_legacy_ack_cannot_clear_replacement_receipt(self, mocker) -> None:
+    b, client_a = _connected(mocker)
+    client_a.receive_message.return_value = {
+      "Messages": [{"Body": "YQ==", "ReceiptHandle": "receipt-a"}]
+    }
+    assert b.pop("q") == b"a"
+    old_generation_key = b._last_receipt_generation_key
+    old_ack_waiting = threading.Event()
+    release_old_ack = threading.Event()
+    errors: list[BaseException] = []
+    original_lease_generation = b._lease_generation
+
+    @contextmanager
+    def gated_lease(operation, *, generation_key=None, **kwargs):
+      if operation == "ack" and generation_key is old_generation_key:
+        old_ack_waiting.set()
+        assert release_old_ack.wait(timeout=2.0)
+      with original_lease_generation(
+        operation, generation_key=generation_key, **kwargs
+      ) as generation:
+        yield generation
+
+    def ack_old_receipt() -> None:
+      try:
+        b.ack("q")
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    mocker.patch.object(b, "_lease_generation", gated_lease)
+    old_ack_thread = threading.Thread(target=ack_old_receipt)
+    old_ack_thread.start()
+    assert old_ack_waiting.wait(timeout=2.0)
+
+    b.disconnect()
+    client_b = mocker.MagicMock(name="client-b")
+    client_b.get_queue_url.return_value = {"QueueUrl": "https://sqs/b/q"}
+    client_b.receive_message.return_value = {
+      "Messages": [{"Body": "Yg==", "ReceiptHandle": "receipt-b"}]
+    }
+    mocker.patch.object(boto3, "client", return_value=client_b)
+    b.connect()
+    assert b.pop("q") == b"b"
+
+    release_old_ack.set()
+    old_ack_thread.join(timeout=2.0)
+    assert not old_ack_thread.is_alive()
+    assert errors == []
+    assert b._last_receipt == ("https://sqs/b/q", "receipt-b")
+
+    b.ack("q")
+    client_a.delete_message.assert_not_called()
+    client_b.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/b/q", ReceiptHandle="receipt-b"
+    )
+
 
 class TestSqsAckToken:
   """The internal ``_SqsAckToken`` carries both per-message ReceiptHandle and
@@ -726,11 +1097,30 @@ class TestSqsAckToken:
     )
     t3 = _SqsAckToken(queue_url="https://sqs/qB", receipt_handle="rh-1")
     t4 = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-2")
+    generation_key = object()
+    t5 = _SqsAckToken(
+      queue_url="https://sqs/qA",
+      receipt_handle="rh-1",
+      generation_key=generation_key,
+    )
+    t6 = _SqsAckToken(
+      queue_url="https://sqs/qA",
+      receipt_handle="rh-1",
+      generation_key=generation_key,
+    )
     assert t1 == t2
     assert t1 != t3  # different queue_url
     assert t1 != t4  # different receipt_handle
+    assert t1 != t5  # different client generation
+    assert t5 == t6
     assert hash(t1) == hash(t2)
-    assert {t1, t2, t3, t4} == {t1, t3, t4}  # dedup via __hash__
+    assert hash(t5) == hash(t6)
+    assert {t1, t2, t3, t4, t5, t6} == {
+      t1,
+      t3,
+      t4,
+      t5,
+    }  # dedup via __hash__
 
   def test_token_repr_is_useful(self) -> None:
     t = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
@@ -1229,6 +1619,17 @@ class TestSqsHalfCredentialGuard:
     assert exc_info.value.setting_name == "endpoint_url"
     boto3.client.assert_not_called()
 
+  def test_connect_rejects_mutated_invalid_region(self, mocker) -> None:
+    backend = _make_backend()
+    backend.config.region_name = "not-a-region"
+    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert exc_info.value.setting_name == "region_name"
+    boto3.client.assert_not_called()
+
 
 # ===========================================================================
 # R14-E — Lifecycle bounds: SQS diagnostic in-flight set cap
@@ -1251,8 +1652,9 @@ class TestSqsInFlightCap:
     client.receive_message.return_value = {
       "Messages": [{"Body": base64.b64encode(body).decode("ascii"), "ReceiptHandle": "rh-new"}]
     }
-    b, _ = _connected(mocker)
-    b._client = client
+    b = _make_backend()
+    mocker.patch.object(boto3, "client", return_value=client)
+    b.connect()
 
     # Pre-saturate the set so the next pop trips the cap.
     b._in_flight = {

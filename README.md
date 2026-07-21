@@ -284,6 +284,17 @@ visibility lease is not auto-renewed; size it above the maximum expected
 pop-to-downloader-response time. Explicit nack makes the message immediately
 visible (`VisibilityTimeout=0`).
 
+An SQS connection is an immutable client generation: credentials, endpoint,
+region, queue prefix, visibility timeout, QueueUrl cache, and receipt tokens do
+not cross a reconnect boundary. Calling `connect()` while already connected is
+an idempotent no-op. To apply changed settings, call `disconnect()` and then
+`connect()`; old receipt tokens become stale without being sent through the new
+client. Disconnect rejects newly arriving operations, waits for already
+admitted SDK calls (including long polls or a purge barrier), and closes the
+retired client only after they finish. First-use QueueUrl discovery is
+single-flight per logical queue; a slow lookup does not serialize unrelated
+queues or delay an already-issued receipt acknowledgement.
+
 ### Memcached (standalone, NoSQL KV)
 
 ```python

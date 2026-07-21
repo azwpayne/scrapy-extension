@@ -308,6 +308,16 @@ separate. In particular, `SCRAPY_RABBITMQ_CONNECTION_ATTEMPTS` and
 `SCRAPY_RABBITMQ_RETRY_DELAY` configure pika's inner connection policy; they do
 not replace the generic manager settings above.
 
+SQS connection teardown is a drain boundary. As soon as `disconnect()` wins
+admission, new queue operations fail with `QueueError`; work already admitted
+keeps one client generation through QueueUrl resolution and its final SDK call.
+Disconnect waits for that work before closing the client, so the shutdown
+budget must cover an SQS long poll, SDK retries, and any active 60-second purge
+barrier. A live `connect()` is idempotent. Apply endpoint, region, prefix, or
+visibility changes with an explicit `disconnect()` / `connect()` sequence;
+receipt tokens from the retired generation are locally stale and must never be
+replayed through the replacement client.
+
 Every successful `ConnectionManager.get_manager()` acquisition must be paired
 with exactly one `close()`. The registry is reference-counted; releasing the
 same acquisition twice can prematurely retire a manager still expected by a

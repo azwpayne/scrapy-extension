@@ -271,7 +271,7 @@ speculative work.
   each delivery token so concurrent ack/nack can issue only one successful
   broker action, keep token-aware pops out of the legacy settlement slot, and
   restore local retryability after a failed RPC.
-- [ ] **CONCURRENCY-01B — SQS client generations.** Bind the SDK client, queue
+- [x] **CONCURRENCY-01B — SQS client generations.** Bind the SDK client, queue
   URL and lifecycle caches, and issued receipt tokens to one generation; make
   disconnect a continuous barrier rather than a short per-queue pulse.
 - [ ] **CONCURRENCY-01C — RabbitMQ connection generations.** Keep candidates
@@ -1076,4 +1076,35 @@ and SQS scheduler path. The concurrency regression also waits until the
 competing thread has actually started before using liveness as lock evidence.
 All 503 related tests passed on Python 3.10 and 3.14 with three real-broker tests
 explicitly skipped; the full Python 3.10 suite passed 3,213 tests with 46
+documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I31 — SQS immutable client generations
+
+Four initial deterministic REDs showed that a repeated connect replaced and
+leaked the live client, post-connect prefix/visibility mutations changed the
+current client's behavior, disconnect could close the client while QueueUrl
+resolution was still in progress, and operations could enter while
+`client.close()` was blocked. Post-implementation fan-out found two more REDs:
+an old tokenless ack could erase a replacement generation's legacy receipt,
+and one slow QueueUrl lookup held a generation-wide cache lock that delayed an
+unrelated queue's acknowledgement. Additional guards pin client construction
+versus disconnect, admitted receipt settlement versus drain, retired-token
+isolation, disconnected error context, and mutated-region revalidation.
+
+SQS now atomically publishes one client generation containing a validated
+operational snapshot plus generation-local QueueUrl and queue-lifecycle caches.
+Every queue transaction holds a shared generation lease from URL resolution
+through its final SDK call. QueueUrl discovery is single-flight per logical
+queue while the shared cache lock protects only short dictionary operations,
+so unrelated queues retain acknowledgement concurrency. Disconnect detaches
+first, rejects new admissions, drains existing leases, clears diagnostics, and
+closes exactly that client; connect/disconnect are serialized and a live
+connect is idempotent. Receipt tokens carry only an opaque generation identity,
+and the tokenless compatibility slot uses a locked receipt/epoch/generation
+compare-and-clear, so no stale path can erase or call a replacement delivery.
+Explicit reconnect is the only boundary at which changed operational settings
+take effect; the shared AWS region validator is also rerun before client I/O.
+
+All 512 related tests passed on Python 3.10 and 3.14 with one real-SQS test
+explicitly skipped; the full Python 3.10 suite passed 3,225 tests with 46
 documented skips. Ruff, strict mypy, and patch integrity remained green.

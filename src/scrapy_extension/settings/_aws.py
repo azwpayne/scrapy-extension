@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
 from scrapy_extension.exceptions import ConfigurationError
+
+_AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+
+
+def validate_aws_region_name(region_name: object) -> str:
+  """Return one AWS-style region name or raise a typed config error."""
+  if not isinstance(region_name, str) or not _AWS_REGION_PATTERN.fullmatch(
+    region_name
+  ):
+    raise ConfigurationError(
+      (
+        "region_name must match the AWS region pattern "
+        "'<aa>-<region>-<n>' (e.g. 'us-east-1', 'ap-southeast-2'). "
+        f"Got region_name={region_name!r}."
+      ),
+      setting_name="region_name",
+      setting_value=region_name,
+    )
+  return region_name
 
 
 def _credential_value(

@@ -318,6 +318,18 @@ if the client call raises, the token remains locally pending and may be retried.
 so callers must retain its returned token. Direct callers must not interpret a
 concurrent no-op as a second broker outcome.
 
+SQS no longer treats repeated `connect()` as an implicit client replacement.
+A live connection is idempotent, and endpoint, region, queue prefix, visibility
+timeout, QueueUrl caches, and receipt tokens remain fixed to that generation.
+Code that mutates `SqsSettings` after startup must explicitly call
+`disconnect()` and then `connect()` before expecting new values. Disconnect is
+now a drain barrier: operations admitted first finish on the old client, while
+operations arriving after teardown begins raise `QueueError`. A receipt token
+from the retired client becomes stale and is never acknowledged through the
+replacement; SQS visibility timeout/redrive provides its at-least-once retry.
+Allow shutdown enough time for an admitted long poll, SDK retry, or 60-second
+purge barrier.
+
 SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
 after PurgeQueue returns. AWS documents that the asynchronous purge can delete
 messages sent during that interval, so returning earlier was not a safe clear

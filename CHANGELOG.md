@@ -107,6 +107,17 @@ upgrading.
   token retryable and raise `QueueError`; token-aware pops no longer populate
   the legacy last-receipt slot. Direct callers that relied on disconnected
   settlement being a silent success must now retry after reconnection.
+- **SQS clients, caches, and receipts now belong to one connection generation.**
+  A live `connect()` is idempotent; changing settings takes effect only after
+  an explicit `disconnect()` / `connect()`. Every admitted queue operation
+  keeps its issuing client and QueueUrl through completion, while disconnect
+  first rejects new work, drains admitted calls, then closes that client.
+  Tokens issued by a retired generation become locally stale and never send an
+  acknowledgement through a replacement client; the legacy receipt slot also
+  uses generation-aware compare-and-clear. QueueUrl discovery is single-flight
+  per logical queue, so one slow lookup does not block another queue's receipt
+  settlement. Calls that lose admission to teardown now raise `QueueError`
+  instead of racing a closing SDK client.
 - **Pulsar acknowledgement tokens now have one terminal outcome.** A successful
   direct token ack or nack suppresses every later terminal action, including a
   concurrent opposite action. Client failures raise `QueueError` but restore

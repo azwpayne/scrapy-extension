@@ -30,6 +30,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -59,6 +60,7 @@ from scrapy_extension.settings import SqsMode
 from scrapy_extension.settings._aws import (
   validate_aws_credentials,
   validate_aws_endpoint,
+  validate_aws_region_name,
 )
 
 if TYPE_CHECKING:
@@ -193,6 +195,7 @@ class _SqsAckToken:
   __slots__ = (
     "_settlement_lock",
     "_settlement_state",
+    "generation_key",
     "queue_epoch",
     "queue_url",
     "receipt_handle",
@@ -203,6 +206,7 @@ class _SqsAckToken:
     queue_url: str,
     receipt_handle: str,
     *,
+    generation_key: object | None = None,
     queue_epoch: int | None = None,
   ) -> None:
     """Initialize the token.
@@ -210,17 +214,19 @@ class _SqsAckToken:
     Args:
         queue_url: The QueueUrl the message was popped from.
         receipt_handle: The SQS ReceiptHandle identifying the message.
+        generation_key: Opaque identity of the client generation that issued
+            this receipt. ``None`` preserves compatibility for manually
+            constructed tokens, which settle on the current generation.
         queue_epoch: The queue lifecycle epoch that issued the delivery.
     """
     self.queue_url = queue_url
     self.receipt_handle = receipt_handle
+    self.generation_key = generation_key
     self.queue_epoch = queue_epoch
     self._settlement_lock = threading.Lock()
     self._settlement_state = "pending"
 
-  def _settle(
-    self, terminal_state: str, operation: Callable[[], None]
-  ) -> bool:
+  def _settle(self, operation: Callable[[], str]) -> bool:
     """Run exactly one terminal broker operation for this delivery.
 
     The per-token lock remains held across the broker call. A competing ack
@@ -229,23 +235,23 @@ class _SqsAckToken:
     never report a no-op success while another settlement is still uncertain.
 
     Args:
-        terminal_state: State to publish after a successful broker operation.
-        operation: Broker operation to execute while the token is claimed.
+        operation: Broker operation to execute while the token is claimed. It
+            returns the terminal state to publish after success.
 
     Returns:
-        True when this call performed and completed the broker operation;
-        False when the token was already terminal.
+        True when this call claimed and terminalized the token, including a
+        local ``stale`` or ``cleared`` outcome; False when the token was
+        already terminal.
     """
     with self._settlement_lock:
       if self._settlement_state != "pending":
         return False
       self._settlement_state = "settling"
-      completed = False
+      terminal_state: str | None = None
       try:
-        operation()
-        completed = True
+        terminal_state = operation()
       finally:
-        self._settlement_state = terminal_state if completed else "pending"
+        self._settlement_state = terminal_state or "pending"
       return True
 
   def __eq__(self, other: object) -> bool:
@@ -254,16 +260,43 @@ class _SqsAckToken:
     return (
       self.queue_url == other.queue_url
       and self.receipt_handle == other.receipt_handle
+      and self.generation_key is other.generation_key
     )
 
   def __hash__(self) -> int:
-    return hash((self.queue_url, self.receipt_handle))
+    return hash((self.queue_url, self.receipt_handle, id(self.generation_key)))
 
   def __repr__(self) -> str:
     return (
       f"_SqsAckToken(queue_url={self.queue_url!r}, "
       f"receipt_handle={self.receipt_handle!r})"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _SqsConnectionSnapshot:
+  """Validated operational values fixed for one SQS client generation."""
+
+  mode: SqsMode
+  region_name: str
+  endpoint_url: str | None
+  queue_name_prefix: str
+  visibility_timeout: int
+
+
+@dataclass(slots=True, eq=False)
+class _SqsClientGeneration:
+  """One atomically published SQS client and its generation-local caches."""
+
+  key: object
+  client: Any
+  snapshot: _SqsConnectionSnapshot
+  queue_urls: dict[str, str] = field(default_factory=dict)
+  queue_resolution_locks: dict[str, threading.Lock] = field(default_factory=dict)
+  queue_lifecycles: dict[str, _SqsQueueLifecycle] = field(default_factory=dict)
+  cache_lock: threading.Lock = field(default_factory=threading.Lock)
+  accepting: bool = True
+  active_leases: int = 0
 
 
 class SqsBackend(Backend, QueueBackend):
@@ -286,8 +319,10 @@ class SqsBackend(Backend, QueueBackend):
 
   Attributes:
       config: SqsSettings instance.
-      _client: The boto3 SQS client (None until connected).
-      _queue_urls: Per-queue cached QueueUrl values.
+      _generation: The authoritative leased client, immutable operational
+          snapshot, and generation-local queue caches.
+      _client: Compatibility mirror of the current generation's boto3 client.
+      _queue_urls: Compatibility mirror of its QueueUrl cache.
       _in_flight: Diagnostic set of popped-but-unacked tokens.
       _last_receipt: ``(queue_url, receipt_handle)`` of the last-popped msg
           (legacy ``ack(token=None)`` fallback only).
@@ -298,6 +333,11 @@ class SqsBackend(Backend, QueueBackend):
 
   def __init__(self, config: SqsSettings) -> None:
     self.config = config
+    self._connect_lock = threading.Lock()
+    self._generation_condition = threading.Condition()
+    self._generation: _SqsClientGeneration | None = None
+    # Compatibility mirrors for diagnostics and older tests. Internal
+    # operations use only the generation captured by a lease.
     self._client: Any = None
     self._queue_urls: dict[str, str] = {}
     self._queue_lifecycles: dict[str, _SqsQueueLifecycle] = {}
@@ -308,18 +348,19 @@ class SqsBackend(Backend, QueueBackend):
     self._in_flight_overflow_warned: bool = False
     self._last_receipt: tuple[str, str] | None = None
     self._last_receipt_epoch: int | None = None
+    self._last_receipt_generation_key: object | None = None
 
-  def connect(self) -> None:
-    """Create the boto3 SQS client.
-
-    Raises:
-        BackendConnectionError: If the client cannot be created.
-    """
+  def _capture_connection_snapshot(
+    self,
+  ) -> tuple[_SqsConnectionSnapshot, dict[str, Any]]:
+    """Capture and revalidate every value used by one client generation."""
     mode = self.config.mode
     region_name = self.config.region_name
     endpoint_url = self.config.endpoint_url
     access_key = self.config.aws_access_key_id
     secret_key = self.config.aws_secret_access_key
+    queue_name_prefix = self.config.queue_name_prefix
+    visibility_timeout = self.config.visibility_timeout
     if not isinstance(mode, SqsMode):
       raise ConfigurationError(
         f"Unsupported SQS mode: {mode}",
@@ -331,44 +372,138 @@ class SqsBackend(Backend, QueueBackend):
       cloud=mode == SqsMode.CLOUD,
       require_endpoint=mode == SqsMode.STANDALONE,
     )
-    key_id, secret = validate_aws_credentials(
-      access_key,
-      secret_key,
+    key_id, secret = validate_aws_credentials(access_key, secret_key)
+    region_name = validate_aws_region_name(region_name)
+    if not isinstance(queue_name_prefix, str):
+      raise ConfigurationError(
+        "queue_name_prefix must be a string.",
+        setting_name="queue_name_prefix",
+        setting_value=None,
+      )
+    if (
+      isinstance(visibility_timeout, bool)
+      or not isinstance(visibility_timeout, int)
+      or not 1 <= visibility_timeout <= 12 * 60 * 60
+    ):
+      raise ConfigurationError(
+        "visibility_timeout must be an integer between 1 and 43200.",
+        setting_name="visibility_timeout",
+        setting_value=None,
+      )
+    snapshot = _SqsConnectionSnapshot(
+      mode=mode,
+      region_name=region_name,
+      endpoint_url=endpoint_url,
+      queue_name_prefix=queue_name_prefix,
+      visibility_timeout=visibility_timeout,
     )
-    try:
-      kwargs: dict[str, Any] = {"region_name": region_name}
-      if endpoint_url is not None:
-        kwargs["endpoint_url"] = endpoint_url
-      if key_id is not None and secret is not None:
-        kwargs["aws_access_key_id"] = _redact(key_id)
-        kwargs["aws_secret_access_key"] = _redact(secret)
-      self._client = boto3.client("sqs", **kwargs)
-      logger.debug("Connected to SQS (%s, %s)", mode.value, region_name)
-    except Exception as e:
-      raise BackendConnectionError(
-        f"Failed to create SQS client: {e}", backend_type="sqs"
-      ) from e
+    kwargs: dict[str, Any] = {"region_name": region_name}
+    if endpoint_url is not None:
+      kwargs["endpoint_url"] = endpoint_url
+    if key_id is not None and secret is not None:
+      kwargs["aws_access_key_id"] = _redact(key_id)
+      kwargs["aws_secret_access_key"] = _redact(secret)
+    return snapshot, kwargs
+
+  def connect(self) -> None:
+    """Publish one immutable SQS client generation, idempotently.
+
+    Raises:
+        BackendConnectionError: If the client cannot be created.
+    """
+    with self._connect_lock:
+      with self._generation_condition:
+        if self._generation is not None:
+          return
+      snapshot, kwargs = self._capture_connection_snapshot()
+      try:
+        candidate = boto3.client("sqs", **kwargs)
+      except Exception as e:
+        raise BackendConnectionError(
+          f"Failed to create SQS client: {e}", backend_type="sqs"
+        ) from e
+      generation = _SqsClientGeneration(
+        key=object(), client=candidate, snapshot=snapshot
+      )
+      with self._generation_condition:
+        self._generation = generation
+        self._client = candidate
+        self._queue_urls = generation.queue_urls
+        self._queue_lifecycles = generation.queue_lifecycles
+        self._queue_lifecycles_lock = generation.cache_lock
+        self._generation_condition.notify_all()
+      logger.debug(
+        "Connected to SQS (%s, %s)",
+        snapshot.mode.value,
+        snapshot.region_name,
+      )
 
   def disconnect(self) -> None:
-    """Close the SQS client."""
-    with self._queue_lifecycles_lock:
-      lifecycles = tuple(self._queue_lifecycles.values())
-    for lifecycle in lifecycles:
-      with lifecycle.destructive_operation():
-        pass
-    if self._client is not None:
-      with _swallow():
-        self._client.close()
-      self._client = None
-    self._queue_urls.clear()
-    with self._in_flight_lock:
-      self._in_flight.clear()
-      self._last_receipt = None
-      self._last_receipt_epoch = None
+    """Detach, drain, and close the current SQS client generation."""
+    with self._connect_lock:
+      with self._generation_condition:
+        generation = self._generation
+        if generation is not None:
+          generation.accepting = False
+          self._generation = None
+        self._client = None
+        self._queue_urls = {}
+        self._queue_lifecycles = {}
+        self._queue_lifecycles_lock = threading.Lock()
+        while generation is not None and generation.active_leases:
+          self._generation_condition.wait()
+      with self._in_flight_lock:
+        self._in_flight.clear()
+        self._last_receipt = None
+        self._last_receipt_epoch = None
+        self._last_receipt_generation_key = None
+      if generation is not None:
+        generation.queue_urls.clear()
+        generation.queue_resolution_locks.clear()
+        generation.queue_lifecycles.clear()
+        with _swallow():
+          generation.client.close()
+
+  @contextmanager
+  def _lease_generation(
+    self,
+    operation: str,
+    *,
+    generation_key: object | None = None,
+    queue_name: str | None = None,
+  ) -> Iterator[_SqsClientGeneration | None]:
+    """Lease one complete generation, or return None for a retired token."""
+    with self._generation_condition:
+      generation = self._generation
+      if generation_key is not None and (
+        generation is None or generation.key is not generation_key
+      ):
+        leased = False
+      else:
+        if generation is None or not generation.accepting:
+          raise QueueError(
+            f"Cannot {operation} with SQS while backend is disconnected.",
+            queue_name=queue_name,
+            operation=operation,
+          )
+        generation.active_leases += 1
+        leased = True
+    if not leased:
+      yield None
+      return
+    assert generation is not None  # noqa: S101  # nosec B101 - narrowed by lease
+    try:
+      yield generation
+    finally:
+      with self._generation_condition:
+        generation.active_leases -= 1
+        if generation.active_leases == 0:
+          self._generation_condition.notify_all()
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
-    return self._client is not None
+    with self._generation_condition:
+      return self._generation is not None
 
   def ping(self) -> bool:
     """Best-effort health: the client is non-None (boto3 is lazy)."""
@@ -393,44 +528,88 @@ class SqsBackend(Backend, QueueBackend):
         QueueError: If the URL cannot be resolved or created.
     """
     _validate_key_name(queue_name, "queue_name")
-    if queue_name in self._queue_urls:
-      return self._queue_urls[queue_name]
-    name = _physical_queue_name(self.config.queue_name_prefix, queue_name)
-    try:
-      resp = self._client.get_queue_url(QueueName=name)
-    except Exception as lookup_error:
-      if not _is_queue_missing(lookup_error):
-        raise QueueError(
-          f"Failed to resolve SQS queue URL for {queue_name}: {lookup_error}",
-          queue_name=queue_name,
-          operation=operation,
-        ) from lookup_error
+    with self._lease_generation(operation, queue_name=queue_name) as generation:
+      if generation is None:  # pragma: no cover - non-token lease is required
+        raise AssertionError("current SQS generation lease returned None")
+      return self._queue_url_for_generation(
+        generation, queue_name, operation=operation
+      )
+
+  def _queue_url_for_generation(
+    self,
+    generation: _SqsClientGeneration,
+    queue_name: str,
+    *,
+    operation: str,
+  ) -> str:
+    """Resolve a QueueUrl through one generation and cache it there."""
+    _validate_key_name(queue_name, "queue_name")
+    with generation.cache_lock:
+      cached = generation.queue_urls.get(queue_name)
+      if cached is not None:
+        return cached
+      resolution_lock = generation.queue_resolution_locks.get(queue_name)
+      if resolution_lock is None:
+        resolution_lock = threading.Lock()
+        generation.queue_resolution_locks[queue_name] = resolution_lock
+
+    # Only callers resolving the same logical queue serialize across network
+    # I/O. The generation cache lock remains a short dict critical section so
+    # a slow qA lookup cannot delay an already-issued qB acknowledgement.
+    with resolution_lock:
+      with generation.cache_lock:
+        cached = generation.queue_urls.get(queue_name)
+        if cached is not None:
+          return cached
+      name = _physical_queue_name(
+        generation.snapshot.queue_name_prefix, queue_name
+      )
       try:
-        resp = self._client.create_queue(QueueName=name)
-      except Exception as create_error:
+        resp = generation.client.get_queue_url(QueueName=name)
+      except Exception as lookup_error:
+        if not _is_queue_missing(lookup_error):
+          raise QueueError(
+            f"Failed to resolve SQS queue URL for {queue_name}: {lookup_error}",
+            queue_name=queue_name,
+            operation=operation,
+          ) from lookup_error
+        try:
+          resp = generation.client.create_queue(QueueName=name)
+        except Exception as create_error:
+          raise QueueError(
+            f"Failed to create missing SQS queue {queue_name}: {create_error}",
+            queue_name=queue_name,
+            operation=operation,
+          ) from create_error
+      try:
+        url = resp["QueueUrl"]
+      except Exception as e:
         raise QueueError(
-          f"Failed to create missing SQS queue {queue_name}: {create_error}",
+          f"Failed to resolve SQS queue URL for {queue_name}: {e}",
           queue_name=queue_name,
           operation=operation,
-        ) from create_error
-    try:
-      url = resp["QueueUrl"]
-    except Exception as e:
-      raise QueueError(
-        f"Failed to resolve SQS queue URL for {queue_name}: {e}",
-        queue_name=queue_name,
-        operation=operation,
-      ) from e
-    self._queue_urls[queue_name] = url
-    return cast(str, url)
+        ) from e
+      with generation.cache_lock:
+        generation.queue_urls[queue_name] = url
+      return cast(str, url)
 
   def _queue_lifecycle(self, queue_url: str) -> _SqsQueueLifecycle:
     """Return the stable lifecycle state for a physical SQS queue URL."""
-    with self._queue_lifecycles_lock:
-      lifecycle = self._queue_lifecycles.get(queue_url)
+    with self._lease_generation("resolve_queue_lifecycle") as generation:
+      if generation is None:  # pragma: no cover - non-token lease is required
+        raise AssertionError("current SQS generation lease returned None")
+      return self._queue_lifecycle_for_generation(generation, queue_url)
+
+  @staticmethod
+  def _queue_lifecycle_for_generation(
+    generation: _SqsClientGeneration, queue_url: str
+  ) -> _SqsQueueLifecycle:
+    """Return one generation's stable per-queue clear barrier."""
+    with generation.cache_lock:
+      lifecycle = generation.queue_lifecycles.get(queue_url)
       if lifecycle is None:
         lifecycle = _SqsQueueLifecycle()
-        self._queue_lifecycles[queue_url] = lifecycle
+        generation.queue_lifecycles[queue_url] = lifecycle
       return lifecycle
 
   # QueueBackend implementation
@@ -461,18 +640,24 @@ class SqsBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="push",
       )
-    url = self._queue_url(queue_name, operation="push")
-    lifecycle = self._queue_lifecycle(url)
-    with lifecycle.operation():
-      try:
-        body = base64.b64encode(item).decode("ascii")
-        self._client.send_message(QueueUrl=url, MessageBody=body)
-      except Exception as e:
-        raise QueueError(
-          f"Failed to push to SQS queue {queue_name}: {e}",
-          queue_name=queue_name,
-          operation="push",
-        ) from e
+    _validate_key_name(queue_name, "queue_name")
+    with self._lease_generation("push", queue_name=queue_name) as generation:
+      if generation is None:  # pragma: no cover - non-token lease is required
+        raise AssertionError("current SQS generation lease returned None")
+      url = self._queue_url_for_generation(
+        generation, queue_name, operation="push"
+      )
+      lifecycle = self._queue_lifecycle_for_generation(generation, url)
+      with lifecycle.operation():
+        try:
+          body = base64.b64encode(item).decode("ascii")
+          generation.client.send_message(QueueUrl=url, MessageBody=body)
+        except Exception as e:
+          raise QueueError(
+            f"Failed to push to SQS queue {queue_name}: {e}",
+            queue_name=queue_name,
+            operation="push",
+          ) from e
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Receive one message from the SQS queue.
@@ -554,11 +739,18 @@ class SqsBackend(Backend, QueueBackend):
         token: The :class:`_SqsAckToken` to track.
     """
     if token.queue_epoch is not None:
-      lifecycle = self._queue_lifecycle(token.queue_url)
-      with lifecycle.operation() as current_epoch:
-        if token.queue_epoch != current_epoch:
+      with self._lease_generation(
+        "track token", generation_key=token.generation_key
+      ) as generation:
+        if generation is None:
           return
-        self._add_in_flight(token)
+        lifecycle = self._queue_lifecycle_for_generation(
+          generation, token.queue_url
+        )
+        with lifecycle.operation() as current_epoch:
+          if token.queue_epoch != current_epoch:
+            return
+          self._add_in_flight(token)
       return
     self._add_in_flight(token)
 
@@ -578,51 +770,103 @@ class SqsBackend(Backend, QueueBackend):
           _MAX_IN_FLIGHT,
         )
 
+  def _legacy_receipt_snapshot(
+    self,
+  ) -> tuple[tuple[str, str], int | None, object | None] | None:
+    """Return the coherent legacy receipt slot under its state lock."""
+    with self._in_flight_lock:
+      if self._last_receipt is None:
+        return None
+      return (
+        self._last_receipt,
+        self._last_receipt_epoch,
+        self._last_receipt_generation_key,
+      )
+
+  def _legacy_receipt_is_current(
+    self,
+    receipt: tuple[str, str],
+    epoch: int | None,
+    generation_key: object | None,
+  ) -> bool:
+    """Return whether all fields still identify the captured legacy slot."""
+    with self._in_flight_lock:
+      return (
+        self._last_receipt == receipt
+        and self._last_receipt_epoch == epoch
+        and self._last_receipt_generation_key is generation_key
+      )
+
+  def _clear_legacy_receipt_if_current(
+    self,
+    receipt: tuple[str, str],
+    epoch: int | None,
+    generation_key: object | None,
+  ) -> bool:
+    """Compare-and-clear exactly one captured legacy receipt generation."""
+    with self._in_flight_lock:
+      if (
+        self._last_receipt != receipt
+        or self._last_receipt_epoch != epoch
+        or self._last_receipt_generation_key is not generation_key
+      ):
+        return False
+      self._last_receipt = None
+      self._last_receipt_epoch = None
+      self._last_receipt_generation_key = None
+      return True
+
   def _settle_token(self, token: _SqsAckToken, *, action: str) -> None:
     """Settle ``token`` once, restoring it to retryable state on failure."""
 
-    def broker_operation() -> None:
-      client = self._client
-      if client is None:
-        raise QueueError(
-          f"Cannot {action} SQS message while backend is disconnected.",
-          operation=action,
+    def broker_operation() -> str:
+      with self._lease_generation(
+        action, generation_key=token.generation_key
+      ) as generation:
+        if generation is None:
+          return "stale"
+        lifecycle = self._queue_lifecycle_for_generation(
+          generation, token.queue_url
         )
-      try:
-        if action == "ack":
-          client.delete_message(
-            QueueUrl=token.queue_url, ReceiptHandle=token.receipt_handle
-          )
-        elif action == "nack":
-          client.change_message_visibility(
-            QueueUrl=token.queue_url,
-            ReceiptHandle=token.receipt_handle,
-            VisibilityTimeout=0,
-          )
-        else:  # pragma: no cover - private helper has two fixed callers
-          raise ValueError(f"Unsupported SQS settlement action: {action}")
-      except QueueError:
-        raise
-      except Exception as e:
-        raise QueueError(
-          f"Failed to {action} SQS message.", operation=action
-        ) from e
+        with lifecycle.operation() as current_epoch:
+          if (
+            token.queue_epoch is not None
+            and token.queue_epoch != current_epoch
+          ):
+            return "cleared"
+          try:
+            if action == "ack":
+              generation.client.delete_message(
+                QueueUrl=token.queue_url,
+                ReceiptHandle=token.receipt_handle,
+              )
+            elif action == "nack":
+              generation.client.change_message_visibility(
+                QueueUrl=token.queue_url,
+                ReceiptHandle=token.receipt_handle,
+                VisibilityTimeout=0,
+              )
+            else:  # pragma: no cover - private helper has two fixed callers
+              raise ValueError(
+                f"Unsupported SQS settlement action: {action}"
+              )
+          except Exception as e:
+            raise QueueError(
+              f"Failed to {action} SQS message.", operation=action
+            ) from e
+          return "acked" if action == "ack" else "nacked"
 
-    lifecycle = self._queue_lifecycle(token.queue_url)
-    with lifecycle.operation() as current_epoch:
-      is_stale = (
-        token.queue_epoch is not None and token.queue_epoch != current_epoch
-      )
-      if is_stale:
-        token._settle("cleared", lambda: None)
-      else:
-        terminal_state = "acked" if action == "ack" else "nacked"
-        token._settle(terminal_state, broker_operation)
-      with self._in_flight_lock:
-        self._in_flight.discard(token)
-        if self._last_receipt == (token.queue_url, token.receipt_handle):
-          self._last_receipt = None
-          self._last_receipt_epoch = None
+    token._settle(broker_operation)
+    with self._in_flight_lock:
+      self._in_flight.discard(token)
+      if (
+        self._last_receipt == (token.queue_url, token.receipt_handle)
+        and self._last_receipt_epoch == token.queue_epoch
+        and self._last_receipt_generation_key is token.generation_key
+      ):
+        self._last_receipt = None
+        self._last_receipt_epoch = None
+        self._last_receipt_generation_key = None
 
   def _receive(
     self,
@@ -647,63 +891,77 @@ class SqsBackend(Backend, QueueBackend):
         QueueError: If the receive fails at the SQS layer.
         ValueError: If queue_name contains invalid characters.
     """
-    url = self._queue_url(queue_name, operation="pop")
-    lifecycle = self._queue_lifecycle(url)
-    with lifecycle.operation() as epoch:
-      try:
-        wait = min(math.ceil(timeout), _MAX_WAIT_SECONDS) if timeout > 0 else 0
-        resp = self._client.receive_message(
-          QueueUrl=url,
-          MaxNumberOfMessages=1,
-          WaitTimeSeconds=wait,
-          VisibilityTimeout=self.config.visibility_timeout,
-        )
-      except Exception as e:
-        raise QueueError(
-          f"Failed to pop from SQS queue {queue_name}: {e}",
-          queue_name=queue_name,
-          operation="pop",
-        ) from e
-      messages = resp.get("Messages") or []
-      if not messages:
-        return (url, None, None, epoch, None)
-      msg = messages[0]
-      receipt = msg.get("ReceiptHandle")
-      if not isinstance(receipt, str) or not receipt:
-        raise QueueError(
-          f"Malformed SQS message in queue {queue_name}: missing ReceiptHandle",
-          queue_name=queue_name,
-          operation="pop",
-        )
-      raw_body = msg.get("Body")
-      try:
-        if not isinstance(raw_body, str) or not raw_body:
-          raise ValueError("message body is missing or empty")
-        body = base64.b64decode(raw_body, validate=True)
-      except (binascii.Error, TypeError, ValueError) as e:
-        # This exact body cannot become valid on retry. Best-effort deletion
-        # terminates the poison delivery; failure leaves normal redrive intact.
+    _validate_key_name(queue_name, "queue_name")
+    with self._lease_generation("pop", queue_name=queue_name) as generation:
+      if generation is None:  # pragma: no cover - non-token lease is required
+        raise AssertionError("current SQS generation lease returned None")
+      url = self._queue_url_for_generation(
+        generation, queue_name, operation="pop"
+      )
+      lifecycle = self._queue_lifecycle_for_generation(generation, url)
+      with lifecycle.operation() as epoch:
         try:
-          self._client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
-        except Exception:  # noqa: BLE001 - preserve the decode failure below
-          logger.exception(
-            "Failed to delete malformed SQS message from queue %r", queue_name
+          wait = min(math.ceil(timeout), _MAX_WAIT_SECONDS) if timeout > 0 else 0
+          resp = generation.client.receive_message(
+            QueueUrl=url,
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=wait,
+            VisibilityTimeout=generation.snapshot.visibility_timeout,
           )
-        raise QueueError(
-          f"Invalid base64 body in SQS queue {queue_name}: {e}",
-          queue_name=queue_name,
-          operation="pop",
-        ) from e
-      if record_legacy:
-        self._last_receipt = (url, receipt)
-        self._last_receipt_epoch = epoch
-      token: _SqsAckToken | None = None
-      if issue_token:
-        token = _SqsAckToken(
-          queue_url=url, receipt_handle=receipt, queue_epoch=epoch
-        )
-        self._add_in_flight(token)
-      return (url, body, receipt, epoch, token)
+        except Exception as e:
+          raise QueueError(
+            f"Failed to pop from SQS queue {queue_name}: {e}",
+            queue_name=queue_name,
+            operation="pop",
+          ) from e
+        messages = resp.get("Messages") or []
+        if not messages:
+          return (url, None, None, epoch, None)
+        msg = messages[0]
+        receipt = msg.get("ReceiptHandle")
+        if not isinstance(receipt, str) or not receipt:
+          raise QueueError(
+            f"Malformed SQS message in queue {queue_name}: missing ReceiptHandle",
+            queue_name=queue_name,
+            operation="pop",
+          )
+        raw_body = msg.get("Body")
+        try:
+          if not isinstance(raw_body, str) or not raw_body:
+            raise ValueError("message body is missing or empty")
+          body = base64.b64decode(raw_body, validate=True)
+        except (binascii.Error, TypeError, ValueError) as e:
+          # This exact body cannot become valid on retry. Best-effort deletion
+          # terminates the poison delivery; failure leaves normal redrive intact.
+          try:
+            generation.client.delete_message(
+              QueueUrl=url, ReceiptHandle=receipt
+            )
+          except Exception:  # noqa: BLE001 - preserve the decode failure below
+            logger.exception(
+              "Failed to delete malformed SQS message from queue %r",
+              queue_name,
+            )
+          raise QueueError(
+            f"Invalid base64 body in SQS queue {queue_name}: {e}",
+            queue_name=queue_name,
+            operation="pop",
+          ) from e
+        if record_legacy:
+          with self._in_flight_lock:
+            self._last_receipt = (url, receipt)
+            self._last_receipt_epoch = epoch
+            self._last_receipt_generation_key = generation.key
+        token: _SqsAckToken | None = None
+        if issue_token:
+          token = _SqsAckToken(
+            queue_url=url,
+            receipt_handle=receipt,
+            generation_key=generation.key,
+            queue_epoch=epoch,
+          )
+          self._add_in_flight(token)
+        return (url, body, receipt, epoch, token)
 
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Delete a popped message so it isn't redelivered.
@@ -767,40 +1025,51 @@ class SqsBackend(Backend, QueueBackend):
 
   def _settle_legacy_receipt(self, *, action: str) -> None:
     """Settle the legacy single receipt without crossing a clear epoch."""
-    last_receipt = self._last_receipt
-    if last_receipt is None:
+    legacy_snapshot = self._legacy_receipt_snapshot()
+    if legacy_snapshot is None:
       return
+    last_receipt, receipt_epoch, generation_key = legacy_snapshot
     url, receipt = last_receipt
-    lifecycle = self._queue_lifecycle(url)
-    with lifecycle.operation() as current_epoch:
-      if self._last_receipt != last_receipt:
+    with self._lease_generation(
+      action, generation_key=generation_key
+    ) as generation:
+      if generation is None:
+        self._clear_legacy_receipt_if_current(
+          last_receipt, receipt_epoch, generation_key
+        )
         return
-      if (
-        self._last_receipt_epoch is not None
-        and self._last_receipt_epoch != current_epoch
-      ):
-        self._last_receipt = None
-        self._last_receipt_epoch = None
-        return
-      client = self._client
-      if client is None:
-        return
-      try:
-        if action == "ack":
-          client.delete_message(QueueUrl=url, ReceiptHandle=receipt)
-        else:
-          client.change_message_visibility(
-            QueueUrl=url,
-            ReceiptHandle=receipt,
-            VisibilityTimeout=0,
+      lifecycle = self._queue_lifecycle_for_generation(generation, url)
+      with lifecycle.operation() as current_epoch:
+        if not self._legacy_receipt_is_current(
+          last_receipt, receipt_epoch, generation_key
+        ):
+          return
+        if (
+          receipt_epoch is not None and receipt_epoch != current_epoch
+        ):
+          self._clear_legacy_receipt_if_current(
+            last_receipt, receipt_epoch, generation_key
           )
-      except Exception as e:
-        raise QueueError(
-          f"Failed to {action} SQS message: {e}", operation=action
-        ) from e
-      else:
-        self._last_receipt = None
-        self._last_receipt_epoch = None
+          return
+        try:
+          if action == "ack":
+            generation.client.delete_message(
+              QueueUrl=url, ReceiptHandle=receipt
+            )
+          else:
+            generation.client.change_message_visibility(
+              QueueUrl=url,
+              ReceiptHandle=receipt,
+              VisibilityTimeout=0,
+            )
+        except Exception as e:
+          raise QueueError(
+            f"Failed to {action} SQS message: {e}", operation=action
+          ) from e
+        else:
+          self._clear_legacy_receipt_if_current(
+            last_receipt, receipt_epoch, generation_key
+          )
 
   def queue_len(self, queue_name: str) -> int:
     """Return the approximate total pending message count for the queue.
@@ -820,32 +1089,52 @@ class SqsBackend(Backend, QueueBackend):
             incomplete response, which can trigger premature idle/CloseSpider
             and lose the backpressure signal. Mirrors the Redis R-qlen contract.
     """
-    url = self._queue_url(queue_name, operation="queue_len")
-    lifecycle = self._queue_lifecycle(url)
-    with lifecycle.operation():
-      try:
-        resp = self._client.get_queue_attributes(
-          QueueUrl=url, AttributeNames=list(_QUEUE_DEPTH_ATTRIBUTES)
-        )
-        attributes = resp["Attributes"]
-        return sum(int(attributes[name]) for name in _QUEUE_DEPTH_ATTRIBUTES)
-      except Exception as e:
-        # Do NOT swallow to 0: the scheduler trusts this value as a pending-work
-        # signal, so a false empty result can trigger premature spider closure.
-        raise QueueError(
-          str(e), queue_name=queue_name, operation="queue_len"
-        ) from e
+    _validate_key_name(queue_name, "queue_name")
+    with self._lease_generation(
+      "queue_len", queue_name=queue_name
+    ) as generation:
+      if generation is None:  # pragma: no cover - non-token lease is required
+        raise AssertionError("current SQS generation lease returned None")
+      url = self._queue_url_for_generation(
+        generation, queue_name, operation="queue_len"
+      )
+      lifecycle = self._queue_lifecycle_for_generation(generation, url)
+      with lifecycle.operation():
+        try:
+          resp = generation.client.get_queue_attributes(
+            QueueUrl=url, AttributeNames=list(_QUEUE_DEPTH_ATTRIBUTES)
+          )
+          attributes = resp["Attributes"]
+          return sum(
+            int(attributes[name]) for name in _QUEUE_DEPTH_ATTRIBUTES
+          )
+        except Exception as e:
+          # Do NOT swallow to 0: the scheduler trusts this value as a pending-work
+          # signal, so a false empty result can trigger premature spider closure.
+          raise QueueError(
+            str(e), queue_name=queue_name, operation="queue_len"
+          ) from e
 
-  def _retire_queue_deliveries(self, queue_url: str) -> None:
+  def _retire_queue_deliveries(
+    self, queue_url: str, generation_key: object
+  ) -> None:
     """Remove local receipt diagnostics invalidated by a destructive clear."""
     with self._in_flight_lock:
       retired = {
-        token for token in self._in_flight if token.queue_url == queue_url
+        token
+        for token in self._in_flight
+        if token.queue_url == queue_url
+        and token.generation_key is generation_key
       }
       self._in_flight.difference_update(retired)
-      if self._last_receipt is not None and self._last_receipt[0] == queue_url:
+      if (
+        self._last_receipt is not None
+        and self._last_receipt[0] == queue_url
+        and self._last_receipt_generation_key is generation_key
+      ):
         self._last_receipt = None
         self._last_receipt_epoch = None
+        self._last_receipt_generation_key = None
 
   def clear_queue(self, queue_name: str) -> None:
     """Purge the SQS queue and wait out AWS's destructive async window.
@@ -864,27 +1153,35 @@ class SqsBackend(Backend, QueueBackend):
         QueueError: If the purge fails at the SQS layer, after conservatively
             waiting out the window in case the request reached AWS.
     """
-    url = self._queue_url(queue_name, operation="clear_queue")
-    lifecycle = self._queue_lifecycle(url)
-    with lifecycle.destructive_operation():
-      self._retire_queue_deliveries(url)
-      purge_error: Exception | None = None
-      try:
-        self._client.purge_queue(QueueUrl=url)
-      except Exception as e:
-        # The request may have reached AWS even when the response was lost.
-        # Fence operations for the full window before surfacing the ambiguity.
-        purge_error = e
-      # Start the full safety interval after the RPC returns. Service-side
-      # acceptance can happen at any point during a slow request, so subtracting
-      # client-call latency would provide a weaker boundary.
-      time.sleep(_SQS_PURGE_WINDOW_SECONDS)
-      if purge_error is not None:
-        raise QueueError(
-          f"Failed to purge SQS queue {queue_name}.",
-          queue_name=queue_name,
-          operation="clear_queue",
-        ) from purge_error
+    _validate_key_name(queue_name, "queue_name")
+    with self._lease_generation(
+      "clear_queue", queue_name=queue_name
+    ) as generation:
+      if generation is None:  # pragma: no cover - non-token lease is required
+        raise AssertionError("current SQS generation lease returned None")
+      url = self._queue_url_for_generation(
+        generation, queue_name, operation="clear_queue"
+      )
+      lifecycle = self._queue_lifecycle_for_generation(generation, url)
+      with lifecycle.destructive_operation():
+        self._retire_queue_deliveries(url, generation.key)
+        purge_error: Exception | None = None
+        try:
+          generation.client.purge_queue(QueueUrl=url)
+        except Exception as e:
+          # The request may have reached AWS even when the response was lost.
+          # Fence operations for the full window before surfacing the ambiguity.
+          purge_error = e
+        # Start the full safety interval after the RPC returns. Service-side
+        # acceptance can happen at any point during a slow request, so subtracting
+        # client-call latency would provide a weaker boundary.
+        time.sleep(_SQS_PURGE_WINDOW_SECONDS)
+        if purge_error is not None:
+          raise QueueError(
+            f"Failed to purge SQS queue {queue_name}.",
+            queue_name=queue_name,
+            operation="clear_queue",
+          ) from purge_error
 
 
 class _swallow:

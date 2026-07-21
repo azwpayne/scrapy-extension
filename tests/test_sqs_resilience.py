@@ -154,11 +154,13 @@ def test_track_in_flight_warns_once_on_overflow(caplog) -> None:
 def test_receive_raises_for_message_without_receipt_handle(mocker) -> None:
   """A malformed delivery must not masquerade as an empty queue."""
   backend = _backend()
-  mocker.patch.object(backend, "_queue_url", return_value="http://q-url")
-  backend._client = mocker.MagicMock()
-  backend._client.receive_message.return_value = {
+  client = mocker.MagicMock()
+  client.get_queue_url.return_value = {"QueueUrl": "http://q-url"}
+  client.receive_message.return_value = {
     "Messages": [{"Body": base64.b64encode(b"x").decode()}]  # no ReceiptHandle
   }
+  mocker.patch("scrapy_extension.backends.sqs.boto3.client", return_value=client)
+  backend.connect()
   with pytest.raises(QueueError) as exc_info:
     backend._receive("q", 0.0)
 
@@ -202,12 +204,15 @@ def test_nack_with_token_client_none_raises_and_remains_retryable() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_nack_with_token_clears_matching_legacy_last_receipt() -> None:
+def test_nack_with_token_clears_matching_legacy_last_receipt(mocker) -> None:
   """Line 483 (true branch): nack(token=...) clears ``_last_receipt`` when it
   points at the same handle — keeps the legacy single-pop slot coherent with
   the per-message token path (single-process sanity)."""
   backend = _backend()
-  backend._client = MagicMock()
+  mocker.patch(
+    "scrapy_extension.backends.sqs.boto3.client", return_value=MagicMock()
+  )
+  backend.connect()
   token = _SqsAckToken("u-1", "rh-1")
   backend._last_receipt = ("u-1", "rh-1")  # legacy slot matches the token
   backend.nack("q", token=token)
@@ -215,13 +220,16 @@ def test_nack_with_token_clears_matching_legacy_last_receipt() -> None:
   assert token not in backend._in_flight
 
 
-def test_nack_with_token_keeps_nonmatching_legacy_last_receipt() -> None:
+def test_nack_with_token_keeps_nonmatching_legacy_last_receipt(mocker) -> None:
   """Line 483->485 (false branch): nack(token=...) where ``_last_receipt``
   points at a DIFFERENT handle leaves it intact — only the matching case
   clears the legacy slot (the token path and legacy path are independent
   except for the single-process coherence optimization)."""
   backend = _backend()
-  backend._client = MagicMock()
+  mocker.patch(
+    "scrapy_extension.backends.sqs.boto3.client", return_value=MagicMock()
+  )
+  backend.connect()
   token = _SqsAckToken("u-new", "rh-new")
   backend._last_receipt = ("u-other", "rh-other")  # different handle
   backend.nack("q", token=token)
