@@ -92,10 +92,12 @@ global gates, then perform a fresh audit before selecting the next item.
 | I8 | Preserve the replacement enqueue commit boundary | a source-ack failure cannot reject a committed replacement or undo dedup |
 | I9 | Repair the Pulsar TLS client contract | real SDK keyword smoke passes; hostname validation is explicit and secure by default |
 | I10 | Make connection-generation proxy snapshots coherent | an accessor returns complete old or new backend/breaker state, never a mixed pair |
-| I11 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
-| I12 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements never acknowledge early |
-| I13 | Repair backend-specific P1 correctness | consumer token incarnations, ES contention, DynamoDB consistent reads |
-| I14 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
+| I11 | Bind deferred acknowledgements to their issuing backend | reconnect cannot route an old token to a replacement backend or wrong physical queue |
+| I12 | Close remaining runtime-generation races | accessors never publish `None`; monitor callbacks cannot self-deadlock; stale breaker outcomes are fenced |
+| I13 | Harden configuration security invariants | mechanism-aware non-empty credentials and verified transports fail fast without secret leakage |
+| I14 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements and local buffers never acknowledge early |
+| I15 | Repair backend-specific P1 correctness | Kafka attempts, ES contention, DynamoDB reads, and SQS limits obey explicit contracts |
+| I16 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -140,6 +142,22 @@ speculative work.
   before constructing queue, set, or storage proxies. A reconnect race may
   return a complete old or new generation, never a mixed proxy through which a
   retired backend can trip the live breaker.
+- [x] **RUN-08 — issuer-bound acknowledgement settlement.** Wrap every token
+  emitted by a built-in backend-delegating strategy with the exact backend
+  proxy and physical queue that issued it. One successful ACK or NACK is
+  terminal, a broker failure remains retryable, concurrent terminal paths are
+  serialized, and custom deferred-ack strategies returning raw tokens fail
+  closed before processing.
+- [ ] **RUN-09 — accessor and close publication safety.** Capture one non-null
+  backend value before returning from a lazy accessor, reject `None` snapshots,
+  make `is_connected()` single-read, and disconnect falsey third-party backend
+  implementations during close.
+- [ ] **RUN-10 — monitor callback lock isolation.** Dispatch connect, retry, and
+  disconnect monitor hooks outside manager locks so a re-entrant observer
+  cannot self-deadlock or publish a competing connection transaction.
+- [ ] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
+  calls so a failure from an older CLOSED generation cannot reopen a breaker
+  that has since completed an OPEN → HALF_OPEN → CLOSED recovery.
 - [ ] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
   acquisition for crawler-owned construction, and use an unshareable fallback
   for unresolved direct construction, so Kafka and RocketMQ consumers are not
@@ -153,23 +171,41 @@ speculative work.
   source token for requests and iterables returned by user errbacks until each
   replacement is durably accepted. Explicitly document the unavoidable
   publish/ack crash gap and define safe behavior for delayed local strategies.
+- [ ] **RUN-04C — durable replacement strategies and snapshots.** Do not ACK a
+  token-bearing source after its replacement has only entered an in-process
+  delay, time-wheel, round-robin, or ring buffer. Preserve recovery snapshots
+  until a later clean checkpoint so a crash during restore is replay-safe.
 - [ ] **SEC-01 — credential completeness.** Reject partial credential pairs and
-  mechanism-inconsistent authentication for Kafka, MongoDB, Elasticsearch,
-  RabbitMQ, RocketMQ, SQS, and DynamoDB without exposing secret values. Preserve
-  valid ambient-credential and mechanism-specific modes rather than requiring
-  a universal username/password pair.
+  empty explicit secrets, URL userinfo, and mechanism-inconsistent
+  authentication for Kafka, MongoDB, Elasticsearch, RabbitMQ, RocketMQ,
+  Pulsar, SQS, and DynamoDB without exposing secret values. Preserve valid
+  ambient-credential and mechanism-specific modes rather than requiring a
+  universal username/password pair.
 - [ ] **SEC-02 — cloud transport.** Reject explicit plaintext AWS endpoints in
-  cloud mode; expose and propagate RocketMQ TLS, then require it for cloud mode
-  with migration notes.
+  cloud mode; expose and propagate RocketMQ TLS and require it for cloud mode;
+  secure Redis Sentinel's control plane; reject authenticated RabbitMQ/Pulsar
+  connections without certificate and hostname verification; define an
+  explicit trusted-network boundary for remote Memcached.
+- [ ] **SEC-03 — validated immutable connection snapshots.** Revalidate a copied
+  settings snapshot at every backend build/connect boundary so post-construction
+  mutation cannot bypass transport or credential validators. Sanitize every
+  URL/URI error before it reaches an exception or log record.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
-- [ ] **BACKEND-01 — consumer token generations.** Bind every deferred-ack token
-  to the backend instance that issued it so a token popped before manager
-  replacement cannot acknowledge a delivery on the replacement. For Kafka,
-  additionally fence by assignment epoch and delivery attempt, invalidate on
+- [ ] **BACKEND-01 — Kafka consumer generations.** Fence tokens by assignment
+  epoch and unique delivery attempt within one backend instance, invalidate on
   rebalance/nack/clear, validate admin responses, and wait for topic deletion
-  before recreation.
+  before recreation. RUN-08 already supplies the cross-backend-incarnation
+  fence; it does not make two deliveries of the same offset distinguishable.
+- [ ] **BACKEND-04 — broker terminal and clear semantics.** Make direct
+  Kafka/Pulsar/SQS token settlement one-shot and retryable, and specify honest
+  lifecycle barriers for Kafka topic recreation, RabbitMQ in-flight deliveries,
+  and SQS's asynchronous purge window.
+- [ ] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
+  stable AWS-compatible names without changing already-valid names, and enforce
+  the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
+  message limit before issuing network calls.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -318,11 +354,13 @@ the replacement's fingerprint, and allowed the broker's source redelivery to
 publish another copy. The strategy push is now the explicit commit boundary:
 post-commit ack failures increment `scheduler/ack_error`, retain the unresolved
 token, and log the terminal failure without changing the accepted push result.
-The reserved fingerprint therefore routes source redelivery through the
-existing duplicate-ack recovery path. The two focused regressions and all 167
-queue/scheduler acknowledgement tests passed; the focused regressions also
-passed on Python 3.14. The full suite passed 2,925 tests with 44 skips, followed
-by Ruff and strict mypy.
+The reserved fingerprint can absorb ordinary source redelivery through the
+existing duplicate-ack recovery path, but Scrapy retry requests may set
+`dont_filter=True`; the publish-then-ack boundary therefore remains explicitly
+at-least-once and can duplicate without a stable lineage/outbox key. The two
+focused regressions and all 167 queue/scheduler acknowledgement tests passed;
+the focused regressions also passed on Python 3.14. The full suite passed 2,925
+tests with 44 skips, followed by Ruff and strict mypy.
 
 ### I9 — Pulsar TLS SDK contract
 
@@ -355,3 +393,25 @@ pair only when both identities still match manager state. The regression first
 failed by returning the retired payload and now passes on Python 3.10 and 3.14;
 143 connection/breaker tests and the full 2,933-test suite with 44 skips passed,
 followed by Ruff and strict mypy.
+
+### I11 — issuer-bound acknowledgement settlement
+
+Two deterministic regressions first showed a token popped from backend A being
+sent to replacement backend B after reconnect, where broker-local generations
+and delivery identifiers can collide. Built-in backend-delegating strategies
+now wrap every non-null raw token with the exact queue-backend proxy and physical
+queue used by that pop; priority buckets and work-stealing peer queues preserve
+their actual source. `BackendQueue` settles through that retained issuer instead
+of resolving the manager again. The private wrapper hides the raw token from its
+representation, exposes read-only routing diagnostics, serializes concurrent
+ACK/NACK paths, becomes terminal after one successful operation, and remains
+pending after a broker exception so the operation can be retried. A custom
+strategy returning a raw token for a deferred-ack backend now fails closed
+before request processing and points authors to the binding helpers.
+
+The exact regression set passed on Python 3.10 and 3.14, 382 related
+queue/strategy/scheduler tests passed on Python 3.10, and the full suite passed
+2,943 tests with 44 documented skips. Ruff and strict mypy remained green. This
+iteration closes cross-manager-generation mis-acknowledgement; Kafka's
+same-instance rebalance and same-offset delivery-attempt fencing remains
+BACKEND-01.

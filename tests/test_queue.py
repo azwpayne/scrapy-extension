@@ -505,6 +505,123 @@ class TestBackendQueuePush:
     queue.nack()
     mock_connection_manager.get_queue_backend().nack.assert_called_once_with("test_queue")
 
+  @pytest.mark.parametrize("operation", ["ack", "nack"])
+  def test_ack_token_stays_bound_to_issuing_backend_after_reconnect(
+    self, mocker, operation
+  ):
+    """A pre-reconnect token must never act on the replacement backend.
+
+    Backend-local generations restart when ``ConnectionManager`` constructs a
+    new backend instance. A late token can therefore collide with a newly
+    delivered tag/offset on that instance. Exercise the real passthrough
+    strategy and switch the manager after pop: terminal handling must target
+    the exact backend that issued the token, not resolve the current backend.
+    """
+    from scrapy_extension.backends.base import QueueBackend
+    from scrapy_extension.backends.circuit_breaker import (
+      CircuitBreaker,
+      wrap_queue_backend,
+    )
+
+    class _TokenBackend(QueueBackend):
+      def __init__(self) -> None:
+        self.payload: bytes | None = None
+        self.ack_calls: list[tuple[str, object]] = []
+        self.nack_calls: list[tuple[str, object]] = []
+
+      def push(
+        self, queue_name: str, item: bytes, priority: float = 0.0
+      ) -> None:
+        del queue_name, item, priority
+
+      def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        del queue_name, timeout
+        return self.payload
+
+      def pop_with_ack(
+        self, queue_name: str, timeout: float = 0.0
+      ) -> tuple[bytes | None, object | None]:
+        del queue_name, timeout
+        return self.payload, "colliding-token"
+
+      def ack(self, queue_name: str, *, token: object | None = None) -> None:
+        self.ack_calls.append((queue_name, token))
+
+      def nack(self, queue_name: str, *, token: object | None = None) -> None:
+        self.nack_calls.append((queue_name, token))
+
+      def queue_len(self, queue_name: str) -> int:
+        del queue_name
+        return 0
+
+      def clear_queue(self, queue_name: str) -> None:
+        del queue_name
+
+    retired = _TokenBackend()
+    replacement = _TokenBackend()
+    retired_proxy = wrap_queue_backend(retired, CircuitBreaker("retired"))
+    replacement_proxy = wrap_queue_backend(
+      replacement,
+      CircuitBreaker("replacement"),
+    )
+    current = [retired_proxy]
+    manager = mocker.MagicMock()
+    manager.get_queue_backend.side_effect = lambda: current[0]
+    manager.get_storage_backend.side_effect = NotImplementedError
+    queue = BackendQueue(connection_manager=manager, queue_name="test_queue")
+    retired.payload = queue._serializer.serialize(
+      queue._request_to_dict(Request("https://example.com"))
+    )
+
+    request = queue.pop()
+    assert request is not None
+    token = request.meta["_backend_ack_token"]
+    current[0] = replacement_proxy
+
+    getattr(queue, operation)(token=token)
+
+    expected = [("test_queue", "colliding-token")]
+    assert getattr(retired, f"{operation}_calls") == expected
+    assert getattr(replacement, f"{operation}_calls") == []
+
+  @pytest.mark.parametrize("breaker_enabled", [False, True])
+  def test_custom_strategy_raw_deferred_ack_token_fails_closed(
+    self, mocker, breaker_enabled
+  ):
+    """Unsafe custom strategy tokens remain unacked for broker redelivery."""
+    from scrapy_extension.backends.base import QueueBackend
+    from scrapy_extension.backends.circuit_breaker import (
+      CircuitBreaker,
+      wrap_queue_backend,
+    )
+
+    backend = mocker.Mock(spec=QueueBackend)
+    backend.requires_ack = True
+    published_backend = (
+      wrap_queue_backend(backend, CircuitBreaker("custom"))
+      if breaker_enabled
+      else backend
+    )
+    manager = mocker.MagicMock()
+    manager.get_queue_backend.return_value = published_backend
+    manager.get_storage_backend.side_effect = NotImplementedError
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    payload = queue._serializer.serialize(
+      queue._request_to_dict(Request("https://example.com"))
+    )
+    strategy.pop_with_ack.return_value = (payload, "raw-token")
+
+    with pytest.raises(QueueError, match="unbound deferred-ack token"):
+      queue.pop()
+
+    backend.ack.assert_not_called()
+    backend.nack.assert_not_called()
+
   def test_decode_body_raises_on_invalid_base64(self):
     """R17/D1: _decode_body raises SerializationError on structurally corrupt body.
 

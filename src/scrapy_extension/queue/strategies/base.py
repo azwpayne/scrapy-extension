@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+  from scrapy_extension.backends.base import QueueBackend
   from scrapy_extension.backends.connectors import ConnectionManager
 
 
@@ -37,6 +38,88 @@ def normalize_queue_timeout(timeout: float) -> float:
   if not math.isfinite(normalized) or normalized < 0:
     raise ValueError(f"timeout must be a finite non-negative number, got {timeout!r}")
   return normalized
+
+
+class _BoundQueueAckToken:
+  """Bind a raw delivery token to its issuing backend incarnation.
+
+  ``ConnectionManager`` may replace a disconnected backend while a Scrapy
+  request remains in flight. Resolving the manager again at completion can
+  hand the old raw token to the replacement backend, whose local generation
+  counters and broker identifiers may have restarted. Keep the exact backend
+  object and physical queue used by the pop so ack/nack cannot cross that
+  incarnation boundary.
+
+  The wrapper is process-local and intentionally private. ``BackendQueue``
+  strips it at the serialization boundary just like every raw ack token.
+  """
+
+  __slots__ = ("_backend", "_queue_name", "_state", "_state_lock", "_token")
+
+  def __init__(
+    self,
+    backend: QueueBackend,
+    queue_name: str,
+    token: Any,
+  ) -> None:
+    self._backend = backend
+    self._queue_name = queue_name
+    self._token = token
+    self._state = "pending"
+    self._state_lock = threading.Lock()
+
+  @property
+  def backend(self) -> QueueBackend:
+    """The immutable backend proxy that issued the raw token."""
+    return self._backend
+
+  @property
+  def queue_name(self) -> str:
+    """The immutable physical queue used for the delivery."""
+    return self._queue_name
+
+  @property
+  def token(self) -> Any:
+    """The raw backend token; exposed only for internal compatibility tests."""
+    return self._token
+
+  @property
+  def state(self) -> str:
+    """Return ``pending``, ``acked``, or ``nacked`` for diagnostics."""
+    with self._state_lock:
+      return self._state
+
+  def ack(self) -> None:
+    """Acknowledge once through the backend that issued this token."""
+    self._settle("acked")
+
+  def nack(self) -> None:
+    """Negatively acknowledge once through the issuing backend instance."""
+    self._settle("nacked")
+
+  def _settle(self, terminal_state: str) -> None:
+    """Apply exactly one successful terminal transition.
+
+    The lock spans the backend call so concurrent response/error signals cannot
+    send conflicting terminal operations. A broker exception leaves the state
+    pending, allowing the same operation to be retried safely.
+    """
+    with self._state_lock:
+      if self._state != "pending":
+        return
+      if terminal_state == "acked":
+        self._backend.ack(self._queue_name, token=self._token)
+      else:
+        self._backend.nack(self._queue_name, token=self._token)
+      self._state = terminal_state
+
+  def __repr__(self) -> str:
+    """Return diagnostics without exposing the raw token's representation."""
+    return (
+      f"_BoundQueueAckToken(backend={type(self._backend).__name__}, "
+      f"queue_name={self._queue_name!r}, token_type={type(self._token).__name__}, "
+      f"state={self.state!r})"
+    )
 
 
 class QueueStrategy(ABC):
@@ -124,15 +207,18 @@ class QueueStrategy(ABC):
     for strategies whose ack semantics don't map to a single backend message.
     Backend-using strategies override this to call
     ``QueueBackend.pop_with_ack`` and thread the token through (passthrough /
-    delay / throttle / priority / time_wheel / work_stealing).
+    delay / throttle / priority / time_wheel / work_stealing). Custom
+    backend-delegating strategies should use ``_pop_backend_with_ack`` or
+    ``_pop_backend_instance_with_ack``: those helpers bind a raw broker token
+    to its issuing backend incarnation and physical queue.
 
     Args:
         queue_name: The queue name.
         timeout: Seconds to block (0 = non-blocking).
 
     Returns:
-        ``(item, token)`` -- ``token`` is ``None`` when the strategy/backend
-        has no per-message ack correlation.
+        ``(item, token)`` -- ``token`` is an opaque incarnation-bound token,
+        or ``None`` when the strategy/backend has no per-message correlation.
     """
     return (self.pop(queue_name, timeout), None)
 
@@ -155,22 +241,62 @@ class QueueStrategy(ABC):
         timeout: Seconds to block (0 = non-blocking).
 
     Returns:
-        ``(item, token)`` -- ``token`` is ``None`` for atomic-pop backends.
+        ``(item, token)`` where a non-``None`` raw token is bound to the
+        issuing backend and physical queue; ``None`` for atomic-pop backends.
+    """
+    backend = self._connection_manager.get_queue_backend()
+    return self._pop_backend_instance_with_ack(backend, queue_name, timeout)
+
+  @staticmethod
+  def _pop_backend_instance_with_ack(
+    backend: QueueBackend,
+    queue_name: str,
+    timeout: float = 0.0,
+  ) -> tuple[bytes | None, Any | None]:
+    """Pop from one backend and bind any token to that exact instance.
+
+    Strategies that scan multiple physical queues must keep the backend and
+    physical queue selected for each individual pop. This helper centralizes
+    both the override detection and the incarnation-bound token wrapper.
     """
     from scrapy_extension.backends.base import QueueBackend
 
-    backend = self._connection_manager.get_queue_backend()
-    unwrapped = getattr(backend, "_backend", backend)
+    wrapped_backend = getattr(backend, "_backend", None)
+    unwrapped = (
+      wrapped_backend if isinstance(wrapped_backend, QueueBackend) else backend
+    )
     backend_cls = getattr(unwrapped, "__class__", None)
+    is_interface_backend = isinstance(backend, QueueBackend)
     override = (
       backend_cls is not None
       and getattr(backend_cls, "pop_with_ack", None) is not None
       and backend_cls.pop_with_ack is not QueueBackend.pop_with_ack
     )
     if override:
-      return backend.pop_with_ack(queue_name, timeout)
-    data = backend.pop(queue_name, timeout)
-    return (data, None)
+      data, token = backend.pop_with_ack(queue_name, timeout)
+    elif not is_interface_backend:
+      # Lightweight ConnectionManager stubs are common for QueueStrategy
+      # consumers. Honor an explicitly configured tuple result, but fall back
+      # to ``pop`` when an unconfigured Mock returns another Mock.
+      result = backend.pop_with_ack(queue_name, timeout)
+      if isinstance(result, tuple) and len(result) == 2:
+        data, token = result
+      else:
+        data = backend.pop(queue_name, timeout)
+        token = None
+    else:
+      data = backend.pop(queue_name, timeout)
+      token = None
+    if token is None:
+      return (data, None)
+    if isinstance(token, _BoundQueueAckToken):
+      return (data, token)
+    # Preserve permissive duck-typed test/custom-manager behavior. Production
+    # ConnectionManager enforces QueueBackend before a strategy can get here;
+    # only interface-backed deliveries participate in the incarnation fence.
+    if not is_interface_backend:
+      return (data, token)
+    return (data, _BoundQueueAckToken(backend, queue_name, token))
 
   @abstractmethod
   def queue_len(self, queue_name: str) -> int:

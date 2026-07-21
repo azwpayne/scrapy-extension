@@ -1010,7 +1010,13 @@ class TestSchedulerAckTokenFlow:
     request = queue.pop(timeout=0)
 
     assert request is not None
-    assert request.meta["_backend_ack_token"] == ("opaque-token",)
+    from scrapy_extension.queue.strategies.base import _BoundQueueAckToken
+
+    token = request.meta["_backend_ack_token"]
+    assert isinstance(token, _BoundQueueAckToken)
+    assert token.backend is backend
+    assert token.queue_name == "q"
+    assert token.token == ("opaque-token",)
 
   def test_pop_omits_token_key_for_atomic_backends(self, mock_connection_manager):
     """Atomic-pop backends (token=None) leave request.meta untouched.

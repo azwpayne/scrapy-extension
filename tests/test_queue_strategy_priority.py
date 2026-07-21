@@ -56,6 +56,56 @@ def test_pop_with_ack_threads_backend_token_from_first_non_empty_bucket():
   qb.pop_with_ack.assert_called_once_with(s._bucket_queue("q", 0), 0.0)
 
 
+def test_pop_with_ack_binds_token_to_physical_bucket_and_issuer():
+  """Terminal handling must preserve both backend incarnation and bucket."""
+  from scrapy_extension.backends.base import QueueBackend
+  from scrapy_extension.queue.strategies.base import _BoundQueueAckToken
+
+  class _TokenBackend(QueueBackend):
+    def __init__(self) -> None:
+      self.ack_calls: list[tuple[str, object]] = []
+
+    def push(
+      self, queue_name: str, item: bytes, priority: float = 0.0
+    ) -> None:
+      del queue_name, item, priority
+
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+      del queue_name, timeout
+      return None
+
+    def pop_with_ack(
+      self, queue_name: str, timeout: float = 0.0
+    ) -> tuple[bytes | None, object | None]:
+      del timeout
+      return b"item", f"token:{queue_name}"
+
+    def ack(self, queue_name: str, *, token: object | None = None) -> None:
+      self.ack_calls.append((queue_name, token))
+
+    def queue_len(self, queue_name: str) -> int:
+      del queue_name
+      return 0
+
+    def clear_queue(self, queue_name: str) -> None:
+      del queue_name
+
+  backend = _TokenBackend()
+  manager = MagicMock(name="ConnectionManager")
+  manager.backend_type = "rabbitmq"
+  manager.get_queue_backend.return_value = backend
+  strategy = PriorityQueueStrategy(manager, levels=3)
+
+  data, token = strategy.pop_with_ack("q")
+
+  assert data == b"item"
+  assert isinstance(token, _BoundQueueAckToken)
+  assert token.backend is backend
+  assert token.queue_name == "q:p0"
+  token.ack()
+  assert backend.ack_calls == [("q:p0", "token:q:p0")]
+
+
 def test_pop_with_ack_uses_one_blocking_fallback_after_empty_scan():
   s, qb = _strategy(levels=3)
   qb.pop_with_ack.side_effect = [

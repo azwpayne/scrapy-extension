@@ -19,12 +19,17 @@ from typing import TYPE_CHECKING, Any, cast
 
 from scrapy.http import FormRequest, JsonRequest, Request, XmlRpcRequest
 
-from scrapy_extension.backends.base import JSONSerializer, _validate_key_name
+from scrapy_extension.backends.base import (
+  JSONSerializer,
+  QueueBackend,
+  _validate_key_name,
+)
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
+  _BoundQueueAckToken,
   normalize_queue_timeout,
 )
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
@@ -41,9 +46,9 @@ DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
 
 #: Meta key carrying the backend ack token from pop → request → response → ack.
 #: Atomic-pop backends set this to ``None`` (harmless); message-queue backends
-#: (Kafka, RabbitMQ) set it to a backend-specific token so the scheduler can
-#: ack the *specific* message that produced this request — correct under
-#: ``CONCURRENT_REQUESTS > 1``.
+#: set it to an opaque token bound to the issuing backend incarnation and
+#: physical queue so the scheduler can ack the *specific* message that produced
+#: this request — correct across concurrency and manager replacement.
 BACKEND_ACK_TOKEN_META_KEY = "_backend_ack_token"  # nosec B105
 
 #: Version marker separating current base64 bodies from legacy raw UTF-8 bodies.
@@ -415,6 +420,26 @@ class BackendQueue:
   def _pop(self, timeout: float) -> Request | None:
     """Execute an admitted pop operation."""
     data, ack_token = self._pop_with_ack(timeout)
+    if ack_token is not None and not isinstance(ack_token, _BoundQueueAckToken):
+      # A custom strategy that consumes a deferred-ack backend but returns the
+      # raw broker token cannot prove which backend incarnation issued it.
+      # Fail closed before processing: the source remains unacked and can be
+      # redelivered, rather than a late completion being sent to a replacement
+      # backend. Built-in backend-delegating strategies all use the binding
+      # helpers; in-process strategies return no token.
+      backend = self.connection_manager.get_queue_backend()
+      wrapped_backend = getattr(backend, "_backend", None)
+      capability_backend = (
+        wrapped_backend if isinstance(wrapped_backend, QueueBackend) else backend
+      )
+      if getattr(capability_backend, "requires_ack", False) is True:
+        raise QueueError(
+          "queue strategy returned an unbound deferred-ack token; custom "
+          "strategies must use QueueStrategy._pop_backend_with_ack() or "
+          "_pop_backend_instance_with_ack()",
+          queue_name=self.queue_name,
+          operation="pop",
+        )
     # Emit on every pop call — ``queue/pop_attempt_count`` (R14-D rename) is
     # the consumer-liveness signal (pop attempts per second), independent of
     # whether an item was returned. A worker popping an empty queue is itself
@@ -815,9 +840,9 @@ class BackendQueue:
   def ack(self, *, token: Any | None = None) -> None:
     """Acknowledge the popped request identified by ``token``.
 
-    Atomic backends (Redis, MongoDB, ElasticSearch, RocketMQ) implement
-    this as a no-op. Message-queue backends (Kafka, RabbitMQ) commit the
-    offset / ack the delivery so the message isn't re-delivered.
+    Atomic backends (Redis, MongoDB, ElasticSearch) implement this as a no-op.
+    Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) commit the
+    offset or acknowledge the delivery so the message is not re-delivered.
 
     When ``token`` is provided (read from
     ``request.meta["_backend_ack_token"]`` by the scheduler), the backend
@@ -826,8 +851,8 @@ class BackendQueue:
     last-popped message (legacy single-slot path).
 
     Args:
-        token: Opaque ack token from ``BackendQueue.pop``'s meta injection,
-            or ``None``.
+        token: Opaque, issuer-bound ack token from ``BackendQueue.pop``'s meta
+            injection, or ``None``.
     """
     self._begin_operation("ack")
     try:
@@ -837,6 +862,9 @@ class BackendQueue:
 
   def _ack(self, *, token: Any | None = None) -> None:
     """Execute an already-admitted acknowledgement."""
+    if isinstance(token, _BoundQueueAckToken):
+      token.ack()
+      return
     backend = self.connection_manager.get_queue_backend()
     if token is not None:
       backend.ack(self.queue_name, token=token)
@@ -861,6 +889,9 @@ class BackendQueue:
 
   def _nack(self, *, token: Any | None = None) -> None:
     """Execute an already-admitted negative acknowledgement."""
+    if isinstance(token, _BoundQueueAckToken):
+      token.nack()
+      return
     backend = self.connection_manager.get_queue_backend()
     if token is not None:
       backend.nack(self.queue_name, token=token)

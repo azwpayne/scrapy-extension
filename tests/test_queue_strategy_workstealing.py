@@ -173,6 +173,60 @@ def test_pop_with_ack_from_published_peer_queue_preserves_token():
   ]
 
 
+def test_pop_with_ack_binds_stolen_token_to_physical_peer_queue():
+  """A stolen delivery must settle against the peer queue that issued it."""
+  from scrapy_extension.backends.base import QueueBackend
+  from scrapy_extension.queue.strategies.base import _BoundQueueAckToken
+
+  class _StealBackend(QueueBackend):
+    def __init__(self) -> None:
+      self.pop_calls: list[str] = []
+      self.ack_calls: list[tuple[str, object]] = []
+
+    def push(
+      self, queue_name: str, item: bytes, priority: float = 0.0
+    ) -> None:
+      del queue_name, item, priority
+
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+      del queue_name, timeout
+      return None
+
+    def pop_with_ack(
+      self, queue_name: str, timeout: float = 0.0
+    ) -> tuple[bytes | None, object | None]:
+      del timeout
+      self.pop_calls.append(queue_name)
+      if queue_name == "q:w2":
+        return b"stolen", "peer-token"
+      return None, None
+
+    def ack(self, queue_name: str, *, token: object | None = None) -> None:
+      self.ack_calls.append((queue_name, token))
+
+    def queue_len(self, queue_name: str) -> int:
+      del queue_name
+      return 0
+
+    def clear_queue(self, queue_name: str) -> None:
+      del queue_name
+
+  backend = _StealBackend()
+  manager = MagicMock(name="ConnectionManager")
+  manager.backend_type = "redis"
+  manager.get_queue_backend.return_value = backend
+  strategy = WorkStealingQueueStrategy(manager, worker_id="w1", peer_ids=("w2",))
+
+  data, token = strategy.pop_with_ack("q")
+
+  assert data == b"stolen"
+  assert isinstance(token, _BoundQueueAckToken)
+  assert token.backend is backend
+  assert token.queue_name == "q:w2"
+  token.ack()
+  assert backend.ack_calls == [("q:w2", "peer-token")]
+
+
 def test_pop_never_probes_legacy_worker_name_on_sqs():
   """Colon-based legacy names were invalid on SQS and must not be resolved."""
   cm = MagicMock(name="ConnectionManager")

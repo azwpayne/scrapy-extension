@@ -186,11 +186,16 @@ class PriorityQueueStrategy(QueueStrategy):
     timeout = normalize_queue_timeout(timeout)
     qb = self._connection_manager.get_queue_backend()
     for level in range(self._levels):
-      data, token = qb.pop_with_ack(self._bucket_queue(queue_name, level), 0.0)
+      physical_queue = self._bucket_queue(queue_name, level)
+      data, token = self._pop_backend_instance_with_ack(qb, physical_queue, 0.0)
       if data is not None:
         return (data, token)
     if timeout > 0:
-      return qb.pop_with_ack(self._bucket_queue(queue_name, 0), timeout)
+      return self._pop_backend_instance_with_ack(
+        qb,
+        self._bucket_queue(queue_name, 0),
+        timeout,
+      )
     return (None, None)
 
   def queue_len(self, queue_name: str) -> int:

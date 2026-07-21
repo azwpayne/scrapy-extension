@@ -662,6 +662,7 @@ class TestQueueBackendProxy:
     (._backend) and the token survives end-to-end.
     """
     from scrapy_extension.queue.queue import BackendQueue
+    from scrapy_extension.queue.strategies.base import _BoundQueueAckToken
     from scrapy_extension.queue.strategies.passthrough import (
       PassthroughQueueStrategy,
     )
@@ -683,7 +684,10 @@ class TestQueueBackendProxy:
     )
     data, token = bq._pop_with_ack(0.0)
     assert data == b"ACK-PATH"
-    assert token == "REAL-TOKEN"
+    assert isinstance(token, _BoundQueueAckToken)
+    assert token.backend is wrapped
+    assert token.queue_name == "q"
+    assert token.token == "REAL-TOKEN"
 
 
   def test_pop_with_ack_is_hot_path_and_dispatches_to_override(self):

@@ -233,7 +233,7 @@ class WorkStealingQueueStrategy(QueueStrategy):
     qb = self._connection_manager.get_queue_backend()
     own = self._own_queue(queue_name)
     deadline = time.monotonic() + timeout if timeout > 0 else None
-    data, token = qb.pop_with_ack(own, 0.0)
+    data, token = self._pop_backend_instance_with_ack(qb, own, 0.0)
     if data is not None:
       return (data, token)
     n_peers = len(self._peer_ids)
@@ -244,15 +244,17 @@ class WorkStealingQueueStrategy(QueueStrategy):
           peer = self._peer_ids[idx]
           remaining = self._remaining_timeout(deadline)
           peer_timeout = min(self._steal_timeout, remaining)
-          data, token = qb.pop_with_ack(
-            self._worker_queue(queue_name, peer), peer_timeout
+          data, token = self._pop_backend_instance_with_ack(
+            qb,
+            self._worker_queue(queue_name, peer),
+            peer_timeout,
           )
           if data is not None:
             self._steal_idx = (idx + 1) % n_peers
             return (data, token)
     remaining = self._remaining_timeout(deadline)
     if remaining > 0:
-      return qb.pop_with_ack(own, remaining)
+      return self._pop_backend_instance_with_ack(qb, own, remaining)
     return (None, None)
 
   def queue_len(self, queue_name: str) -> int:
