@@ -281,7 +281,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      resp = self._table.get_item(Key={"pk": key})
+      resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
     except Exception as e:
       msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
@@ -339,7 +339,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      resp = self._table.get_item(Key={"pk": key})
+      resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
     except Exception as e:
       msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="exists", key=key) from e
@@ -364,7 +364,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      resp = self._table.get_item(Key={"pk": key})
+      resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
     except Exception as e:
       msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="ttl", key=key) from e
@@ -397,7 +397,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         StorageError: On operational failures (was previously silently
             swallowed).
     """
-    if prefix:
+    if prefix is not None:
       _validate_key_name(prefix, "prefix")
     # R-dynprefix: scope the scan to the prefix (StorageBackend ABC contract:
     # "only clear keys starting with this prefix"). Pre-fix the prefix was
@@ -406,8 +406,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     # FilterExpression (no boto3.conditions import, assertable in tests); ``pk``
     # is not a DynamoDB reserved word so it needs no ExpressionAttributeNames.
     # Pagination still works: LastEvaluatedKey is returned regardless of filter.
-    scan_kwargs: dict[str, Any] = {}
-    if prefix:
+    scan_kwargs: dict[str, Any] = {"ConsistentRead": True}
+    if prefix is not None:
       scan_kwargs["FilterExpression"] = "begins_with(pk, :p)"
       scan_kwargs["ExpressionAttributeValues"] = {":p": prefix}
     try:

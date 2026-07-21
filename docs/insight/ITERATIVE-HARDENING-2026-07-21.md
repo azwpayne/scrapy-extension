@@ -211,10 +211,15 @@ speculative work.
   count. Give pushes stable identities, make claim/delete/set writes safe under
   ambiguous transport outcomes, reject partial search/count results, and make
   clear cover unrefreshed writes.
-- [ ] **BACKEND-03 — DynamoDB consistency and clear scope.** Use consistent reads
-  where the storage contract promises immediate visibility, preserve an empty
-  string as a real prefix instead of a whole-table clear, and enforce DynamoDB's
-  item-size and persisted-value error boundaries.
+- [x] **BACKEND-03A — DynamoDB consistency and clear scope.** Use consistent
+  reads where the storage contract promises immediate visibility, including
+  every paginated scan, and reserve whole-table clear for an explicit `None`;
+  reject an empty prefix before any AWS operation instead of silently widening
+  it to the whole table.
+- [ ] **BACKEND-03B — DynamoDB storage boundaries.** Enforce DynamoDB's
+  400 KiB item and 2,048-byte partition-key limits before network I/O, propagate
+  deterministic pipeline failures, and reject malformed persisted value/TTL
+  shapes through the typed storage-error contract.
 
 ### Verified P2 follow-ups
 
@@ -474,3 +479,19 @@ contract is preserved. Six exact regressions passed on Python 3.14, 246 related
 breaker/manager/degradation tests passed on Python 3.10, and the full suite
 passed 2,954 tests with 44 documented skips. Ruff and strict mypy remained
 green.
+
+### I15a — DynamoDB consistent reads and destructive-clear scope
+
+Five RED regressions showed that all three point-read operations used
+eventually consistent reads, every page of `clear_storage()` did the same, and
+an empty string bypassed prefix validation and widened into an entire-table
+delete. `retrieve()`, `exists()`, and `ttl()` now request `ConsistentRead=True`;
+the flag is also present on every paginated scan. Only `prefix=None` selects a
+whole-table clear, while `prefix=""` fails validation before `scan()` or
+`batch_writer()` can run. The scan/delete sequence deliberately does not claim
+snapshot isolation from concurrent writers.
+
+The five exact regressions passed on Python 3.10 and 3.14, 91 related DynamoDB
+and cross-backend TTL tests passed, and the full suite passed 2,959 tests with
+44 documented skips. Ruff and strict mypy remained green. DynamoDB physical
+size and malformed persisted-value boundaries remain BACKEND-03B.

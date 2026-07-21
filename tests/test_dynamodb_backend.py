@@ -195,6 +195,16 @@ class TestDynamoDBStorageOps:
     table.get_item.return_value = {}
     assert b.retrieve("key1") is None
 
+  def test_retrieve_uses_consistent_read(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {}
+
+    assert b.retrieve("key1") is None
+
+    table.get_item.assert_called_once_with(
+      Key={"pk": "key1"}, ConsistentRead=True
+    )
+
   def test_retrieve_expired_deletes_and_returns_none(self, mocker) -> None:
     b, table = _connected(mocker)
     table.get_item.return_value = {
@@ -224,6 +234,14 @@ class TestDynamoDBStorageOps:
     b, table = _connected(mocker)
     table.get_item.return_value = {"Item": {"pk": "k", "value": b"x"}}
     assert b.exists("k") is True
+
+  def test_exists_uses_consistent_read(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {}
+
+    assert b.exists("k") is False
+
+    table.get_item.assert_called_once_with(Key={"pk": "k"}, ConsistentRead=True)
 
   def test_exists_false_for_expired(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -261,6 +279,14 @@ class TestDynamoDBStorageOps:
     table.get_item.return_value = {}
     assert b.ttl("missing") is None
     table.delete_item.assert_not_called()
+
+  def test_ttl_uses_consistent_read(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {}
+
+    assert b.ttl("k") is None
+
+    table.get_item.assert_called_once_with(Key={"pk": "k"}, ConsistentRead=True)
 
   def test_ttl_none_with_null_expire_at(self, mocker) -> None:
     """A persisted null expiry is the same permanent-value sentinel as absence."""
@@ -342,6 +368,31 @@ class TestDynamoDBStorageOps:
     ] == [{"pk": "tenant_a:first"}, {"pk": "tenant_a:second"}]
     assert table.scan.call_count == 2
     assert table.scan.call_args_list[1].kwargs["ExclusiveStartKey"] == page_cursor
+
+  def test_clear_storage_uses_consistent_read_on_every_page(self, mocker) -> None:
+    b, table = _connected(mocker)
+    page_cursor = {"pk": "tenant_a:first"}
+    table.scan.side_effect = [
+      {"Items": [], "LastEvaluatedKey": page_cursor},
+      {"Items": []},
+    ]
+
+    b.clear_storage(prefix="tenant_a:")
+
+    assert table.scan.call_count == 2
+    for scan_call in table.scan.call_args_list:
+      assert scan_call.kwargs["ConsistentRead"] is True
+    assert table.scan.call_args_list[1].kwargs["ExclusiveStartKey"] == page_cursor
+
+  def test_clear_storage_rejects_empty_prefix_before_aws_io(self, mocker) -> None:
+    b, table = _connected(mocker)
+    table.scan.return_value = {"Items": []}
+
+    with pytest.raises(ValueError, match="Invalid prefix"):
+      b.clear_storage(prefix="")
+
+    table.scan.assert_not_called()
+    table.batch_writer.assert_not_called()
 
   def test_clear_storage_prefix_applies_filter_expression(self, mocker) -> None:
     """R-dynprefix: clear_storage(prefix) scopes the scan via FilterExpression.
