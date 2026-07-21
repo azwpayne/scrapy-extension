@@ -46,6 +46,7 @@ from scrapy_extension.exceptions import (
 )
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
+from scrapy_extension.settings.mongodb import validate_mongodb_write_concern
 
 if TYPE_CHECKING:
   from pymongo.collection import Collection
@@ -127,6 +128,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         setting_name="mode",
         setting_value=self.config.mode,
       )
+    # Settings models remain mutable after construction. Recheck before any
+    # client construction so a live mutation cannot downgrade public writes
+    # to an unacknowledged socket handoff.
+    self._validated_write_concern()
     try:
       if self.config.mode == MongoDBMode.STANDALONE:
         self._connect_standalone()
@@ -173,6 +178,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Dictionary of client configuration options.
     """
+    self._validated_write_concern()
     # Return cached kwargs if available
     if self._client_kwargs is not None:
       return self._client_kwargs.copy()
@@ -201,14 +207,20 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def _write_concern_kwargs(self) -> dict[str, Any]:
     """Build write-concern kwargs from config (w / journal / wtimeoutMS)."""
-    kwargs: dict[str, Any] = {}
-    if self.config.w is not None:
-      kwargs["w"] = self.config.w
+    w, w_timeout_ms = self._validated_write_concern()
+    kwargs: dict[str, Any] = {"w": w}
     if self.config.journal is not None:
       kwargs["journal"] = self.config.journal
-    if self.config.w_timeout_ms is not None:
-      kwargs["wtimeoutMS"] = self.config.w_timeout_ms
+    if w_timeout_ms is not None:
+      kwargs["wtimeoutMS"] = w_timeout_ms
     return kwargs
+
+  def _validated_write_concern(self) -> tuple[int | str, int | None]:
+    """Revalidate the acknowledged-write policy against mutable settings."""
+    return validate_mongodb_write_concern(
+      self.config.w,
+      self.config.w_timeout_ms,
+    )
 
   def _tls_kwargs(self) -> dict[str, Any]:
     """Build TLS/SSL kwargs from config (empty when tls disabled)."""

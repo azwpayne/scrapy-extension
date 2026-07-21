@@ -258,6 +258,44 @@ class TestMongoDBLiterals:
     assert MongoDBSettings(auth_mechanism=value).auth_mechanism == value
 
 
+class TestMongoDBWriteConcern:
+  """Public mutation success must represent an acknowledged MongoDB write."""
+
+  @pytest.mark.parametrize("w", [0, -1, False, "0", "-1", "", "custom-tag"])
+  def test_unacknowledged_or_unsupported_w_is_rejected(self, w: object) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(w=w)  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "w"
+
+  @pytest.mark.parametrize(
+    ("w", "expected"), [(1, 1), (2, 2), ("1", 1), ("majority", "majority")]
+  )
+  def test_acknowledged_w_is_normalized(
+    self, w: int | str, expected: int | str
+  ) -> None:
+    assert MongoDBSettings(w=w).w == expected
+
+  def test_integer_w_can_be_loaded_from_environment(self, monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_MONGO_W", "1")
+    assert MongoDBSettings().w == 1
+
+  def test_zero_w_from_environment_is_rejected(self, monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_MONGO_W", "0")
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings()
+    assert exc_info.value.setting_name == "w"
+
+  @pytest.mark.parametrize("w_timeout_ms", [-1, True])
+  def test_invalid_write_timeout_is_rejected(self, w_timeout_ms: object) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(w_timeout_ms=w_timeout_ms)  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "w_timeout_ms"
+
+  def test_write_timeout_can_be_loaded_from_environment(self, monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_MONGO_W_TIMEOUT_MS", "5000")
+    assert MongoDBSettings().w_timeout_ms == 5000
+
+
 # ---------------------------------------------------------------------------
 # SV5 — Empty-string + unbounded-int gaps (5 fields)
 # ---------------------------------------------------------------------------

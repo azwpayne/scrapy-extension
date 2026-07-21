@@ -19,6 +19,82 @@ from scrapy_extension.exceptions.base import ConfigurationError
 _VALID_MONGO_SCHEMES: tuple[str, ...] = ("mongodb://", "mongodb+srv://")
 
 
+def validate_mongodb_write_concern(
+  w: object, w_timeout_ms: object
+) -> tuple[int | str, int | None]:
+  """Return a write concern whose completion confirms server acknowledgement."""
+  normalized_w: int | str
+  if isinstance(w, bool):
+    raise ConfigurationError(
+      "MongoDB w must be a positive integer or 'majority', not a boolean.",
+      setting_name="w",
+    )
+  if isinstance(w, int):
+    if w < 1:
+      raise ConfigurationError(
+        "MongoDB mutations require an acknowledged write concern (w >= 1).",
+        setting_name="w",
+      )
+    normalized_w = w
+  elif isinstance(w, str):
+    candidate = w.strip()
+    if candidate == "majority":
+      normalized_w = candidate
+    else:
+      try:
+        numeric_w = int(candidate, 10)
+      except ValueError:
+        raise ConfigurationError(
+          "MongoDB w must be a positive integer or 'majority'.",
+          setting_name="w",
+        ) from None
+      if numeric_w < 1:
+        raise ConfigurationError(
+          "MongoDB mutations require an acknowledged write concern (w >= 1).",
+          setting_name="w",
+        )
+      normalized_w = numeric_w
+  else:
+    raise ConfigurationError(
+      "MongoDB w must be a positive integer or 'majority'.",
+      setting_name="w",
+    )
+
+  if w_timeout_ms is None:
+    normalized_timeout = None
+  elif isinstance(w_timeout_ms, bool):
+    raise ConfigurationError(
+      "MongoDB w_timeout_ms must be a non-negative integer or None.",
+      setting_name="w_timeout_ms",
+    )
+  elif isinstance(w_timeout_ms, int):
+    if w_timeout_ms < 0:
+      raise ConfigurationError(
+        "MongoDB w_timeout_ms must be a non-negative integer or None.",
+        setting_name="w_timeout_ms",
+      )
+    normalized_timeout = w_timeout_ms
+  elif isinstance(w_timeout_ms, str):
+    try:
+      normalized_timeout = int(w_timeout_ms.strip(), 10)
+    except ValueError:
+      raise ConfigurationError(
+        "MongoDB w_timeout_ms must be a non-negative integer or None.",
+        setting_name="w_timeout_ms",
+      ) from None
+    if normalized_timeout < 0:
+      raise ConfigurationError(
+        "MongoDB w_timeout_ms must be a non-negative integer or None.",
+        setting_name="w_timeout_ms",
+      )
+  else:
+    raise ConfigurationError(
+      "MongoDB w_timeout_ms must be a non-negative integer or None.",
+      setting_name="w_timeout_ms",
+    )
+  return normalized_w, normalized_timeout
+
+
 class MongoDBMode(str, Enum):
   """MongoDB deployment modes.
 
@@ -195,7 +271,7 @@ class MongoDBSettings(BaseSettings):
   # === Write Concern ===
   w: int | str = Field(
     default=1,
-    description="Write concern (1, 'majority', or integer)",
+    description="Acknowledged write concern (positive integer or 'majority')",
   )
   journal: bool = Field(
     default=True,
@@ -203,7 +279,7 @@ class MongoDBSettings(BaseSettings):
   )
   w_timeout_ms: int | None = Field(
     default=None,
-    description="Write concern timeout in milliseconds",
+    description="Non-negative write concern timeout in milliseconds",
   )
 
   # === Server Selection ===
@@ -225,6 +301,26 @@ class MongoDBSettings(BaseSettings):
   _PRODUCTION_MODES: ClassVar[frozenset[MongoDBMode]] = frozenset(
     {MongoDBMode.ATLAS, MongoDBMode.SHARDED_CLUSTER, MongoDBMode.REPLICA_SET}
   )
+
+  @field_validator("w", mode="before")
+  @classmethod
+  def _normalize_write_concern(cls, value: object) -> int | str:
+    """Normalize numeric environment text and reject bool before coercion."""
+    normalized, _timeout = validate_mongodb_write_concern(value, None)
+    return normalized
+
+  @field_validator("w_timeout_ms", mode="before")
+  @classmethod
+  def _reject_invalid_write_timeout(cls, value: object) -> int | None:
+    """Reject booleans and negatives before pydantic can coerce them."""
+    _w, normalized = validate_mongodb_write_concern(1, value)
+    return normalized
+
+  @model_validator(mode="after")
+  def _validate_write_concern(self) -> Self:
+    """Require a server-acknowledged public mutation boundary."""
+    validate_mongodb_write_concern(self.w, self.w_timeout_ms)
+    return self
 
   @model_validator(mode="after")
   def _validate_tls_insecure_not_in_production_mode(self) -> Self:

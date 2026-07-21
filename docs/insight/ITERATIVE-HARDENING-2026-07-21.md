@@ -254,7 +254,7 @@ speculative work.
 - [x] **BACKEND-07A — confirmed Kafka publication.** Reject Kafka `acks=0`,
   apply advertised retention/min-ISR settings to new topics, and reject
   inconsistent replication, ISR, and partition-count policy.
-- [ ] **BACKEND-07B — confirmed MongoDB mutations.** Reject unacknowledged write
+- [x] **BACKEND-07B — confirmed MongoDB mutations.** Reject unacknowledged write
   concerns so queue/set/storage success cannot mean only a local socket-buffer
   handoff.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
@@ -954,4 +954,21 @@ selected config are read and a mismatch fails before publication. The cache is
 policy-aware, so a changed valid policy is reverified rather than ignored. All
 387 related tests passed on Python 3.10 and 3.14 with two real-broker tests
 explicitly skipped; the full Python 3.10 suite passed 3,173 tests with 45
+documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I27 — MongoDB acknowledged mutation boundary
+
+Fourteen RED outcomes across two evidence batches showed that zero, negative,
+boolean, empty, and unsupported MongoDB write concerns passed construction;
+numeric environment values stayed strings; negative and boolean timeouts were
+accepted; and a post-construction `w=0` mutation reached client creation. A
+second RED pinned legitimate numeric timeout text so hardening would not break
+environment-based configuration.
+
+One validator now defines the supported write boundary: `w` is a positive
+integer or `"majority"`, numeric environment text is normalized, and timeout is
+`None` or a non-negative integer. It runs during settings parsing, client-kwargs
+construction, and immediately before SDK I/O, with credential-free errors.
+All 452 related tests passed on Python 3.10 and 3.14 with six real-MongoDB tests
+explicitly skipped; the full Python 3.10 suite passed 3,190 tests with 45
 documented skips. Ruff, strict mypy, and patch integrity remained green.

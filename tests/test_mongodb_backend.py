@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from scrapy_extension.backends.mongodb import MongoDBBackend
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBSettings
 
@@ -22,6 +22,20 @@ def test_mongodb_backend_connect(mocker):
 
   mock_instance.admin.command.assert_called_once_with("ping")
   assert backend.is_connected()
+
+
+def test_mongodb_connect_rejects_mutated_unacknowledged_w_before_sdk_io(mocker):
+  config = MongoDBSettings(username="crawler", password="do-not-leak")
+  backend = MongoDBBackend(config)
+  config.w = 0
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "w"
+  assert "do-not-leak" not in str(exc_info.value)
+  client.assert_not_called()
 
 
 def test_mongodb_backend_disconnect(mocker):

@@ -123,6 +123,11 @@ SCRAPY_MONGO_URI = "mongodb://localhost:27017"
 SCRAPY_MONGO_DATABASE = "scrapy"
 ```
 
+MongoDB mutations use an acknowledged write concern. Set `SCRAPY_MONGO_W` to
+a positive integer or `"majority"` (recommended for replicated durability);
+`0`, negative values, booleans, and custom tag strings are rejected before
+client I/O. `SCRAPY_MONGO_W_TIMEOUT_MS`, when set, must be non-negative.
+
 ### Kafka (standalone, cluster, confluent)
 
 ```python

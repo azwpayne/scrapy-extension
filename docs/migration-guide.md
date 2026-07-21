@@ -286,6 +286,15 @@ alter an existing topic. Existing partition, replication, retention, and
 minimum-ISR policy is verified, and a mismatch blocks publication until it is
 reconciled with broker tooling.
 
+MongoDB `w=0` and negative write concerns are no longer accepted because an
+unacknowledged PyMongo result cannot satisfy queue, set, or storage mutation
+success. Use a positive integer or `"majority"`; custom replica-set tag names
+are outside this backend's supported settings surface. Boolean values are not
+treated as integers. `w_timeout_ms` must be a non-negative integer when set.
+These rules are rechecked immediately before client construction, so code that
+mutates a settings model after construction must update it to a supported value
+before reconnecting.
+
 RabbitMQ `clear_queue()` now fails with `QueueError` when the target queue has
 an unacknowledged local delivery. RabbitMQ purge only removes ready messages;
 allowing a later nack would otherwise resurrect work from before the clear.

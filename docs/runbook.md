@@ -256,6 +256,7 @@ Common causes (round-9 SV1–SV5 close all of these):
 | "credentials over cleartext http://" | ES cloud creds over http (SEC-3) | `settings/elasticsearch.py` |
 | "Authenticated Pulsar connections require … verification" | Token auth attempted with plaintext or a TLS verification escape hatch | `settings/pulsar.py`; fix the broker CA/hostname and keep both validation flags secure |
 | "Remote Memcached uses an unauthenticated plaintext protocol" | A non-loopback Memcached host lacks an explicit trusted-network decision | Prefer a TLS-capable storage backend, or set `SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=True` only behind an isolated private firewall |
+| "MongoDB mutations require an acknowledged write concern" | `SCRAPY_MONGO_W` is zero, negative, boolean, or unsupported text | Use a positive integer or `majority`; prefer `majority` for replicated durability |
 | "endpoint_url must be http:// or https://" | LocalStack/AWS endpoint scheme (SEC-4) | `settings/{sqs,dynamodb}.py` |
 | "aws_access_key_id and aws_secret_access_key must both be set" | Half-configured AWS creds | `settings/{sqs,dynamodb}.py` (config-time), `backends/connectors.py` (connect-time SEC-7) |
 
@@ -274,6 +275,12 @@ count, replication factor, retention, and minimum ISR, then fails on drift.
 Reconcile that drift out of band. Keep
 `num_partitions == max_priority_partitions` because priority is the physical
 partition index.
+
+MongoDB push, set, and storage mutation success requires an acknowledged write
+concern. The backend supports positive integer `w` values and `"majority"`;
+`w=0` is never a valid throughput shortcut. A write-concern timeout limits how
+long acknowledgement may wait but does not turn a timeout into success. Treat
+the resulting exception as outcome-ambiguous and retry only idempotent work.
 
 If the error is in a backend's `from_settings` / `from_crawler` factory,
 check `backends/connectors.py:resolve_backend_config` — it resolves

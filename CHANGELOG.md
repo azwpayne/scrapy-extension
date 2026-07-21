@@ -72,6 +72,11 @@ upgrading.
   queue priority maps directly to physical partitions. Existing topics remain
   operator-managed; their policy is verified and a mismatch fails instead of
   being silently reconfigured or ignored.
+- **MongoDB mutations now require an acknowledged write concern.** `w=0`,
+  negative or boolean values, and unsupported write-concern strings fail at
+  settings construction and again before client I/O. Supported values are a
+  positive integer or `"majority"`; numeric environment text is normalized to
+  an integer. Negative and boolean write timeouts are also rejected.
 - **RabbitMQ `clear_queue()` now rejects in-flight deliveries.** Rabbit's purge
   excludes unacknowledged messages, which could previously be nacked after a
   successful clear and resurrect pre-clear work. Exact per-queue pending counts
