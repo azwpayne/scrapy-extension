@@ -151,6 +151,24 @@ discovery clients. The public raw `client` property is not leased after it
 returns; never retain it across reconnect or use it for maintenance sequences
 that must stay on one generation.
 
+Redis data clients never automatically replay a command after an
+outcome-ambiguous connection, write, or response failure. Treat the resulting
+typed backend error as outcome-ambiguous: the server may have committed the
+command. In particular, blindly repeating push can enqueue twice, while a pop
+response loss can hide one already-consumed item; zero replay only prevents
+consuming a second item inside the same SDK call. Server-confirmed
+non-execution paths such as NOSCRIPT and Cluster MOVED/ASK/TRYAGAIN may still
+continue within the SDK. ClusterDown and SlotNotCovered fail fast because
+redis-py couples them to the same outer count as transport retries; recover
+through a later visible caller/manager connection attempt. Reconcile through
+application identities or domain state before retrying mutations. Remove the
+deprecated `SCRAPY_REDIS_RETRY_ON_TIMEOUT` input; both values are retained only
+for config compatibility and have no data-plane effect. The similarly named
+Sentinel setting is separate and permits at most one immediate retry per
+read-only control request after a timeout. This Retry policy does not retry
+authentication failures, although Sentinel may continue to another configured
+endpoint; it does not replace manager-level connection attempts.
+
 ## Storage TTL semantics (expired = absent)
 
 All five storage-capable backends (Redis, MongoDB, ElasticSearch, Memcached,
@@ -210,7 +228,7 @@ expect one in-flight operation per connected backend generation.
 
 | Surface | Ack / state boundary | Crash behavior | Operator action |
 |---|---|---|---|
-| Redis / MongoDB / ElasticSearch queue pop | Atomic pop removes the item from the backend queue. | A worker crash after pop can lose the request unless the spider re-enqueues or the backend implementation provides its own recovery. | Use idempotent callbacks and durable item storage for critical crawls. |
+| Redis / MongoDB / ElasticSearch queue pop | Atomic pop removes the item from the backend queue. Redis never automatically replays a transport-failed pop. | A worker crash after pop can lose the request unless the spider re-enqueues or the backend implementation provides its own recovery. A lost Redis response may hide one already-consumed item even though the SDK does not consume a second. | Use idempotent callbacks and durable item storage for critical crawls. Reconcile an ambiguous Redis failure before issuing another pop. |
 | Kafka / RabbitMQ / Pulsar queue pop | `pop_with_ack()` returns a per-message token; scheduler acks on Scrapy `response_received`. Kafka binds tokens to generation/assignment/attempt; Pulsar permits one successful terminal action and keeps client failures retryable. | Crash before ack redelivers. Kafka nacks/rebalances retire the old attempt so its late completion cannot commit the replacement. Crash after response but before callback/pipeline completion can lose downstream work. | Treat ack as downloader-level, not end-to-end completion. Retry the same Pulsar token after a reported client failure. RabbitMQ push waits for a publisher confirm and raises on unroutable/nacked delivery. |
 | SQS queue pop | Receipt-handle token plus `SCRAPY_SQS_VISIBILITY_TIMEOUT` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the visibility lease. | No automatic renewal. Size the lease above worst-case download time. Explicit nack sets visibility to 0 for immediate redelivery. |
 | RocketMQ queue pop | Single-outcome message token plus `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the invisibility lease. | No automatic renewal. Token-aware pop never fills the legacy ack slot; ack/nack on one token serialize and a failure remains locally retryable. Explicit nack shortens the lease to RocketMQ's 10-second minimum. Pair set/storage through per-component backends. |
@@ -329,7 +347,10 @@ per-component config and is the single chokepoint for the fallback chain.
 These are ConnectionManager-level controls. Backend-native retry settings are
 separate. In particular, `SCRAPY_RABBITMQ_CONNECTION_ATTEMPTS` and
 `SCRAPY_RABBITMQ_RETRY_DELAY` configure pika's inner connection policy; they do
-not replace the generic manager settings above.
+not replace the generic manager settings above. Redis's deprecated
+`SCRAPY_REDIS_RETRY_ON_TIMEOUT` setting does not control manager retries and no
+longer enables data-command replay; do not substitute one setting for the
+other.
 
 SQS connection teardown is a drain boundary. As soon as `disconnect()` wins
 admission, new queue operations fail with `QueueError`; work already admitted

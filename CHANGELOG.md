@@ -39,6 +39,29 @@ upgrading.
   not protected after it returns. Sentinel pools now receive the configured
   connection cap, and the cluster coverage setting is mapped to redis-py's
   supported `require_full_coverage` parameter.
+- **Redis data commands no longer receive automatic SDK transport retries.**
+  Across the supported redis-py 7.3–8.x range, the deprecated
+  `retry_on_timeout=False` flag does not reliably remove `TimeoutError` from
+  the default retry policy; a lost response could therefore replay an already
+  committed Lua push or pop. Standalone, master-slave, Sentinel-master, and
+  Cluster data clients now receive a fresh zero-replay policy that still runs
+  redis-py's failed-connection cleanup before raising the existing typed
+  backend error. This prevents a hidden replay after an outcome-ambiguous
+  connection, write, or response failure but does not remove ambiguity or roll
+  back the first attempt. Server-confirmed non-execution paths such as
+  NOSCRIPT and Cluster MOVED/ASK/TRYAGAIN retain their protocol continuation.
+  redis-py couples ClusterDown/SlotNotCovered recovery to the same outer retry
+  count, so those two errors now fail fast while MOVED/ASK/TRYAGAIN routing is
+  unchanged. The Stable
+  `SCRAPY_REDIS_RETRY_ON_TIMEOUT` input retains its historical default and both
+  values remain parseable for compatibility, but it is deprecated, ignored by
+  the data plane, and emits `FutureWarning` when explicitly supplied. Remove it
+  from configurations rather than replacing it with manager connection-retry
+  settings. `SCRAPY_REDIS_SENTINEL_RETRY_ON_TIMEOUT` now controls only
+  read-only discovery and permits at most one immediate SDK retry per control
+  request after a timeout when enabled. This Retry policy does not retry
+  authentication failures, although Sentinel may continue to another
+  configured endpoint; manager-level connection attempts remain separate.
 - **Storage TTL inputs and results are uniform across all five backends.** Direct
   `StorageBackend.store` calls accept only `None` or a positive integer number
   of seconds; zero, negatives, floats, and booleans now raise `ValueError`.

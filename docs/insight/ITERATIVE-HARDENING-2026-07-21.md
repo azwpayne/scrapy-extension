@@ -290,7 +290,7 @@ speculative work.
 - [x] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
   all SDK handles to a leased generation so clear and blocking-pop loops cannot
   cross reconnect or lazily resurrect themselves after disconnect.
-- [ ] **BACKEND-09A — Redis outcome-ambiguous retry policy.** Give standalone,
+- [x] **BACKEND-09A — Redis outcome-ambiguous retry policy.** Give standalone,
   Sentinel-master, and Cluster data clients an explicit no-replay SDK retry
   policy so a response timeout after a committed queue Lua script cannot push
   twice or consume a second item. Define the migration semantics of the public
@@ -1496,3 +1496,57 @@ audit, the two-worker compatibility canary, and patch integrity remained green.
 Independent contract, SDK, security, and concurrency re-reviews found no
 remaining reproducible P0/P1/P2 inside the I40 scope. Retry replay semantics
 and remaining mode/SDK truth gaps are deliberately bounded as I41 and I42.
+
+### I41 — Redis outcome-ambiguous command retry policy
+
+The specification treats a connection, write, or response failure as
+outcome-ambiguous: Redis may have committed a queue Lua script or another
+mutation before the client observed the failure. Standalone, master-slave,
+Sentinel-master, and Cluster data clients must therefore receive a fresh
+`Retry(NoBackoff(), 0)` for every candidate generation. The policy retains
+redis-py's default supported data-plane error classes so its failure callback
+still disconnects a poisoned connection, but it never invisibly sends the data
+command again. Server-confirmed non-execution paths remain distinct:
+NOSCRIPT loading and Cluster MOVED/ASK/TRYAGAIN protocol continuation are not
+disabled.
+
+The Stable `retry_on_timeout` input remains parseable with its historical
+`True` default, but both values are deprecated compatibility inputs and cannot
+enable data replay. Explicit use emits a static `FutureWarning` when the
+backend is constructed. The warning is deliberately attributed to a fixed
+library line instead of caller source because Python's default renderer prints
+the attributed line and could otherwise copy inline credentials into logs.
+The separate Sentinel control setting now permits at most one immediate SDK
+retry per request after Redis or socket timeout; its Retry policy does not
+retry authentication failures, although Sentinel discovery may continue to a
+different configured endpoint. ConnectionManager retries remain separate.
+
+redis-py couples Cluster `ConnectionError`/`TimeoutError` and
+ClusterDown/SlotNotCovered recovery to one outer retry count. Zeroing that
+count therefore intentionally makes the latter two failures fail fast as the
+conservative safety tradeoff; MOVED/ASK/TRYAGAIN routing remains intact. A
+later caller or manager attempt is visible, creates or reuses lifecycle state
+under the normal contract, and is not an SDK-hidden replay. The README,
+changelog, stability policy, migration guide, runbook, example, and superseded
+round-7 insight now state this boundary and the first-attempt ambiguity.
+
+Nineteen dedicated regressions cover the historical default and schema,
+explicit/flat/environment compatibility, safe warning attribution, fresh
+policy identity, Sentinel timeout/auth separation, and all construction modes.
+The execution seams use real redis-py `Script`, `Redis.execute_command`,
+`RedisCluster` outer routing plus a real node pool, and a real
+`SentinelConnectionPool` managed TLS connection. A simulated committed send
+followed by a lost response produces the existing typed `QueueError`, preserves
+the timeout as `__cause__`, disconnects the failed connection, and sends one
+EVALSHA/EVAL in standalone push/pop, Cluster push, and Sentinel-master pop.
+
+The final isolated Python 3.10 and 3.14 suites each passed 3,432 tests with 46
+documented skips. The two-worker Redis compatibility canary passed 82 tests.
+Ruff, strict mypy, configured Bandit, lockfile validation, dependency audit,
+and patch integrity remained green. Three successive six-specialist review
+waves found and closed the real-SDK execution gaps, warning lock/attribution
+risk, Sentinel authentication retry, and documentation quantifier defects;
+the final review found no remaining reproducible P0/P1/P2 in I41. Deployment
+mode truthfulness, typed Cluster exceptions, Cluster DB/redirect controls,
+primary-only master-slave behavior, and endpoint/userinfo hardening remain the
+bounded I42 scope.

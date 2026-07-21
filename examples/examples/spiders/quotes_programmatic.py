@@ -17,5 +17,4 @@ class QuotesProgrammaticSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Sp
     "password": None,
     "socket_timeout": 30.0,
     "socket_connect_timeout": 5.0,
-    "retry_on_timeout": True,
   }

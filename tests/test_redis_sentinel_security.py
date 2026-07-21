@@ -23,7 +23,6 @@ def _settings(**overrides) -> RedisSettings:
     "password": "redis-secret",
     "socket_timeout": 17.0,
     "socket_connect_timeout": 3.0,
-    "retry_on_timeout": False,
     "sentinel_retry_on_timeout": False,
     "ssl_enabled": True,
     "ssl_cafile": "/tls/ca.pem",
@@ -65,7 +64,8 @@ def test_sentinel_control_plane_inherits_tls_and_socket_policy(mocker) -> None:
   control = constructor_kwargs["sentinel_kwargs"]
   assert control["socket_timeout"] == 17.0
   assert control["socket_connect_timeout"] == 3.0
-  assert control["retry_on_timeout"] is False
+  assert "retry_on_timeout" not in control
+  assert control["retry"].get_retries() == 0
   assert control["ssl"] is True
   assert control["ssl_ca_certs"] == "/tls/ca.pem"
   assert control["ssl_certfile"] == "/tls/client.pem"

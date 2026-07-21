@@ -27,6 +27,7 @@ def test_redis_flat_scrapy_setting_is_forwarded_to_backend() -> None:
       "SCRAPY_REDIS_HOST": "redis.internal",
       "SCRAPY_REDIS_DB": 0,
       "SCRAPY_REDIS_DECODE_RESPONSES": False,
+      "SCRAPY_REDIS_RETRY_ON_TIMEOUT": False,
       "SCRAPY_MONGO_URI": "mongodb://must-not-leak:27017",
     }
   )
@@ -38,6 +39,7 @@ def test_redis_flat_scrapy_setting_is_forwarded_to_backend() -> None:
     "host": "redis.internal",
     "db": 0,
     "decode_responses": False,
+    "retry_on_timeout": False,
   }
 
 

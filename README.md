@@ -128,6 +128,34 @@ disconnect or use it to compose lifecycle-sensitive multi-command operations;
 the generation lease protects the bundled backend methods, not external SDK
 calls made after the property returns.
 
+Bundled Redis data commands are not automatically replayed after an
+outcome-ambiguous connection, write, or response failure. Redis may have
+committed a push, pop, set mutation, or delete before its response was lost;
+sending the command again could duplicate a push, consume another queued item,
+extend a TTL, or change a boolean mutation result. The explicit zero-replay
+policy discards the failed connection but cannot roll back or reveal the first
+attempt's outcome. Protocol continuations after the server explicitly reports
+that execution did not occur, such as NOSCRIPT or Cluster MOVED/ASK/TRYAGAIN,
+remain available. Do not blindly repeat an ambiguous push or pop; reconcile or
+deduplicate at the application boundary.
+
+redis-py uses the same Cluster outer-retry count for transport failures and
+ClusterDown/SlotNotCovered responses. Setting that count to zero therefore
+also makes those two topology failures fail fast; MOVED/ASK/TRYAGAIN routing is
+unchanged. A later caller or ConnectionManager attempt can rebuild topology,
+but it is a new, visible attempt rather than a hidden command replay.
+
+`SCRAPY_REDIS_RETRY_ON_TIMEOUT` remains accepted with its historical default
+for configuration compatibility, but is deprecated and neither value enables
+data-plane replay; remove it from new configurations. Explicit use emits a
+`FutureWarning` when the backend is constructed. The separate
+`SCRAPY_REDIS_SENTINEL_RETRY_ON_TIMEOUT` setting applies only to read-only
+Sentinel discovery: `True` permits at most one immediate SDK retry after a
+timeout for each control request. This per-request Retry policy does not retry
+authentication failures, although Sentinel may continue to another configured
+endpoint. The ConnectionManager's connection-attempt policy remains separate,
+and the discovered Redis master still uses the zero-replay data policy.
+
 In Sentinel mode, `SCRAPY_REDIS_SSL_ENABLED=True` secures both Sentinel
 discovery and the discovered master. Configure `SCRAPY_REDIS_SSL_CAFILE`; when
 using mTLS, provide `SCRAPY_REDIS_SSL_CERTFILE` and
@@ -633,7 +661,7 @@ Use `passthrough` when item loss is unacceptable. Use `batched` only when throug
 
 | Surface | Ack / state boundary | Crash behavior | Operational guidance |
 |---|---|---|---|
-| Redis / MongoDB / ElasticSearch queue pop | atomic backend pop; scheduler ack is inert | item is removed once popped; a later callback/pipeline crash can lose downstream item work | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters |
+| Redis / MongoDB / ElasticSearch queue pop | atomic backend pop; scheduler ack is inert; Redis does not replay an outcome-ambiguous transport failure | item is removed once popped; a later callback/pipeline crash can lose downstream item work. A lost Redis response may hide one already-consumed item, but the SDK will not consume a second item in the same call | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters; reconcile an ambiguous Redis failure before another pop |
 | Kafka / RabbitMQ / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; RabbitMQ push also waits for publisher confirmation |
 | SQS / RocketMQ queue pop | per-message token plus a finite broker visibility/invisibility lease | an unacked message becomes deliverable again when the lease expires, including while a slow download is still running | no automatic lease renewal; set the lease above maximum pop-to-response time. SQS nack is immediate; RocketMQ nack uses its 10-second floor |
 | Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |

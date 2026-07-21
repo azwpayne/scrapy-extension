@@ -16,6 +16,7 @@ import math
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -27,8 +28,11 @@ from scrapy_extension.backends._redaction import _redact
 
 try:
   from redis import Redis
+  from redis.backoff import NoBackoff
   from redis.cluster import ClusterNode, RedisCluster
   from redis.exceptions import RedisError
+  from redis.exceptions import TimeoutError as RedisTimeoutError
+  from redis.retry import Retry
   from redis.sentinel import Sentinel
 except ImportError as e:
   if not _is_missing_optional_dependency(e, "redis"):
@@ -64,6 +68,7 @@ _REDIS_FIELD_ADAPTERS: dict[str, TypeAdapter[Any]] = {
 }
 
 _BLOCKING_POP_POLL_INTERVAL = 0.05
+_SENTINEL_CONTROL_RETRIES = 1
 
 _POP_LUA = """
 local popped = redis.call('ZPOPMIN', KEYS[1])
@@ -102,6 +107,21 @@ def _normalize_pop_timeout(timeout: float) -> float:
   return normalized
 
 
+def _new_no_replay_retry() -> Retry:
+  """Return a fresh SDK policy that cleans up failures without replaying."""
+  return Retry(backoff=NoBackoff(), retries=0)
+
+
+def _new_sentinel_control_retry(enabled: bool) -> Retry:
+  """Return the timeout-only retry policy for Sentinel control requests."""
+  retries = _SENTINEL_CONTROL_RETRIES if enabled else 0
+  return Retry(
+    backoff=NoBackoff(),
+    retries=retries,
+    supported_errors=(RedisTimeoutError, TimeoutError),
+  )
+
+
 class _RedisConnectCancelled(Exception):
   """Internal signal for a candidate fenced by lifecycle teardown."""
 
@@ -118,7 +138,6 @@ class _RedisConnectionSnapshot:
   username: str | None
   socket_timeout: float | None
   socket_connect_timeout: float | None
-  retry_on_timeout: bool
   max_connections: int | None
   decode_responses: bool
   replicas: tuple[str, ...]
@@ -181,6 +200,20 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         config: Configuration for Redis connection.
     """
     self.config = config
+    if "retry_on_timeout" in config.model_fields_set:
+      warnings.warn(
+        (
+          "RedisSettings.retry_on_timeout / "
+          "SCRAPY_REDIS_RETRY_ON_TIMEOUT is deprecated and ignored; Redis "
+          "data-plane SDK retries are disabled to prevent outcome-ambiguous "
+          "command replay."
+        ),
+        FutureWarning,
+        # Keep attribution on this static library line. Python's default
+        # warning renderer prints the attributed source line; pointing at a
+        # caller that constructs RedisSettings inline could disclose literals.
+        stacklevel=1,
+      )
     self._connect_lock = threading.Lock()
     self._connect_local = threading.local()
     self._generation_condition = threading.Condition()
@@ -272,7 +305,6 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       username=validated.username,
       socket_timeout=validated.socket_timeout,
       socket_connect_timeout=validated.socket_connect_timeout,
-      retry_on_timeout=validated.retry_on_timeout,
       max_connections=validated.max_connections,
       decode_responses=validated.decode_responses,
       replicas=tuple(validated.replicas),
@@ -319,7 +351,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "username": snapshot.username,
       "socket_timeout": snapshot.socket_timeout,
       "socket_connect_timeout": snapshot.socket_connect_timeout,
-      "retry_on_timeout": snapshot.retry_on_timeout,
+      "retry": _new_no_replay_retry(),
       "max_connections": snapshot.max_connections,
       "decode_responses": snapshot.decode_responses,
       "ssl": snapshot.ssl_enabled,
@@ -380,7 +412,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         sentinel_kwargs: dict[str, Any] = {
           "socket_timeout": snapshot.socket_timeout,
           "socket_connect_timeout": snapshot.socket_connect_timeout,
-          "retry_on_timeout": snapshot.sentinel_retry_on_timeout,
+          "retry": _new_sentinel_control_retry(
+            snapshot.sentinel_retry_on_timeout
+          ),
           "max_connections": snapshot.max_connections,
           "ssl": snapshot.ssl_enabled,
           "ssl_ca_certs": snapshot.ssl_cafile,
@@ -396,7 +430,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           list(snapshot.sentinel_nodes),
           socket_timeout=snapshot.socket_timeout,
           socket_connect_timeout=snapshot.socket_connect_timeout,
-          retry_on_timeout=snapshot.sentinel_retry_on_timeout,
+          retry=_new_no_replay_retry(),
           max_connections=snapshot.max_connections,
           min_other_sentinels=snapshot.min_other_sentinels,
           sentinel_kwargs=sentinel_kwargs,
@@ -409,7 +443,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           username=snapshot.username,
           socket_timeout=snapshot.socket_timeout,
           socket_connect_timeout=snapshot.socket_connect_timeout,
-          retry_on_timeout=snapshot.retry_on_timeout,
+          retry=_new_no_replay_retry(),
           max_connections=snapshot.max_connections,
           decode_responses=snapshot.decode_responses,
           ssl=snapshot.ssl_enabled,
@@ -431,7 +465,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           username=snapshot.username,
           socket_timeout=snapshot.socket_timeout,
           socket_connect_timeout=snapshot.socket_connect_timeout,
-          retry_on_timeout=snapshot.retry_on_timeout,
+          retry=_new_no_replay_retry(),
           max_connections=snapshot.max_connections,
           decode_responses=snapshot.decode_responses,
           require_full_coverage=(not snapshot.cluster_skip_full_coverage_check),

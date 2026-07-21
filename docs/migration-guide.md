@@ -183,6 +183,44 @@ multi-command usage with the bundled backend methods, or coordinate its entire
 lifecycle outside the backend. No Redis data rewrite is required solely for
 this lifecycle change.
 
+## Redis Timeout Retry Policy
+
+Redis data-plane commands no longer receive automatic redis-py transport
+retries. Supported redis-py releases include timeout errors in their default
+retry object even when the deprecated `retry_on_timeout=False` argument is
+passed. If a push or pop Lua script committed and only its response was lost,
+that default could enqueue a duplicate or consume a second item. Other
+apparently idempotent mutations are also unsafe to replay invisibly because a
+second result, intervening writer, or refreshed TTL can change their meaning.
+
+`RedisSettings.retry_on_timeout` and
+`SCRAPY_REDIS_RETRY_ON_TIMEOUT` remain parseable with their historical default
+for Stable configuration compatibility, but are deprecated compatibility
+inputs. Both values now select the same zero-replay data policy, and explicit
+use emits `FutureWarning` when the backend is constructed. Remove the field
+from programmatic, Scrapy, and environment configuration. Do not replace it with
+`SCRAPY_RETRY_ATTEMPTS`: that setting retries connection establishment, not a
+failed data command.
+
+Zero replay guarantees that the SDK does not secretly resend a data command
+after an outcome-ambiguous connection, write, or response failure. A reported
+failure may follow a committed first attempt, and no automatic rollback or
+reconciliation is possible. Server-confirmed non-execution paths such as
+NOSCRIPT and Cluster MOVED/ASK/TRYAGAIN can still continue safely. redis-py
+couples ClusterDown/SlotNotCovered recovery to the same outer retry count, so
+those two Cluster errors now fail fast; a later caller or manager attempt is
+visible and rebuilds topology independently. Do not blindly repeat queue
+push/pop operations; use an application operation ID, deduplication, or
+domain-specific reconciliation where loss/duplication is unacceptable.
+
+The separate `sentinel_retry_on_timeout` setting remains active only for
+read-only Sentinel discovery. When true, it permits at most one immediate SDK
+retry after a timeout for each control request; it does not retry
+authentication failures. Sentinel may still continue discovery against another
+configured endpoint, and the setting does not limit ConnectionManager
+connection attempts. No Redis key migration is required for this policy
+change.
+
 ## Queued-Request Wire Format
 
 Current request dictionaries mark bodies with

@@ -94,7 +94,8 @@ class RedisSettings(BaseSettings):
       password: Redis authentication password.
       socket_timeout: Socket timeout in seconds.
       socket_connect_timeout: Socket connection timeout in seconds.
-      retry_on_timeout: Whether to retry on timeout.
+      retry_on_timeout: Deprecated compatibility input; data commands are not
+        automatically replayed after timeout for either value.
       masters: List of master nodes for cluster mode.
       replicas: List of replica nodes for master_slave mode.
       sentinels: List of sentinel nodes for sentinel mode.
@@ -171,7 +172,11 @@ class RedisSettings(BaseSettings):
   )
   retry_on_timeout: bool = Field(
     default=True,
-    description="Whether to retry on timeout",
+    description=(
+      "Deprecated compatibility input. Redis data-plane commands never use "
+      "automatic SDK timeout retries because their outcome may be ambiguous."
+    ),
+    json_schema_extra={"deprecated": True},
   )
   max_connections: int | None = Field(
     default=None,
@@ -217,7 +222,9 @@ class RedisSettings(BaseSettings):
   )
   sentinel_retry_on_timeout: bool = Field(
     default=True,
-    description="Retry on timeout when connecting to sentinels",
+    description=(
+      "Retry one timeout per read-only Sentinel control SDK request"
+    ),
   )
 
   # === Cluster Mode Settings ===
