@@ -338,6 +338,15 @@ SCRAPY_DYNAMODB_ENDPOINT_URL = "http://localhost:4566"  # optional standalone ov
 As with SQS, standalone mode defaults to loopback LocalStack. Set mode to
 `cloud` and leave `endpoint_url` unset for real AWS.
 
+DynamoDB gives every connection candidate a private boto3 Session and publishes
+the prepared Session/Resource/Table set as one generation. A live `connect()`
+is idempotent; apply endpoint, region, table, or credential-setting changes with
+an explicit `disconnect()` / `connect()`. Because the boto3 Resource API is not
+thread-safe, storage calls and health probes are serialized for each backend
+instance. Disconnect drains an admitted operation, then closes that
+generation's botocore client. Paginated clears and lazy TTL cleanup remain on
+their issuing table generation.
+
 See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/main/examples) for representative spiders and deployment-mode recipes (Sentinel, Cluster, Atlas, Confluent, etc).
 
 ## Backend Capabilities

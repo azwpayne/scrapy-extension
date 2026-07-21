@@ -277,9 +277,10 @@ speculative work.
 - [x] **CONCURRENCY-01C — RabbitMQ connection generations.** Keep candidates
   private, make live connect idempotent, preserve a healthy session after a
   failed candidate, and retire old unacknowledged deliveries through close.
-- [ ] **CONCURRENCY-01D — DynamoDB table generations.** Publish resource/table
-  handles together, serialize the non-thread-safe boto3 Resource API, and keep
-  every multi-page or lazy-TTL operation on one generation.
+- [x] **CONCURRENCY-01D — DynamoDB table generations.** Publish a private
+  Session/resource/table set together, serialize the non-thread-safe boto3
+  Resource API, and keep every multi-page or lazy-TTL operation on one
+  generation.
 - [ ] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
   all SDK handles to a leased generation so clear and blocking-pop loops cannot
   cross reconnect or lazily resurrect themselves after disconnect.
@@ -289,6 +290,13 @@ speculative work.
 - [ ] **CONCURRENCY-01G — RocketMQ client generations.** Publish producer,
   consumer, validated settings, and subscription cache as one generation so a
   replacement consumer cannot inherit a stale subscribed-topic hit.
+- [ ] **CONCURRENCY-01H — SQS private SDK sessions.** Stop using boto3's shared
+  default Session alias when constructing SQS client generations so independent
+  backend instances cannot race SDK client setup.
+- [ ] **CONCURRENCY-01I — DynamoDB supported SDK ownership.** Replace the
+  cross-thread Resource with a low-level client or dedicated owner-thread model
+  so the implementation lies entirely inside boto3's documented thread-safety
+  boundary, not only behind an external serialization lock.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -303,6 +311,15 @@ speculative work.
   400 KiB item and 2,048-byte partition-key limits before network I/O, propagate
   deterministic pipeline failures, and reject malformed persisted value/TTL
   shapes through the typed storage-error contract.
+- [ ] **BACKEND-03C — bounded DynamoDB batch clear.** Replace BatchWriter's
+  unbounded hot retry of `UnprocessedItems` with explicit 25-item writes,
+  bounded exponential jitter, and a typed partial-clear failure.
+- [ ] **BACKEND-03D — remaining DynamoDB response/region contracts.** Accept
+  valid multi-segment AWS regions such as GovCloud, revalidate them at connect,
+  and reject malformed delete responses through `StorageError`.
+- [ ] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
+  text: `_RedactedStr` protects `repr`, while ordinary string operations expose
+  the underlying value required by SDK authentication.
 
 ### Verified P2 follow-ups
 
@@ -1140,3 +1157,35 @@ All 142 local RabbitMQ tests passed on Python 3.10 and 3.14 with five
 real-broker tests explicitly skipped; the full Python 3.10 suite passed 3,234
 tests with 46 documented skips. Ruff, strict mypy, Bandit, lockfile validation,
 and patch integrity remained green.
+
+### I33 — DynamoDB immutable table generations
+
+Deterministic RED regressions showed that a table candidate was visible
+before preparation completed, repeated or concurrent connects replaced live
+handles, disconnect could be followed by a late candidate resurrection, and a
+queued pre-disconnect connect intent could publish afterward. They also proved
+that boto3 Resource calls overlapped, disconnect closed no HTTP client and did
+not drain an active write, settings mutation took effect without reconnect,
+and paginated clear or lazy TTL cleanup could splice table generations.
+
+DynamoDB now gives every candidate a private boto3 Session, privately prepares
+its Resource/Table, and publishes the complete set as one immutable generation
+only after the table is data-plane usable. Live connect is idempotent. The epoch
+is captured before the connect single-flight lock, so disconnect fences both an
+in-progress candidate and every already queued intent. Checkpoints prevent a
+known-stale candidate from continuing preparation, while an already admitted
+`create_table` is drained as a persistent side effect. One re-entrant operation
+lock serializes the non-thread-safe Resource API and forms the retirement
+barrier: every public operation captures the authoritative generation once,
+disconnect waits for an admitted operation, then closes
+`resource.meta.client`. Compatibility handle mirrors are updated atomically but
+never drive internal operations. Connection snapshots exclude credentials,
+revalidate the AWS region before I/O, and take settings changes only at explicit
+reconnect. Paginated clear and read-plus-lazy-delete remain on one Table; clear
+is linearized only against this backend instance because a DynamoDB Scan is not
+a cross-client snapshot transaction.
+
+All 221 order-sensitive connector and DynamoDB tests passed on Python 3.10 and
+3.14 with one real-service integration test explicitly skipped. The full Python
+3.10 suite passed 3,266 tests with 46 documented skips. Ruff, strict mypy,
+Bandit, lockfile validation, and patch integrity remained green.

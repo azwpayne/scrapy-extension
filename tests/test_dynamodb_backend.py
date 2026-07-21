@@ -1,8 +1,8 @@
 """Tests for DynamoDBBackend (subsystem ③) — mocked boto3.
 
 Injects a mock ``boto3`` into ``sys.modules`` (shared with the SQS test) and
-patches the canonical ``boto3.resource`` (module-attribute pattern) to assert
-call patterns against a fake Table.
+patches the private candidate ``Session.resource`` call to assert call patterns
+against a fake Table.
 """
 
 from __future__ import annotations
@@ -47,13 +47,27 @@ def _make_backend(**overrides) -> DynamoDBBackend:
   return DynamoDBBackend(DynamoDBSettings(**overrides))
 
 
+def _patch_resource(mocker, *, return_value=None, side_effect=None):
+  """Patch the private candidate Session and return its resource() mock."""
+  session = mocker.MagicMock()
+  if side_effect is not None:
+    session.resource.side_effect = side_effect
+  else:
+    session.resource.return_value = return_value
+  session_factory = mocker.patch.object(
+    boto3.session, "Session", return_value=session
+  )
+  return session_factory, session.resource
+
+
 def _connected(mocker):
   b = _make_backend()
   resource = mocker.MagicMock()
   table = mocker.MagicMock()
   table.load.return_value = None  # table already exists
+  table.table_status = "ACTIVE"
   resource.Table.return_value = table
-  mocker.patch.object(boto3, "resource", return_value=resource)
+  _patch_resource(mocker, return_value=resource)
   b.connect()
   return b, table
 
@@ -97,7 +111,7 @@ class TestDynamoDBConnect:
     existing.load.side_effect = _make_client_error("ResourceNotFoundException")  # triggers create
     resource.Table.return_value = existing
     resource.create_table.return_value = new_table
-    mocker.patch.object(boto3, "resource", return_value=resource)
+    _patch_resource(mocker, return_value=resource)
     b.connect()
     resource.create_table.assert_called_once()
     new_table.wait_until_exists.assert_called_once()
@@ -113,7 +127,7 @@ class TestDynamoDBConnect:
     reattached = mocker.MagicMock()
     resource.Table.side_effect = [loser_table, reattached]
     resource.create_table.side_effect = _make_client_error("ResourceInUseException")
-    mocker.patch.object(boto3, "resource", return_value=resource)
+    _patch_resource(mocker, return_value=resource)
     b.connect()  # must not raise BackendConnectionError
     resource.create_table.assert_called_once()
     reattached.wait_until_exists.assert_called_once()
@@ -129,7 +143,7 @@ class TestDynamoDBConnect:
     existing.load.side_effect = _make_client_error("ResourceNotFoundException")
     resource.Table.return_value = existing
     resource.create_table.side_effect = _make_client_error("LimitExceededException")
-    mocker.patch.object(boto3, "resource", return_value=resource)
+    _patch_resource(mocker, return_value=resource)
     with pytest.raises(BackendConnectionError):
       b.connect()
     resource.create_table.assert_called_once()
@@ -139,7 +153,7 @@ class TestDynamoDBConnect:
 
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
-    mocker.patch.object(boto3, "resource", side_effect=RuntimeError("boom"))
+    _patch_resource(mocker, side_effect=RuntimeError("boom"))
     with pytest.raises(BackendConnectionError):
       b.connect()
 
@@ -588,14 +602,14 @@ class TestDynamoDBStorageErrorContract:
 
 
 # ---------------------------------------------------------------------------
-# SEC-1 (round-6): DynamoDB AWS creds redaction in boto3.resource kwargs.
+# SEC-1 (round-6): DynamoDB AWS creds redaction in Session.resource kwargs.
 # SEC-7: AWS credentials must be both-or-neither (XOR validation).
 # ---------------------------------------------------------------------------
 
 
 def test_dynamodb_credentials_redacted_in_resource_kwargs(mocker):
   """SEC-1: aws_access_key_id / aws_secret_access_key handed to
-  boto3.resource are wrapped in _RedactedStr so ``repr(call_args)`` doesn't
+  Session.resource kwargs are wrapped in _RedactedStr so ``repr(call_args)`` doesn't
   leak them. The str values are preserved so boto3 still authenticates.
   """
   from scrapy_extension.backends._redaction import _RedactedStr
@@ -624,7 +638,7 @@ def test_dynamodb_credentials_redacted_in_resource_kwargs(mocker):
     captured.update(kwargs)
     return _FakeResource()
 
-  mocker.patch.object(boto3, "resource", side_effect=_fake_resource)
+  _patch_resource(mocker, side_effect=_fake_resource)
   # Table creation path also needs stubbing to avoid real wait_until_exists.
   backend.connect()
   key = captured["aws_access_key_id"]
@@ -667,7 +681,7 @@ class TestDynamoDBHalfCredentialGuard:
     assert exc_info.value.setting_name == "aws_access_key_id"
 
   def test_both_set_proceeds(self, mocker):
-    """Both set → no ConfigurationError; boto3.resource called."""
+    """Both set → no ConfigurationError; Session.resource called."""
     backend = _make_backend(
       aws_access_key_id="AKIAEXAMPLEKEY",
       aws_secret_access_key="top-secret",
@@ -676,9 +690,9 @@ class TestDynamoDBHalfCredentialGuard:
     fake_resource.Table.return_value.load.side_effect = _make_client_error(
       "ResourceNotFoundException"
     )
-    mocker.patch.object(boto3, "resource", return_value=fake_resource)
+    _, resource_factory = _patch_resource(mocker, return_value=fake_resource)
     backend.connect()  # must not raise
-    boto3.resource.assert_called_once()
+    resource_factory.assert_called_once()
 
   def test_neither_set_proceeds(self, mocker):
     """Neither set → no ConfigurationError; boto3 default credential chain."""
@@ -687,9 +701,9 @@ class TestDynamoDBHalfCredentialGuard:
     fake_resource.Table.return_value.load.side_effect = _make_client_error(
       "ResourceNotFoundException"
     )
-    mocker.patch.object(boto3, "resource", return_value=fake_resource)
+    _, resource_factory = _patch_resource(mocker, return_value=fake_resource)
     backend.connect()  # must not raise
-    _, kwargs = boto3.resource.call_args.args, boto3.resource.call_args.kwargs
+    kwargs = resource_factory.call_args.kwargs
     assert "aws_access_key_id" not in kwargs
     assert "aws_secret_access_key" not in kwargs
 
@@ -705,33 +719,39 @@ class TestDynamoDBHalfCredentialGuard:
   ) -> None:
     backend = _make_backend(mode=DynamoDBMode.CLOUD)
     backend.config.endpoint_url = endpoint_url
-    mocker.patch.object(boto3, "resource", return_value=mocker.MagicMock())
+    session_factory, _ = _patch_resource(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert "do-not-leak" not in str(exc_info.value)
-    boto3.resource.assert_not_called()
+    session_factory.assert_not_called()
 
   def test_connect_rejects_mutated_empty_explicit_credentials(self, mocker) -> None:
     backend = _make_backend()
     backend.config.aws_access_key_id = ""  # type: ignore[assignment]
     backend.config.aws_secret_access_key = ""  # type: ignore[assignment]
-    mocker.patch.object(boto3, "resource", return_value=mocker.MagicMock())
+    session_factory, _ = _patch_resource(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert exc_info.value.setting_name == "aws_access_key_id"
-    boto3.resource.assert_not_called()
+    session_factory.assert_not_called()
 
   def test_connect_rejects_mutated_missing_standalone_endpoint(self, mocker) -> None:
     backend = _make_backend()
     backend.config.endpoint_url = None
-    mocker.patch.object(boto3, "resource", return_value=mocker.MagicMock())
+    session_factory, _ = _patch_resource(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert exc_info.value.setting_name == "endpoint_url"
-    boto3.resource.assert_not_called()
+    session_factory.assert_not_called()

@@ -19,8 +19,11 @@ def _connected(mocker, **overrides):
   resource = mocker.MagicMock()
   table = mocker.MagicMock()
   table.load.return_value = None
+  table.table_status = "ACTIVE"
   resource.Table.return_value = table
-  mocker.patch.object(boto3, "resource", return_value=resource)
+  session = mocker.MagicMock()
+  session.resource.return_value = resource
+  mocker.patch.object(boto3.session, "Session", return_value=session)
   b.connect()
   return b, table
 

@@ -47,6 +47,24 @@ def _backend() -> DynamoDBBackend:
   return DynamoDBBackend(DynamoDBSettings())
 
 
+def _connected_backend(mocker) -> tuple[DynamoDBBackend, Any]:
+  """Publish a complete mocked generation through the production connect path."""
+  backend = _backend()
+  resource = mocker.MagicMock()
+  table = mocker.MagicMock()
+  table.load.return_value = None
+  table.table_status = "ACTIVE"
+  resource.Table.return_value = table
+  session = mocker.MagicMock()
+  session.resource.return_value = resource
+  mocker.patch(
+    "scrapy_extension.backends.dynamodb.boto3.session.Session",
+    return_value=session,
+  )
+  backend.connect()
+  return backend, table
+
+
 # ---------------------------------------------------------------------------
 # _is_resource_not_found type-narrowing (line 67)
 # ---------------------------------------------------------------------------
@@ -89,15 +107,16 @@ def test_connect_rejects_partial_credentials_access_key_only() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_connect_passes_endpoint_url_into_boto3_resource(mocker) -> None:
+def test_connect_passes_endpoint_url_into_private_session_resource(mocker) -> None:
   """Line 118: when ``endpoint_url`` is set (LocalStack), it is forwarded to
-  ``boto3.resource`` so local dev routes correctly."""
+  the candidate Session's ``resource`` call so local dev routes correctly."""
   mock_boto3 = mocker.patch("scrapy_extension.backends.dynamodb.boto3")
   # Table.load() succeeds (no raise) -> existing-table path, connect completes:
-  mock_boto3.resource.return_value.Table.return_value.load.return_value = None
+  resource_factory = mock_boto3.session.Session.return_value.resource
+  resource_factory.return_value.Table.return_value.load.return_value = None
   backend = DynamoDBBackend(DynamoDBSettings(endpoint_url="http://localhost:4566"))
   backend.connect()
-  _, kwargs = mock_boto3.resource.call_args
+  kwargs = resource_factory.call_args.kwargs
   assert kwargs["endpoint_url"] == "http://localhost:4566"
 
 
@@ -117,10 +136,10 @@ def test_ping_returns_false_when_table_handle_is_none() -> None:
 def test_ping_returns_true_on_successful_load(mocker) -> None:
   """Line 157: ping() returns True when ``table.load()`` succeeds — the
   health-check contract for a connected backend."""
-  backend = _backend()
-  backend._table = mocker.MagicMock()
+  backend, table = _connected_backend(mocker)
+  table.load.reset_mock()
   assert backend.ping() is True
-  backend._table.load.assert_called_once()
+  table.load.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +151,8 @@ def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
   """Line 196: a vanished table mid-``put_item`` (ResourceNotFoundException)
   is a StorageError (NOT silently swallowed) — preserves at-least-once: the
   caller (item pipeline) must see the failure, not a silent data loss."""
-  backend = _backend()
-  backend._table = mocker.MagicMock()
-  backend._table.put_item.side_effect = _FakeClientError("ResourceNotFoundException")
+  backend, table = _connected_backend(mocker)
+  table.put_item.side_effect = _FakeClientError("ResourceNotFoundException")
   with pytest.raises(StorageError, match="table not found"):
     backend.store("k", b"v")
 
@@ -145,10 +163,9 @@ def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
 
 
 def test_exists_raises_storage_error_when_table_vanishes(mocker) -> None:
-  backend = _backend()
-  backend._table = mocker.MagicMock()
+  backend, table = _connected_backend(mocker)
   error = _FakeClientError("ResourceNotFoundException")
-  backend._table.get_item.side_effect = error
+  table.get_item.side_effect = error
   with pytest.raises(StorageError) as exc_info:
     backend.exists("k")
   assert exc_info.value.operation == "exists"
@@ -157,9 +174,8 @@ def test_exists_raises_storage_error_when_table_vanishes(mocker) -> None:
 
 def test_exists_returns_false_when_item_is_absent(mocker) -> None:
   """Line 285: a get_item response with no ``Item`` → False (key not present)."""
-  backend = _backend()
-  backend._table = mocker.MagicMock()
-  backend._table.get_item.return_value = {}  # no "Item"
+  backend, table = _connected_backend(mocker)
+  table.get_item.return_value = {}  # no "Item"
   assert backend.exists("k") is False
 
 
@@ -169,10 +185,9 @@ def test_exists_returns_false_when_item_is_absent(mocker) -> None:
 
 
 def test_ttl_raises_storage_error_when_table_vanishes(mocker) -> None:
-  backend = _backend()
-  backend._table = mocker.MagicMock()
+  backend, table = _connected_backend(mocker)
   error = _FakeClientError("ResourceNotFoundException")
-  backend._table.get_item.side_effect = error
+  table.get_item.side_effect = error
   with pytest.raises(StorageError) as exc_info:
     backend.ttl("k")
   assert exc_info.value.operation == "ttl"

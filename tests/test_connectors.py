@@ -50,6 +50,9 @@ _ensure_sdk_stub(
   {
     "client": MagicMock(name="boto3.client"),
     "resource": MagicMock(name="boto3.resource"),
+    "session": types.SimpleNamespace(
+      Session=MagicMock(name="boto3.session.Session")
+    ),
   },
 )
 _ensure_sdk_stub("pymemcache")

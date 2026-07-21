@@ -129,6 +129,15 @@ upgrading.
   per logical queue, so one slow lookup does not block another queue's receipt
   settlement. Calls that lose admission to teardown now raise `QueueError`
   instead of racing a closing SDK client.
+- **DynamoDB Session/Resource/Table handles now belong to one generation.**
+  Every candidate owns a private boto3 Session instead of the process-wide
+  default. A live `connect()` is idempotent and candidates are published only
+  after the table reaches a data-plane-usable state. Disconnect fences
+  in-progress and queued connect attempts, drains admitted storage operations
+  and table creation, and closes the retired botocore client. All boto3 Resource
+  calls are serialized, and paginated clear plus lazy TTL cleanup stay on their
+  issuing table. Settings mutations take effect only after an explicit
+  `disconnect()` / `connect()`.
 - **Pulsar acknowledgement tokens now have one terminal outcome.** A successful
   direct token ack or nack suppresses every later terminal action, including a
   concurrent opposite action. Client failures raise `QueueError` but restore

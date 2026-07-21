@@ -375,6 +375,18 @@ real boolean (or canonical `true`/`false` environment text), is captured at
 connect, and cannot be enabled by mutating settings afterward. A false flush
 reply is an error rather than successful completion.
 
+DynamoDB no longer treats repeated `connect()` as an implicit table/client
+replacement. A live call is idempotent, and endpoint, region, table name, and
+credential configuration/source selection remain fixed for that connection
+generation; ambient providers may still refresh temporary credentials. Code
+that mutates `DynamoDBSettings` after startup must call `disconnect()` and then
+`connect()` before expecting new values. Every candidate now owns a private
+boto3 Session. Shared backend instances serialize all Resource operations,
+including health checks and the complete paginated clear; budget for one
+in-flight operation per generation. Disconnect drains that call and closes the
+underlying botocore client. Local clear/store ordering is now linearized, but
+DynamoDB Scan still has no cross-process snapshot isolation.
+
 ## Validation and Rollback
 
 Before opening traffic, verify:

@@ -331,6 +331,18 @@ it constructs the successor. Treat a `QueueError` from a timed pop during
 reconnect as an interrupted operation and retry through the caller's normal
 queue loop.
 
+DynamoDB gives each candidate a private boto3 Session and publishes the prepared
+Session, Resource, and data-plane-usable Table as one generation. A live
+`connect()` is idempotent; apply endpoint, region, table, or credential-setting
+changes with `disconnect()` / `connect()`. Storage calls, health probes, and the
+entire paginated clear are serialized because boto3 Resources are not
+thread-safe. Disconnect waits for an admitted call or table creation before
+closing the botocore client, so the shutdown budget must cover SDK retries and a
+full clear. This linearizes clear against writes made through the same backend
+instance only: DynamoDB Scan does not provide snapshot isolation across other
+processes or clients, so clear remains a best-effort maintenance operation under
+external concurrent writes.
+
 Every successful `ConnectionManager.get_manager()` acquisition must be paired
 with exactly one `close()`. The registry is reference-counted; releasing the
 same acquisition twice can prematurely retire a manager still expected by a

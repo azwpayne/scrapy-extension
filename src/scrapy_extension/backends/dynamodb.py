@@ -6,7 +6,7 @@ checked on read (expired items are deleted and reported missing). The table
 is auto-created on connect if missing (PAY_PER_REQUEST, hash key ``pk``).
 
 boto3 resource API (stable):
-- ``boto3.resource("dynamodb", region_name=, endpoint_url=, ...)``
+- ``boto3.session.Session().resource("dynamodb", region_name=, endpoint_url=, ...)``
 - ``resource.Table(name)`` / ``resource.create_table(...)``
 - ``table.load()`` / ``table.wait_until_exists()``
 - ``table.put_item(Item=)`` / ``get_item(Key=)`` / ``delete_item(Key=, ReturnValues=)``
@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +49,7 @@ from scrapy_extension.settings import DynamoDBMode
 from scrapy_extension.settings._aws import (
   validate_aws_credentials,
   validate_aws_endpoint,
+  validate_aws_region_name,
 )
 
 if TYPE_CHECKING:
@@ -63,6 +66,31 @@ _DDB_INUSE_CODES = frozenset({"ResourceInUseException"})
 _DDB_MAX_PARTITION_KEY_BYTES = 2_048
 _DDB_MAX_ITEM_BYTES = 400 * 1_024
 _MISSING = object()
+_DDB_USABLE_TABLE_STATUSES = frozenset({"ACTIVE", "UPDATING"})
+
+
+class _DynamoDBConnectCancelled(Exception):
+  """Internal signal for a candidate fenced by lifecycle teardown."""
+
+
+@dataclass(frozen=True)
+class _DynamoDBConnectionSnapshot:
+  """One validated, non-secret settings snapshot for a table generation."""
+
+  mode: DynamoDBMode
+  table_name: str
+  region_name: str
+  endpoint_url: str | None
+
+
+@dataclass(frozen=True)
+class _DynamoDBGeneration:
+  """One private Session/Resource/Table set published as a single unit."""
+
+  session: Any
+  resource: Any
+  table: Any
+  snapshot: _DynamoDBConnectionSnapshot
 
 
 def _validate_partition_key(key: str) -> None:
@@ -142,19 +170,38 @@ class DynamoDBBackend(Backend, StorageBackend):
 
   def __init__(self, config: DynamoDBSettings) -> None:
     self.config = config
+    # The boto3 Resource API is not thread-safe. This re-entrant lock is both
+    # the operation serializer and the generation retirement barrier: a
+    # disconnect cannot close a Resource until its admitted operation exits.
+    self._operation_lock = threading.RLock()
+    self._connect_lock = threading.Lock()
+    self._lifecycle_epoch = 0
+    self._generation: _DynamoDBGeneration | None = None
+    # Compatibility/diagnostic mirrors. Internal operations use only the
+    # authoritative generation so a Resource and Table can never be mixed.
     self._resource: Any = None
     self._table: Any = None
 
-  def connect(self) -> None:
-    """Create the resource and ensure the table exists.
+  def _capture_connect_intent(self) -> tuple[int, bool]:
+    """Capture teardown epoch before waiting for connect single-flight."""
+    with self._operation_lock:
+      return self._lifecycle_epoch, self._generation is not None
 
-    Raises:
-        BackendConnectionError: If the resource/table cannot be set up.
-    """
+  def _raise_if_connect_cancelled(self, request_epoch: int) -> None:
+    """Stop a stale candidate before its next externally visible SDK step."""
+    with self._operation_lock:
+      if (
+        request_epoch != self._lifecycle_epoch
+        or self._generation is not None
+      ):
+        raise _DynamoDBConnectCancelled
+
+  def _capture_connection_snapshot(
+    self,
+  ) -> tuple[_DynamoDBConnectionSnapshot, dict[str, Any]]:
+    """Capture and revalidate every value consumed by one connect attempt."""
     mode = self.config.mode
     table_name = self.config.table_name
-    region_name = self.config.region_name
-    endpoint_url = self.config.endpoint_url
     access_key = self.config.aws_access_key_id
     secret_key = self.config.aws_secret_access_key
     if not isinstance(mode, DynamoDBMode):
@@ -163,8 +210,9 @@ class DynamoDBBackend(Backend, StorageBackend):
         setting_name="mode",
         setting_value=mode,
       )
-    validate_aws_endpoint(
-      endpoint_url,
+    region_name = validate_aws_region_name(self.config.region_name)
+    endpoint_url = validate_aws_endpoint(
+      self.config.endpoint_url,
       cloud=mode == DynamoDBMode.CLOUD,
       require_endpoint=mode == DynamoDBMode.STANDALONE,
     )
@@ -172,67 +220,203 @@ class DynamoDBBackend(Backend, StorageBackend):
       access_key,
       secret_key,
     )
+
+    snapshot = _DynamoDBConnectionSnapshot(
+      mode=mode,
+      table_name=table_name,
+      region_name=region_name,
+      endpoint_url=endpoint_url,
+    )
+    kwargs: dict[str, Any] = {"region_name": region_name}
+    if endpoint_url is not None:
+      kwargs["endpoint_url"] = endpoint_url
+    if key_id is not None and secret is not None:
+      # Preserve the SDK's required string behavior without retaining the
+      # credentials in the published settings snapshot or exposing their repr.
+      kwargs["aws_access_key_id"] = _redact(key_id)
+      kwargs["aws_secret_access_key"] = _redact(secret)
+    return snapshot, kwargs
+
+  @staticmethod
+  def _close_resource(resource: Any) -> None:
+    """Best-effort close a candidate or retired botocore HTTP client."""
+    if resource is None:
+      return
     try:
-      kwargs: dict[str, Any] = {"region_name": region_name}
-      if endpoint_url is not None:
-        kwargs["endpoint_url"] = endpoint_url
-      if key_id is not None and secret is not None:
-        kwargs["aws_access_key_id"] = _redact(key_id)
-        kwargs["aws_secret_access_key"] = _redact(secret)
-      self._resource = boto3.resource("dynamodb", **kwargs)
-      self._table = self._resource.Table(table_name)
+      resource.meta.client.close()
+    except Exception as exc:
+      logger.debug("Suppressed DynamoDB resource close error: %s", exc)
+
+  def _build_candidate(
+    self,
+    snapshot: _DynamoDBConnectionSnapshot,
+    resource_kwargs: dict[str, Any],
+    request_epoch: int,
+  ) -> _DynamoDBGeneration:
+    """Prepare one private generation without mutating published state."""
+    session: Any = None
+    resource: Any = None
+    try:
+      self._raise_if_connect_cancelled(request_epoch)
+      # boto3's module-level resource() alias shares the process-wide default
+      # Session, which is not thread-safe. A candidate owns a private Session
+      # so independent backend instances cannot race model/waiter/client setup.
+      session = boto3.session.Session()
+      self._raise_if_connect_cancelled(request_epoch)
+      resource = session.resource("dynamodb", **resource_kwargs)
+      self._raise_if_connect_cancelled(request_epoch)
+      table = resource.Table(snapshot.table_name)
       try:
-        self._table.load()
+        table.load()
       except Exception as e:
         # Only a genuine "table not found" triggers create_table — every other
         # error (throttle, network, auth, validation) MUST propagate (#31), or
         # a transient blip spuriously creates a conflicting table.
         if not _is_resource_not_found(e):
           raise
-        try:
-          self._table = self._resource.create_table(
-            TableName=table_name,
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-            AttributeDefinitions=[
-              {"AttributeName": "pk", "AttributeType": "S"}
-            ],
-            BillingMode="PAY_PER_REQUEST",
-          )
-        except Exception as create_err:
-          # Concurrent boot race (e.g. k8s pod rollout): another worker already
-          # started creating this table — ResourceInUseException. Reattach to
-          # the existing table and wait. Any other error propagates (#31): a
-          # transient blip must not mask as "created".
-          if not _is_resource_in_use(create_err):
-            raise
-          self._table = self._resource.Table(table_name)
-        self._table.wait_until_exists()
-      logger.debug("Connected to DynamoDB table %s", table_name)
-    except Exception as e:
-      self._table = None
-      self._resource = None
-      raise BackendConnectionError(
-        f"Failed to connect to DynamoDB: {e}", backend_type="dynamodb"
-      ) from e
+        # A teardown that won while DescribeTable was in flight must prevent a
+        # late candidate from creating persistent infrastructure afterward.
+        # Atomically admit the persistent create side effect against teardown.
+        # If create wins, disconnect drains this SDK call; if teardown wins,
+        # the stale candidate never creates infrastructure after it returns.
+        with self._operation_lock:
+          self._raise_if_connect_cancelled(request_epoch)
+          try:
+            table = resource.create_table(
+              TableName=snapshot.table_name,
+              KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+              AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"}
+              ],
+              BillingMode="PAY_PER_REQUEST",
+            )
+          except Exception as create_err:
+            # Concurrent boot race (e.g. k8s pod rollout): another worker
+            # already started creating this table. Reattach and wait. Any
+            # other error propagates: a transient blip must not mask as created.
+            if not _is_resource_in_use(create_err):
+              raise
+            table = resource.Table(snapshot.table_name)
+        self._raise_if_connect_cancelled(request_epoch)
+        table.wait_until_exists()
+      else:
+        self._raise_if_connect_cancelled(request_epoch)
+        # DescribeTable succeeds for transitional states too. ACTIVE and
+        # UPDATING accept data-plane work; other states must reach ACTIVE before
+        # the generation can truthfully be published as ready.
+        if table.table_status not in _DDB_USABLE_TABLE_STATUSES:
+          table.wait_until_exists()
+      return _DynamoDBGeneration(
+        session=session,
+        resource=resource,
+        table=table,
+        snapshot=snapshot,
+      )
+    except BaseException:
+      self._close_resource(resource)
+      raise
+
+  def _publish_generation_locked(
+    self, generation: _DynamoDBGeneration
+  ) -> None:
+    """Publish one complete generation while holding ``_operation_lock``."""
+    self._generation = generation
+    self._resource = generation.resource
+    self._table = generation.table
+
+  def _detach_generation_locked(self) -> _DynamoDBGeneration | None:
+    """Detach the current generation while holding ``_operation_lock``."""
+    generation = self._generation
+    self._generation = None
+    self._resource = None
+    self._table = None
+    return generation
+
+  def _table_for_operation_locked(self, operation: str, key: str | None) -> Any:
+    """Return the authoritative table or raise the stable storage contract."""
+    generation = self._generation
+    if generation is None:
+      raise StorageError(
+        "DynamoDB backend is not connected",
+        operation=operation,
+        key=key,
+      )
+    return generation.table
+
+  def connect(self) -> None:
+    """Privately prepare and atomically publish one table generation.
+
+    A live connection makes this method an idempotent no-op. Configuration
+    changes take effect only after an explicit ``disconnect()`` / ``connect()``.
+
+    Raises:
+        BackendConnectionError: If the resource/table cannot be set up.
+        ConfigurationError: If the captured configuration is invalid.
+    """
+    request_epoch, already_connected = self._capture_connect_intent()
+    if already_connected:
+      return
+    with self._connect_lock:
+      with self._operation_lock:
+        if request_epoch != self._lifecycle_epoch:
+          return
+        if self._generation is not None:
+          return
+      snapshot, resource_kwargs = self._capture_connection_snapshot()
+      try:
+        candidate = self._build_candidate(
+          snapshot, resource_kwargs, request_epoch
+        )
+      except _DynamoDBConnectCancelled:
+        return
+      except Exception as exc:
+        # Teardown intentionally cancels an in-progress connection attempt.
+        # A late SDK failure from that stale attempt is not a new live error.
+        with self._operation_lock:
+          if request_epoch != self._lifecycle_epoch:
+            return
+        raise BackendConnectionError(
+          "Failed to connect to DynamoDB.", backend_type="dynamodb"
+        ) from exc
+
+      with self._operation_lock:
+        publish = (
+          request_epoch == self._lifecycle_epoch
+          and self._generation is None
+        )
+        if publish:
+          self._publish_generation_locked(candidate)
+      if not publish:
+        self._close_resource(candidate.resource)
+        return
+      logger.debug("Connected to DynamoDB table %s", snapshot.table_name)
 
   def disconnect(self) -> None:
-    """Release the resource/table handles (boto3 has no explicit close)."""
-    self._table = None
-    self._resource = None
+    """Fence connect intents, drain operations, and close the retired client."""
+    with self._operation_lock:
+      self._lifecycle_epoch += 1
+      generation = self._detach_generation_locked()
+      if generation is not None:
+        self._close_resource(generation.resource)
 
   def is_connected(self) -> bool:
-    """Return True if the table handle has been created."""
-    return self._table is not None
+    """Return True if a complete generation is currently published."""
+    with self._operation_lock:
+      return self._generation is not None
 
   def ping(self) -> bool:
     """Health check via table.load()."""
-    if self._table is None:
-      return False
-    try:
-      self._table.load()
-      return True
-    except Exception:
-      return False
+    with self._operation_lock:
+      generation = self._generation
+      if generation is None:
+        return False
+      try:
+        generation.table.load()
+        return (
+          generation.table.table_status in _DDB_USABLE_TABLE_STATUSES
+        )
+      except Exception:
+        return False
 
   @property
   def backend_type(self) -> BackendType:
@@ -279,7 +463,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     return expire_at, epoch
 
   def _lazy_reap_if_expired(
-    self, expiry: tuple[Any, float] | None, key: str
+    self, table: Any, expiry: tuple[Any, float] | None, key: str
   ) -> bool:
     """Lazy-reap an expired item; return True if expired (caller treats as absent).
 
@@ -295,7 +479,7 @@ class DynamoDBBackend(Backend, StorageBackend):
       return False
     raw_expiry, _ = expiry
     with _swallow():
-      self._table.delete_item(
+      table.delete_item(
         Key={"pk": key},
         ConditionExpression="expire_at = :exp",
         ExpressionAttributeValues={":exp": raw_expiry},
@@ -325,16 +509,18 @@ class DynamoDBBackend(Backend, StorageBackend):
       expire_at = math.ceil(time.time() + ttl)
       item["expire_at"] = expire_at
     _validate_item_size(key, data, expire_at)
-    try:
-      self._table.put_item(Item=item)
-    except Exception as e:
-      if _is_resource_not_found(e):
-        # Table vanished mid-operation — treat as storage failure too, but
-        # callers checking existence after will see the table gone.
-        msg = f"DynamoDB table not found while storing key {key!r}: {e}"
-      else:
-        msg = f"Failed to store key {key!r} in DynamoDB: {e}"
-      raise StorageError(msg, operation="store", key=key) from e
+    with self._operation_lock:
+      table = self._table_for_operation_locked("store", key)
+      try:
+        table.put_item(Item=item)
+      except Exception as e:
+        if _is_resource_not_found(e):
+          # Table vanished mid-operation — treat as storage failure too, but
+          # callers checking existence after will see the table gone.
+          msg = f"DynamoDB table not found while storing key {key!r}: {e}"
+        else:
+          msg = f"Failed to store key {key!r} in DynamoDB: {e}"
+        raise StorageError(msg, operation="store", key=key) from e
 
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key (None if missing or expired).
@@ -351,29 +537,31 @@ class DynamoDBBackend(Backend, StorageBackend):
             swallowed to ``return None``).
     """
     _validate_partition_key(key)
-    try:
-      resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
-    except Exception as e:
-      msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
-      raise StorageError(msg, operation="retrieve", key=key) from e
-    item = self._response_item(resp, "retrieve", key)
-    if item is None:
-      return None
-    expiry = self._validated_expiry(item, "retrieve", key)
-    if self._lazy_reap_if_expired(expiry, key):
-      return None
-    value = item.get("value", _MISSING)
-    if isinstance(value, (bytes, bytearray)):
-      return bytes(value)
-    try:
-      binary_value = getattr(value, "value", None)
-    except Exception as e:
-      msg = "DynamoDB item has an unreadable binary value attribute"
-      raise StorageError(msg, operation="retrieve", key=key) from e
-    if isinstance(binary_value, (bytes, bytearray)):
-      return bytes(binary_value)
-    msg = "DynamoDB item has a missing or non-binary value attribute"
-    raise StorageError(msg, operation="retrieve", key=key)
+    with self._operation_lock:
+      table = self._table_for_operation_locked("retrieve", key)
+      try:
+        resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
+      except Exception as e:
+        msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
+        raise StorageError(msg, operation="retrieve", key=key) from e
+      item = self._response_item(resp, "retrieve", key)
+      if item is None:
+        return None
+      expiry = self._validated_expiry(item, "retrieve", key)
+      if self._lazy_reap_if_expired(table, expiry, key):
+        return None
+      value = item.get("value", _MISSING)
+      if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+      try:
+        binary_value = getattr(value, "value", None)
+      except Exception as e:
+        msg = "DynamoDB item has an unreadable binary value attribute"
+        raise StorageError(msg, operation="retrieve", key=key) from e
+      if isinstance(binary_value, (bytes, bytearray)):
+        return bytes(binary_value)
+      msg = "DynamoDB item has a missing or non-binary value attribute"
+      raise StorageError(msg, operation="retrieve", key=key)
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -391,12 +579,14 @@ class DynamoDBBackend(Backend, StorageBackend):
             "didn't exist", causing dedup re-emission).
     """
     _validate_partition_key(key)
-    try:
-      resp = self._table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
-    except Exception as e:
-      msg = f"Failed to delete key {key!r} in DynamoDB: {e}"
-      raise StorageError(msg, operation="delete", key=key) from e
-    return "Attributes" in resp
+    with self._operation_lock:
+      table = self._table_for_operation_locked("delete", key)
+      try:
+        resp = table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
+      except Exception as e:
+        msg = f"Failed to delete key {key!r} in DynamoDB: {e}"
+        raise StorageError(msg, operation="delete", key=key) from e
+      return "Attributes" in resp
 
   def exists(self, key: str) -> bool:
     """Check if a key exists and is not expired.
@@ -413,16 +603,18 @@ class DynamoDBBackend(Backend, StorageBackend):
             swallowed to ``return False``).
     """
     _validate_partition_key(key)
-    try:
-      resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
-    except Exception as e:
-      msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
-      raise StorageError(msg, operation="exists", key=key) from e
-    item = self._response_item(resp, "exists", key)
-    if item is None:
-      return False
-    expiry = self._validated_expiry(item, "exists", key)
-    return not self._lazy_reap_if_expired(expiry, key)
+    with self._operation_lock:
+      table = self._table_for_operation_locked("exists", key)
+      try:
+        resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
+      except Exception as e:
+        msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
+        raise StorageError(msg, operation="exists", key=key) from e
+      item = self._response_item(resp, "exists", key)
+      if item is None:
+        return False
+      expiry = self._validated_expiry(item, "exists", key)
+      return not self._lazy_reap_if_expired(table, expiry, key)
 
   def ttl(self, key: str) -> int | None:
     """Return remaining TTL seconds if the item has expire_at, else None.
@@ -439,26 +631,28 @@ class DynamoDBBackend(Backend, StorageBackend):
             swallowed to ``return None``).
     """
     _validate_partition_key(key)
-    try:
-      resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
-    except Exception as e:
-      msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
-      raise StorageError(msg, operation="ttl", key=key) from e
-    item = self._response_item(resp, "ttl", key)
-    if item is None:
-      return None
-    expiry = self._validated_expiry(item, "ttl", key)
-    if expiry is None:
-      return None
-    # R-dynttl: symmetry with retrieve()/exists() — lazy-reap expired rows so
-    # the table does not accumulate dead rows, and return None (expired =
-    # absent, matching retrieve's None / exists's False). Pre-fix this
-    # returned 0 for an expired key without reaping, conflating "about to
-    # expire" with "expired long ago" and leaving the dead row to linger until
-    # a retrieve/exists/clear_storage touched it.
-    if self._lazy_reap_if_expired(expiry, key):
-      return None
-    return max(0, int(expiry[1] - time.time()))
+    with self._operation_lock:
+      table = self._table_for_operation_locked("ttl", key)
+      try:
+        resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
+      except Exception as e:
+        msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
+        raise StorageError(msg, operation="ttl", key=key) from e
+      item = self._response_item(resp, "ttl", key)
+      if item is None:
+        return None
+      expiry = self._validated_expiry(item, "ttl", key)
+      if expiry is None:
+        return None
+      # R-dynttl: symmetry with retrieve()/exists() — lazy-reap expired rows so
+      # the table does not accumulate dead rows, and return None (expired =
+      # absent, matching retrieve's None / exists's False). Pre-fix this
+      # returned 0 for an expired key without reaping, conflating "about to
+      # expire" with "expired long ago" and leaving the dead row to linger until
+      # a retrieve/exists/clear_storage touched it.
+      if self._lazy_reap_if_expired(table, expiry, key):
+        return None
+      return max(0, int(expiry[1] - time.time()))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Best-effort clear via scan + batch delete, optionally prefix-scoped.
@@ -486,25 +680,28 @@ class DynamoDBBackend(Backend, StorageBackend):
     if prefix is not None:
       scan_kwargs["FilterExpression"] = "begins_with(pk, :p)"
       scan_kwargs["ExpressionAttributeValues"] = {":p": prefix}
-    try:
-      # Paginate: a single ``scan`` returns at most ~1 MB per page; without
-      # following ``LastEvaluatedKey`` a large table is silently partial-clear
-      # (#31). Loop until the scan reports no further page.
-      last_key: dict[str, Any] | None = None
-      while True:
-        scan = self._table.scan(
-          **scan_kwargs,
-          **({"ExclusiveStartKey": last_key} if last_key else {}),
-        )
-        with self._table.batch_writer() as batch:
-          for item in scan.get("Items", []):
-            batch.delete_item(Key={"pk": item["pk"]})
-        last_key = scan.get("LastEvaluatedKey")
-        if not last_key:
-          break
-    except Exception as e:
-      msg = f"Failed to clear DynamoDB table: {e}"
-      raise StorageError(msg, operation="clear_storage", key=None) from e
+    with self._operation_lock:
+      table = self._table_for_operation_locked("clear_storage", None)
+      try:
+        # Paginate: a single ``scan`` returns at most ~1 MB per page; without
+        # following ``LastEvaluatedKey`` a large table is silently partial-clear
+        # (#31). Loop until the scan reports no further page. The operation lock
+        # pins every page and batch flush to this exact Table generation.
+        last_key: dict[str, Any] | None = None
+        while True:
+          scan = table.scan(
+            **scan_kwargs,
+            **({"ExclusiveStartKey": last_key} if last_key else {}),
+          )
+          with table.batch_writer() as batch:
+            for item in scan.get("Items", []):
+              batch.delete_item(Key={"pk": item["pk"]})
+          last_key = scan.get("LastEvaluatedKey")
+          if not last_key:
+            break
+      except Exception as e:
+        msg = f"Failed to clear DynamoDB table: {e}"
+        raise StorageError(msg, operation="clear_storage", key=None) from e
 
 
 class _swallow:
