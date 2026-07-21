@@ -1142,10 +1142,18 @@ class TestRedisBackendQueueOperations:
     )
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
     backend = RedisBackend(redis_settings)
+    backend.connect()
+    assert backend._generation is not None
+    wait = mocker.patch.object(
+      backend._generation.retired,
+      "wait",
+      side_effect=lambda delay: now.__setitem__(0, now[0] + delay) or False,
+    )
     result = backend.pop("test_queue", timeout=1.0)
     assert result is None
     assert now[0] == pytest.approx(11.0)
     assert mock_script.call_count > 1
+    assert wait.call_count > 1
     mock_redis.bzpopmin.assert_not_called()
 
   def test_queue_pop_error(self, redis_settings, mock_redis, mocker):

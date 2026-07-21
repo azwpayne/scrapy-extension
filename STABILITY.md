@@ -87,7 +87,7 @@ release.
 
 | Backend | Queue | Set | Storage | Tier | Notes |
 |---|---|---|---|---|---|
-| Redis | Yes | Yes | Yes | Stable — full | Namespaced queue/set/storage physical domains; atomic Lua queue operations; 4 modes. Legacy unnamespaced keys require explicit migration. |
+| Redis | Yes | Yes | Yes | Stable — full | Namespaced queue/set/storage domains; atomic Lua queue operations; leased immutable client/namespace generations with draining teardown; 4 modes. The raw `client` property is a point-in-time SDK escape hatch. Legacy unnamespaced keys require explicit migration. |
 | MongoDB | Yes | Yes | Yes | Stable — full | Acknowledged writes (`w>=1`/`majority`); TLS/auth; 4 modes (standalone, replica_set, sharded_cluster, atlas). |
 | ElasticSearch | Yes | Yes | Yes | Stable — full | 2 modes (standalone, cloud). |
 | Kafka | Yes | No | No | Stable — queue-only | Mechanism-aware SASL/SSL (PLAIN, SCRAM, ambient GSSAPI; OAUTH provider unsupported); broker-confirmed sends (`acks=1/all`), configured topic durability, conservative committed-offset group lag, and concurrent-safe per-message tokens. `priority`/`work_stealing` strategies are rejected. |

@@ -98,6 +98,9 @@ global gates, then perform a fresh audit before selecting the next item.
 | I14 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements and local buffers never acknowledge early |
 | I15 | Repair backend-specific P1 correctness | Kafka attempts, ES contention, DynamoDB reads, and SQS limits obey explicit contracts |
 | I16 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
+| I40 | Give Redis operations immutable leased client generations | no operation or queued connect intent can cross teardown; Sentinel resources close |
+| I41 | Remove outcome-ambiguous redis-py command retries | a response timeout cannot replay queue push/pop Lua mutations |
+| I42 | Make Redis deployment-mode settings truthful to redis-py | unsupported Cluster knobs and primary-only master-slave semantics fail or document explicitly |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -284,9 +287,24 @@ speculative work.
   Session/resource/table set together, serialize the non-thread-safe boto3
   Resource API, and keep every multi-page or lazy-TTL operation on one
   generation.
-- [ ] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
+- [x] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
   all SDK handles to a leased generation so clear and blocking-pop loops cannot
   cross reconnect or lazily resurrect themselves after disconnect.
+- [ ] **BACKEND-09A — Redis outcome-ambiguous retry policy.** Give standalone,
+  Sentinel-master, and Cluster data clients an explicit no-replay SDK retry
+  policy so a response timeout after a committed queue Lua script cannot push
+  twice or consume a second item. Define the migration semantics of the public
+  `retry_on_timeout` setting instead of forwarding a deprecated flag that
+  redis-py 8 does not honor as false.
+- [ ] **BACKEND-09B — truthful Redis mode/SDK parameters.** Finish aligning
+  Sentinel and Cluster construction with supported redis-py parameters, reject
+  Cluster database selections the server ignores, and resolve the advertised
+  master-slave replica-read settings that currently route every operation to
+  the primary. Map redis-py's separate `RedisClusterException` hierarchy into
+  the backend health/queue/set/storage contracts. Reject userinfo-bearing node
+  endpoints and sanitize direct settings-validation failures so an endpoint
+  cannot retain or disclose embedded credentials. Unsupported settings must
+  not remain accepted no-ops.
 - [ ] **CONCURRENCY-01F — Kafka client generations.** Publish producer, admin,
   consumer, validated settings, and topic-policy caches as one generation;
   failed candidates must not clear a healthy generation.
@@ -1434,3 +1452,47 @@ actual security contract: HTTPS and rejection of the poisoned host. All 179
 focused DynamoDB tests passed. The full Python 3.10 and 3.14 suites each passed
 3,372 tests with 46 documented skips. Ruff, strict mypy, Bandit, lockfile
 validation, dependency audit, and patch integrity remained green.
+
+### I40 — Redis immutable connection generations
+
+The specification replaced Redis's mutable client aliases with one
+authoritative generation containing the validated connection snapshot, data
+client, Sentinel master/control-plane owners, namespace, lease count, and
+retirement signal. A candidate is now built and pinged privately, then
+published only if its lifecycle epoch is still current. A concurrent
+disconnect fences queued and in-flight connect intents; repeated connect is
+idempotent; a failed candidate closes only its own handles. The public `client`
+property remains a point-in-time, lazy-connect compatibility escape hatch, but
+internal operations never use it and it carries no lease guarantee.
+
+Every queue, set, storage, clear, blocking-pop, and health operation now leases
+exactly one generation and derives keys from its frozen namespace. Disconnect
+atomically stops admission, detaches the generation and compatibility mirrors,
+wakes long polls, drains admitted work, and closes distinct data and Sentinel
+control-plane handles outside the lifecycle condition. A blocking pop cannot
+continue on a replacement client, and clear cannot scan on one client then
+delete on another. Clear failures explicitly report possible partial
+completion. Pop timeout validation rejects booleans, negative/non-finite
+numbers, wrong types, and float overflow before I/O, and its deadline begins
+before lazy connection and script setup.
+
+Fresh implementation audits exposed and closed additional exception-safety
+windows: publication interruption now rolls back and closes the candidate;
+`retired.set()` interruption is retried while teardown still drains and closes;
+the first `BaseException` is re-raised only after every distinct Sentinel
+handle is visited; candidate-ping connect reentry fails fast; operation and
+health leases decrement before their thread-local reentry guard is cleared;
+and owner/flag ordering removes same-thread teardown entry/exit deadlocks.
+Connection-time settings are copied and strictly revalidated field by field
+without Pydantic serialization warnings that could expose a mutated secret.
+Sentinel pool limits and Cluster full-coverage policy are forwarded exactly.
+
+Forty-one deterministic Redis generation regressions passed, including the
+four final audit REDs for retirement interruption, lease-release ordering,
+candidate-ping reentry, and Sentinel cleanup after a master close interrupt.
+The full isolated Python 3.10 and 3.14 suites each passed 3,413 tests with 46
+documented skips. Ruff, strict mypy, Bandit, lockfile validation, dependency
+audit, the two-worker compatibility canary, and patch integrity remained green.
+Independent contract, SDK, security, and concurrency re-reviews found no
+remaining reproducible P0/P1/P2 inside the I40 scope. Retry replay semantics
+and remaining mode/SDK truth gaps are deliberately bounded as I41 and I42.

@@ -108,6 +108,26 @@ read or delete another application's keys in a shared database. Persistent
 deployments must drain or explicitly migrate the old keys before upgrading;
 see the [migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md#redis-physical-key-layout).
 
+Redis connections are immutable generations. While a generation is published,
+`connect()` is an idempotent no-op; it is not a health probe. Every bundled
+queue, set, storage, and health operation stays on one client and one namespace
+snapshot through completion. To recover after a failed `ping()`, or to apply a
+changed connection-used endpoint, credential, TLS, mode, or namespace setting,
+call `disconnect()` and then `connect()`. During disconnect, new admission is
+rejected, a timed queue pop wakes with `QueueError`, and other admitted
+operations drain before the retired data and Sentinel discovery clients close.
+After teardown completes, a brand-new operation retains the established lazy
+reconnect behavior; an already admitted loop can never make that transition.
+In particular, a storage clear cannot scan with one client and delete through
+a replacement. A Redis-layer clear failure may follow accepted deletes and is
+reported as possibly partial.
+
+The concrete backend's `client` property remains a lazy, point-in-time SDK
+escape hatch for compatibility. Do not retain that raw object across
+disconnect or use it to compose lifecycle-sensitive multi-command operations;
+the generation lease protects the bundled backend methods, not external SDK
+calls made after the property returns.
+
 In Sentinel mode, `SCRAPY_REDIS_SSL_ENABLED=True` secures both Sentinel
 discovery and the discovered master. Configure `SCRAPY_REDIS_SSL_CAFILE`; when
 using mTLS, provide `SCRAPY_REDIS_SSL_CERTFILE` and

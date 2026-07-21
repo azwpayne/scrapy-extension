@@ -21,6 +21,24 @@ upgrading.
   implicit legacy fallback because it could read or delete another
   application's key. Drain or explicitly migrate persistent data before
   upgrading; see [`docs/migration-guide.md`](docs/migration-guide.md).
+- **Redis clients and namespaces now belong to immutable connection
+  generations.** While a generation is published, `connect()` is idempotent
+  instead of replacing its client; use `disconnect()` / `connect()` after a
+  failed health probe or to apply changed connection-used endpoint,
+  credential, TLS, mode, or namespace values. Candidates remain private
+  through their health check, and disconnect fences both in-progress and
+  already queued connection intents. Every bundled queue, set, storage, and
+  health operation leases one client and namespace snapshot; timed pop is
+  interrupted by teardown, while other admitted operations drain before the
+  data client and all Sentinel discovery clients close. A new operation after
+  completed teardown retains lazy reconnect, but an old loop cannot cross that
+  boundary. Direct Redis pop now rejects booleans, negative, non-finite,
+  non-numeric, and overflowing timeout values before lazy connection. A failed
+  SCAN/DELETE storage clear is explicitly reported as possibly partial. The raw
+  `client` property remains a point-in-time compatibility escape hatch and is
+  not protected after it returns. Sentinel pools now receive the configured
+  connection cap, and the cluster coverage setting is mapped to redis-py's
+  supported `require_full_coverage` parameter.
 - **Storage TTL inputs and results are uniform across all five backends.** Direct
   `StorageBackend.store` calls accept only `None` or a positive integer number
   of seconds; zero, negatives, floats, and booleans now raise `ValueError`.

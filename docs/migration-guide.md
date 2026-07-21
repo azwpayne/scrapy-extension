@@ -147,6 +147,42 @@ ordering among equal priorities.
 `clear_storage()` scans only the configured namespace's storage domain. Do not
 use `FLUSHDB` to clean up migration leftovers on a shared database.
 
+## Redis Connection Generations
+
+Redis connection settings and the physical-key namespace are now captured in
+one immutable generation. Calling `connect()` while a generation is published
+is an idempotent no-op; it does not recheck health. After `ping()` fails, use an
+explicit `disconnect()` / `connect()` sequence to recover. Code that previously
+mutated `RedisSettings` and called `connect()` again must use the same sequence
+before expecting a changed connection-used endpoint, credential, TLS policy,
+mode, or namespace to take effect.
+
+Every bundled backend operation is pinned to its issuing generation. A timed
+`pop()` that overlaps teardown now raises `QueueError` instead of continuing to
+poll through a replacement client. Other already admitted operations drain;
+this keeps a multi-step `clear_storage()` on one client but means shutdown can
+wait for its SCAN/DELETE sequence or another active Redis command. Size socket
+timeouts and maintenance windows accordingly, and stop new work before a large
+clear. SCAN is not a transactional keyspace snapshot: concurrent external
+writers can be missed, and a failure after accepted deletes is reported as
+possibly partial. Quiesce writers and rerun a failed maintenance clear after
+repairing Redis connectivity.
+
+A new operation started after teardown completes retains lazy connection
+compatibility. An operation that overlapped teardown is fenced and cannot
+resurrect itself on the replacement. Direct `RedisBackend.pop()` timeout values
+must now be finite, non-negative numbers; booleans, negative/non-finite values,
+wrong types, and values that overflow a float raise `ValueError` before any
+lazy connection attempt.
+
+Direct callers may still use `RedisBackend.client`, which lazily returns the
+current raw redis-py object. That return value is only a point-in-time escape
+hatch: it carries no operation lease once the property returns and can be
+closed by a concurrent disconnect. Replace retained raw-client and
+multi-command usage with the bundled backend methods, or coordinate its entire
+lifecycle outside the backend. No Redis data rewrite is required solely for
+this lifecycle change.
+
 ## Queued-Request Wire Format
 
 Current request dictionaries mark bodies with

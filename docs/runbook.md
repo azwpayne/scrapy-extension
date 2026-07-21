@@ -128,6 +128,29 @@ Current keys do not fall back to the legacy raw layout. During an upgrade:
 `clear_storage(None)` scans only the selected namespace's storage domain and
 never flushes the Redis database.
 
+### Redis reconnect and shutdown boundary
+
+A Redis backend publishes one fully health-checked client generation. Repeated
+`connect()` calls are no-ops while that generation remains published; they do
+not recheck health. After `ping()` fails, or before applying changed
+connection-used endpoint, credential, TLS, mode, or namespace settings, run an
+explicit `disconnect()` / `connect()` sequence. Bundled operations admitted
+before teardown keep the old client and namespace until they finish. New
+admission cannot splice into that generation, and a timed queue pop wakes with
+`QueueError` rather than polling a replacement. Once teardown completes, a
+brand-new operation may use the established lazy reconnect behavior.
+
+Budget shutdown for the longest admitted Redis RPC and for a complete
+`clear_storage()` SCAN/DELETE sequence. Quiesce writers before a maintenance
+clear: SCAN is not a transactional snapshot, and a failure after earlier
+deletes is explicitly reported as possibly partial. Repair connectivity and
+rerun the clear while writers remain stopped. Do not invoke `disconnect()`
+re-entrantly from code executing inside a backend operation; the backend fails
+that call fast. Sentinel teardown closes both the discovered master and the
+discovery clients. The public raw `client` property is not leased after it
+returns; never retain it across reconnect or use it for maintenance sequences
+that must stay on one generation.
+
 ## Storage TTL semantics (expired = absent)
 
 All five storage-capable backends (Redis, MongoDB, ElasticSearch, Memcached,

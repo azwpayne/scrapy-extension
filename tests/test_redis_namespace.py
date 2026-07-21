@@ -10,9 +10,13 @@ def _connected_backend(mocker, *, namespace: str = "scrapy-extension"):
   from scrapy_extension.backends.redis import RedisBackend
   from scrapy_extension.settings import RedisSettings
 
-  backend = RedisBackend(RedisSettings(namespace=namespace))
   client = mocker.MagicMock()
-  backend._client = client
+  client.ping.return_value = True
+  client.set.return_value = True
+  client.setex.return_value = True
+  mocker.patch("scrapy_extension.backends.redis.Redis", return_value=client)
+  backend = RedisBackend(RedisSettings(namespace=namespace))
+  backend.connect()
   return backend, client
 
 
@@ -35,7 +39,10 @@ def test_same_logical_name_maps_to_disjoint_physical_domains(mocker) -> None:
   ]
   client.sadd.assert_called_once_with("crawler-a:set:shared", b"fingerprint")
   client.set.assert_called_once_with("crawler-a:storage:shared", b"stored")
-  assert len({queue_keys[0], client.sadd.call_args.args[0], client.set.call_args.args[0]}) == 3
+  assert (
+    len({queue_keys[0], client.sadd.call_args.args[0], client.set.call_args.args[0]})
+    == 3
+  )
 
 
 def test_all_queue_key_operations_use_queue_domain(mocker) -> None:
@@ -58,22 +65,13 @@ def test_blocking_pop_polls_with_atomic_lua_instead_of_destructive_bzpop(
   mocker,
 ) -> None:
   """A blocking pop must not expose a crash gap after removing the ZSET member."""
-  from types import SimpleNamespace
-
   from scrapy_extension.backends import redis as redis_module
 
   backend, client = _connected_backend(mocker, namespace="crawler-a")
   pop_script = mocker.MagicMock(side_effect=[[0, None], [1, b"payload"]])
   client.register_script.return_value = pop_script
   client.bzpopmin.side_effect = AssertionError("BZPOPMIN is not crash-safe here")
-  now = [100.0]
-  sleep = mocker.Mock(side_effect=lambda delay: now.__setitem__(0, now[0] + delay))
-  mocker.patch.object(
-    redis_module,
-    "time",
-    SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
-    create=True,
-  )
+  mocker.patch.object(redis_module, "_BLOCKING_POP_POLL_INTERVAL", 0.0)
 
   assert backend.pop("jobs", timeout=1.0) == b"payload"
 
@@ -83,7 +81,6 @@ def test_blocking_pop_polls_with_atomic_lua_instead_of_destructive_bzpop(
     == ["{crawler-a:queue:jobs}:items", "{crawler-a:queue:jobs}:payload"]
     for call in pop_script.call_args_list
   )
-  sleep.assert_called_once_with(0.05)
   client.bzpopmin.assert_not_called()
   client.pipeline.assert_not_called()
 
