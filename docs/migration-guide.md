@@ -38,9 +38,12 @@ Before upgrading a TLS deployment, verify that each broker certificate covers
 the hostname used in `SCRAPY_PULSAR_SERVICE_URL`. Replace a mismatched
 certificate or service URL rather than disabling validation. Setting
 `SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=False` is an explicit insecure
-compatibility escape hatch for isolated local environments only. Plain
-`pulsar://` deployments do not forward any TLS keyword and are otherwise
-unchanged.
+compatibility escape hatch for unauthenticated isolated local environments
+only. When `SCRAPY_PULSAR_AUTH_TOKEN` is configured, both hostname and
+certificate verification are mandatory; `ALLOW_INSECURE_CONNECTION=True` and
+`TLS_VALIDATE_HOSTNAME=False` now fail at startup. Blank tokens and URL
+userinfo are also rejected without retaining their values. Plain `pulsar://`
+deployments do not forward any TLS keyword and are otherwise unchanged.
 
 The Pulsar SDK treats URL schemes as case-sensitive. Settings now trim outer
 whitespace, lowercase only the scheme, and trim comma-separated endpoints
@@ -48,6 +51,9 @@ before client construction. Cluster discovery uses one prefix:
 `pulsar://broker-one:6650,broker-two:6650`. A repeated form such as
 `pulsar://broker-one:6650,pulsar://broker-two:6650` is rejected at startup
 because the SDK interprets the second prefix as an invalid hostname.
+Connection setup revalidates one captured settings snapshot and uses it for
+both client and later subscription construction. Public startup errors no
+longer include raw driver text or the service URL.
 
 ## RocketMQ Authenticated TLS
 

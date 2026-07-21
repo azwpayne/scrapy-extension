@@ -746,6 +746,48 @@ class TestSV3PulsarAuthTokenRequiresSsl:
     )
     assert s.auth_token is not None
 
+  def test_blank_auth_token_is_rejected_without_retention(self) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarSettings(
+        service_url="pulsar+ssl://broker:6651",
+        auth_token="   ",  # type: ignore[arg-type]
+      )
+
+    assert exc_info.value.setting_name == "auth_token"
+    assert exc_info.value.setting_value == "***REDACTED***"
+
+  @pytest.mark.parametrize(
+    ("overrides", "setting_name"),
+    [
+      ({"allow_insecure_connection": True}, "allow_insecure_connection"),
+      ({"tls_validate_hostname": False}, "tls_validate_hostname"),
+    ],
+  )
+  def test_authenticated_tls_cannot_disable_verification(
+    self, overrides: dict[str, object], setting_name: str
+  ) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarSettings(
+        service_url="pulsar+ssl://broker:6651",
+        auth_token="top-secret",  # type: ignore[arg-type]
+        **overrides,
+      )
+
+    assert exc_info.value.setting_name == setting_name
+
+  def test_service_url_userinfo_is_rejected_without_retention(self) -> None:
+    secret = "do-not-leak"
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarSettings(
+        service_url=f"pulsar+ssl://crawler:{secret}@broker:6651"
+      )
+
+    assert exc_info.value.setting_name == "service_url"
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value.__dict__)
+    assert exc_info.value.__cause__ is None
+
   def test_no_auth_token_with_plain_url_accepted(self) -> None:
     """No ``auth_token`` + ``pulsar://`` → accepted (validator skips)."""
     s = PulsarSettings(service_url="pulsar://broker:6650")

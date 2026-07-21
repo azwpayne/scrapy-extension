@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import traceback
 from threading import Event, Lock, Thread
 from unittest.mock import MagicMock
 
@@ -45,7 +46,11 @@ from scrapy_extension.backends.pulsar import (  # noqa: E402
   PulsarBackend,
   _PulsarAckToken,
 )
-from scrapy_extension.exceptions import BackendConnectionError, QueueError  # noqa: E402
+from scrapy_extension.exceptions import (  # noqa: E402
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 from scrapy_extension.schedule.scheduler import BackendScheduler  # noqa: E402
 from scrapy_extension.settings import PulsarMode, PulsarSettings  # noqa: E402
 
@@ -107,6 +112,122 @@ class TestPulsarConnect:
     auth_mock = mocker.patch.object(pulsar, "AuthenticationToken")
     b.connect()
     auth_mock.assert_called_once_with("secret-token")
+
+  def test_connect_revalidates_mutated_authenticated_tls_before_sdk_io(
+    self, mocker
+  ) -> None:
+    settings = PulsarSettings(
+      service_url="pulsar+ssl://broker:6651",
+      auth_token="secret-token",  # type: ignore[arg-type]
+    )
+    settings.allow_insecure_connection = True
+    client = mocker.patch.object(pulsar, "Client")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_insecure_connection"
+    client.assert_not_called()
+
+  def test_connect_rejects_mutated_blank_token_before_sdk_io(self, mocker) -> None:
+    settings = PulsarSettings(service_url="pulsar+ssl://broker:6651")
+    settings.auth_token = "   "  # type: ignore[assignment]
+    client = mocker.patch.object(pulsar, "Client")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "auth_token"
+    client.assert_not_called()
+
+  def test_connect_uses_one_validated_settings_snapshot(self, mocker) -> None:
+    settings = PulsarSettings(
+      mode=PulsarMode.CLUSTER,
+      service_url="pulsar+ssl://one:6651,two:6651",
+      subscription_name="original-subscription",
+      consumer_type="Shared",
+      initial_position="Earliest",
+      negative_ack_redelivery_delay_ms=7_000,
+      auth_token="original-secret",  # type: ignore[arg-type]
+      tls_trust_certs_file="/tls/original-ca.pem",
+    )
+    backend = PulsarBackend(settings)
+    client = mocker.MagicMock(name="client")
+    consumer = mocker.MagicMock(name="consumer")
+    consumer.receive.side_effect = pulsar.Timeout("empty")
+    client.subscribe.return_value = consumer
+    client_factory = mocker.patch.object(pulsar, "Client", return_value=client)
+    auth_object = mocker.MagicMock(name="authentication")
+
+    def mutate_after_authentication(_token):
+      settings.mode = PulsarMode.STANDALONE
+      settings.service_url = "pulsar://attacker:6650"
+      settings.subscription_name = "attacker-subscription"
+      settings.consumer_type = "Exclusive"
+      settings.initial_position = "Latest"
+      settings.negative_ack_redelivery_delay_ms = 1
+      settings.auth_token = None
+      settings.tls_trust_certs_file = "/tls/attacker-ca.pem"
+      settings.allow_insecure_connection = True
+      settings.tls_validate_hostname = False
+      return auth_object
+
+    mocker.patch.object(
+      pulsar,
+      "AuthenticationToken",
+      side_effect=mutate_after_authentication,
+    )
+
+    backend.connect()
+    assert backend.pop("queue") is None
+
+    client_factory.assert_called_once_with(
+      "pulsar+ssl://one:6651,two:6651",
+      authentication=auth_object,
+      tls_allow_insecure_connection=False,
+      tls_trust_certs_file_path="/tls/original-ca.pem",
+      tls_validate_hostname=True,
+    )
+    client.subscribe.assert_called_once_with(
+      "scrapy-queue",
+      "original-subscription",
+      consumer_type=pulsar.ConsumerType.Shared,
+      initial_position=pulsar.InitialPosition.Earliest,
+      negative_ack_redelivery_delay_ms=7_000,
+    )
+
+  def test_connection_snapshot_repr_redacts_auth_token(self) -> None:
+    secret = "snapshot-secret"
+    settings = PulsarSettings(
+      service_url="pulsar+ssl://broker:6651",
+      auth_token=secret,  # type: ignore[arg-type]
+    )
+
+    snapshot = PulsarBackend(settings)._capture_connection_snapshot()
+
+    assert secret not in repr(snapshot)
+
+  def test_startup_error_traceback_does_not_echo_driver_secrets(
+    self, mocker
+  ) -> None:
+    secret = "pulsar-driver-secret"
+    settings = PulsarSettings(
+      service_url="pulsar+ssl://broker:6651",
+      auth_token=secret,  # type: ignore[arg-type]
+    )
+    mocker.patch.object(
+      pulsar,
+      "Client",
+      side_effect=RuntimeError(f"driver dump included {secret}"),
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      PulsarBackend(settings).connect()
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert secret not in str(exc_info.value)
+    assert secret not in rendered
+    assert exc_info.value.__cause__ is None
 
   def test_connect_is_idempotent_while_connected(self, mocker) -> None:
     consumer = mocker.MagicMock(name="consumer")

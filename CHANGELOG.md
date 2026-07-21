@@ -95,20 +95,22 @@ upgrading.
   lose both copies. Use a backend-durable strategy/path; zero effective delay
   still pushes directly to the backend.
 
-- **Pulsar `auth_token` now requires `pulsar+ssl://`.** `PulsarSettings(
-  auth_token=…)` rejects `service_url` values that do not start with
-  `pulsar+ssl://` (round-9c SV3-2). Sending a token over plaintext `pulsar://`
-  leaks it on the wire; operators who intentionally run token-auth over a
-  private plaintext broker must switch to `pulsar+ssl://` (or drop the token).
-  Fix: change `SCRAPY_PULSAR_SERVICE_URL` to `pulsar+ssl://broker:6651`.
+- **Pulsar `auth_token` now requires fully verified TLS.** Authenticated
+  settings require `pulsar+ssl://`, `allow_insecure_connection=False`, and
+  `tls_validate_hostname=True`; an empty/blank token is rejected. Service URL
+  userinfo is forbidden so credentials cannot be retained in config or logs.
+  Operators using token auth must fix the broker certificate/service hostname
+  rather than use either TLS validation escape hatch.
 - **Pulsar TLS now validates broker hostnames by default.** The backend now
   translates its public compatibility fields to the real pulsar-client
   `tls_*` constructor keywords; the previous names made every TLS client
   construction fail. New setting `SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=True`
-  also closes the SDK's insecure default. Fix mismatched broker certificates,
-  or set it to `False` only as an explicit local-development compatibility
-  escape hatch. Service URLs are normalized to the SDK's case-sensitive scheme
-  and single-prefix cluster syntax; see
+  also closes the SDK's insecure default. Unauthenticated local deployments may
+  set it to `False` only as an explicit development compatibility escape hatch;
+  token authentication cannot. Each client generation now uses one validated,
+  repr-redacted snapshot for client and subscription construction, and public
+  startup tracebacks suppress driver text. Service URLs are normalized to the
+  SDK's case-sensitive scheme and single-prefix cluster syntax; see
   [`docs/migration-guide.md`](docs/migration-guide.md).
 - **Authenticated RocketMQ connections now require TLS.** New setting
   `SCRAPY_ROCKETMQ_TLS_ENABLED` is passed to both the Producer and

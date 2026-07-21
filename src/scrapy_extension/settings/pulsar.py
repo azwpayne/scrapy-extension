@@ -18,6 +18,125 @@ from scrapy_extension.exceptions.base import ConfigurationError
 _VALID_PULSAR_SCHEMES: tuple[str, ...] = ("pulsar://", "pulsar+ssl://")
 
 
+def _auth_token_value(value: object) -> str | None:
+  """Extract a non-empty Pulsar token without retaining invalid input."""
+  if value is None:
+    return None
+  if isinstance(value, SecretStr):
+    token = value.get_secret_value()
+  elif isinstance(value, str):
+    token = value
+  else:
+    raise ConfigurationError(
+      "auth_token must be a string when explicitly configured.",
+      setting_name="auth_token",
+    )
+  if not token.strip():
+    raise ConfigurationError(
+      "auth_token must be non-empty when explicitly configured.",
+      setting_name="auth_token",
+    )
+  return token
+
+
+def validate_pulsar_connection(
+  service_url: object,
+  auth_token: object,
+  tls_trust_certs_file: object,
+  allow_insecure_connection: object,
+  tls_validate_hostname: object,
+) -> tuple[str, str | None, str | None, bool, bool]:
+  """Validate and normalize one coherent Pulsar connection value set.
+
+  The returned token is raw for SDK use; callers that retain it must wrap it
+  in the backend's repr-redacting string type. Invalid URLs and credentials are
+  never attached to the raised exception.
+  """
+  if not isinstance(service_url, str):
+    raise ConfigurationError(
+      "service_url must be a string.", setting_name="service_url"
+    )
+  url = service_url.strip()
+  lowered = url.lower()
+  scheme = next(
+    (
+      candidate
+      for candidate in _VALID_PULSAR_SCHEMES
+      if lowered.startswith(candidate)
+    ),
+    None,
+  )
+  if scheme is None:
+    raise ConfigurationError(
+      "service_url must start with 'pulsar://' or 'pulsar+ssl://'.",
+      setting_name="service_url",
+    )
+  endpoint_text = url[len(scheme) :]
+  if "://" in endpoint_text:
+    raise ConfigurationError(
+      "Pulsar cluster service_url must use a single scheme followed by a "
+      "comma-separated endpoint list.",
+      setting_name="service_url",
+    )
+  endpoints = tuple(endpoint.strip() for endpoint in endpoint_text.split(","))
+  if not endpoints or any(not endpoint for endpoint in endpoints):
+    raise ConfigurationError(
+      "service_url must contain one or more non-empty Pulsar endpoints.",
+      setting_name="service_url",
+    )
+  if any("@" in endpoint for endpoint in endpoints):
+    raise ConfigurationError(
+      "Pulsar service_url must not contain URL userinfo; configure "
+      "auth_token separately.",
+      setting_name="service_url",
+    )
+
+  if tls_trust_certs_file is not None and (
+    not isinstance(tls_trust_certs_file, str)
+    or not tls_trust_certs_file.strip()
+  ):
+    raise ConfigurationError(
+      "tls_trust_certs_file must be a non-empty path when configured.",
+      setting_name="tls_trust_certs_file",
+    )
+  if not isinstance(allow_insecure_connection, bool):
+    raise ConfigurationError(
+      "allow_insecure_connection must be a boolean.",
+      setting_name="allow_insecure_connection",
+    )
+  if not isinstance(tls_validate_hostname, bool):
+    raise ConfigurationError(
+      "tls_validate_hostname must be a boolean.",
+      setting_name="tls_validate_hostname",
+    )
+
+  token = _auth_token_value(auth_token)
+  normalized_url = f"{scheme}{','.join(endpoints)}"
+  if token is not None:
+    if scheme != "pulsar+ssl://":
+      raise ConfigurationError(
+        "Authenticated Pulsar connections require 'pulsar+ssl://' transport.",
+        setting_name="service_url",
+      )
+    if allow_insecure_connection:
+      raise ConfigurationError(
+        "Authenticated Pulsar connections require certificate verification.",
+        setting_name="allow_insecure_connection",
+      )
+    if not tls_validate_hostname:
+      raise ConfigurationError(
+        "Authenticated Pulsar connections require hostname verification.",
+        setting_name="tls_validate_hostname",
+      )
+  return (
+    normalized_url,
+    token,
+    tls_trust_certs_file,
+    allow_insecure_connection,
+    tls_validate_hostname,
+  )
+
+
 class PulsarMode(str, Enum):
   """Pulsar deployment modes.
 
@@ -85,19 +204,21 @@ class PulsarSettings(BaseSettings):
   )
   allow_insecure_connection: bool = Field(
     default=False,
-    description="Allow insecure TLS connections (dev only)",
+    description=(
+      "Allow insecure TLS connections for unauthenticated development only"
+    ),
   )
   tls_validate_hostname: bool = Field(
     default=True,
     description=(
       "Validate the broker hostname against its TLS certificate; disable only "
-      "for explicit local compatibility"
+      "for unauthenticated local compatibility"
     ),
   )
 
   @model_validator(mode="after")
-  def _validate_service_url_scheme(self) -> Self:
-    """SV4: ``service_url`` must start with ``pulsar://`` or ``pulsar+ssl://``.
+  def _validate_connection(self) -> Self:
+    """Validate URL grammar, credentials, and authenticated TLS policy.
 
     A bare ``host:port`` or ``http://`` value otherwise surfaces as an
     opaque ``ValueError`` inside the pulsar client at connect. The SDK treats
@@ -110,68 +231,17 @@ class PulsarSettings(BaseSettings):
         ConfigurationError: if ``service_url`` does not start with a valid
             Pulsar scheme.
     """
-    url = self.service_url.strip()
-    lowered = url.lower()
-    scheme = next(
-      (
-        candidate
-        for candidate in _VALID_PULSAR_SCHEMES
-        if lowered.startswith(candidate)
-      ),
-      None,
+    (
+      self.service_url,
+      _token,
+      _trust_file,
+      _allow_insecure,
+      _validate_hostname,
+    ) = validate_pulsar_connection(
+      self.service_url,
+      self.auth_token,
+      self.tls_trust_certs_file,
+      self.allow_insecure_connection,
+      self.tls_validate_hostname,
     )
-    if scheme is None:
-      raise ConfigurationError(
-        (
-          "service_url must start with 'pulsar://' or 'pulsar+ssl://'. "
-          f"Got service_url={self.service_url!r}."
-        ),
-        setting_name="service_url",
-        setting_value=self.service_url,
-      )
-    endpoint_text = url[len(scheme) :]
-    if "://" in endpoint_text:
-      raise ConfigurationError(
-        "Pulsar cluster service_url must use a single scheme followed by a "
-        "comma-separated endpoint list",
-        setting_name="service_url",
-        setting_value=self.service_url,
-      )
-    endpoints = [endpoint.strip() for endpoint in endpoint_text.split(",")]
-    if any(not endpoint for endpoint in endpoints):
-      raise ConfigurationError(
-        "service_url must contain one or more non-empty Pulsar endpoints",
-        setting_name="service_url",
-        setting_value=self.service_url,
-      )
-    self.service_url = f"{scheme}{','.join(endpoints)}"
-    return self
-
-  @model_validator(mode="after")
-  def _validate_auth_token_requires_ssl(self) -> Self:
-    """SV3-2 (H): ``auth_token`` set → ``service_url`` must be ``pulsar+ssl://``.
-
-    Pulsar's ``AuthenticationToken`` is transmitted on every broker
-    connection. Without TLS (``pulsar://`` rather than ``pulsar+ssl://``),
-    the token traverses the wire in cleartext — a credential-leak footgun.
-    This mirrors the Redis ``ssl_enabled``→``ssl_cafile`` and Kafka
-    SASL→``security_protocol`` raise-on-incoherence pattern.
-
-    Raises:
-        ConfigurationError: if ``auth_token`` is set and ``service_url``
-            does not start with ``pulsar+ssl://``.
-    """
-    if self.auth_token is None:
-      return self
-    if not self.service_url.lower().startswith("pulsar+ssl://"):
-      raise ConfigurationError(
-        (
-          "auth_token is set but service_url is not 'pulsar+ssl://' "
-          f"(got service_url={self.service_url!r}). The token would be "
-          "sent in cleartext over a non-TLS connection. Use "
-          "'pulsar+ssl://' to protect the token on the wire."
-        ),
-        setting_name="service_url",
-        setting_value=self.service_url,
-      )
     return self

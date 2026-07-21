@@ -225,6 +225,19 @@ SCRAPY_BACKEND_TYPE = "pulsar"
 SCRAPY_PULSAR_SERVICE_URL = "pulsar://localhost:6655"
 ```
 
+Token-authenticated deployments must use fully verified TLS:
+
+```python
+SCRAPY_PULSAR_SERVICE_URL = "pulsar+ssl://broker.example:6651"
+SCRAPY_PULSAR_AUTH_TOKEN = "..."
+# Optional for private PKI; system roots are used when omitted.
+SCRAPY_PULSAR_TLS_TRUST_CERTS_FILE = "/etc/ssl/private-pki-ca.pem"
+```
+
+Authenticated connections reject blank tokens, URL userinfo,
+`SCRAPY_PULSAR_ALLOW_INSECURE_CONNECTION=True`, and
+`SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=False`.
+
 ### Amazon SQS (standalone=LocalStack, cloud=AWS)
 
 ```python

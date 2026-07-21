@@ -182,11 +182,12 @@ speculative work.
 - [x] **SEC-01B1 — RabbitMQ/RocketMQ credential completeness.** Reject blank
   explicit credentials, RabbitMQ URL userinfo and remote guest use, and
   incomplete RocketMQ key pairs without retaining secret values.
-- [ ] **SEC-01B2 — remaining broker credential completeness.** Reject empty
+- [x] **SEC-01B2A — Pulsar credential completeness.** Reject blank explicit
+  tokens and service-URL userinfo without retaining their values.
+- [ ] **SEC-01B2B — remaining broker credential completeness.** Reject empty
   explicit secrets, URL/URI userinfo, and mechanism-inconsistent authentication
-  for Kafka, MongoDB, Elasticsearch, and Pulsar. Preserve valid
-  mechanism-specific modes rather than requiring a universal username/password
-  pair.
+  for Kafka, MongoDB, and Elasticsearch. Preserve valid mechanism-specific
+  modes rather than requiring a universal username/password pair.
 - [x] **SEC-02A — AWS cloud transport.** Reject URL userinfo and explicit
   plaintext SQS/DynamoDB endpoints in cloud mode while retaining HTTP support
   for explicit standalone LocalStack-compatible endpoints.
@@ -196,8 +197,9 @@ speculative work.
 - [x] **SEC-02B2A — RabbitMQ broker transport.** Limit plaintext to all-loopback
   endpoint sets, forbid `amqps://` downgrade, require certificate/hostname
   verification, and bind TLS SNI to each actual cluster node.
-- [ ] **SEC-02B2B — remaining broker transport.** Reject authenticated Pulsar
-  connections without certificate and hostname verification, and define an
+- [x] **SEC-02B2B1 — authenticated Pulsar transport.** Require both certificate
+  and hostname verification whenever a token is configured.
+- [ ] **SEC-02B2B2 — Memcached transport boundary.** Define and enforce an
   explicit trusted-network boundary for remote Memcached.
 - [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
   endpoint and credential fields at connect time and use one captured set of
@@ -209,9 +211,12 @@ speculative work.
 - [x] **SEC-03B2A — RabbitMQ validated connection snapshot.** Revalidate every
   connection and QoS value once, use only the captured values across primary
   and failover nodes, repr-redact the password, and sanitize startup failures.
-- [ ] **SEC-03B2B — remaining validated connection snapshots.** Apply copied,
+- [x] **SEC-03B2B1 — Pulsar validated connection snapshot.** Revalidate and
+  freeze client/subscription settings per generation, repr-redact the token,
+  and sanitize URL/driver startup failures.
+- [ ] **SEC-03B2B2 — remaining validated connection snapshots.** Apply copied,
   revalidated connection snapshots and sanitized URL/URI failures to Kafka,
-  MongoDB, Elasticsearch, Pulsar, and Memcached.
+  MongoDB, Elasticsearch, and Memcached.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
@@ -833,3 +838,24 @@ tracking. Token-aware pops no longer write the legacy slot. All 83 local Pulsar
 tests passed on Python 3.10 and 3.14 with the real-broker test explicitly
 skipped; the full Python 3.10 suite passed 3,110 tests with 45 documented skips.
 Ruff, strict mypy, and patch integrity remained green.
+
+### I22 — Pulsar authenticated transport and connection snapshots
+
+Nine initial RED regressions showed that Pulsar accepted blank tokens, URL
+userinfo, and token-authenticated TLS with certificate or hostname verification
+disabled. Construction-time validation could be bypassed by mutating the
+settings object before `connect()`, client and subscription construction read
+different settings generations, the retained snapshot did not exist, and raw
+driver text—including a token—reached the public connection error traceback.
+
+A shared validator now normalizes and checks one captured connection value set
+at settings construction and again immediately before SDK I/O. Token auth
+requires `pulsar+ssl://`, certificate verification, and hostname verification;
+blank tokens, userinfo, and blank trust paths fail without retaining values.
+Each client generation atomically publishes an immutable snapshot containing
+its repr-redacted token and all later subscription inputs, so post-capture
+mutation cannot downgrade transport or change consumer identity. Public startup
+errors suppress the service URL and driver text. All 327 related tests passed
+on Python 3.10 and 3.14 with one real-broker test explicitly skipped; the full
+Python 3.10 suite passed 3,119 tests with 45 documented skips. Ruff, strict
+mypy, and patch integrity remained green.

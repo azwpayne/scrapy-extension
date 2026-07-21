@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -40,7 +41,6 @@ from scrapy_extension.backends.base import (
   BackendType,
   QueueBackend,
   _validate_key_name,
-  secret_value,
 )
 from scrapy_extension.exceptions import (
   BackendConnectionError,
@@ -48,6 +48,7 @@ from scrapy_extension.exceptions import (
   QueueError,
 )
 from scrapy_extension.settings import PulsarMode
+from scrapy_extension.settings.pulsar import validate_pulsar_connection
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import PulsarSettings
@@ -165,6 +166,22 @@ class _PulsarAckToken:
     )
 
 
+@dataclass(frozen=True)
+class _PulsarConnectionSnapshot:
+  """One validated, repr-safe set of values used by a client generation."""
+
+  mode: PulsarMode
+  service_url: str
+  subscription_name: str
+  consumer_type: str
+  initial_position: str
+  negative_ack_redelivery_delay_ms: int
+  auth_token: str | None
+  tls_trust_certs_file: str | None
+  allow_insecure_connection: bool
+  tls_validate_hostname: bool
+
+
 def _consumer_type(value: str) -> Any:
   """Map a setting string to a pulsar ConsumerType member.
 
@@ -271,6 +288,7 @@ class PulsarBackend(Backend, QueueBackend):
     """
     self.config = config
     self._client: Any = None
+    self._connection_snapshot: _PulsarConnectionSnapshot | None = None
     self._producers: dict[str, Any] = {}
     self._consumers: dict[str, Any] = {}
     self._lifecycle_lock = Lock()
@@ -294,6 +312,80 @@ class PulsarBackend(Backend, QueueBackend):
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
 
+  def _capture_connection_snapshot(self) -> _PulsarConnectionSnapshot:
+    """Capture and revalidate every value used by one client generation."""
+    mode = self.config.mode
+    service_url = self.config.service_url
+    subscription_name = self.config.subscription_name
+    consumer_type = self.config.consumer_type
+    initial_position = self.config.initial_position
+    negative_ack_redelivery_delay_ms = self.config.negative_ack_redelivery_delay_ms
+    auth_token = self.config.auth_token
+    tls_trust_certs_file = self.config.tls_trust_certs_file
+    allow_insecure_connection = self.config.allow_insecure_connection
+    tls_validate_hostname = self.config.tls_validate_hostname
+
+    if mode not in (PulsarMode.STANDALONE, PulsarMode.CLUSTER):
+      try:
+        mode_text = str(mode)
+      except (TypeError, ValueError):
+        mode_text = getattr(mode, "value", repr(mode))
+      raise ConfigurationError(
+        f"Unsupported Pulsar mode: {mode_text}",
+        setting_name="mode",
+        setting_value=mode,
+      )
+    (
+      normalized_url,
+      token_text,
+      trust_file,
+      allow_insecure,
+      validate_hostname,
+    ) = validate_pulsar_connection(
+      service_url,
+      auth_token,
+      tls_trust_certs_file,
+      allow_insecure_connection,
+      tls_validate_hostname,
+    )
+    if not isinstance(subscription_name, str) or not subscription_name.strip():
+      raise ConfigurationError(
+        "Pulsar subscription_name must be a non-empty string.",
+        setting_name="subscription_name",
+      )
+    if consumer_type not in ("Shared", "Failover", "Exclusive", "Key_Shared"):
+      raise ConfigurationError(
+        "Pulsar consumer_type is invalid.", setting_name="consumer_type"
+      )
+    if initial_position not in ("Earliest", "Latest"):
+      raise ConfigurationError(
+        "Pulsar initial_position is invalid.", setting_name="initial_position"
+      )
+    if (
+      isinstance(negative_ack_redelivery_delay_ms, bool)
+      or not isinstance(negative_ack_redelivery_delay_ms, int)
+      or negative_ack_redelivery_delay_ms < 0
+    ):
+      raise ConfigurationError(
+        "Pulsar negative_ack_redelivery_delay_ms must be an integer >= 0.",
+        setting_name="negative_ack_redelivery_delay_ms",
+      )
+
+    return _PulsarConnectionSnapshot(
+      mode=mode,
+      service_url=normalized_url,
+      subscription_name=subscription_name,
+      consumer_type=consumer_type,
+      initial_position=initial_position,
+      negative_ack_redelivery_delay_ms=negative_ack_redelivery_delay_ms,
+      auth_token=(
+        cast(str, _redact(token_text)) if token_text is not None else None
+      ),
+      tls_trust_certs_file=trust_file,
+      allow_insecure_connection=allow_insecure,
+      tls_validate_hostname=validate_hostname,
+    )
+
   def connect(self) -> None:
     """Connect to Pulsar by creating a client from ``service_url``.
 
@@ -301,12 +393,10 @@ class PulsarBackend(Backend, QueueBackend):
         BackendConnectionError: If the client cannot be created.
         ConfigurationError: If the mode is unsupported.
     """
-    if self.config.mode not in (PulsarMode.STANDALONE, PulsarMode.CLUSTER):
-      raise ConfigurationError(
-        f"Unsupported Pulsar mode: {self.config.mode}",
-        setting_name="mode",
-        setting_value=self.config.mode,
-      )
+    with self._lifecycle_lock:
+      if self._client is not None:
+        return
+    snapshot = self._capture_connection_snapshot()
     try:
       kwargs: dict[str, Any] = {}
       # Keep the package's public compatibility names, but translate them to
@@ -314,17 +404,17 @@ class PulsarBackend(Backend, QueueBackend):
       # unprefixed names were accepted by MagicMock tests yet rejected by the
       # real SDK, making every TLS connect fail before network I/O. Hostname
       # validation is explicit because the SDK itself defaults it to False.
-      is_ssl = self.config.service_url.lower().startswith("pulsar+ssl://")
+      is_ssl = snapshot.service_url.startswith("pulsar+ssl://")
       if is_ssl:
         kwargs["tls_allow_insecure_connection"] = (
-          self.config.allow_insecure_connection
+          snapshot.allow_insecure_connection
         )
-        kwargs["tls_validate_hostname"] = self.config.tls_validate_hostname
-        if self.config.tls_trust_certs_file:
-          kwargs["tls_trust_certs_file_path"] = self.config.tls_trust_certs_file
-      if self.config.auth_token:
+        kwargs["tls_validate_hostname"] = snapshot.tls_validate_hostname
+        if snapshot.tls_trust_certs_file:
+          kwargs["tls_trust_certs_file_path"] = snapshot.tls_trust_certs_file
+      if snapshot.auth_token is not None:
         kwargs["authentication"] = pulsar.AuthenticationToken(
-          _redact(secret_value(self.config.auth_token))
+          snapshot.auth_token
         )
       with self._lifecycle_lock:
         # ``connect`` is idempotent and linearizes with ``disconnect``.  Keep
@@ -334,15 +424,21 @@ class PulsarBackend(Backend, QueueBackend):
         # client that is published just after teardown takes its snapshot.
         if self._client is not None:
           return
-        client = pulsar.Client(self.config.service_url, **kwargs)
+        client = pulsar.Client(snapshot.service_url, **kwargs)
         self._lifecycle_generation += 1
         self._client = client
-      logger.debug("Connected to Pulsar at %s (%s)", self.config.service_url, self.config.mode.value)
-    except Exception as e:
+        self._connection_snapshot = snapshot
+      logger.debug(
+        "Connected to Pulsar at %s (%s)",
+        snapshot.service_url,
+        snapshot.mode.value,
+      )
+    except ConfigurationError:
+      raise
+    except Exception:
       raise BackendConnectionError(
-        f"Failed to connect to Pulsar ({self.config.service_url}): {e}",
-        backend_type="pulsar",
-      ) from e
+        "Failed to connect to Pulsar.", backend_type="pulsar"
+      ) from None
 
   def disconnect(self) -> None:
     """Close the Pulsar client and release producers/consumers."""
@@ -360,6 +456,7 @@ class PulsarBackend(Backend, QueueBackend):
       self._subscribed_topic = None
       self._producers.clear()
       self._client = None
+      self._connection_snapshot = None
       self._last_msg = None
       self._last_delivery = None
       with self._in_flight_lock:
@@ -822,19 +919,27 @@ class PulsarBackend(Backend, QueueBackend):
           return consumer
         client = self._client
         generation = self._lifecycle_generation
+        snapshot = self._connection_snapshot
       if client is None:
         raise QueueError(
           f"Cannot subscribe to Pulsar topic {topic}: backend is disconnected",
           queue_name=topic,
           operation="pop",
         )
+      if snapshot is None:
+        # Compatibility for tests/third-party instrumentation that injects a
+        # private client directly; normal connected generations always publish
+        # their validated snapshot atomically with the client.
+        snapshot = self._capture_connection_snapshot()
       try:
         consumer = client.subscribe(
           topic,
-          self.config.subscription_name,
-          consumer_type=_consumer_type(self.config.consumer_type),
-          initial_position=_initial_position(self.config.initial_position),
-          negative_ack_redelivery_delay_ms=self.config.negative_ack_redelivery_delay_ms,
+          snapshot.subscription_name,
+          consumer_type=_consumer_type(snapshot.consumer_type),
+          initial_position=_initial_position(snapshot.initial_position),
+          negative_ack_redelivery_delay_ms=(
+            snapshot.negative_ack_redelivery_delay_ms
+          ),
         )
       except Exception as e:
         raise QueueError(
