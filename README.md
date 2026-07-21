@@ -260,9 +260,14 @@ visible (`VisibilityTimeout=0`).
 SCRAPY_BACKEND_TYPE = "memcached"
 SCRAPY_MEMCACHED_HOST = "localhost"
 SCRAPY_MEMCACHED_PORT = 11211
+# Required only for a non-loopback server on an isolated trusted network:
+# SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT = True
 # SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL = True  # dedicated servers only
 ```
 
+Memcached traffic in this backend is unauthenticated and unencrypted. Loopback
+hosts work by default; any remote host fails at startup unless
+`ALLOW_REMOTE_PLAINTEXT=True` explicitly accepts that trusted-network risk.
 Memcached cannot enumerate or prefix-delete application keys. Consequently,
 `clear_storage(prefix=...)` is unsupported and `clear_storage(None)` raises by
 default. Enabling `ALLOW_FLUSH_ALL` permits a server-wide destructive flush and

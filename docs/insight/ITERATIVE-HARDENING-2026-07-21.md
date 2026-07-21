@@ -199,7 +199,7 @@ speculative work.
   verification, and bind TLS SNI to each actual cluster node.
 - [x] **SEC-02B2B1 — authenticated Pulsar transport.** Require both certificate
   and hostname verification whenever a token is configured.
-- [ ] **SEC-02B2B2 — Memcached transport boundary.** Define and enforce an
+- [x] **SEC-02B2B2 — Memcached transport boundary.** Define and enforce an
   explicit trusted-network boundary for remote Memcached.
 - [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
   endpoint and credential fields at connect time and use one captured set of
@@ -214,9 +214,12 @@ speculative work.
 - [x] **SEC-03B2B1 — Pulsar validated connection snapshot.** Revalidate and
   freeze client/subscription settings per generation, repr-redact the token,
   and sanitize URL/driver startup failures.
-- [ ] **SEC-03B2B2 — remaining validated connection snapshots.** Apply copied,
+- [x] **SEC-03B2B2 — Memcached validated connection snapshot.** Revalidate one
+  immutable endpoint/policy snapshot, publish only after a successful probe,
+  make connect idempotent, and sanitize startup failures.
+- [ ] **SEC-03B2B3 — remaining validated connection snapshots.** Apply copied,
   revalidated connection snapshots and sanitized URL/URI failures to Kafka,
-  MongoDB, Elasticsearch, and Memcached.
+  MongoDB, and Elasticsearch.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
@@ -858,4 +861,25 @@ mutation cannot downgrade transport or change consumer identity. Public startup
 errors suppress the service URL and driver text. All 327 related tests passed
 on Python 3.10 and 3.14 with one real-broker test explicitly skipped; the full
 Python 3.10 suite passed 3,119 tests with 45 documented skips. Ruff, strict
+mypy, and patch integrity remained green.
+
+### I23 — Memcached trusted-network and connection lifecycle boundary
+
+Fifteen initial RED assertions showed that any remote host was accepted over
+Memcached's unauthenticated plaintext protocol, malformed host components were
+retained, and post-construction host/port mutation bypassed field validation.
+The backend published its candidate before the `stats()` probe succeeded,
+created another client on repeated `connect()`, retained no validated snapshot,
+and exposed endpoint plus raw driver text in startup failures.
+
+Loopback hosts remain zero-configuration. A non-loopback host now requires the
+explicit `allow_remote_plaintext=True` trusted-private-network acknowledgement;
+bare host grammar, port, mode, and policy are validated both at settings
+construction and immediately before SDK I/O. Connect attempts are serialized,
+the probed candidate and immutable endpoint snapshot publish together, repeated
+connect is idempotent, and disconnect atomically detaches that generation.
+Startup failures suppress endpoint and driver details, while an explicitly
+remote connection emits an operator warning. All 430 related tests passed on
+Python 3.10 and 3.14 with one real-service test explicitly skipped; the full
+Python 3.10 suite passed 3,135 tests with 45 documented skips. Ruff, strict
 mypy, and patch integrity remained green.

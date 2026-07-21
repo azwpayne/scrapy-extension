@@ -112,6 +112,13 @@ upgrading.
   startup tracebacks suppress driver text. Service URLs are normalized to the
   SDK's case-sensitive scheme and single-prefix cluster syntax; see
   [`docs/migration-guide.md`](docs/migration-guide.md).
+- **Remote Memcached plaintext is now explicit.** Memcached exposes neither
+  authentication nor transport encryption through this backend, so a
+  non-loopback host now requires
+  `SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=True`. Enable it only across an
+  isolated trusted network. Connection values are revalidated into one
+  immutable snapshot, a client is not published until `stats()` succeeds,
+  repeated connect is idempotent, and startup errors suppress driver text.
 - **Authenticated RocketMQ connections now require TLS.** New setting
   `SCRAPY_ROCKETMQ_TLS_ENABLED` is passed to both the Producer and
   SimpleConsumer gRPC clients. Any explicit access/secret key must be a complete

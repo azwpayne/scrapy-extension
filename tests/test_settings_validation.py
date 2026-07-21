@@ -271,6 +271,39 @@ class TestMemcachedBounds:
       MemcachedSettings(host="")
 
 
+class TestMemcachedTrustedNetworkBoundary:
+  @pytest.mark.parametrize(
+    "host", ["localhost", "localhost.", "cache.localhost", "127.0.0.1", "::1"]
+  )
+  def test_loopback_plaintext_is_accepted_by_default(self, host: str) -> None:
+    settings = MemcachedSettings(host=host)
+
+    assert settings.allow_remote_plaintext is False
+
+  def test_remote_plaintext_requires_explicit_trusted_network_opt_in(self) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedSettings(host="cache.internal")
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+
+  def test_remote_plaintext_can_be_explicitly_authorized(self) -> None:
+    settings = MemcachedSettings(
+      host="cache.internal", allow_remote_plaintext=True
+    )
+
+    assert settings.host == "cache.internal"
+    assert settings.allow_remote_plaintext is True
+
+  @pytest.mark.parametrize("host", ["user@cache.internal", "cache/path", "cache?x"])
+  def test_host_rejects_url_components_without_retention(self, host: str) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedSettings(host=host, allow_remote_plaintext=True)
+
+    assert exc_info.value.setting_name == "host"
+    assert host not in str(exc_info.value)
+    assert host not in repr(exc_info.value.__dict__)
+
+
 class TestRedisHostBounds:
   """RedisSettings host min_length (SV5)."""
 

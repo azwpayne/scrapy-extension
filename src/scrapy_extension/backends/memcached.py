@@ -18,6 +18,8 @@ pymemcache API used (stable):
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -39,14 +41,28 @@ from scrapy_extension.backends.base import (
   _validate_key_name,
   _validate_ttl,
 )
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions import BackendConnectionError
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MemcachedMode
+from scrapy_extension.settings.memcached import (
+  is_memcached_loopback,
+  validate_memcached_connection,
+)
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import MemcachedSettings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _MemcachedConnectionSnapshot:
+  """One validated set of values used by a Memcached connect attempt."""
+
+  mode: MemcachedMode
+  host: str
+  port: int
+  allow_remote_plaintext: bool
 
 
 class MemcachedBackend(Backend, StorageBackend):
@@ -71,54 +87,77 @@ class MemcachedBackend(Backend, StorageBackend):
     """
     self.config = config
     self._client: Any = None
+    self._connection_snapshot: _MemcachedConnectionSnapshot | None = None
+    self._connect_lock = Lock()
+    self._lifecycle_lock = Lock()
+
+  def _capture_connection_snapshot(self) -> _MemcachedConnectionSnapshot:
+    """Capture and revalidate every value used by one connect attempt."""
+    mode, host, port, allow_remote = validate_memcached_connection(
+      self.config.mode,
+      self.config.host,
+      self.config.port,
+      self.config.allow_remote_plaintext,
+    )
+    return _MemcachedConnectionSnapshot(
+      mode=mode,
+      host=host,
+      port=port,
+      allow_remote_plaintext=allow_remote,
+    )
 
   def connect(self) -> None:
     """Connect to Memcached and verify with a stats() call.
 
-    On failure the half-created client is closed and ``_client`` is reset to
-    ``None`` so :meth:`is_connected` reports ``False`` truthfully (R-mcc,
-    mirrors RabbitMQ R25-A1) -- a failed ``stats()`` probe must not leave a
-    never-connected client that lies "connected" and wedges the backend.
+    The candidate remains private until ``stats()`` succeeds. On failure it is
+    closed without ever publishing ``_client``, so :meth:`is_connected`
+    truthfully remains false. Repeated calls while connected are idempotent.
 
     Raises:
         BackendConnectionError: If the connection cannot be established.
     """
-    if self.config.mode is not MemcachedMode.STANDALONE:
-      raise ConfigurationError(
-        f"Unsupported Memcached mode: {self.config.mode}",
-        setting_name="mode",
-        setting_value=self.config.mode,
+    with self._connect_lock:
+      with self._lifecycle_lock:
+        if self._client is not None:
+          return
+      snapshot = self._capture_connection_snapshot()
+      candidate: Any = None
+      try:
+        candidate = MemcachedClient((snapshot.host, snapshot.port))
+        candidate.stats()
+      except Exception:
+        if candidate is not None:
+          with _swallow():
+            candidate.close()
+        raise BackendConnectionError(
+          "Failed to connect to Memcached.", backend_type="memcached"
+        ) from None
+      with self._lifecycle_lock:
+        # ``_connect_lock`` serializes connect attempts; the lifecycle lock
+        # publishes the successfully probed client and its exact settings as
+        # one generation for concurrent health/disconnect readers.
+        self._client = candidate
+        self._connection_snapshot = snapshot
+      if not is_memcached_loopback(snapshot.host):
+        logger.warning(
+          "Remote Memcached plaintext was explicitly enabled for %s:%d; "
+          "use only an isolated trusted network.",
+          snapshot.host,
+          snapshot.port,
+        )
+      logger.debug(
+        "Connected to Memcached at %s:%s", snapshot.host, snapshot.port
       )
-    try:
-      self._client = MemcachedClient((self.config.host, self.config.port))
-      self._client.stats()
-      logger.debug("Connected to Memcached at %s:%s", self.config.host, self.config.port)
-    except Exception as e:
-      # R-mcc: null the half-created client so is_connected() stays truthful.
-      # pymemcache's Client ctor is lazy (no network I/O); stats() is the real
-      # probe, so a failed stats() leaves _client pointing at a never-connected
-      # client. Without this reset, is_connected() (``return self._client is not
-      # None``) returns True after a connect() that already raised
-      # BackendConnectionError -- ConnectionManager.is_connected() delegates
-      # here (connectors.py), so external health checks would see a lying True
-      # and skip reconnect, wedging the backend "connected-but-dead". Mirrors
-      # RabbitMQ R25-A1 null-on-failure (rabbitmq.py:246). The ``is not None``
-      # guard also covers the ctor-raises path (client never assigned -> skip).
-      if self._client is not None:
-        with _swallow():
-          self._client.close()
-        self._client = None
-      raise BackendConnectionError(
-        f"Failed to connect to Memcached ({self.config.host}:{self.config.port}): {e}",
-        backend_type="memcached",
-      ) from e
 
   def disconnect(self) -> None:
     """Close the Memcached client."""
-    if self._client is not None:
-      with _swallow():
-        self._client.close()
+    with self._lifecycle_lock:
+      client = self._client
       self._client = None
+      self._connection_snapshot = None
+    if client is not None:
+      with _swallow():
+        client.close()
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""

@@ -17,6 +17,10 @@ Skipped by default. To run, point at a memcached you don't mind throwaway
 
     SCRAPY_TEST_MEMCACHED_HOST=localhost uv run pytest tests/integration/test_memcached_integration.py -q
 
+For a non-loopback test server, also set
+``SCRAPY_TEST_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=1`` to acknowledge that the
+Memcached protocol is unauthenticated and unencrypted.
+
 The test uses a UUID-prefixed key namespace so concurrent runs and leftover
 data don't interfere.
 """
@@ -48,6 +52,9 @@ def test_store_retrieve_round_trip() -> None:
   settings = MemcachedSettings(
     mode=MemcachedMode.STANDALONE,
     host=os.environ["SCRAPY_TEST_MEMCACHED_HOST"],
+    allow_remote_plaintext=(
+      os.environ.get("SCRAPY_TEST_MEMCACHED_ALLOW_REMOTE_PLAINTEXT") == "1"
+    ),
   )
   backend = MemcachedBackend(settings)
   backend.connect()

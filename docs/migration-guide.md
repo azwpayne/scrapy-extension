@@ -291,6 +291,13 @@ unsupported, and global `clear_storage(None)` is disabled unless
 `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=True`. That flag issues server-wide
 `flush_all`; enable it only for a dedicated Memcached instance.
 
+Memcached has no authenticated or encrypted transport in this backend. A
+non-loopback `SCRAPY_MEMCACHED_HOST` now fails unless
+`SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=True` explicitly acknowledges an
+isolated trusted-network deployment. Loopback hosts remain unchanged. Before
+upgrading a remote deployment, verify network isolation/firewall policy and add
+the opt-in; otherwise migrate the storage role to a TLS-capable backend.
+
 ## Validation and Rollback
 
 Before opening traffic, verify:

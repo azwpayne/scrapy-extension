@@ -9,7 +9,9 @@ the dependency installed, then patches the backend's captured
 from __future__ import annotations
 
 import sys
+import traceback
 import types
+from threading import Event, Thread
 from unittest.mock import MagicMock
 
 import pytest
@@ -81,6 +83,7 @@ class TestMemcachedBackendType:
     assert s.mode is MemcachedMode.STANDALONE
     assert s.host == "localhost"
     assert s.port == 11211
+    assert s.allow_remote_plaintext is False
     assert s.allow_flush_all is False
 
 
@@ -99,6 +102,113 @@ class TestMemcachedConnect:
     memcached_mod.MemcachedClient.assert_called_once_with(("localhost", 11211))
     client.stats.assert_called_once()
     assert b.is_connected() is True
+
+  def test_connect_is_idempotent_while_connected(self, mocker) -> None:
+    b, client = _connected(mocker)
+
+    b.connect()
+
+    memcached_mod.MemcachedClient.assert_called_once_with(("localhost", 11211))
+    client.stats.assert_called_once_with()
+
+  def test_connect_does_not_publish_client_before_probe_succeeds(self, mocker) -> None:
+    stats_entered = Event()
+    release_stats = Event()
+    client = mocker.MagicMock(name="client")
+
+    def blocking_stats():
+      stats_entered.set()
+      assert release_stats.wait(timeout=2.0)
+
+    client.stats.side_effect = blocking_stats
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    backend = _make_backend()
+    errors: list[BaseException] = []
+
+    def connect() -> None:
+      try:
+        backend.connect()
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    thread = Thread(target=connect)
+    thread.start()
+    assert stats_entered.wait(timeout=2.0)
+    was_private_during_probe = not backend.is_connected()
+    release_stats.set()
+    thread.join(timeout=2.0)
+
+    assert was_private_during_probe
+    assert not thread.is_alive()
+    assert errors == []
+    assert backend.is_connected() is True
+
+  def test_connect_revalidates_mutated_remote_host_before_sdk_io(
+    self, mocker
+  ) -> None:
+    settings = MemcachedSettings()
+    settings.host = "cache.internal"
+    client = mocker.patch.object(memcached_mod, "MemcachedClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+    client.assert_not_called()
+
+  def test_connect_revalidates_mutated_port_before_sdk_io(self, mocker) -> None:
+    settings = MemcachedSettings()
+    settings.port = 0
+    client = mocker.patch.object(memcached_mod, "MemcachedClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "port"
+    client.assert_not_called()
+
+  def test_connect_retains_one_preconstruction_snapshot(self, mocker) -> None:
+    settings = MemcachedSettings(
+      host="cache.internal", allow_remote_plaintext=True
+    )
+    client = mocker.MagicMock(name="client")
+
+    def mutate_after_construction(_endpoint):
+      settings.host = "attacker.internal"
+      settings.port = 22122
+      settings.allow_remote_plaintext = False
+      return client
+
+    client_factory = mocker.patch.object(
+      memcached_mod,
+      "MemcachedClient",
+      side_effect=mutate_after_construction,
+    )
+    backend = MemcachedBackend(settings)
+
+    backend.connect()
+
+    client_factory.assert_called_once_with(("cache.internal", 11211))
+    assert backend._connection_snapshot is not None
+    assert backend._connection_snapshot.host == "cache.internal"
+    assert backend._connection_snapshot.port == 11211
+    assert backend._connection_snapshot.allow_remote_plaintext is True
+
+  def test_startup_error_traceback_does_not_echo_driver_text(self, mocker) -> None:
+    secret = "memcached-driver-secret"
+    mocker.patch.object(
+      memcached_mod,
+      "MemcachedClient",
+      side_effect=RuntimeError(f"driver dump included {secret}"),
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      _make_backend().connect()
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert secret not in str(exc_info.value)
+    assert secret not in rendered
+    assert exc_info.value.__cause__ is None
 
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
@@ -136,6 +246,7 @@ class TestMemcachedConnect:
     b.disconnect()
     client.close.assert_called_once()
     assert b.is_connected() is False
+    assert b._connection_snapshot is None
 
 
 class TestMemcachedStorageOps:
