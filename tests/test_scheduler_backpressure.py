@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from scrapy import Request, Spider
 
+from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 from scrapy_extension.exceptions import QueueError, SerializationError
@@ -299,6 +300,18 @@ class TestBackpressureLenErrorDegradesToPop:
     assert result is None
     queue.pop.assert_called_once_with(timeout=0)
     assert scheduler._backpressure_paused is False
+
+
+def test_next_request_degrades_when_queue_circuit_is_open() -> None:
+  """A fail-fast circuit rejection is a temporary empty poll, not a crash."""
+  manager = MagicMock(name="ConnectionManager")
+  scheduler = BackendScheduler(connection_manager=manager)
+  queue = MagicMock(name="BackendQueue")
+  queue.pop.side_effect = CircuitBreakerOpenError("redis-queue")
+  scheduler._queue = queue
+
+  assert scheduler.next_request() is None
+  queue.pop.assert_called_once_with(timeout=0)
 
 
 class TestBackpressureStatsNoneAndFallthrough:

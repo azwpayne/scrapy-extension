@@ -977,14 +977,59 @@ class ConnectionManager:
 
   def _connect_with_retries(self) -> None:
     """Run one serialized connection transaction for :meth:`connect`."""
-    with self._lock:
-      if self._retired:
-        raise BackendConnectionError(
-          "Cannot connect a released ConnectionManager",
-          backend_type=str(self.backend_type),
+    stale_backend: Backend | None = None
+    while True:
+      with self._lock:
+        if self._retired:
+          raise BackendConnectionError(
+            "Cannot connect a released ConnectionManager",
+            backend_type=str(self.backend_type),
+          )
+        backend = self._backend
+      if backend is None:
+        break
+
+      # A published object can outlive its network connection. Run the health
+      # probe outside ``_lock`` because Redis/MongoDB/ElasticSearch probes may
+      # perform network I/O; holding the shared state lock here would block
+      # close() and peer access for the entire timeout window.
+      try:
+        connected = backend.is_connected()
+      except Exception:
+        connected = False
+        logger.debug(
+          "Backend health check failed before reconnect",
+          exc_info=True,
         )
-      if self._backend is not None:
-        return
+
+      with self._lock:
+        if self._retired:
+          raise BackendConnectionError(
+            "Cannot connect a released ConnectionManager",
+            backend_type=str(self.backend_type),
+          )
+        # Re-check identity after the unlocked health probe. A lifecycle race
+        # may have detached the inspected backend; retry against current state
+        # instead of publishing a decision about an obsolete object.
+        if self._backend is not backend:
+          continue
+        if connected:
+          return
+        self._backend = None
+        stale_backend = backend
+        break
+
+    if stale_backend is not None:
+      try:
+        stale_backend.disconnect()
+      except Exception as exc:
+        logger.warning("Error disconnecting stale backend: %s", exc)
+      self._notify_monitor("on_disconnect", str(self.backend_type), None)
+      # Proxies resolve the newly published backend lazily, but share this
+      # breaker. An explicit reconnect is a new connection generation, so it
+      # must not inherit the old generation's OPEN state.
+      if self._breaker is not None:
+        self._breaker.reset()
 
     retry_attempts, retry_delay = self._retry_policy()
     total_attempts = retry_attempts + 1

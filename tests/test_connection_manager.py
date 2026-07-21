@@ -355,6 +355,34 @@ def test_connect_does_not_retry_configuration_errors(mocker):
   sleep.assert_not_called()
 
 
+def test_connect_replaces_existing_disconnected_backend(mocker):
+  """An existing object is not evidence of a live backend connection.
+
+  A backend can lose connectivity after its initial successful connection.
+  Explicit ``connect()`` is the recovery API, so it must health-check the
+  published backend and replace a disconnected instance instead of returning
+  early solely because ``_backend`` is non-None.
+  """
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 0})
+  stale_backend = mocker.MagicMock(name="stale-backend")
+  stale_backend.is_connected.return_value = False
+  replacement = mocker.MagicMock(name="replacement-backend")
+  manager._backend = stale_backend
+  create_backend = mocker.patch.object(
+    manager,
+    "_create_backend",
+    return_value=replacement,
+  )
+
+  manager.connect()
+
+  stale_backend.is_connected.assert_called_once_with()
+  stale_backend.disconnect.assert_called_once_with()
+  create_backend.assert_called_once_with()
+  replacement.connect.assert_called_once_with()
+  assert manager._backend is replacement
+
+
 def test_backend_property_concurrent_first_connect_single_connect(mocker):
   """A2 + thread-safety: when N threads hit the ``backend`` property
   concurrently on a fresh manager, exactly ONE ``connect()`` runs and all

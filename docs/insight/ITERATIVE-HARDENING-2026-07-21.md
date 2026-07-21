@@ -120,10 +120,10 @@ speculative work.
 - [x] **PLUGIN-01 — descriptor boundary.** Validate entry-point name,
   `backend_type`, dotted class paths, and duplicates. Logging a broken plugin
   must not become an exception under warnings-as-errors.
-- [ ] **RUN-01 — circuit-breaker boundary.** Treat breaker-open queue reads and
+- [x] **RUN-01 — circuit-breaker boundary.** Treat breaker-open queue reads and
   dedup checks as expected temporary backend failures rather than scheduler
   crashes.
-- [ ] **RUN-02 — reconnect contract.** A manager with a disconnected backend
+- [x] **RUN-02 — reconnect contract.** A manager with a disconnected backend
   must actually reconnect instead of returning solely because an object exists.
 - [ ] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
   acquisition so consumer-bearing backends are not accidentally shared across
@@ -243,3 +243,17 @@ logging so Python warning filters cannot hide the bundled registry. The author
 contract and changelog carry the same semantics. All 21 registry tests passed on
 Python 3.10 and 3.14; the full suite passed 2,915 tests with 44 skips, plus Ruff
 and strict mypy.
+
+### I7 — transient outage recovery boundaries
+
+Three regressions first proved that an OPEN circuit escaped queue polling and
+deduplication, while an explicit `ConnectionManager.connect()` ignored an
+existing-but-disconnected backend. Queue polling now treats only the typed
+circuit rejection alongside queue failures; deduplication routes the same
+rejection through its existing warn-once, error-counter, not-seen degradation
+path without swallowing configuration failures. Explicit reconnect performs an
+unlocked health probe, atomically detaches and cleans up a stale generation,
+resets its circuit breaker, and publishes a fresh backend through the existing
+serialized retry transaction. The three regressions passed on Python 3.10 and
+3.14; 102 connection-manager tests, 74 scheduler/dupefilter tests, the full
+2,918-test suite with 44 skips, Ruff, and strict mypy all passed.

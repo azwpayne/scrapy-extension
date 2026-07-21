@@ -17,6 +17,7 @@ from twisted.internet.defer import Deferred
 from twisted.python.failure import Failure as TwistedFailure
 
 from scrapy_extension.backends.base import BackendType, _validate_key_name
+from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.backends.connectors import (
   _CONNECTION_MANAGER_SCOPE_KEY,
   ConnectionManager,
@@ -1268,7 +1269,7 @@ class BackendScheduler:
       if self.stats:
         self.stats.inc_value("scheduler/deserialization_errors")
       return None
-    except QueueError:
+    except (QueueError, CircuitBreakerOpenError):
       logger.exception("Failed to get next request")
       return None
     else:

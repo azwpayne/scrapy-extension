@@ -1116,6 +1116,30 @@ class TestBackendDupeFilterTransientBackendError:
     )
     return dupefilter, monitor
 
+  def test_open_circuit_degrades_to_not_seen(
+    self,
+    mock_connection_manager,
+    mocker,
+  ):
+    """A circuit-breaker rejection follows the transient-outage envelope."""
+    from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
+
+    membership_filter = mocker.Mock(name="membership_filter")
+    membership_filter.add.side_effect = CircuitBreakerOpenError("redis-set")
+    membership_filter.saturation = None
+    monitor = mocker.Mock(name="monitor")
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      key="open-circuit",
+      membership_filter=membership_filter,
+      monitor=monitor,
+    )
+    dupefilter.open()
+
+    assert dupefilter.request_seen(Request("https://example.com/circuit")) is False
+    monitor.on_error.assert_called_once()
+    assert monitor.on_error.call_args.args[0] == "dedup"
+
   def test_transient_error_does_not_crash(self, mock_connection_manager, mocker):
     """RED/GREEN: a transient backend error must not propagate.
 

@@ -11,6 +11,7 @@ from threading import Lock, RLock
 from typing import TYPE_CHECKING, Protocol
 
 from scrapy_extension.backends.base import _validate_key_name
+from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 from scrapy_extension.dupefilter.filters.memory_filter import DEFAULT_MEMORY_MAXSIZE
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
@@ -56,10 +57,11 @@ _filter_full_warned: bool = False
 # Module-level warn-once flag for the transient-backend-error degradation (Risk 4).
 # Mirrors ``_filter_full_warned``: a long-running crawl shouldn't have its log
 # spammed by per-request transient-outage signals. The first time the SetBackend
-# raises BackendConnectionError we warn once per process, bump ``errors/dedup``
-# on every occurrence via the monitor, and treat the item as NOT-seen (allow
-# enqueue — a duplicate fetch during a transient outage is strictly better than
-# a crashed crawl). Tests reset this for isolation.
+# raises BackendConnectionError or the circuit breaker rejects a call we warn
+# once per process, bump ``errors/dedup`` on every occurrence via the monitor,
+# and treat the item as NOT-seen (allow enqueue — a duplicate fetch during a
+# transient outage is strictly better than a crashed crawl). Tests reset this
+# for isolation.
 _backend_error_warned: bool = False
 
 # Non-removable filters (notably Bloom) cannot compensate a successful add
@@ -550,15 +552,15 @@ class BackendDupeFilter:
       # silently disabling this guard.
       self._handle_filter_full(fingerprint)
       return False
-    except BackendConnectionError as exc:
+    except (BackendConnectionError, CircuitBreakerOpenError) as exc:
       # Transient-backend-error graceful degradation (Risk 4).
       #
-      # A transient Redis/MongoDB/ES outage during dedup raises
-      # BackendConnectionError from the SetBackend. Left uncaught it propagates
-      # to the Scrapy engine and crashes the crawl — contradicting the
-      # codebase's documented "a dead spider is worse than a duplicate fetch"
-      # philosophy (applied for FilterFull above and in the BLE001-guarded
-      # monitor hooks). Mirror the FilterFull arm: warn once per process, emit
+      # A transient Redis/MongoDB/ES outage raises BackendConnectionError, and
+      # an already-tripped circuit rejects the call with
+      # CircuitBreakerOpenError. Left uncaught either propagates to the Scrapy
+      # engine and crashes the crawl — contradicting the codebase's documented
+      # "a dead spider is worse than a duplicate fetch" philosophy. Mirror the
+      # FilterFull arm: warn once per process, emit
       # ``monitor.on_error("dedup", exc)`` so a wired collector increments
       # ``errors/dedup``, and degrade to not-seen (allow the request through).
       # The tradeoff is possible duplicate fetches during the outage window —
@@ -682,18 +684,19 @@ class BackendDupeFilter:
   def _handle_backend_error(self, fingerprint: str, exc: BaseException) -> None:
     """Degrade gracefully when the membership-filter backend is transiently down.
 
-    Risk 4: a transient :class:`BackendConnectionError` from the SetBackend
-    (Redis/MongoDB/ES outage during dedup) must not crash the crawl. Mirror
-    :meth:`_handle_filter_full`: warn once per process (module-level
-    ``_backend_error_warned``), emit ``monitor.on_error("dedup", exc)`` so a
-    wired stats collector increments ``errors/dedup``, and emit a dedup-miss
-    hook so observability stays consistent with the not-seen outcome the
-    caller returns. The tradeoff is possible duplicate fetches until the
-    backend recovers — strictly better than crawl death.
+    Risk 4: a transient :class:`BackendConnectionError` or fail-fast
+    :class:`CircuitBreakerOpenError` from the SetBackend must not crash the
+    crawl. Mirror :meth:`_handle_filter_full`: warn once per process
+    (module-level ``_backend_error_warned``), emit
+    ``monitor.on_error("dedup", exc)`` so a wired stats collector increments
+    ``errors/dedup``, and emit a dedup-miss hook so observability stays
+    consistent with the not-seen outcome the caller returns. The tradeoff is
+    possible duplicate fetches until the backend recovers — strictly better
+    than crawl death.
 
     Args:
         fingerprint: The request fingerprint being checked when the error fired.
-        exc: The transient ``BackendConnectionError`` from the SetBackend.
+        exc: The transient backend failure or circuit rejection.
     """
     global _backend_error_warned
     if not _backend_error_warned:
