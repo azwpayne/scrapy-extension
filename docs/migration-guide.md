@@ -214,6 +214,13 @@ Field type, range, enum, and Pydantic extra-field failures raise
 `pydantic.ValidationError`. Unknown adapter settings, unsupported capabilities,
 and project cross-field constraints raise `ConfigurationError`.
 
+For Redis Sentinel, `ssl_enabled=True` now applies to Sentinel discovery as
+well as the discovered master. Verify every Sentinel endpoint presents a
+certificate trusted by `ssl_cafile` and covered by hostname validation. mTLS
+requires both `ssl_certfile` and `ssl_keyfile`; a partial pair now fails before
+network I/O. Deployments that intentionally mixed plaintext Sentinel with a
+TLS data plane must align the control plane with TLS before upgrading.
+
 Queue-only backends must be bound with `SCRAPY_QUEUE_BACKEND_TYPE`; retain a
 set-capable backend for the default distributed dedup filter and a
 storage-capable backend for the item pipeline. `priority` and `work_stealing`

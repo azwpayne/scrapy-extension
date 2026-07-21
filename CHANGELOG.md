@@ -108,6 +108,10 @@ upgrading.
   ssl_enabled=True)` rejects a missing `ssl_cafile` (round-9c SV3-3). TLS
   without a pinned CA is vulnerable to MITM; operators who previously relied
   on the system CA store must now pass an explicit `SCRAPY_REDIS_SSL_CAFILE`.
+  Sentinel discovery now inherits the same TLS/CA/hostname/client-certificate
+  policy instead of silently using plaintext control connections. Client cert
+  and key must be configured together; Redis startup errors no longer include
+  raw driver text, while SDK-bound passwords are repr-redacted.
 - **`BackendQueue.push` pops `delay` / `source` from `request.meta`.** A delayed
   request that is re-pushed (e.g. by a retry) no longer re-applies the original
   delay (round-14 R14-F). Code that re-reads `request.meta['delay']` /

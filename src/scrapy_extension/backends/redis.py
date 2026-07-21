@@ -17,6 +17,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
+from scrapy_extension.backends._redaction import _redact
 
 try:
     from redis import Redis
@@ -47,6 +48,7 @@ from scrapy_extension.exceptions import (
     StorageError,
 )
 from scrapy_extension.settings import RedisMode
+from scrapy_extension.settings.redis import validate_redis_tls
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import RedisSettings
@@ -121,26 +123,34 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If the connection cannot be established.
         ConfigurationError: If the configuration is invalid for the mode.
     """
+    mode = self.config.mode
     try:
-      if self.config.mode == RedisMode.STANDALONE:
+      if mode == RedisMode.STANDALONE:
         self._connect_standalone()
-      elif self.config.mode == RedisMode.MASTER_SLAVE:
+      elif mode == RedisMode.MASTER_SLAVE:
         self._connect_master_slave()
-      elif self.config.mode == RedisMode.SENTINEL:
+      elif mode == RedisMode.SENTINEL:
         self._connect_sentinel()
-      elif self.config.mode == RedisMode.CLUSTER:
+      elif mode == RedisMode.CLUSTER:
         self._connect_cluster()
-      logger.debug("Connected to Redis in %s mode", self.config.mode.value)
+      else:
+        raise ConfigurationError(
+          f"Unsupported Redis mode: {mode}",
+          setting_name="mode",
+          setting_value=mode,
+        )
+      logger.debug("Connected to Redis in %s mode", mode.value)
     except (BackendConnectionError, ConfigurationError):
       self.disconnect()
       raise
-    except Exception as e:
+    except Exception:
       self.disconnect()
-      msg = f"Failed to connect to Redis ({self.config.mode.value}): {e}"
+      mode_name = mode.value if isinstance(mode, RedisMode) else "unknown"
+      msg = f"Failed to connect to Redis ({mode_name})"
       raise BackendConnectionError(
         msg,
         backend_type="redis",
-      ) from e
+      ) from None
 
   def _create_redis_client(self) -> Redis:
     """Create a Redis client with shared configuration.
@@ -148,22 +158,38 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Configured Redis client instance.
     """
+    host = self.config.host
+    port = self.config.port
+    db = self.config.db
+    password = _redact(secret_value(self.config.password))
+    username = self.config.username
+    socket_timeout = self.config.socket_timeout
+    socket_connect_timeout = self.config.socket_connect_timeout
+    retry_on_timeout = self.config.retry_on_timeout
+    max_connections = self.config.max_connections
+    decode_responses = self.config.decode_responses
+    ssl_enabled = self.config.ssl_enabled
+    ssl_cafile = self.config.ssl_cafile
+    ssl_certfile = self.config.ssl_certfile
+    ssl_keyfile = self.config.ssl_keyfile
+    ssl_check_hostname = self.config.ssl_check_hostname
+    validate_redis_tls(ssl_enabled, ssl_cafile, ssl_certfile, ssl_keyfile)
     return Redis(
-      host=self.config.host,
-      port=self.config.port,
-      db=self.config.db,
-      password=secret_value(self.config.password),
-      username=self.config.username,
-      socket_timeout=self.config.socket_timeout,
-      socket_connect_timeout=self.config.socket_connect_timeout,
-      retry_on_timeout=self.config.retry_on_timeout,
-      max_connections=self.config.max_connections,
-      decode_responses=self.config.decode_responses,
-      ssl=self.config.ssl_enabled,
-      ssl_ca_certs=self.config.ssl_cafile,
-      ssl_certfile=self.config.ssl_certfile,
-      ssl_keyfile=self.config.ssl_keyfile,
-      ssl_check_hostname=self.config.ssl_check_hostname,
+      host=host,
+      port=port,
+      db=db,
+      password=password,
+      username=username,
+      socket_timeout=socket_timeout,
+      socket_connect_timeout=socket_connect_timeout,
+      retry_on_timeout=retry_on_timeout,
+      max_connections=max_connections,
+      decode_responses=decode_responses,
+      ssl=ssl_enabled,
+      ssl_ca_certs=ssl_cafile,
+      ssl_certfile=ssl_certfile,
+      ssl_keyfile=ssl_keyfile,
+      ssl_check_hostname=ssl_check_hostname,
     )
 
   def _connect_standalone(self) -> None:
@@ -204,12 +230,32 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Raises:
         ConfigurationError: If sentinels are not configured.
     """
-    if not self.config.sentinels:
+    sentinels = tuple(self.config.sentinels)
+    sentinel_master_name = self.config.sentinel_master_name
+    sentinel_password = _redact(secret_value(self.config.sentinel_password))
+    sentinel_username = self.config.sentinel_username
+    password = _redact(secret_value(self.config.password))
+    username = self.config.username
+    db = self.config.db
+    socket_timeout = self.config.socket_timeout
+    socket_connect_timeout = self.config.socket_connect_timeout
+    retry_on_timeout = self.config.retry_on_timeout
+    sentinel_retry_on_timeout = self.config.sentinel_retry_on_timeout
+    min_other_sentinels = self.config.min_other_sentinels
+    decode_responses = self.config.decode_responses
+    ssl_enabled = self.config.ssl_enabled
+    ssl_cafile = self.config.ssl_cafile
+    ssl_certfile = self.config.ssl_certfile
+    ssl_keyfile = self.config.ssl_keyfile
+    ssl_check_hostname = self.config.ssl_check_hostname
+    validate_redis_tls(ssl_enabled, ssl_cafile, ssl_certfile, ssl_keyfile)
+
+    if not sentinels:
       msg = "Sentinel mode requires 'sentinels' configuration"
       raise ConfigurationError(
         msg,
         setting_name="sentinels",
-        setting_value=self.config.sentinels,
+        setting_value=sentinels,
       )
 
     # Parse sentinel addresses. SEC-6: wrap malformed entries (raw ValueError
@@ -217,44 +263,53 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # so callers see a backend-typed error instead of an unhandled ValueError.
     sentinel_tuples: list[tuple[str, int]] = []
     try:
-      for sentinel_str in self.config.sentinels:
+      for sentinel_str in sentinels:
         host, port_str = sentinel_str.rsplit(":", 1)
         sentinel_tuples.append((host, int(port_str)))
 
       # Create Sentinel connection
-      sentinel_kwargs: dict[str, Any] = {}
-      if self.config.sentinel_password:
-        sentinel_kwargs["password"] = secret_value(self.config.sentinel_password)
-      if self.config.sentinel_username:
-        sentinel_kwargs["username"] = self.config.sentinel_username
+      sentinel_kwargs: dict[str, Any] = {
+        "socket_timeout": socket_timeout,
+        "socket_connect_timeout": socket_connect_timeout,
+        "retry_on_timeout": sentinel_retry_on_timeout,
+        "ssl": ssl_enabled,
+        "ssl_ca_certs": ssl_cafile,
+        "ssl_certfile": ssl_certfile,
+        "ssl_keyfile": ssl_keyfile,
+        "ssl_check_hostname": ssl_check_hostname,
+      }
+      if sentinel_password is not None:
+        sentinel_kwargs["password"] = sentinel_password
+      if sentinel_username is not None:
+        sentinel_kwargs["username"] = sentinel_username
 
       # redis.sentinel.Sentinel ships py.typed but no inline annotations on
       # __init__/master_for/ClusterNode — these are genuine untyped-third-party
       # call sites (verified: Sentinel.__init__ has no signature annotations).
       self._sentinel = Sentinel(  # type: ignore[no-untyped-call]
         sentinel_tuples,
-        socket_timeout=self.config.socket_timeout,
-        socket_connect_timeout=self.config.socket_connect_timeout,
-        retry_on_timeout=self.config.sentinel_retry_on_timeout,
-        min_other_sentinels=self.config.min_other_sentinels,
-        sentinel_kwargs=sentinel_kwargs or None,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_connect_timeout,
+        retry_on_timeout=sentinel_retry_on_timeout,
+        min_other_sentinels=min_other_sentinels,
+        sentinel_kwargs=sentinel_kwargs,
       )
 
       # Get master connection through sentinel
       self._master_client = self._sentinel.master_for(  # type: ignore[no-untyped-call]
-        self.config.sentinel_master_name,
-        db=self.config.db,
-        password=secret_value(self.config.password),
-        username=self.config.username,
-        socket_timeout=self.config.socket_timeout,
-        socket_connect_timeout=self.config.socket_connect_timeout,
-        retry_on_timeout=self.config.retry_on_timeout,
-        decode_responses=self.config.decode_responses,
-        ssl=self.config.ssl_enabled,
-        ssl_ca_certs=self.config.ssl_cafile,
-        ssl_certfile=self.config.ssl_certfile,
-        ssl_keyfile=self.config.ssl_keyfile,
-        ssl_check_hostname=self.config.ssl_check_hostname,
+        sentinel_master_name,
+        db=db,
+        password=password,
+        username=username,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_connect_timeout,
+        retry_on_timeout=retry_on_timeout,
+        decode_responses=decode_responses,
+        ssl=ssl_enabled,
+        ssl_ca_certs=ssl_cafile,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        ssl_check_hostname=ssl_check_hostname,
       )
 
       # Verify connection. SEC-6: a connection failure here (bad master name,
@@ -267,13 +322,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         )
     except BackendConnectionError:
       raise
-    except Exception as e:
-      msg = f"Failed to connect via Redis Sentinel: {e}"
-      raise BackendConnectionError(msg, backend_type="redis") from e
+    except Exception:
+      msg = "Failed to connect via Redis Sentinel"
+      raise BackendConnectionError(msg, backend_type="redis") from None
     self._client = self._master_client
 
     logger.debug(
-      "Connected to master '%s' via Sentinel", self.config.sentinel_master_name
+      "Connected to master '%s' via Sentinel", sentinel_master_name
     )
 
   def _connect_cluster(self) -> None:
@@ -285,10 +340,27 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ConfigurationError: If startup nodes are not configured.
     """
     # Determine startup nodes
-    startup_nodes = self.config.cluster_startup_nodes
+    host = self.config.host
+    port = self.config.port
+    startup_nodes = tuple(self.config.cluster_startup_nodes)
+    password = _redact(secret_value(self.config.password))
+    username = self.config.username
+    socket_timeout = self.config.socket_timeout
+    socket_connect_timeout = self.config.socket_connect_timeout
+    retry_on_timeout = self.config.retry_on_timeout
+    max_connections = self.config.max_connections
+    decode_responses = self.config.decode_responses
+    skip_full_coverage_check = self.config.cluster_skip_full_coverage_check
+    max_redirects = self.config.cluster_max_redirects
+    ssl_enabled = self.config.ssl_enabled
+    ssl_cafile = self.config.ssl_cafile
+    ssl_certfile = self.config.ssl_certfile
+    ssl_keyfile = self.config.ssl_keyfile
+    ssl_check_hostname = self.config.ssl_check_hostname
+    validate_redis_tls(ssl_enabled, ssl_cafile, ssl_certfile, ssl_keyfile)
     if not startup_nodes:
       # Fall back to host:port if no startup nodes configured
-      startup_nodes = [f"{self.config.host}:{self.config.port}"]
+      startup_nodes = (f"{host}:{port}",)
 
     # SEC-6: wrap malformed startup-node entries and cluster connection /
     # ping failures in BackendConnectionError (matches the Sentinel path).
@@ -300,20 +372,20 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
       self._client = RedisCluster(
         startup_nodes=nodes,
-        password=secret_value(self.config.password),
-        username=self.config.username,
-        socket_timeout=self.config.socket_timeout,
-        socket_connect_timeout=self.config.socket_connect_timeout,
-        retry_on_timeout=self.config.retry_on_timeout,
-        max_connections=self.config.max_connections,
-        decode_responses=self.config.decode_responses,
-        skip_full_coverage_check=self.config.cluster_skip_full_coverage_check,
-        max_redirects=self.config.cluster_max_redirects,
-        ssl=self.config.ssl_enabled,
-        ssl_ca_certs=self.config.ssl_cafile,
-        ssl_certfile=self.config.ssl_certfile,
-        ssl_keyfile=self.config.ssl_keyfile,
-        ssl_check_hostname=self.config.ssl_check_hostname,
+        password=password,
+        username=username,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_connect_timeout,
+        retry_on_timeout=retry_on_timeout,
+        max_connections=max_connections,
+        decode_responses=decode_responses,
+        skip_full_coverage_check=skip_full_coverage_check,
+        max_redirects=max_redirects,
+        ssl=ssl_enabled,
+        ssl_ca_certs=ssl_cafile,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        ssl_check_hostname=ssl_check_hostname,
       )
 
       # Verify connection
@@ -324,9 +396,9 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         )
     except BackendConnectionError:
       raise
-    except Exception as e:
-      msg = f"Failed to connect to Redis Cluster: {e}"
-      raise BackendConnectionError(msg, backend_type="redis") from e
+    except Exception:
+      msg = "Failed to connect to Redis Cluster"
+      raise BackendConnectionError(msg, backend_type="redis") from None
     logger.debug("Connected to Redis Cluster with %d startup nodes", len(nodes))
 
   def disconnect(self) -> None:

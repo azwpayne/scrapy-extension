@@ -187,16 +187,20 @@ speculative work.
 - [x] **SEC-02A — AWS cloud transport.** Reject URL userinfo and explicit
   plaintext SQS/DynamoDB endpoints in cloud mode while retaining HTTP support
   for explicit standalone LocalStack-compatible endpoints.
-- [ ] **SEC-02B — broker transport.** Expose and propagate RocketMQ TLS and
-  require it for cloud mode; secure Redis Sentinel's control plane; reject
-  authenticated RabbitMQ/Pulsar connections without certificate and hostname
-  verification; define an explicit trusted-network boundary for remote
-  Memcached.
+- [x] **SEC-02B1 — RocketMQ and Redis control-plane transport.** Propagate
+  authenticated RocketMQ TLS and apply Redis TLS, CA, mTLS, hostname, timeout,
+  and credential policy to both Sentinel discovery and discovered masters.
+- [ ] **SEC-02B2 — remaining broker transport.** Reject authenticated
+  RabbitMQ/Pulsar connections without certificate and hostname verification;
+  define an explicit trusted-network boundary for remote Memcached.
 - [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
   endpoint and credential fields at connect time and use one captured set of
   connection values, so construction-time mutation and validation/use races
   cannot select an unvalidated identity or endpoint. Sanitize endpoint failures.
-- [ ] **SEC-03B — remaining validated connection snapshots.** Apply copied,
+- [x] **SEC-03B1 — Redis validated connection snapshots.** Capture every
+  connection-used value before SDK construction, revalidate TLS after settings
+  mutation, repr-redact credentials, and suppress raw startup trace text.
+- [ ] **SEC-03B2 — remaining validated connection snapshots.** Apply copied,
   revalidated connection snapshots and sanitized URL/URI failures to every
   remaining backend.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
@@ -736,3 +740,25 @@ and post-clear tokens use the new epoch normally. This follows AWS's current
 All 107 SQS contract tests passed on Python 3.10 and 3.14, and the full suite
 passed 3,061 tests with 44 documented skips. Ruff, strict mypy, and patch
 integrity remained green.
+
+### I18 — Redis Sentinel control-plane TLS and snapshots
+
+Eight initial RED regressions showed that `ssl_enabled=True` protected the
+discovered Redis master but not Sentinel discovery itself. Supplying
+`sentinel_kwargs` also disabled redis-py's fallback propagation of socket
+timeouts, raw Sentinel/master passwords remained visible in configuration
+reprs, SDK construction could mix pre- and post-mutation settings, client
+certificate halves were accepted, and driver text could expose secrets in a
+rendered startup traceback.
+
+Every Redis connection path now captures its connection-used values before SDK
+construction and revalidates the captured TLS tuple. Sentinel control clients
+receive the same TLS enablement, CA, optional client certificate/key, hostname
+verification, and dedicated retry policy as intended for discovery; the master
+retains its normal retry policy. Credentials use repr-redacting string wrappers
+for standalone, cluster, Sentinel, and discovered-master constructors. Public
+startup exceptions and rendered tracebacks omit raw driver/parser text. A
+locked redis-py smoke test proves `sentinel_kwargs["ssl"]` selects
+`SSLConnection`. All 418 related tests passed on Python 3.10 and 3.14. Ruff,
+strict mypy, and patch integrity remained green. The full Python 3.10 suite
+passed 3,070 tests with 44 documented skips.

@@ -883,8 +883,9 @@ class TestRedisSentinelClusterWiring:
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
     assert exc_info.value.backend_type == "redis"
-    # The original ValueError is chained for debuggability.
-    assert isinstance(exc_info.value.__cause__, ValueError)
+    # Startup traces suppress raw driver/parser text because it may contain
+    # credentials or endpoint material.
+    assert exc_info.value.__cause__ is None
 
   def test_sentinel_malformed_entry_non_numeric_port_raises(self, mocker):
     """SEC-6: non-numeric port in a sentinel entry is wrapped as
@@ -903,7 +904,7 @@ class TestRedisSentinelClusterWiring:
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
     assert exc_info.value.backend_type == "redis"
-    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert exc_info.value.__cause__ is None
 
   def test_cluster_parses_startup_nodes_into_cluster_nodes(self, mock_master_client, mocker):
     """_connect_cluster parses cluster_startup_nodes into ClusterNode objects.
@@ -962,7 +963,7 @@ class TestRedisSentinelClusterWiring:
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
     assert exc_info.value.backend_type == "redis"
-    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert exc_info.value.__cause__ is None
 
   def test_cluster_no_failover_rediscovery_path_exists(self, mock_master_client, mocker):
     """Document the failover gap: the backend delegates failover to the
@@ -2378,7 +2379,8 @@ def test_sentinel_ping_failure_wrapped_as_connection_error(mocker):
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
   assert exc_info.value.backend_type == "redis"
-  assert "master unknown" in str(exc_info.value)
+  assert "master unknown" not in str(exc_info.value)
+  assert exc_info.value.__cause__ is None
 
 
 def test_cluster_ping_failure_wrapped_as_connection_error(mocker):
@@ -2401,4 +2403,5 @@ def test_cluster_ping_failure_wrapped_as_connection_error(mocker):
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
   assert exc_info.value.backend_type == "redis"
-  assert "cluster unreachable" in str(exc_info.value)
+  assert "cluster unreachable" not in str(exc_info.value)
+  assert exc_info.value.__cause__ is None

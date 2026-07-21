@@ -30,6 +30,41 @@ class RedisMode(str, Enum):
   CLUSTER = "cluster"
 
 
+def validate_redis_tls(
+  ssl_enabled: bool,
+  ssl_cafile: str | None,
+  ssl_certfile: str | None,
+  ssl_keyfile: str | None,
+) -> None:
+  """Validate Redis TLS trust and optional client-certificate material."""
+  tls_paths = {
+    "ssl_cafile": ssl_cafile,
+    "ssl_certfile": ssl_certfile,
+    "ssl_keyfile": ssl_keyfile,
+  }
+  for setting_name, value in tls_paths.items():
+    if value is not None and not value.strip():
+      raise ConfigurationError(
+        f"Redis TLS setting '{setting_name}' cannot be blank.",
+        setting_name=setting_name,
+      )
+  if ssl_enabled and ssl_cafile is None:
+    raise ConfigurationError(
+      (
+        "ssl_enabled=True requires 'ssl_cafile' to be set (path to a CA "
+        "certificate bundle)."
+      ),
+      setting_name="ssl_cafile",
+      setting_value=ssl_cafile,
+    )
+  if (ssl_certfile is None) != (ssl_keyfile is None):
+    missing_name = "ssl_keyfile" if ssl_certfile is not None else "ssl_certfile"
+    raise ConfigurationError(
+      "Redis TLS client authentication requires both certificate and key files.",
+      setting_name=missing_name,
+    )
+
+
 class RedisSettings(BaseSettings):
   """Redis-specific settings for all deployment modes.
 
@@ -285,16 +320,10 @@ class RedisSettings(BaseSettings):
         ConfigurationError: if ``ssl_enabled`` is True and ``ssl_cafile`` is
             unset/empty.
     """
-    if self.ssl_enabled and not self.ssl_cafile:
-      raise ConfigurationError(
-        (
-          "ssl_enabled=True requires 'ssl_cafile' to be set (path to a CA "
-          "certificate bundle). Without it, redis-py may silently skip "
-          "certificate verification (MITM risk) or fail with an opaque SSL "
-          "error when the container has no system roots. Provide your CA "
-          "file (self-signed operators must supply their own)."
-        ),
-        setting_name="ssl_cafile",
-        setting_value=self.ssl_cafile,
-      )
+    validate_redis_tls(
+      self.ssl_enabled,
+      self.ssl_cafile,
+      self.ssl_certfile,
+      self.ssl_keyfile,
+    )
     return self

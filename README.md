@@ -108,6 +108,13 @@ read or delete another application's keys in a shared database. Persistent
 deployments must drain or explicitly migrate the old keys before upgrading;
 see the [migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md#redis-physical-key-layout).
 
+In Sentinel mode, `SCRAPY_REDIS_SSL_ENABLED=True` secures both Sentinel
+discovery and the discovered master. Configure `SCRAPY_REDIS_SSL_CAFILE`; when
+using mTLS, provide `SCRAPY_REDIS_SSL_CERTFILE` and
+`SCRAPY_REDIS_SSL_KEYFILE` together. Hostname verification remains enabled by
+default. This is one transport policy—there is no silent plaintext Sentinel
+control-plane fallback.
+
 ### MongoDB (standalone, replica_set, sharded_cluster, atlas)
 
 ```python

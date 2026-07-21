@@ -8,6 +8,12 @@ Before upgrading a persistent deployment, read the
 [migration guide](migration-guide.md). It covers Redis physical-key changes,
 strategy snapshot ownership, and queued-request wire compatibility.
 
+For Redis Sentinel deployments with TLS enabled, verify both the Sentinel
+ports and the discovered Redis master accept TLS using the configured CA.
+`ssl_certfile` and `ssl_keyfile` are an inseparable mTLS pair, and hostname
+verification is enabled by default. The backend never downgrades Sentinel
+discovery to plaintext when the Redis data-plane TLS flag is set.
+
 ## Switch dedup strategy
 
 Select a `MembershipFilter` via `SCRAPY_DEDUP_STRATEGY` — no code change
