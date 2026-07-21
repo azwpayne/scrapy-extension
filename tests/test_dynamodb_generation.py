@@ -26,6 +26,8 @@ def _resource(mocker: Any, table: Any | None = None) -> tuple[Any, Any]:
   table.load.return_value = None
   table.table_status = "ACTIVE"
   resource.Table.return_value = table
+  table.meta.client = resource.meta.client
+  resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
   return resource, table
 
 
@@ -681,8 +683,6 @@ def test_paginated_clear_stays_on_issuing_generation(mocker) -> None:
     return {"Items": [{"pk": "second"}]}
 
   table_a.scan.side_effect = scan_pages
-  batch_a = mocker.MagicMock()
-  table_a.batch_writer.return_value.__enter__.return_value = batch_a
   errors: list[BaseException] = []
   clear_thread = _thread_call(backend.clear_storage, errors, name="clear")
   assert scan_entered.wait(timeout=5)
@@ -707,11 +707,15 @@ def test_paginated_clear_stays_on_issuing_generation(mocker) -> None:
   assert close_calls_while_clear_blocked == 0
   assert errors == []
   assert table_a.scan.call_count == 2
-  assert [call.kwargs["Key"] for call in batch_a.delete_item.call_args_list] == [
-    {"pk": "first"},
-    {"pk": "second"},
+  assert [
+    call.kwargs["RequestItems"]
+    for call in resource_a.meta.client.batch_write_item.call_args_list
+  ] == [
+    {"table-a": [{"DeleteRequest": {"Key": {"pk": "first"}}}]},
+    {"table-a": [{"DeleteRequest": {"Key": {"pk": "second"}}}]},
   ]
   table_b.scan.assert_not_called()
+  resource_b.meta.client.batch_write_item.assert_not_called()
   table_b.batch_writer.assert_not_called()
   assert factory.call_count == 2
   resource_a.meta.client.close.assert_called_once_with()

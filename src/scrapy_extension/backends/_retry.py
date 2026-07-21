@@ -1,9 +1,12 @@
-"""Retry / backoff policy extracted from ConnectionManager (Risk 6 incremental).
+"""Shared full-jitter backoff calculation (Risk 6 incremental).
 
 The full-jitter exponential backoff calculation lives here so it is independently
 unit-testable without spinning up a :class:`~scrapy_extension.backends.connectors.ConnectionManager`
-+ real backend. ``ConnectionManager.connect`` calls :func:`compute_full_jitter_backoff`
-— behavior is byte-identical to the prior inline ``random.uniform(0, retry_delay * 2**attempt)``.
++ real backend. ``ConnectionManager.connect`` uses its validated retry settings;
+the DynamoDB clear path uses a separate fixed, bounded policy. Both call the
+same mathematical helper without sharing retry counters, configuration, or
+monitor events. Connection behavior remains byte-identical to the prior inline
+``random.uniform(0, retry_delay * 2**attempt)``.
 
 This is the first incremental extraction out of the (939-LOC) ``ConnectionManager``
 god-class. The deep-insights report roadmap splits the rest into
@@ -32,7 +35,9 @@ def compute_full_jitter_backoff(attempt: int, base_delay: float) -> float:
   Args:
       attempt: 0-based just-failed attempt index (0 = first failure → the first
           retry follows this sleep).
-      base_delay: Base delay in seconds (the ``retry_delay`` setting).
+      base_delay: Caller-owned base delay in seconds. ConnectionManager passes
+          its ``retry_delay`` setting; bounded backend policies may pass their
+          own validated/fixed value.
 
   Returns:
       Seconds to sleep — ``uniform(0, base_delay * 2**attempt)``. Always

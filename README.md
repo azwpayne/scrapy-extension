@@ -347,6 +347,16 @@ instance. Disconnect drains an admitted operation, then closes that
 generation's botocore client. Paginated clears and lazy TTL cleanup remain on
 their issuing table generation.
 
+`clear_storage()` uses explicit batches of at most 25 deletes. A batch gets at
+most eight application-level BatchWriteItem submissions; only a structurally
+valid `UnprocessedItems` subset is retried with full-jitter backoff. Botocore's
+own retry/timeout layer remains separate, so this is not a wire-attempt or
+wall-clock bound. Exhaustion, malformed service responses, or SDK failures
+raise `StorageError` and may leave a partial clear. The method does not roll
+back accepted deletes. Stop external writers before a deterministic maintenance
+clear: even a successful strongly consistent Scan is not a cross-page snapshot
+and cannot prove the table stayed empty.
+
 See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/main/examples) for representative spiders and deployment-mode recipes (Sentinel, Cluster, Atlas, Confluent, etc).
 
 ## Backend Capabilities

@@ -21,6 +21,8 @@ def _connected(mocker, **overrides):
   table.load.return_value = None
   table.table_status = "ACTIVE"
   resource.Table.return_value = table
+  table.meta.client = resource.meta.client
+  resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
   session = mocker.MagicMock()
   session.resource.return_value = resource
   mocker.patch.object(boto3.session, "Session", return_value=session)

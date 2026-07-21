@@ -311,9 +311,11 @@ speculative work.
   400 KiB item and 2,048-byte partition-key limits before network I/O, propagate
   deterministic pipeline failures, and reject malformed persisted value/TTL
   shapes through the typed storage-error contract.
-- [ ] **BACKEND-03C — bounded DynamoDB batch clear.** Replace BatchWriter's
+- [x] **BACKEND-03C — bounded DynamoDB batch clear.** Replace BatchWriter's
   unbounded hot retry of `UnprocessedItems` with explicit 25-item writes,
-  bounded exponential jitter, and a typed partial-clear failure.
+  eight application-level BatchWriteItem submissions per batch with bounded
+  exponential jitter, strict sent-subset response validation,
+  pagination-cycle detection, and a typed partial-clear failure.
 - [ ] **BACKEND-03D — remaining DynamoDB response/region contracts.** Accept
   valid multi-segment AWS regions such as GovCloud, revalidate them at connect,
   and reject malformed delete responses through `StorageError`.
@@ -1189,3 +1191,41 @@ All 221 order-sensitive connector and DynamoDB tests passed on Python 3.10 and
 3.14 with one real-service integration test explicitly skipped. The full Python
 3.10 suite passed 3,266 tests with 46 documented skips. Ruff, strict mypy,
 Bandit, lockfile validation, and patch integrity remained green.
+
+### I34 — Bounded DynamoDB batch clear
+
+The locked boto3 1.43.34 `BatchWriter` immediately requeues
+`UnprocessedItems` and loops on context-manager exit without a retry limit or
+sleep. Persistent throttling could therefore spin forever while holding the
+DynamoDB operation/retirement lock, blocking every storage call and
+`disconnect()`. Deterministic REDs also established that a replacement must
+not use a mutated table name, retry sleep cannot release local write ordering,
+malformed service responses must not inject new deletes, and cyclic Scan
+cursors form a second liveness hazard.
+
+Clear now pins one generation's Table, Resource client, and table-name snapshot
+for the complete operation. Each physical batch contains at most 25 native
+Resource-client delete requests and permits eight application-level
+BatchWriteItem submissions, with up to seven full-jitter sleeps at a 50 ms
+base. Only a structurally valid multiset subset of the current pending requests
+is retried; foreign tables, PutRequests, duplicate amplification, out-of-prefix
+Scan items, malformed Scan/BatchWrite shapes, and non-adjacent cursor cycles
+fail closed. Cursor history uses fixed-size SHA-256 digests for linear lookup
+without retaining full partition keys. SDK exceptions rely on botocore's own
+inner retry policy and are never retried by this loop.
+
+Every failure remains `StorageError(operation="clear_storage", key=None)` and
+warns that accepted deletes make the result possibly partial; driver text is
+kept only as `__cause__`, not copied into the public error or logs. The lock
+covers Scan, BatchWrite, jitter sleep, and retry so local store/teardown cannot
+interleave between attempts. Success means all requests observed by that Scan
+were accepted, not that external writers left the table empty. The per-batch
+6.35-second application-sleep maximum excludes page count, SDK retries, and
+network timeouts and is not a global shutdown deadline.
+
+The 33 focused batch-clear regressions passed on Python 3.10, including an
+isolated real boto3 Resource/Stubber transformer test. On Python 3.14, all 234
+related connector and DynamoDB tests passed with one real-service integration
+test explicitly skipped. The final Python 3.10 suite passed 3,299 tests with 46
+documented skips. Ruff, strict mypy, Bandit, lockfile validation, and patch
+integrity remained green.

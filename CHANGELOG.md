@@ -138,6 +138,20 @@ upgrading.
   calls are serialized, and paginated clear plus lazy TTL cleanup stay on their
   issuing table. Settings mutations take effect only after an explicit
   `disconnect()` / `connect()`.
+- **DynamoDB clear now reports a bounded, non-transactional outcome.** The
+  boto3 `BatchWriter` could retry persistent `UnprocessedItems` forever in a
+  hot loop while blocking every storage operation and disconnect. Clear now
+  sends at most 25 deletes per physical request, retries only the validated
+  unprocessed subset with up to seven full-jitter sleeps (eight
+  application-level BatchWriteItem submissions per batch), and raises
+  `StorageError(operation="clear_storage", key=None)` on
+  exhaustion, malformed Scan/BatchWrite responses, repeated pagination
+  cursors, or SDK failure. An error may follow accepted deletes and no rollback
+  is attempted; callers must treat it as a possibly partial clear. Success
+  means all keys observed by that Scan were accepted for deletion, not that an
+  externally written table is empty. Botocore's own retries and network
+  timeouts remain a separate inner budget, so this is not a wire-attempt or
+  wall-clock bound.
 - **Pulsar acknowledgement tokens now have one terminal outcome.** A successful
   direct token ack or nack suppresses every later terminal action, including a
   concurrent opposite action. Client failures raise `QueueError` but restore

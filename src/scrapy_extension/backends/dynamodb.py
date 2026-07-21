@@ -10,11 +10,12 @@ boto3 resource API (stable):
 - ``resource.Table(name)`` / ``resource.create_table(...)``
 - ``table.load()`` / ``table.wait_until_exists()``
 - ``table.put_item(Item=)`` / ``get_item(Key=)`` / ``delete_item(Key=, ReturnValues=)``
-- ``table.scan()`` / ``table.batch_writer()``
+- ``table.scan()`` / ``resource.meta.client.batch_write_item(RequestItems=)``
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import threading
@@ -36,6 +37,7 @@ except ImportError as e:
   ) from e
 
 from scrapy_extension.backends._redaction import _redact
+from scrapy_extension.backends._retry import compute_full_jitter_backoff
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
@@ -65,6 +67,9 @@ _DDB_NOT_FOUND_CODES = frozenset({"ResourceNotFoundException"})
 _DDB_INUSE_CODES = frozenset({"ResourceInUseException"})
 _DDB_MAX_PARTITION_KEY_BYTES = 2_048
 _DDB_MAX_ITEM_BYTES = 400 * 1_024
+_DDB_BATCH_WRITE_LIMIT = 25
+_DDB_BATCH_MAX_ATTEMPTS = 8
+_DDB_BATCH_BACKOFF_BASE_SECONDS = 0.05
 _MISSING = object()
 _DDB_USABLE_TABLE_STATUSES = frozenset({"ACTIVE", "UPDATING"})
 
@@ -332,8 +337,10 @@ class DynamoDBBackend(Backend, StorageBackend):
     self._table = None
     return generation
 
-  def _table_for_operation_locked(self, operation: str, key: str | None) -> Any:
-    """Return the authoritative table or raise the stable storage contract."""
+  def _generation_for_operation_locked(
+    self, operation: str, key: str | None
+  ) -> _DynamoDBGeneration:
+    """Return the authoritative generation or the stable storage error."""
     generation = self._generation
     if generation is None:
       raise StorageError(
@@ -341,7 +348,139 @@ class DynamoDBBackend(Backend, StorageBackend):
         operation=operation,
         key=key,
       )
-    return generation.table
+    return generation
+
+  def _table_for_operation_locked(self, operation: str, key: str | None) -> Any:
+    """Return the authoritative table or raise the stable storage contract."""
+    return self._generation_for_operation_locked(operation, key).table
+
+  @staticmethod
+  def _validated_unprocessed_deletes(
+    response: Any,
+    table_name: str,
+    submitted: list[dict[str, Any]],
+  ) -> list[dict[str, Any]]:
+    """Validate and return the exact submitted deletes DynamoDB deferred.
+
+    The Resource client's DynamoDB transformers deserialize
+    ``UnprocessedItems`` back to the same native request shape that was sent.
+    Treat the response as untrusted: only a multiset subset of this attempt's
+    deletes may be retried, so a malformed response can never induce a new
+    deletion.
+    """
+    malformed = StorageError(
+      "DynamoDB returned a malformed batch-write response; the clear may "
+      "be partially complete",
+      operation="clear_storage",
+      key=None,
+    )
+    if not isinstance(response, dict):
+      raise malformed
+    unprocessed = response.get("UnprocessedItems", _MISSING)
+    if not isinstance(unprocessed, dict):
+      raise malformed
+    if any(name != table_name for name in unprocessed):
+      raise malformed
+    raw_pending = unprocessed.get(table_name, [])
+    if not isinstance(raw_pending, list):
+      raise malformed
+    if table_name in unprocessed and not raw_pending:
+      # The service model requires at least one WriteRequest whenever a table
+      # is present; successful completion is represented by an empty map.
+      raise malformed
+
+    remaining = list(submitted)
+    validated: list[dict[str, Any]] = []
+    for request in raw_pending:
+      if not isinstance(request, dict) or set(request) != {"DeleteRequest"}:
+        raise malformed
+      delete = request["DeleteRequest"]
+      if not isinstance(delete, dict) or set(delete) != {"Key"}:
+        raise malformed
+      key = delete["Key"]
+      if (
+        not isinstance(key, dict)
+        or set(key) != {"pk"}
+        or not isinstance(key["pk"], str)
+      ):
+        raise malformed
+      try:
+        match = remaining.index(request)
+      except ValueError:
+        raise malformed from None
+      remaining.pop(match)
+      validated.append(request)
+    return validated
+
+  @staticmethod
+  def _validated_scan_page(
+    response: Any,
+  ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Validate one Scan page without treating malformed data as success."""
+    malformed = StorageError(
+      "DynamoDB returned a malformed scan response; the clear may be "
+      "partially complete",
+      operation="clear_storage",
+      key=None,
+    )
+    if not isinstance(response, dict):
+      raise malformed
+    raw_items = response.get("Items", _MISSING)
+    if not isinstance(raw_items, list):
+      raise malformed
+    items: list[dict[str, Any]] = []
+    for item in raw_items:
+      if not isinstance(item, dict) or not isinstance(item.get("pk"), str):
+        raise malformed
+      items.append(item)
+
+    cursor = response.get("LastEvaluatedKey")
+    if cursor is None or cursor == {}:
+      return items, None
+    if (
+      not isinstance(cursor, dict)
+      or set(cursor) != {"pk"}
+      or not isinstance(cursor["pk"], str)
+    ):
+      raise malformed
+    return items, cursor
+
+  @classmethod
+  def _delete_batch_with_backoff(
+    cls,
+    client: Any,
+    table_name: str,
+    requests: list[dict[str, Any]],
+  ) -> None:
+    """Delete one physical batch with bounded unprocessed-item retries."""
+    pending = list(requests)
+    for attempt in range(_DDB_BATCH_MAX_ATTEMPTS):
+      response = client.batch_write_item(
+        RequestItems={table_name: pending},
+      )
+      pending = cls._validated_unprocessed_deletes(response, table_name, pending)
+      if not pending:
+        return
+      if attempt == _DDB_BATCH_MAX_ATTEMPTS - 1:
+        logger.warning(
+          "DynamoDB clear exhausted %d attempts with %d request(s) still unprocessed",
+          _DDB_BATCH_MAX_ATTEMPTS,
+          len(pending),
+        )
+        raise StorageError(
+          "DynamoDB clear is partially complete: "
+          f"{len(pending)} delete request(s) remained unprocessed after "
+          f"{_DDB_BATCH_MAX_ATTEMPTS} attempts",
+          operation="clear_storage",
+          key=None,
+        )
+      delay = compute_full_jitter_backoff(attempt, _DDB_BATCH_BACKOFF_BASE_SECONDS)
+      logger.debug(
+        "Retrying %d unprocessed DynamoDB clear request(s) after %.3fs",
+        len(pending),
+        delay,
+      )
+      time.sleep(delay)
 
   def connect(self) -> None:
     """Privately prepare and atomically publish one table generation.
@@ -655,7 +794,14 @@ class DynamoDBBackend(Backend, StorageBackend):
       return max(0, int(expiry[1] - time.time()))
 
   def clear_storage(self, prefix: str | None = None) -> None:
-    """Best-effort clear via scan + batch delete, optionally prefix-scoped.
+    """Clear observed keys via bounded batch deletes, optionally by prefix.
+
+    Each physical batch contains at most 25 deletes and gets at most eight
+    application-level BatchWriteItem submissions with full-jitter backoff for
+    valid ``UnprocessedItems``.
+    Success means every delete observed by this paginated Scan was accepted;
+    it does not prove the table/prefix is empty in the presence of external
+    writers because DynamoDB Scan has no cross-page snapshot isolation.
 
     Args:
         prefix: If provided, only clear keys whose ``pk`` starts with this
@@ -664,8 +810,9 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Raises:
         ValueError: If prefix contains invalid characters.
-        StorageError: On operational failures (was previously silently
-            swallowed).
+        StorageError: On operational, malformed-response, repeated-cursor, or
+            retry-exhaustion failures. Deletion is non-transactional, so the
+            clear may already be partially complete.
     """
     if prefix is not None:
       _validate_key_name(prefix, "prefix")
@@ -681,26 +828,62 @@ class DynamoDBBackend(Backend, StorageBackend):
       scan_kwargs["FilterExpression"] = "begins_with(pk, :p)"
       scan_kwargs["ExpressionAttributeValues"] = {":p": prefix}
     with self._operation_lock:
-      table = self._table_for_operation_locked("clear_storage", None)
+      generation = self._generation_for_operation_locked("clear_storage", None)
+      table = generation.table
+      client = generation.resource.meta.client
+      table_name = generation.snapshot.table_name
       try:
         # Paginate: a single ``scan`` returns at most ~1 MB per page; without
         # following ``LastEvaluatedKey`` a large table is silently partial-clear
         # (#31). Loop until the scan reports no further page. The operation lock
         # pins every page and batch flush to this exact Table generation.
         last_key: dict[str, Any] | None = None
+        # Retain fixed-size digests rather than up to 2 KiB of raw key text per
+        # page while detecting non-adjacent pagination cycles.
+        seen_cursor_digests: set[bytes] = set()
         while True:
           scan = table.scan(
             **scan_kwargs,
             **({"ExclusiveStartKey": last_key} if last_key else {}),
           )
-          with table.batch_writer() as batch:
-            for item in scan.get("Items", []):
-              batch.delete_item(Key={"pk": item["pk"]})
-          last_key = scan.get("LastEvaluatedKey")
+          items, next_key = self._validated_scan_page(scan)
+          if prefix is not None and any(
+            not item["pk"].startswith(prefix) for item in items
+          ):
+            raise StorageError(
+              "DynamoDB returned a malformed out-of-scope scan response; "
+              "the clear may be partially complete",
+              operation="clear_storage",
+              key=None,
+            )
+          if next_key is not None:
+            cursor_digest = hashlib.sha256(
+              next_key["pk"].encode("utf-8")
+            ).digest()
+            if cursor_digest in seen_cursor_digests:
+              raise StorageError(
+                "DynamoDB clear is partially complete: Scan returned a "
+                "repeated pagination cursor",
+                operation="clear_storage",
+                key=None,
+              )
+            seen_cursor_digests.add(cursor_digest)
+          requests = [{"DeleteRequest": {"Key": {"pk": item["pk"]}}} for item in items]
+          for offset in range(0, len(requests), _DDB_BATCH_WRITE_LIMIT):
+            self._delete_batch_with_backoff(
+              client,
+              table_name,
+              requests[offset : offset + _DDB_BATCH_WRITE_LIMIT],
+            )
+          last_key = next_key
           if not last_key:
             break
+      except StorageError:
+        raise
       except Exception as e:
-        msg = f"Failed to clear DynamoDB table: {e}"
+        # Preserve the driver error as the cause without copying endpoint,
+        # prefix, key, or credential-shaped text into the public exception.
+        msg = "Failed to clear DynamoDB table; the clear may be partially complete"
         raise StorageError(msg, operation="clear_storage", key=None) from e
 
 

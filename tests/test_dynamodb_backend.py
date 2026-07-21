@@ -67,6 +67,8 @@ def _connected(mocker):
   table.load.return_value = None  # table already exists
   table.table_status = "ACTIVE"
   resource.Table.return_value = table
+  table.meta.client = resource.meta.client
+  resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
   _patch_resource(mocker, return_value=resource)
   b.connect()
   return b, table
@@ -416,10 +418,16 @@ class TestDynamoDBStorageOps:
   def test_clear_storage_scans_and_deletes(self, mocker) -> None:
     b, table = _connected(mocker)
     table.scan.return_value = {"Items": [{"pk": "a"}, {"pk": "b"}]}
-    batch = mocker.MagicMock()
-    table.batch_writer.return_value.__enter__.return_value = batch
     b.clear_storage()
-    assert batch.delete_item.call_count == 2
+    table.meta.client.batch_write_item.assert_called_once_with(
+      RequestItems={
+        "scrapy-extension": [
+          {"DeleteRequest": {"Key": {"pk": "a"}}},
+          {"DeleteRequest": {"Key": {"pk": "b"}}},
+        ]
+      }
+    )
+    table.batch_writer.assert_not_called()
 
   def test_clear_storage_deletes_every_scan_page(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -431,15 +439,15 @@ class TestDynamoDBStorageOps:
       },
       {"Items": [{"pk": "tenant_a:second"}]},
     ]
-    batch = mocker.MagicMock()
-    table.batch_writer.return_value.__enter__.return_value = batch
-
     b.clear_storage(prefix="tenant_a:")
 
     assert [
-      delete_call.kwargs["Key"]
-      for delete_call in batch.delete_item.call_args_list
-    ] == [{"pk": "tenant_a:first"}, {"pk": "tenant_a:second"}]
+      call.kwargs["RequestItems"]
+      for call in table.meta.client.batch_write_item.call_args_list
+    ] == [
+      {"scrapy-extension": [{"DeleteRequest": {"Key": {"pk": "tenant_a:first"}}}]},
+      {"scrapy-extension": [{"DeleteRequest": {"Key": {"pk": "tenant_a:second"}}}]},
+    ]
     assert table.scan.call_count == 2
     assert table.scan.call_args_list[1].kwargs["ExclusiveStartKey"] == page_cursor
 
@@ -466,6 +474,7 @@ class TestDynamoDBStorageOps:
       b.clear_storage(prefix="")
 
     table.scan.assert_not_called()
+    table.meta.client.batch_write_item.assert_not_called()
     table.batch_writer.assert_not_called()
 
   def test_clear_storage_prefix_applies_filter_expression(self, mocker) -> None:

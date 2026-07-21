@@ -387,6 +387,17 @@ in-flight operation per generation. Disconnect drains that call and closes the
 underlying botocore client. Local clear/store ordering is now linearized, but
 DynamoDB Scan still has no cross-process snapshot isolation.
 
+DynamoDB clear no longer delegates persistent `UnprocessedItems` to boto3's
+unbounded `BatchWriter` exit loop. Each 25-item batch now has eight
+application-level BatchWriteItem submissions and bounded full-jitter sleeps. A
+Scan/BatchWrite failure, malformed response, repeated cursor, or exhausted batch raises
+`StorageError(operation="clear_storage", key=None)` instead of hanging or
+claiming success. This is intentionally non-transactional: earlier deletes may
+already be committed, no rollback occurs, and retrying starts a new convergent
+clear. Operators requiring an empty result must stop all external writers for
+the whole operation. Botocore's own retries/timeouts are a separate inner
+budget, so the per-batch limit is not a wire-attempt or global shutdown bound.
+
 ## Validation and Rollback
 
 Before opening traffic, verify:

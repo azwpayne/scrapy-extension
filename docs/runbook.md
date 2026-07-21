@@ -343,6 +343,21 @@ instance only: DynamoDB Scan does not provide snapshot isolation across other
 processes or clients, so clear remains a best-effort maintenance operation under
 external concurrent writes.
 
+For a deterministic DynamoDB maintenance clear, first quiesce every external
+writer, then call `clear_storage()`, and resume writers only after it succeeds.
+The backend sends at most 25 deletes per request and gives each physical batch
+eight application-level BatchWriteItem submissions. Seven full-jitter sleeps
+have a theoretical local maximum of 6.35 seconds per batch, but this is not a
+whole-clear, wire-attempt, or disconnect deadline:
+page/batch count is unbounded, botocore has its own retry and network-timeout
+budget, and the operation lock has no fairness guarantee. The lock intentionally
+covers Scan, BatchWrite, and backoff so local writes cannot interleave between
+partial retries. A typed `StorageError` means the clear may already be partial;
+after fixing the cause, rerun it as a new idempotent convergence pass rather
+than attempting rollback. Never call `disconnect()` re-entrantly from a
+synchronous logging hook or signal handler; schedule teardown on another
+thread.
+
 Every successful `ConnectionManager.get_manager()` acquisition must be paired
 with exactly one `close()`. The registry is reference-counted; releasing the
 same acquisition twice can prematurely retire a manager still expected by a
