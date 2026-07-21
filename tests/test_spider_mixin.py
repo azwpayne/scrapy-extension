@@ -9,6 +9,7 @@ from scrapy import Spider, signals
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 
 # Redis password fixture - use env var to avoid S105 warnings
@@ -201,6 +202,53 @@ class TestSetupBackend:
 
     assert result is mock_manager
     assert get_manager_spy.call_count == 1
+
+  def test_consumer_backend_scope_is_unique_per_spider_instance(self) -> None:
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.KAFKA
+
+    first = TestSpider()
+    second = TestSpider()
+    first_manager = first.setup_backend()
+    second_manager = second.setup_backend()
+    try:
+      assert first_manager is not second_manager
+    finally:
+      first.close_backend()
+      second.close_backend()
+
+  def test_consumer_backend_rejects_second_logical_queue(self, mocker) -> None:
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.KAFKA
+
+    spider = TestSpider()
+    spider.setup_backend()
+    first = spider.get_queue("first-queue")
+
+    with pytest.raises(ConfigurationError, match="one logical consumer queue"):
+      spider.get_queue("second-queue")
+
+    assert spider.get_queue("first-queue") is first
+
+  def test_consumer_backend_queue_and_scheduler_must_share_name(self, mocker) -> None:
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.ROCKETMQ
+
+    spider = TestSpider()
+    spider.setup_backend()
+    spider.get_queue("custom-queue")
+
+    with pytest.raises(ConfigurationError, match="one logical consumer queue"):
+      spider.get_scheduler()
 
   def test_setup_backend_is_idempotent(self, mocker):
     """Repeated setup must not leak a manager acquire."""

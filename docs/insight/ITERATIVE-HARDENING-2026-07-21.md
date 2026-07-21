@@ -158,7 +158,7 @@ speculative work.
 - [x] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
   calls so a failure from an older CLOSED generation cannot reopen a breaker
   that has since completed an OPEN → HALF_OPEN → CLOSED recovery.
-- [ ] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
+- [x] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
   acquisition for crawler-owned construction, and use an unshareable fallback
   for unresolved direct construction, so Kafka and RocketMQ consumers are not
   accidentally shared across spiders. Apply the same isolation to backend
@@ -566,3 +566,23 @@ typed `QueueError` with queue/operation context before queue URL resolution or
 send I/O. All five regressions passed on Python 3.10 and 3.14, 268 related
 SQS/spider/fan-out tests passed, and the full suite passed 3,005 tests with 44
 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I14a — single-consumer manager scope across spiders
+
+Six initial RED regressions demonstrated that Kafka and RocketMQ schedulers
+constructed from the unresolved `q:{spider}` template shared one mutable
+consumer manager, and that two backend-spider-mixin instances did the same.
+The mixin also allowed one such consumer to be reused for two different logical
+queues. A compatibility assertion proved that explicitly fixed queue names
+could continue sharing a manager.
+
+Crawler-owned scheduler construction now resolves the spider name before
+manager acquisition. Direct unresolved templates receive an opaque registry-
+only discriminator, while fixed logical queue names retain deterministic
+sharing. Kafka and RocketMQ spider mixins receive a stable per-instance scope
+and fail fast if one instance attempts to bind its single consumer to a second
+logical queue. The discriminator remains excluded from backend settings, so it
+cannot mutate or leak into driver configuration. All seven regressions passed
+on Python 3.10 and 3.14, 270 related scheduler/mixin/manager tests passed, and
+the full suite passed 3,012 tests with 44 documented skips. Ruff, strict mypy,
+and patch integrity remained green.

@@ -87,6 +87,9 @@ _CONNECTION_MANAGER_DIRECT_KEYS: dict[str, str] = {
 # consumer state tied to one logical queue. It participates in ``_registry_key``
 # but is stripped before constructing the backend's Pydantic settings model.
 _CONNECTION_MANAGER_SCOPE_KEY = "__connection_manager_queue_scope"
+_CONSUMER_SCOPED_BACKENDS: frozenset[str] = frozenset(
+  {BackendType.KAFKA.value, BackendType.ROCKETMQ.value}
+)
 _CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS: frozenset[str] = frozenset(
   {
     *_CONNECTION_MANAGER_INTERNAL_KEYS.values(),

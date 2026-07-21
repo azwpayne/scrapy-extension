@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from scrapy import Spider, signals
+
+from scrapy_extension.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,8 @@ class BackendSpiderMixin(Spider):
     self._queue: BackendQueue | None = None
     self._dupefilter: BackendDupeFilter | None = None
     self._scheduler: BackendScheduler | None = None
+    self._consumer_manager_scope = uuid.uuid4().hex
+    self._consumer_queue_name: str | None = None
     self._signals_connected = False
     self._connected_signals: Any | None = None
     # Component close hooks are user-extensible and may call close_backend()
@@ -154,7 +159,19 @@ class BackendSpiderMixin(Spider):
           raise RuntimeError(msg)
 
         settings = self._build_backend_settings()
-        from scrapy_extension.backends.connectors import ConnectionManager
+        from scrapy_extension.backends.connectors import (
+          _CONNECTION_MANAGER_SCOPE_KEY,
+          _CONSUMER_SCOPED_BACKENDS,
+          ConnectionManager,
+        )
+
+        if self._backend_type_name() in _CONSUMER_SCOPED_BACKENDS:
+          settings = {
+            **settings,
+            _CONNECTION_MANAGER_SCOPE_KEY: (
+              f"spider-mixin-{self._consumer_manager_scope}"
+            ),
+          }
 
         manager = ConnectionManager.get_manager(
           backend_type=self.backend_type,
@@ -271,17 +288,39 @@ class BackendSpiderMixin(Spider):
     # ``backend_type`` may be a ``BackendType`` enum (its ``.value`` is the
     # registry key) or a plain registry-key string (round-5 R5-1: the public
     # ``resolve_backend_config`` API now returns strings). Accept both.
-    if not self.backend_type:
-      backend_value = None
-    elif hasattr(self.backend_type, "value"):
-      backend_value = self.backend_type.value
-    else:
-      backend_value = self.backend_type
+    backend_value = self._backend_type_name()
     builder_name = self._BACKEND_SHORTCUT_BUILDERS.get(backend_value or "")
     if builder_name is not None:
       settings.update(getattr(self, builder_name)())
 
     return settings
+
+  def _backend_type_name(self) -> str | None:
+    """Return the normalized registry name for this spider's backend."""
+    backend_type = self.backend_type
+    if backend_type is None:
+      return None
+    value = getattr(backend_type, "value", backend_type)
+    return value if isinstance(value, str) else None
+
+  def _claim_consumer_queue(self, queue_name: str) -> None:
+    """Bind single-consumer backends to one logical queue per mixin instance."""
+    from scrapy_extension.backends.connectors import _CONSUMER_SCOPED_BACKENDS
+
+    if self._backend_type_name() not in _CONSUMER_SCOPED_BACKENDS:
+      return
+    from scrapy_extension.backends.base import _validate_key_name
+
+    _validate_key_name(queue_name, "queue_name")
+    claimed = self._consumer_queue_name
+    if claimed is not None and claimed != queue_name:
+      raise ConfigurationError(
+        f"Backend {self._backend_type_name()!r} supports one logical consumer "
+        f"queue per spider mixin instance; already bound to {claimed!r}.",
+        setting_name="queue_name",
+        setting_value=queue_name,
+      )
+    self._consumer_queue_name = queue_name
 
   def _connect_signals(self) -> None:
     """Connect Scrapy signals for backend lifecycle management.
@@ -457,16 +496,22 @@ class BackendSpiderMixin(Spider):
         )
         raise RuntimeError(msg)
 
-      if self._queue is None:
-        from scrapy_extension.queue.queue import BackendQueue
+      from scrapy_extension.queue.queue import BackendQueue
 
-        name = queue_name or f"{self.name}:queue"
-        self._queue = BackendQueue(
-          connection_manager=manager,
-          queue_name=name,
-          spider=self,
-          queue_strategy=self._build_queue_strategy_from_settings(manager),
-        )
+      name = queue_name or f"{self.name}:queue"
+      previous_claim = self._consumer_queue_name
+      self._claim_consumer_queue(name)
+      try:
+        if self._queue is None:
+          self._queue = BackendQueue(
+            connection_manager=manager,
+            queue_name=name,
+            spider=self,
+            queue_strategy=self._build_queue_strategy_from_settings(manager),
+          )
+      except BaseException:
+        self._consumer_queue_name = previous_claim
+        raise
 
       return self._queue
 
@@ -524,11 +569,18 @@ class BackendSpiderMixin(Spider):
       if self._scheduler is None:
         from scrapy_extension.schedule.scheduler import BackendScheduler
 
-        self._scheduler = BackendScheduler(
-          connection_manager=manager,
-          queue_key=f"{self.name}:queue",
-          owns_connection_manager=False,
-        )
+        queue_name = f"{self.name}:queue"
+        previous_claim = self._consumer_queue_name
+        self._claim_consumer_queue(queue_name)
+        try:
+          self._scheduler = BackendScheduler(
+            connection_manager=manager,
+            queue_key=queue_name,
+            owns_connection_manager=False,
+          )
+        except BaseException:
+          self._consumer_queue_name = previous_claim
+          raise
 
       return self._scheduler
 
@@ -554,6 +606,7 @@ class BackendSpiderMixin(Spider):
       self._dupefilter = None
       self._scheduler = None
       self._connection_manager = None
+      self._consumer_queue_name = None
 
       if signal_manager is not None:
         self._disconnect_lifecycle_signals(signal_manager)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,7 @@ from scrapy_extension.backends.base import BackendType, _validate_key_name
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.backends.connectors import (
   _CONNECTION_MANAGER_SCOPE_KEY,
+  _CONSUMER_SCOPED_BACKENDS,
   ConnectionManager,
   resolve_backend_config,
 )
@@ -50,9 +52,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_QUEUE_SCOPED_MANAGER_BACKENDS = frozenset(
-  {BackendType.KAFKA.value, BackendType.ROCKETMQ.value}
-)
 _LIFECYCLE_NEW = "new"
 _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
@@ -298,7 +297,12 @@ class BackendScheduler:
     self._lifecycle_state = _LIFECYCLE_NEW
 
   @classmethod
-  def from_settings(cls, settings: Settings) -> BackendScheduler:
+  def from_settings(
+    cls,
+    settings: Settings,
+    *,
+    spider_name: str | None = None,
+  ) -> BackendScheduler:
     """Create scheduler from Scrapy settings.
 
     Selects the queue strategy from ``SCRAPY_QUEUE_STRATEGY`` (default
@@ -382,9 +386,23 @@ class BackendScheduler:
         setting_name="SCRAPY_QUEUE_KEY",
         setting_value=queue_key,
       )
+    if spider_name is not None:
+      try:
+        _validate_key_name(spider_name, "spider.name")
+      except ValueError as exc:
+        raise ConfigurationError(
+          str(exc),
+          setting_name="spider.name",
+          setting_value=spider_name,
+        ) from exc
+    resolved_queue_key = (
+      queue_key.replace("{spider}", spider_name)
+      if spider_name is not None
+      else queue_key
+    )
     try:
       _validate_key_name(
-        queue_key.replace("{spider}", "spider"),
+        resolved_queue_key.replace("{spider}", "spider"),
         "SCRAPY_QUEUE_KEY",
       )
     except ValueError as exc:
@@ -393,16 +411,22 @@ class BackendScheduler:
         setting_name="SCRAPY_QUEUE_KEY",
         setting_value=queue_key,
       ) from exc
-    if backend_type in _QUEUE_SCOPED_MANAGER_BACKENDS:
+    if backend_type in _CONSUMER_SCOPED_BACKENDS:
       # Kafka and RocketMQ each keep one mutable consumer on the backend
       # instance. Sharing that instance across logical queues makes Kafka
       # replace its subscription on every alternating pop and makes RocketMQ
       # accumulate both subscriptions on one receive loop. Add a registry-only
       # discriminator so schedulers for different queues get independent
       # consumers; ConnectionManager strips it before Pydantic validation.
+      scope = resolved_queue_key
+      if spider_name is None and "{spider}" in queue_key:
+        # Direct ``from_settings`` has no crawler/spider identity yet. Sharing
+        # the literal template would join unrelated future queues to one
+        # mutable consumer, so this scheduler gets a registry-only opaque scope.
+        scope = f"unresolved-{uuid.uuid4().hex}"
       backend_settings = {
         **backend_settings,
-        _CONNECTION_MANAGER_SCOPE_KEY: queue_key,
+        _CONNECTION_MANAGER_SCOPE_KEY: scope,
       }
     manager = ConnectionManager.get_manager(
       backend_type=backend_type,
@@ -619,7 +643,7 @@ class BackendScheduler:
           ) from exc
       return cls(
         connection_manager=manager,
-        queue_key=queue_key,
+        queue_key=resolved_queue_key,
         queue_strategy=queue_strategy,
         backpressure_pause_at=pause_at,
         backpressure_resume_at=resume_at,
@@ -790,7 +814,10 @@ class BackendScheduler:
   @classmethod
   def from_crawler(cls, crawler: Crawler) -> BackendScheduler:
     """Create scheduler from crawler."""
-    scheduler = cls.from_settings(crawler.settings)
+    scheduler = cls.from_settings(
+      crawler.settings,
+      spider_name=cls._crawler_spider_name(crawler),
+    )
     try:
       scheduler.stats = crawler.stats
       dupefilter_path = crawler.settings.get("DUPEFILTER_CLASS")
@@ -807,6 +834,18 @@ class BackendScheduler:
           "Failed to close scheduler after crawler factory failure"
         )
       raise
+
+  @staticmethod
+  def _crawler_spider_name(crawler: Crawler) -> str | None:
+    """Return an attached instance or crawler spider-class name when known."""
+    for owner in (
+      getattr(crawler, "spider", None),
+      getattr(crawler, "spidercls", None),
+    ):
+      name = getattr(owner, "name", None)
+      if isinstance(name, str) and name:
+        return name
+    return None
 
   def open(self, spider: Spider) -> Deferred[None] | None:
     """Open the scheduler for a spider and wire ack/nack signals.
