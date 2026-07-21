@@ -322,9 +322,10 @@ speculative work.
 - [x] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
   text: `_RedactedStr` protects `repr`, while ordinary string operations expose
   the underlying value required by SDK authentication.
-- [ ] **TEST-ISO-01 — canonical optional-SDK stubs.** Remove collection-order
-  coupling between connector and backend coverage tests by making every Pulsar
-  stub expose one complete shared enum/client surface; pin both file orders.
+- [x] **TEST-ISO-01 — real optional-SDK collection boundary.** Remove all
+  collection-time Pulsar/boto3/pymemcache module replacement, use the SDKs
+  required by the test dependency group, patch only per-test constructor
+  seams, and pin cold/preloaded forward/reverse collection identity.
 
 ### Verified P2 follow-ups
 
@@ -1359,3 +1360,47 @@ not change. All 189 selected SQS/AWS-region tests passed with the one live-servi
 integration test explicitly skipped. The full Python 3.10 and 3.14 suites each
 passed 3,363 tests with 46 documented skips. Ruff, strict mypy, Bandit,
 lockfile validation, dependency audit, and patch integrity remained green.
+
+### I38 — real SDK collection isolation and Pulsar enum compatibility
+
+The first RED reproduced a deterministic collection-order-dependent pytest
+failure:
+`test_connectors` created a `ModuleType("pulsar")` containing only `Client`,
+then `test_backend_coverage2` retained it with `setdefault`; the first receive
+failed before subscription because `ConsumerType` did not exist. Reversing the
+files happened to pass only because a whole-module `MagicMock` fabricated every
+missing attribute. A second real-SDK RED showed that this permissiveness had
+hidden a production defect: the public `Key_Shared` setting looked up the
+nonexistent Python attribute `ConsumerType.Key_Shared`, while Apache's 2.11
+binding source and real 3.0, 3.8, and locked 3.12 clients all expose only
+`ConsumerType.KeyShared`.
+
+The expanded audit found eleven test modules replacing Pulsar, boto3, or
+pymemcache during collection. Nine also had module-scoped cleanup fixtures that
+ran only after all collection imports and unconditionally popped entries they
+might not own; the other two left their replacements installed. Depending on
+order, a backend could remain bound to an orphan stub while later imports
+received the real SDK, or one module could delete a real SDK loaded by another.
+Hand-written package stubs also lacked import specs, package paths,
+parent-child wiring, or strict exception/enum surfaces.
+
+The specification therefore withdrew the initial "complete shared stub"
+proposal. The test dependency group already installs every backend SDK, so
+ordinary tests now import those canonical modules and patch only `Client`,
+`Session`, `AuthenticationToken`, or captured client constructors within each
+test. Missing-dependency behavior remains isolated in the existing subprocess
+tests. The production mapping keeps the stable public string `Key_Shared` but
+resolves it strictly to `ConsumerType.KeyShared`, without a fallback that could
+re-legitimize inaccurate stubs.
+
+A subprocess module-import matrix uses `runpy.run_path` to exercise the
+collection-time top levels of all eleven former injectors both forward and
+reverse, from cold and SDK-preloaded states. It asserts real module metadata,
+unchanged preloaded constructor/exception identities, and identical SDK
+objects in `sys.modules` and each backend module. All four matrix cases and the
+locked real-SDK enum seam passed. All 479 affected tests passed under a
+randomized serial run, and 203 Pulsar/collection tests passed with two xdist
+workers. The full Python 3.10 and 3.14 suites each passed 3,368 tests with 46
+documented skips. Ruff, strict mypy, Bandit, lockfile validation, dependency
+audit, and patch integrity remained green. Five independent post-implementation
+reviews found no remaining reproducible P0/P1/P2 in the I38 scope.

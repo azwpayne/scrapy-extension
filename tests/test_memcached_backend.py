@@ -1,58 +1,28 @@
-"""Tests for MemcachedBackend (subsystem ③) — mocked pymemcache.
-
-Injects a stub ``pymemcache`` package into ``sys.modules`` so the backend's
-module-level ``from pymemcache.client.base import Client`` succeeds without
-the dependency installed, then patches the backend's captured
-``MemcachedClient`` name to assert call patterns.
-"""
+"""Tests for MemcachedBackend (subsystem ③) with mocked client seams."""
 
 from __future__ import annotations
 
 import subprocess
 import sys
 import traceback
-import types
 from threading import Event, Thread
-from unittest.mock import MagicMock
 
 import pytest
 
-# Stub the pymemcache package so the backend imports cleanly.
-if "pymemcache" not in sys.modules:
-  _pkg = types.ModuleType("pymemcache")
-  _pkg_client = types.ModuleType("pymemcache.client")
-  _pkg_base = types.ModuleType("pymemcache.client.base")
-  _pkg_base.Client = MagicMock(name="MemcachedClient")
-  sys.modules["pymemcache"] = _pkg
-  sys.modules["pymemcache.client"] = _pkg_client
-  sys.modules["pymemcache.client.base"] = _pkg_base
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cleanup_sys_modules_mock_pymemcache():
-  """Pop the module-level ``pymemcache`` mock tree after this module's tests.
-
-  R14-G flake fix: module-top-level ``sys.modules`` injection pollutes the
-  session for later modules; pop all three injected keys at module teardown.
-  """
-  yield
-  for key in ("pymemcache", "pymemcache.client", "pymemcache.client.base"):
-    sys.modules.pop(key, None)
-
-import scrapy_extension.backends.memcached as memcached_mod  # noqa: E402
-from scrapy_extension.backends.base import (  # noqa: E402
+import scrapy_extension.backends.memcached as memcached_mod
+from scrapy_extension.backends.base import (
   BackendType,
   QueueBackend,
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
-from scrapy_extension.exceptions import (  # noqa: E402
+from scrapy_extension.backends.memcached import MemcachedBackend
+from scrapy_extension.exceptions import (
   BackendConnectionError,
   ConfigurationError,
 )
-from scrapy_extension.exceptions.base import StorageError  # noqa: E402
-from scrapy_extension.settings import MemcachedMode, MemcachedSettings  # noqa: E402
+from scrapy_extension.exceptions.base import StorageError
+from scrapy_extension.settings import MemcachedMode, MemcachedSettings
 
 
 def _make_backend(**overrides) -> MemcachedBackend:

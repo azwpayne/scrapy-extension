@@ -20,37 +20,14 @@ This test RED-first pins the gate. It does NOT instantiate real backends
 
 from __future__ import annotations
 
-import sys
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
-# Pulsar-client (C++ binding) and boto3 (SQS) are NOT installed in the test
-# env (only redis/pymongo/kafka-python-ng/pika/elasticsearch are — see
-# pyproject [dependency-groups].test). Inject mocks so this file can import
-# SqsBackend/PulsarBackend for the capability-class lookup WITHOUT relying
-# on another test file (e.g. test_sqs_backend.py) having populated
-# sys.modules first — that cross-file ordering dependency made the file fail
-# when run standalone. Self-sufficient now.
-sys.modules.setdefault("pulsar", MagicMock())
-sys.modules.setdefault("boto3", MagicMock())
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cleanup_sys_modules_mocks():
-  """Pop the module-level ``pulsar``/``boto3`` mocks after this module's tests.
-
-  R14-G flake fix: module-top-level ``sys.modules.setdefault`` pollutes the
-  session for later modules; pop at module teardown.
-  """
-  yield
-  for key in ("pulsar", "boto3"):
-    sys.modules.pop(key, None)
-
-from scrapy_extension.backends.base import BackendType  # noqa: E402
-from scrapy_extension.backends.connectors import ConnectionManager  # noqa: E402
-from scrapy_extension.exceptions import ConfigurationError  # noqa: E402
-from scrapy_extension.schedule.scheduler import BackendScheduler  # noqa: E402
+from scrapy_extension.backends.base import BackendType
+from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
 def _make_settings(

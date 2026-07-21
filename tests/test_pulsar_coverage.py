@@ -2,39 +2,19 @@
 
 from __future__ import annotations
 
-import sys
 from unittest.mock import MagicMock
 
-sys.modules.setdefault("pulsar", MagicMock())
-import pulsar  # noqa: E402 — the mocked module actually in sys.modules
-import pytest  # noqa: E402
+import pulsar
+import pytest
 
-
-class _PulsarTimeout(Exception):
-  """Test double matching ``pulsar.Timeout`` from the C++ client binding."""
-
-
-pulsar.Timeout = _PulsarTimeout
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cleanup_sys_modules_mock_pulsar():
-  """Pop the module-level ``pulsar`` mock after this module's tests finish.
-
-  R14-G flake fix: module-top-level ``sys.modules.setdefault`` pollutes the
-  session for later modules; pop at module teardown.
-  """
-  yield
-  sys.modules.pop("pulsar", None)
-
-from scrapy_extension.backends.pulsar import (  # noqa: E402
+from scrapy_extension.backends.pulsar import (
   PulsarBackend,
   _consumer_type,
   _initial_position,
   _message_bytes,
 )
-from scrapy_extension.exceptions import ConfigurationError, QueueError  # noqa: E402
-from scrapy_extension.settings import PulsarSettings  # noqa: E402
+from scrapy_extension.exceptions import ConfigurationError, QueueError
+from scrapy_extension.settings import PulsarSettings
 
 
 def _connected(mocker, **overrides):

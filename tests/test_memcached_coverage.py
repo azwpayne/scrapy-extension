@@ -2,37 +2,12 @@
 
 from __future__ import annotations
 
-import sys
-import types
-from unittest.mock import MagicMock
+import pytest
 
-if "pymemcache" not in sys.modules:
-  _pkg = types.ModuleType("pymemcache")
-  _pkg_client = types.ModuleType("pymemcache.client")
-  _pkg_base = types.ModuleType("pymemcache.client.base")
-  _pkg_base.Client = MagicMock(name="MemcachedClient")
-  sys.modules["pymemcache"] = _pkg
-  sys.modules["pymemcache.client"] = _pkg_client
-  sys.modules["pymemcache.client.base"] = _pkg_base
-
-import pytest  # noqa: E402
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cleanup_sys_modules_mock_pymemcache():
-  """Pop the module-level ``pymemcache`` mock tree after this module's tests.
-
-  R14-G flake fix: module-top-level ``sys.modules`` injection pollutes the
-  session for later modules; pop all three injected keys at module teardown.
-  """
-  yield
-  for key in ("pymemcache", "pymemcache.client", "pymemcache.client.base"):
-    sys.modules.pop(key, None)
-
-import scrapy_extension.backends.memcached as memcached_mod  # noqa: E402
-from scrapy_extension.backends.memcached import MemcachedBackend  # noqa: E402
-from scrapy_extension.exceptions.base import StorageError  # noqa: E402
-from scrapy_extension.settings import MemcachedSettings  # noqa: E402
+import scrapy_extension.backends.memcached as memcached_mod
+from scrapy_extension.backends.memcached import MemcachedBackend
+from scrapy_extension.exceptions.base import StorageError
+from scrapy_extension.settings import MemcachedSettings
 
 
 def _connected(mocker):

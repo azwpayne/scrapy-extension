@@ -440,6 +440,12 @@ upgrading.
 
 ### Fixed
 
+- Pulsar `consumer_type="Key_Shared"` now maps to the real Python SDK member
+  `ConsumerType.KeyShared`; permissive whole-module mocks had fabricated the
+  misspelled attribute and hidden the production failure. Tests now retain the
+  installed Pulsar, boto3, and pymemcache modules during collection and patch
+  only per-test constructor seams, eliminating order-dependent module identity
+  splits and accidental deletion of SDKs another test imported.
 - The security policy now correctly describes `_RedactedStr` as a repr-only
   accidental-display guard. Ordinary string formatting, direct `%s`/f-string
   logging, and serialization can expose the underlying SDK credential by

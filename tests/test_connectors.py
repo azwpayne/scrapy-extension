@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,53 +14,6 @@ from scrapy_extension.backends.base import (
 )
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
-
-
-# --- SDK stubs for backends whose optional deps are absent in the test env ---
-# Mirrors tests/test_memcached_backend.py: inject a stub package into sys.modules
-# so the backend's module-level ``import pulsar`` / ``import boto3`` /
-# ``from pymemcache.client.base import Client`` succeeds without the dep installed.
-def _ensure_sdk_stub(module_dotted: str, attrs: dict[str, object] | None = None) -> None:
-  """Inject (or extend) a stub package at ``module_dotted`` in sys.modules.
-
-  Creates each parent package so attribute access like ``pulsar.Client`` works
-  once the leaf module is imported.
-  """
-  parts = module_dotted.split(".")
-  attrs = attrs or {}
-  for i in range(1, len(parts) + 1):
-    name = ".".join(parts[:i])
-    if name not in sys.modules:
-      mod = types.ModuleType(name)
-      sys.modules[name] = mod
-  leaf = sys.modules[module_dotted]
-  for k, v in attrs.items():
-    setattr(leaf, k, v)
-
-
-_ensure_sdk_stub("pulsar", {"Client": MagicMock(name="PulsarClient")})
-# Later SQS/DynamoDB test modules use ``sys.modules.setdefault`` during
-# collection and patch these canonical attributes. An attribute-less stub here
-# survived into those modules and made their tests order-dependent. Keep the
-# optional-dependency stub, but expose the same surface they patch.
-_ensure_sdk_stub(
-  "boto3",
-  {
-    "client": MagicMock(name="boto3.client"),
-    "resource": MagicMock(name="boto3.resource"),
-    "session": types.SimpleNamespace(
-      Session=MagicMock(name="boto3.session.Session")
-    ),
-  },
-)
-_ensure_sdk_stub("pymemcache")
-_ensure_sdk_stub("pymemcache.client")
-_ensure_sdk_stub("pymemcache.client.base", {"Client": MagicMock(name="MemcachedClient")})
-# NOTE: rocketmq-python-client (apache 5.1.1, pure-Python gRPC) is in the test
-# dependency group, so no stub is needed — and stubbing it would shadow the
-# real top-level surface (Producer / SimpleConsumer / Message /
-# ClientConfiguration / Credentials) that backends/rocketmq.py imports.
-
 
 # Expected concrete class name per BackendType. Asserting ``type(backend).__name__``
 # (in addition to ``backend.backend_type``) catches a case block wiring the WRONG
@@ -1025,7 +976,7 @@ class TestConnectionManagerCreateBackendAllTypes:
   def test_create_backend_supports_all_backend_types(self, backend_type):
     """Every BackendType must build via _create_backend without ValueError.
 
-    SDKs absent from the test env are stubbed at module top. We only exercise
+    The test dependency group supplies every optional SDK. We only exercise
     construction — connect() is never called (no real services).
     """
     manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})

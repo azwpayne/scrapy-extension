@@ -2,27 +2,12 @@
 
 from __future__ import annotations
 
-import sys
-from unittest.mock import MagicMock
+import boto3
+import pytest
 
-sys.modules.setdefault("boto3", MagicMock())
-import boto3  # noqa: E402
-import pytest  # noqa: E402
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cleanup_sys_modules_mock_boto3():
-  """Pop the module-level ``boto3`` mock after this module's tests finish.
-
-  R14-G flake fix: module-top-level ``sys.modules.setdefault`` pollutes the
-  session for later modules; pop at module teardown.
-  """
-  yield
-  sys.modules.pop("boto3", None)
-
-from scrapy_extension.backends.sqs import SqsBackend  # noqa: E402
-from scrapy_extension.exceptions import ConfigurationError, QueueError  # noqa: E402
-from scrapy_extension.settings import SqsSettings  # noqa: E402
+from scrapy_extension.backends.sqs import SqsBackend
+from scrapy_extension.exceptions import ConfigurationError, QueueError
+from scrapy_extension.settings import SqsSettings
 
 
 class _SqsClientError(Exception):

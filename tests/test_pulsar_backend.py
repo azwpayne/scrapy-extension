@@ -1,9 +1,8 @@
-"""Tests for PulsarBackend (subsystem ③) — mocked pulsar-client.
+"""Tests for PulsarBackend (subsystem ③) with mocked network seams.
 
-The real ``pulsar-client`` is a heavy C++ binding; we inject a mock into
-``sys.modules`` before importing the backend so the module-level
-``import pulsar`` succeeds without the dependency installed, and assert call
-patterns against the mock.
+The test dependency group supplies the real binding so enums, exceptions, and
+constructor signatures stay faithful; individual tests patch ``Client`` or
+``AuthenticationToken`` without replacing the SDK module.
 """
 
 from __future__ import annotations
@@ -14,45 +13,25 @@ import traceback
 from threading import Event, Lock, Thread
 from unittest.mock import MagicMock
 
+import pulsar
 import pytest
 
-sys.modules.setdefault("pulsar", MagicMock())
-import pulsar  # noqa: E402 — the mocked module actually in sys.modules
-
-
-class _PulsarTimeout(Exception):
-  """Test double matching ``pulsar.Timeout`` from the C++ client binding."""
-
-
-pulsar.Timeout = _PulsarTimeout
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cleanup_sys_modules_mock_pulsar():
-  """Pop the module-level ``pulsar`` mock after this module's tests finish.
-
-  R14-G flake fix: module-top-level ``sys.modules.setdefault`` pollutes the
-  session for later modules; pop at module teardown.
-  """
-  yield
-  sys.modules.pop("pulsar", None)
-
-from scrapy_extension.backends.base import (  # noqa: E402
+from scrapy_extension.backends.base import (
   BackendType,
   SetBackend,
   StorageBackend,
 )
-from scrapy_extension.backends.pulsar import (  # noqa: E402
+from scrapy_extension.backends.pulsar import (
   PulsarBackend,
   _PulsarAckToken,
 )
-from scrapy_extension.exceptions import (  # noqa: E402
+from scrapy_extension.exceptions import (
   BackendConnectionError,
   ConfigurationError,
   QueueError,
 )
-from scrapy_extension.schedule.scheduler import BackendScheduler  # noqa: E402
-from scrapy_extension.settings import PulsarMode, PulsarSettings  # noqa: E402
+from scrapy_extension.schedule.scheduler import BackendScheduler
+from scrapy_extension.settings import PulsarMode, PulsarSettings
 
 
 def _make_backend(**overrides) -> PulsarBackend:
@@ -1156,6 +1135,28 @@ def test_locked_pulsar_sdk_tls_keyword_contract() -> None:
       "assert 'tls_validate_hostname' in names",
       "assert 'allow_insecure_connection' not in names",
       "assert 'tls_trust_certs_file' not in names",
+    )
+  )
+
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_locked_pulsar_sdk_consumer_type_contract() -> None:
+  """The public Key_Shared setting maps to the real SDK's KeyShared member."""
+  script = "\n".join(
+    (
+      "import pulsar",
+      "from scrapy_extension.backends.pulsar import _consumer_type",
+      "assert hasattr(pulsar.ConsumerType, 'KeyShared')",
+      "assert not hasattr(pulsar.ConsumerType, 'Key_Shared')",
+      "assert _consumer_type('Key_Shared') is pulsar.ConsumerType.KeyShared",
     )
   )
 

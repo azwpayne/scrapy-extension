@@ -198,7 +198,9 @@ def _consumer_type(value: str) -> Any:
     "Shared": getattr(pulsar.ConsumerType, "Shared", None),
     "Failover": getattr(pulsar.ConsumerType, "Failover", None),
     "Exclusive": getattr(pulsar.ConsumerType, "Exclusive", None),
-    "Key_Shared": getattr(pulsar.ConsumerType, "Key_Shared", None),
+    # The public setting follows Pulsar's documented subscription spelling,
+    # while every supported Python binding exposes the enum as ``KeyShared``.
+    "Key_Shared": getattr(pulsar.ConsumerType, "KeyShared", None),
   }
   member = mapping.get(value)
   if member is None:
