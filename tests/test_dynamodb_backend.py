@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from typing import Any
@@ -72,6 +73,24 @@ class TestDynamoDBBackendType:
 
 
 class TestDynamoDBConnect:
+  def test_each_generation_ignores_ambient_endpoint_configuration(
+    self, mocker
+  ) -> None:
+    backend = _make_backend()
+    resource = mocker.MagicMock()
+    table = mocker.MagicMock()
+    table.load.return_value = None
+    table.table_status = "ACTIVE"
+    resource.Table.return_value = table
+    _session_factory, resource_factory = _patch_resource(
+      mocker, return_value=resource
+    )
+
+    backend.connect()
+
+    config = resource_factory.call_args.kwargs["config"]
+    assert config.ignore_configured_endpoint_urls is True
+
   def test_unsupported_mode_is_configuration_error(self) -> None:
     b = _make_backend()
     b.config.mode = "unsupported"  # type: ignore[assignment]
@@ -888,3 +907,67 @@ class TestDynamoDBHalfCredentialGuard:
 
     assert exc_info.value.setting_name == "endpoint_url"
     session_factory.assert_not_called()
+
+  @pytest.mark.parametrize(
+    "endpoint_source",
+    ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_DYNAMODB", "shared-config"],
+  )
+  def test_cloud_snapshot_ignores_real_boto3_ambient_endpoint(
+    self, endpoint_source: str, tmp_path
+  ) -> None:
+    environment = {
+      name: value
+      for name, value in os.environ.items()
+      if not name.upper().startswith("AWS_")
+    }
+    environment.update(
+      {
+        # Prove the per-candidate Config wins over botocore's ambient default.
+        "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "false",
+        "AWS_EC2_METADATA_DISABLED": "true",
+      }
+    )
+    config_file = tmp_path / "aws-config"
+    config_content = "[default]\nregion = us-east-1\n"
+    if endpoint_source == "shared-config":
+      config_content += "endpoint_url = http://ambient.invalid:4566\n"
+    else:
+      environment[endpoint_source] = "http://ambient.invalid:4566"
+    config_file.write_text(config_content, encoding="utf-8")
+    credentials_file = tmp_path / "aws-credentials"
+    credentials_file.write_text("", encoding="utf-8")
+    environment["AWS_CONFIG_FILE"] = str(config_file)
+    environment["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials_file)
+
+    script = "\n".join(
+      (
+        "import boto3",
+        "from scrapy_extension.backends.dynamodb import DynamoDBBackend",
+        "from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings",
+        "settings = DynamoDBSettings(",
+        "  mode=DynamoDBMode.CLOUD,",
+        "  aws_access_key_id='test-key',",
+        "  aws_secret_access_key='test-secret',",
+        ")",
+        "backend = DynamoDBBackend(settings)",
+        "_snapshot, kwargs = backend._capture_connection_snapshot()",
+        "resource = boto3.session.Session().resource('dynamodb', **kwargs)",
+        "try:",
+        "  endpoint = resource.meta.client.meta.endpoint_url",
+        "  assert endpoint.startswith('https://'), endpoint",
+        "  assert 'ambient.invalid' not in endpoint, endpoint",
+        "finally:",
+        "  resource.meta.client.close()",
+      )
+    )
+
+    result = subprocess.run(
+      [sys.executable, "-c", script],
+      capture_output=True,
+      text=True,
+      check=False,
+      timeout=10,
+      env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr

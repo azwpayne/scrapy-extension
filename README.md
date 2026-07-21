@@ -371,6 +371,12 @@ instance. Disconnect drains an admitted operation, then closes that
 generation's botocore client. Paginated clears and lazy TTL cleanup remain on
 their issuing table generation.
 
+Region and custom endpoint URLs are authoritative backend settings. Ambient
+`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_DYNAMODB`, and shared-config custom
+endpoints are ignored, so they cannot redirect cloud mode around its HTTPS
+guard. Botocore's credential provider chain and normal FIPS/dual-stack endpoint
+selection are unchanged.
+
 `clear_storage()` uses explicit batches of at most 25 deletes. A batch gets at
 most eight application-level BatchWriteItem submissions; only a structurally
 valid `UnprocessedItems` subset is retried with full-jitter backoff. Botocore's

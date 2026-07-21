@@ -28,6 +28,7 @@ from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
   import boto3
+  from botocore.config import Config as BotoConfig
 except ImportError as e:
   if not _is_missing_optional_dependency(e, "boto3"):
     raise
@@ -232,7 +233,13 @@ class DynamoDBBackend(Backend, StorageBackend):
       region_name=region_name,
       endpoint_url=endpoint_url,
     )
-    kwargs: dict[str, Any] = {"region_name": region_name}
+    kwargs: dict[str, Any] = {
+      "region_name": region_name,
+      # The endpoint policy belongs to this validated snapshot. Ignore
+      # AWS_ENDPOINT_URL[_DYNAMODB] and shared-config endpoint overrides so an
+      # ambient HTTP URL cannot bypass the cloud-mode transport guard.
+      "config": BotoConfig(ignore_configured_endpoint_urls=True),
+    }
     if endpoint_url is not None:
       kwargs["endpoint_url"] = endpoint_url
     if key_id is not None and secret is not None:

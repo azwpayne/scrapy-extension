@@ -350,6 +350,11 @@ instance only: DynamoDB Scan does not provide snapshot isolation across other
 processes or clients, so clear remains a best-effort maintenance operation under
 external concurrent writes.
 
+Custom DynamoDB endpoints must be set through the backend's validated endpoint
+setting. Botocore environment variables (`AWS_ENDPOINT_URL` and
+`AWS_ENDPOINT_URL_DYNAMODB`) and shared-config custom endpoints are ignored;
+cloud mode therefore cannot be silently redirected to an ambient HTTP target.
+
 For a deterministic DynamoDB maintenance clear, first quiesce every external
 writer, then call `clear_storage()`, and resume writers only after it succeeds.
 The backend sends at most 25 deletes per request and gives each physical batch

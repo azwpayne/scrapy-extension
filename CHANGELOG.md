@@ -153,6 +153,12 @@ upgrading.
   calls are serialized, and paginated clear plus lazy TTL cleanup stay on their
   issuing table. Settings mutations take effect only after an explicit
   `disconnect()` / `connect()`.
+- **DynamoDB ambient custom endpoint URLs are now ignored.**
+  Every private Resource receives botocore's
+  `ignore_configured_endpoint_urls` guard. Ambient `AWS_ENDPOINT_URL`,
+  `AWS_ENDPOINT_URL_DYNAMODB`, and shared-config custom endpoints can no longer
+  bypass cloud-mode HTTPS validation; the normal credential provider chain and
+  FIPS/dual-stack endpoint selection remain available.
 - **DynamoDB clear now reports a bounded, non-transactional outcome.** The
   boto3 `BatchWriter` could retry persistent `UnprocessedItems` forever in a
   hot loop while blocking every storage operation and disconnect. Clear now

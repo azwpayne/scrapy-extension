@@ -209,6 +209,9 @@ speculative work.
   endpoint and credential fields at connect time and use one captured set of
   connection values, so construction-time mutation and validation/use races
   cannot select an unvalidated identity or endpoint. Sanitize endpoint failures.
+- [x] **SEC-03A2 — DynamoDB ambient endpoint isolation.** Make each private
+  Resource ignore botocore environment/shared-config endpoint overrides so
+  cloud HTTPS policy cannot be bypassed outside the validated snapshot.
 - [x] **SEC-03B1 — Redis validated connection snapshots.** Capture every
   connection-used value before SDK construction, revalidate TLS after settings
   mutation, repr-redact credentials, and suppress raw startup trace text.
@@ -1404,3 +1407,30 @@ workers. The full Python 3.10 and 3.14 suites each passed 3,368 tests with 46
 documented skips. Ruff, strict mypy, Bandit, lockfile validation, dependency
 audit, and patch integrity remained green. Five independent post-implementation
 reviews found no remaining reproducible P0/P1/P2 in the I38 scope.
+
+### I39 — DynamoDB ambient endpoint isolation
+
+Eight read-only audits re-ranked the remaining backend, lifecycle, security,
+SDK, and release risks. The selected atomic task closes a narrow transport
+policy gap before the larger Redis/Kafka/RocketMQ/MongoDB/Elasticsearch
+generation changes: a cloud DynamoDB snapshot with no explicit endpoint still
+allowed botocore to consume `AWS_ENDPOINT_URL_DYNAMODB`, `AWS_ENDPOINT_URL`, or
+a shared-config service endpoint after package validation had completed.
+
+Four REDs proved the boundary at both seams. The mocked private Resource call
+received no botocore Config, and hermetic real-boto3 subprocesses resolved the
+global environment variable, service-specific environment variable, and a
+shared-config endpoint to an attacker-controlled HTTP target. Every Resource
+candidate now receives `BotoConfig(ignore_configured_endpoint_urls=True)`, so
+only the validated backend endpoint can customize routing. Ambient credential
+providers and standard botocore FIPS/dual-stack endpoint selection remain
+available; only ambient custom endpoint routing is isolated.
+
+Post-implementation review found no production P0/P1 defect. It did catch a
+fixed-hostname assertion and inherited AWS process state in the subprocess
+test; the final regression removes every unrelated `AWS_*` variable, disables
+metadata access, installs an explicit negative control, and asserts only the
+actual security contract: HTTPS and rejection of the poisoned host. All 179
+focused DynamoDB tests passed. The full Python 3.10 and 3.14 suites each passed
+3,372 tests with 46 documented skips. Ruff, strict mypy, Bandit, lockfile
+validation, dependency audit, and patch integrity remained green.

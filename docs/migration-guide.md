@@ -420,6 +420,12 @@ in-flight operation per generation. Disconnect drains that call and closes the
 underlying botocore client. Local clear/store ordering is now linearized, but
 DynamoDB Scan still has no cross-process snapshot isolation.
 
+DynamoDB custom endpoints must now be configured with
+`SCRAPY_DYNAMODB_ENDPOINT_URL`. The backend intentionally ignores
+`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_DYNAMODB`, and shared-config custom
+endpoints so an ambient URL cannot bypass cloud-mode transport validation.
+Ambient credentials continue to work; only endpoint routing is isolated.
+
 DynamoDB clear no longer delegates persistent `UnprocessedItems` to boto3's
 unbounded `BatchWriter` exit loop. Each 25-item batch now has eight
 application-level BatchWriteItem submissions and bounded full-jitter sleeps. A
