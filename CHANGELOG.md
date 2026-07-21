@@ -87,7 +87,8 @@ upgrading.
 - **RocketMQ acknowledgement tokens now have one terminal outcome.** Concurrent
   ack/nack calls for the same delivery are serialized across the broker RPC, so
   only one can succeed. A failed broker call restores the token to a retryable
-  state instead of consuming it locally.
+  local state instead of consuming it locally. Token-aware pops no longer also
+  populate the legacy last-delivery slot, which could bypass this state machine.
 - **MongoDB mutations now require an acknowledged write concern.** `w=0`,
   negative or boolean values, and unsupported write-concern strings fail at
   settings construction and again before client I/O. Supported values are a

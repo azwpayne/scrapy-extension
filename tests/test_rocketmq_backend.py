@@ -870,6 +870,21 @@ def test_pop_with_ack_returns_body_and_token_no_ack(mocker) -> None:
   mock_consumer.ack.assert_not_called()
 
 
+def test_token_pop_cannot_be_settled_through_legacy_slot(mocker) -> None:
+  backend, _, consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  consumer.receive.return_value = [message]
+
+  _body, token = backend.pop_with_ack("q")
+  backend.ack("q", token=None)
+  backend.nack("q", token=token)
+
+  assert backend._last_msg is None
+  assert backend._last_delivery is None
+  consumer.ack.assert_not_called()
+  consumer.change_invisible_duration.assert_called_once_with(message, 10)
+
+
 def test_pop_with_ack_empty_returns_none_none(mocker) -> None:
   """pop_with_ack on an empty queue returns (None, None)."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
@@ -939,24 +954,30 @@ def test_ack_and_nack_for_same_token_are_serialized(mocker) -> None:
   _body, token = backend.pop_with_ack("q")
   ack_entered = threading.Event()
   release_ack = threading.Event()
+  nack_started = threading.Event()
   errors: list[BaseException] = []
 
   def blocking_ack(_message) -> None:
     ack_entered.set()
     assert release_ack.wait(timeout=2.0)
 
-  def settle(operation) -> None:
+  def settle(operation, started=None) -> None:
+    if started is not None:
+      started.set()
     try:
       operation("q", token=token)
     except BaseException as error:  # pragma: no cover - assertion aid
       errors.append(error)
 
   consumer.ack.side_effect = blocking_ack
-  ack_thread = threading.Thread(target=settle, args=(backend.ack,))
-  nack_thread = threading.Thread(target=settle, args=(backend.nack,))
+  ack_thread = threading.Thread(target=settle, args=(backend.ack, None))
+  nack_thread = threading.Thread(
+    target=settle, args=(backend.nack, nack_started)
+  )
   ack_thread.start()
   assert ack_entered.wait(timeout=2.0)
   nack_thread.start()
+  assert nack_started.wait(timeout=2.0)
   nack_thread.join(timeout=0.2)
   settlement_was_serialized = nack_thread.is_alive()
   release_ack.set()

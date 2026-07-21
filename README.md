@@ -245,7 +245,8 @@ usually unreachable from the host.
 > maximum expected pop-to-downloader-response time. Explicit nack shortens the
 > lease to RocketMQ's 10-second minimum.
 > A delivery token has one terminal outcome: concurrent ack/nack calls are
-> serialized, and only a failed broker RPC leaves the token retryable.
+> serialized, token-aware pops cannot be settled through the legacy slot, and
+> only a failed broker RPC leaves the token locally retryable.
 
 ### Pulsar (standalone, cluster)
 

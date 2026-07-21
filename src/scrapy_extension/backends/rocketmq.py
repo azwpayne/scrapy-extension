@@ -458,7 +458,8 @@ class RocketMQBackend(Backend, QueueBackend):
   ) -> tuple[bytes | None, Any | None]:
     """Pop an item together with a consumer-generation-scoped ack token.
 
-    Does NOT ack — the caller acks via :meth:`ack` after processing.
+    Does NOT ack or populate the legacy single-delivery slot — the caller acks
+    only through the returned token via :meth:`ack` after processing.
     :class:`BackendScheduler` threads the opaque token through
     ``request.meta["_backend_ack_token"]``.
 
@@ -475,8 +476,6 @@ class RocketMQBackend(Backend, QueueBackend):
     msg, consumer, generation = self._receive_delivery(queue_name, timeout)
     if msg is None:
       return (None, None)
-    self._last_msg = msg
-    self._last_delivery = (consumer, generation, msg)
     token = _RocketMQAckToken(msg, consumer, generation)
     return (self._extract_body(msg), token)
 

@@ -269,7 +269,8 @@ speculative work.
   physical resources while preserving already-valid legacy names.
 - [x] **CONCURRENCY-01A — RocketMQ token terminality.** Serialize settlement on
   each delivery token so concurrent ack/nack can issue only one successful
-  broker action, while a failed RPC restores retryability.
+  broker action, keep token-aware pops out of the legacy settlement slot, and
+  restore local retryability after a failed RPC.
 - [ ] **CONCURRENCY-01B — SQS client generations.** Bind the SDK client, queue
   URL and lifecycle caches, and issued receipt tokens to one generation; make
   disconnect a continuous barrier rather than a short per-queue pulse.
@@ -1060,3 +1061,19 @@ the legacy slot only after a successful terminal action. All 502 related tests
 passed on Python 3.10 and 3.14 with three real-broker tests explicitly skipped;
 the full Python 3.10 suite passed 3,212 tests with 46 documented skips. Ruff,
 strict mypy, and patch integrity remained green.
+
+### I30b — RocketMQ token and legacy settlement isolation
+
+The post-I30 fan-out found a second deterministic RED path: `pop_with_ack()`
+published the same delivery into both its locked token and the unlocked legacy
+last-message slot. A caller could therefore ack through `token=None` and then
+nack the still-pending token, issuing two contradictory broker actions despite
+the token state machine.
+
+Only legacy `pop()` now publishes the legacy slot. Token-aware pop returns its
+delivery exclusively through the token, matching the Kafka, RabbitMQ, Pulsar,
+and SQS scheduler path. The concurrency regression also waits until the
+competing thread has actually started before using liveness as lock evidence.
+All 503 related tests passed on Python 3.10 and 3.14 with three real-broker tests
+explicitly skipped; the full Python 3.10 suite passed 3,213 tests with 46
+documented skips. Ruff, strict mypy, and patch integrity remained green.

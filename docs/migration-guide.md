@@ -313,8 +313,10 @@ target queue.
 
 RocketMQ delivery tokens now serialize ack and nack across the broker call.
 After either action succeeds, every later settlement for that token is a no-op;
-if the client call raises, the token remains pending and may be retried. Direct
-callers must not interpret a concurrent no-op as a second broker outcome.
+if the client call raises, the token remains locally pending and may be retried.
+`pop_with_ack()` no longer populates the legacy `pop()`/`ack(token=None)` slot,
+so callers must retain its returned token. Direct callers must not interpret a
+concurrent no-op as a second broker outcome.
 
 SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
 after PurgeQueue returns. AWS documents that the asynchronous purge can delete
