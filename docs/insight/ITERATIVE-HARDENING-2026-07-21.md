@@ -267,6 +267,27 @@ speculative work.
 - [ ] **BACKEND-08B — broker-safe logical queue names.** Map supported logical
   names such as `q:{spider}` and overlong values to stable Kafka/RocketMQ
   physical resources while preserving already-valid legacy names.
+- [x] **CONCURRENCY-01A — RocketMQ token terminality.** Serialize settlement on
+  each delivery token so concurrent ack/nack can issue only one successful
+  broker action, while a failed RPC restores retryability.
+- [ ] **CONCURRENCY-01B — SQS client generations.** Bind the SDK client, queue
+  URL and lifecycle caches, and issued receipt tokens to one generation; make
+  disconnect a continuous barrier rather than a short per-queue pulse.
+- [ ] **CONCURRENCY-01C — RabbitMQ connection generations.** Keep candidates
+  private, make live connect idempotent, preserve a healthy session after a
+  failed candidate, and retire old unacknowledged deliveries through close.
+- [ ] **CONCURRENCY-01D — DynamoDB table generations.** Publish resource/table
+  handles together, serialize the non-thread-safe boto3 Resource API, and keep
+  every multi-page or lazy-TTL operation on one generation.
+- [ ] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
+  all SDK handles to a leased generation so clear and blocking-pop loops cannot
+  cross reconnect or lazily resurrect themselves after disconnect.
+- [ ] **CONCURRENCY-01F — Kafka client generations.** Publish producer, admin,
+  consumer, validated settings, and topic-policy caches as one generation;
+  failed candidates must not clear a healthy generation.
+- [ ] **CONCURRENCY-01G — RocketMQ client generations.** Publish producer,
+  consumer, validated settings, and subscription cache as one generation so a
+  replacement consumer cannot inherit a stale subscribed-topic hit.
 - [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
@@ -1022,3 +1043,20 @@ explicitly. A real-service integration regression covers depth before the first
 poll. All 474 related tests passed on Python 3.10 and 3.14 with three broker
 tests explicitly skipped; the full Python 3.10 suite passed 3,210 tests with 46
 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I30 — RocketMQ single-outcome delivery settlement
+
+One deterministic RED barrier held an acknowledgement RPC open while a nack
+for the same delivery completed concurrently. Both terminal broker actions
+were issued because the token exposed only an unlocked completed flag set after
+the RPC returned.
+
+RocketMQ delivery tokens now own a settlement lock and explicit pending,
+settling, terminal, and stale states. The lock covers the broker call, so a
+competing ack or nack observes either the successful terminal state or the
+restored pending state after an exception; it can never overlap an uncertain
+settlement. Token-aware ack/nack retain the existing generation fence and clear
+the legacy slot only after a successful terminal action. All 502 related tests
+passed on Python 3.10 and 3.14 with three real-broker tests explicitly skipped;
+the full Python 3.10 suite passed 3,212 tests with 46 documented skips. Ruff,
+strict mypy, and patch integrity remained green.

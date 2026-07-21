@@ -932,6 +932,61 @@ def test_ack_token_is_idempotent(mocker) -> None:
   consumer.change_invisible_duration.assert_not_called()
 
 
+def test_ack_and_nack_for_same_token_are_serialized(mocker) -> None:
+  backend, _, consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  consumer.receive.return_value = [message]
+  _body, token = backend.pop_with_ack("q")
+  ack_entered = threading.Event()
+  release_ack = threading.Event()
+  errors: list[BaseException] = []
+
+  def blocking_ack(_message) -> None:
+    ack_entered.set()
+    assert release_ack.wait(timeout=2.0)
+
+  def settle(operation) -> None:
+    try:
+      operation("q", token=token)
+    except BaseException as error:  # pragma: no cover - assertion aid
+      errors.append(error)
+
+  consumer.ack.side_effect = blocking_ack
+  ack_thread = threading.Thread(target=settle, args=(backend.ack,))
+  nack_thread = threading.Thread(target=settle, args=(backend.nack,))
+  ack_thread.start()
+  assert ack_entered.wait(timeout=2.0)
+  nack_thread.start()
+  nack_thread.join(timeout=0.2)
+  settlement_was_serialized = nack_thread.is_alive()
+  release_ack.set()
+  ack_thread.join(timeout=2.0)
+  nack_thread.join(timeout=2.0)
+
+  assert settlement_was_serialized
+  assert not ack_thread.is_alive()
+  assert not nack_thread.is_alive()
+  assert errors == []
+  consumer.ack.assert_called_once_with(message)
+  consumer.change_invisible_duration.assert_not_called()
+
+
+def test_failed_token_settlement_remains_retryable(mocker) -> None:
+  backend, _, consumer, _ = _make_connected_backend(mocker)
+  message = mocker.MagicMock(body=b"x")
+  consumer.receive.return_value = [message]
+  consumer.ack.side_effect = [RuntimeError("ack failed"), None]
+  _body, token = backend.pop_with_ack("q")
+
+  with pytest.raises(QueueError):
+    backend.ack("q", token=token)
+  backend.ack("q", token=token)
+  backend.nack("q", token=token)
+
+  assert consumer.ack.call_count == 2
+  consumer.change_invisible_duration.assert_not_called()
+
+
 def test_stale_token_does_not_ack_replacement_consumer(mocker) -> None:
   backend, _, old_consumer, _ = _make_connected_backend(mocker)
   message = mocker.MagicMock(body=b"x")

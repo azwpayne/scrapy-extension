@@ -94,7 +94,7 @@ release.
 | RabbitMQ | Yes | No | No | Stable — queue-only | Priority queues; per-message channel-generation tokens; mandatory synchronous publisher confirms. HA policy remains operator-managed. |
 | Pulsar | Yes | No | No | Stable — queue-only | Topic-bound concurrent ack tokens. Queue depth and purge require an admin API and are unsupported here. |
 | SQS | Yes | No | No | Stable — queue-only | Standard queues; LocalStack + AWS; per-message receipt tokens; approximate depth; finite visibility lease without auto-renewal. |
-| RocketMQ | Yes | Guard | Guard | Stable — queue-only | gRPC proxy (`--enable-proxy`, port 8081); per-message deferred ack; finite invisibility lease; queue depth unsupported; `priority`/`work_stealing` rejected. |
+| RocketMQ | Yes | Guard | Guard | Stable — queue-only | gRPC proxy (`--enable-proxy`, port 8081); single-outcome per-message deferred ack; finite invisibility lease; queue depth unsupported; `priority`/`work_stealing` rejected. |
 | DynamoDB | No | No | Yes | Stable — storage-only | KV+TTL; LocalStack + AWS. |
 | Memcached | No | No | Yes | **Experimental** | KV+TTL (storage-only); single-socket operations are serialized and mutations await server replies; TTL introspection and prefix clear unsupported; server-wide clear requires generation-scoped `allow_flush_all`; remote plaintext requires explicit `allow_remote_plaintext`. **Supply-chain caveat:** the supported `pymemcache>=4,<5` range currently resolves to the unmaintained 4.0.0 release. |
 

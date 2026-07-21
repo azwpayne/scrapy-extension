@@ -244,6 +244,8 @@ usually unreachable from the host.
 > The lease is not auto-renewed: configure `INVISIBLE_DURATION` above the
 > maximum expected pop-to-downloader-response time. Explicit nack shortens the
 > lease to RocketMQ's 10-second minimum.
+> A delivery token has one terminal outcome: concurrent ack/nack calls are
+> serialized, and only a failed broker RPC leaves the token retryable.
 
 ### Pulsar (standalone, cluster)
 

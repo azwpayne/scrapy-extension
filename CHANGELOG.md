@@ -84,6 +84,10 @@ upgrading.
   `auto_offset_reset`: `earliest` sees existing records, `latest` begins at the
   end, and `none` raises instead of faking an empty queue. Depth metadata calls
   are serialized with poll/ack/nack on the non-thread-safe consumer.
+- **RocketMQ acknowledgement tokens now have one terminal outcome.** Concurrent
+  ack/nack calls for the same delivery are serialized across the broker RPC, so
+  only one can succeed. A failed broker call restores the token to a retryable
+  state instead of consuming it locally.
 - **MongoDB mutations now require an acknowledged write concern.** `w=0`,
   negative or boolean values, and unsupported write-concern strings fail at
   settings construction and again before client I/O. Supported values are a

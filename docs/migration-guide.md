@@ -311,6 +311,11 @@ worker's deliveries, disconnect, wait for the broker to requeue them, reconnect,
 and then retry clear. A pending delivery on another queue does not block the
 target queue.
 
+RocketMQ delivery tokens now serialize ack and nack across the broker call.
+After either action succeeds, every later settlement for that token is a no-op;
+if the client call raises, the token remains pending and may be retried. Direct
+callers must not interpret a concurrent no-op as a second broker outcome.
+
 SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
 after PurgeQueue returns. AWS documents that the asynchronous purge can delete
 messages sent during that interval, so returning earlier was not a safe clear

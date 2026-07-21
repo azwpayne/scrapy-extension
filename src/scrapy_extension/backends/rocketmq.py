@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -68,13 +69,36 @@ _MIN_INVISIBLE_DURATION = 10
 class _RocketMQAckToken:
   """Consumer-generation-scoped token for one RocketMQ delivery."""
 
-  __slots__ = ("_completed", "consumer", "generation", "message")
+  __slots__ = (
+    "_settlement_lock",
+    "_settlement_state",
+    "consumer",
+    "generation",
+    "message",
+  )
 
   def __init__(self, message: Any, consumer: Any, generation: int) -> None:
     self.message = message
     self.consumer = consumer
     self.generation = generation
-    self._completed = False
+    self._settlement_lock = threading.Lock()
+    self._settlement_state = "pending"
+
+  def _settle(
+    self, terminal_state: str, operation: Callable[[], None]
+  ) -> bool:
+    """Run one broker settlement, restoring retryability on failure."""
+    with self._settlement_lock:
+      if self._settlement_state != "pending":
+        return False
+      self._settlement_state = "settling"
+      completed = False
+      try:
+        operation()
+        completed = True
+      finally:
+        self._settlement_state = terminal_state if completed else "pending"
+      return True
 
 
 class RocketMQBackend(Backend, QueueBackend):
@@ -494,18 +518,29 @@ class RocketMQBackend(Backend, QueueBackend):
       QueueError: If the underlying ack call fails.
     """
     del queue_name
-    token_obj: _RocketMQAckToken | None = None
     if token is not None:
-      if not isinstance(token, _RocketMQAckToken) or token._completed:
+      if not isinstance(token, _RocketMQAckToken):
         return
       if (
         token.generation != self._consumer_generation
         or token.consumer is not self._consumer
       ):
+        token._settle("stale", lambda: None)
         return
-      token_obj = token
       target = token.message
       consumer = token.consumer
+
+      def acknowledge() -> None:
+        try:
+          consumer.ack(target)
+        except Exception as e:
+          msg = f"Failed to ack RocketMQ message: {e}"
+          raise QueueError(msg, operation="ack") from e
+
+      if token._settle("acked", acknowledge) and self._last_msg is target:
+        self._last_msg = None
+        self._last_delivery = None
+      return
     else:
       target = self._last_msg
       if target is None:
@@ -528,8 +563,6 @@ class RocketMQBackend(Backend, QueueBackend):
       msg = f"Failed to ack RocketMQ message: {e}"
       raise QueueError(msg, operation="ack") from e
     else:
-      if token_obj is not None:
-        token_obj._completed = True
       # Clear the legacy slot when we acked the tracked message so a later
       # ack(token=None) is a no-op, not a re-ack.
       if self._last_msg is target:
@@ -553,18 +586,31 @@ class RocketMQBackend(Backend, QueueBackend):
       QueueError: If changing the message lease fails.
     """
     del queue_name
-    token_obj: _RocketMQAckToken | None = None
     if token is not None:
-      if not isinstance(token, _RocketMQAckToken) or token._completed:
+      if not isinstance(token, _RocketMQAckToken):
         return
       if (
         token.generation != self._consumer_generation
         or token.consumer is not self._consumer
       ):
+        token._settle("stale", lambda: None)
         return
-      token_obj = token
       target = token.message
       consumer = token.consumer
+
+      def change_invisible_duration() -> None:
+        try:
+          consumer.change_invisible_duration(
+            target, _MIN_INVISIBLE_DURATION
+          )
+        except Exception as e:
+          msg = f"Failed to nack RocketMQ message: {e}"
+          raise QueueError(msg, operation="nack") from e
+
+      if token._settle("nacked", change_invisible_duration) and self._last_msg is target:
+        self._last_msg = None
+        self._last_delivery = None
+      return
     else:
       target = self._last_msg
       if target is None:
@@ -589,8 +635,6 @@ class RocketMQBackend(Backend, QueueBackend):
       msg = f"Failed to nack RocketMQ message: {e}"
       raise QueueError(msg, operation="nack") from e
     else:
-      if token_obj is not None:
-        token_obj._completed = True
       if self._last_msg is target:
         self._last_msg = None
         self._last_delivery = None
