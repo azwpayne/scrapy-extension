@@ -171,7 +171,7 @@ speculative work.
   source token for requests and iterables returned by user errbacks until each
   replacement is durably accepted. Explicitly document the unavoidable
   publish/ack crash gap and define safe behavior for delayed local strategies.
-- [ ] **RUN-04C — durable replacement strategies and snapshots.** Do not ACK a
+- [x] **RUN-04C — durable replacement strategies and snapshots.** Do not ACK a
   token-bearing source after its replacement has only entered an in-process
   delay, time-wheel, round-robin, or ring buffer. Preserve recovery snapshots
   until a later clean checkpoint so a crash during restore is replay-safe.
@@ -609,3 +609,20 @@ loss of both copies. All eleven regressions passed on Python 3.10 and 3.14, 325
 related queue/strategy/scheduler tests passed, and the full suite passed 3,023
 tests with 44 documented skips. Ruff, strict mypy, and patch integrity remained
 green.
+
+### I14c — replay-safe recovery checkpoints
+
+One stateful-storage RED regression simulated a hard crash immediately after a
+successful strategy restore. The eager delete removed the only persisted copy,
+so the next process started without the still-unprocessed local queue state.
+Existing tests also encoded that unsafe deletion as expected behavior.
+
+Restore now leaves the prior checkpoint intact. A later clean close overwrites
+it with the strategy's current state or deletes it only after the strategy has
+cleanly drained. If a process dies between restore and that checkpoint,
+already-completed entries can replay but pending entries cannot disappear.
+This is the deliberate at-least-once side of the snapshot contract; stable
+per-worker ownership remains required to prevent two live workers from sharing
+one checkpoint. The exact regression passed on Python 3.10 and 3.14, all 310
+snapshot/queue/strategy tests passed, and the full suite passed 3,024 tests with
+44 documented skips. Ruff, strict mypy, and patch integrity remained green.

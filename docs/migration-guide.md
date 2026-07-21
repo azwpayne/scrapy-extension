@@ -156,9 +156,11 @@ Enabling an owner does not consume or delete the old unowned snapshot. Decide
 while workers are stopped whether to restore the old state once, transform it
 to the owner-specific key, or discard it.
 
-A successful restore deletes the consumed snapshot and a later clean close
-writes current state again. Deletion is best-effort: alert on an error because
-a crash before the next successful close can replay the stale snapshot.
+A successful restore retains its checkpoint until a later clean close writes
+the current state or deletes the key after a clean drain. A crash during that
+interval replays the prior checkpoint: completed work can repeat, but pending
+work is not lost. Keep callbacks idempotent and alert on checkpoint store/delete
+failures, which extend the duplicate-replay window.
 
 ## TTL Contract
 

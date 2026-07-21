@@ -103,9 +103,11 @@ upgrading.
   the existing spider+queue key remains for single-worker compatibility. Setting
   `SCRAPY_QUEUE_SNAPSHOT_OWNER` (or the `SCRAPY_QUEUE_WORKER_ID` fallback)
   selects a length-prefixed v2 key so same-spider workers cannot overwrite one
-  another. A successfully restored snapshot is now consumed/deleted and is
-  rewritten only on the next clean close, preventing stale replay after a later
-  crash. Enabling an owner intentionally leaves the old unowned key untouched;
+  another. A restored checkpoint now remains available until the next clean
+  close replaces it with current state or deletes it after a clean drain. This
+  makes a crash during recovery at-least-once: completed entries may replay,
+  but pending entries cannot disappear with an eagerly deleted checkpoint.
+  Enabling an owner intentionally leaves the old unowned key untouched;
   migrate or discard it explicitly.
 - **RocketMQ backend rewritten against apache `rocketmq-python-client` 5.1.1 gRPC** (#15/#44).
   The prior backend's `connect()` imported fictional API paths

@@ -249,6 +249,16 @@ def _storage_mock(retrieve_return=None):
   return storage
 
 
+def _stateful_storage(initial: dict[str, bytes]):
+  """Storage mock whose retrieve/store/delete calls mutate shared state."""
+  state = dict(initial)
+  storage = MagicMock(name="StatefulStorageBackend")
+  storage.retrieve.side_effect = lambda key: state.get(key)
+  storage.store.side_effect = lambda key, value: state.__setitem__(key, value)
+  storage.delete.side_effect = lambda key: state.pop(key, None)
+  return storage, state
+
+
 def _wired_cm(storage=None, queue_backend=None):
   cm = MagicMock(name="ConnectionManager")
   cm.get_storage_backend.return_value = storage if storage is not None else _storage_mock()
@@ -517,7 +527,43 @@ def test_backends_queue_init_restores_snapshot():
   assert len(strategy._holding) == 1
   assert strategy._holding[0][2] == b"recovered"
   storage.retrieve.assert_called_once_with(_SNAPSHOT_KEY)
-  storage.delete.assert_called_once_with(_SNAPSHOT_KEY)
+  storage.delete.assert_not_called()
+
+
+def test_restored_snapshot_survives_crash_until_clean_checkpoint():
+  source = _delay(clock_value=100.0)
+  source.push("q", b"recovered", delay=10.0)
+  blob = source.snapshot()
+  assert blob is not None
+  storage, state = _stateful_storage({_SNAPSHOT_KEY: blob})
+  cm = _wired_cm(storage=storage)
+
+  first_strategy = _delay(clock_value=100.0)
+  BackendQueue(
+    connection_manager=cm,
+    queue_name="q",
+    queue_strategy=first_strategy,
+    monitor=MagicMock(),
+  )
+
+  assert len(first_strategy._holding) == 1
+  assert state[_SNAPSHOT_KEY] == blob
+
+  # Simulate a hard crash by constructing a new queue without closing the
+  # first. The same recovery checkpoint must still be available and replayable.
+  second_strategy = _delay(clock_value=100.0)
+  second = BackendQueue(
+    connection_manager=cm,
+    queue_name="q",
+    queue_strategy=second_strategy,
+    monitor=MagicMock(),
+  )
+  assert len(second_strategy._holding) == 1
+
+  # A later clean checkpoint with no remaining state retires the old snapshot.
+  second.clear()
+  second.close()
+  assert _SNAPSHOT_KEY not in state
 
 
 def test_backends_queue_close_deletes_stale_snapshot_when_strategy_is_empty():

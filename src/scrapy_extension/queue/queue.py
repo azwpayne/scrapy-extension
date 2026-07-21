@@ -1107,14 +1107,15 @@ class BackendQueue:
     """Restore the strategy's in-process state on startup (initiative #3).
 
     Loads the snapshot bytes from the storage backend (when storage-capable),
-    passes them to ``strategy.restore()``, then deletes the consumed snapshot.
-    A later clean close writes the strategy's current state again. Consuming
-    after restore prevents a subsequent crash from replaying the same stale
-    startup state indefinitely. Storage-incapable backends
-    (queue-only) and connection managers without ``get_storage_backend`` skip
-    silently. Only real ``bytes``/``bytearray`` are restored — a non-bytes
-    retrieve result (e.g. a mock in tests) is skipped. Best-effort: any
-    failure is logged, never crashes startup.
+    and passes them to ``strategy.restore()``. The checkpoint remains in
+    storage until a later clean close atomically replaces it with the current
+    state (or deletes it after a clean drain). Retaining it makes a crash after
+    restore replay-safe: already-processed entries may repeat, but unprocessed
+    entries cannot disappear with the only checkpoint. Storage-incapable
+    backends (queue-only) and connection managers without
+    ``get_storage_backend`` skip silently. Only real ``bytes``/``bytearray``
+    are restored — a non-bytes retrieve result (e.g. a mock in tests) is
+    skipped. Best-effort: any failure is logged, never crashes startup.
     """
     get_storage = getattr(self.connection_manager, "get_storage_backend", None)
     if get_storage is None:
@@ -1147,14 +1148,5 @@ class BackendQueue:
     except Exception:  # noqa: BLE001 — restore must not crash startup (docstring)
       logger.exception(
         "strategy.restore() raised for queue %r; starting clean.",
-        self.queue_name,
-      )
-      return
-    try:
-      storage.delete(snapshot_key)
-    except Exception:  # noqa: BLE001 — consumed-state cleanup is best effort
-      logger.exception(
-        "Restored strategy snapshot for queue %r but failed to delete the "
-        "consumed state; a crash before the next clean close may replay it.",
         self.queue_name,
       )

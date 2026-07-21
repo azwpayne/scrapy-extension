@@ -147,13 +147,12 @@ def test_restore_snapshot_skips_when_retrieve_raises() -> None:
   )
 
 
-def test_restore_snapshot_delete_failure_does_not_crash_startup() -> None:
-  """A restored snapshot is consumed best-effort; delete failure is logged."""
+def test_restore_snapshot_retains_checkpoint_without_delete() -> None:
+  """A restored checkpoint remains available until a clean close replaces it."""
   source = _delay()
   source.push("q", b"recover", delay=10.0)
   state = source.snapshot()
   storage = _storage(retrieve_return=state)
-  storage.delete.side_effect = RuntimeError("delete boom")
   strategy = _delay()
 
   BackendQueue(
@@ -164,7 +163,7 @@ def test_restore_snapshot_delete_failure_does_not_crash_startup() -> None:
   )
 
   assert len(strategy._holding) == 1
-  storage.delete.assert_called_once_with("queue:snapshot:q")
+  storage.delete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

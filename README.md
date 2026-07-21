@@ -420,8 +420,10 @@ isolate a pop to one strategy-selected topic. Backend-delegating strategies
 snapshots. Persistence is available only when the queue's connection manager
 also exposes storage. In a multi-worker deployment, configure a stable unique
 `SCRAPY_QUEUE_SNAPSHOT_OWNER` per worker; when omitted,
-`SCRAPY_QUEUE_WORKER_ID` is the fallback. Successfully restored snapshots are
-consumed and deleted, then rewritten on the next clean close.
+`SCRAPY_QUEUE_WORKER_ID` is the fallback. A restored checkpoint remains stored
+until the next clean close replaces it with current state or deletes it after a
+clean drain. A crash after restore can therefore replay already-processed
+entries, but cannot lose the only copy of entries not yet processed.
 
 ### Storage strategy — `SCRAPY_STORAGE_STRATEGY`
 
