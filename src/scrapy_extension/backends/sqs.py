@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import logging
 import math
+import re
 from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -63,6 +65,15 @@ logger = logging.getLogger(__name__)
 # SQS caps WaitTimeSeconds at 20.
 _MAX_WAIT_SECONDS = 20
 
+# Standard queue names accept only these characters and at most 80 of them.
+_SQS_QUEUE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+# MessageBody is capped at 1 MiB. This backend base64-encodes the raw bytes;
+# because 1 MiB is divisible by four, the largest encodable input is exactly
+# three quarters of that limit.
+_SQS_MAX_MESSAGE_BODY_BYTES = 1_048_576
+_SQS_MAX_RAW_PAYLOAD_BYTES = 3 * (_SQS_MAX_MESSAGE_BODY_BYTES // 4)
+
 # ``queue_len`` is used as a pending-work signal, so include messages that are
 # temporarily invisible or delayed rather than reporting only immediately
 # receivable messages.
@@ -84,6 +95,20 @@ def _is_queue_missing(exc: BaseException) -> bool:
     return False
   error = response.get("Error")
   return isinstance(error, dict) and error.get("Code") in _QUEUE_MISSING_CODES
+
+
+def _physical_queue_name(prefix: str, queue_name: str) -> str:
+  """Return an unchanged valid SQS name or a stable portable mapping."""
+  candidate = f"{prefix}{queue_name}"
+  if _SQS_QUEUE_NAME_PATTERN.fullmatch(candidate):
+    return candidate
+  digest = hashlib.blake2s(digest_size=16)
+  digest.update(b"scrapy-extension-sqs-v1")
+  for part in (prefix, queue_name):
+    encoded = part.encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+  return f"scrapyext-q-{digest.hexdigest()}"
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
@@ -259,7 +284,7 @@ class SqsBackend(Backend, QueueBackend):
     _validate_key_name(queue_name, "queue_name")
     if queue_name in self._queue_urls:
       return self._queue_urls[queue_name]
-    name = f"{self.config.queue_name_prefix}{queue_name}"
+    name = _physical_queue_name(self.config.queue_name_prefix, queue_name)
     try:
       resp = self._client.get_queue_url(QueueName=name)
     except Exception as lookup_error:
@@ -302,6 +327,20 @@ class SqsBackend(Backend, QueueBackend):
         ValueError: If queue_name contains invalid characters.
     """
     del priority
+    if not item:
+      raise QueueError(
+        "SQS payload must contain at least one raw byte because MessageBody "
+        "cannot be empty.",
+        queue_name=queue_name,
+        operation="push",
+      )
+    if len(item) > _SQS_MAX_RAW_PAYLOAD_BYTES:
+      raise QueueError(
+        "SQS payload exceeds the 786,432 raw bytes that fit after base64 "
+        "encoding within the 1 MiB MessageBody limit.",
+        queue_name=queue_name,
+        operation="push",
+      )
     url = self._queue_url(queue_name, operation="push")
     try:
       body = base64.b64encode(item).decode("ascii")

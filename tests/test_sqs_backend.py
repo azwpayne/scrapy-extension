@@ -126,6 +126,82 @@ class TestSqsPushPop:
     b.push("queue1", b"b")
     client.get_queue_url.assert_called_once_with(QueueName="scrapy-queue1")
 
+  def test_push_maps_colon_logical_name_to_stable_aws_name(self, mocker) -> None:
+    first, first_client = _connected(mocker)
+    first.push("spider:queue", b"payload")
+    physical_name = first_client.get_queue_url.call_args.kwargs["QueueName"]
+
+    assert 1 <= len(physical_name) <= 80
+    assert all(character.isalnum() or character in "-_" for character in physical_name)
+    assert ":" not in physical_name
+
+    second = _make_backend()
+    second_client = mocker.MagicMock()
+    second_client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
+    mocker.patch.object(boto3, "client", return_value=second_client)
+    second.connect()
+    second.push("spider:queue", b"payload")
+
+    second_client.get_queue_url.assert_called_once_with(QueueName=physical_name)
+
+  def test_push_preserves_already_valid_80_character_name(self, mocker) -> None:
+    b = _make_backend(queue_name_prefix="")
+    client = mocker.MagicMock()
+    client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
+    mocker.patch.object(boto3, "client", return_value=client)
+    b.connect()
+    valid_name = "q" * 80
+
+    b.push(valid_name, b"payload")
+
+    client.get_queue_url.assert_called_once_with(QueueName=valid_name)
+
+  def test_push_maps_name_when_prefix_makes_it_too_long(self, mocker) -> None:
+    b = _make_backend(queue_name_prefix="prefix-")
+    client = mocker.MagicMock()
+    client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
+    mocker.patch.object(boto3, "client", return_value=client)
+    b.connect()
+
+    b.push("q" * 80, b"payload")
+
+    physical_name = client.get_queue_url.call_args.kwargs["QueueName"]
+    assert physical_name != f"prefix-{'q' * 80}"
+    assert len(physical_name) <= 80
+    assert all(character.isalnum() or character in "-_" for character in physical_name)
+
+  def test_push_enforces_base64_adjusted_raw_payload_limit(self, mocker) -> None:
+    b, client = _connected(mocker)
+    largest_raw_payload = b"x" * 786_432
+
+    b.push("queue1", largest_raw_payload)
+
+    encoded = client.send_message.call_args.kwargs["MessageBody"]
+    assert len(encoded.encode("ascii")) == 1_048_576
+
+    over_limit = _make_backend()
+    over_limit_client = mocker.MagicMock()
+    mocker.patch.object(boto3, "client", return_value=over_limit_client)
+    over_limit.connect()
+
+    with pytest.raises(QueueError, match="786,432 raw bytes") as exc_info:
+      over_limit.push("queue1", largest_raw_payload + b"x")
+
+    assert exc_info.value.operation == "push"
+    assert exc_info.value.queue_name == "queue1"
+    over_limit_client.get_queue_url.assert_not_called()
+    over_limit_client.send_message.assert_not_called()
+
+  def test_push_rejects_empty_payload_before_io(self, mocker) -> None:
+    b, client = _connected(mocker)
+
+    with pytest.raises(QueueError, match="at least one raw byte") as exc_info:
+      b.push("queue1", b"")
+
+    assert exc_info.value.operation == "push"
+    client.get_queue_url.assert_not_called()
+    client.send_message.assert_not_called()
+
   def test_push_ignores_priority(self, mocker) -> None:
     b, _ = _connected(mocker)
     b.push("queue1", b"x", priority=99.0)

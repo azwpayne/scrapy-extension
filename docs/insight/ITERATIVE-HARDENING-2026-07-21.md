@@ -211,7 +211,7 @@ speculative work.
   Kafka/Pulsar/SQS token settlement one-shot and retryable, and specify honest
   lifecycle barriers for Kafka topic recreation, RabbitMQ in-flight deliveries,
   and SQS's asynchronous purge window.
-- [ ] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
+- [x] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
   message limit before issuing network calls.
@@ -546,3 +546,23 @@ swap values between validation and use in the current attempt. The 22 exact
 regressions passed on Python 3.10 and 3.14, 415 related settings/SQS/DynamoDB
 tests passed, and the full suite passed 3,000 tests with 44 documented skips.
 Ruff, strict mypy, and the patch integrity check remained green.
+
+### I15c — SQS physical names and base64-adjusted payload limits
+
+Three initial RED regressions proved that the mixin's default colon-delimited
+logical name and a prefix-expanded name over 80 characters were passed directly
+to SQS, while a 786,433-byte raw payload reached AWS after expanding beyond the
+MessageBody limit. A fourth compatibility assertion confirmed that an already
+valid 80-character name was unchanged; a final RED regression covered SQS's
+non-empty body minimum. AWS currently permits only alphanumeric, hyphen, and
+underscore queue names up to 80 characters, and MessageBody is capped at 1 MiB:
+[queue quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-queues.html),
+[message quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html).
+
+The backend now preserves a valid `prefix + logical_name` exactly and otherwise
+uses a versioned, length-delimited BLAKE2 mapping whose output is a short valid
+standard-queue name. Empty payloads and raw payloads above 786,432 bytes raise a
+typed `QueueError` with queue/operation context before queue URL resolution or
+send I/O. All five regressions passed on Python 3.10 and 3.14, 268 related
+SQS/spider/fan-out tests passed, and the full suite passed 3,005 tests with 44
+documented skips. Ruff, strict mypy, and patch integrity remained green.
