@@ -105,7 +105,7 @@ speculative work.
 - [x] **PKG-01 — canonical release artifacts.** Move `CHANGELOG.md`,
   `CONTRIBUTING.md`, `LICENSE`, `SECURITY.md`, and `STABILITY.md` back to the
   root; restore all public links; assert wheel/sdist contents and metadata.
-- [ ] **TEST-01 — complete test dependency group.** Add direct test dependencies
+- [x] **TEST-01 — complete test dependency group.** Add direct test dependencies
   for every backend module exercised by public lazy imports; prove the tests pass
   in a fresh synced environment and in an adversarial order.
 - [ ] **TEST-02 — RocketMQ import isolation.** Replace unit-test patching that
@@ -186,3 +186,12 @@ its metadata reports the MIT licence and Python `>=3.10`. A fresh Python 3.10
 environment installed only the built wheel and imported version `0.1.0` from
 `site-packages`. The repository suite then passed with 2,905 tests and 44
 documented skips using an isolated home directory.
+
+### I2 — complete, order-independent test dependencies
+
+The fixed-seed public lazy-import slice first reproduced three failures because
+`boto3` was absent. Added `boto3`, `pulsar-client`, and `pymemcache` to the test
+dependency group with the same constraints as their backend extras and refreshed
+the lockfile. A fresh temporary environment synced with `--locked --group test`,
+exported all three direct requirements, passed the adversarial 114-test slice,
+and passed the full suite with 2,905 tests and 44 documented skips.
