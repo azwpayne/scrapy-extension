@@ -7,7 +7,9 @@ Verifies the lossless round-trip claim made in
       -> request_from_dict``
 
 yields a request equal to the original on method / url / body / priority /
-encoding, with meta keys, cb_kwargs, headers, cookies, and flags preserved.
+encoding, with durable meta keys, cb_kwargs, headers, cookies, and flags
+preserved. Transient scheduler routing/acknowledgement metadata is intentionally
+removed at the persistence boundary.
 
 The body path is the one fixed by the CRITICAL hardening pass: bodies are
 base64-encoded (pure ASCII) before JSON so binary POST bodies round-trip
@@ -25,13 +27,15 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 from scrapy.http import Request
 from scrapy.utils.request import request_from_dict
 
 from scrapy_extension.backends.base import JSONSerializer
-from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.queue import BACKEND_ACK_TOKEN_META_KEY, BackendQueue
+
+_TRANSIENT_META_KEYS = frozenset((BACKEND_ACK_TOKEN_META_KEY, "delay", "source"))
 
 #: Ascii method tokens.
 _methods = st.sampled_from(["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"])
@@ -164,6 +168,22 @@ def queue() -> BackendQueue:
   priority=st.integers(min_value=-(1 << 30), max_value=1 << 30),
   flags=_flags,
 )
+@example(
+  method="GET",
+  url_path="",
+  body=None,
+  headers={},
+  cookies={},
+  meta={
+    "_backend_ack_token": "opaque",
+    "delay": None,
+    "source": "feed-a",
+    "keep": "value",
+  },
+  cb_kwargs={},
+  priority=0,
+  flags=[],
+)
 @settings(
   max_examples=300,
   deadline=None,
@@ -226,8 +246,14 @@ def test_request_serialization_round_trip(
   assert recovered.priority == original.priority
   assert recovered.encoding == original.encoding
 
-  # meta round-trips (keys + values).
-  assert dict(recovered.meta) == dict(original.meta)
+  # Durable meta round-trips. Scheduler routing/ack controls are deliberately
+  # consumed at the persistence boundary and must not reappear after restart.
+  expected_meta = {
+    key: value
+    for key, value in original.meta.items()
+    if key not in _TRANSIENT_META_KEYS
+  }
+  assert dict(recovered.meta) == expected_meta
   # cb_kwargs round-trip.
   assert recovered.cb_kwargs == original.cb_kwargs
   # Flags round-trip.

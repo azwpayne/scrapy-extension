@@ -218,6 +218,11 @@ addopts = [
 ]
 filterwarnings = [
     "error::UserWarning", # 将警告视为错误
+    # itemadapter 0.13.1 imports pydantic.v1 only to recognise legacy item
+    # models. Pydantic emits this warning on 3.14 even when the application
+    # exclusively uses Pydantic v2. Keep the exemption exact by message and
+    # stacklevel-reported importer module; every other UserWarning stays fatal.
+    "ignore:Core Pydantic V1 functionality isn't compatible with Python 3\\.14 or greater\\.:UserWarning:itemadapter\\._imports",
     # xdist disables benchmarks during pytest_configure; keep that one expected
     # plugin warning from becoming an INTERNALERROR. This must follow the broad
     # UserWarning rule because the last matching filter takes precedence.

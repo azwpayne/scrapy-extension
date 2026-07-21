@@ -111,7 +111,7 @@ speculative work.
 - [x] **TEST-02 — RocketMQ import isolation.** Replace unit-test patching that
   imports the real SDK with a controlled module stub. Run the one real SDK
   contract check in a subprocess with a temporary home directory.
-- [ ] **TEST-03 — supported-Python truth.** Correct the Hypothesis expected-meta
+- [x] **TEST-03 — supported-Python truth.** Correct the Hypothesis expected-meta
   oracle for reserved keys. Resolve the exact Python 3.14 itemadapter/Pydantic-v1
   warning without hiding unrelated user warnings.
 - [ ] **COMPAT-01 — Scrapy pipeline hooks.** Accept both legacy explicit-spider
@@ -207,3 +207,15 @@ loading behind the connected-state gate, so a disconnected `push` raises the
 documented `QueueError` without touching the optional dependency. Both RocketMQ
 files passed all 95 tests, and the full 2,905-test suite, Ruff, and strict mypy
 all passed without overriding `HOME`.
+
+### I4 — truthful CPython 3.10–3.14 matrix
+
+Added an explicit Hypothesis example proving that persisted request metadata
+must exclude the acknowledgement token and the consumed `delay`/`source`
+routing controls, then corrected the property oracle to compare only durable
+metadata. On Python 3.14, itemadapter 0.13.1 imports `pydantic.v1` solely to
+recognise legacy models; the resulting compatibility warning is now ignored
+only for its exact message and `itemadapter._imports` origin. A warning-policy
+canary proves unrelated `UserWarning` instances remain fatal. Every CPython
+3.10–3.14 non-integration lane passed 2,906 tests with 7 skips and 37 integration
+tests deselected; Ruff and strict mypy also passed.
