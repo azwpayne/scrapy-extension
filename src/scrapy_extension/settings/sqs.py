@@ -14,6 +14,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._aws import (
+  validate_aws_credentials,
+  validate_aws_endpoint,
+)
 
 # AWS region: two lowercase letters, hyphen, lowercase word, hyphen, digits.
 # Rejects typos like "us-eat-1" (the round-6 SPEC motivator).
@@ -75,37 +79,15 @@ class SqsSettings(BaseSettings):
 
   @model_validator(mode="after")
   def _validate_endpoint_url_scheme(self) -> Self:
-    """SEC-4: ``endpoint_url`` (when set) must be ``http://`` or ``https://``.
-
-    In STANDALONE mode, an unset endpoint is normalized to the loopback-only
-    LocalStack default so zero-config startup cannot silently target real AWS.
-    CLOUD deliberately preserves ``None`` for boto3's real-AWS endpoint chain.
-
-    Catches typos and bare ``host:port`` values (e.g. ``localstack:4566``)
-    that would otherwise fall through to boto3's default credential/endpoint
-    chain (silent wrong target). ``http://`` is allowed — LocalStack and
-    compatible local emulators serve over plaintext. Mirrors the RabbitMQ
-    guest-guard pattern (raise, not warn).
-
-    Raises:
-        ConfigurationError: if ``endpoint_url`` is set and does not start
-            with ``http://`` or ``https://``.
-    """
+    """Normalize local defaults and enforce the shared AWS URL policy."""
     if self.endpoint_url is None:
       if self.mode == SqsMode.STANDALONE:
         self.endpoint_url = _DEFAULT_LOCAL_ENDPOINT
-      return self
-    lowered = self.endpoint_url.lower()
-    if not (lowered.startswith("http://") or lowered.startswith("https://")):
-      raise ConfigurationError(
-        (
-          "endpoint_url must start with 'http://' or 'https://' "
-          "('http://' is LocalStack-only). "
-          f"Got endpoint_url={self.endpoint_url!r}."
-        ),
-        setting_name="endpoint_url",
-        setting_value=self.endpoint_url,
-      )
+    validate_aws_endpoint(
+      self.endpoint_url,
+      cloud=self.mode == SqsMode.CLOUD,
+      require_endpoint=self.mode == SqsMode.STANDALONE,
+    )
     return self
 
   @model_validator(mode="after")
@@ -136,46 +118,8 @@ class SqsSettings(BaseSettings):
 
   @model_validator(mode="after")
   def _validate_aws_credentials_both_or_neither(self) -> Self:
-    """SV3-6a (M): AWS creds must be both-set or both-unset.
-
-    boto3's default credential chain silently ignores a lone
-    ``aws_access_key_id`` without ``aws_secret_access_key`` (and vice versa)
-    — it falls through to IAM role / env / config, masking the
-    half-configured state. The round-6 SEC-7 connect-path XOR catches this
-    at ``connect()`` time; this validator lifts the same check into the
-    settings layer so it fires at config time (fail-fast, closer to the
-    misconfiguration). Mirrors the DynamoDB validator.
-
-    Verified safe: all existing repo fixtures set both creds or neither.
-
-    Raises:
-        ConfigurationError: if exactly one of ``aws_access_key_id`` /
-            ``aws_secret_access_key`` is set.
-    """
-    key_set = self.aws_access_key_id is not None
-    secret_set = self.aws_secret_access_key is not None
-    if key_set and not secret_set:
-      raise ConfigurationError(
-        (
-          "aws_access_key_id is set but aws_secret_access_key is None — "
-          "AWS credentials must be both-set or both-unset. boto3's default "
-          "chain silently falls through to IAM/env/config when only one is "
-          "provided, masking the half-configured state. Either set "
-          "aws_secret_access_key or remove aws_access_key_id (to use the "
-          "default chain)."
-        ),
-        setting_name="aws_secret_access_key",
-        setting_value=self.aws_secret_access_key,
-      )
-    if secret_set and not key_set:
-      raise ConfigurationError(
-        (
-          "aws_secret_access_key is set but aws_access_key_id is None — "
-          "AWS credentials must be both-set or both-unset. Either set "
-          "aws_access_key_id or remove aws_secret_access_key (to use the "
-          "default chain)."
-        ),
-        setting_name="aws_access_key_id",
-        setting_value=self.aws_access_key_id,
-      )
+    """Require either an intentional ambient path or a non-empty pair."""
+    validate_aws_credentials(
+      self.aws_access_key_id, self.aws_secret_access_key
+    )
     return self

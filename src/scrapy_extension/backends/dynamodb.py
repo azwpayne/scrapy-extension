@@ -40,11 +40,14 @@ from scrapy_extension.backends.base import (
   StorageBackend,
   _validate_key_name,
   _validate_ttl,
-  secret_value,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import DynamoDBMode
+from scrapy_extension.settings._aws import (
+  validate_aws_credentials,
+  validate_aws_endpoint,
+)
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import DynamoDBSettings
@@ -148,36 +151,36 @@ class DynamoDBBackend(Backend, StorageBackend):
     Raises:
         BackendConnectionError: If the resource/table cannot be set up.
     """
-    if self.config.mode not in (DynamoDBMode.STANDALONE, DynamoDBMode.CLOUD):
+    mode = self.config.mode
+    table_name = self.config.table_name
+    region_name = self.config.region_name
+    endpoint_url = self.config.endpoint_url
+    access_key = self.config.aws_access_key_id
+    secret_key = self.config.aws_secret_access_key
+    if not isinstance(mode, DynamoDBMode):
       raise ConfigurationError(
-        f"Unsupported DynamoDB mode: {self.config.mode}",
+        f"Unsupported DynamoDB mode: {mode}",
         setting_name="mode",
-        setting_value=self.config.mode,
+        setting_value=mode,
       )
-    # SEC-7: AWS credentials must be both-or-neither (see SqsBackend.connect).
-    key_id = secret_value(self.config.aws_access_key_id)
-    secret = secret_value(self.config.aws_secret_access_key)
-    has_key = bool(key_id)
-    has_secret = bool(secret)
-    if has_key != has_secret:
-      missing = "aws_secret_access_key" if has_key else "aws_access_key_id"
-      present = "aws_access_key_id" if has_key else "aws_secret_access_key"
-      raise ConfigurationError(
-        "AWS credentials must be both-or-neither: "
-        f"{present} is set but {missing} is empty. "
-        "Set both explicitly, or leave both unset to use the boto3 "
-        "default credential chain (env / IMDS / config files).",
-        setting_name=missing,
-      )
+    validate_aws_endpoint(
+      endpoint_url,
+      cloud=mode == DynamoDBMode.CLOUD,
+      require_endpoint=mode == DynamoDBMode.STANDALONE,
+    )
+    key_id, secret = validate_aws_credentials(
+      access_key,
+      secret_key,
+    )
     try:
-      kwargs: dict[str, Any] = {"region_name": self.config.region_name}
-      if self.config.endpoint_url:
-        kwargs["endpoint_url"] = self.config.endpoint_url
-      if has_key and has_secret:
+      kwargs: dict[str, Any] = {"region_name": region_name}
+      if endpoint_url is not None:
+        kwargs["endpoint_url"] = endpoint_url
+      if key_id is not None and secret is not None:
         kwargs["aws_access_key_id"] = _redact(key_id)
         kwargs["aws_secret_access_key"] = _redact(secret)
       self._resource = boto3.resource("dynamodb", **kwargs)
-      self._table = self._resource.Table(self.config.table_name)
+      self._table = self._resource.Table(table_name)
       try:
         self._table.load()
       except Exception as e:
@@ -188,7 +191,7 @@ class DynamoDBBackend(Backend, StorageBackend):
           raise
         try:
           self._table = self._resource.create_table(
-            TableName=self.config.table_name,
+            TableName=table_name,
             KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
             AttributeDefinitions=[
               {"AttributeName": "pk", "AttributeType": "S"}
@@ -202,9 +205,9 @@ class DynamoDBBackend(Backend, StorageBackend):
           # transient blip must not mask as "created".
           if not _is_resource_in_use(create_err):
             raise
-          self._table = self._resource.Table(self.config.table_name)
+          self._table = self._resource.Table(table_name)
         self._table.wait_until_exists()
-      logger.debug("Connected to DynamoDB table %s", self.config.table_name)
+      logger.debug("Connected to DynamoDB table %s", table_name)
     except Exception as e:
       self._table = None
       self._resource = None

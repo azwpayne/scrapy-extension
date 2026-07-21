@@ -313,6 +313,69 @@ def test_aws_cloud_keeps_default_endpoint_chain(
   assert settings.endpoint_url is None
 
 
+@pytest.mark.parametrize(
+  ("settings_cls", "mode"),
+  [
+    pytest.param(SqsSettings, SqsMode.CLOUD, id="sqs"),
+    pytest.param(DynamoDBSettings, DynamoDBMode.CLOUD, id="dynamodb"),
+  ],
+)
+def test_aws_cloud_rejects_explicit_plaintext_endpoint(
+  settings_cls: type[SqsSettings] | type[DynamoDBSettings],
+  mode: SqsMode | DynamoDBMode,
+) -> None:
+  with pytest.raises(ConfigurationError) as exc_info:
+    settings_cls(  # type: ignore[call-arg]
+      mode=mode,
+      endpoint_url="http://aws-proxy.internal:4566",
+    )
+
+  assert exc_info.value.setting_name == "endpoint_url"
+  assert "HTTPS" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("settings_cls", [SqsSettings, DynamoDBSettings])
+def test_aws_endpoint_rejects_userinfo_without_leaking_it(
+  settings_cls: type[SqsSettings] | type[DynamoDBSettings],
+) -> None:
+  password = "do-not-leak-endpoint-password"
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    settings_cls(endpoint_url=f"http://operator:{password}@localhost:4566")
+
+  assert exc_info.value.setting_name == "endpoint_url"
+  assert password not in str(exc_info.value)
+  assert password not in repr(exc_info.value)
+  assert password not in repr(exc_info.value.setting_value)
+  assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("settings_cls", [SqsSettings, DynamoDBSettings])
+@pytest.mark.parametrize(
+  ("access_key", "secret_key", "invalid_setting"),
+  [
+    ("", None, "aws_access_key_id"),
+    (None, "", "aws_secret_access_key"),
+    ("", "", "aws_access_key_id"),
+    ("AKIAEXAMPLE", "", "aws_secret_access_key"),
+    ("", "secret", "aws_access_key_id"),
+  ],
+)
+def test_aws_explicit_empty_credentials_do_not_fall_back_to_ambient_chain(
+  settings_cls: type[SqsSettings] | type[DynamoDBSettings],
+  access_key: str | None,
+  secret_key: str | None,
+  invalid_setting: str,
+) -> None:
+  with pytest.raises(ConfigurationError) as exc_info:
+    settings_cls(
+      aws_access_key_id=access_key,
+      aws_secret_access_key=secret_key,
+    )
+
+  assert exc_info.value.setting_name == invalid_setting
+
+
 def test_flat_backend_setting_typo_fails_fast() -> None:
   settings = ScrapySettings(
     {

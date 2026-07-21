@@ -175,21 +175,30 @@ speculative work.
   token-bearing source after its replacement has only entered an in-process
   delay, time-wheel, round-robin, or ring buffer. Preserve recovery snapshots
   until a later clean checkpoint so a crash during restore is replay-safe.
-- [ ] **SEC-01 — credential completeness.** Reject partial credential pairs and
-  empty explicit secrets, URL userinfo, and mechanism-inconsistent
-  authentication for Kafka, MongoDB, Elasticsearch, RabbitMQ, RocketMQ,
-  Pulsar, SQS, and DynamoDB without exposing secret values. Preserve valid
-  ambient-credential and mechanism-specific modes rather than requiring a
+- [x] **SEC-01A — AWS credential completeness.** For SQS and DynamoDB, distinguish
+  an intentional both-unset ambient credential path from explicit empty or
+  partial credentials at settings and connect time, without retaining values in
+  validation errors.
+- [ ] **SEC-01B — broker credential completeness.** Reject empty explicit
+  secrets, URL userinfo, and mechanism-inconsistent authentication for Kafka,
+  MongoDB, Elasticsearch, RabbitMQ, RocketMQ, and Pulsar without exposing secret
+  values. Preserve valid mechanism-specific modes rather than requiring a
   universal username/password pair.
-- [ ] **SEC-02 — cloud transport.** Reject explicit plaintext AWS endpoints in
-  cloud mode; expose and propagate RocketMQ TLS and require it for cloud mode;
-  secure Redis Sentinel's control plane; reject authenticated RabbitMQ/Pulsar
-  connections without certificate and hostname verification; define an
-  explicit trusted-network boundary for remote Memcached.
-- [ ] **SEC-03 — validated immutable connection snapshots.** Revalidate a copied
-  settings snapshot at every backend build/connect boundary so post-construction
-  mutation cannot bypass transport or credential validators. Sanitize every
-  URL/URI error before it reaches an exception or log record.
+- [x] **SEC-02A — AWS cloud transport.** Reject URL userinfo and explicit
+  plaintext SQS/DynamoDB endpoints in cloud mode while retaining HTTP support
+  for explicit standalone LocalStack-compatible endpoints.
+- [ ] **SEC-02B — broker transport.** Expose and propagate RocketMQ TLS and
+  require it for cloud mode; secure Redis Sentinel's control plane; reject
+  authenticated RabbitMQ/Pulsar connections without certificate and hostname
+  verification; define an explicit trusted-network boundary for remote
+  Memcached.
+- [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
+  endpoint and credential fields at connect time and use one captured set of
+  connection values, so construction-time mutation and validation/use races
+  cannot select an unvalidated identity or endpoint. Sanitize endpoint failures.
+- [ ] **SEC-03B — remaining validated connection snapshots.** Apply copied,
+  revalidated connection snapshots and sanitized URL/URI failures to every
+  remaining backend.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
@@ -517,3 +526,23 @@ operational backend exceptions. All 19 regressions passed on Python 3.10 and
 3.14, 205 related DynamoDB/pipeline/storage-strategy tests passed, and the full
 suite passed 2,978 tests with 44 documented skips. Ruff, strict mypy, and the
 patch integrity check remained green.
+
+### I13a — shared AWS credential and endpoint security
+
+Twenty-two RED regressions showed that SQS and DynamoDB accepted explicit HTTP
+cloud endpoints and URL userinfo, allowed explicit empty credentials to become
+ambient credentials, and trusted settings that had been mutated after initial
+validation. A shared AWS policy now distinguishes `None`/`None` (the intentional
+boto3 ambient chain) from every partial, blank, or whitespace-only explicit
+credential. It validates absolute endpoint URLs without echoing or retaining
+userinfo, requires HTTPS for cloud overrides, and requires an explicit endpoint
+in standalone connect paths so mutation cannot redirect LocalStack traffic to
+real AWS.
+
+Both backend connect methods capture all connection-used fields once, validate
+that captured endpoint/credential set, and pass only the same locals to boto3;
+concurrent mutation can therefore affect a later connection attempt but cannot
+swap values between validation and use in the current attempt. The 22 exact
+regressions passed on Python 3.10 and 3.14, 415 related settings/SQS/DynamoDB
+tests passed, and the full suite passed 3,000 tests with 44 documented skips.
+Ruff, strict mypy, and the patch integrity check remained green.

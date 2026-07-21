@@ -34,7 +34,11 @@ from scrapy_extension.backends.base import (  # noqa: E402
   SetBackend,
 )
 from scrapy_extension.backends.sqs import SqsBackend, _SqsAckToken  # noqa: E402
-from scrapy_extension.exceptions import BackendConnectionError, QueueError  # noqa: E402
+from scrapy_extension.exceptions import (  # noqa: E402
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 from scrapy_extension.settings import SqsMode, SqsSettings  # noqa: E402
 
 
@@ -789,6 +793,49 @@ class TestSqsHalfCredentialGuard:
     _, kwargs = boto3.client.call_args.args, boto3.client.call_args.kwargs
     assert "aws_access_key_id" not in kwargs
     assert "aws_secret_access_key" not in kwargs
+
+  @pytest.mark.parametrize(
+    "endpoint_url",
+    [
+      "http://aws-proxy.internal:4566",
+      "https://operator:do-not-leak@aws-proxy.internal",
+    ],
+  )
+  def test_connect_revalidates_mutated_cloud_endpoint(
+    self, mocker, endpoint_url
+  ) -> None:
+    backend = _make_backend(mode=SqsMode.CLOUD)
+    backend.config.endpoint_url = endpoint_url
+    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert "do-not-leak" not in str(exc_info.value)
+    boto3.client.assert_not_called()
+
+  def test_connect_rejects_mutated_empty_explicit_credentials(self, mocker) -> None:
+    backend = _make_backend()
+    backend.config.aws_access_key_id = ""  # type: ignore[assignment]
+    backend.config.aws_secret_access_key = ""  # type: ignore[assignment]
+    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert exc_info.value.setting_name == "aws_access_key_id"
+    boto3.client.assert_not_called()
+
+  def test_connect_rejects_mutated_missing_standalone_endpoint(self, mocker) -> None:
+    backend = _make_backend()
+    backend.config.endpoint_url = None
+    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      backend.connect()
+
+    assert exc_info.value.setting_name == "endpoint_url"
+    boto3.client.assert_not_called()
 
 
 # ===========================================================================
