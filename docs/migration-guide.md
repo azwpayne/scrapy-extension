@@ -21,6 +21,34 @@ Do not use a rolling dual-write deployment. There is no supported transaction
 across the old and new layouts, and message bodies from different codec
 generations are not always distinguishable.
 
+## Pulsar TLS Hostname Validation
+
+Pulsar TLS client construction now uses the keyword names accepted by
+`pulsar-client` 2.11–3.x. The package-level compatibility settings keep their
+existing names:
+
+- `SCRAPY_PULSAR_ALLOW_INSECURE_CONNECTION` maps to
+  `tls_allow_insecure_connection`;
+- `SCRAPY_PULSAR_TLS_TRUST_CERTS_FILE` maps to
+  `tls_trust_certs_file_path`;
+- new `SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME` maps directly to
+  `tls_validate_hostname` and defaults to `True` for `pulsar+ssl://` URLs.
+
+Before upgrading a TLS deployment, verify that each broker certificate covers
+the hostname used in `SCRAPY_PULSAR_SERVICE_URL`. Replace a mismatched
+certificate or service URL rather than disabling validation. Setting
+`SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=False` is an explicit insecure
+compatibility escape hatch for isolated local environments only. Plain
+`pulsar://` deployments do not forward any TLS keyword and are otherwise
+unchanged.
+
+The Pulsar SDK treats URL schemes as case-sensitive. Settings now trim outer
+whitespace, lowercase only the scheme, and trim comma-separated endpoints
+before client construction. Cluster discovery uses one prefix:
+`pulsar://broker-one:6650,broker-two:6650`. A repeated form such as
+`pulsar://broker-one:6650,pulsar://broker-two:6650` is rejected at startup
+because the SDK interprets the second prefix as an invalid hostname.
+
 ## Redis Physical-Key Layout
 
 Redis now maps each logical name into a configured namespace and separates the

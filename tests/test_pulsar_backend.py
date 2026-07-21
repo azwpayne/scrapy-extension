@@ -8,6 +8,7 @@ patterns against the mock.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from threading import Event, Lock, Thread
 from unittest.mock import MagicMock
@@ -823,7 +824,7 @@ class TestPulsarTlsDecouple:
 
   def test_ssl_passes_allow_insecure_without_trust_certs(self, mocker) -> None:
     """pulsar+ssl:// + allow_insecure_connection=False + no trust_certs:
-    Client kwargs include allow_insecure_connection WITHOUT trust certs."""
+    Client kwargs include the SDK's TLS-prefixed insecure flag."""
     b = _make_backend(
       service_url="pulsar+ssl://broker:6651",
       allow_insecure_connection=False,
@@ -831,10 +832,10 @@ class TestPulsarTlsDecouple:
     mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
     b.connect()
     _, kwargs = pulsar.Client.call_args.args, pulsar.Client.call_args.kwargs
-    assert "allow_insecure_connection" in kwargs
-    assert kwargs["allow_insecure_connection"] is False
+    assert kwargs["tls_allow_insecure_connection"] is False
+    assert kwargs["tls_validate_hostname"] is True
     # trust_certs is NOT passed when unset (the bug was gating on this).
-    assert "tls_trust_certs_file" not in kwargs
+    assert "tls_trust_certs_file_path" not in kwargs
 
   def test_ssl_passes_allow_insecure_true_without_trust_certs(self, mocker) -> None:
     """SEC-5 reverse: allow_insecure_connection=True is forwarded (not silently
@@ -846,8 +847,9 @@ class TestPulsarTlsDecouple:
     mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
     b.connect()
     kwargs = pulsar.Client.call_args.kwargs
-    assert kwargs.get("allow_insecure_connection") is True
-    assert "tls_trust_certs_file" not in kwargs
+    assert kwargs.get("tls_allow_insecure_connection") is True
+    assert kwargs.get("tls_validate_hostname") is True
+    assert "tls_trust_certs_file_path" not in kwargs
 
   def test_ssl_passes_both_when_both_set(self, mocker) -> None:
     """Both set → both passed (backward compat with the original path)."""
@@ -859,20 +861,60 @@ class TestPulsarTlsDecouple:
     mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
     b.connect()
     kwargs = pulsar.Client.call_args.kwargs
-    assert kwargs.get("allow_insecure_connection") is True
-    assert kwargs.get("tls_trust_certs_file") == "/etc/ssl/ca.pem"
+    assert kwargs.get("tls_allow_insecure_connection") is True
+    assert kwargs.get("tls_validate_hostname") is True
+    assert kwargs.get("tls_trust_certs_file_path") == "/etc/ssl/ca.pem"
+
+  def test_ssl_forwards_explicit_hostname_validation_opt_out(self, mocker) -> None:
+    """The public compatibility setting controls the real SDK keyword."""
+    b = _make_backend(
+      service_url="pulsar+ssl://broker:6651",
+      tls_validate_hostname=False,
+    )
+    mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
+    b.connect()
+
+    assert pulsar.Client.call_args.kwargs["tls_validate_hostname"] is False
 
   def test_non_ssl_url_omits_tls_kwargs(self, mocker) -> None:
     """pulsar:// (plaintext) doesn't pass either TLS field."""
     b = _make_backend(
       service_url="pulsar://broker:6650",
       allow_insecure_connection=True,  # ignored — not an ssl url
+      tls_trust_certs_file="/tmp/plaintext-ignored.pem",
+      tls_validate_hostname=False,
     )
     mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
     b.connect()
     kwargs = pulsar.Client.call_args.kwargs
-    assert "allow_insecure_connection" not in kwargs
-    assert "tls_trust_certs_file" not in kwargs
+    assert "tls_allow_insecure_connection" not in kwargs
+    assert "tls_validate_hostname" not in kwargs
+    assert "tls_trust_certs_file_path" not in kwargs
+
+
+def test_locked_pulsar_sdk_tls_keyword_contract() -> None:
+  """The installed real client must expose every TLS keyword we forward."""
+  script = "\n".join(
+    (
+      "import inspect",
+      "import pulsar",
+      "names = inspect.signature(pulsar.Client).parameters",
+      "assert 'tls_allow_insecure_connection' in names",
+      "assert 'tls_trust_certs_file_path' in names",
+      "assert 'tls_validate_hostname' in names",
+      "assert 'allow_insecure_connection' not in names",
+      "assert 'tls_trust_certs_file' not in names",
+    )
+  )
+
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
 
 
 def test_pulsar_auth_token_is_redacted_str(mocker) -> None:

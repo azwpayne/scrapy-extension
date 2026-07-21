@@ -90,10 +90,11 @@ global gates, then perform a fresh audit before selecting the next item.
 | I6 | Enforce plugin descriptor isolation and validation | malformed/duplicate plugins cannot replace or abort bundled discovery |
 | I7 | Close simple runtime failure-boundary gaps | breaker-open queue/dedup paths degrade safely; explicit reconnect works |
 | I8 | Preserve the replacement enqueue commit boundary | a source-ack failure cannot reject a committed replacement or undo dedup |
-| I9 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
-| I10 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements never acknowledge early |
-| I11 | Repair backend-specific P1 correctness | Kafka assignment epochs, ES contention, DynamoDB consistent reads |
-| I12 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
+| I9 | Repair the Pulsar TLS client contract | real SDK keyword smoke passes; hostname validation is explicit and secure by default |
+| I10 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
+| I11 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements never acknowledge early |
+| I12 | Repair backend-specific P1 correctness | Kafka assignment epochs, ES contention, DynamoDB consistent reads |
+| I13 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -154,7 +155,7 @@ speculative work.
 - [ ] **SEC-02 — cloud transport.** Reject explicit plaintext AWS endpoints in
   cloud mode; expose and propagate RocketMQ TLS, then require it for cloud mode
   with migration notes.
-- [ ] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
+- [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
 - [ ] **BACKEND-01 — Kafka token generations.** Fence acknowledgement tokens by
@@ -314,3 +315,21 @@ existing duplicate-ack recovery path. The two focused regressions and all 167
 queue/scheduler acknowledgement tests passed; the focused regressions also
 passed on Python 3.14. The full suite passed 2,925 tests with 44 skips, followed
 by Ruff and strict mypy.
+
+### I9 — Pulsar TLS SDK contract
+
+The third audit compared the real locked `pulsar-client` 3.12.0 signature with
+the backend builder. All TLS connects passed `allow_insecure_connection` and
+`tls_trust_certs_file`, but the SDK accepts only
+`tls_allow_insecure_connection` and `tls_trust_certs_file_path`; MagicMock-based
+tests had hidden the resulting pre-network `TypeError`. The SDK also defaults
+`tls_validate_hostname` to false. The same real-SDK probe disproved an older
+claim that schemes were case-insensitive and confirmed that cluster URLs use
+one scheme followed by a host list. Nine RED regressions captured these
+defects.
+The public compatibility fields remain unchanged and are translated only for
+`pulsar+ssl://`; a new `tls_validate_hostname` setting defaults to true and is
+forwarded explicitly. Service URLs are canonicalized to the SDK grammar, and a
+subprocess contract test pins the real SDK signature. Nineteen focused tests
+passed on Python 3.10 and 3.14; 280 related settings/backend tests and the full
+2,932-test suite with 44 skips passed, followed by Ruff and strict mypy.

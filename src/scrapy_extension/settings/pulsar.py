@@ -87,23 +87,40 @@ class PulsarSettings(BaseSettings):
     default=False,
     description="Allow insecure TLS connections (dev only)",
   )
+  tls_validate_hostname: bool = Field(
+    default=True,
+    description=(
+      "Validate the broker hostname against its TLS certificate; disable only "
+      "for explicit local compatibility"
+    ),
+  )
 
   @model_validator(mode="after")
   def _validate_service_url_scheme(self) -> Self:
     """SV4: ``service_url`` must start with ``pulsar://`` or ``pulsar+ssl://``.
 
     A bare ``host:port`` or ``http://`` value otherwise surfaces as an
-    opaque ``ValueError`` inside the pulsar client at connect. For a cluster,
-    each comma-separated entry must carry a valid scheme (checked on the
-    first segment for the common single-URL case; cluster URLs follow the
-    same ``pulsar://`` scheme).
+    opaque ``ValueError`` inside the pulsar client at connect. The SDK treats
+    the scheme as case-sensitive and expects a cluster as one scheme followed
+    by comma-separated endpoints (``pulsar://one:6650,two:6650``). Normalize
+    scheme case and surrounding endpoint whitespace here so every accepted
+    value is directly consumable by the client.
 
     Raises:
         ConfigurationError: if ``service_url`` does not start with a valid
             Pulsar scheme.
     """
     url = self.service_url.strip()
-    if not url or not url.lower().startswith(_VALID_PULSAR_SCHEMES):
+    lowered = url.lower()
+    scheme = next(
+      (
+        candidate
+        for candidate in _VALID_PULSAR_SCHEMES
+        if lowered.startswith(candidate)
+      ),
+      None,
+    )
+    if scheme is None:
       raise ConfigurationError(
         (
           "service_url must start with 'pulsar://' or 'pulsar+ssl://'. "
@@ -112,6 +129,22 @@ class PulsarSettings(BaseSettings):
         setting_name="service_url",
         setting_value=self.service_url,
       )
+    endpoint_text = url[len(scheme) :]
+    if "://" in endpoint_text:
+      raise ConfigurationError(
+        "Pulsar cluster service_url must use a single scheme followed by a "
+        "comma-separated endpoint list",
+        setting_name="service_url",
+        setting_value=self.service_url,
+      )
+    endpoints = [endpoint.strip() for endpoint in endpoint_text.split(",")]
+    if any(not endpoint for endpoint in endpoints):
+      raise ConfigurationError(
+        "service_url must contain one or more non-empty Pulsar endpoints",
+        setting_name="service_url",
+        setting_value=self.service_url,
+      )
+    self.service_url = f"{scheme}{','.join(endpoints)}"
     return self
 
   @model_validator(mode="after")

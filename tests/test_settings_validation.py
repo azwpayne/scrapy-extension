@@ -49,6 +49,7 @@ from scrapy_extension.settings.dynamodb import DynamoDBSettings
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 from scrapy_extension.settings.kafka import KafkaMode
 from scrapy_extension.settings.mongodb import MongoDBMode
+from scrapy_extension.settings.pulsar import PulsarMode
 from scrapy_extension.settings.rabbitmq import RabbitMQMode
 from scrapy_extension.settings.rocketmq import RocketMQSettings
 from scrapy_extension.settings.sqs import SqsSettings
@@ -499,6 +500,29 @@ class TestPulsarServiceUrlScheme:
     """Valid ``pulsar://`` and ``pulsar+ssl://`` URLs stay accepted."""
     assert PulsarSettings(service_url=url).service_url == url
 
+  @pytest.mark.parametrize(
+    ("raw_url", "canonical_url"),
+    [
+      (" Pulsar+SSL://broker:6651 ", "pulsar+ssl://broker:6651"),
+      ("PULSAR://one:6650, two:6650", "pulsar://one:6650,two:6650"),
+    ],
+  )
+  def test_service_url_canonicalizes_sdk_sensitive_syntax(
+    self,
+    raw_url: str,
+    canonical_url: str,
+  ) -> None:
+    """Normalize scheme case and endpoint whitespace before SDK construction."""
+    assert PulsarSettings(service_url=raw_url).service_url == canonical_url
+
+  def test_cluster_service_url_rejects_repeated_schemes(self) -> None:
+    """The SDK expects one scheme followed by a comma-separated host list."""
+    with pytest.raises(ConfigurationError, match="single scheme"):
+      PulsarSettings(
+        mode=PulsarMode.CLUSTER,
+        service_url="pulsar://one:6650,pulsar://two:6650",
+      )
+
 
 class TestRocketMQNamesrvFormat:
   """RocketMQSettings.namesrv_address SV4 ``host:port`` guard."""
@@ -725,6 +749,19 @@ class TestSV3PulsarAuthTokenRequiresSsl:
     """No ``auth_token`` + ``pulsar://`` → accepted (validator skips)."""
     s = PulsarSettings(service_url="pulsar://broker:6650")
     assert s.auth_token is None
+
+  def test_tls_hostname_validation_defaults_secure(self) -> None:
+    """TLS connections validate the broker hostname unless explicitly opted out."""
+    s = PulsarSettings(service_url="pulsar+ssl://broker:6651")
+    assert s.tls_validate_hostname is True
+
+  def test_tls_hostname_validation_can_be_explicitly_disabled(self) -> None:
+    """Local compatibility remains available as an explicit insecure choice."""
+    s = PulsarSettings(
+      service_url="pulsar+ssl://broker:6651",
+      tls_validate_hostname=False,
+    )
+    assert s.tls_validate_hostname is False
 
 
 class TestSV3RedisSslRequiresCafile:

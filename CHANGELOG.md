@@ -58,6 +58,15 @@ upgrading.
   leaks it on the wire; operators who intentionally run token-auth over a
   private plaintext broker must switch to `pulsar+ssl://` (or drop the token).
   Fix: change `SCRAPY_PULSAR_SERVICE_URL` to `pulsar+ssl://broker:6651`.
+- **Pulsar TLS now validates broker hostnames by default.** The backend now
+  translates its public compatibility fields to the real pulsar-client
+  `tls_*` constructor keywords; the previous names made every TLS client
+  construction fail. New setting `SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=True`
+  also closes the SDK's insecure default. Fix mismatched broker certificates,
+  or set it to `False` only as an explicit local-development compatibility
+  escape hatch. Service URLs are normalized to the SDK's case-sensitive scheme
+  and single-prefix cluster syntax; see
+  [`docs/migration-guide.md`](docs/migration-guide.md).
 - **Redis `ssl_enabled=True` now requires `ssl_cafile`.** `RedisSettings(
   ssl_enabled=True)` rejects a missing `ssl_cafile` (round-9c SV3-3). TLS
   without a pinned CA is vulnerable to MITM; operators who previously relied
