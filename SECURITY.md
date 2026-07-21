@@ -55,23 +55,37 @@ can audit and rely on it.
 ### Credential redaction
 
 Structured password, token, API-key, and AWS-secret fields use Pydantic
-`SecretStr`, so their model repr is redacted. Selected client config values are
-also converted to the internal `_RedactedStr`, whose repr/string form is `***`.
-`ConfigurationError` redacts `setting_value` when its setting name contains a
-sensitive fragment.
+`SecretStr`. Selected values extracted for client construction are additionally
+wrapped in the internal `_RedactedStr`. These controls have different
+boundaries:
+
+| Mechanism | Masked display paths | Paths exposing the underlying secret |
+|---|---|---|
+| Pydantic `SecretStr` | Structured settings/model display and normal wrapper rendering. | Explicit `get_secret_value()` and code/serializers that call it, including this package's request/item JSON path. |
+| `_RedactedStr` | `repr(value)`, an `!r` f-string, `%r`, and repr-based container/config display (currently `<redacted>`; the marker is not public API). | `str(value)`, a default/`!s` f-string, `%s`, `format`, concatenation/indexing, and JSON/string serialization. |
+| Sensitive `ConfigurationError.setting_value` | The exception domain field is replaced with the stable `***REDACTED***` marker. | Original inputs can still remain in caller traceback frame locals outside the exception's domain fields. |
+
+`_RedactedStr` must remain string-equivalent so backend SDKs receive the real
+credential for authentication. It is not a log sanitizer: direct logging,
+formatting, or serialization can expose the value even though a repr-based
+configuration dump is masked.
 
 This is defense-in-depth, not a universal no-leak guarantee:
 
 - Plain URI/DSN fields can contain userinfo. In particular, a MongoDB URI is a
   normal string and its caller/model repr can expose an embedded password.
 - A caller-owned `dict`, application log, debugger, broker/client diagnostic,
-  or third-party traceback is outside the redaction boundary.
+  or third-party traceback is outside the redaction boundary. Repr-based
+  display may mask a wrapped value, but these systems may coerce or serialize
+  it through an exposing path instead.
 - Backends must pass the underlying secret to their SDK to authenticate; SDK
   internals are not controlled by this package.
 
 Prefer discrete `SecretStr` fields when available, avoid credentials inside
-URIs, and never log complete settings dictionaries or DSNs. Treat a redacted
-display as a convenience, not as an access-control mechanism.
+URIs, and never log complete settings dictionaries, client kwargs, or DSNs.
+Audit `%s`, f-string, formatting, structured-logging, and JSON paths that can
+receive SDK-bound credentials. Treat a redacted repr as a convenience, not as
+an access-control mechanism.
 
 ### TLS / scheme guards (round-6 SEC-1..7 + round-9 SV3/SV4)
 
@@ -81,7 +95,7 @@ before any network call. Each guard raises `ConfigurationError` with
 
 | Guard | Where | What it catches |
 |---|---|---|
-| SEC-1 | `backends/_redaction.py` | credential leakage in repr/str/logs |
+| SEC-1 | `backends/_redaction.py` | accidental credential exposure in repr-based client-config displays |
 | SEC-2 | `settings/mongodb.py` `_validate_tls_insecure_not_in_production_mode` | `tls_allow_invalid_certificates=True` in production modes (disables cert verification) |
 | SEC-3 | `settings/elasticsearch.py` | credentials sent over cleartext `http://` |
 | SEC-4 | `settings/{sqs,dynamodb}.py` `_validate_endpoint_url_scheme` | `endpoint_url` without `http://` or `https://` scheme |

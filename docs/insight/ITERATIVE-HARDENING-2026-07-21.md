@@ -319,7 +319,7 @@ speculative work.
 - [x] **BACKEND-03D — remaining DynamoDB response/region contracts.** Accept
   valid multi-segment AWS regions such as GovCloud, revalidate them at connect,
   and reject malformed delete responses through `StorageError`.
-- [ ] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
+- [x] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
   text: `_RedactedStr` protects `repr`, while ordinary string operations expose
   the underlying value required by SDK authentication.
 
@@ -1273,3 +1273,33 @@ All 457 focused settings/SQS/DynamoDB tests passed on Python 3.10. The full
 Python 3.10 and 3.14 suites each passed 3,354 tests with 46 documented skips.
 Ruff, strict mypy, Bandit, lockfile validation, and patch integrity remained
 green.
+
+### I36 — Accurate repr-only redaction policy
+
+The specification required a documentation correction, not a runtime string
+change. Pydantic `SecretStr` masks structured display until explicitly
+unwrapped; `_RedactedStr` is a real SDK-bound `str` that masks only direct and
+repr-based container display while the wrapper survives; sensitive
+`ConfigurationError.setting_value` is replaced in the exception domain field
+with its separate stable marker. Ordinary `str`, default/`!s` f-string, `%s`,
+formatting, encoding/concatenation, JSON, SDK diagnostics, arbitrary traceback
+capture, and process memory are outside `_RedactedStr`'s guarantee. Changing
+`__str__` would break authentication and still could not turn a string subclass
+into a data classification boundary. This package's request/item JSON path also
+explicitly unwraps supported Pydantic secret values.
+
+One policy RED proved that `SECURITY.md` claimed both repr and string forms
+were `***` and described SEC-1 as protecting repr, str, and logs, while the
+executable contract has always been `repr(value) == "<redacted>"` and
+`str(value) == secret`. The implementation task replaced that promise with a
+three-column boundary matrix, made the README contract explicit, separated
+RocketMQ credential repr protection from startup-error sanitization, corrected
+older changelog scope language, and limited helper/test docstrings to
+repr-based capture. A semantic policy regression parses the protected and
+exposed table columns, while a behavior matrix pins f-string, `%s`, `format`,
+and JSON exposure. No production behavior, public API, configuration, or data
+migration changed; `_RedactedStr` remains Internal per `STABILITY.md`.
+
+All eight focused redaction/policy tests passed on Python 3.10. The full Python
+3.10 and 3.14 suites each passed 3,356 tests with 46 documented skips. Ruff,
+strict mypy, Bandit, lockfile validation, and patch integrity remained green.

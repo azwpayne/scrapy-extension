@@ -2,8 +2,8 @@
 
 ``_redact`` / ``_RedactedStr`` are security-relevant: they keep SASL
 passwords and other secrets out of ``repr()`` dumps of backend client
-config dicts (defense-in-depth against accidental logging / Sentry
-capture). Backends exercise the wrap-a-real-secret path indirectly, but
+config dicts (defense-in-depth against accidental repr logging/capture).
+Backends exercise the wrap-a-real-secret path indirectly, but
 the idempotency, non-string/empty passthrough, repr-masking, and
 str-semantics guarantees had no direct tests — these pin them so a
 future change to this hot helper can't silently break the contract every
@@ -11,6 +11,9 @@ backend depends on.
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 from scrapy_extension.backends._redaction import _redact, _RedactedStr
 
@@ -50,8 +53,10 @@ def test_redact_passes_through_empty_string() -> None:
 
 def test_redacted_str_repr_is_masked() -> None:
   """``repr()`` of a redacted string is the mask, NOT the secret — the whole
-  point: ``repr(config_dict)`` and traceback locals don't leak credentials."""
-  assert repr(_redact("super-secret-token")) == "<redacted>"
+  point: repr-based config/local displays don't expose credentials."""
+  wrapped = _redact("super-secret-token")
+  assert repr(wrapped) == "<redacted>"
+  assert "super-secret-token" not in repr({"token": wrapped})
 
 
 def test_redacted_str_preserves_str_semantics() -> None:
@@ -63,3 +68,73 @@ def test_redacted_str_preserves_str_semantics() -> None:
   assert wrapped[0] == "a"
   assert len(wrapped) == 6
   assert "bcd" in wrapped
+
+
+def test_redacted_str_ordinary_string_paths_expose_underlying_value() -> None:
+  """SDK-compatible string/serialization paths deliberately keep the value."""
+  wrapped = _redact("sdk-auth-secret")
+
+  assert str(wrapped) == "sdk-auth-secret"
+  assert f"{wrapped}" == "sdk-auth-secret"
+  assert "%s" % wrapped == "sdk-auth-secret"  # noqa: UP031
+  assert "{}".format(wrapped) == "sdk-auth-secret"  # noqa: UP032
+  assert json.dumps({"secret": wrapped}) == '{"secret": "sdk-auth-secret"}'
+
+
+def test_security_policy_matches_repr_only_redaction_boundary() -> None:
+  """Keep the normative policy aligned with the executable string contract."""
+  policy = (Path(__file__).resolve().parents[1] / "SECURITY.md").read_text(
+    encoding="utf-8"
+  )
+  credential_section = policy.split("### Credential redaction", 1)[1].split(
+    "\n### ", 1
+  )[0]
+  header_row = next(
+    (
+      line
+      for line in credential_section.splitlines()
+      if line.startswith("| Mechanism |")
+    ),
+    "",
+  )
+  header_cells = [
+    cell.strip().lower() for cell in header_row.strip("|").split("|")
+  ]
+  contract_row = next(
+    (
+      line
+      for line in credential_section.splitlines()
+      if line.startswith("|") and "`_RedactedStr`" in line
+    ),
+    "",
+  )
+  cells = [cell.strip() for cell in contract_row.strip("|").split("|")]
+  secret_str_row = next(
+    (
+      line
+      for line in credential_section.splitlines()
+      if line.startswith("|") and "Pydantic `SecretStr`" in line
+    ),
+    "",
+  )
+  secret_str_cells = [
+    cell.strip() for cell in secret_str_row.strip("|").split("|")
+  ]
+
+  assert header_cells == [
+    "mechanism",
+    "masked display paths",
+    "paths exposing the underlying secret",
+  ]
+  assert len(cells) == 3, "SECURITY.md must state both redaction boundaries"
+  wrapper, masked_paths, exposed_paths = cells
+  assert wrapper == "`_RedactedStr`"
+  assert "`repr(value)`" in masked_paths
+  for exposed_path in ("`str(value)`", "f-string", "`%s`", "JSON"):
+    assert exposed_path in exposed_paths
+  assert len(secret_str_cells) == 3
+  assert secret_str_cells[0] == "Pydantic `SecretStr`"
+  assert "`get_secret_value()`" in secret_str_cells[2]
+  assert "JSON" in secret_str_cells[2]
+  assert "repr/string form" not in credential_section
+  assert "credential leakage in repr/str/logs" not in policy

@@ -2,14 +2,15 @@
 
 SEC-1 (round-6 security parity): the same ``_RedactedStr`` pattern first
 introduced in the Kafka backend (to keep SASL passwords out of ``repr()``
-dumps / Sentry captures of client config) is now applied uniformly to every
-backend that hands a secret to a client-library config dict.
+dumps / repr-based captures of client config) is now applied uniformly to
+every backend that hands a secret to a client-library config dict.
 
 The wrapped value is a ``str`` subclass whose underlying value IS the real
 secret, so client libraries (kafka-python, pika, pymongo, elasticsearch-py,
 pulsar-client, boto3, redis-py) that consume it via ``str()`` semantics
 keep working unchanged. Only ``repr()`` is masked — defense-in-depth against
-accidental logging, NOT against an adversary who can read process memory.
+accidental repr-based display/logging, NOT against ordinary string operations
+or an adversary who can read process memory.
 """
 
 from __future__ import annotations
@@ -25,11 +26,13 @@ class _RedactedStr(str):
   The str VALUE is the real secret so client libraries receive a usable
   string (``str(instance)`` returns the secret, indexing works, equality
   works). Only ``repr(instance)`` returns the mask, so ``repr(config_dict)``
-  and traceback dumps of locals don't reveal the raw credential.
+  and repr-based local-variable dumps don't reveal the raw credential while
+  the wrapper is retained.
 
-  Note: this is defense-in-depth against accidental logging / Sentry
-  capture, NOT against an adversary who can read process memory. The raw
-  value is still reachable via ``str(instance)`` or by indexing.
+  Note: this is defense-in-depth against accidental repr logging/capture,
+  NOT against ordinary string formatting, serialization, or an adversary who
+  can read process memory. The raw value is still reachable via
+  ``str(instance)`` or by indexing.
   """
 
   __slots__ = ()

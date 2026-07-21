@@ -212,8 +212,9 @@ upgrading.
   SimpleConsumer gRPC clients. Any explicit access/secret key must be a complete
   non-empty pair and implies TLS; cloud mode always requires both credentials
   and TLS. Connection setup now revalidates one coherent value snapshot and
-  redacts SDK-bound credentials and public startup failures. Anonymous
-  standalone/cluster deployments retain the existing plaintext default.
+  repr-redacts SDK-bound credentials and sanitizes public startup failure text.
+  Anonymous standalone/cluster deployments retain the existing plaintext
+  default.
 - **Redis `ssl_enabled=True` now requires `ssl_cafile`.** `RedisSettings(
   ssl_enabled=True)` rejects a missing `ssl_cafile` (round-9c SV3-3). TLS
   without a pinned CA is vulnerable to MITM; operators who previously relied
@@ -331,7 +332,7 @@ upgrading.
   scraped" from "items silently dropped" on storage-unsupported backends
   (Kafka, RabbitMQ, RocketMQ).
 - `ConfigurationError` redacts sensitive `setting_value` at construction
-  (defensive against repr / traceback / debugger leaks).
+  (defensive against exception-field repr and attribute introspection).
 - Explicit `__all__` on `base.py`, `backends/__init__.py`, and verified
   across every module with a public surface.
 - ElasticSearch CLOUD mode fail-fast: `ElasticSearchSettings` now rejects
@@ -424,6 +425,10 @@ upgrading.
 
 ### Fixed
 
+- The security policy now correctly describes `_RedactedStr` as a repr-only
+  accidental-display guard. Ordinary string formatting, direct `%s`/f-string
+  logging, and serialization can expose the underlying SDK credential by
+  design; this is a documentation correction with no runtime behavior change.
 - DynamoDB `delete()` now distinguishes an absent item from a malformed
   `DeleteItem(ALL_OLD)` response. Only a complete old item carrying the
   requested table partition key reports `True`; malformed service/emulator
@@ -541,11 +546,11 @@ upgrading.
   `SPEC-round8-testing.md`, `SPEC-round8-v1readiness.md`,
   `SPEC-round8-settings-validation.md`) + consolidated execution menu
   (`docs/insight/EXECUTION-INDEX.md`).
-- **Security (round 6, landed in this arc):** TLS/scheme guards SEC-1..7
-  across `settings/*.py` — `_RedactedStr`, SEC-2 MongoDB insecure-TLS-in-prod
-  rejection, SEC-3 ES cleartext-credentials-over-http rejection, SEC-4
-  LocalStack/AWS `endpoint_url` scheme validation, SEC-7 AWS credential XOR
-  at connect path. See [`SECURITY.md`](SECURITY.md).
+- **Security (round 6, landed in this arc):** settings and backend SDK-config
+  guards SEC-1..7 — SEC-1 `_RedactedStr` repr protection, SEC-2 MongoDB
+  insecure-TLS-in-prod rejection, SEC-3 ES cleartext-credentials-over-http
+  rejection, SEC-4 LocalStack/AWS `endpoint_url` scheme validation, SEC-7 AWS
+  credential XOR at connect path. See [`SECURITY.md`](SECURITY.md).
 
 ### Round 9 — settings validation (SV1–SV5), perf (U4), OOM cap (U5)
 
