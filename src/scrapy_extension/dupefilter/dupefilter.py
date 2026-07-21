@@ -9,6 +9,7 @@ import logging
 from collections import OrderedDict
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, Protocol
+from weakref import WeakSet
 
 from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
@@ -150,6 +151,14 @@ class BackendDupeFilter:
     self._retry_allowance_lock = Lock()
     self._retry_allowance_limit = _DEFAULT_RETRY_ALLOWANCE_LIMIT
     self._retry_allowance_overflow_warned = False
+    # A false request_seen result does not always mean a fingerprint was
+    # reserved: filter-full and transient-outage degradation deliberately
+    # admit without writing. Track only genuine new reservations (and
+    # one-shot retry allowances) by Request identity so the scheduler can
+    # compensate a later failed push without deleting an unrelated marker.
+    # Weak membership prevents callers that use request_seen directly from
+    # retaining Request objects indefinitely.
+    self._pending_reservations: WeakSet[Request] = WeakSet()
     self._manager_released = False
     self._owns_connection_manager = owns_connection_manager
     self._lifecycle_lock = RLock()
@@ -514,6 +523,7 @@ class BackendDupeFilter:
     """
     fingerprint = self.request_fingerprint(request)
     encoded_fingerprint = fingerprint.encode()
+    self._pending_reservations.discard(request)
 
     # Non-removable filters retain their original bit/fingerprint after a
     # failed queue push. ``forget`` grants exactly one retry miss; deletion
@@ -521,6 +531,7 @@ class BackendDupeFilter:
     # cannot consume the same allowance twice. The underlying retained marker
     # makes every other caller a duplicate before and after that one retry.
     if self._consume_retry_allowance(encoded_fingerprint):
+      self._pending_reservations.add(request)
       self._monitor.on_dedup_miss(fingerprint)
       return False
 
@@ -571,6 +582,8 @@ class BackendDupeFilter:
       return False
 
     # add() returns True when the item was newly added; a duplicate maps to False.
+    if added:
+      self._pending_reservations.add(request)
     seen = not added
     if seen:
       self._monitor.on_dedup_hit(fingerprint)
@@ -590,6 +603,25 @@ class BackendDupeFilter:
       cap = getattr(self._filter, "capacity", None)
       self._monitor.on_filter_saturation(len(self._filter), cap)
     return seen
+
+  def consume_reservation(self, request: Request) -> bool:
+    """Consume whether the latest check reserved state for ``request``.
+
+    Scrapy's public dupefilter protocol returns only seen/not-seen. The
+    scheduler additionally needs to know whether a not-seen result actually
+    wrote a fingerprint before deciding if a failed queue push should call
+    :meth:`forget`. Filter-full and transient-outage misses return False but
+    create no reservation, so compensating those would delete unrelated state.
+
+    Returns:
+        True exactly once for a genuine reservation; False for degraded misses,
+        duplicates, unknown requests, and repeated consumption.
+    """
+    with self._lifecycle_lock:
+      if request not in self._pending_reservations:
+        return False
+      self._pending_reservations.discard(request)
+      return True
 
   def forget(self, request: Request) -> None:
     """Compensate a new fingerprint whose subsequent queue push failed.
@@ -612,6 +644,7 @@ class BackendDupeFilter:
     with self._lifecycle_lock:
       if self._closed:
         raise RuntimeError("dupefilter is closed")
+      self._pending_reservations.discard(request)
       fingerprint = self.request_fingerprint(request).encode()
       try:
         self._filter.remove(fingerprint)
@@ -650,6 +683,7 @@ class BackendDupeFilter:
     """Discard transient failed-push allowances at lifecycle boundaries."""
     with self._retry_allowance_lock:
       self._retry_allowances.clear()
+    self._pending_reservations.clear()
 
   def _handle_filter_full(self, fingerprint: str) -> None:
     """Degrade gracefully when the membership filter reports it is full.

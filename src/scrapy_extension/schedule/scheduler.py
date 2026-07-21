@@ -24,6 +24,7 @@ from scrapy_extension.backends.connectors import (
   resolve_backend_config,
 )
 from scrapy_extension.exceptions import (
+  BackendConnectionError,
   BackendError,
   ConfigurationError,
   QueueError,
@@ -1145,7 +1146,21 @@ class BackendScheduler:
         # request_seen atomically reserves a new fingerprint before push. Keep
         # that ordering so concurrent producers cannot both enqueue the same
         # request; compensate the reservation if the later push fails.
-        dedup_reserved = True
+        consume_reservation = getattr(
+          self.dupefilter,
+          "consume_reservation",
+          None,
+        )
+        # Scrapy's standard dupefilter protocol has no reservation-result API.
+        # Bundled BackendDupeFilter exposes the precise result so degraded
+        # not-seen outcomes (open circuit / filter full) are never rolled back.
+        # Preserve legacy behavior for custom dupefilters that implement
+        # ``forget`` but not this optional extension.
+        dedup_reserved = (
+          bool(consume_reservation(request))
+          if callable(consume_reservation)
+          else True
+        )
       phase = "push"
       queue.push(request, priority=priority)
       if self.stats:
@@ -1269,7 +1284,7 @@ class BackendScheduler:
       if self.stats:
         self.stats.inc_value("scheduler/deserialization_errors")
       return None
-    except (QueueError, CircuitBreakerOpenError):
+    except (QueueError, BackendConnectionError, CircuitBreakerOpenError):
       logger.exception("Failed to get next request")
       return None
     else:
@@ -1283,7 +1298,12 @@ class BackendScheduler:
     """
     try:
       return len(self) > 0
-    except (NotImplementedError, QueueError):
+    except (
+      NotImplementedError,
+      QueueError,
+      BackendConnectionError,
+      CircuitBreakerOpenError,
+    ):
       logger.warning(
         "Queue length lookup is unavailable; assuming pending requests exist"
       )

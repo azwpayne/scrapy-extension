@@ -22,7 +22,11 @@ from scrapy import Request, Spider
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
-from scrapy_extension.exceptions import QueueError, SerializationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  QueueError,
+  SerializationError,
+)
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -302,16 +306,45 @@ class TestBackpressureLenErrorDegradesToPop:
     assert scheduler._backpressure_paused is False
 
 
-def test_next_request_degrades_when_queue_circuit_is_open() -> None:
-  """A fail-fast circuit rejection is a temporary empty poll, not a crash."""
+@pytest.mark.parametrize(
+  "transient_error",
+  [
+    CircuitBreakerOpenError("redis-queue"),
+    BackendConnectionError("redis reconnect exhausted"),
+  ],
+)
+def test_next_request_degrades_during_transient_backend_outage(
+  transient_error: Exception,
+) -> None:
+  """Circuit rejection or failed reconnect is an empty poll, not a crash."""
   manager = MagicMock(name="ConnectionManager")
   scheduler = BackendScheduler(connection_manager=manager)
   queue = MagicMock(name="BackendQueue")
-  queue.pop.side_effect = CircuitBreakerOpenError("redis-queue")
+  queue.pop.side_effect = transient_error
   scheduler._queue = queue
 
   assert scheduler.next_request() is None
   queue.pop.assert_called_once_with(timeout=0)
+
+
+@pytest.mark.parametrize(
+  "transient_error",
+  [
+    CircuitBreakerOpenError("redis-queue"),
+    BackendConnectionError("redis reconnect exhausted"),
+  ],
+)
+def test_has_pending_requests_stays_conservative_during_transient_outage(
+  transient_error: Exception,
+) -> None:
+  """An unavailable depth source must never make Scrapy declare idle."""
+  manager = MagicMock(name="ConnectionManager")
+  scheduler = BackendScheduler(connection_manager=manager)
+  queue = MagicMock(name="BackendQueue")
+  queue.__len__.side_effect = transient_error
+  scheduler._queue = queue
+
+  assert scheduler.has_pending_requests() is True
 
 
 class TestBackpressureStatsNoneAndFallthrough:
@@ -431,6 +464,31 @@ class TestEnqueueDedupReservation:
     assert scheduler.enqueue_request(request) is True
     assert len(membership_filter) == 1
     assert queue.push.call_count == 2
+
+  def test_degraded_dedup_miss_does_not_roll_back_uncreated_reservation(
+    self,
+    mocker,
+  ) -> None:
+    """An open circuit admits a request but creates no fingerprint to undo."""
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = mocker.Mock(name="membership_filter")
+    membership_filter.add.side_effect = CircuitBreakerOpenError("redis-set")
+    membership_filter.saturation = None
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("queue unavailable")
+    scheduler._queue = queue
+
+    request = Request("https://example.com/no-reservation")
+    assert scheduler.enqueue_request(request) is False
+    membership_filter.remove.assert_not_called()
 
   def test_reservation_precedes_push_and_filters_reentrant_duplicate(self) -> None:
     manager = MagicMock(name="ConnectionManager")

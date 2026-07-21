@@ -125,27 +125,47 @@ speculative work.
   crashes.
 - [x] **RUN-02 — reconnect contract.** A manager with a disconnected backend
   must actually reconnect instead of returning solely because an object exists.
+- [x] **RUN-05 — reconnect generation fencing.** A retained proxy from a
+  retired connection generation must not be able to reopen the replacement
+  generation's circuit breaker when its in-flight call finishes late.
+- [x] **RUN-06 — dedup reservation provenance.** Roll back a fingerprint after
+  a failed queue push only when that exact request check created a reservation;
+  transient reconnect failures must remain scheduler-safe on poll and depth
+  paths.
 - [ ] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
-  acquisition so consumer-bearing backends are not accidentally shared across
-  spiders.
+  acquisition for crawler-owned construction, and use an unshareable fallback
+  for unresolved direct construction, so Kafka and RocketMQ consumers are not
+  accidentally shared across spiders. Apply the same isolation to backend
+  spider mixins without mutating a manager's registry key after acquisition.
 - [ ] **RUN-04 — replacement-request acknowledgement.** Transfer/defer the
   source token until a replacement request is durably accepted; distinguish
   "replacement committed, source ack failed" from a failed push so dedup state
-  is not rolled back.
+  is not rolled back. Preserve the same invariant for errback-returned requests
+  and iterables, and explicitly document the unavoidable publish/ack crash gap.
 - [ ] **SEC-01 — credential completeness.** Reject partial credential pairs and
-  mechanism-inconsistent authentication for Kafka, MongoDB, Elasticsearch, and
-  RocketMQ without exposing secret values.
+  mechanism-inconsistent authentication for Kafka, MongoDB, Elasticsearch,
+  RabbitMQ, RocketMQ, SQS, and DynamoDB without exposing secret values. Preserve
+  valid ambient-credential and mechanism-specific modes rather than requiring
+  a universal username/password pair.
 - [ ] **SEC-02 — cloud transport.** Reject explicit plaintext AWS endpoints in
   cloud mode; expose and propagate RocketMQ TLS, then require it for cloud mode
   with migration notes.
-- [ ] **BACKEND-01 — Kafka assignment epoch.** Invalidate stale ack/nack tokens
-  on rebalance and queue clear; wait for asynchronous topic deletion before
-  recreation.
-- [ ] **BACKEND-02 — Elasticsearch contention.** Never report an empty queue
-  solely because optimistic-claim conflicts exhausted a small retry count.
-- [ ] **BACKEND-03 — DynamoDB read-after-write.** Use consistent reads for
-  retrieve, exists, and TTL where the storage contract promises immediate
-  visibility.
+- [ ] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
+  by the locked Pulsar client, propagate hostname validation, and prove the TLS
+  branch with a real-signature smoke test.
+- [ ] **BACKEND-01 — Kafka token generations.** Fence acknowledgement tokens by
+  backend incarnation, assignment epoch, and delivery attempt; invalidate them
+  on rebalance, nack, and clear. Validate admin responses and wait for topic
+  deletion before recreation.
+- [ ] **BACKEND-02 — Elasticsearch commit ambiguity.** Never report an empty
+  queue solely because optimistic-claim conflicts exhausted a small retry
+  count. Give pushes stable identities, make claim/delete/set writes safe under
+  ambiguous transport outcomes, reject partial search/count results, and make
+  clear cover unrefreshed writes.
+- [ ] **BACKEND-03 — DynamoDB consistency and clear scope.** Use consistent reads
+  where the storage contract promises immediate visibility, preserve an empty
+  string as a real prefix instead of a whole-table clear, and enforce DynamoDB's
+  item-size and persisted-value error boundaries.
 
 ### Verified P2 follow-ups
 
@@ -164,6 +184,8 @@ correctness work:
   explicit ownership semantics;
 - resolve the ambiguous legacy request-body codec with a versioned migration
   policy rather than another decode heuristic;
+- add low-noise metrics for repeated circuit-open polls instead of logging a
+  traceback on every scheduler heartbeat;
 - align examples, release runbook commands, plugin example semantics, and
   remaining historical-document links with current behaviour.
 
@@ -253,7 +275,23 @@ circuit rejection alongside queue failures; deduplication routes the same
 rejection through its existing warn-once, error-counter, not-seen degradation
 path without swallowing configuration failures. Explicit reconnect performs an
 unlocked health probe, atomically detaches and cleans up a stale generation,
-resets its circuit breaker, and publishes a fresh backend through the existing
-serialized retry transaction. The three regressions passed on Python 3.10 and
-3.14; 102 connection-manager tests, 74 scheduler/dupefilter tests, the full
-2,918-test suite with 44 skips, Ruff, and strict mypy all passed.
+creates a fresh circuit-breaker generation, and publishes a fresh backend
+through the existing serialized retry transaction. The three regressions passed
+on Python 3.10 and 3.14; 102 connection-manager tests, 74 scheduler/dupefilter
+tests, the full 2,918-test suite with 44 skips, Ruff, and strict mypy all passed.
+
+### I7 follow-up — generation-isolated outage recovery
+
+A fresh-eyes audit disproved two assumptions left by the first I7 patch. A
+retained proxy binds the old breaker as well as the old backend, so resetting
+that shared object allowed a late retired-backend failure to trip the fresh
+connection. Also, a dedup "not seen" result during degradation did not prove a
+fingerprint had been written, so unconditional compensation could remove an
+unrelated marker after the queue push failed. Reconnect now installs a new
+breaker with the same immutable policy, while old proxies retain the retired
+generation. The bundled dupefilter records reservation provenance by request
+identity and exposes a one-shot scheduler handshake; custom dupefilters retain
+the legacy fallback. Poll and pending-depth paths now also contain typed
+reconnect exhaustion. Six focused regressions passed on Python 3.10 and 3.14;
+142 breaker/connection tests, 106 scheduler/dupefilter tests, the full
+2,923-test suite with 44 skips, Ruff, and strict mypy all passed.

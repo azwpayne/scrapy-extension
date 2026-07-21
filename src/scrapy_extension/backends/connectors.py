@@ -1025,11 +1025,12 @@ class ConnectionManager:
       except Exception as exc:
         logger.warning("Error disconnecting stale backend: %s", exc)
       self._notify_monitor("on_disconnect", str(self.backend_type), None)
-      # Proxies resolve the newly published backend lazily, but share this
-      # breaker. An explicit reconnect is a new connection generation, so it
-      # must not inherit the old generation's OPEN state.
+      # Proxies bind both backend and breaker at construction. A retained old
+      # proxy can finish after reconnect; resetting the SAME breaker lets that
+      # late outcome trip the replacement backend. Give each connection
+      # generation a distinct breaker so old calls can only mutate old state.
       if self._breaker is not None:
-        self._breaker.reset()
+        self._breaker = self._breaker.new_generation()
 
     retry_attempts, retry_delay = self._retry_policy()
     total_attempts = retry_attempts + 1

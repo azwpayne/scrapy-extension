@@ -162,6 +162,26 @@ class CircuitBreaker:
       self._last_failure_time = None
       self._probe_in_flight = False
 
+  def new_generation(self) -> CircuitBreaker:
+    """Return a CLOSED breaker with the same immutable configuration.
+
+    Backend reconnect replaces one connection generation with another. A
+    retained proxy can still finish an old in-flight call after that point;
+    giving the replacement backend a distinct breaker prevents that late
+    outcome from mutating the new generation's availability state.
+
+    Returns:
+        A fresh breaker with identical name, thresholds, clock, and failure
+        exception policy.
+    """
+    return CircuitBreaker(
+      self.name,
+      failure_threshold=self.failure_threshold,
+      reset_timeout=self.reset_timeout,
+      time_fn=self._time_fn,
+      failure_exceptions=self.failure_exceptions,
+    )
+
   def _now(self) -> float:
     """Read the current monotonic time via the injected clock."""
     return self._time_fn()

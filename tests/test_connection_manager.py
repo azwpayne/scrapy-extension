@@ -383,6 +383,86 @@ def test_connect_replaces_existing_disconnected_backend(mocker):
   assert manager._backend is replacement
 
 
+def test_reconnect_isolates_breaker_from_retired_backend_failures(mocker):
+  """A late old-generation failure cannot trip the replacement generation."""
+  from scrapy_extension.backends.base import Backend, QueueBackend
+  from scrapy_extension.backends.circuit_breaker import (
+    BreakerState,
+    CircuitBreaker,
+  )
+  from scrapy_extension.exceptions import BackendError, QueueError
+
+  class _QueueBackend(Backend, QueueBackend):
+    def __init__(self, name: str) -> None:
+      self.name = name
+      self.connected = True
+      self.connect_mock = mocker.Mock(name=f"{name}.connect")
+      self.disconnect_mock = mocker.Mock(name=f"{name}.disconnect")
+      self.pop_mock = mocker.Mock(name=f"{name}.pop", return_value=None)
+
+    @property
+    def backend_type(self) -> BackendType:
+      return BackendType.REDIS
+
+    def connect(self) -> None:
+      self.connect_mock()
+      self.connected = True
+
+    def disconnect(self) -> None:
+      self.disconnect_mock()
+      self.connected = False
+
+    def is_connected(self) -> bool:
+      return self.connected
+
+    def ping(self) -> bool:
+      return self.connected
+
+    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+      del queue_name, item, priority
+
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+      return self.pop_mock(queue_name, timeout)
+
+    def queue_len(self, queue_name: str) -> int:
+      del queue_name
+      return 0
+
+    def clear_queue(self, queue_name: str) -> None:
+      del queue_name
+
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 0})
+  retired = _QueueBackend("retired-backend")
+  manager._backend = retired
+  retired_breaker = CircuitBreaker(
+    "redis-backend",
+    failure_threshold=1,
+    failure_exceptions=(BackendError,),
+  )
+  manager._breaker = retired_breaker
+  manager._breaker_configured = True
+  retired_proxy = manager.get_queue_backend()
+
+  replacement = _QueueBackend("replacement-backend")
+  replacement.pop_mock.return_value = b"fresh"
+  retired.connected = False
+  mocker.patch.object(manager, "_create_backend", return_value=replacement)
+
+  manager.connect()
+  replacement_proxy = manager.get_queue_backend()
+
+  assert manager._breaker is not retired_breaker
+  retired.pop_mock.side_effect = QueueError("late retired failure")
+  with pytest.raises(QueueError, match="late retired failure"):
+    retired_proxy.pop("queue")
+
+  assert retired_breaker.state is BreakerState.OPEN
+  assert manager._breaker is not None
+  assert manager._breaker.state is BreakerState.CLOSED
+  assert replacement_proxy.pop("queue") == b"fresh"
+  replacement.pop_mock.assert_called_once_with("queue", 0.0)
+
+
 def test_backend_property_concurrent_first_connect_single_connect(mocker):
   """A2 + thread-safety: when N threads hit the ``backend`` property
   concurrently on a fresh manager, exactly ONE ``connect()`` runs and all
