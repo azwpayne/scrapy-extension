@@ -89,10 +89,11 @@ global gates, then perform a fresh audit before selecting the next item.
 | I5 | Adapt pipeline hooks to current Scrapy calling conventions | no pipeline deprecation warning; old and new hook calls work |
 | I6 | Enforce plugin descriptor isolation and validation | malformed/duplicate plugins cannot replace or abort bundled discovery |
 | I7 | Close simple runtime failure-boundary gaps | breaker-open queue/dedup paths degrade safely; explicit reconnect works |
-| I8 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
-| I9 | Repair multi-spider and acknowledgement lifecycle invariants | spider scopes are isolated; replacement requests never acknowledge early |
-| I10 | Repair backend-specific P1 correctness | Kafka assignment epochs, ES contention, DynamoDB consistent reads |
-| I11 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
+| I8 | Preserve the replacement enqueue commit boundary | a source-ack failure cannot reject a committed replacement or undo dedup |
+| I9 | Harden configuration security invariants | partial credentials and insecure cloud endpoint combinations fail fast |
+| I10 | Repair multi-spider and remaining acknowledgement invariants | spider scopes are isolated; errback replacements never acknowledge early |
+| I11 | Repair backend-specific P1 correctness | Kafka assignment epochs, ES contention, DynamoDB consistent reads |
+| I12 | Re-audit contracts, docs, CI, and remaining P2 items | stop condition met or next bounded iteration selected |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -137,11 +138,14 @@ speculative work.
   for unresolved direct construction, so Kafka and RocketMQ consumers are not
   accidentally shared across spiders. Apply the same isolation to backend
   spider mixins without mutating a manager's registry key after acquisition.
-- [ ] **RUN-04 — replacement-request acknowledgement.** Transfer/defer the
-  source token until a replacement request is durably accepted; distinguish
-  "replacement committed, source ack failed" from a failed push so dedup state
-  is not rolled back. Preserve the same invariant for errback-returned requests
-  and iterables, and explicitly document the unavoidable publish/ack crash gap.
+- [x] **RUN-04A — post-commit source acknowledgement.** Once a replacement is
+  durably pushed, a source-token ack failure remains observable but cannot
+  reject the push or roll back its dedup reservation; retain the unresolved
+  token and let broker redelivery reach the duplicate-ack path.
+- [ ] **RUN-04B — errback replacement acknowledgement.** Transfer/defer the
+  source token for requests and iterables returned by user errbacks until each
+  replacement is durably accepted. Explicitly document the unavoidable
+  publish/ack crash gap and define safe behavior for delayed local strategies.
 - [ ] **SEC-01 — credential completeness.** Reject partial credential pairs and
   mechanism-inconsistent authentication for Kafka, MongoDB, Elasticsearch,
   RabbitMQ, RocketMQ, SQS, and DynamoDB without exposing secret values. Preserve
@@ -295,3 +299,18 @@ the legacy fallback. Poll and pending-depth paths now also contain typed
 reconnect exhaustion. Six focused regressions passed on Python 3.10 and 3.14;
 142 breaker/connection tests, 106 scheduler/dupefilter tests, the full
 2,923-test suite with 44 skips, Ruff, and strict mypy all passed.
+
+### I8 — committed replacement acknowledgement boundary
+
+Two regressions demonstrated that `BackendQueue` first committed a retry or
+redirect replacement, then allowed a failed source ack to escape as though the
+push itself had failed. The scheduler consequently returned `False`, removed
+the replacement's fingerprint, and allowed the broker's source redelivery to
+publish another copy. The strategy push is now the explicit commit boundary:
+post-commit ack failures increment `scheduler/ack_error`, retain the unresolved
+token, and log the terminal failure without changing the accepted push result.
+The reserved fingerprint therefore routes source redelivery through the
+existing duplicate-ack recovery path. The two focused regressions and all 167
+queue/scheduler acknowledgement tests passed; the focused regressions also
+passed on Python 3.14. The full suite passed 2,925 tests with 44 skips, followed
+by Ruff and strict mypy.

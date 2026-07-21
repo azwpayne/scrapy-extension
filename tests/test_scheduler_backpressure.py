@@ -27,6 +27,7 @@ from scrapy_extension.exceptions import (
   QueueError,
   SerializationError,
 )
+from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -489,6 +490,48 @@ class TestEnqueueDedupReservation:
     request = Request("https://example.com/no-reservation")
     assert scheduler.enqueue_request(request) is False
     membership_filter.remove.assert_not_called()
+
+  def test_committed_replacement_ack_failure_keeps_dedup_reservation(
+    self,
+    mocker,
+  ) -> None:
+    """A committed replacement stays accepted while its source redelivers."""
+    manager = MagicMock(name="ConnectionManager")
+    backend = manager.get_queue_backend.return_value
+    backend.ack.side_effect = QueueError("source ack failed")
+    strategy = MagicMock(name="QueueStrategy")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+    )
+    counts, stats = _stats_counter()
+    spider = mocker.Mock(name="Spider")
+    spider.crawler.stats = stats
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="test_queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+      stats=stats,
+    )
+    scheduler._queue = queue
+
+    request = Request(
+      "https://example.com/replacement",
+      meta={"_backend_ack_token": "old-token"},
+    )
+    assert scheduler.enqueue_request(request) is True
+
+    strategy.push.assert_called_once()
+    assert len(membership_filter) == 1
+    assert counts.get("scheduler/ack_error") == 1
+    assert counts.get("scheduler/queue_error") is None
+    assert request.meta["_backend_ack_token"] == "old-token"
 
   def test_reservation_precedes_push_and_filters_reentrant_duplicate(self) -> None:
     manager = MagicMock(name="ConnectionManager")

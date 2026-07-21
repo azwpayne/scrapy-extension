@@ -356,8 +356,23 @@ class BackendQueue:
       # This push already owns an operation lease. Use the admitted primitive
       # directly so a concurrent close cannot reject the terminal ack between
       # the replacement enqueue and completion of this push.
-      self._ack(token=replacement_ack_token)
-      request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+      try:
+        self._ack(token=replacement_ack_token)
+      except Exception:  # noqa: BLE001 - replacement is already committed
+        # The strategy push is the commit boundary. Reclassifying this as a
+        # failed enqueue makes the scheduler roll back its dedup reservation
+        # and can let the broker's source redelivery publish a second
+        # replacement. Keep the token unresolved, report the terminal failure,
+        # and return success for the durable replacement. A later redelivery is
+        # filtered as a duplicate and gets another chance to ack its own token.
+        self._inc_stat("scheduler/ack_error")
+        logger.exception(
+          "Failed to acknowledge source delivery after replacement committed "
+          "to queue %r",
+          self.queue_name,
+        )
+      else:
+        request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
     try:
       self._monitor.on_push(self.queue_name, priority)
     except Exception:  # noqa: BLE001 - enqueue has already committed

@@ -355,7 +355,9 @@ Differential diagnosis:
   rejecting ack/nack commits on a deferred-ack backend. Native broker redelivery
   may keep delivery moving, but duplicates rise —
   check broker connectivity/permissions and watch `dupefilter/filtered` for the
-  redelivery side-effect.
+  redelivery side-effect. If the failure follows a committed retry/redirect
+  replacement, that replacement remains accepted and dedup-reserved; the source
+  token stays unresolved so broker redelivery can reach the duplicate-ack path.
 
 ## Poison payload handling
 

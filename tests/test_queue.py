@@ -628,6 +628,32 @@ class TestBackendQueuePush:
     )
     assert "_backend_ack_token" not in request.meta
 
+  def test_committed_replacement_survives_source_ack_failure(
+    self, mock_connection_manager, mocker
+  ):
+    """A post-commit ack failure must not reclassify the push as rejected."""
+    strategy = mocker.MagicMock()
+    backend = mock_connection_manager.get_queue_backend.return_value
+    backend.ack.side_effect = QueueError("source ack failed")
+    spider = mocker.Mock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    request = Request(
+      url="https://example.com/retry",
+      meta={"_backend_ack_token": "old-token"},
+    )
+
+    queue.push(request)
+
+    strategy.push.assert_called_once()
+    backend.ack.assert_called_once_with("test_queue", token="old-token")
+    assert request.meta["_backend_ack_token"] == "old-token"
+    spider.crawler.stats.inc_value.assert_any_call("scheduler/ack_error")
+
   def test_push_failure_keeps_original_delivery_unacked(
     self, mock_connection_manager, mock_spider, mocker
   ):
