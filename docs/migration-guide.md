@@ -311,6 +311,17 @@ worker's deliveries, disconnect, wait for the broker to requeue them, reconnect,
 and then retry clear. A pending delivery on another queue does not block the
 target queue.
 
+RabbitMQ no longer treats repeated `connect()` as an implicit session
+replacement. A healthy call is idempotent, and queue durability, auto-delete,
+exclusivity, maximum-priority, and delivery-mode values stay fixed for that
+connection generation. Code that mutates `RabbitMQSettings` after startup must
+call `disconnect()` and then `connect()` before expecting the new policy. Teardown
+immediately invalidates the published session and any private candidate; an
+old acknowledgement token becomes a local no-op, and a timed pop interrupted
+by reconnect raises `QueueError` rather than consuming from the new channel.
+Budget for closing the old Pika channel/connection when explicitly replacing
+an unhealthy generation because that close is the broker redelivery boundary.
+
 RocketMQ delivery tokens now serialize ack and nack across the broker call.
 After either action succeeds, every later settlement for that token is a no-op;
 if the client call raises, the token remains locally pending and may be retried.

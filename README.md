@@ -174,6 +174,11 @@ must use verified TLS (`amqps://` or `SCRAPY_RABBITMQ_SSL_ENABLED=True`) with
 matching. Optional mTLS requires both `SCRAPY_RABBITMQ_SSL_CERTFILE` and
 `SCRAPY_RABBITMQ_SSL_KEYFILE`. Publishes use `mandatory=True` and synchronous
 publisher confirms; an unroutable or broker-nacked publish raises `QueueError`.
+One fully prepared connection/channel pair is published as a generation. A
+live `connect()` is idempotent; use an explicit `disconnect()` / `connect()` to
+apply changed queue policy or connection settings. Disconnect immediately
+fences private candidates and stale acknowledgement tokens, and a timed pop
+fails rather than crossing onto a replacement channel.
 
 ### ElasticSearch (standalone, cloud)
 

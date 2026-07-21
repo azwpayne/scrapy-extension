@@ -274,7 +274,7 @@ speculative work.
 - [x] **CONCURRENCY-01B — SQS client generations.** Bind the SDK client, queue
   URL and lifecycle caches, and issued receipt tokens to one generation; make
   disconnect a continuous barrier rather than a short per-queue pulse.
-- [ ] **CONCURRENCY-01C — RabbitMQ connection generations.** Keep candidates
+- [x] **CONCURRENCY-01C — RabbitMQ connection generations.** Keep candidates
   private, make live connect idempotent, preserve a healthy session after a
   failed candidate, and retire old unacknowledged deliveries through close.
 - [ ] **CONCURRENCY-01D — DynamoDB table generations.** Publish resource/table
@@ -1108,3 +1108,35 @@ take effect; the shared AWS region validator is also rerun before client I/O.
 All 512 related tests passed on Python 3.10 and 3.14 with one real-SQS test
 explicitly skipped; the full Python 3.10 suite passed 3,225 tests with 46
 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I32 — RabbitMQ immutable connection generations
+
+Four initial deterministic REDs showed that repeated `connect()` replaced and
+leaked a healthy Pika session, candidate preparation failure could clear a
+healthy peer's shared handles, disconnect could return before a private
+candidate later resurrected the backend, and replacement left the old handles
+open. The implementation audit added four more guards for queued connect
+intents, retirement-before-replacement ordering, per-generation queue policy,
+and timeout polling across reconnect. Post-implementation fan-out found two
+additional RED outcomes: reconnect could publish while disconnect was still
+closing an old unacknowledged generation, and the public `exclusive` queue
+setting was silently omitted from Pika declaration and the snapshot.
+
+RabbitMQ now serializes connection construction, builds mode-specific
+connection/channel candidates without touching published state, and publishes
+the complete channel session only after a lifecycle-epoch check. Healthy
+connect is idempotent. Disconnect atomically advances the epoch and detaches the
+published generation, so both an in-progress candidate and every already
+queued connect intent become stale and close or return without resurrection.
+An unhealthy generation is closed before its successor is constructed, and a
+dedicated retirement barrier prevents any new generation from publishing until
+a concurrent disconnect has closed the old handles. This makes channel close
+the explicit broker redelivery boundary. Queue durability, auto-delete,
+exclusivity, maximum-priority, and delivery mode come from the validated
+connection snapshot, and a timed basic-get loop remains pinned to its starting
+channel generation.
+
+All 142 local RabbitMQ tests passed on Python 3.10 and 3.14 with five
+real-broker tests explicitly skipped; the full Python 3.10 suite passed 3,234
+tests with 46 documented skips. Ruff, strict mypy, Bandit, lockfile validation,
+and patch integrity remained green.

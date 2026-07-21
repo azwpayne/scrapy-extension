@@ -318,6 +318,19 @@ visibility changes with an explicit `disconnect()` / `connect()` sequence;
 receipt tokens from the retired generation are locally stale and must never be
 replayed through the replacement client.
 
+RabbitMQ publishes a connection and prepared channel as one generation. A live
+`connect()` is intentionally idempotent; roll queue-policy or endpoint changes
+with `disconnect()` / `connect()`. Disconnect detaches the current generation
+and advances its lifecycle fence before closing handles, so it may return while
+a slow private candidate is still unwinding; that candidate will close locally
+and cannot resurrect the backend. Replacing an already unhealthy published
+session closes the old channel and connection before the new candidate is
+created, allowing RabbitMQ to recover unacknowledged deliveries. A concurrent
+connect also waits for disconnect to finish retiring published handles before
+it constructs the successor. Treat a `QueueError` from a timed pop during
+reconnect as an interrupted operation and retry through the caller's normal
+queue loop.
+
 Every successful `ConnectionManager.get_manager()` acquisition must be paired
 with exactly one `close()`. The registry is reference-counted; releasing the
 same acquisition twice can prematurely retire a manager still expected by a

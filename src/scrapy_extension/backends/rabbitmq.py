@@ -127,9 +127,23 @@ class _RabbitMQConnectionSnapshot:
   retry_delay: int
   prefetch_count: int
   prefetch_size: int
+  durable: bool
+  auto_delete: bool
+  exclusive: bool
+  max_priority: int
+  delivery_mode: Literal[1, 2]
   ha_mode: str | None
   ha_params: str | None
   ha_sync_mode: str
+
+
+@dataclass(frozen=True)
+class _RabbitMQCandidate:
+  """A fully prepared connection generation that is not yet published."""
+
+  connection: pika.BlockingConnection
+  channel: pika.channel.Channel
+  snapshot: _RabbitMQConnectionSnapshot
 
 
 class RabbitMQBackend(Backend, QueueBackend):
@@ -161,9 +175,19 @@ class RabbitMQBackend(Backend, QueueBackend):
         config: Configuration for RabbitMQ connection.
     """
     self.config = config
+    self._connect_lock = threading.Lock()
+    # Serializes retirement of published handles with the next publication.
+    # Private candidate construction remains outside this lock, so disconnect
+    # never waits for an unbounded network connect attempt.
+    self._retirement_lock = threading.Lock()
     self._connection: pika.BlockingConnection | None = None
     self._channel: pika.channel.Channel | None = None
+    self._connection_snapshot: _RabbitMQConnectionSnapshot | None = None
     self._channel_generation = 0
+    # Captured when connect() is entered, before waiting for the single-flight
+    # lock. disconnect() advances it at its retirement linearization point so
+    # both an in-progress candidate and already-queued intents are fenced.
+    self._lifecycle_epoch = 0
     # Ack operations use this immutable snapshot instead of ``_channel`` so
     # a reconnect between validation and the broker call cannot redirect an
     # old token to the new channel.
@@ -190,6 +214,91 @@ class RabbitMQBackend(Backend, QueueBackend):
     self._ssl_warning_emitted: bool = False
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
+
+  def _session_is_healthy_locked(self) -> bool:
+    """Return whether the atomically published channel session is usable."""
+    session = self._channel_session
+    if session is None:
+      return False
+    _generation, session_channel = session
+    try:
+      return bool(
+        self._connection is not None
+        and self._connection.is_open
+        and session_channel is not None
+        and self._channel is session_channel
+        and getattr(session_channel, "is_open", False)
+      )
+    except Exception:
+      return False
+
+  def _capture_connect_intent(self) -> tuple[int, bool]:
+    """Capture teardown epoch before waiting for the connect single-flight."""
+    with self._delivery_lock:
+      return self._lifecycle_epoch, self._session_is_healthy_locked()
+
+  @staticmethod
+  def _close_handles(
+    channel: pika.channel.Channel | None,
+    connection: pika.BlockingConnection | None,
+    *,
+    keep_channel: pika.channel.Channel | None = None,
+    keep_connection: pika.BlockingConnection | None = None,
+  ) -> None:
+    """Best-effort close a detached or losing connection generation."""
+    if channel is not None and channel is not keep_channel:
+      with contextlib.suppress(Exception):
+        channel.close()
+    if connection is not None and connection is not keep_connection:
+      with contextlib.suppress(Exception):
+        connection.close()
+
+  def _publish_handles_locked(
+    self,
+    connection: pika.BlockingConnection,
+    channel: pika.channel.Channel,
+    *,
+    snapshot: _RabbitMQConnectionSnapshot | None,
+  ) -> tuple[
+    pika.channel.Channel | None,
+    pika.BlockingConnection | None,
+  ]:
+    """Install one complete session while holding ``_delivery_lock``."""
+    old_channel = self._channel
+    old_connection = self._connection
+    self._declared_queues.clear()
+    self._last_delivery_tag = None
+    self._last_delivery_queue = None
+    self._in_flight_tags.clear()
+    self._pending_deliveries.clear()
+    self._channel_generation += 1
+    self._connection = connection
+    self._channel = channel
+    self._connection_snapshot = snapshot
+    # Publish the complete ack session last. Readers see either the old
+    # generation or this fully installed channel, never a mixed pair.
+    self._channel_session = (self._channel_generation, channel)
+    return old_channel, old_connection
+
+  def _detach_handles_locked(
+    self,
+  ) -> tuple[
+    pika.channel.Channel | None,
+    pika.BlockingConnection | None,
+  ]:
+    """Detach one published generation while holding ``_delivery_lock``."""
+    channel = self._channel
+    connection = self._connection
+    self._channel_session = None
+    self._channel = None
+    self._connection = None
+    self._connection_snapshot = None
+    self._declared_queues.clear()
+    self._last_delivery_tag = None
+    self._last_delivery_queue = None
+    self._in_flight_tags.clear()
+    self._pending_deliveries.clear()
+    return channel, connection
 
   def _capture_connection_snapshot(self) -> _RabbitMQConnectionSnapshot:
     """Capture and revalidate every value consumed by one connect attempt."""
@@ -232,6 +341,11 @@ class RabbitMQBackend(Backend, QueueBackend):
     retry_delay = self.config.retry_delay
     prefetch_count = self.config.prefetch_count
     prefetch_size = self.config.prefetch_size
+    durable = self.config.durable
+    auto_delete = self.config.auto_delete
+    exclusive = self.config.exclusive
+    max_priority = self.config.max_priority
+    delivery_mode = self.config.delivery_mode
     ha_mode = self.config.ha_mode
     ha_params = self.config.ha_params
     ha_sync_mode = self.config.ha_sync_mode
@@ -277,6 +391,34 @@ class RabbitMQBackend(Backend, QueueBackend):
           f"RabbitMQ {setting_name} must be an integer >= {minimum}.",
           setting_name=setting_name,
         )
+    for setting_name, value in (
+      ("durable", durable),
+      ("auto_delete", auto_delete),
+      ("exclusive", exclusive),
+    ):
+      if not isinstance(value, bool):
+        raise ConfigurationError(
+          f"RabbitMQ {setting_name} must be a boolean.",
+          setting_name=setting_name,
+        )
+    if (
+      isinstance(max_priority, bool)
+      or not isinstance(max_priority, int)
+      or not 1 <= max_priority <= 255
+    ):
+      raise ConfigurationError(
+        "RabbitMQ max_priority must be an integer between 1 and 255.",
+        setting_name="max_priority",
+      )
+    if (
+      isinstance(delivery_mode, bool)
+      or not isinstance(delivery_mode, int)
+      or delivery_mode not in (1, 2)
+    ):
+      raise ConfigurationError(
+        "RabbitMQ delivery_mode must be either 1 or 2.",
+        setting_name="delivery_mode",
+      )
 
     return _RabbitMQConnectionSnapshot(
       mode=mode,
@@ -297,6 +439,11 @@ class RabbitMQBackend(Backend, QueueBackend):
       retry_delay=retry_delay,
       prefetch_count=prefetch_count,
       prefetch_size=prefetch_size,
+      durable=durable,
+      auto_delete=auto_delete,
+      exclusive=exclusive,
+      max_priority=max_priority,
+      delivery_mode=cast(Literal[1, 2], delivery_mode),
       ha_mode=ha_mode,
       ha_params=ha_params,
       ha_sync_mode=ha_sync_mode,
@@ -311,32 +458,79 @@ class RabbitMQBackend(Backend, QueueBackend):
         BackendConnectionError: If the connection cannot be established.
         ConfigurationError: If the configuration is invalid for the mode.
     """
-    snapshot = self._capture_connection_snapshot()
-    if not snapshot.ssl_enabled and not self._ssl_warning_emitted:
-      logger.warning(
-        "RabbitMQ loopback connection is using plaintext transport. "
-        "Remote endpoints require verified TLS. (warning emitted once per "
-        "backend instance)"
+    request_epoch, already_connected = self._capture_connect_intent()
+    if already_connected:
+      return
+    with self._connect_lock:
+      with self._retirement_lock:
+        with self._delivery_lock:
+          if request_epoch != self._lifecycle_epoch:
+            return
+          if self._session_is_healthy_locked():
+            return
+          old_channel, old_connection = self._detach_handles_locked()
+        # Retire an unhealthy generation before creating a replacement. This
+        # lets the broker recover its unacknowledged deliveries before another
+        # consumer generation becomes visible.
+        self._close_handles(old_channel, old_connection)
+      with self._delivery_lock:
+        if request_epoch != self._lifecycle_epoch:
+          return
+        if self._session_is_healthy_locked():
+          return
+      snapshot = self._capture_connection_snapshot()
+      if not snapshot.ssl_enabled and not self._ssl_warning_emitted:
+        logger.warning(
+          "RabbitMQ loopback connection is using plaintext transport. "
+          "Remote endpoints require verified TLS. (warning emitted once per "
+          "backend instance)"
+        )
+        self._ssl_warning_emitted = True
+      try:
+        if snapshot.mode == RabbitMQMode.STANDALONE:
+          candidate = self._connect_standalone(snapshot)
+        elif snapshot.mode == RabbitMQMode.CLUSTER:
+          candidate = self._connect_cluster(snapshot)
+        else:
+          candidate = self._connect_mirrored_queues(snapshot)
+      except ConfigurationError:
+        raise
+      except Exception:
+        with self._delivery_lock:
+          if request_epoch != self._lifecycle_epoch:
+            return
+        msg = f"Failed to connect to RabbitMQ ({snapshot.mode.value})"
+        raise BackendConnectionError(
+          msg,
+          backend_type="rabbitmq",
+        ) from None
+
+      with self._retirement_lock:
+        with self._delivery_lock:
+          cancelled = request_epoch != self._lifecycle_epoch
+          peer_published = self._session_is_healthy_locked()
+          if not cancelled and not peer_published:
+            old_channel, old_connection = self._publish_handles_locked(
+              candidate.connection,
+              candidate.channel,
+              snapshot=candidate.snapshot,
+            )
+            published = True
+          else:
+            old_channel = None
+            old_connection = None
+            published = False
+
+      if not published:
+        self._close_handles(candidate.channel, candidate.connection)
+        return
+      self._close_handles(
+        old_channel,
+        old_connection,
+        keep_channel=candidate.channel,
+        keep_connection=candidate.connection,
       )
-      self._ssl_warning_emitted = True
-    try:
-      if snapshot.mode == RabbitMQMode.STANDALONE:
-        self._connect_standalone(snapshot)
-      elif snapshot.mode == RabbitMQMode.CLUSTER:
-        self._connect_cluster(snapshot)
-      else:
-        self._connect_mirrored_queues(snapshot)
       logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
-    except ConfigurationError:
-      self.disconnect()
-      raise
-    except Exception:
-      self.disconnect()
-      msg = f"Failed to connect to RabbitMQ ({snapshot.mode.value})"
-      raise BackendConnectionError(
-        msg,
-        backend_type="rabbitmq",
-      ) from None
 
   def _get_ssl_verify_mode(self, mode: str | None = None) -> ssl.VerifyMode:
     """Get SSL verification mode from config.
@@ -410,36 +604,19 @@ class RabbitMQBackend(Backend, QueueBackend):
 
   def _connect_standalone(
     self, snapshot: _RabbitMQConnectionSnapshot | None = None
-  ) -> None:
-    """Connect to standalone RabbitMQ node.
-
-    R14-E: ``_setup_qos`` runs BEFORE the connection/channel are committed
-    to instance state. On QoS failure the freshly-opened channel/connection
-    are closed and ``_channel``/``_connection`` are nulled, so
-    :meth:`is_connected` reports False truthfully instead of True-on-half-
-    init (mirrors the R25-A1 connect-path cleanup pattern in
-    ``connectors.py``).
-    """
+  ) -> _RabbitMQCandidate:
+    """Build a fully prepared standalone candidate without publishing it."""
     if snapshot is None:
       snapshot = self._capture_connection_snapshot()
     parameters = self._build_common_parameters(snapshot=snapshot)
     connection = pika.BlockingConnection(parameters)
     channel = self._open_prepared_channel(connection, snapshot=snapshot)
-    self._activate_channel(connection, channel)
-    logger.debug(
-      "Connected to standalone RabbitMQ at %s:%s", snapshot.host, snapshot.port
-    )
+    return _RabbitMQCandidate(connection, channel, snapshot)
 
   def _connect_cluster(
     self, snapshot: _RabbitMQConnectionSnapshot | None = None
-  ) -> None:
-    """Connect to RabbitMQ cluster.
-
-    Uses cluster_nodes for failover if primary node is unavailable.
-
-    R14-E: QoS runs before ``_connection``/``_channel`` are committed, with
-    null-on-failure cleanup so :meth:`is_connected` stays truthful.
-    """
+  ) -> _RabbitMQCandidate:
+    """Build a prepared cluster candidate without publishing it."""
     if snapshot is None:
       snapshot = self._capture_connection_snapshot()
     if snapshot.cluster_nodes:
@@ -464,8 +641,7 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     connection = pika.BlockingConnection(connection_parameters)
     channel = self._open_prepared_channel(connection, snapshot=snapshot)
-    self._activate_channel(connection, channel)
-    logger.debug("Connected to RabbitMQ cluster")
+    return _RabbitMQCandidate(connection, channel, snapshot)
 
   def _open_prepared_channel(
     self,
@@ -485,9 +661,6 @@ class RabbitMQBackend(Backend, QueueBackend):
           channel.close()
       with contextlib.suppress(Exception):
         connection.close()
-      self._channel_session = None
-      self._channel = None
-      self._connection = None
       raise
 
   def _activate_channel(
@@ -495,23 +668,26 @@ class RabbitMQBackend(Backend, QueueBackend):
     connection: pika.BlockingConnection,
     channel: pika.channel.Channel,
   ) -> None:
-    """Commit a successfully initialized channel as a new ack generation."""
-    with self._delivery_lock:
-      self._declared_queues.clear()
-      self._last_delivery_tag = None
-      self._last_delivery_queue = None
-      self._in_flight_tags.clear()
-      self._pending_deliveries.clear()
-      self._channel_generation += 1
-      self._connection = connection
-      self._channel = channel
-      # Assign the complete session last so ack/pop readers see either the old
-      # session or the new one, never a new channel paired with an old generation.
-      self._channel_session = (self._channel_generation, channel)
+    """Publish prepared handles through the test-compatibility seam."""
+    with self._retirement_lock:
+      with self._delivery_lock:
+        old_channel, old_connection = self._detach_handles_locked()
+      self._close_handles(
+        old_channel,
+        old_connection,
+        keep_channel=channel,
+        keep_connection=connection,
+      )
+      with self._delivery_lock:
+        self._publish_handles_locked(
+          connection,
+          channel,
+          snapshot=None,
+        )
 
   def _connect_mirrored_queues(
     self, snapshot: _RabbitMQConnectionSnapshot | None = None
-  ) -> None:
+  ) -> _RabbitMQCandidate:
     """Connect to RabbitMQ with mirrored queues (HA).
 
     Classic mirrored-queue HA policy (``ha-mode`` / ``ha-params`` /
@@ -527,19 +703,19 @@ class RabbitMQBackend(Backend, QueueBackend):
     # First connect like cluster mode.
     if snapshot is None:
       snapshot = self._capture_connection_snapshot()
-    self._connect_cluster(snapshot)
-    if not (self._channel and snapshot.ha_mode):
-      return
-    logger.warning(
-      "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
-      "ha-sync-mode=%s) is configured but NOT applied via AMQP by this "
-      "client — set it out-of-band via `rabbitmqctl set_policy` or the "
-      "management API. Classic mirroring is deprecated in modern RabbitMQ; "
-      "consider quorum queues for HA.",
-      snapshot.ha_mode,
-      snapshot.ha_params,
-      snapshot.ha_sync_mode,
-    )
+    candidate = self._connect_cluster(snapshot)
+    if snapshot.ha_mode:
+      logger.warning(
+        "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
+        "ha-sync-mode=%s) is configured but NOT applied via AMQP by this "
+        "client — set it out-of-band via `rabbitmqctl set_policy` or the "
+        "management API. Classic mirroring is deprecated in modern RabbitMQ; "
+        "consider quorum queues for HA.",
+        snapshot.ha_mode,
+        snapshot.ha_params,
+        snapshot.ha_sync_mode,
+      )
+    return candidate
 
   def _setup_qos(self) -> None:
     """Set up QoS (Quality of Service) settings on the current channel.
@@ -610,27 +786,15 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
 
   def disconnect(self) -> None:
-    """Close RabbitMQ connection."""
+    """Fence connect intents, detach the live generation, and close it."""
     # Invalidate the ack session before closing either handle. A concurrent
     # stale completion can at worst retain the old channel snapshot; it can
     # never be redirected to a later channel.
-    with self._delivery_lock:
-      channel = self._channel
-      connection = self._connection
-      self._channel_session = None
-      self._channel = None
-      self._connection = None
-      self._declared_queues.clear()
-      self._last_delivery_tag = None
-      self._last_delivery_queue = None
-      self._in_flight_tags.clear()
-      self._pending_deliveries.clear()
-    if channel is not None:
-      with contextlib.suppress(Exception):
-        channel.close()
-    if connection is not None:
-      with contextlib.suppress(Exception):
-        connection.close()
+    with self._retirement_lock:
+      with self._delivery_lock:
+        self._lifecycle_epoch += 1
+        channel, connection = self._detach_handles_locked()
+      self._close_handles(channel, connection)
     # R-mq-reconnect: ack tracking was cleared before closing so it cannot leak
     # to the next channel.
     # Delivery tags are channel-scoped — a tag from the closed channel is
@@ -649,15 +813,8 @@ class RabbitMQBackend(Backend, QueueBackend):
     Returns:
         True if connection is available.
     """
-    try:
-      return bool(
-        self._connection is not None
-        and self._connection.is_open
-        and self._channel is not None
-        and self._channel.is_open
-      )
-    except Exception:
-      return False
+    with self._delivery_lock:
+      return self._session_is_healthy_locked()
 
   def ping(self) -> bool:
     """Check RabbitMQ health.
@@ -667,6 +824,31 @@ class RabbitMQBackend(Backend, QueueBackend):
     resource leaks from repeated channel allocation.
     """
     return self.is_connected()
+
+  def _queue_policy_locked(
+    self,
+  ) -> tuple[bool, bool, bool, int, Literal[1, 2]]:
+    """Return queue policy frozen for the published connection generation."""
+    snapshot = self._connection_snapshot
+    if snapshot is not None:
+      return (
+        snapshot.durable,
+        snapshot.auto_delete,
+        snapshot.exclusive,
+        snapshot.max_priority,
+        snapshot.delivery_mode,
+      )
+    # ``_activate_channel`` remains as a test/private compatibility seam. Such
+    # synthetic sessions have no validated connect snapshot, so retain the
+    # historical settings fallback for them.
+    delivery_mode: Literal[1, 2] = 1 if self.config.delivery_mode == 1 else 2
+    return (
+      self.config.durable,
+      self.config.auto_delete,
+      self.config.exclusive,
+      self.config.max_priority,
+      delivery_mode,
+    )
 
   @property
   def backend_type(self) -> BackendType:
@@ -702,12 +884,16 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
     if queue_name in self._declared_queues:
       return
+    durable, auto_delete, exclusive, max_priority, _delivery_mode = (
+      self._queue_policy_locked()
+    )
     try:
       self._channel.queue_declare(
         queue=queue_name,
-        durable=self.config.durable,
-        auto_delete=self.config.auto_delete,
-        arguments={"x-max-priority": self.config.max_priority},
+        durable=durable,
+        auto_delete=auto_delete,
+        exclusive=exclusive,
+        arguments={"x-max-priority": max_priority},
       )
     except AMQPError as e:
       error_text = str(e)
@@ -715,8 +901,10 @@ class RabbitMQBackend(Backend, QueueBackend):
         msg = (
           f"Queue {queue_name} exists with incompatible arguments: {e}. "
           f"Drop the queue first or align config "
-          f"(durable={self.config.durable}, "
-          f"x-max-priority={self.config.max_priority})."
+          f"(durable={durable}, "
+          f"auto_delete={auto_delete}, "
+          f"exclusive={exclusive}, "
+          f"x-max-priority={max_priority})."
         )
       else:
         msg = f"Failed to declare queue {queue_name}: {e}"
@@ -752,12 +940,13 @@ class RabbitMQBackend(Backend, QueueBackend):
         )
       try:
         self._ensure_queue_exists(queue_name)
+        _durable, _auto_delete, _exclusive, max_priority, delivery_mode = (
+          self._queue_policy_locked()
+        )
 
         # Clamp priority to valid range
-        clamped_priority = max(0, min(int(priority), self.config.max_priority))
+        clamped_priority = max(0, min(int(priority), max_priority))
 
-        # Cast delivery_mode to Literal[1, 2] for pika compatibility
-        delivery_mode: Literal[1, 2] = 1 if self.config.delivery_mode == 1 else 2
         properties = pika.BasicProperties(
           priority=clamped_priority,
           delivery_mode=delivery_mode,
@@ -902,6 +1091,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     deadline = time.monotonic() + timeout if timeout > 0 else None
+    expected_generation: int | None = None
     try:
       while True:
         with self._delivery_lock:
@@ -909,6 +1099,14 @@ class RabbitMQBackend(Backend, QueueBackend):
           if session is None:
             raise QueueError(
               "Not connected to RabbitMQ",
+              queue_name=queue_name,
+              operation="pop",
+            )
+          if expected_generation is None:
+            expected_generation = session[0]
+          elif session[0] != expected_generation:
+            raise QueueError(
+              "RabbitMQ connection changed while waiting for a message",
               queue_name=queue_name,
               operation="pop",
             )
@@ -939,6 +1137,13 @@ class RabbitMQBackend(Backend, QueueBackend):
         if remaining <= 0:
           return (None, None)
         with self._delivery_lock:
+          session = self._channel_session
+          if session is None or session[0] != expected_generation:
+            raise QueueError(
+              "RabbitMQ connection changed while waiting for a message",
+              queue_name=queue_name,
+              operation="pop",
+            )
           connection = self._connection
           if connection is not None:
             connection.process_data_events(time_limit=min(0.05, remaining))

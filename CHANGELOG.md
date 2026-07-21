@@ -101,6 +101,17 @@ upgrading.
   disconnect lets the broker requeue it for a post-reconnect purge. Channel
   operations and purge share a linearization lock; unrelated queues do not
   block one another. Token-aware pops no longer populate the legacy ack slot.
+- **RabbitMQ connections now have explicit generations.** Calling `connect()`
+  on a healthy backend is idempotent instead of replacing and leaking the live
+  Pika session. Connection candidates remain private until fully prepared;
+  failed or disconnect-fenced candidates close locally and cannot erase or
+  resurrect a healthy generation. Replacing an unhealthy session closes its
+  handles before constructing the successor so broker-unacknowledged work can
+  be recovered. Queue durability, auto-delete, exclusivity, maximum priority,
+  and publication mode are frozen at connect, and settings changes take effect
+  only after `disconnect()` / `connect()`.
+  A timed pop fails if teardown or reconnect changes generations instead of
+  silently continuing on the replacement channel.
 - **SQS acknowledgement tokens now have one terminal outcome.** Repeating a
   direct token ack/nack, or invoking the opposite action after success, no
   longer issues another broker call. Broker and disconnect failures keep the
