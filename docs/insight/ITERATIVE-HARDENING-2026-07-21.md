@@ -155,7 +155,7 @@ speculative work.
 - [x] **RUN-10 — monitor callback lock isolation.** Dispatch connect, retry, and
   disconnect monitor hooks outside manager locks so a re-entrant observer
   cannot self-deadlock or publish a competing connection transaction.
-- [ ] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
+- [x] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
   calls so a failure from an older CLOSED generation cannot reopen a breaker
   that has since completed an OPEN → HALF_OPEN → CLOSED recovery.
 - [ ] **RUN-03 — multi-spider manager scope.** Resolve `{spider}` before manager
@@ -455,3 +455,22 @@ typed released-manager error. The four lock-state/re-entry regressions and three
 callback-failure checks passed on Python 3.14; 243 related tests and the full
 Python 3.10 suite passed, the latter with 2,951 tests and 44 documented skips.
 Ruff and strict mypy remained green.
+
+### I12c — circuit-breaker outcome epochs
+
+Two threaded RED regressions held a CLOSED call in flight while another call
+tripped the breaker. After either a successful HALF_OPEN recovery or an
+explicit reset, the old call's late failure reopened the healthy breaker because
+outcomes carried only their prior state. A related probe-slot regression showed
+that a non-counted exception from an old HALF_OPEN probe could release a newer
+generation's active probe slot.
+
+Every admitted call now carries the breaker's state-transition epoch. The epoch
+advances on CLOSED/OPEN/HALF_OPEN transitions and every explicit reset; success,
+failure, signal, and non-counted-exception bookkeeping applies only when both
+the state and epoch still match. Ordinary concurrent CLOSED failures continue
+to share an epoch until the threshold transition, so the consecutive-failure
+contract is preserved. Six exact regressions passed on Python 3.14, 246 related
+breaker/manager/degradation tests passed on Python 3.10, and the full suite
+passed 2,954 tests with 44 documented skips. Ruff and strict mypy remained
+green.

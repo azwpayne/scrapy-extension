@@ -19,6 +19,7 @@ from scrapy_extension.backends.circuit_breaker import (
   CircuitBreaker,
   CircuitBreakerOpenError,
   _BackendProxyBase,
+  _CallAdmission,
   wrap_queue_backend,
   wrap_set_backend,
   wrap_storage_backend,
@@ -222,13 +223,13 @@ class TestSuccessResets:
 
 
 class TestStaleSuccessRace:
-  """A late success from a slow call (stale ``prior_state``) must not wedge the
+  """A late success from a slow call (stale admission) must not wedge the
   breaker OPEN.
 
-  Race: ``call()`` captures ``prior_state`` under the lock, RELEASES the lock,
+  Race: ``call()`` captures an admission under the lock, RELEASES the lock,
   runs ``func()`` (slow, no lock), then re-acquires the lock and calls
-  ``_record_success(prior_state)`` with a STALE prior_state. If another thread
-  trips the breaker OPEN during func(), the stale ``_record_success(CLOSED)``
+  ``_record_success(admission)`` with a STALE epoch. If another thread trips
+  the breaker OPEN during func(), the stale CLOSED success otherwise
   clears ``_last_failure_time = None``. The cool-down check in ``_allow_call``
   gates on ``opened_at is not None`` — a None timestamp prevents the
   OPEN->HALF_OPEN transition, so the breaker can NEVER recover (no background
@@ -240,24 +241,24 @@ class TestStaleSuccessRace:
     clock = FakeClock()
     b = CircuitBreaker("q", failure_threshold=3, reset_timeout=10.0, time_fn=clock)
 
-    # Thread A: capture prior_state=CLOSED under the lock (the slow call's
+    # Thread A: capture a CLOSED admission under the lock (the slow call's
     # acquire), then "release" — func() is now in flight (not simulated).
     with b._lock:
-      prior_state = b._allow_call()
-    assert prior_state is BreakerState.CLOSED
+      admission = b._allow_call()
+    assert admission.state is BreakerState.CLOSED
 
     # Thread B: while A's func() is in flight, threshold failures trip OPEN.
     for _ in range(3):
       with b._lock:
-        b._record_failure(BreakerState.CLOSED)
+        b._record_failure(_CallAdmission(BreakerState.CLOSED, b._epoch))
     assert b.state is BreakerState.OPEN
     trip_time = b.last_failure_time
     assert trip_time is not None
 
     # Thread A: slow func() finally SUCCEEDS and records with the STALE
-    # prior_state=CLOSED (captured before the trip).
+    # CLOSED admission (captured before the trip).
     with b._lock:
-      b._record_success(prior_state)
+      b._record_success(admission)
 
     # The breaker must STILL be OPEN with the trip timestamp INTACT — the wedge
     # would clear _last_failure_time=None, blocking the OPEN->HALF_OPEN check.
@@ -272,10 +273,155 @@ class TestStaleSuccessRace:
     clock.advance(100.0)
     with b._lock:
       effective = b._allow_call()
-    assert effective is BreakerState.HALF_OPEN, (
+    assert effective.state is BreakerState.HALF_OPEN, (
       "breaker could not recover OPEN->HALF_OPEN — _last_failure_time was "
       "cleared by a stale success (permanent backend outage)"
     )
+
+
+class TestStaleFailureRace:
+  """Outcomes admitted before a state generation change cannot mutate it."""
+
+  def test_pre_trip_failure_cannot_reopen_breaker_after_probe_recovery(self):
+    clock = FakeClock()
+    breaker = CircuitBreaker(
+      "q",
+      failure_threshold=1,
+      reset_timeout=5.0,
+      time_fn=clock,
+    )
+    old_call_started = threading.Event()
+    release_old_call = threading.Event()
+    old_errors: list[RuntimeError] = []
+
+    def slow_old_failure() -> None:
+      old_call_started.set()
+      release_old_call.wait(timeout=2.0)
+      raise RuntimeError("retired socket timed out")
+
+    def run_old_call() -> None:
+      try:
+        breaker.call(slow_old_failure)
+      except RuntimeError as exc:
+        old_errors.append(exc)
+
+    thread = threading.Thread(target=run_old_call)
+    thread.start()
+    try:
+      assert old_call_started.wait(timeout=1.0)
+      with pytest.raises(RuntimeError, match="backend on fire"):
+        breaker.call(_boom)
+      assert breaker.state is BreakerState.OPEN
+
+      clock.advance(5.0)
+      assert breaker.call(_ok) == "ok"
+      assert breaker.state is BreakerState.CLOSED
+    finally:
+      release_old_call.set()
+      thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert len(old_errors) == 1
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+    assert breaker.last_failure_time is None
+
+  def test_reset_fences_failure_from_call_admitted_before_reset(self):
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    old_call_started = threading.Event()
+    release_old_call = threading.Event()
+    old_errors: list[RuntimeError] = []
+
+    def slow_old_failure() -> None:
+      old_call_started.set()
+      release_old_call.wait(timeout=2.0)
+      raise RuntimeError("pre-reset failure")
+
+    def run_old_call() -> None:
+      try:
+        breaker.call(slow_old_failure)
+      except RuntimeError as exc:
+        old_errors.append(exc)
+
+    thread = threading.Thread(target=run_old_call)
+    thread.start()
+    try:
+      assert old_call_started.wait(timeout=1.0)
+      breaker.reset()
+    finally:
+      release_old_call.set()
+      thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert len(old_errors) == 1
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+    assert breaker.last_failure_time is None
+
+  def test_stale_non_counted_probe_cannot_release_new_probe_slot(self):
+    breaker = CircuitBreaker(
+      "q",
+      failure_threshold=1,
+      reset_timeout=0.0,
+      failure_exceptions=(RuntimeError,),
+    )
+    old_probe_started = threading.Event()
+    release_old_probe = threading.Event()
+    new_probe_started = threading.Event()
+    release_new_probe = threading.Event()
+    old_errors: list[ValueError] = []
+
+    with pytest.raises(RuntimeError):
+      breaker.call(_boom)
+
+    def old_probe() -> None:
+      old_probe_started.set()
+      release_old_probe.wait(timeout=2.0)
+      raise ValueError("non-counted old probe")
+
+    def run_old_probe() -> None:
+      try:
+        breaker.call(old_probe)
+      except ValueError as exc:
+        old_errors.append(exc)
+
+    old_thread = threading.Thread(target=run_old_probe)
+    old_thread.start()
+    assert old_probe_started.wait(timeout=1.0)
+
+    # Fence the old HALF_OPEN probe, then create a different HALF_OPEN epoch
+    # with its own in-flight probe.
+    breaker.reset()
+    with pytest.raises(RuntimeError):
+      breaker.call(_boom)
+
+    def new_probe() -> str:
+      new_probe_started.set()
+      release_new_probe.wait(timeout=2.0)
+      return "recovered"
+
+    new_results: list[str] = []
+    new_thread = threading.Thread(
+      target=lambda: new_results.append(breaker.call(new_probe))
+    )
+    new_thread.start()
+    try:
+      assert new_probe_started.wait(timeout=1.0)
+      release_old_probe.set()
+      old_thread.join(timeout=1.0)
+      assert not old_thread.is_alive()
+
+      # The old ValueError must not clear the current epoch's probe slot.
+      with pytest.raises(CircuitBreakerOpenError):
+        breaker.call(_ok)
+    finally:
+      release_old_probe.set()
+      release_new_probe.set()
+      old_thread.join(timeout=1.0)
+      new_thread.join(timeout=1.0)
+
+    assert old_errors and new_results == ["recovered"]
+    assert breaker.state is BreakerState.CLOSED
 
 
 # ---------------------------------------------------------------------------

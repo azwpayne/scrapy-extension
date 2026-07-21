@@ -31,7 +31,7 @@ import threading
 import time
 from collections.abc import Callable
 from enum import Enum
-from typing import Any
+from typing import Any, NamedTuple
 
 from scrapy_extension.backends.base import QueueBackend, SetBackend, StorageBackend
 from scrapy_extension.exceptions import BackendError
@@ -59,6 +59,13 @@ class BreakerState(str, Enum):
   CLOSED = "closed"
   OPEN = "open"
   HALF_OPEN = "half_open"
+
+
+class _CallAdmission(NamedTuple):
+  """State generation under which one backend call was admitted."""
+
+  state: BreakerState
+  epoch: int
 
 
 class CircuitBreakerOpenError(BackendError):
@@ -122,6 +129,11 @@ class CircuitBreaker:
     self._state = BreakerState.CLOSED
     self._failure_count = 0
     self._last_failure_time: float | None = None
+    # Incremented on every state transition and explicit reset. Calls execute
+    # outside ``_lock``; their result may only mutate the generation under
+    # which it was admitted. This fences late old-socket failures after a
+    # complete OPEN → HALF_OPEN → CLOSED recovery cycle.
+    self._epoch = 0
     # Guards the HALF_OPEN window so only ONE thread issues the probe call.
     # Set in _allow_call() on the OPEN→HALF_OPEN transition; cleared under the
     # lock once the probe's outcome is recorded. Without this, the lock is
@@ -158,6 +170,7 @@ class CircuitBreaker:
     """
     with self._lock:
       self._state = BreakerState.CLOSED
+      self._epoch += 1
       self._failure_count = 0
       self._last_failure_time = None
       self._probe_in_flight = False
@@ -186,11 +199,11 @@ class CircuitBreaker:
     """Read the current monotonic time via the injected clock."""
     return self._time_fn()
 
-  def _allow_call(self) -> BreakerState:
-    """Decide whether a call may proceed and return the effective state.
+  def _allow_call(self) -> _CallAdmission:
+    """Decide whether a call may proceed and return its state generation.
 
-    Called under ``self._lock``. Returns the state the caller should operate
-    under:
+    Called under ``self._lock``. Returns the state and transition epoch the
+    caller should operate under:
 
     - ``OPEN`` → reject without touching the backend.
     - ``CLOSED`` or ``HALF_OPEN`` → invoke the backend; the caller records
@@ -210,50 +223,43 @@ class CircuitBreaker:
         # Cool-down elapsed — allow a single probe. Claim the probe slot; no
         # other thread can enter func() in HALF_OPEN until this probe settles.
         self._state = BreakerState.HALF_OPEN
+        self._epoch += 1
         self._probe_in_flight = True
       else:
-        return BreakerState.OPEN
+        return _CallAdmission(BreakerState.OPEN, self._epoch)
     elif self._state is BreakerState.HALF_OPEN:
       if self._probe_in_flight:
         # A probe is already in flight (another thread claimed the slot in this
         # HALF_OPEN window). Fail fast without issuing a second concurrent probe.
-        return BreakerState.OPEN
+        return _CallAdmission(BreakerState.OPEN, self._epoch)
       # A prior non-counted exception or process signal released the probe
       # slot while deliberately leaving the breaker HALF_OPEN. Re-claim it for
       # this call so concurrent callers still observe the single-probe rule.
       self._probe_in_flight = True
-    return self._state
+    return _CallAdmission(self._state, self._epoch)
 
-  def _record_success(self, prior_state: BreakerState) -> None:
+  def _record_success(self, admission: _CallAdmission) -> None:
     """Record a successful call, possibly closing the breaker.
 
     On any success the consecutive-failure count resets to zero. If the call
     was a HALF_OPEN probe, the breaker closes fully and the probe slot is
     released.
 
-    Stale-prior_state guard: ``call()`` captures ``prior_state`` under the
-    lock, releases it for ``func()``, then re-acquires the lock here. If
-    another thread tripped the breaker OPEN during func(), the stale success
-    must NOT clobber the trip's bookkeeping — clearing ``_last_failure_time``
-    here would wedge the breaker OPEN forever (the cool-down check in
-    :meth:`_allow_call` gates on ``opened_at is not None``, so a None
-    timestamp prevents the OPEN→HALF_OPEN transition; no background timer
-    runs, recovery is lazy on the next call). The late success is from a call
-    that started BEFORE the trip; it must not undo a trip reflecting the
-    backend's state at trip time. See
-    ``test_late_success_does_not_wedge_open_breaker``.
+    ``call()`` captures an admission epoch under the lock, releases it for
+    ``func()``, then re-acquires the lock here. Any intervening state
+    transition makes the result stale: neither a late success nor failure may
+    mutate the newer generation's bookkeeping.
     """
-    if self._state is BreakerState.OPEN:
-      # Another thread tripped the breaker while func() was in flight; the
-      # stale success must not clobber the trip timestamp (would wedge OPEN).
+    if admission.epoch != self._epoch or admission.state is not self._state:
       return
     self._failure_count = 0
     self._last_failure_time = None
-    if prior_state is BreakerState.HALF_OPEN:
+    if admission.state is BreakerState.HALF_OPEN:
       self._state = BreakerState.CLOSED
+      self._epoch += 1
       self._probe_in_flight = False
 
-  def _record_failure(self, prior_state: BreakerState) -> None:
+  def _record_failure(self, admission: _CallAdmission) -> None:
     """Record a failed call, possibly tripping / re-opening the breaker.
 
     A HALF_OPEN probe failure re-opens immediately (one strike and the
@@ -261,15 +267,28 @@ class CircuitBreaker:
     next cool-down window can issue a fresh probe. A CLOSED failure increments
     the consecutive count and trips when the threshold is reached.
     """
+    if admission.epoch != self._epoch or admission.state is not self._state:
+      return
     self._last_failure_time = self._now()
-    if prior_state is BreakerState.HALF_OPEN:
+    if admission.state is BreakerState.HALF_OPEN:
       self._state = BreakerState.OPEN
+      self._epoch += 1
       self._failure_count = 0
       self._probe_in_flight = False
       return
     self._failure_count += 1
     if self._failure_count >= self.failure_threshold:
       self._state = BreakerState.OPEN
+      self._epoch += 1
+
+  def _release_probe(self, admission: _CallAdmission) -> None:
+    """Release a non-counted HALF_OPEN call only in its admission epoch."""
+    if (
+      admission.state is BreakerState.HALF_OPEN
+      and admission.epoch == self._epoch
+      and self._state is BreakerState.HALF_OPEN
+    ):
+      self._probe_in_flight = False
 
   def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Invoke ``func(*args, **kwargs)`` under the breaker's protection.
@@ -303,8 +322,8 @@ class CircuitBreaker:
         package.
     """
     with self._lock:
-      prior_state = self._allow_call()
-      if prior_state is BreakerState.OPEN:
+      admission = self._allow_call()
+      if admission.state is BreakerState.OPEN:
         raise CircuitBreakerOpenError(self.name)
 
     try:
@@ -317,26 +336,25 @@ class CircuitBreaker:
         # mid-probe we must release it — otherwise the breaker wedges
         # HALF_OPEN forever (no timer releases the slot; only _record_success
         # / _record_failure do, and we deliberately skip both for signals).
-        if prior_state is BreakerState.HALF_OPEN:
+        if admission.state is BreakerState.HALF_OPEN:
           with self._lock:
-            self._probe_in_flight = False
+            self._release_probe(admission)
         raise
       if not isinstance(exc, self.failure_exceptions):
         # Caller/input errors are neither a backend success nor a backend
         # failure. A HALF_OPEN call already claimed the sole probe slot, so
         # release it without closing or re-opening the breaker; the next
         # eligible call can perform the real recovery probe.
-        if prior_state is BreakerState.HALF_OPEN:
+        if admission.state is BreakerState.HALF_OPEN:
           with self._lock:
-            if self._state is BreakerState.HALF_OPEN:
-              self._probe_in_flight = False
+            self._release_probe(admission)
         raise
       with self._lock:
-        self._record_failure(prior_state)
+        self._record_failure(admission)
       raise
     else:
       with self._lock:
-        self._record_success(prior_state)
+        self._record_success(admission)
       return result
 
 
