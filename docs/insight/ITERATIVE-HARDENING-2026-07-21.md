@@ -290,7 +290,7 @@ speculative work.
 - [ ] **CONCURRENCY-01G — RocketMQ client generations.** Publish producer,
   consumer, validated settings, and subscription cache as one generation so a
   replacement consumer cannot inherit a stale subscribed-topic hit.
-- [ ] **CONCURRENCY-01H — SQS private SDK sessions.** Stop using boto3's shared
+- [x] **CONCURRENCY-01H — SQS private SDK sessions.** Stop using boto3's shared
   default Session alias when constructing SQS client generations so independent
   backend instances cannot race SDK client setup.
 - [ ] **CONCURRENCY-01I — DynamoDB supported SDK ownership.** Replace the
@@ -322,6 +322,9 @@ speculative work.
 - [x] **DOC-SEC-01 — accurate redaction policy.** Correct the public security
   text: `_RedactedStr` protects `repr`, while ordinary string operations expose
   the underlying value required by SDK authentication.
+- [ ] **TEST-ISO-01 — canonical optional-SDK stubs.** Remove collection-order
+  coupling between connector and backend coverage tests by making every Pulsar
+  stub expose one complete shared enum/client surface; pin both file orders.
 
 ### Verified P2 follow-ups
 
@@ -1303,3 +1306,56 @@ migration changed; `_RedactedStr` remains Internal per `STABILITY.md`.
 All eight focused redaction/policy tests passed on Python 3.10. The full Python
 3.10 and 3.14 suites each passed 3,356 tests with 46 documented skips. Ruff,
 strict mypy, Bandit, lockfile validation, and patch integrity remained green.
+
+### I37 — SQS private SDK sessions
+
+The specification closed the remaining ownership gap before an SQS client
+generation is published. Boto3 Sessions are not thread-safe, while the
+module-level `boto3.client()` alias resolves through one process-wide lazy
+default Session. The backend's instance-local connect lock therefore could not
+protect two independent backends constructing clients concurrently. That
+default Session also caches ambient credential/provider state beyond one
+backend generation, so a disconnect followed by changed environment
+credentials could still sign through the older identity.
+
+Post-implementation contract review exposed a second P1 at the same ownership
+boundary: a cloud snapshot with no explicit endpoint allowed botocore to read
+`AWS_ENDPOINT_URL_SQS` or `AWS_ENDPOINT_URL`, so an ambient HTTP URL bypassed
+the package's cloud HTTPS validator. A real subprocess RED reproduced both
+variables. Every client now receives
+`BotoConfig(ignore_configured_endpoint_urls=True)`, available across the
+declared boto3 1.34–1.x range, so a custom endpoint URL can come only from the
+validated SQS setting while ambient credential providers and botocore's
+standard FIPS/dual-stack endpoint selection remain enabled.
+
+Three initial deterministic REDs forbade the module alias, overlapped two
+independent backend connections, and required a private client-construction
+failure to remain unpublished with its original cause. The completed matrix
+also covers Session-constructor failure and fresh-candidate retry, idempotent
+live connect, distinct reconnect ownership, exact region/endpoint/credential
+kwargs, and configuration validation before SDK construction. An isolated
+real boto3/botocore subprocess poisons the global default Session and uses a
+Stubber-backed low-level SQS client to verify QueueUrl resolution, base64 send,
+and exactly-once client close. A second real-SDK subprocess changes ambient
+credentials across reconnect and proves that each new private Session resolves
+the new identity without creating `boto3.DEFAULT_SESSION`.
+
+Every `_SqsClientGeneration` now owns its private
+`boto3.session.Session`, low-level client, immutable operational snapshot,
+caches, and opaque key. The Session is retained for the generation lifetime
+but never used on the data path and is not closed because boto3 Session has no
+close contract; disconnect continues to drain leases and close only the
+retired low-level client. No global construction lock or client-wide operation
+lock was added, so independent generation construction and documented
+low-level-client concurrency remain available.
+
+This deliberately stops inheriting `boto3.setup_default_session(...)` and
+event hooks installed only on that process-wide object. The README, changelog,
+and migration guide route users to botocore's ambient credential providers or
+the explicit SQS key pair. The SQS region setting is authoritative, custom
+endpoint URLs can come only from the SQS endpoint setting, and normal
+FIPS/dual-stack selection remains available; queue data and wire formats do
+not change. All 189 selected SQS/AWS-region tests passed with the one live-service
+integration test explicitly skipped. The full Python 3.10 and 3.14 suites each
+passed 3,363 tests with 46 documented skips. Ruff, strict mypy, Bandit,
+lockfile validation, dependency audit, and patch integrity remained green.

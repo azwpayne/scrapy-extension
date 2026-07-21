@@ -1,7 +1,7 @@
 """Tests for SqsBackend (subsystem ③) — mocked boto3.
 
-Injects a mock ``boto3`` into ``sys.modules`` and patches ``boto3.client``
-(the module-attribute pattern) to assert call patterns.
+Injects a mock ``boto3`` into ``sys.modules`` and patches each private
+``boto3.session.Session().client`` factory to assert call patterns.
 """
 
 from __future__ import annotations
@@ -48,13 +48,31 @@ def _make_backend(**overrides) -> SqsBackend:
   return SqsBackend(SqsSettings(**overrides))
 
 
+def _patch_client(mocker, *, return_value=None, side_effect=None):
+  """Patch one private Session and return its Session/client factories."""
+  session = mocker.MagicMock(name="private-sqs-session")
+  if side_effect is not None:
+    session.client.side_effect = side_effect
+  else:
+    session.client.return_value = return_value
+  session_factory = mocker.patch.object(
+    boto3.session, "Session", return_value=session
+  )
+  mocker.patch.object(
+    boto3,
+    "client",
+    side_effect=AssertionError("shared default Session must not be used"),
+  )
+  return session_factory, session.client
+
+
 def _connected(mocker, **client_children):
   b = _make_backend()
   client = mocker.MagicMock()
   client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
   for attr, val in client_children.items():
     getattr(client, attr).return_value = val
-  mocker.patch.object(boto3, "client", return_value=client)
+  _patch_client(mocker, return_value=client)
   b.connect()
   return b, client
 
@@ -86,13 +104,190 @@ class TestSqsBackendType:
 
 
 class TestSqsConnect:
+  def test_each_generation_uses_a_private_boto3_session(self, mocker) -> None:
+    b = _make_backend()
+    private_session = mocker.MagicMock(name="private-session")
+    client = mocker.MagicMock(name="private-client")
+    private_session.client.return_value = client
+    session_factory = mocker.patch.object(
+      boto3.session, "Session", return_value=private_session
+    )
+    default_client = mocker.patch.object(
+      boto3,
+      "client",
+      side_effect=AssertionError("shared default Session must not be used"),
+    )
+
+    b.connect()
+
+    session_factory.assert_called_once_with()
+    private_session.client.assert_called_once()
+    args, kwargs = private_session.client.call_args
+    assert args == ("sqs",)
+    assert kwargs["region_name"] == "us-east-1"
+    assert kwargs["endpoint_url"] == "http://localhost:4566"
+    assert kwargs["config"].ignore_configured_endpoint_urls is True
+    default_client.assert_not_called()
+    assert b._generation is not None
+    assert b._generation.session is private_session
+    assert b._generation.client is client
+
+  def test_independent_backends_construct_private_sessions_concurrently(
+    self, mocker
+  ) -> None:
+    backends = [
+      _make_backend(region_name="us-east-1"),
+      _make_backend(region_name="eu-west-1"),
+    ]
+    client_barrier = threading.Barrier(2)
+    shared_alias_barrier = threading.Barrier(2)
+    created: list[tuple[MagicMock, MagicMock]] = []
+    created_lock = threading.Lock()
+
+    def make_session() -> MagicMock:
+      session = mocker.MagicMock(name="private-session")
+      client = mocker.MagicMock(name="private-client")
+
+      def make_client(_service: str, **_kwargs) -> MagicMock:
+        client_barrier.wait(timeout=5.0)
+        return client
+
+      session.client.side_effect = make_client
+      with created_lock:
+        created.append((session, client))
+      return session
+
+    session_factory = mocker.patch.object(
+      boto3.session, "Session", side_effect=make_session
+    )
+    def make_default_client(_service: str, **_kwargs) -> MagicMock:
+      shared_alias_barrier.wait(timeout=5.0)
+      return mocker.MagicMock(name="shared-default-session-client")
+
+    default_client = mocker.patch.object(
+      boto3, "client", side_effect=make_default_client
+    )
+    errors: list[BaseException] = []
+
+    def connect(backend: SqsBackend) -> None:
+      try:
+        backend.connect()
+      except BaseException as error:  # pragma: no cover - assertion aid
+        errors.append(error)
+
+    threads = [
+      threading.Thread(target=connect, args=(backend,)) for backend in backends
+    ]
+    for thread in threads:
+      thread.start()
+    for thread in threads:
+      thread.join(timeout=5.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert session_factory.call_count == 2
+    assert len(created) == 2
+    assert created[0][0] is not created[1][0]
+    assert created[0][1] is not created[1][1]
+    assert {
+      session.client.call_args.kwargs["region_name"]
+      for session, _client in created
+    } == {"us-east-1", "eu-west-1"}
+    assert {
+      id(backend._generation.session)
+      for backend in backends
+      if backend._generation is not None
+    } == {id(session) for session, _client in created}
+    client_by_session = {id(session): client for session, client in created}
+    for backend in backends:
+      assert backend._generation is not None
+      assert (
+        backend._generation.client
+        is client_by_session[id(backend._generation.session)]
+      )
+    default_client.assert_not_called()
+
+  def test_private_session_client_failure_remains_unpublished(
+    self, mocker
+  ) -> None:
+    b = _make_backend()
+    failure = RuntimeError("private client construction failed")
+    failed_session = mocker.MagicMock(name="failed-session")
+    failed_session.client.side_effect = failure
+    recovered_session = mocker.MagicMock(name="recovered-session")
+    recovered_client = mocker.MagicMock(name="recovered-client")
+    recovered_session.client.return_value = recovered_client
+    session_factory = mocker.patch.object(
+      boto3.session,
+      "Session",
+      side_effect=[failed_session, recovered_session],
+    )
+    default_client = mocker.patch.object(
+      boto3,
+      "client",
+      side_effect=AssertionError("shared default Session must not be used"),
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      b.connect()
+
+    assert exc_info.value.__cause__ is failure
+    session_factory.assert_called_once_with()
+    failed_session.client.assert_called_once()
+    default_client.assert_not_called()
+    assert b._generation is None
+    assert b.is_connected() is False
+
+    b.connect()
+
+    assert session_factory.call_count == 2
+    assert b._generation is not None
+    assert b._generation.session is recovered_session
+    assert b._generation.client is recovered_client
+    default_client.assert_not_called()
+
+  def test_private_session_construction_failure_is_retryable(
+    self, mocker
+  ) -> None:
+    b = _make_backend()
+    failure = RuntimeError("private Session construction failed")
+    recovered_session = mocker.MagicMock(name="recovered-session")
+    recovered_client = mocker.MagicMock(name="recovered-client")
+    recovered_session.client.return_value = recovered_client
+    session_factory = mocker.patch.object(
+      boto3.session,
+      "Session",
+      side_effect=[failure, recovered_session],
+    )
+    default_client = mocker.patch.object(
+      boto3,
+      "client",
+      side_effect=AssertionError("shared default Session must not be used"),
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      b.connect()
+
+    assert exc_info.value.__cause__ is failure
+    assert b._generation is None
+
+    b.connect()
+
+    assert session_factory.call_count == 2
+    assert b._generation is not None
+    assert b._generation.session is recovered_session
+    assert b._generation.client is recovered_client
+    default_client.assert_not_called()
+
   def test_connect_creates_client(self, mocker) -> None:
     b = _make_backend()
     client = mocker.MagicMock()
-    mocker.patch.object(boto3, "client", return_value=client)
+    _session_factory, client_factory = _patch_client(
+      mocker, return_value=client
+    )
     b.connect()
-    boto3.client.assert_called_once()
-    args, kwargs = boto3.client.call_args
+    client_factory.assert_called_once()
+    args, kwargs = client_factory.call_args
     assert args == ("sqs",)
     assert kwargs["region_name"] == "us-east-1"
     assert b.is_connected() is True
@@ -105,8 +300,8 @@ class TestSqsConnect:
   ) -> None:
     b = _make_backend()
     b.config.region_name = region_name
-    client_factory = mocker.patch.object(
-      boto3, "client", return_value=mocker.MagicMock()
+    _session_factory, client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
     )
 
     b.connect()
@@ -119,30 +314,41 @@ class TestSqsConnect:
     b = _make_backend(region_name="us-gov-west-1")
     client_a = mocker.MagicMock(name="client-a")
     client_b = mocker.MagicMock(name="client-b")
-    client_factory = mocker.patch.object(
-      boto3, "client", side_effect=[client_a, client_b]
+    session_a = mocker.MagicMock(name="session-a")
+    session_a.client.return_value = client_a
+    session_b = mocker.MagicMock(name="session-b")
+    session_b.client.return_value = client_b
+    session_factory = mocker.patch.object(
+      boto3.session, "Session", side_effect=[session_a, session_b]
+    )
+    default_client = mocker.patch.object(
+      boto3,
+      "client",
+      side_effect=AssertionError("shared default Session must not be used"),
     )
 
     b.connect()
     b.config.region_name = "eusc-de-east-1"
     b.connect()
 
-    assert client_factory.call_count == 1
+    assert session_factory.call_count == 1
     assert b._generation is not None
     assert b._generation.snapshot.region_name == "us-gov-west-1"
 
     b.disconnect()
     b.connect()
 
-    assert client_factory.call_count == 2
-    assert client_factory.call_args.kwargs["region_name"] == "eusc-de-east-1"
+    assert session_factory.call_count == 2
+    assert session_b.client.call_args.kwargs["region_name"] == "eusc-de-east-1"
     assert b._generation is not None
+    assert b._generation.session is session_b
     assert b._generation.snapshot.region_name == "eusc-de-east-1"
     client_a.close.assert_called_once_with()
+    default_client.assert_not_called()
 
   def test_connect_failure_raises(self, mocker) -> None:
     b = _make_backend()
-    mocker.patch.object(boto3, "client", side_effect=RuntimeError("boom"))
+    _patch_client(mocker, side_effect=RuntimeError("boom"))
     with pytest.raises(BackendConnectionError):
       b.connect()
 
@@ -160,8 +366,8 @@ class TestSqsConnect:
     client_a.get_queue_url.return_value = {"QueueUrl": "https://sqs/a/q"}
     client_b = mocker.MagicMock(name="client-b")
     client_b.get_queue_url.return_value = {"QueueUrl": "https://sqs/b/q"}
-    client_factory = mocker.patch.object(
-      boto3, "client", side_effect=[client_a, client_b]
+    session_factory, client_factory = _patch_client(
+      mocker, side_effect=[client_a, client_b]
     )
 
     b.connect()
@@ -170,6 +376,7 @@ class TestSqsConnect:
     b.push("q", b"second")
 
     assert client_factory.call_count == 1
+    session_factory.assert_called_once_with()
     assert b._client is client_a
     client_a.get_queue_url.assert_called_once_with(QueueName="scrapy-q")
     assert client_a.send_message.call_count == 2
@@ -193,7 +400,7 @@ class TestSqsConnect:
     client_b = mocker.MagicMock(name="client-b")
     client_b.get_queue_url.return_value = {"QueueUrl": "https://sqs/b/q"}
     client_b.receive_message.return_value = {}
-    mocker.patch.object(boto3, "client", return_value=client_b)
+    _patch_client(mocker, return_value=client_b)
     b.connect()
     b.push("q", b"replacement")
     assert b.pop("q") is None
@@ -228,7 +435,7 @@ class TestSqsConnect:
       finally:
         disconnect_finished.set()
 
-    mocker.patch.object(boto3, "client", side_effect=construct)
+    _patch_client(mocker, side_effect=construct)
     connect_thread = threading.Thread(target=run, args=(b.connect,))
     disconnect_thread = threading.Thread(target=disconnect)
     connect_thread.start()
@@ -270,7 +477,7 @@ class TestSqsConnect:
         disconnect_finished.set()
 
     client.get_queue_url.side_effect = blocking_lookup
-    mocker.patch.object(boto3, "client", return_value=client)
+    _patch_client(mocker, return_value=client)
     b.connect()
     push_thread = threading.Thread(target=push)
     disconnect_thread = threading.Thread(target=disconnect)
@@ -339,7 +546,7 @@ class TestSqsConnect:
     _body, token = b.pop_with_ack("q")
     b.disconnect()
     client_b = mocker.MagicMock(name="client-b")
-    mocker.patch.object(boto3, "client", return_value=client_b)
+    _patch_client(mocker, return_value=client_b)
     b.connect()
 
     b.ack("q", token=token)
@@ -427,7 +634,7 @@ class TestSqsConnect:
     client.receive_message.return_value = {
       "Messages": [{"Body": "eA==", "ReceiptHandle": "receipt-b"}]
     }
-    mocker.patch.object(boto3, "client", return_value=client)
+    _patch_client(mocker, return_value=client)
     b.connect()
     _body, token = b.pop_with_ack("qB")
     push_thread = threading.Thread(target=push_q_a)
@@ -493,7 +700,7 @@ class TestSqsPushPop:
     second = _make_backend()
     second_client = mocker.MagicMock()
     second_client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
-    mocker.patch.object(boto3, "client", return_value=second_client)
+    _patch_client(mocker, return_value=second_client)
     second.connect()
     second.push("spider:queue", b"payload")
 
@@ -503,7 +710,7 @@ class TestSqsPushPop:
     b = _make_backend(queue_name_prefix="")
     client = mocker.MagicMock()
     client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
-    mocker.patch.object(boto3, "client", return_value=client)
+    _patch_client(mocker, return_value=client)
     b.connect()
     valid_name = "q" * 80
 
@@ -515,7 +722,7 @@ class TestSqsPushPop:
     b = _make_backend(queue_name_prefix="prefix-")
     client = mocker.MagicMock()
     client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
-    mocker.patch.object(boto3, "client", return_value=client)
+    _patch_client(mocker, return_value=client)
     b.connect()
 
     b.push("q" * 80, b"payload")
@@ -536,7 +743,7 @@ class TestSqsPushPop:
 
     over_limit = _make_backend()
     over_limit_client = mocker.MagicMock()
-    mocker.patch.object(boto3, "client", return_value=over_limit_client)
+    _patch_client(mocker, return_value=over_limit_client)
     over_limit.connect()
 
     with pytest.raises(QueueError, match="786,432 raw bytes") as exc_info:
@@ -613,7 +820,7 @@ class TestSqsPushPop:
     client = mocker.MagicMock()
     client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
     client.receive_message.return_value = {}
-    mocker.patch.object(boto3, "client", return_value=client)
+    _patch_client(mocker, return_value=client)
     b.connect()
 
     b.pop("queue1", timeout=7.0)
@@ -992,7 +1199,7 @@ def _connected_multi_queue(mocker, urls: dict[str, str]):
     raise RuntimeError(f"unexpected QueueName={QueueName!r}")
 
   client.get_queue_url.side_effect = _get_queue_url
-  mocker.patch.object(boto3, "client", return_value=client)
+  _patch_client(mocker, return_value=client)
   b.connect()
   return b, client
 
@@ -1109,7 +1316,7 @@ class TestSqsAckCorrectQueueUrl:
     client_b.receive_message.return_value = {
       "Messages": [{"Body": "Yg==", "ReceiptHandle": "receipt-b"}]
     }
-    mocker.patch.object(boto3, "client", return_value=client_b)
+    _patch_client(mocker, return_value=client_b)
     b.connect()
     assert b.pop("q") == b"b"
 
@@ -1530,15 +1737,15 @@ class TestSqsLegacyAckCompat:
 
 
 # ---------------------------------------------------------------------------
-# SEC-1 (round-6): SQS AWS creds redaction in boto3.client kwargs.
+# SEC-1 (round-6): SQS AWS creds redaction in Session.client kwargs.
 # SEC-7: AWS credentials must be both-or-neither (XOR validation).
 # ---------------------------------------------------------------------------
 
 
 def test_sqs_credentials_redacted_in_client_kwargs(mocker):
-  """SEC-1: aws_access_key_id / aws_secret_access_key handed to boto3.client
-  are wrapped in _RedactedStr so ``repr(call_args)`` doesn't leak them. The
-  str values are preserved so boto3 still authenticates.
+  """SEC-1: credentials handed to the private Session client are wrapped in
+  _RedactedStr so ``repr(call_args)`` doesn't leak them while preserving the
+  string values boto3 needs for authentication.
   """
   from scrapy_extension.backends._redaction import _RedactedStr
   from scrapy_extension.settings import SqsSettings
@@ -1550,9 +1757,8 @@ def test_sqs_credentials_redacted_in_client_kwargs(mocker):
   backend = SqsBackend(config)
 
   captured = {}
-  mocker.patch.object(
-    boto3,
-    "client",
+  _patch_client(
+    mocker,
     side_effect=lambda service, **kw: captured.update(kw) or mocker.MagicMock(),
   )
   backend.connect()
@@ -1601,21 +1807,26 @@ class TestSqsHalfCredentialGuard:
     assert exc_info.value.setting_name == "aws_access_key_id"
 
   def test_both_set_proceeds(self, mocker):
-    """Both set → no ConfigurationError; boto3.client called with both."""
+    """Both set → no ConfigurationError; Session.client receives both."""
     backend = _make_backend(
       aws_access_key_id="AKIAEXAMPLEKEY",
       aws_secret_access_key="top-secret",
     )
-    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    session_factory, client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
+    )
     backend.connect()  # must not raise
-    boto3.client.assert_called_once()
+    session_factory.assert_called_once_with()
+    client_factory.assert_called_once()
 
   def test_neither_set_proceeds(self, mocker):
     """Neither set → no ConfigurationError; boto3 default credential chain."""
     backend = _make_backend()  # defaults: both None
-    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    _session_factory, client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
+    )
     backend.connect()  # must not raise
-    _, kwargs = boto3.client.call_args.args, boto3.client.call_args.kwargs
+    _, kwargs = client_factory.call_args.args, client_factory.call_args.kwargs
     assert "aws_access_key_id" not in kwargs
     assert "aws_secret_access_key" not in kwargs
 
@@ -1631,47 +1842,55 @@ class TestSqsHalfCredentialGuard:
   ) -> None:
     backend = _make_backend(mode=SqsMode.CLOUD)
     backend.config.endpoint_url = endpoint_url
-    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    session_factory, _client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert "do-not-leak" not in str(exc_info.value)
-    boto3.client.assert_not_called()
+    session_factory.assert_not_called()
 
   def test_connect_rejects_mutated_empty_explicit_credentials(self, mocker) -> None:
     backend = _make_backend()
     backend.config.aws_access_key_id = ""  # type: ignore[assignment]
     backend.config.aws_secret_access_key = ""  # type: ignore[assignment]
-    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    session_factory, _client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert exc_info.value.setting_name == "aws_access_key_id"
-    boto3.client.assert_not_called()
+    session_factory.assert_not_called()
 
   def test_connect_rejects_mutated_missing_standalone_endpoint(self, mocker) -> None:
     backend = _make_backend()
     backend.config.endpoint_url = None
-    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    session_factory, _client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert exc_info.value.setting_name == "endpoint_url"
-    boto3.client.assert_not_called()
+    session_factory.assert_not_called()
 
   def test_connect_rejects_mutated_invalid_region(self, mocker) -> None:
     backend = _make_backend()
     backend.config.region_name = "not-a-region"
-    mocker.patch.object(boto3, "client", return_value=mocker.MagicMock())
+    session_factory, _client_factory = _patch_client(
+      mocker, return_value=mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
 
     assert exc_info.value.setting_name == "region_name"
-    boto3.client.assert_not_called()
+    session_factory.assert_not_called()
 
 
 # ===========================================================================
@@ -1696,7 +1915,7 @@ class TestSqsInFlightCap:
       "Messages": [{"Body": base64.b64encode(body).decode("ascii"), "ReceiptHandle": "rh-new"}]
     }
     b = _make_backend()
-    mocker.patch.object(boto3, "client", return_value=client)
+    _patch_client(mocker, return_value=client)
     b.connect()
 
     # Pre-saturate the set so the next pop trips the cap.

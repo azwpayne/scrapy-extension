@@ -76,11 +76,21 @@ class TestInvalidModeGuards:
     with pytest.raises(ConfigurationError):
       b.connect()
 
-  def test_sqs_invalid_mode(self) -> None:
+  def test_sqs_invalid_mode(self, mocker) -> None:
     b = SqsBackend(SqsSettings())
     b.config.mode = "bogus"  # type: ignore[assignment]
+    session_factory = mocker.patch(
+      "scrapy_extension.backends.sqs.boto3.session.Session",
+      side_effect=AssertionError("validation must precede Session construction"),
+    )
+    default_client = mocker.patch(
+      "scrapy_extension.backends.sqs.boto3.client",
+      side_effect=AssertionError("shared default Session must not be used"),
+    )
     with pytest.raises(ConfigurationError):
       b.connect()
+    session_factory.assert_not_called()
+    default_client.assert_not_called()
 
 
 def _pulsar(mocker):

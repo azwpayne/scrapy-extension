@@ -73,6 +73,39 @@ previous plaintext default, but should be limited to trusted local networks.
 The TLS flag targets the RocketMQ 5.x gRPC proxy and is propagated separately
 to both SDK client constructors; it is not a `ClientConfiguration` option.
 
+## SQS Private boto3 Sessions
+
+Every new SQS connection generation now creates a private
+`boto3.session.Session` and constructs its low-level client from that Session.
+It no longer calls the module-level `boto3.client()` alias or inherits the
+process-wide Session installed by `boto3.setup_default_session(...)`. This
+isolates independent backend instances within one process and ensures an explicit
+disconnect/reconnect re-resolves ambient credentials instead of retaining a
+credential object cached by an older generation.
+
+No queue data migration is required. Before upgrading, replace any default-
+Session credential injection with one of these supported sources:
+
+- botocore's ambient credential provider chain, including credential
+  environment variables and `AWS_PROFILE`-selected shared files;
+- an IAM role or workload identity available to botocore; or
+- the existing explicit SQS access-key and secret-key settings.
+
+The SQS region is not inherited from the profile/default Session; it remains
+controlled by `SCRAPY_SQS_REGION_NAME`. A configured SQS access/secret pair is
+passed directly to the client and takes precedence over ambient credentials.
+A custom endpoint URL can come only from `SCRAPY_SQS_ENDPOINT_URL`: ambient
+`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_SQS`, and service endpoints in shared AWS
+config are ignored. Migrate those custom URLs to the SQS setting, whose
+cloud-mode value must be HTTPS. When that setting is unset, botocore may still
+select its standard AWS FIPS or dual-stack endpoint variant.
+
+Custom botocore event hooks registered only on the process-wide default
+Session are no longer injected into this backend. If those hooks are required,
+provide an explicitly customized backend rather than depending on global boto3
+state. Restart workers so every process constructs a new private generation;
+the SQS message and receipt formats are unchanged.
+
 ## Redis Physical-Key Layout
 
 Redis now maps each logical name into a configured namespace and separates the

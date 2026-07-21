@@ -129,6 +129,21 @@ upgrading.
   per logical queue, so one slow lookup does not block another queue's receipt
   settlement. Calls that lose admission to teardown now raise `QueueError`
   instead of racing a closing SDK client.
+- **SQS no longer uses boto3's process-wide default Session.** Every connection
+  generation constructs and owns a private `boto3.session.Session` plus its
+  low-level client, so independent backends cannot concurrently mutate or
+  reuse non-thread-safe default-Session state and reconnects re-resolve ambient
+  credentials. Botocore's ambient credential provider chain—including
+  credential environment variables, `AWS_PROFILE`-selected shared files, and
+  IAM/workload identities—continues to work. Region remains controlled by the
+  SQS setting, an explicit SQS key pair overrides ambient credentials, and a
+  custom endpoint URL can come only from the SQS endpoint setting. Ambient
+  `AWS_ENDPOINT_URL` / `AWS_ENDPOINT_URL_SQS` and shared-config custom endpoint
+  overrides are ignored so HTTP cannot bypass cloud-mode TLS validation.
+  Botocore FIPS/dual-stack selection remains available when the SQS endpoint
+  is unset. Code that depended on `boto3.setup_default_session(...)` or event
+  hooks registered only on that global Session must migrate; see
+  [`docs/migration-guide.md`](docs/migration-guide.md).
 - **DynamoDB Session/Resource/Table handles now belong to one generation.**
   Every candidate owns a private boto3 Session instead of the process-wide
   default. A live `connect()` is idempotent and candidates are published only

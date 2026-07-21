@@ -7,7 +7,8 @@ visibility timeout to zero for immediate re-delivery. Priority is ignored
 (SQS has no native priority queue).
 
 boto3 API (stable, well-known):
-- ``boto3.client("sqs", region_name=, endpoint_url=, aws_access_key_id=, ...)``
+- ``boto3.session.Session().client("sqs", region_name=, endpoint_url=,
+  aws_access_key_id=, ...)``
 - ``client.get_queue_url(QueueName=)`` / ``create_queue(QueueName=)``
 - ``client.send_message(QueueUrl=, MessageBody=, DelaySeconds=)``
 - ``client.receive_message(QueueUrl=, MaxNumberOfMessages=1, WaitTimeSeconds=, VisibilityTimeout=)``
@@ -37,6 +38,7 @@ from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
   import boto3
+  from botocore.config import Config as BotoConfig
 except ImportError as e:
   if not _is_missing_optional_dependency(e, "boto3"):
     raise
@@ -289,6 +291,7 @@ class _SqsClientGeneration:
   """One atomically published SQS client and its generation-local caches."""
 
   key: object
+  session: Any
   client: Any
   snapshot: _SqsConnectionSnapshot
   queue_urls: dict[str, str] = field(default_factory=dict)
@@ -397,7 +400,13 @@ class SqsBackend(Backend, QueueBackend):
       queue_name_prefix=queue_name_prefix,
       visibility_timeout=visibility_timeout,
     )
-    kwargs: dict[str, Any] = {"region_name": region_name}
+    kwargs: dict[str, Any] = {
+      "region_name": region_name,
+      # SQS endpoint policy belongs to the validated settings snapshot.
+      # Ignore AWS_ENDPOINT_URL[_SQS] and shared-config endpoint overrides so
+      # an ambient HTTP URL cannot bypass the cloud-mode TLS guard.
+      "config": BotoConfig(ignore_configured_endpoint_urls=True),
+    }
     if endpoint_url is not None:
       kwargs["endpoint_url"] = endpoint_url
     if key_id is not None and secret is not None:
@@ -417,13 +426,18 @@ class SqsBackend(Backend, QueueBackend):
           return
       snapshot, kwargs = self._capture_connection_snapshot()
       try:
-        candidate = boto3.client("sqs", **kwargs)
+        # The module-level boto3.client() alias shares boto3's process-wide
+        # default Session, which is not safe for concurrent client creation.
+        # Each candidate owns a private Session for its whole generation;
+        # normal operations share only the low-level client.
+        session = boto3.session.Session()
+        candidate = session.client("sqs", **kwargs)
       except Exception as e:
         raise BackendConnectionError(
           f"Failed to create SQS client: {e}", backend_type="sqs"
         ) from e
       generation = _SqsClientGeneration(
-        key=object(), client=candidate, snapshot=snapshot
+        key=object(), session=session, client=candidate, snapshot=snapshot
       )
       with self._generation_condition:
         self._generation = generation

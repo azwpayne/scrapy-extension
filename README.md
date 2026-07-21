@@ -306,6 +306,22 @@ retired client only after they finish. First-use QueueUrl discovery is
 single-flight per logical queue; a slow lookup does not serialize unrelated
 queues or delay an already-issued receipt acknowledgement.
 
+Each SQS generation also owns a private `boto3.session.Session` and low-level
+client. This avoids concurrent use and cross-generation credential caching in
+boto3's process-wide default Session. Botocore's ambient credential provider
+chain—credential environment variables (including a session token),
+`AWS_PROFILE`-selected shared files, and IAM/workload identities—is resolved
+independently for every new generation. Region always comes from
+`SCRAPY_SQS_REGION_NAME`, a custom endpoint URL can come only from
+`SCRAPY_SQS_ENDPOINT_URL`, and an explicit SQS access/secret pair overrides
+ambient credentials. `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_SQS`, and
+shared-config custom endpoints are ignored so they cannot bypass cloud-mode
+HTTPS validation. Botocore FIPS/dual-stack endpoint selection remains
+available when the SQS endpoint is unset. A custom
+`boto3.setup_default_session(...)` or event hook attached only to that global
+Session is intentionally not inherited; see the
+[migration guide](docs/migration-guide.md#sqs-private-boto3-sessions).
+
 ### Memcached (standalone, NoSQL KV)
 
 ```python

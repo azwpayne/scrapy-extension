@@ -33,11 +33,26 @@ class _SqsClientError(Exception):
     self.response = {"Error": {"Code": code}}
 
 
+def _patch_client(mocker, client):
+  """Patch one private SQS Session and guard the shared default alias."""
+  session = mocker.MagicMock(name="private-sqs-session")
+  session.client.return_value = client
+  session_factory = mocker.patch.object(
+    boto3.session, "Session", return_value=session
+  )
+  mocker.patch.object(
+    boto3,
+    "client",
+    side_effect=AssertionError("shared default Session must not be used"),
+  )
+  return session_factory, session.client
+
+
 def _connected(mocker, **overrides):
   b = SqsBackend(SqsSettings(**overrides))
   client = mocker.MagicMock()
   client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
-  mocker.patch.object(boto3, "client", return_value=client)
+  _patch_client(mocker, client)
   b.connect()
   return b, client
 
@@ -47,14 +62,20 @@ class TestSqsErrorPaths:
     b, _ = _connected(mocker, aws_access_key_id="k", aws_secret_access_key="s")
     assert b.is_connected()
 
-  def test_connect_rejects_unsupported_mode_as_configuration_error(self) -> None:
+  def test_connect_rejects_unsupported_mode_as_configuration_error(
+    self, mocker
+  ) -> None:
     b = SqsBackend(SqsSettings())
     b.config.mode = "unsupported"  # type: ignore[assignment]
+    session_factory, _client_factory = _patch_client(
+      mocker, mocker.MagicMock()
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
       b.connect()
 
     assert exc_info.value.setting_name == "mode"
+    session_factory.assert_not_called()
 
   def test_queue_url_create_fallback(self, mocker) -> None:
     b, client = _connected(mocker)

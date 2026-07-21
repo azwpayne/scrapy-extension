@@ -40,6 +40,21 @@ def _backend() -> SqsBackend:
   return SqsBackend(SqsSettings())
 
 
+def _patch_client(mocker, client):
+  """Patch one private SQS Session and guard the shared default alias."""
+  session = mocker.MagicMock(name="private-sqs-session")
+  session.client.return_value = client
+  session_factory = mocker.patch(
+    "scrapy_extension.backends.sqs.boto3.session.Session",
+    return_value=session,
+  )
+  mocker.patch(
+    "scrapy_extension.backends.sqs.boto3.client",
+    side_effect=AssertionError("shared default Session must not be used"),
+  )
+  return session_factory, session.client
+
+
 # ---------------------------------------------------------------------------
 # _SqsAckToken.__eq__ protocol (line 96)
 # ---------------------------------------------------------------------------
@@ -62,7 +77,7 @@ def test_ack_token_eq_returns_not_implemented_for_other_types() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_connect_rejects_partial_aws_credentials_access_key_only() -> None:
+def test_connect_rejects_partial_aws_credentials_access_key_only(mocker) -> None:
   """Lines 172-174 (SEC-7, defense-in-depth): connect() re-checks the
   both-or-neither credential invariant even though ``SqsSettings`` already
   validates it at construction — so a backend whose config is mutated
@@ -73,12 +88,14 @@ def test_connect_rejects_partial_aws_credentials_access_key_only() -> None:
 
   backend = _backend()
   backend.config.aws_access_key_id = SecretStr("ak")  # bypass settings validation
+  session_factory, _client_factory = _patch_client(mocker, MagicMock())
   with pytest.raises(ConfigurationError) as exc:
     backend.connect()
   assert "aws_secret_access_key" in str(exc.value)
+  session_factory.assert_not_called()
 
 
-def test_connect_rejects_partial_aws_credentials_secret_only() -> None:
+def test_connect_rejects_partial_aws_credentials_secret_only(mocker) -> None:
   """Lines 172-174 (SEC-7, defense-in-depth): the reverse mismatch — secret
   set, key missing — also caught at connect() when settings validation is
   bypassed by post-construction mutation."""
@@ -86,9 +103,11 @@ def test_connect_rejects_partial_aws_credentials_secret_only() -> None:
 
   backend = _backend()
   backend.config.aws_secret_access_key = SecretStr("sk")  # bypass settings validation
+  session_factory, _client_factory = _patch_client(mocker, MagicMock())
   with pytest.raises(ConfigurationError) as exc:
     backend.connect()
   assert "aws_access_key_id" in str(exc.value)
+  session_factory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +117,12 @@ def test_connect_rejects_partial_aws_credentials_secret_only() -> None:
 
 def test_connect_passes_endpoint_url_into_boto3_client(mocker) -> None:
   """Line 184: when ``endpoint_url`` is set (LocalStack), it is forwarded to
-  ``boto3.client`` so LocalStack tests route correctly."""
-  mock_boto3 = mocker.patch("scrapy_extension.backends.sqs.boto3")
+  the private Session client so LocalStack tests route correctly."""
+  session_factory, client_factory = _patch_client(mocker, MagicMock())
   backend = SqsBackend(SqsSettings(endpoint_url="http://localhost:4566"))
   backend.connect()
-  _, kwargs = mock_boto3.client.call_args
+  session_factory.assert_called_once_with()
+  _, kwargs = client_factory.call_args
   assert kwargs["endpoint_url"] == "http://localhost:4566"
 
 
@@ -159,7 +179,7 @@ def test_receive_raises_for_message_without_receipt_handle(mocker) -> None:
   client.receive_message.return_value = {
     "Messages": [{"Body": base64.b64encode(b"x").decode()}]  # no ReceiptHandle
   }
-  mocker.patch("scrapy_extension.backends.sqs.boto3.client", return_value=client)
+  _patch_client(mocker, client)
   backend.connect()
   with pytest.raises(QueueError) as exc_info:
     backend._receive("q", 0.0)
@@ -209,9 +229,7 @@ def test_nack_with_token_clears_matching_legacy_last_receipt(mocker) -> None:
   points at the same handle — keeps the legacy single-pop slot coherent with
   the per-message token path (single-process sanity)."""
   backend = _backend()
-  mocker.patch(
-    "scrapy_extension.backends.sqs.boto3.client", return_value=MagicMock()
-  )
+  _patch_client(mocker, MagicMock())
   backend.connect()
   token = _SqsAckToken("u-1", "rh-1")
   backend._last_receipt = ("u-1", "rh-1")  # legacy slot matches the token
@@ -226,9 +244,7 @@ def test_nack_with_token_keeps_nonmatching_legacy_last_receipt(mocker) -> None:
   clears the legacy slot (the token path and legacy path are independent
   except for the single-process coherence optimization)."""
   backend = _backend()
-  mocker.patch(
-    "scrapy_extension.backends.sqs.boto3.client", return_value=MagicMock()
-  )
+  _patch_client(mocker, MagicMock())
   backend.connect()
   token = _SqsAckToken("u-new", "rh-new")
   backend._last_receipt = ("u-other", "rh-other")  # different handle
