@@ -216,7 +216,7 @@ speculative work.
   every paginated scan, and reserve whole-table clear for an explicit `None`;
   reject an empty prefix before any AWS operation instead of silently widening
   it to the whole table.
-- [ ] **BACKEND-03B — DynamoDB storage boundaries.** Enforce DynamoDB's
+- [x] **BACKEND-03B — DynamoDB storage boundaries.** Enforce DynamoDB's
   400 KiB item and 2,048-byte partition-key limits before network I/O, propagate
   deterministic pipeline failures, and reject malformed persisted value/TTL
   shapes through the typed storage-error contract.
@@ -494,4 +494,26 @@ snapshot isolation from concurrent writers.
 The five exact regressions passed on Python 3.10 and 3.14, 91 related DynamoDB
 and cross-backend TTL tests passed, and the full suite passed 2,959 tests with
 44 documented skips. Ruff and strict mypy remained green. DynamoDB physical
-size and malformed persisted-value boundaries remain BACKEND-03B.
+size and malformed persisted-value boundaries were deferred to BACKEND-03B.
+
+### I15b — DynamoDB physical and persisted-data boundaries
+
+Nineteen RED regressions established four silent-failure paths: DynamoDB-sized
+items and overlong partition keys reached AWS, corrupt binary/TTL attributes
+returned absence sentinels or raw conversion exceptions, and the item pipeline
+swallowed a backend's deterministic validation error as a success-shaped item
+return. The implementation now applies AWS's documented 2,048-byte partition
+key and 400 KiB names-plus-values limits before network I/O, including key and
+optional numeric-TTL overhead. See the
+[DynamoDB constraints](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html)
+and [item-size rules](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html).
+
+Every point operation shares the key ceiling. Reads accept bytes, bytearray, or
+boto3's binary wrapper, validate finite numeric expiries (including `Decimal`),
+and otherwise raise `StorageError` with the exact operation and key. The
+pipeline now propagates local configuration/serialization/type/value/overflow
+failures immediately while retaining its existing tolerance and threshold for
+operational backend exceptions. All 19 regressions passed on Python 3.10 and
+3.14, 205 related DynamoDB/pipeline/storage-strategy tests passed, and the full
+suite passed 2,978 tests with 44 documented skips. Ruff, strict mypy, and the
+patch integrity check remained green.

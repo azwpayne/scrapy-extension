@@ -171,6 +171,31 @@ class TestDynamoDBStorageOps:
     assert type(expire_at) is int
     assert expire_at == 1_061
 
+  def test_store_enforces_complete_400_kib_item_limit_before_io(
+    self, mocker
+  ) -> None:
+    b, table = _connected(mocker)
+    # Item size is attribute names plus values: ``pk`` (2), key (1),
+    # ``value`` (5), and raw binary bytes. Exactly 400 KiB is accepted.
+    largest_value = b"x" * (400 * 1024 - 2 - 1 - 5)
+
+    b.store("k", largest_value)
+
+    table.put_item.assert_called_once()
+    with pytest.raises(ValueError, match="400 KiB"):
+      b.store("k", largest_value + b"x")
+    assert table.put_item.call_count == 1
+
+  def test_store_rejects_partition_key_over_2048_bytes_before_io(
+    self, mocker
+  ) -> None:
+    b, table = _connected(mocker)
+
+    with pytest.raises(ValueError, match="2,048 UTF-8 bytes"):
+      b.store("k" * 2049, b"value")
+
+    table.put_item.assert_not_called()
+
   def test_retrieve_returns_value(self, mocker) -> None:
     b, table = _connected(mocker)
     table.get_item.return_value = {"Item": {"pk": "key1", "value": b"payload"}}
@@ -189,6 +214,41 @@ class TestDynamoDBStorageOps:
     }
 
     assert b.retrieve("key1") == b"payload"
+
+  @pytest.mark.parametrize("stored_value", [None, "text", object()])
+  def test_retrieve_rejects_malformed_persisted_value(
+    self, mocker, stored_value
+  ) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "key1", "value": stored_value}
+    }
+
+    with pytest.raises(StorageError) as exc_info:
+      b.retrieve("key1")
+
+    assert exc_info.value.operation == "retrieve"
+    assert exc_info.value.key == "key1"
+
+  @pytest.mark.parametrize(
+    ("method_name", "operation"),
+    [("retrieve", "retrieve"), ("exists", "exists"), ("ttl", "ttl")],
+  )
+  @pytest.mark.parametrize("expire_at", [True, "tomorrow", float("nan")])
+  def test_reads_reject_malformed_persisted_expiry(
+    self, mocker, method_name, operation, expire_at
+  ) -> None:
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "key1", "value": b"payload", "expire_at": expire_at}
+    }
+
+    with pytest.raises(StorageError) as exc_info:
+      getattr(b, method_name)("key1")
+
+    assert exc_info.value.operation == operation
+    assert exc_info.value.key == "key1"
+    table.delete_item.assert_not_called()
 
   def test_retrieve_missing_returns_none(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -415,6 +475,25 @@ class TestDynamoDBStorageOps:
     b, _ = _connected(mocker)
     with pytest.raises(ValueError):
       b.store("bad key!", b"x")
+
+  @pytest.mark.parametrize(
+    ("method_name", "table_method"),
+    [
+      ("retrieve", "get_item"),
+      ("delete", "delete_item"),
+      ("exists", "get_item"),
+      ("ttl", "get_item"),
+    ],
+  )
+  def test_key_operations_reject_partition_key_over_2048_bytes_before_io(
+    self, mocker, method_name, table_method
+  ) -> None:
+    b, table = _connected(mocker)
+
+    with pytest.raises(ValueError, match="2,048 UTF-8 bytes"):
+      getattr(b, method_name)("k" * 2049)
+
+    getattr(table, table_method).assert_not_called()
 
 
 # ---------------------------------------------------------------------------

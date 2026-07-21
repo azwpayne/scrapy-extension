@@ -550,6 +550,22 @@ class TestBackendPipelineProcessItem:
     # Storage was attempted.
     assert mock_storage.store.call_count == 1
 
+  def test_process_item_propagates_deterministic_backend_validation_error(
+    self, mock_connection_manager, mocker
+  ):
+    """A backend's local validation failure must not look like stored data."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = True
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_storage.store.side_effect = ValueError("item exceeds backend limit")
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+
+    with pytest.raises(ValueError, match="backend limit"):
+      pipeline.process_item(SampleItem(name="Test", value=1), spider)
+
+    spider.crawler.stats.inc_value.assert_not_called()
+
   def test_process_item_wraps_item_serialization_failure(
     self, mock_connection_manager, mocker
   ):

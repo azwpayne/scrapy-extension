@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -56,6 +57,38 @@ logger = logging.getLogger(__name__)
 # Runtime storage operations must therefore surface this code as StorageError.
 _DDB_NOT_FOUND_CODES = frozenset({"ResourceNotFoundException"})
 _DDB_INUSE_CODES = frozenset({"ResourceInUseException"})
+_DDB_MAX_PARTITION_KEY_BYTES = 2_048
+_DDB_MAX_ITEM_BYTES = 400 * 1_024
+_MISSING = object()
+
+
+def _validate_partition_key(key: str) -> None:
+  """Validate the package key grammar and DynamoDB's physical byte ceiling."""
+  _validate_key_name(key, "key")
+  key_size = len(key.encode("utf-8"))
+  if key_size > _DDB_MAX_PARTITION_KEY_BYTES:
+    raise ValueError(
+      "DynamoDB partition key exceeds 2,048 UTF-8 bytes "
+      f"({key_size} bytes)."
+    )
+
+
+def _number_size_upper_bound(value: int) -> int:
+  """Return a safe DynamoDB byte estimate for the positive integer value."""
+  digits = len(str(abs(value)))
+  return (digits + 1) // 2 + 1
+
+
+def _validate_item_size(key: str, data: bytes, expire_at: int | None) -> None:
+  """Reject items beyond DynamoDB's 400 KiB names-plus-values limit."""
+  item_size = len("pk") + len(key.encode("utf-8")) + len("value") + len(data)
+  if expire_at is not None:
+    item_size += len("expire_at") + _number_size_upper_bound(expire_at)
+  if item_size > _DDB_MAX_ITEM_BYTES:
+    raise ValueError(
+      f"DynamoDB item is {item_size} bytes; the maximum is 400 KiB "
+      "including attribute names and values."
+    )
 
 
 def _is_resource_not_found(exc: BaseException) -> bool:
@@ -203,34 +236,66 @@ class DynamoDBBackend(Backend, StorageBackend):
     """Return BackendType.DYNAMODB."""
     return BackendType.DYNAMODB
 
-  def _is_expired(self, item: dict[str, Any]) -> bool:
-    """Return True if the item has an expire_at that has passed."""
-    expire_at = item.get("expire_at")
-    return expire_at is not None and float(expire_at) <= time.time()
+  @staticmethod
+  def _response_item(
+    response: Any, operation: str, key: str
+  ) -> dict[str, Any] | None:
+    """Return a structurally valid item or raise the storage error contract."""
+    if not isinstance(response, dict):
+      msg = "DynamoDB returned a non-mapping item response"
+      raise StorageError(msg, operation=operation, key=key)
+    item = response.get("Item", _MISSING)
+    if item is _MISSING:
+      return None
+    if not isinstance(item, dict):
+      msg = "DynamoDB returned a malformed Item mapping"
+      raise StorageError(msg, operation=operation, key=key)
+    return item
 
-  def _lazy_reap_if_expired(self, item: dict[str, Any], key: str) -> bool:
+  @staticmethod
+  def _validated_expiry(
+    item: dict[str, Any], operation: str, key: str
+  ) -> tuple[Any, float] | None:
+    """Read a finite numeric expiry without leaking a raw conversion error."""
+    expire_at = item.get("expire_at")
+    if expire_at is None:
+      return None
+    if isinstance(expire_at, bool) or not isinstance(
+      expire_at, (int, float, Decimal)
+    ):
+      msg = "DynamoDB item has a non-numeric expire_at attribute"
+      raise StorageError(msg, operation=operation, key=key)
+    try:
+      epoch = float(expire_at)
+    except (OverflowError, TypeError, ValueError) as e:
+      msg = "DynamoDB item has an invalid numeric expire_at attribute"
+      raise StorageError(msg, operation=operation, key=key) from e
+    if not math.isfinite(epoch):
+      msg = "DynamoDB item has a non-finite expire_at attribute"
+      raise StorageError(msg, operation=operation, key=key)
+    return expire_at, epoch
+
+  def _lazy_reap_if_expired(
+    self, expiry: tuple[Any, float] | None, key: str
+  ) -> bool:
     """Lazy-reap an expired item; return True if expired (caller treats as absent).
 
     Centralizes the TTL-expiry contract shared by ``retrieve`` / ``exists`` /
     ``ttl``: if the item's ``expire_at`` is in the past, delete it best-effort
     (via ``_swallow``) so the table does not accumulate dead rows, and return True.
 
-    R-dyncas: the delete is a CAS on ``expire_at``
-    (``ConditionExpression="expire_at = :exp"``), NOT unconditional. ``item`` is
-    a stale ``get_item`` snapshot; a concurrent ``store()`` (``put_item``) between
-    the read and this reap would overwrite the key with a fresh value, and an
-    unconditional delete would clobber the fresh write -> data loss. The CAS makes
-    a concurrent overwrite fail the condition (``ConditionalCheckFailedException``,
-    swallowed by ``_swallow``) so the fresh item survives. ``expire_at`` is
-    guaranteed non-None here (``_is_expired`` returns False when None).
+    R-dyncas: the delete is a CAS on ``expire_at`` rather than unconditional.
+    A concurrent ``store()`` after the strongly consistent read therefore makes
+    the condition fail instead of letting lazy cleanup clobber the fresh value.
     """
-    if not self._is_expired(item):
+    if expiry is None or expiry[1] > time.time():
       return False
+    raw_expiry, _ = expiry
     with _swallow():
       self._table.delete_item(
         Key={"pk": key},
         ConditionExpression="expire_at = :exp",
-        ExpressionAttributeValues={":exp": item.get("expire_at")},
+        ExpressionAttributeValues={":exp": raw_expiry},
       )
     return True
 
@@ -249,11 +314,14 @@ class DynamoDBBackend(Backend, StorageBackend):
             throughput / limit / etc.). Was previously silently swallowed,
             masking data loss in the item pipeline.
     """
-    _validate_key_name(key, "key")
+    _validate_partition_key(key)
     _validate_ttl(ttl)
     item: dict[str, Any] = {"pk": key, "value": data}
+    expire_at: int | None = None
     if ttl is not None:
-      item["expire_at"] = math.ceil(time.time() + ttl)
+      expire_at = math.ceil(time.time() + ttl)
+      item["expire_at"] = expire_at
+    _validate_item_size(key, data, expire_at)
     try:
       self._table.put_item(Item=item)
     except Exception as e:
@@ -279,26 +347,30 @@ class DynamoDBBackend(Backend, StorageBackend):
         StorageError: On operational failures (was previously silently
             swallowed to ``return None``).
     """
-    _validate_key_name(key, "key")
+    _validate_partition_key(key)
     try:
       resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
     except Exception as e:
       msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
       raise StorageError(msg, operation="retrieve", key=key) from e
-    item = resp.get("Item")
-    if not item:
+    item = self._response_item(resp, "retrieve", key)
+    if item is None:
       return None
-    if self._lazy_reap_if_expired(item, key):
+    expiry = self._validated_expiry(item, "retrieve", key)
+    if self._lazy_reap_if_expired(expiry, key):
       return None
-    value = item.get("value")
+    value = item.get("value", _MISSING)
     if isinstance(value, (bytes, bytearray)):
       return bytes(value)
-    binary_value = getattr(value, "value", None)
-    return (
-      bytes(binary_value)
-      if isinstance(binary_value, (bytes, bytearray))
-      else None
-    )
+    try:
+      binary_value = getattr(value, "value", None)
+    except Exception as e:
+      msg = "DynamoDB item has an unreadable binary value attribute"
+      raise StorageError(msg, operation="retrieve", key=key) from e
+    if isinstance(binary_value, (bytes, bytearray)):
+      return bytes(binary_value)
+    msg = "DynamoDB item has a missing or non-binary value attribute"
+    raise StorageError(msg, operation="retrieve", key=key)
 
   def delete(self, key: str) -> bool:
     """Delete data by key.
@@ -315,7 +387,7 @@ class DynamoDBBackend(Backend, StorageBackend):
             swallowed to ``return False`` — masked ``ThrottlingException`` as
             "didn't exist", causing dedup re-emission).
     """
-    _validate_key_name(key, "key")
+    _validate_partition_key(key)
     try:
       resp = self._table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
     except Exception as e:
@@ -337,16 +409,17 @@ class DynamoDBBackend(Backend, StorageBackend):
         StorageError: On operational failures (was previously silently
             swallowed to ``return False``).
     """
-    _validate_key_name(key, "key")
+    _validate_partition_key(key)
     try:
       resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
     except Exception as e:
       msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="exists", key=key) from e
-    item = resp.get("Item")
-    if not item:
+    item = self._response_item(resp, "exists", key)
+    if item is None:
       return False
-    return not self._lazy_reap_if_expired(item, key)
+    expiry = self._validated_expiry(item, "exists", key)
+    return not self._lazy_reap_if_expired(expiry, key)
 
   def ttl(self, key: str) -> int | None:
     """Return remaining TTL seconds if the item has expire_at, else None.
@@ -362,17 +435,17 @@ class DynamoDBBackend(Backend, StorageBackend):
         StorageError: On operational failures (was previously silently
             swallowed to ``return None``).
     """
-    _validate_key_name(key, "key")
+    _validate_partition_key(key)
     try:
       resp = self._table.get_item(Key={"pk": key}, ConsistentRead=True)
     except Exception as e:
       msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
       raise StorageError(msg, operation="ttl", key=key) from e
-    item = resp.get("Item")
-    if not item:
+    item = self._response_item(resp, "ttl", key)
+    if item is None:
       return None
-    expire_at = item.get("expire_at")
-    if expire_at is None:
+    expiry = self._validated_expiry(item, "ttl", key)
+    if expiry is None:
       return None
     # R-dynttl: symmetry with retrieve()/exists() — lazy-reap expired rows so
     # the table does not accumulate dead rows, and return None (expired =
@@ -380,9 +453,9 @@ class DynamoDBBackend(Backend, StorageBackend):
     # returned 0 for an expired key without reaping, conflating "about to
     # expire" with "expired long ago" and leaving the dead row to linger until
     # a retrieve/exists/clear_storage touched it.
-    if self._lazy_reap_if_expired(item, key):
+    if self._lazy_reap_if_expired(expiry, key):
       return None
-    return max(0, int(float(expire_at) - time.time()))
+    return max(0, int(expiry[1] - time.time()))
 
   def clear_storage(self, prefix: str | None = None) -> None:
     """Best-effort clear via scan + batch delete, optionally prefix-scoped.

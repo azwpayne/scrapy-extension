@@ -496,6 +496,17 @@ class BackendPipeline:
 
     try:
       self._store_item(key, data)
+    except (
+      ConfigurationError,
+      SerializationError,
+      TypeError,
+      ValueError,
+      OverflowError,
+    ):
+      # Local validation/configuration failures are deterministic. Returning
+      # the item would report success-shaped data loss and retrying cannot heal
+      # it, so preserve their original typed failure for Scrapy/operator policy.
+      raise
     except Exception as e:
       logger.warning(
         "Failed to store item %s: %s. Item will not be persisted.",
