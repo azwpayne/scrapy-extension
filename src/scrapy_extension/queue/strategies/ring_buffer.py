@@ -122,6 +122,11 @@ class RingBufferQueueStrategy(QueueStrategy):
     """Bind this in-process buffer to one logical queue."""
     self._bind_single_queue(queue_name)
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Ring-buffer items exist only in this process until consumed."""
+    del delay, source
+    return False
+
   # ------------------------------------------------------------------ push
 
   def push(

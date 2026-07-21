@@ -40,7 +40,19 @@ def normalize_queue_timeout(timeout: float) -> float:
   return normalized
 
 
-class _BoundQueueAckToken:
+class _QueueAckToken(ABC):
+  """Internal process-local token with explicit terminal operations."""
+
+  @abstractmethod
+  def ack(self) -> None:
+    """Acknowledge the represented delivery transition."""
+
+  @abstractmethod
+  def nack(self) -> None:
+    """Negatively acknowledge the represented delivery transition."""
+
+
+class _BoundQueueAckToken(_QueueAckToken):
   """Bind a raw delivery token to its issuing backend incarnation.
 
   ``ConnectionManager`` may replace a disconnected backend while a Scrapy
@@ -164,6 +176,18 @@ class QueueStrategy(ABC):
           f"{type(self).__name__} is already bound to logical queue "
           f"{self._bound_queue_name!r}; cannot reuse it for {queue_name!r}"
         )
+
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Whether a successful push crossed a crash-durable backend boundary.
+
+    Backend-delegating strategies inherit ``True``. Strategies that can retain
+    the item only in process must override this for the applicable routing
+    inputs. ``BackendQueue`` uses the answer solely for source-delivery
+    transfers: acknowledging an MQ source after a volatile local append would
+    lose both source and replacement on a hard crash.
+    """
+    del delay, source
+    return True
 
   @abstractmethod
   def push(

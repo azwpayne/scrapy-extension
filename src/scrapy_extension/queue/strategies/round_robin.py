@@ -61,6 +61,11 @@ class RoundRobinQueueStrategy(QueueStrategy):
     """Bind this in-process fairness state to one logical queue."""
     self._bind_single_queue(queue_name)
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Round-robin items remain volatile until this process consumes them."""
+    del delay, source
+    return False
+
   def push(
     self,
     queue_name: str,

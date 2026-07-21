@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from collections.abc import AsyncIterable, Iterable, Mapping
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from scrapy import signals
+from scrapy.http import Request
 from scrapy.utils.misc import load_object
 from twisted.internet.defer import Deferred
 from twisted.python.failure import Failure as TwistedFailure
@@ -33,6 +35,7 @@ from scrapy_extension.exceptions import (
   SerializationError,
 )
 from scrapy_extension.queue.queue import BACKEND_ACK_TOKEN_META_KEY, BackendQueue
+from scrapy_extension.queue.strategies.base import _QueueAckToken
 from scrapy_extension.utils._config import (
   get_bool_setting,
   parse_float_setting,
@@ -42,7 +45,7 @@ from scrapy_extension.utils._config import (
 if TYPE_CHECKING:
   from scrapy import Spider
   from scrapy.crawler import Crawler
-  from scrapy.http import Request, Response
+  from scrapy.http import Response
   from scrapy.settings import Settings
   from scrapy.statscollectors import StatsCollector
   from twisted.internet.defer import Deferred
@@ -57,14 +60,115 @@ _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
 
 
+class _DeferredReplacementAckGroup:
+  """Settle one source only after an errback output stream is committed.
+
+  Each replacement request gets a distinct child token. A child becomes
+  complete only when ``BackendQueue.push`` reaches its commit boundary (or the
+  scheduler terminates it as a duplicate/invalid replacement). The source is
+  acknowledged after the output iterable is exhausted *and* every registered
+  child is complete. An output-iteration failure aborts the group with a nack.
+  """
+
+  def __init__(
+    self,
+    scheduler: BackendScheduler,
+    source_token: Any,
+  ) -> None:
+    self._scheduler = scheduler
+    self._source_token = source_token
+    self._lock = threading.Lock()
+    self._pending: set[int] = set()
+    self._next_child = 0
+    self._sealed = False
+    self._terminal = False
+
+  def new_child(self) -> _DeferredReplacementAckToken | None:
+    """Register one replacement unless this group already aborted."""
+    with self._lock:
+      if self._terminal:
+        return None
+      child_id = self._next_child
+      self._next_child += 1
+      self._pending.add(child_id)
+    return _DeferredReplacementAckToken(self, child_id)
+
+  def seal(self) -> None:
+    """Declare output enumeration complete and ack if no child remains."""
+    with self._lock:
+      if self._terminal:
+        return
+      self._sealed = True
+      if self._pending:
+        return
+      if self._scheduler._ack_token(
+        self._source_token,
+        log_message=(
+          "Failed to ack source message after errback replacements committed"
+        ),
+      ):
+        self._terminal = True
+
+  def accept(self, child_id: int) -> None:
+    """Mark one replacement committed and settle a sealed final child."""
+    with self._lock:
+      if self._terminal or child_id not in self._pending:
+        return
+      if not self._sealed or len(self._pending) > 1:
+        self._pending.remove(child_id)
+        return
+      if self._scheduler._ack_token(
+        self._source_token,
+        log_message=(
+          "Failed to ack source message after errback replacements committed"
+        ),
+      ):
+        self._pending.remove(child_id)
+        self._terminal = True
+
+  def abort(self) -> None:
+    """Nack a source whose replacement output failed during enumeration."""
+    with self._lock:
+      if self._terminal:
+        return
+      self._scheduler._nack_token(
+        self._source_token,
+        log_message="Failed to nack source after errback output failure",
+      )
+      # Even if the broker call failed, visibility timeout/redelivery is the
+      # only safe recovery. Never let late child commits turn this into an ack.
+      self._pending.clear()
+      self._terminal = True
+
+
+class _DeferredReplacementAckToken(_QueueAckToken):
+  """One idempotent child completion in a deferred source-ack group."""
+
+  __slots__ = ("_child_id", "_group")
+
+  def __init__(self, group: _DeferredReplacementAckGroup, child_id: int) -> None:
+    self._group = group
+    self._child_id = child_id
+
+  def ack(self) -> None:
+    """Record that this replacement reached its queue commit boundary."""
+    self._group.accept(self._child_id)
+
+  def nack(self) -> None:
+    """Abort the source when a child is negatively acknowledged locally."""
+    self._group.abort()
+
+
 class _BackendDownloadFailureErrback:
-  """Nack a terminal downloader failure, then delegate to the user errback.
+  """Settle a downloader failure around the user errback's final output.
 
   Downloader middleware handles retry/redirect before Scrapy invokes a
   request's spider errback. Installing this wrapper only on popped deliveries
-  therefore leaves replacement requests on the existing enqueue-then-ack path,
-  while a final Failure receives the missing nack transition. The wrapper is
-  removed before any request is serialized back into the backend queue.
+  leaves middleware replacements on the existing enqueue-then-ack path. A user
+  errback's replacement requests receive child tokens so the source is acked
+  only after the complete output stream commits; an unhandled/failed stream is
+  nacked. The wrapper is removed before a request is serialized back into the
+  backend queue.
   """
 
   def __init__(self, scheduler: BackendScheduler, original: Any | None) -> None:
@@ -91,15 +195,134 @@ class _BackendDownloadFailureErrback:
     return self._finish_success(request, result)
 
   def _finish_success(self, request: Any, result: Any) -> Any:
-    """Ack handled failures; a returned Failure remains an unhandled nack."""
+    """Settle handled failures after any replacement output is committed."""
     if isinstance(result, TwistedFailure):
       return self._finish_failure(request, result)
-    if request is not None:
-      self.scheduler._ack_request_token(
-        request,
-        log_message="Failed to ack message after handled download failure",
-      )
+    if request is None:
+      return result
+    if isinstance(result, Request):
+      return self._transfer_request(request, result)
+    if isinstance(result, AsyncIterable):
+      return self._transfer_async_iterable(request, result)
+    if isinstance(result, Iterable) and not isinstance(
+      result,
+      (str, bytes, bytearray, Mapping),
+    ):
+      return self._transfer_iterable(request, result)
+    self.scheduler._ack_request_token(
+      request,
+      log_message="Failed to ack message after handled download failure",
+    )
     return result
+
+  def _new_group(
+    self,
+    request: Request,
+  ) -> tuple[_DeferredReplacementAckGroup, Any] | None:
+    """Move the source token out of its request and into a deferred group."""
+    token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
+    if token is None:
+      return None
+    group = _DeferredReplacementAckGroup(self.scheduler, token)
+    request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+    return group, token
+
+  def _attach_replacement(
+    self,
+    group: _DeferredReplacementAckGroup,
+    source_token: Any,
+    replacement: Request,
+  ) -> None:
+    """Attach one commit-tracking child without overwriting another delivery."""
+    existing = replacement.meta.get(BACKEND_ACK_TOKEN_META_KEY)
+    if existing is not None and existing is not source_token:
+      logger.error(
+        "Errback replacement already carries a different backend ack token; "
+        "nacking the source instead of overwriting either delivery"
+      )
+      if self.scheduler.stats:
+        self.scheduler.stats.inc_value("scheduler/ack_transfer_conflict")
+      group.abort()
+      return
+    child = group.new_child()
+    if child is not None:
+      replacement.meta[BACKEND_ACK_TOKEN_META_KEY] = child
+
+  def _transfer_request(self, request: Request, replacement: Request) -> Request:
+    """Transfer one source delivery to a replacement request commit token."""
+    group_and_token = self._new_group(request)
+    if group_and_token is None:
+      return replacement
+    group, source_token = group_and_token
+    self._attach_replacement(group, source_token, replacement)
+    group.seal()
+    return replacement
+
+  def _transfer_iterable(
+    self,
+    request: Request,
+    result: Iterable[Any],
+  ) -> Iterable[Any]:
+    """Stream synchronous errback output while tracking replacement commits."""
+    group: _DeferredReplacementAckGroup | None = None
+    source_token: Any = None
+    try:
+      for value in result:
+        if isinstance(value, Request):
+          if group is None:
+            group_and_token = self._new_group(request)
+            if group_and_token is not None:
+              group, source_token = group_and_token
+          if group is not None:
+            self._attach_replacement(group, source_token, value)
+        yield value
+    except BaseException:
+      if group is not None:
+        group.abort()
+      else:
+        self._finish_failure(request, None)
+      raise
+    else:
+      if group is not None:
+        group.seal()
+      else:
+        self.scheduler._ack_request_token(
+          request,
+          log_message="Failed to ack message after handled download failure",
+        )
+
+  async def _transfer_async_iterable(
+    self,
+    request: Request,
+    result: AsyncIterable[Any],
+  ) -> Any:
+    """Stream asynchronous errback output while tracking replacement commits."""
+    group: _DeferredReplacementAckGroup | None = None
+    source_token: Any = None
+    try:
+      async for value in result:
+        if isinstance(value, Request):
+          if group is None:
+            group_and_token = self._new_group(request)
+            if group_and_token is not None:
+              group, source_token = group_and_token
+          if group is not None:
+            self._attach_replacement(group, source_token, value)
+        yield value
+    except BaseException:
+      if group is not None:
+        group.abort()
+      else:
+        self._finish_failure(request, None)
+      raise
+    else:
+      if group is not None:
+        group.seal()
+      else:
+        self.scheduler._ack_request_token(
+          request,
+          log_message="Failed to ack message after handled download failure",
+        )
 
   def _finish_failure(self, request: Any, failure: Any) -> Any:
     """Nack an unhandled or failed errback while preserving its Failure."""
@@ -1024,38 +1247,52 @@ class BackendScheduler:
       log_message="Failed to nack message after spider_error",
     )
 
-  def _ack_request_token(self, request: Request, *, log_message: str) -> None:
-    """Best-effort ack of the token carried by ``request``."""
+  def _ack_token(self, token: Any, *, log_message: str) -> bool:
+    """Best-effort ack of one explicit token, returning settlement success."""
     queue = self._queue
-    if queue is None or getattr(request, "meta", None) is None:
-      return
-    token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
-    if token is None:
-      return
+    if queue is None:
+      return False
     try:
       queue.ack(token=token)
     except BackendError:
       if self.stats:
         self.stats.inc_value("scheduler/ack_error")
       logger.exception(log_message)
-    else:
-      request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+      return False
+    return True
 
-  def _nack_request_token(self, request: Request, *, log_message: str) -> None:
-    """Best-effort nack of the token carried by ``request``."""
-    queue = self._queue
-    if queue is None or getattr(request, "meta", None) is None:
+  def _ack_request_token(self, request: Request, *, log_message: str) -> None:
+    """Best-effort ack of the token carried by ``request``."""
+    if getattr(request, "meta", None) is None:
       return
     token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
     if token is None:
       return
+    if self._ack_token(token, log_message=log_message):
+      request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+
+  def _nack_token(self, token: Any, *, log_message: str) -> bool:
+    """Best-effort nack of one explicit token, returning settlement success."""
+    queue = self._queue
+    if queue is None:
+      return False
     try:
       queue.nack(token=token)
     except BackendError:
       if self.stats:
         self.stats.inc_value("scheduler/nack_error")
       logger.exception(log_message)
-    else:
+      return False
+    return True
+
+  def _nack_request_token(self, request: Request, *, log_message: str) -> None:
+    """Best-effort nack of the token carried by ``request``."""
+    if getattr(request, "meta", None) is None:
+      return
+    token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
+    if token is None:
+      return
+    if self._nack_token(token, log_message=log_message):
       request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
 
   def _restore_original_errback(self, request: Request) -> None:

@@ -11,6 +11,10 @@ from scrapy.utils.request import request_from_dict
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
+from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
+from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
 
 
 class _QueueTestSpider(Spider):
@@ -793,6 +797,70 @@ class TestBackendQueuePush:
 
     mock_connection_manager.get_queue_backend().ack.assert_not_called()
     assert request.meta["_backend_ack_token"] == "old-token"
+
+  @pytest.mark.parametrize(
+    "strategy_factory",
+    (
+      lambda manager: DelayQueueStrategy(manager, default_delay=1.0),
+      lambda manager: TimeWheelQueueStrategy(manager, default_delay=1.0),
+      lambda manager: RoundRobinQueueStrategy(manager),
+      lambda manager: RingBufferQueueStrategy(manager),
+    ),
+  )
+  def test_volatile_strategy_rejects_source_token_before_local_acceptance(
+    self,
+    mock_connection_manager,
+    strategy_factory,
+  ):
+    mock_connection_manager.get_queue_backend().queue_len.return_value = 0
+    strategy = strategy_factory(mock_connection_manager)
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    request = Request(
+      "https://example.com/retry",
+      meta={"_backend_ack_token": "old-token"},
+    )
+
+    with pytest.raises(QueueError, match="in-process queue strategy"):
+      queue.push(request)
+
+    assert strategy.queue_len("test_queue") == 0
+    mock_connection_manager.get_queue_backend().ack.assert_not_called()
+    assert request.meta["_backend_ack_token"] == "old-token"
+
+  @pytest.mark.parametrize(
+    "strategy_factory",
+    (
+      lambda manager: DelayQueueStrategy(manager, default_delay=0.0),
+      lambda manager: TimeWheelQueueStrategy(manager, default_delay=0.0),
+    ),
+  )
+  def test_zero_delay_replacement_still_commits_through_backend(
+    self,
+    mock_connection_manager,
+    strategy_factory,
+  ):
+    strategy = strategy_factory(mock_connection_manager)
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    request = Request(
+      "https://example.com/retry",
+      meta={"_backend_ack_token": "old-token"},
+    )
+
+    queue.push(request)
+
+    mock_connection_manager.get_queue_backend().push.assert_called_once()
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
 
   @pytest.mark.parametrize(
     "delay",

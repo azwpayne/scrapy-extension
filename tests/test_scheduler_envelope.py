@@ -382,6 +382,155 @@ class TestEnqueueBranchClosure:
     queue.ack.assert_called_once_with(token="delivery-token")
     queue.nack.assert_not_called()
 
+  def test_errback_request_transfers_ack_until_replacement_commit(self) -> None:
+    replacement = Request("https://example.com/replacement")
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=replacement),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+
+    assert request.errback(MagicMock(request=request)) is replacement
+
+    queue.ack.assert_not_called()
+    assert BACKEND_ACK_TOKEN_META_KEY not in request.meta
+    transferred = replacement.meta[BACKEND_ACK_TOKEN_META_KEY]
+
+    transferred.ack()
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+
+  def test_errback_iterable_acks_after_every_replacement_commits(self) -> None:
+    replacements = [
+      Request("https://example.com/replacement/1"),
+      Request("https://example.com/replacement/2"),
+    ]
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=iter(replacements)),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+
+    output = list(request.errback(MagicMock(request=request)))
+
+    assert output == replacements
+    queue.ack.assert_not_called()
+    first_token = replacements[0].meta[BACKEND_ACK_TOKEN_META_KEY]
+    second_token = replacements[1].meta[BACKEND_ACK_TOKEN_META_KEY]
+
+    first_token.ack()
+    queue.ack.assert_not_called()
+    second_token.ack()
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+
+  def test_errback_generator_waits_for_exhaustion_and_commit(self) -> None:
+    replacement = Request("https://example.com/replacement")
+
+    def outputs():
+      yield replacement
+
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=outputs()),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+
+    output = iter(request.errback(MagicMock(request=request)))
+    assert next(output) is replacement
+    replacement.meta[BACKEND_ACK_TOKEN_META_KEY].ack()
+    queue.ack.assert_not_called()
+
+    with pytest.raises(StopIteration):
+      next(output)
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+
+  def test_errback_iterable_failure_nacks_source_delivery(self) -> None:
+    replacement = Request("https://example.com/replacement")
+
+    def outputs():
+      yield replacement
+      raise RuntimeError("output iteration failed")
+
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=outputs()),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+
+    output = iter(request.errback(MagicMock(request=request)))
+    assert next(output) is replacement
+    with pytest.raises(RuntimeError, match="output iteration failed"):
+      next(output)
+
+    queue.nack.assert_called_once_with(token="delivery-token")
+    queue.ack.assert_not_called()
+
+  def test_errback_async_iterable_waits_for_every_replacement(self) -> None:
+    replacements = [
+      Request("https://example.com/replacement/1"),
+      Request("https://example.com/replacement/2"),
+    ]
+
+    async def outputs():
+      for replacement in replacements:
+        yield replacement
+
+    scheduler = BackendScheduler(connection_manager=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    queued_request = Request(
+      "https://example.com/download-failure",
+      errback=MagicMock(return_value=outputs()),
+      meta={BACKEND_ACK_TOKEN_META_KEY: "delivery-token"},
+    )
+    queue.pop.return_value = queued_request
+    scheduler._queue = queue
+    request = scheduler.next_request()
+    assert request is not None and request.errback is not None
+
+    output = request.errback(MagicMock(request=request))
+    observed = []
+    for _replacement in replacements:
+      with pytest.raises(StopIteration) as yielded:
+        output.__anext__().send(None)
+      observed.append(yielded.value.value)
+    with pytest.raises(StopAsyncIteration):
+      output.__anext__().send(None)
+
+    assert observed == replacements
+    queue.ack.assert_not_called()
+
+    replacements[0].meta[BACKEND_ACK_TOKEN_META_KEY].ack()
+    queue.ack.assert_not_called()
+    replacements[1].meta[BACKEND_ACK_TOKEN_META_KEY].ack()
+
+    queue.ack.assert_called_once_with(token="delivery-token")
+
   def test_G2_dont_filter_skips_dedup_and_pushes(self) -> None:
     """G2: request.dont_filter=True → dedup NOT consulted, push proceeds."""
     manager = MagicMock(name="ConnectionManager")

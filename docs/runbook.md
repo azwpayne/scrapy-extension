@@ -165,7 +165,7 @@ pipeline keeps its setting-level compatibility rule:
 | SQS queue pop | Receipt-handle token plus `SCRAPY_SQS_VISIBILITY_TIMEOUT` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the visibility lease. | No automatic renewal. Size the lease above worst-case download time. Explicit nack sets visibility to 0 for immediate redelivery. |
 | RocketMQ queue pop | Message token plus `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the invisibility lease. | No automatic renewal. Explicit nack shortens the lease to RocketMQ's 10-second minimum. Pair set/storage through per-component backends. |
 | Backend/plugin declaring `supports_concurrent_ack=False` | Single ack slot only. | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` is set. | Keep concurrency at 1, or pick a backend with a real in-flight ack set. |
-| Stateful queue strategies | In-process scheduling/fairness/rate state. | Hard crash can lose held strategy state; snapshot/restore is best-effort where implemented. | Prefer `passthrough` when distributed durability beats scheduling policy. |
+| Stateful queue strategies | In-process scheduling/fairness/rate state. | Hard crash can lose held strategy state; a token-bearing replacement is rejected before it enters volatile delay/time-wheel/round-robin/ring-buffer state. | Use a backend-durable push path when replacing an unacked broker delivery; zero effective delay remains a direct backend push. |
 | `batched` storage | In-process write buffer. | Hard crash before flush loses buffered items. | Prefer `passthrough` when persistence must happen before item acknowledgement. |
 
 All five bundled deferred-ack backends use per-message tokens and support
@@ -337,6 +337,7 @@ from the existing monitor stats:
 | `scheduler/queue/poison_dropped` | A deterministic-invalid serialized request was terminally acked/dropped so it cannot pin a Kafka partition or hot-loop in a broker queue. |
 | `scheduler/queue/empty_payload_dropped` | A broker record with a real ack token but no request payload (for example a Kafka tombstone) was terminally consumed. |
 | `scheduler/queue/replacement_poison_dropped` | A retry/redirect replacement was locally invalid, so its original broker delivery was terminally consumed. |
+| `scheduler/queue/volatile_replacement_rejected` | A replacement still owned an unacked broker source but its selected strategy would retain it only in process. The push was rejected before local mutation; use a backend-durable strategy/path. |
 
 Differential diagnosis:
 

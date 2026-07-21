@@ -51,6 +51,13 @@ upgrading.
   ack/drop the delivery, increments `scheduler/queue/poison_dropped`, and still
   raises `SerializationError`. The prior nack/redelivery behavior could pin a
   Kafka partition or create a permanently hot poison loop.
+- **Token-bearing replacements cannot enter volatile queue state.** A retry,
+  redirect, or user-errback replacement that still owns an unacknowledged
+  broker source now raises `QueueError` before a positive-delay `delay` /
+  `time_wheel` append or any `round_robin` / `ring_buffer` append. Previously
+  the source was acked after only an in-process write and a hard crash could
+  lose both copies. Use a backend-durable strategy/path; zero effective delay
+  still pushes directly to the backend.
 
 - **Pulsar `auth_token` now requires `pulsar+ssl://`.** `PulsarSettings(
   auth_token=…)` rejects `service_url` values that do not start with

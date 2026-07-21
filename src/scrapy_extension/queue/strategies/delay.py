@@ -195,6 +195,12 @@ class DelayQueueStrategy(QueueStrategy):
       logger.debug("on_delay_depth hook raised", exc_info=True)
     self._warn_over_cap_once(held)
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Return false while a delayed item would live only in the local heap."""
+    del source
+    effective = delay if delay > 0 else self._default_delay
+    return effective <= 0
+
   def _warn_over_cap_once(self, held: int) -> None:
     """Emit a one-time per-process WARNING when the holding heap exceeds cap.
 

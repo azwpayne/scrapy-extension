@@ -30,6 +30,7 @@ from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
   _BoundQueueAckToken,
+  _QueueAckToken,
   normalize_queue_timeout,
 )
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
@@ -312,6 +313,25 @@ class BackendQueue:
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise error from e
+    if replacement_ack_token is not None and not self._strategy.is_push_durable(
+      delay=delay,
+      source=source,
+    ):
+      # A source delivery can be terminated only after its replacement crosses
+      # a crash-durable boundary. Delay/time-wheel holding state, round-robin
+      # deques, and ring buffers are process-local; accepting into them and then
+      # acking the broker source creates a deterministic hard-crash loss window.
+      # Fail closed before serialization or strategy mutation. The scheduler
+      # keeps the source token unresolved, rolls back any dedup reservation, and
+      # broker redelivery can retry under a durable strategy/configuration.
+      self._inc_stat("scheduler/queue/volatile_replacement_rejected")
+      raise QueueError(
+        f"Cannot transfer a broker source delivery into in-process queue "
+        f"strategy {type(self._strategy).__name__}; use a backend-durable "
+        "strategy or remove the local delay/source routing",
+        queue_name=self.queue_name,
+        operation="push",
+      )
     try:
       request_dict = self._request_to_dict(request)
       data = self._serializer.serialize(request_dict)
@@ -862,7 +882,7 @@ class BackendQueue:
 
   def _ack(self, *, token: Any | None = None) -> None:
     """Execute an already-admitted acknowledgement."""
-    if isinstance(token, _BoundQueueAckToken):
+    if isinstance(token, _QueueAckToken):
       token.ack()
       return
     backend = self.connection_manager.get_queue_backend()
@@ -889,7 +909,7 @@ class BackendQueue:
 
   def _nack(self, *, token: Any | None = None) -> None:
     """Execute an already-admitted negative acknowledgement."""
-    if isinstance(token, _BoundQueueAckToken):
+    if isinstance(token, _QueueAckToken):
       token.nack()
       return
     backend = self.connection_manager.get_queue_backend()

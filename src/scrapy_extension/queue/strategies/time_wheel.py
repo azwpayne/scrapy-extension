@@ -224,6 +224,12 @@ class TimeWheelQueueStrategy(QueueStrategy):
       else:
         heapq.heappush(self._overflow, (ready_at, next(self._seq), item, priority))
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Return false while a delayed item would live only in wheel state."""
+    del source
+    effective = delay if delay > 0 else self._default_delay
+    return effective <= 0
+
   # ------------------------------------------------------------------ pop
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:

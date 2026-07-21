@@ -167,7 +167,7 @@ speculative work.
   durably pushed, a source-token ack failure remains observable but cannot
   reject the push or roll back its dedup reservation; retain the unresolved
   token and let broker redelivery reach the duplicate-ack path.
-- [ ] **RUN-04B — errback replacement acknowledgement.** Transfer/defer the
+- [x] **RUN-04B — errback replacement acknowledgement.** Transfer/defer the
   source token for requests and iterables returned by user errbacks until each
   replacement is durably accepted. Explicitly document the unavoidable
   publish/ack crash gap and define safe behavior for delayed local strategies.
@@ -586,3 +586,26 @@ cannot mutate or leak into driver configuration. All seven regressions passed
 on Python 3.10 and 3.14, 270 related scheduler/mixin/manager tests passed, and
 the full suite passed 3,012 tests with 44 documented skips. Ruff, strict mypy,
 and patch integrity remained green.
+
+### I14b — errback output commit groups and volatile-strategy fail-closed
+
+Four initial RED regressions proved that a handled user errback immediately
+acked its broker source even when it returned one replacement request, a stream
+of several requests, or a generator that later failed. Four additional RED
+cases proved that delayed, time-wheel, round-robin, and ring-buffer replacement
+pushes acked the source after only a process-local append. Two compatibility
+cases preserved the direct backend commit for zero effective delay.
+
+The scheduler now transfers a source delivery into an idempotent child-token
+group. It seals the group only after synchronous or asynchronous output
+enumeration completes, acks only after every replacement crosses its queue
+commit boundary, and nacks on iteration failure. `BackendQueue` recognizes the
+shared internal token protocol and asks each strategy whether the selected push
+is crash-durable. Token-bearing replacements fail before serialization or
+local mutation when the answer is false; their source remains unacknowledged
+for broker redelivery. Documentation now states the unavoidable replacement-
+publish/source-ack crash gap: it can produce duplicates, but ordering prevents
+loss of both copies. All eleven regressions passed on Python 3.10 and 3.14, 325
+related queue/strategy/scheduler tests passed, and the full suite passed 3,023
+tests with 44 documented skips. Ruff, strict mypy, and patch integrity remained
+green.

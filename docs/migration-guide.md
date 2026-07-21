@@ -112,6 +112,19 @@ dropped to avoid a permanent poison loop; monitor
 `scheduler/queue/empty_payload_dropped`, and
 `scheduler/queue/replacement_poison_dropped` during migration.
 
+Retry, redirect, and user-errback replacement requests retain the source
+delivery until the replacement queue commit. An errback iterable is one commit
+group: every returned request must be accepted before the source is acked. The
+replacement publish and source ACK cannot be atomic across brokers, so a crash
+between them can still redeliver the source and create a duplicate; retain
+deduplication or make `dont_filter=True` replacements idempotent.
+
+A replacement carrying an unacknowledged source token is now rejected before
+it enters volatile `delay`/`time_wheel` holding state (positive effective
+delay), `round_robin`, or `ring_buffer`. Migrate those flows to a
+backend-durable strategy/path; a zero effective delay remains a direct backend
+push.
+
 JSON is a wire format, not encryption. Queue payloads can contain request
 bodies, metadata, callback arguments, cookies, tokens, or personal data. Use
 authenticated TLS, least-privilege topic/key/index ACLs, and encryption at rest
