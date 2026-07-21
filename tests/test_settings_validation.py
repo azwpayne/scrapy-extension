@@ -416,6 +416,7 @@ class TestRabbitMQModeConditional:
       password="p",
       mode=RabbitMQMode.CLUSTER,
       cluster_nodes=["node2:5672", "node3:5672"],
+      ssl_enabled=True,
     )
     assert len(s.cluster_nodes) == 2
 

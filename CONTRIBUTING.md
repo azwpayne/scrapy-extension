@@ -40,7 +40,7 @@ skips; set → it runs against that service.
 | Redis | `SCRAPY_TEST_REDIS_URL` | `redis://localhost:6379/0` |
 | MongoDB | `SCRAPY_TEST_MONGODB_URI` | `mongodb://localhost:27017` |
 | ElasticSearch | `SCRAPY_TEST_ES_HOSTS` | `http://localhost:9200` (comma-separated) |
-| RabbitMQ | `SCRAPY_TEST_RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` |
+| RabbitMQ | `SCRAPY_TEST_RABBITMQ_URL` | `amqp://localhost:5672/` |
 | Kafka | `SCRAPY_TEST_KAFKA_BOOTSTRAP` | `localhost:9092` |
 | RocketMQ | `SCRAPY_TEST_ROCKETMQ_NAMESRV` | `localhost:8081` (gRPC proxy, broker started with `--enable-proxy`) |
 

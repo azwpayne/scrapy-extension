@@ -179,20 +179,26 @@ speculative work.
   an intentional both-unset ambient credential path from explicit empty or
   partial credentials at settings and connect time, without retaining values in
   validation errors.
-- [ ] **SEC-01B — broker credential completeness.** Reject empty explicit
-  secrets, URL userinfo, and mechanism-inconsistent authentication for Kafka,
-  MongoDB, Elasticsearch, RabbitMQ, RocketMQ, and Pulsar without exposing secret
-  values. Preserve valid mechanism-specific modes rather than requiring a
-  universal username/password pair.
+- [x] **SEC-01B1 — RabbitMQ/RocketMQ credential completeness.** Reject blank
+  explicit credentials, RabbitMQ URL userinfo and remote guest use, and
+  incomplete RocketMQ key pairs without retaining secret values.
+- [ ] **SEC-01B2 — remaining broker credential completeness.** Reject empty
+  explicit secrets, URL/URI userinfo, and mechanism-inconsistent authentication
+  for Kafka, MongoDB, Elasticsearch, and Pulsar. Preserve valid
+  mechanism-specific modes rather than requiring a universal username/password
+  pair.
 - [x] **SEC-02A — AWS cloud transport.** Reject URL userinfo and explicit
   plaintext SQS/DynamoDB endpoints in cloud mode while retaining HTTP support
   for explicit standalone LocalStack-compatible endpoints.
 - [x] **SEC-02B1 — RocketMQ and Redis control-plane transport.** Propagate
   authenticated RocketMQ TLS and apply Redis TLS, CA, mTLS, hostname, timeout,
   and credential policy to both Sentinel discovery and discovered masters.
-- [ ] **SEC-02B2 — remaining broker transport.** Reject authenticated
-  RabbitMQ/Pulsar connections without certificate and hostname verification;
-  define an explicit trusted-network boundary for remote Memcached.
+- [x] **SEC-02B2A — RabbitMQ broker transport.** Limit plaintext to all-loopback
+  endpoint sets, forbid `amqps://` downgrade, require certificate/hostname
+  verification, and bind TLS SNI to each actual cluster node.
+- [ ] **SEC-02B2B — remaining broker transport.** Reject authenticated Pulsar
+  connections without certificate and hostname verification, and define an
+  explicit trusted-network boundary for remote Memcached.
 - [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
   endpoint and credential fields at connect time and use one captured set of
   connection values, so construction-time mutation and validation/use races
@@ -200,9 +206,12 @@ speculative work.
 - [x] **SEC-03B1 — Redis validated connection snapshots.** Capture every
   connection-used value before SDK construction, revalidate TLS after settings
   mutation, repr-redact credentials, and suppress raw startup trace text.
-- [ ] **SEC-03B2 — remaining validated connection snapshots.** Apply copied,
-  revalidated connection snapshots and sanitized URL/URI failures to every
-  remaining backend.
+- [x] **SEC-03B2A — RabbitMQ validated connection snapshot.** Revalidate every
+  connection and QoS value once, use only the captured values across primary
+  and failover nodes, repr-redact the password, and sanitize startup failures.
+- [ ] **SEC-03B2B — remaining validated connection snapshots.** Apply copied,
+  revalidated connection snapshots and sanitized URL/URI failures to Kafka,
+  MongoDB, Elasticsearch, Pulsar, and Memcached.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
@@ -762,3 +771,23 @@ locked redis-py smoke test proves `sentinel_kwargs["ssl"]` selects
 `SSLConnection`. All 418 related tests passed on Python 3.10 and 3.14. Ruff,
 strict mypy, and patch integrity remained green. The full Python 3.10 suite
 passed 3,070 tests with 44 documented skips.
+
+### I19 — RabbitMQ authenticated transport and connection snapshots
+
+Sixteen of twenty initial security regressions failed: remote primary and
+cluster endpoints accepted plaintext credentials, `amqps://` could be
+explicitly downgraded, URL userinfo was retained, weak certificate modes and
+partial mTLS material were accepted, and Pika TLS options omitted the node
+hostname needed for SNI and certificate matching. Connection setup also read
+mutable settings separately for every failover node and QoS step, while raw
+driver text—including credentials—could reach the public startup traceback.
+
+Plaintext is now limited to all-loopback endpoint sets. Any remote node requires
+TLS with `CERT_REQUIRED`; remote `guest`, URL userinfo, blank credentials,
+partial certificate/key pairs, and secure-URL downgrade fail before SDK I/O.
+Every attempt revalidates one immutable, repr-redacted snapshot and uses it for
+the primary, every parsed IPv4/IPv6 failover node, TLS context, Pika SNI,
+timeouts, retry settings, and QoS. Public startup errors suppress driver text.
+All 521 related tests passed on Python 3.10 and 3.14, and the full Python 3.10
+suite passed 3,093 tests with 44 documented skips. Ruff, strict mypy, and patch
+integrity remained green.

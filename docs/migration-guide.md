@@ -206,7 +206,7 @@ under the selected bundled backend prefix. Correct common legacy spellings:
 | Redis `startup_nodes` | `cluster_startup_nodes` / `SCRAPY_REDIS_CLUSTER_STARTUP_NODES` |
 | Redis `ssl` | `ssl_enabled` / `SCRAPY_REDIS_SSL_ENABLED` |
 | Redis `ssl_cert_reqs` | explicit `ssl_cafile`, `ssl_certfile`, `ssl_keyfile`, `ssl_check_hostname` |
-| RabbitMQ host/port with implicit guest credentials | explicit username and password, or `SCRAPY_RABBITMQ_URL` |
+| RabbitMQ URL userinfo or remote `amqp://` | credential-free `amqps://` URL plus explicit username/password fields |
 | AWS standalone mode without an endpoint | LocalStack-compatible `endpoint_url`; use cloud mode for the AWS endpoint/credential chain |
 | comma-separated environment value for a list | JSON array, for example `'["https://es1:9200"]'` |
 
@@ -220,6 +220,15 @@ certificate trusted by `ssl_cafile` and covered by hostname validation. mTLS
 requires both `ssl_certfile` and `ssl_keyfile`; a partial pair now fails before
 network I/O. Deployments that intentionally mixed plaintext Sentinel with a
 TLS data plane must align the control plane with TLS before upgrading.
+
+RabbitMQ plaintext is now a loopback-only development path. Remove credentials
+from `SCRAPY_RABBITMQ_URL`, set them through
+`SCRAPY_RABBITMQ_USERNAME`/`SCRAPY_RABBITMQ_PASSWORD`, and use `amqps://` (or
+`SCRAPY_RABBITMQ_SSL_ENABLED=True`) when the primary or any cluster node is
+remote. TLS always enforces `CERT_REQUIRED` and hostname matching; optional
+client authentication requires both certificate and key files. An explicit
+`ssl_enabled=False` can no longer downgrade an `amqps://` URL, and the `guest`
+user is accepted only for an all-loopback endpoint set.
 
 Queue-only backends must be bound with `SCRAPY_QUEUE_BACKEND_TYPE`; retain a
 set-capable backend for the default distributed dedup filter and a

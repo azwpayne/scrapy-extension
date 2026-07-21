@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import Enum
+from ipaddress import ip_address
 from typing import Any, Literal
 from urllib.parse import unquote
 
@@ -29,6 +30,185 @@ class RabbitMQMode(str, Enum):
   STANDALONE = "standalone"
   CLUSTER = "cluster"
   MIRRORED_QUEUES = "mirrored_queues"
+
+
+def _secret_text(value: SecretStr | str | None) -> str | None:
+  """Extract a secret for validation without retaining it in an exception."""
+  if isinstance(value, SecretStr):
+    return value.get_secret_value()
+  return value
+
+
+def normalize_rabbitmq_host(host: str) -> str:
+  """Normalize a RabbitMQ hostname for Pika and loopback classification."""
+  if not isinstance(host, str):
+    raise ConfigurationError(
+      "RabbitMQ host must be a non-empty hostname or IP address.",
+      setting_name="host",
+    )
+  normalized = host.strip()
+  if normalized.startswith("[") and normalized.endswith("]"):
+    normalized = normalized[1:-1]
+  if not normalized or any(char in normalized for char in "/@?#"):
+    raise ConfigurationError(
+      "RabbitMQ host must be a non-empty hostname or IP address.",
+      setting_name="host",
+    )
+  return normalized
+
+
+def parse_rabbitmq_node(node: str, default_port: int) -> tuple[str, int]:
+  """Parse one cluster node without confusing bracketed or bare IPv6 hosts."""
+  if not isinstance(node, str) or not node.strip():
+    raise ConfigurationError(
+      "RabbitMQ cluster nodes must be non-empty host or host:port values.",
+      setting_name="cluster_nodes",
+    )
+  text = node.strip()
+  port = default_port
+  if text.startswith("["):
+    closing = text.find("]")
+    if closing < 0:
+      raise ConfigurationError(
+        "RabbitMQ cluster node has an invalid bracketed IPv6 host.",
+        setting_name="cluster_nodes",
+      )
+    host = text[1:closing]
+    remainder = text[closing + 1 :]
+    if remainder:
+      if not remainder.startswith(":") or not remainder[1:]:
+        raise ConfigurationError(
+          "RabbitMQ cluster node must use '[IPv6]:port' syntax.",
+          setting_name="cluster_nodes",
+        )
+      port_text = remainder[1:]
+      try:
+        port = int(port_text)
+      except ValueError:
+        raise ConfigurationError(
+          "RabbitMQ cluster node port must be an integer.",
+          setting_name="cluster_nodes",
+        ) from None
+  else:
+    try:
+      ip_address(text)
+    except ValueError:
+      if text.count(":") > 1:
+        raise ConfigurationError(
+          "RabbitMQ IPv6 cluster nodes with a port must use '[IPv6]:port'.",
+          setting_name="cluster_nodes",
+        ) from None
+      if ":" in text:
+        host, port_text = text.rsplit(":", 1)
+        if not port_text:
+          raise ConfigurationError(
+            "RabbitMQ cluster node port cannot be empty.",
+            setting_name="cluster_nodes",
+          )
+        try:
+          port = int(port_text)
+        except ValueError:
+          raise ConfigurationError(
+            "RabbitMQ cluster node port must be an integer.",
+            setting_name="cluster_nodes",
+          ) from None
+      else:
+        host = text
+    else:
+      host = text
+
+  normalized_host = normalize_rabbitmq_host(host)
+  if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    raise ConfigurationError(
+      "RabbitMQ cluster node port must be between 1 and 65535.",
+      setting_name="cluster_nodes",
+    )
+  return normalized_host, port
+
+
+def _is_loopback_host(host: str) -> bool:
+  normalized = normalize_rabbitmq_host(host).lower().rstrip(".")
+  if normalized == "localhost" or normalized.endswith(".localhost"):
+    return True
+  try:
+    return ip_address(normalized).is_loopback
+  except ValueError:
+    return False
+
+
+def validate_rabbitmq_connection(
+  *,
+  host: str,
+  port: int,
+  cluster_nodes: tuple[str, ...],
+  username: str | None,
+  password: str | None,
+  ssl_enabled: bool,
+  ssl_cafile: str | None,
+  ssl_certfile: str | None,
+  ssl_keyfile: str | None,
+  ssl_verify_mode: str,
+) -> tuple[str, tuple[tuple[str, int], ...]]:
+  """Validate a complete connection snapshot and return parsed endpoints."""
+  normalized_host = normalize_rabbitmq_host(host)
+  if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    raise ConfigurationError(
+      "RabbitMQ port must be between 1 and 65535.",
+      setting_name="port",
+    )
+  if not isinstance(username, str) or not username.strip():
+    raise ConfigurationError(
+      "RabbitMQ username must be explicitly set and cannot be blank.",
+      setting_name="username",
+    )
+  if not isinstance(password, str) or not password.strip():
+    raise ConfigurationError(
+      "RabbitMQ password must be explicitly set and cannot be blank.",
+      setting_name="password",
+    )
+  if not isinstance(ssl_enabled, bool):
+    raise ConfigurationError(
+      "RabbitMQ ssl_enabled must be a boolean.",
+      setting_name="ssl_enabled",
+    )
+
+  tls_paths = {
+    "ssl_cafile": ssl_cafile,
+    "ssl_certfile": ssl_certfile,
+    "ssl_keyfile": ssl_keyfile,
+  }
+  for setting_name, value in tls_paths.items():
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+      raise ConfigurationError(
+        f"RabbitMQ TLS setting '{setting_name}' cannot be blank.",
+        setting_name=setting_name,
+      )
+  if (ssl_certfile is None) != (ssl_keyfile is None):
+    missing_name = "ssl_keyfile" if ssl_certfile is not None else "ssl_certfile"
+    raise ConfigurationError(
+      "RabbitMQ TLS client authentication requires both certificate and key files.",
+      setting_name=missing_name,
+    )
+  if ssl_enabled and ssl_verify_mode != "CERT_REQUIRED":
+    raise ConfigurationError(
+      "RabbitMQ TLS requires CERT_REQUIRED certificate and hostname verification.",
+      setting_name="ssl_verify_mode",
+    )
+
+  parsed_nodes = tuple(parse_rabbitmq_node(node, port) for node in cluster_nodes)
+  endpoint_hosts = (normalized_host, *(node_host for node_host, _ in parsed_nodes))
+  has_remote_endpoint = any(not _is_loopback_host(item) for item in endpoint_hosts)
+  if has_remote_endpoint and not ssl_enabled:
+    raise ConfigurationError(
+      "RabbitMQ connections outside loopback require verified TLS.",
+      setting_name="ssl_enabled",
+    )
+  if has_remote_endpoint and username == "guest":
+    raise ConfigurationError(
+      "RabbitMQ's guest user is restricted to loopback endpoints.",
+      setting_name="username",
+    )
+  return normalized_host, parsed_nodes
 
 
 class RabbitMQSettings(BaseSettings):
@@ -59,8 +239,8 @@ class RabbitMQSettings(BaseSettings):
   url: SecretStr | None = Field(
     default=None,
     description=(
-      "AMQP connection URL shortcut. Values from explicit host/port/credential "
-      "fields take precedence over URL components."
+      "Credential-free AMQP connection URL shortcut. Values from explicit "
+      "host/port fields take precedence over URL components."
     ),
   )
   host: str = Field(
@@ -220,6 +400,17 @@ class RabbitMQSettings(BaseSettings):
         setting_name="url",
       ) from None
 
+    if parsed.username is not None or parsed.password is not None:
+      raise ConfigurationError(
+        "RabbitMQ URL userinfo is not allowed; use explicit credential settings.",
+        setting_name="url",
+      ) from None
+    if parsed.host is None:
+      raise ConfigurationError(
+        "RabbitMQ URL must include a host.",
+        setting_name="url",
+      )
+
     values = dict(data)
     if parsed.host is not None:
       host = parsed.host
@@ -229,14 +420,20 @@ class RabbitMQSettings(BaseSettings):
     values.setdefault(
       "port", parsed.port or (5671 if parsed.scheme == "amqps" else 5672)
     )
-    if parsed.username is not None:
-      values.setdefault("username", unquote(parsed.username))
-    if parsed.password is not None:
-      values.setdefault("password", unquote(parsed.password))
-
     path = parsed.path or ""
     virtual_host = unquote(path[1:] if path.startswith("/") else path)
     values.setdefault("virtual_host", virtual_host or "/")
+    if parsed.scheme == "amqps" and "ssl_enabled" in values:
+      explicit_ssl = values["ssl_enabled"]
+      false_text = (
+        isinstance(explicit_ssl, str)
+        and explicit_ssl.strip().lower() in {"0", "false", "no", "off"}
+      )
+      if explicit_ssl is False or explicit_ssl == 0 or false_text:
+        raise ConfigurationError(
+          "An amqps:// URL cannot be downgraded with ssl_enabled=False.",
+          setting_name="ssl_enabled",
+        )
     values.setdefault("ssl_enabled", parsed.scheme == "amqps")
     return values
 
@@ -282,4 +479,16 @@ class RabbitMQSettings(BaseSettings):
         setting_name="ha_mode",
         setting_value=self.ha_mode,
       )
+    validate_rabbitmq_connection(
+      host=self.host,
+      port=self.port,
+      cluster_nodes=tuple(self.cluster_nodes),
+      username=self.username,
+      password=_secret_text(self.password),
+      ssl_enabled=self.ssl_enabled,
+      ssl_cafile=self.ssl_cafile,
+      ssl_certfile=self.ssl_certfile,
+      ssl_keyfile=self.ssl_keyfile,
+      ssl_verify_mode=self.ssl_verify_mode,
+    )
     return self

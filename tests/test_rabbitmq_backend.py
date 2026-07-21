@@ -36,6 +36,8 @@ def test_rabbitmq_channel_creation_failure_closes_connection(mocker, mode):
   """A connection not yet published on the backend still needs cleanup."""
   config = RabbitMQSettings(username="user", password="pass")
   config.mode = mode
+  if mode == RabbitMQMode.CLUSTER:
+    config.cluster_nodes = ["localhost:5672"]
   backend = RabbitMQBackend(config)
   connection = mocker.MagicMock()
   connection.channel.side_effect = pika.exceptions.AMQPError("channel failed")
@@ -81,8 +83,8 @@ def test_rabbitmq_backend_warns_when_ssl_disabled(mocker, caplog):
     backend.connect()
 
   assert any(
-    "without SSL" in rec.message and "cleartext" in rec.message for rec in caplog.records
-  ), "expected cleartext-credential warning when ssl_enabled=False"
+    "loopback" in rec.message and "plaintext" in rec.message for rec in caplog.records
+  ), "expected loopback-plaintext warning when ssl_enabled=False"
   assert backend._ssl_warning_emitted is True
 
 
@@ -109,7 +111,7 @@ def test_rabbitmq_backend_ssl_warning_debounces_across_reconnects(mocker, caplog
     backend.connect()  # second connect — should NOT re-warn
 
   ssl_warnings = [
-    rec for rec in caplog.records if "without SSL" in rec.message
+    rec for rec in caplog.records if "loopback" in rec.message and "plaintext" in rec.message
   ]
   assert len(ssl_warnings) == 1, "SSL warning must fire exactly once per instance"
 
@@ -161,7 +163,7 @@ def test_rabbitmq_backend_push(mocker):
     {"mode": RabbitMQMode.STANDALONE},
     {
       "mode": RabbitMQMode.CLUSTER,
-      "cluster_nodes": ["rabbit-2:5672"],
+      "cluster_nodes": ["localhost:5673"],
     },
     {
       "mode": RabbitMQMode.MIRRORED_QUEUES,
@@ -612,7 +614,8 @@ def test_rabbitmq_backend_connect_non_amqp_error(mocker):
 
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
-  assert "Network unreachable" in str(exc_info.value)
+  assert "Network unreachable" not in str(exc_info.value)
+  assert exc_info.value.__cause__ is None
 
 
 def test_rabbitmq_backend_get_ssl_verify_mode_cert_none():
@@ -625,28 +628,15 @@ def test_rabbitmq_backend_get_ssl_verify_mode_cert_none():
   assert result == ssl.CERT_NONE
 
 
-def test_rabbitmq_backend_build_common_parameters_cert_none_disables_hostname_check(
-  mocker,
-):
-  """CERT_NONE must disable hostname checks before verify_mode is lowered."""
-  config = RabbitMQSettings(
-    ssl_enabled=True,
-    ssl_verify_mode="CERT_NONE",
-  )
-  backend = RabbitMQBackend(config)
+def test_rabbitmq_backend_rejects_cert_none_before_parameter_construction():
+  """The live connection path must never construct an unverified TLS context."""
+  with pytest.raises(ConfigurationError) as exc_info:
+    RabbitMQSettings(
+      ssl_enabled=True,
+      ssl_verify_mode="CERT_NONE",
+    )
 
-  ssl_context = ssl.create_default_context()
-  create_default_context = mocker.patch(
-    "ssl.create_default_context",
-    return_value=ssl_context,
-  )
-
-  parameters = backend._build_common_parameters()
-
-  create_default_context.assert_called_once_with(cafile=config.ssl_cafile)
-  assert parameters.ssl_options is not None
-  assert ssl_context.verify_mode == ssl.CERT_NONE
-  assert ssl_context.check_hostname is False
+  assert exc_info.value.setting_name == "ssl_verify_mode"
 
 
 def test_rabbitmq_backend_get_ssl_verify_mode_cert_optional():
@@ -673,8 +663,11 @@ def test_rabbitmq_backend_guest_credentials_non_standalone(mocker):
   """Invalid settings stay ConfigurationError rather than connection failure."""
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.CLUSTER
+  config.host = "rabbit-1.internal"
+  config.cluster_nodes = ["rabbit-2.internal:5671"]
   config.username = "guest"
   config.password = "guest"
+  config.ssl_enabled = True
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -685,8 +678,8 @@ def test_rabbitmq_backend_guest_credentials_non_standalone(mocker):
 
   with pytest.raises(ConfigurationError) as exc_info:
     backend.connect()
-  assert exc_info.value.setting_name == "username/password"
-  assert "guest/guest" in str(exc_info.value)
+  assert exc_info.value.setting_name == "username"
+  assert "loopback" in str(exc_info.value)
 
 
 def test_rabbitmq_backend_mirrored_queues_ha_mode(mocker):
@@ -1145,6 +1138,7 @@ def test_rabbitmq_backend_connect_cluster_with_nodes(mocker):
   config.cluster_nodes = ["node2:5672", "node3:5673"]
   config.username = "user"
   config.password = "pass"
+  config.ssl_enabled = True
   backend = RabbitMQBackend(config)
 
   mock_instance = mocker.MagicMock()
@@ -1174,7 +1168,7 @@ def test_rabbitmq_backend_connect_cluster_with_nodes(mocker):
 
 
 def test_rabbitmq_backend_mirrored_queues_no_ha_mode(mocker):
-  """Test _connect_mirrored_queues skips HA setup when ha_mode is None (lines 242->exit)."""
+  """Connect-time revalidation rejects a post-construction missing HA mode."""
   config = RabbitMQSettings()
   config.mode = RabbitMQMode.MIRRORED_QUEUES
   config.ha_mode = None
@@ -1186,10 +1180,14 @@ def test_rabbitmq_backend_mirrored_queues_no_ha_mode(mocker):
   mock_channel = mocker.MagicMock()
   mock_instance.channel.return_value = mock_channel
   mock_instance.is_open = True
-  mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+  blocking_connection = mocker.patch(
+    "pika.BlockingConnection", return_value=mock_instance
+  )
 
-  backend.connect()
-  assert backend._channel is not None
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+  assert exc_info.value.setting_name == "ha_mode"
+  blocking_connection.assert_not_called()
 
 
 def test_rabbitmq_backend_mirrored_queues_ha_params_non_digit(mocker):

@@ -702,11 +702,11 @@ class TestBuildBackendSettings:
     class TestSpider(BackendSpiderMixin, Spider):
       name = "test_spider"
       backend_type = BackendType.RABBITMQ
-      rabbitmq_url = "amqp://guest:guest@localhost:5672/"
+      rabbitmq_url = "amqp://localhost:5672/"
 
     spider = TestSpider()
     result = spider._build_backend_settings()
-    assert result["url"] == "amqp://guest:guest@localhost:5672/"
+    assert result["url"] == "amqp://localhost:5672/"
 
   def test_rabbitmq_url_optional(self):
     """Test that RabbitMQ url is optional."""

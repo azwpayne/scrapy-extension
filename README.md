@@ -134,14 +134,19 @@ SCRAPY_KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 
 ```python
 SCRAPY_BACKEND_TYPE = "rabbitmq"
-SCRAPY_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+SCRAPY_RABBITMQ_URL = "amqp://localhost:5672/"
+SCRAPY_RABBITMQ_USERNAME = "guest"
+SCRAPY_RABBITMQ_PASSWORD = "guest"
 ```
 
-RabbitMQ has no implicit guest credential fallback: use the URL shortcut above
-or provide both `SCRAPY_RABBITMQ_USERNAME` and
-`SCRAPY_RABBITMQ_PASSWORD`. Publishes use `mandatory=True` and synchronous
-publisher confirms; an unroutable or broker-nacked publish raises `QueueError`
-instead of reporting a successful enqueue.
+RabbitMQ URLs must not contain userinfo; provide both credential fields so
+passwords remain secret-wrapped. Plaintext `amqp://` is accepted only when
+every configured node is loopback. Remote standalone and cluster connections
+must use verified TLS (`amqps://` or `SCRAPY_RABBITMQ_SSL_ENABLED=True`) with
+`CERT_REQUIRED`; Pika receives each node's hostname for SNI and certificate
+matching. Optional mTLS requires both `SCRAPY_RABBITMQ_SSL_CERTFILE` and
+`SCRAPY_RABBITMQ_SSL_KEYFILE`. Publishes use `mandatory=True` and synchronous
+publisher confirms; an unroutable or broker-nacked publish raises `QueueError`.
 
 ### ElasticSearch (standalone, cloud)
 

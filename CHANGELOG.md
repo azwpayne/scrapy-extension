@@ -112,6 +112,15 @@ upgrading.
   policy instead of silently using plaintext control connections. Client cert
   and key must be configured together; Redis startup errors no longer include
   raw driver text, while SDK-bound passwords are repr-redacted.
+- **RabbitMQ remote connections now require verified TLS.** Plaintext AMQP is
+  limited to loopback-only endpoint sets; one remote primary or cluster node
+  requires `ssl_enabled=True` and `CERT_REQUIRED`. Each Pika `SSLOptions`
+  instance now receives the actual node hostname for SNI/certificate matching,
+  client certificate/key files must be paired, and the remote `guest` user is
+  rejected. AMQP URL userinfo is no longer accepted—use the explicit username
+  and password fields—and an `amqps://` URL cannot be downgraded by an explicit
+  false TLS flag. Connect-time validation uses one repr-redacted snapshot and
+  public startup tracebacks suppress raw driver text.
 - **`BackendQueue.push` pops `delay` / `source` from `request.meta`.** A delayed
   request that is re-pushed (e.g. by a retry) no longer re-applies the original
   delay (round-14 R14-F). Code that re-reads `request.meta['delay']` /
@@ -275,8 +284,8 @@ upgrading.
   (`importlib.metadata`) instead of a hardcoded string.
 - Kafka SASL password is wrapped in a redacting `str` subclass so
   `repr(producer_config)` no longer leaks it.
-- RabbitMQ emits a one-shot cleartext-credentials warning when
-  `ssl_enabled=False`.
+- RabbitMQ emits a one-shot loopback-plaintext warning when
+  `ssl_enabled=False`; remote plaintext now fails validation.
 - `BackendDupeFilter` honors a configured `REQUEST_FINGERPRINTER_CLASS`
   via `crawler.request_fingerprinter` (byte-identical to the default
   fingerprinter when unset, so existing fingerprints are unchanged).

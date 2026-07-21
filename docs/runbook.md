@@ -406,6 +406,13 @@ local deployments. Both producer and consumer use the same captured TLS,
 endpoint, credential, timeout, and consumer-group snapshot for each connection
 attempt.
 
+For RabbitMQ, keep `amqp://` strictly loopback-only. Remote primary or cluster
+nodes require verified TLS, and credentials must be configured outside the URL.
+Confirm every node certificate covers the exact configured hostname: the
+backend passes that hostname to Pika for SNI and matching. `CERT_NONE`,
+`CERT_OPTIONAL`, partial client-certificate pairs, remote `guest`, and
+`amqps://`-to-plaintext overrides fail before connection I/O.
+
 ## Cutting a release
 
 High-level release flow (a dedicated `docs/release-runbook.md` does not yet

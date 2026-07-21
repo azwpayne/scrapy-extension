@@ -227,23 +227,20 @@ docker run -d --name scrapy-rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-manage
 scrapy crawl quotes_rabbitmq
 ```
 
-Use either a URL containing credentials or explicit required username/password
-fields:
+Use a credential-free URL plus the required username/password fields:
 
 ```python
 SCRAPY_QUEUE_BACKEND_TYPE = "rabbitmq"
-SCRAPY_RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
-
-# Equivalent explicit form
-# SCRAPY_RABBITMQ_HOST = "localhost"
-# SCRAPY_RABBITMQ_PORT = 5672
-# SCRAPY_RABBITMQ_USERNAME = "guest"
-# SCRAPY_RABBITMQ_PASSWORD = "guest"
-# SCRAPY_RABBITMQ_VIRTUAL_HOST = "/"
+SCRAPY_RABBITMQ_URL = "amqp://localhost:5672/"
+SCRAPY_RABBITMQ_USERNAME = "guest"
+SCRAPY_RABBITMQ_PASSWORD = "guest"
 
 SCRAPY_SET_BACKEND_TYPE = "redis"
 SCRAPY_STORAGE_BACKEND_TYPE = "redis"
 ```
+
+Plaintext is limited to loopback. Use `amqps://` and non-guest credentials for
+a remote broker; URL userinfo is rejected.
 
 Mirrored queue settings use real Scrapy keys:
 

@@ -130,6 +130,10 @@ def test_bundled_settings_environment_loading_is_unchanged(
   expected: object,
 ) -> None:
   monkeypatch.setenv(env_name, raw_value)
+  if settings_cls is RabbitMQSettings:
+    monkeypatch.setenv("SCRAPY_RABBITMQ_USERNAME", "crawler")
+    monkeypatch.setenv("SCRAPY_RABBITMQ_PASSWORD", "secret")
+    monkeypatch.setenv("SCRAPY_RABBITMQ_SSL_ENABLED", "true")
 
   settings = settings_cls()
 
@@ -200,8 +204,10 @@ def test_rabbitmq_url_populates_connection_fields(
   monkeypatch.delenv("SCRAPY_RABBITMQ_USERNAME", raising=False)
   monkeypatch.delenv("SCRAPY_RABBITMQ_PASSWORD", raising=False)
 
-  settings = RabbitMQSettings(  # type: ignore[call-arg]
-    url="amqps://crawler:p%40ss@rabbit.internal:5671/%2F"  # type: ignore[arg-type]
+  settings = RabbitMQSettings(
+    url="amqps://rabbit.internal:5671/%2F",  # type: ignore[arg-type]
+    username="crawler",
+    password="p@ss",  # type: ignore[arg-type]
   )
 
   assert settings.host == "rabbit.internal"
@@ -211,7 +217,7 @@ def test_rabbitmq_url_populates_connection_fields(
   assert settings.virtual_host == "/"
   assert settings.ssl_enabled is True
   assert settings.url is not None
-  assert "p%40ss" not in repr(settings)
+  assert "p@ss" not in repr(settings)
 
 
 def test_rabbitmq_url_normalizes_ipv6_host_for_pika(
@@ -220,8 +226,10 @@ def test_rabbitmq_url_normalizes_ipv6_host_for_pika(
   monkeypatch.delenv("SCRAPY_RABBITMQ_USERNAME", raising=False)
   monkeypatch.delenv("SCRAPY_RABBITMQ_PASSWORD", raising=False)
 
-  settings = RabbitMQSettings(  # type: ignore[call-arg]
-    url="amqp://crawler:secret@[::1]/vhost"  # type: ignore[arg-type]
+  settings = RabbitMQSettings(
+    url="amqp://[::1]/vhost",  # type: ignore[arg-type]
+    username="crawler",
+    password="secret",  # type: ignore[arg-type]
   )
 
   assert settings.host == "::1"
@@ -235,13 +243,13 @@ def test_rabbitmq_explicit_fields_override_url(
   monkeypatch.delenv("SCRAPY_RABBITMQ_PASSWORD", raising=False)
 
   settings = RabbitMQSettings(
-    url="amqps://url-user:url-pass@url-host/url-vhost",  # type: ignore[arg-type]
+    url="amqps://url-host/url-vhost",  # type: ignore[arg-type]
     host="explicit-host",
     port=5679,
     username="explicit-user",
     password="explicit-pass",  # type: ignore[arg-type]
     virtual_host="explicit-vhost",
-    ssl_enabled=False,
+    ssl_enabled=True,
   )
 
   assert settings.host == "explicit-host"
@@ -249,7 +257,7 @@ def test_rabbitmq_explicit_fields_override_url(
   assert settings.username == "explicit-user"
   assert settings.password.get_secret_value() == "explicit-pass"
   assert settings.virtual_host == "explicit-vhost"
-  assert settings.ssl_enabled is False
+  assert settings.ssl_enabled is True
 
 
 def test_rabbitmq_url_rejects_non_amqp_scheme_without_leaking_password(

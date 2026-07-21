@@ -369,6 +369,7 @@ class TestRabbitMQBackendModes:
       username="user",
       password="pass",
       cluster_nodes=["node2:5672", "node3:5672"],
+      ssl_enabled=True,
     )
 
     mock_conn, _ = mock_pika_connection
@@ -390,6 +391,7 @@ class TestRabbitMQBackendModes:
       password="pass",
       ha_mode="all",
       ha_sync_mode="automatic",
+      ssl_enabled=True,
     )
 
     mock_conn, mock_channel = mock_pika_connection
@@ -412,6 +414,7 @@ class TestRabbitMQBackendModes:
       ha_mode="exactly",
       ha_params="2",
       ha_sync_mode="manual",
+      ssl_enabled=True,
     )
 
     mock_conn, mock_channel = mock_pika_connection
@@ -467,7 +470,7 @@ class TestRabbitMQBackendModes:
       keyfile="/path/to/key.pem",
     )
     # Verify SSLOptions was created with the context
-    mock_ssl_opts_class.assert_called_once_with(mock_ssl_context)
+    mock_ssl_opts_class.assert_called_once_with(mock_ssl_context, "localhost")
     # Verify ConnectionParameters was called with SSL options
     call_kwargs = mock_params_class.call_args.kwargs
     assert call_kwargs["ssl_options"] == mock_ssl_options_instance

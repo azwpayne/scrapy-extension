@@ -15,6 +15,7 @@ import contextlib
 import logging
 import ssl
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -43,15 +44,12 @@ from scrapy_extension.exceptions import (
     QueueError,
 )
 from scrapy_extension.settings import RabbitMQMode
+from scrapy_extension.settings.rabbitmq import validate_rabbitmq_connection
 
 if TYPE_CHECKING:
   from scrapy_extension.settings import RabbitMQSettings
 
 logger = logging.getLogger(__name__)
-
-# RabbitMQ broker default credential (well-known; operators override via settings).
-# Used to detect the insecure default guest/guest login in non-standalone modes.
-_DEFAULT_GUEST_CREDENTIAL = "guest"  # nosec B105
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
@@ -96,6 +94,33 @@ class _RabbitMQAckToken:
       f"_RabbitMQAckToken(delivery_tag={self.delivery_tag}, "
       f"channel_generation={self.channel_generation})"
     )
+
+
+@dataclass(frozen=True)
+class _RabbitMQConnectionSnapshot:
+  """One validated, repr-safe set of values used by a connect attempt."""
+
+  mode: RabbitMQMode
+  host: str
+  port: int
+  cluster_nodes: tuple[tuple[str, int], ...]
+  username: str
+  password: str
+  virtual_host: str
+  ssl_enabled: bool
+  ssl_cafile: str | None
+  ssl_certfile: str | None
+  ssl_keyfile: str | None
+  ssl_verify_mode: str
+  heartbeat: int
+  blocked_connection_timeout: int
+  connection_attempts: int
+  retry_delay: int
+  prefetch_count: int
+  prefetch_size: int
+  ha_mode: str | None
+  ha_params: str | None
+  ha_sync_mode: str
 
 
 class RabbitMQBackend(Backend, QueueBackend):
@@ -148,6 +173,117 @@ class RabbitMQBackend(Backend, QueueBackend):
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
 
+  def _capture_connection_snapshot(self) -> _RabbitMQConnectionSnapshot:
+    """Capture and revalidate every value consumed by one connect attempt."""
+    mode = self.config.mode
+    if mode not in (
+      RabbitMQMode.STANDALONE,
+      RabbitMQMode.CLUSTER,
+      RabbitMQMode.MIRRORED_QUEUES,
+    ):
+      try:
+        mode_text = str(mode)
+      except (TypeError, ValueError):
+        mode_text = getattr(mode, "value", repr(mode))
+      raise ConfigurationError(
+        f"Unsupported RabbitMQ mode: {mode_text}",
+        setting_name="mode",
+        setting_value=mode,
+      )
+
+    host = self.config.host
+    port = self.config.port
+    try:
+      raw_cluster_nodes = tuple(self.config.cluster_nodes)
+    except TypeError:
+      raise ConfigurationError(
+        "RabbitMQ cluster_nodes must be an iterable of host values.",
+        setting_name="cluster_nodes",
+      ) from None
+    username = self.config.username
+    raw_password = secret_value(self.config.password)
+    virtual_host = self.config.virtual_host
+    ssl_enabled = self.config.ssl_enabled
+    ssl_cafile = self.config.ssl_cafile
+    ssl_certfile = self.config.ssl_certfile
+    ssl_keyfile = self.config.ssl_keyfile
+    ssl_verify_mode = self.config.ssl_verify_mode
+    heartbeat = self.config.heartbeat
+    blocked_connection_timeout = self.config.blocked_connection_timeout
+    connection_attempts = self.config.connection_attempts
+    retry_delay = self.config.retry_delay
+    prefetch_count = self.config.prefetch_count
+    prefetch_size = self.config.prefetch_size
+    ha_mode = self.config.ha_mode
+    ha_params = self.config.ha_params
+    ha_sync_mode = self.config.ha_sync_mode
+
+    normalized_host, cluster_nodes = validate_rabbitmq_connection(
+      host=host,
+      port=port,
+      cluster_nodes=raw_cluster_nodes,
+      username=username,
+      password=raw_password,
+      ssl_enabled=ssl_enabled,
+      ssl_cafile=ssl_cafile,
+      ssl_certfile=ssl_certfile,
+      ssl_keyfile=ssl_keyfile,
+      ssl_verify_mode=ssl_verify_mode,
+    )
+    if mode == RabbitMQMode.CLUSTER and not cluster_nodes:
+      raise ConfigurationError(
+        "RabbitMQ CLUSTER mode requires at least one cluster node.",
+        setting_name="cluster_nodes",
+      )
+    if mode == RabbitMQMode.MIRRORED_QUEUES and not ha_mode:
+      raise ConfigurationError(
+        "RabbitMQ MIRRORED_QUEUES mode requires ha_mode.",
+        setting_name="ha_mode",
+      )
+    if not isinstance(virtual_host, str) or not virtual_host:
+      raise ConfigurationError(
+        "RabbitMQ virtual_host must be a non-empty string.",
+        setting_name="virtual_host",
+      )
+    integer_bounds = (
+      ("heartbeat", heartbeat, 0),
+      ("blocked_connection_timeout", blocked_connection_timeout, 0),
+      ("connection_attempts", connection_attempts, 1),
+      ("retry_delay", retry_delay, 0),
+      ("prefetch_count", prefetch_count, 0),
+      ("prefetch_size", prefetch_size, 0),
+    )
+    for setting_name, value, minimum in integer_bounds:
+      if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigurationError(
+          f"RabbitMQ {setting_name} must be an integer >= {minimum}.",
+          setting_name=setting_name,
+        )
+
+    return _RabbitMQConnectionSnapshot(
+      mode=mode,
+      host=normalized_host,
+      port=port,
+      cluster_nodes=cluster_nodes,
+      username=username,
+      password=cast(str, _redact(raw_password)),
+      virtual_host=virtual_host,
+      ssl_enabled=ssl_enabled,
+      ssl_cafile=ssl_cafile,
+      ssl_certfile=ssl_certfile,
+      ssl_keyfile=ssl_keyfile,
+      ssl_verify_mode=ssl_verify_mode,
+      heartbeat=heartbeat,
+      blocked_connection_timeout=blocked_connection_timeout,
+      connection_attempts=connection_attempts,
+      retry_delay=retry_delay,
+      prefetch_count=prefetch_count,
+      prefetch_size=prefetch_size,
+      ha_mode=ha_mode,
+      ha_params=ha_params,
+      ha_sync_mode=ha_sync_mode,
+    )
+
   def connect(self) -> None:
     """Establish connection to RabbitMQ based on deployment mode.
 
@@ -157,61 +293,41 @@ class RabbitMQBackend(Backend, QueueBackend):
         BackendConnectionError: If the connection cannot be established.
         ConfigurationError: If the configuration is invalid for the mode.
     """
-    if self.config.mode not in (
-      RabbitMQMode.STANDALONE,
-      RabbitMQMode.CLUSTER,
-      RabbitMQMode.MIRRORED_QUEUES,
-    ):
-      try:
-        mode_text = str(self.config.mode)
-      except (TypeError, ValueError):
-        mode_text = getattr(self.config.mode, "value", repr(self.config.mode))
-      msg = f"Unsupported RabbitMQ mode: {mode_text}"
-      raise ConfigurationError(
-        msg,
-        setting_name="mode",
-        setting_value=self.config.mode,
-      )
-    if not getattr(self.config, "ssl_enabled", False) and not self._ssl_warning_emitted:
+    snapshot = self._capture_connection_snapshot()
+    if not snapshot.ssl_enabled and not self._ssl_warning_emitted:
       logger.warning(
-        "RabbitMQ connecting without SSL — credentials (username/password) "
-        "traverse the network in cleartext. Set ssl_enabled=True (and "
-        "configure ssl_cafile / ssl_certfile / ssl_keyfile as needed) for "
-        "any deployment outside localhost. (warning emitted once per "
+        "RabbitMQ loopback connection is using plaintext transport. "
+        "Remote endpoints require verified TLS. (warning emitted once per "
         "backend instance)"
       )
       self._ssl_warning_emitted = True
     try:
-      if self.config.mode == RabbitMQMode.STANDALONE:
-        self._connect_standalone()
-      elif self.config.mode == RabbitMQMode.CLUSTER:
-        self._connect_cluster()
+      if snapshot.mode == RabbitMQMode.STANDALONE:
+        self._connect_standalone(snapshot)
+      elif snapshot.mode == RabbitMQMode.CLUSTER:
+        self._connect_cluster(snapshot)
       else:
-        self._connect_mirrored_queues()
-      logger.debug("Connected to RabbitMQ in %s mode", self.config.mode.value)
+        self._connect_mirrored_queues(snapshot)
+      logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
     except ConfigurationError:
+      self.disconnect()
       raise
-    except AMQPError as e:
-      msg = f"Failed to connect to RabbitMQ ({self.config.mode.value}): {e}"
+    except Exception:
+      self.disconnect()
+      msg = f"Failed to connect to RabbitMQ ({snapshot.mode.value})"
       raise BackendConnectionError(
         msg,
         backend_type="rabbitmq",
-      ) from e
-    except Exception as e:
-      # ConnectionFailed or other unexpected errors from pika connection layer
-      msg = f"Failed to connect to RabbitMQ ({self.config.mode.value}): {e}"
-      raise BackendConnectionError(
-        msg,
-        backend_type="rabbitmq",
-      ) from e
+      ) from None
 
-  def _get_ssl_verify_mode(self) -> ssl.VerifyMode:
+  def _get_ssl_verify_mode(self, mode: str | None = None) -> ssl.VerifyMode:
     """Get SSL verification mode from config.
 
     Returns:
         ssl.CERT_NONE, ssl.CERT_OPTIONAL, or ssl.CERT_REQUIRED.
     """
-    mode = self.config.ssl_verify_mode
+    if mode is None:
+      mode = self.config.ssl_verify_mode
     if mode == "CERT_NONE":
       return ssl.CERT_NONE
     if mode == "CERT_OPTIONAL":
@@ -223,6 +339,8 @@ class RabbitMQBackend(Backend, QueueBackend):
     self,
     host: str | None = None,
     port: int | None = None,
+    *,
+    snapshot: _RabbitMQConnectionSnapshot | None = None,
   ) -> pika.ConnectionParameters:
     """Build common RabbitMQ connection parameters.
 
@@ -234,57 +352,47 @@ class RabbitMQBackend(Backend, QueueBackend):
         ConnectionParameters with common settings.
 
     Raises:
-        ConfigurationError: If using default guest credentials in non-standalone mode.
+        ConfigurationError: If the captured connection policy is invalid.
     """
-    # Warn/fail if using default guest credentials in non-standalone mode
-    if (
-      self.config.mode != RabbitMQMode.STANDALONE
-      and self.config.username == _DEFAULT_GUEST_CREDENTIAL
-      and self.config.password == _DEFAULT_GUEST_CREDENTIAL
-    ):
-      msg = (
-        "Default 'guest/guest' credentials are insecure for non-standalone modes. "
-        "Set SCRAPY_RABBITMQ_USERNAME and SCRAPY_RABBITMQ_PASSWORD explicitly."
-      )
-      raise ConfigurationError(
-        msg,
-        setting_name="username/password",
-        setting_value="guest/guest",
-      )
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
+    connection_host = snapshot.host if host is None else host
+    connection_port = snapshot.port if port is None else port
     credentials = pika.PlainCredentials(
-      self.config.username,
-      _redact(secret_value(self.config.password)),
+      snapshot.username,
+      snapshot.password,
     )
 
     # Build SSL options if enabled
     ssl_options = None
-    if self.config.ssl_enabled:
-      ssl_context = ssl.create_default_context(cafile=self.config.ssl_cafile)
-      if self.config.ssl_certfile and self.config.ssl_keyfile:
+    if snapshot.ssl_enabled:
+      ssl_context = ssl.create_default_context(cafile=snapshot.ssl_cafile)
+      if snapshot.ssl_certfile and snapshot.ssl_keyfile:
         ssl_context.load_cert_chain(
-          certfile=self.config.ssl_certfile,
-          keyfile=self.config.ssl_keyfile,
+          certfile=snapshot.ssl_certfile,
+          keyfile=snapshot.ssl_keyfile,
         )
 
-      verify_mode = self._get_ssl_verify_mode()
-      if verify_mode == ssl.CERT_NONE:
-        ssl_context.check_hostname = False
+      verify_mode = self._get_ssl_verify_mode(snapshot.ssl_verify_mode)
       ssl_context.verify_mode = verify_mode
-      ssl_options = pika.SSLOptions(ssl_context)
+      ssl_context.check_hostname = True
+      ssl_options = pika.SSLOptions(ssl_context, connection_host)
 
     return pika.ConnectionParameters(
-      host=host or self.config.host,
-      port=port or self.config.port,
-      virtual_host=self.config.virtual_host,
+      host=connection_host,
+      port=connection_port,
+      virtual_host=snapshot.virtual_host,
       credentials=credentials,
-      heartbeat=self.config.heartbeat,
-      blocked_connection_timeout=self.config.blocked_connection_timeout,
-      connection_attempts=self.config.connection_attempts,
-      retry_delay=self.config.retry_delay,
+      heartbeat=snapshot.heartbeat,
+      blocked_connection_timeout=snapshot.blocked_connection_timeout,
+      connection_attempts=snapshot.connection_attempts,
+      retry_delay=snapshot.retry_delay,
       ssl_options=ssl_options,
     )
 
-  def _connect_standalone(self) -> None:
+  def _connect_standalone(
+    self, snapshot: _RabbitMQConnectionSnapshot | None = None
+  ) -> None:
     """Connect to standalone RabbitMQ node.
 
     R14-E: ``_setup_qos`` runs BEFORE the connection/channel are committed
@@ -294,15 +402,19 @@ class RabbitMQBackend(Backend, QueueBackend):
     init (mirrors the R25-A1 connect-path cleanup pattern in
     ``connectors.py``).
     """
-    parameters = self._build_common_parameters()
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
+    parameters = self._build_common_parameters(snapshot=snapshot)
     connection = pika.BlockingConnection(parameters)
-    channel = self._open_prepared_channel(connection)
+    channel = self._open_prepared_channel(connection, snapshot=snapshot)
     self._activate_channel(connection, channel)
     logger.debug(
-      "Connected to standalone RabbitMQ at %s:%s", self.config.host, self.config.port
+      "Connected to standalone RabbitMQ at %s:%s", snapshot.host, snapshot.port
     )
 
-  def _connect_cluster(self) -> None:
+  def _connect_cluster(
+    self, snapshot: _RabbitMQConnectionSnapshot | None = None
+  ) -> None:
     """Connect to RabbitMQ cluster.
 
     Uses cluster_nodes for failover if primary node is unavailable.
@@ -310,14 +422,16 @@ class RabbitMQBackend(Backend, QueueBackend):
     R14-E: QoS runs before ``_connection``/``_channel`` are committed, with
     null-on-failure cleanup so :meth:`is_connected` stays truthful.
     """
-    if self.config.cluster_nodes:
-      parameters = [self._build_common_parameters()]
-      all_hosts = [f"{self.config.host}:{self.config.port}"]
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
+    if snapshot.cluster_nodes:
+      parameters = [self._build_common_parameters(snapshot=snapshot)]
+      all_hosts = [f"{snapshot.host}:{snapshot.port}"]
 
-      for node in self.config.cluster_nodes:
-        host, separator, port_text = node.partition(":")
-        port = int(port_text) if separator and port_text else self.config.port
-        parameters.append(self._build_common_parameters(host=host, port=port))
+      for host, port in snapshot.cluster_nodes:
+        parameters.append(
+          self._build_common_parameters(host=host, port=port, snapshot=snapshot)
+        )
         all_hosts.append(f"{host}:{port}")
 
       logger.debug("Connecting to RabbitMQ cluster with hosts: %s", all_hosts)
@@ -326,23 +440,26 @@ class RabbitMQBackend(Backend, QueueBackend):
       )
     else:
       logger.debug(
-        "Connecting to RabbitMQ cluster at %s:%s", self.config.host, self.config.port
+        "Connecting to RabbitMQ cluster at %s:%s", snapshot.host, snapshot.port
       )
-      connection_parameters = self._build_common_parameters()
+      connection_parameters = self._build_common_parameters(snapshot=snapshot)
 
     connection = pika.BlockingConnection(connection_parameters)
-    channel = self._open_prepared_channel(connection)
+    channel = self._open_prepared_channel(connection, snapshot=snapshot)
     self._activate_channel(connection, channel)
     logger.debug("Connected to RabbitMQ cluster")
 
   def _open_prepared_channel(
-    self, connection: pika.BlockingConnection
+    self,
+    connection: pika.BlockingConnection,
+    *,
+    snapshot: _RabbitMQConnectionSnapshot | None = None,
   ) -> pika.channel.Channel:
     """Open and initialize a channel, closing local handles on failure."""
     channel: pika.channel.Channel | None = None
     try:
       channel = connection.channel()
-      self._prepare_channel(channel)
+      self._prepare_channel(channel, snapshot=snapshot)
       return channel
     except Exception:
       if channel is not None:
@@ -371,7 +488,9 @@ class RabbitMQBackend(Backend, QueueBackend):
     # session or the new one, never a new channel paired with an old generation.
     self._channel_session = (self._channel_generation, channel)
 
-  def _connect_mirrored_queues(self) -> None:
+  def _connect_mirrored_queues(
+    self, snapshot: _RabbitMQConnectionSnapshot | None = None
+  ) -> None:
     """Connect to RabbitMQ with mirrored queues (HA).
 
     Classic mirrored-queue HA policy (``ha-mode`` / ``ha-params`` /
@@ -385,8 +504,10 @@ class RabbitMQBackend(Backend, QueueBackend):
     "Configured", which was misleading and left the policy unset).
     """
     # First connect like cluster mode.
-    self._connect_cluster()
-    if not (self._channel and self.config.ha_mode):
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
+    self._connect_cluster(snapshot)
+    if not (self._channel and snapshot.ha_mode):
       return
     logger.warning(
       "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
@@ -394,9 +515,9 @@ class RabbitMQBackend(Backend, QueueBackend):
       "client — set it out-of-band via `rabbitmqctl set_policy` or the "
       "management API. Classic mirroring is deprecated in modern RabbitMQ; "
       "consider quorum queues for HA.",
-      self.config.ha_mode,
-      self.config.ha_params,
-      self.config.ha_sync_mode,
+      snapshot.ha_mode,
+      snapshot.ha_params,
+      snapshot.ha_sync_mode,
     )
 
   def _setup_qos(self) -> None:
@@ -410,7 +531,12 @@ class RabbitMQBackend(Backend, QueueBackend):
     if self._channel is not None:
       self._apply_qos(self._channel)
 
-  def _prepare_channel(self, channel: pika.channel.Channel) -> None:
+  def _prepare_channel(
+    self,
+    channel: pika.channel.Channel,
+    *,
+    snapshot: _RabbitMQConnectionSnapshot | None = None,
+  ) -> None:
     """Apply consumer QoS and enable synchronous publisher confirms.
 
     A channel is not published to instance state until both steps succeed.
@@ -423,10 +549,15 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         AMQPError: If QoS or publisher-confirm setup fails.
     """
-    self._apply_qos(channel)
+    self._apply_qos(channel, snapshot=snapshot)
     channel.confirm_delivery()
 
-  def _apply_qos(self, channel: pika.channel.Channel) -> None:
+  def _apply_qos(
+    self,
+    channel: pika.channel.Channel,
+    *,
+    snapshot: _RabbitMQConnectionSnapshot | None = None,
+  ) -> None:
     """Apply QoS (prefetch) settings to ``channel``.
 
     R14-E: extracted from :meth:`_setup_qos` so the connect paths can call
@@ -442,15 +573,19 @@ class RabbitMQBackend(Backend, QueueBackend):
     Raises:
         AMQPError: If ``basic_qos`` fails at the AMQP layer.
     """
-    if self.config.prefetch_count > 0 or self.config.prefetch_size > 0:
+    prefetch_count = (
+      self.config.prefetch_count if snapshot is None else snapshot.prefetch_count
+    )
+    prefetch_size = self.config.prefetch_size if snapshot is None else snapshot.prefetch_size
+    if prefetch_count > 0 or prefetch_size > 0:
       channel.basic_qos(
-        prefetch_count=self.config.prefetch_count,
-        prefetch_size=self.config.prefetch_size,
+        prefetch_count=prefetch_count,
+        prefetch_size=prefetch_size,
       )
       logger.debug(
         "Set QoS: prefetch_count=%d, prefetch_size=%d",
-        self.config.prefetch_count,
-        self.config.prefetch_size,
+        prefetch_count,
+        prefetch_size,
       )
 
   def disconnect(self) -> None:

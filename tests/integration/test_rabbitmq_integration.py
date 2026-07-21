@@ -29,12 +29,14 @@ Running
 Skipped by default. Point at a RabbitMQ you don't mind ``inttest:*`` queues
 landing in::
 
-    SCRAPY_TEST_RABBITMQ_URL=amqp://guest:guest@localhost:5672/ \
+    SCRAPY_TEST_RABBITMQ_URL=amqp://localhost:5672/ \
       uv run pytest tests/integration -q
 
 Each test uses a UUID-prefixed queue name so concurrent runs and leftover
-queues don't interfere. Note: RabbitMQ's ``guest`` user connects from
-localhost only — use real creds in the URL for a remote broker.
+queues don't interfere. The helper defaults to ``guest`` only for loopback;
+set ``SCRAPY_TEST_RABBITMQ_USERNAME`` and
+``SCRAPY_TEST_RABBITMQ_PASSWORD`` for another account. Remote brokers require
+an ``amqps://`` URL.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ pytestmark = [
   pytest.mark.skipif(
     not os.environ.get("SCRAPY_TEST_RABBITMQ_URL"),
     reason=(
-      "Set SCRAPY_TEST_RABBITMQ_URL (e.g. amqp://guest:guest@localhost:5672/) "
+      "Set SCRAPY_TEST_RABBITMQ_URL (e.g. amqp://localhost:5672/) "
       "to run RabbitMQ integration tests against a live instance."
     ),
   ),
@@ -59,26 +61,30 @@ pytestmark = [
 
 
 def _settings_from_url(url: str):  # type: ignore[no-untyped-def]
-  """Build RabbitSettings from an amqp:// URL via stdlib urlparse.
+  """Build RabbitSettings from an AMQP test URL via stdlib urlparse.
 
-  RabbitMQSettings exposes host/port/username/password/virtual_host (no
-  ``url`` field), so the amqp:// URL is decomposed into those. Kept
-  dependency-free so the module imports without pika installed — it skips
-  before any pika call.
+  The test-only URL is decomposed so credentials can come from separate
+  environment variables and the production URL-userinfo guard remains covered.
+  Legacy test URLs containing userinfo remain accepted by this helper only.
   """
   from pydantic import SecretStr
 
   from scrapy_extension.settings.rabbitmq import RabbitMQSettings
 
   parsed = urlparse(url)
+  tls_enabled = parsed.scheme == "amqps"
+  username = os.environ.get("SCRAPY_TEST_RABBITMQ_USERNAME") or parsed.username
+  password = os.environ.get("SCRAPY_TEST_RABBITMQ_PASSWORD") or parsed.password
   # amqp://host:port/  → path "/" → vhost "/"; amqp://host:port/vh → "vh"
   vhost = parsed.path.lstrip("/") or "/"
   return RabbitMQSettings(
     host=parsed.hostname or "localhost",
-    port=parsed.port or 5672,
-    username=parsed.username or "guest",
-    password=SecretStr(parsed.password) if parsed.password else SecretStr("guest"),
+    port=parsed.port or (5671 if tls_enabled else 5672),
+    username=username or "guest",
+    password=SecretStr(password or "guest"),
     virtual_host=vhost,
+    ssl_enabled=tls_enabled,
+    ssl_cafile=os.environ.get("SCRAPY_TEST_RABBITMQ_SSL_CAFILE"),
     connection_attempts=1,
     heartbeat=60,
   )
