@@ -227,9 +227,11 @@ speculative work.
 - [x] **BACKEND-04B — SQS clear barrier.** Fence old delivery epochs and hold an
   exclusive per-queue barrier for the full asynchronous PurgeQueue window,
   including ambiguous failures, without serializing ordinary queue operations.
-- [ ] **BACKEND-04C — remaining terminal and clear semantics.** Make direct
-  Pulsar token settlement one-shot and retryable, and specify an honest
-  lifecycle barrier for RabbitMQ in-flight deliveries.
+- [x] **BACKEND-04C1 — RabbitMQ clear lifecycle.** Track exact per-queue pending
+  deliveries, keep token and legacy settlement paths independent, and reject a
+  purge that could be followed by an old delivery's nack/requeue.
+- [ ] **BACKEND-04C2 — Pulsar terminal settlement.** Make direct Pulsar token
+  settlement one-shot across ack/nack and retryable after client failures.
 - [x] **BACKEND-05 — SQS physical boundaries.** Map logical queue names to
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
@@ -791,3 +793,24 @@ timeouts, retry settings, and QoS. Public startup errors suppress driver text.
 All 521 related tests passed on Python 3.10 and 3.14, and the full Python 3.10
 suite passed 3,093 tests with 44 documented skips. Ruff, strict mypy, and patch
 integrity remained green.
+
+### I20 — RabbitMQ clear lifecycle barrier
+
+Six of ten initial RED regressions demonstrated that `queue_purge()` could run
+while the same logical queue still had unacknowledged local deliveries. RabbitMQ
+does not purge those deliveries, so a later nack could requeue pre-clear work.
+The token-aware pop path also populated the legacy last-tag slot, allowing a
+token delivery to be settled once through each API. Clear and pop had no local
+linearization point, and the diagnostic token cap could not safely answer
+whether a queue remained in flight.
+
+Every issued delivery now increments an exact O(number-of-queues) pending
+counter that is decremented only after a confirmed ack/nack. A target queue with
+any pending delivery fails before broker purge; unrelated queues remain
+clearable. Disconnect resets local accounting only after invalidating the
+channel, allowing RabbitMQ to requeue old work for a post-reconnect purge.
+Token-aware pops no longer touch the legacy slot. An RLock serializes Pika
+push/pop/ack/nack/depth/purge operations, and two deterministic thread tests
+prove both clear-before-pop and pop-before-clear orderings. All 231 related tests
+passed on Python 3.10 and 3.14; the full Python 3.10 suite passed 3,104 tests
+with 45 documented skips. Ruff, strict mypy, and patch integrity remained green.

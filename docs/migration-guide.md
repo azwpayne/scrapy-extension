@@ -258,6 +258,14 @@ replacement topic. Stop all producers and consumers, drain or delete the topic
 with Kafka's operator tooling, verify cluster metadata convergence, and choose
 an intentional consumer-group offset policy before restarting.
 
+RabbitMQ `clear_queue()` now fails with `QueueError` when the target queue has
+an unacknowledged local delivery. RabbitMQ purge only removes ready messages;
+allowing a later nack would otherwise resurrect work from before the clear.
+Direct callers must retain and settle every token before clearing. To abandon a
+worker's deliveries, disconnect, wait for the broker to requeue them, reconnect,
+and then retry clear. A pending delivery on another queue does not block the
+target queue.
+
 SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
 after PurgeQueue returns. AWS documents that the asynchronous purge can delete
 messages sent during that interval, so returning earlier was not a safe clear

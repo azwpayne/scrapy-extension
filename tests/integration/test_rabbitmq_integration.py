@@ -202,3 +202,23 @@ def test_ack_idempotent_when_no_pending(rabbitmq_backend, unique_prefix):
   # No message popped on this queue → no tracked tag → must not raise.
   rabbitmq_backend.ack(queue)
   rabbitmq_backend.nack(queue)
+
+
+def test_clear_rejects_unacked_delivery_then_purges_requeue(
+  rabbitmq_backend, unique_prefix
+):
+  """Purge must not report a clear boundary while an old nack can resurrect work."""
+  from scrapy_extension.exceptions import QueueError
+
+  queue = f"{unique_prefix}:clear"
+  rabbitmq_backend.push(queue, b"old-work")
+  body, token = rabbitmq_backend.pop_with_ack(queue)
+  assert body == b"old-work"
+  assert token is not None
+
+  with pytest.raises(QueueError, match="in-flight"):
+    rabbitmq_backend.clear_queue(queue)
+
+  rabbitmq_backend.nack(queue, token=token)
+  rabbitmq_backend.clear_queue(queue)
+  assert rabbitmq_backend.queue_len(queue) == 0

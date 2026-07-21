@@ -298,6 +298,14 @@ offsets, so it cannot provide the queue abstraction's safe-clear boundary.
 Stop producers/consumers and use an operator-controlled Kafka maintenance or
 drain workflow instead.
 
+**RabbitMQ clear barrier**: broker purge removes ready messages, not
+unacknowledged deliveries. `clear_queue()` therefore fails before purge while
+that logical queue has any locally issued, unsettled delivery. Ack/nack those
+tokens first; after disconnect, reconnect before clearing so the broker has
+requeued the old deliveries. Operations and purge are serialized at the channel
+boundary, while in-flight deliveries on unrelated queues do not block the
+target clear.
+
 **SQS clear barrier**: `clear_queue()` waits at least 60 seconds after the
 PurgeQueue RPC because AWS may delete messages sent during that asynchronous
 window. Operations on the same physical queue wait behind the barrier; other

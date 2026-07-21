@@ -159,14 +159,17 @@ def test_nack_with_token_raises_on_amqp_error() -> None:
     backend.nack("q", token=_token(backend, 5))
 
 
-def test_nack_with_token_clears_matching_last_delivery_tag() -> None:
-  """Line 720->722 (true branch): nack(token=...) clears ``_last_delivery_tag``
-  when it matches the token — keeps the legacy single-pop slot coherent
-  with the per-message token path (single-process sanity)."""
+def test_nack_with_token_does_not_settle_matching_legacy_slot() -> None:
+  """Token and legacy settlement paths remain independent.
+
+  A token-aware pop no longer populates the legacy slot, so a token must not
+  clear a separately tracked legacy delivery even if a synthetic test gives
+  both the same numeric tag.
+  """
   backend, _channel = _connected_backend()
   backend._last_delivery_tag = 5
   backend.nack("q", token=_token(backend, 5))
-  assert backend._last_delivery_tag is None
+  assert backend._last_delivery_tag == 5
 
 
 def test_nack_legacy_is_noop_when_channel_or_tag_absent() -> None:
@@ -195,10 +198,7 @@ def test_setup_qos_applies_qos_when_channel_present(mocker) -> None:
 
 
 def test_nack_with_token_keeps_nonmatching_last_delivery_tag() -> None:
-  """Line 720->722 (false branch): nack(token=...) where ``_last_delivery_tag``
-  points at a DIFFERENT tag leaves it intact — only the matching case clears
-  the legacy slot (the token path and legacy path are independent except
-  for the single-process coherence optimization)."""
+  """A token settlement leaves an unrelated legacy delivery intact."""
   backend, _channel = _connected_backend()
   backend._last_delivery_tag = 99  # different from the token below
   backend.nack("q", token=_token(backend, 5))

@@ -165,6 +165,11 @@ pipeline keeps its setting-level compatibility rule:
   delete/recreate through the crawler: stop all producers/consumers, use Kafka
   operator tooling, wait for metadata convergence, and explicitly reset or
   replace the consumer group before resuming.
+- RabbitMQ queue purge does not include unacknowledged deliveries. The backend
+  rejects `clear_queue()` while the target queue has local in-flight work; ack
+  or nack every token first. If a worker is being reset, disconnect so RabbitMQ
+  requeues its deliveries, reconnect, and only then retry clear. In-flight work
+  on another logical queue does not block the target.
 - SQS queue clear is synchronous at the library boundary but takes at least 60
   seconds after the PurgeQueue RPC. Budget that interval in maintenance and
   shutdown deadlines. Same-queue traffic waits; unrelated SQS queues continue.

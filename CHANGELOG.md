@@ -57,6 +57,13 @@ upgrading.
   against the replacement topic. It now fails before admin I/O; perform a
   stopped, operator-controlled drain/reset instead. Topic creation also checks
   the admin response's per-topic error code before caching success.
+- **RabbitMQ `clear_queue()` now rejects in-flight deliveries.** Rabbit's purge
+  excludes unacknowledged messages, which could previously be nacked after a
+  successful clear and resurrect pre-clear work. Exact per-queue pending counts
+  now block purge until every local delivery is acked/nacked, or until a
+  disconnect lets the broker requeue it for a post-reconnect purge. Channel
+  operations and purge share a linearization lock; unrelated queues do not
+  block one another. Token-aware pops no longer populate the legacy ack slot.
 - **SQS acknowledgement tokens now have one terminal outcome.** Repeating a
   direct token ack/nack, or invoking the opposite action after success, no
   longer issues another broker call. Broker and disconnect failures keep the
