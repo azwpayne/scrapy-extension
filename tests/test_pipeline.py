@@ -1,9 +1,12 @@
 """Tests for BackendPipeline component."""
 
+import warnings
 from dataclasses import dataclass
 
 import pytest
 from scrapy import Field, Item
+from scrapy.exceptions import ScrapyDeprecationWarning
+from scrapy.pipelines import ItemPipelineManager
 
 from scrapy_extension.backends.base import JSONSerializer, _validate_key_name
 from scrapy_extension.exceptions import BackendError, SerializationError
@@ -183,6 +186,46 @@ class TestBackendPipelineFromCrawler:
     pipeline = BackendPipeline.from_crawler(mock_crawler)
 
     assert pipeline.key_prefix == "crawler_items"
+
+  def test_scrapy_manager_registration_has_no_required_spider_warning(
+    self, mock_connection_manager, mocker
+  ):
+    """Current Scrapy must be able to omit the deprecated spider argument."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+
+    with warnings.catch_warnings():
+      warnings.simplefilter("error", ScrapyDeprecationWarning)
+      ItemPipelineManager(pipeline, crawler=mocker.Mock())
+
+  def test_crawler_owned_spider_supports_argumentless_hooks(
+    self, mock_connection_manager, mocker
+  ):
+    """Scrapy's new hook path resolves the spider saved by from_crawler()."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.name = "crawler_spider"
+    crawler = mocker.Mock()
+    crawler.spider = spider
+    crawler.stats = None
+    mocker.patch.object(BackendPipeline, "from_settings", return_value=pipeline)
+
+    created = BackendPipeline.from_crawler(crawler)
+    created.open_spider()
+    item = SampleItem(name="Test", value=123)
+
+    assert created.process_item(item) is item
+
+    created.close_spider()
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_argumentless_hook_without_crawler_or_opened_spider_fails_clearly(
+    self, mock_connection_manager
+  ):
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+
+    with pytest.raises(RuntimeError, match="has no spider"):
+      pipeline.open_spider()
 
 
 class TestBackendPipelineOpenSpider:

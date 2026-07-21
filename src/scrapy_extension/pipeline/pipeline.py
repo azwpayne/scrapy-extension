@@ -10,7 +10,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from itemadapter import ItemAdapter, is_item
 
@@ -32,7 +32,7 @@ from scrapy_extension.storage.strategies.passthrough import (
 from scrapy_extension.utils._config import parse_float_setting, parse_int_setting
 
 if TYPE_CHECKING:
-  from scrapy import Item, Spider
+  from scrapy import Spider
   from scrapy.crawler import Crawler
   from scrapy.settings import Settings
 
@@ -130,6 +130,7 @@ class BackendPipeline:
     self._lifecycle_lock = threading.Lock()
     self._opened = False
     self._opened_spider: Spider | None = None
+    self._crawler: Crawler | None = None
     self._closed = False
     set_monitor = getattr(self.storage_strategy, "set_monitor", None)
     if callable(set_monitor):
@@ -289,6 +290,7 @@ class BackendPipeline:
         A new BackendPipeline instance.
     """
     pipeline = cls.from_settings(crawler.settings)
+    pipeline._crawler = crawler
     try:
       # Default-on observability — mirrors the dupefilter wiring. Only override
       # when no explicit monitor was provided (operators passing a custom monitor
@@ -319,7 +321,21 @@ class BackendPipeline:
     with self._lifecycle_lock:
       self._close_locked()
 
-  def open_spider(self, spider: Spider) -> None:
+  def _resolve_spider(self, spider: Spider | None) -> Spider:
+    """Resolve old explicit-spider and new crawler-owned Scrapy calls."""
+    if spider is not None:
+      return spider
+    if self._opened_spider is not None:
+      return self._opened_spider
+    crawler_spider = self._crawler.spider if self._crawler is not None else None
+    if crawler_spider is None:
+      raise RuntimeError(
+        "BackendPipeline has no spider; construct it with from_crawler() or "
+        "pass spider explicitly"
+      )
+    return crawler_spider
+
+  def open_spider(self, spider: Spider | None = None) -> None:
     """Called when a spider opens.
 
     Detects whether the configured backend supports storage. If not
@@ -331,11 +347,13 @@ class BackendPipeline:
     than aborting the crawl at startup.
 
     Args:
-        spider: The spider instance.
+        spider: The spider instance for legacy Scrapy/direct calls. Current
+            Scrapy omits it and the pipeline resolves ``crawler.spider``.
     """
     with self._lifecycle_lock:
       if self._closed:
         raise RuntimeError("pipeline is closed")
+      spider = self._resolve_spider(spider)
       if self._opened:
         if spider is self._opened_spider:
           return
@@ -373,17 +391,21 @@ class BackendPipeline:
       self._opened_spider = spider
       logger.info("Pipeline opened for spider %s", spider.name)
 
-  def close_spider(self, spider: Spider) -> None:
+  def close_spider(self, spider: Spider | None = None) -> None:
     """Called when a spider closes.
 
     Flushes any buffered items via the storage strategy before shutting the
     connection manager down (so batched strategies drain on spider close).
 
     Args:
-        spider: The spider instance.
+        spider: The spider instance for legacy Scrapy/direct calls. Current
+            Scrapy omits it and the pipeline uses the opened/crawler spider.
     """
-    logger.info("Pipeline closed for spider %s", spider.name)
     with self._lifecycle_lock:
+      if self._closed:
+        return
+      spider = self._resolve_spider(spider)
+      logger.info("Pipeline closed for spider %s", spider.name)
       self._close_locked()
 
   def _close_locked(self) -> None:
@@ -409,14 +431,15 @@ class BackendPipeline:
           # is the only failure, shutdown remains best-effort as before.
           logger.exception("connection_manager.close() failed during teardown")
 
-  def process_item(self, item: Item, spider: Spider) -> Item:
+  def process_item(self, item: Any, spider: Spider | None = None) -> Any:
     """Process one item while excluding concurrent terminal teardown."""
     with self._lifecycle_lock:
       if self._closed:
         raise RuntimeError("pipeline is closed")
+      spider = self._resolve_spider(spider)
       return self._process_item_unlocked(item, spider)
 
-  def _process_item_unlocked(self, item: Item, spider: Spider) -> Item:
+  def _process_item_unlocked(self, item: Any, spider: Spider) -> Any:
     """Process and store an item.
 
     Best-effort: catches storage errors so a temporary backend failure
@@ -542,7 +565,7 @@ class BackendPipeline:
     unique_id = uuid.uuid4().hex[:8]
     return f"{self.key_prefix}:{spider.name}:{timestamp}:{unique_id}"
 
-  def _serialize_item(self, item: Item) -> bytes:
+  def _serialize_item(self, item: Any) -> bytes:
     """Serialize an item.
 
     Args:

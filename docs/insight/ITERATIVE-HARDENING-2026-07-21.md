@@ -114,7 +114,7 @@ speculative work.
 - [x] **TEST-03 — supported-Python truth.** Correct the Hypothesis expected-meta
   oracle for reserved keys. Resolve the exact Python 3.14 itemadapter/Pydantic-v1
   warning without hiding unrelated user warnings.
-- [ ] **COMPAT-01 — Scrapy pipeline hooks.** Accept both legacy explicit-spider
+- [x] **COMPAT-01 — Scrapy pipeline hooks.** Accept both legacy explicit-spider
   calls and current crawler-owned/omitted-spider calls for open, close, and item
   processing; prove registration emits no deprecation warning.
 - [ ] **PLUGIN-01 — descriptor boundary.** Validate entry-point name,
@@ -219,3 +219,14 @@ only for its exact message and `itemadapter._imports` origin. A warning-policy
 canary proves unrelated `UserWarning` instances remain fatal. Every CPython
 3.10–3.14 non-integration lane passed 2,906 tests with 7 skips and 37 integration
 tests deselected; Ruff and strict mypy also passed.
+
+### I5 — Scrapy pipeline hook compatibility
+
+First pinned Scrapy 2.17's own registration check as a failing regression: all
+three pipeline hooks required the deprecated `spider` argument. The hooks now
+accept the legacy explicit argument or resolve the crawler/opened spider when
+Scrapy omits it, while a direct argumentless call with no available spider fails
+with a clear lifecycle error. `process_item` now reflects ItemAdapter's real
+item-like input surface instead of claiming only `scrapy.Item`. All 58 focused
+pipeline tests passed on Python 3.10 and 3.14, the full suite passed 2,909 tests
+with 44 skips, and Ruff plus strict mypy remained green.
