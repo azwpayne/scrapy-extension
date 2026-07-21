@@ -117,7 +117,7 @@ speculative work.
 - [x] **COMPAT-01 — Scrapy pipeline hooks.** Accept both legacy explicit-spider
   calls and current crawler-owned/omitted-spider calls for open, close, and item
   processing; prove registration emits no deprecation warning.
-- [ ] **PLUGIN-01 — descriptor boundary.** Validate entry-point name,
+- [x] **PLUGIN-01 — descriptor boundary.** Validate entry-point name,
   `backend_type`, dotted class paths, and duplicates. Logging a broken plugin
   must not become an exception under warnings-as-errors.
 - [ ] **RUN-01 — circuit-breaker boundary.** Treat breaker-open queue reads and
@@ -230,3 +230,16 @@ with a clear lifecycle error. `process_item` now reflects ItemAdapter's real
 item-like input surface instead of claiming only `scrapy.Item`. All 58 focused
 pipeline tests passed on Python 3.10 and 3.14, the full suite passed 2,909 tests
 with 44 skips, and Ruff plus strict mypy remained green.
+
+### I6 — isolated and deterministic plugin discovery
+
+Five regressions first demonstrated that malformed class paths and mismatched
+names were accepted, duplicate third-party names used last-write-wins, and a
+broken plugin could abort discovery under warnings-as-errors. Discovery now
+requires valid/equal entry-point and descriptor names, dotted Python identifier
+paths, and a frozen string capability set. Duplicate third-party names register
+neither claimant. Broken, conflicting, and shadowing plugins are reported via
+logging so Python warning filters cannot hide the bundled registry. The author
+contract and changelog carry the same semantics. All 21 registry tests passed on
+Python 3.10 and 3.14; the full suite passed 2,915 tests with 44 skips, plus Ruff
+and strict mypy.

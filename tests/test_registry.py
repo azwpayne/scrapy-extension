@@ -7,8 +7,7 @@ PLAN's TDD acceptance gate. They MUST verify that:
 - 3rd-party descriptors are discovered via ``importlib.metadata.entry_points``
   (Test 2);
 - capability mismatches fail fast with a typed error (Test 3);
-- bundled-wins-on-conflict emits ``UserWarning`` (Test 4) — load-bearing
-  because ``pyproject.toml`` sets ``filterwarnings = ["error::UserWarning"]``;
+- bundled-wins-on-conflict emits a warning log without raising (Test 4);
 - a broken plugin callable never breaks the bundled set (Test 5);
 - ``get_registry()`` never imports any backend module — lazy-import preserved
   (Test 6);
@@ -17,7 +16,9 @@ PLAN's TDD acceptance gate. They MUST verify that:
 
 from __future__ import annotations
 
+import logging
 import sys
+import warnings
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -49,6 +50,46 @@ def _register_kwarg() -> BackendDescriptor:
 
 def _register_good_plugin() -> BackendDescriptor:
   return _make_descriptor("goodplugin", capabilities=frozenset({"queue"}))
+
+
+def _register_mismatched_plugin() -> BackendDescriptor:
+  return _make_descriptor("actualname", capabilities=frozenset({"queue"}))
+
+
+def _register_validname() -> BackendDescriptor:
+  return _make_descriptor("validname", capabilities=frozenset({"queue"}))
+
+
+def _register_invalid_backend_path() -> BackendDescriptor:
+  return _make_descriptor(
+    "badbackendpath",
+    capabilities=frozenset({"queue"}),
+    backend_cls_path="NotDotted",
+  )
+
+
+def _register_invalid_settings_path() -> BackendDescriptor:
+  return _make_descriptor(
+    "badsettingspath",
+    capabilities=frozenset({"queue"}),
+    settings_cls_path="tests.test_registry.not-valid",
+  )
+
+
+def _register_duplicate_first() -> BackendDescriptor:
+  return _make_descriptor(
+    "duplicate",
+    capabilities=frozenset({"queue"}),
+    backend_cls_path="tests.test_registry._StubBackend",
+  )
+
+
+def _register_duplicate_second() -> BackendDescriptor:
+  return _make_descriptor(
+    "duplicate",
+    capabilities=frozenset({"storage"}),
+    backend_cls_path="tests.test_registry._OtherStubBackend",
+  )
 
 
 def _register_shadow_redis() -> BackendDescriptor:
@@ -246,6 +287,117 @@ class TestThirdPartyDiscovered:
     assert instance.settings.kwargs == {"host": "local"}
 
 
+class TestDescriptorBoundary:
+  """Malformed or ambiguous plugins never enter or abort the registry."""
+
+  def test_broken_plugin_isolated_when_user_warnings_are_errors(self, monkeypatch):
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="broken",
+          value="tests.test_registry._broken_plugin",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    with warnings.catch_warnings():
+      warnings.simplefilter("error", UserWarning)
+      registry = get_registry()
+
+    assert "redis" in registry
+    assert "broken" not in registry
+
+  def test_entry_point_name_must_match_descriptor_type(self, monkeypatch):
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="declaredname",
+          value="tests.test_registry._register_mismatched_plugin",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    registry = get_registry()
+
+    assert "declaredname" not in registry
+    assert "actualname" not in registry
+
+  def test_entry_point_name_must_match_public_pattern(self, monkeypatch):
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="Bad-EP",
+          value="tests.test_registry._register_validname",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    assert "validname" not in get_registry()
+
+  @pytest.mark.parametrize(
+    ("name", "registration"),
+    (
+      ("badbackendpath", "_register_invalid_backend_path"),
+      ("badsettingspath", "_register_invalid_settings_path"),
+    ),
+  )
+  def test_class_paths_must_be_dotted_identifiers(
+    self, monkeypatch, name, registration
+  ):
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name=name,
+          value=f"tests.test_registry.{registration}",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    assert name not in get_registry()
+
+  def test_duplicate_third_party_name_registers_neither_plugin(self, monkeypatch):
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="duplicate",
+          value="tests.test_registry._register_duplicate_first",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="duplicate",
+          value="tests.test_registry._register_duplicate_second",
+          group=_ENTRY_POINT_GROUP,
+        ),
+      ],
+    )
+    _reset_registry_cache()
+
+    assert "duplicate" not in get_registry()
+
+
 class TestCapabilityGated:
   """Test 3: capability_gated."""
 
@@ -302,14 +454,12 @@ class TestCapabilityGated:
 class TestNameConflictBundledWins:
   """Test 4: name_conflict_bundled_wins."""
 
-  def test_name_conflict_bundled_wins(self, monkeypatch):
+  def test_name_conflict_bundled_wins(self, monkeypatch, caplog):
     """An entry-point named ``"redis"`` → bundled descriptor wins AND a
-    ``UserWarning`` is emitted.
+    warning is logged.
 
-    Load-bearing because ``pyproject.toml`` sets
-    ``filterwarnings = ["error::UserWarning"]``: the bundled-wins path
-    MUST emit the warning so a 3rd-party package can't silently shadow a
-    bundled backend (deterministic + observable).
+    The registry must stay available even when applications promote Python
+    warnings to exceptions, while the conflict remains observable.
     """
     from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
 
@@ -325,20 +475,22 @@ class TestNameConflictBundledWins:
     )
     _reset_registry_cache()
 
-    with pytest.warns(UserWarning):
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING):
+      warnings.simplefilter("error", UserWarning)
       registry = get_registry()
 
     # Bundled descriptor wins — verified by the canonical path string,
     # not just any descriptor named "redis".
     desc = get_descriptor("redis")
     assert desc.backend_cls_path == "scrapy_extension.backends.redis.RedisBackend"
+    assert "shadows bundled backend" in caplog.text
 
 
 class TestImportErrorGracefulSkip:
   """Test 5: import_error_graceful_skip."""
 
-  def test_import_error_graceful_skip(self, monkeypatch):
-    """An entry-point callable raising ``ImportError`` is SKIPPED + warned;
+  def test_import_error_graceful_skip(self, monkeypatch, caplog):
+    """An entry-point callable raising ``ImportError`` is SKIPPED + logged;
     the bundled 10 stay intact.
 
     A single broken 3rd-party plugin must never break the bundled set —
@@ -364,8 +516,9 @@ class TestImportErrorGracefulSkip:
     )
     _reset_registry_cache()
 
-    # The broken plugin must not raise; it's skipped with a warning.
-    with pytest.warns(UserWarning):
+    # The broken plugin must not raise even under warnings-as-errors.
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING):
+      warnings.simplefilter("error", UserWarning)
       registry = get_registry()
 
     # Bundled 10 still intact.
@@ -385,6 +538,7 @@ class TestImportErrorGracefulSkip:
     # The good plugin was discovered; the broken one was not.
     assert "goodplugin" in registry
     assert "broken" not in registry
+    assert "Skipping 3rd-party backend entry-point 'broken'" in caplog.text
 
 
 class TestLazyImportPreserved:
@@ -525,17 +679,17 @@ def _register_invalid_backend_type_name() -> BackendDescriptor:
 
 
 def _register_generic_exception() -> BackendDescriptor:
-  """Callable raises a non-ImportError exception — must still skip-with-warn."""
+  """Callable raises a non-ImportError exception — still skip and log."""
   raise RuntimeError("plugin blew up at registration")
 
 
 class TestPluginDiscoveryErrors:
-  """R14-G: broken 3rd-party plugins must WARN+SKIP, never crash discovery.
+  """R14-G: broken 3rd-party plugins must LOG+SKIP, never crash discovery.
 
   The load-bearing contract: a single misbehaving plugin must NEVER prevent
   the bundled 10 from being discovered. Every failure mode of
   ``_load_plugin_descriptor`` is caught by ``_discover_entry_points``'s broad
-  ``except Exception`` and converted to a ``UserWarning`` + ``continue``.
+  ``except Exception`` is converted to a warning log + ``continue``.
 
   Covers:
     - callable returns the wrong type (TypeError path);
@@ -549,8 +703,9 @@ class TestPluginDiscoveryErrors:
     monkeypatch: pytest.MonkeyPatch,
     plugin_name: str,
     registration_value: str,
+    caplog: pytest.LogCaptureFixture,
   ) -> None:
-    """Patch one broken entry-point; assert the bundled 10 survive + warn fires."""
+    """Patch one broken entry-point; assert bundled backends survive + log."""
     from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
 
     _patch_entry_points(
@@ -570,7 +725,8 @@ class TestPluginDiscoveryErrors:
     )
     _reset_registry_cache()
 
-    with pytest.warns(UserWarning):
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING):
+      warnings.simplefilter("error", UserWarning)
       registry = get_registry()
 
     # Bundled 10 always intact regardless of plugin breakage.
@@ -592,37 +748,42 @@ class TestPluginDiscoveryErrors:
     # The good peer plugin was discovered; the broken one was skipped.
     assert "goodplugin" in registry
     assert plugin_name not in registry
+    assert f"entry-point '{plugin_name}'" in caplog.text
 
-  def test_wrong_return_type_skips_with_warning(self, monkeypatch):
-    """A callable returning a non-BackendDescriptor raises TypeError → skip+warn."""
+  def test_wrong_return_type_skips_with_warning(self, monkeypatch, caplog):
+    """A non-BackendDescriptor return raises TypeError → skip + warning log."""
     self._expect_skip(
       monkeypatch,
       plugin_name="wrongtype",
       registration_value="tests.test_registry._register_wrong_return_type",
+      caplog=caplog,
     )
 
-  def test_unknown_capabilities_skips_with_warning(self, monkeypatch):
-    """A descriptor with unsupported capabilities raises ValueError → skip+warn."""
+  def test_unknown_capabilities_skips_with_warning(self, monkeypatch, caplog):
+    """Unsupported capabilities raise ValueError → skip + warning log."""
     self._expect_skip(
       monkeypatch,
       plugin_name="badcap",
       registration_value="tests.test_registry._register_unknown_capabilities",
+      caplog=caplog,
     )
 
-  def test_invalid_backend_type_name_skips_with_warning(self, monkeypatch):
-    """A descriptor whose backend_type fails the name regex → skip+warn."""
+  def test_invalid_backend_type_name_skips_with_warning(self, monkeypatch, caplog):
+    """An invalid backend_type raises ValueError → skip + warning log."""
     self._expect_skip(
       monkeypatch,
       plugin_name="badname",
       registration_value="tests.test_registry._register_invalid_backend_type_name",
+      caplog=caplog,
     )
 
-  def test_generic_exception_skips_with_warning(self, monkeypatch):
-    """A callable raising a non-ImportError exception → skip+warn (broad catch)."""
+  def test_generic_exception_skips_with_warning(self, monkeypatch, caplog):
+    """A generic exception is caught, skipped, and logged."""
     self._expect_skip(
       monkeypatch,
       plugin_name="boom",
       registration_value="tests.test_registry._register_generic_exception",
+      caplog=caplog,
     )
 
   def test_entry_points_enumeration_failure_returns_empty(

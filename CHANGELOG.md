@@ -248,6 +248,11 @@ upgrading.
 
 ### Fixed
 
+- Third-party backend discovery now validates that entry-point names equal
+  descriptor `backend_type` values, validates both dotted class paths, and
+  rejects all duplicate third-party names. Broken/conflicting plugins are
+  reported through logging instead of `warnings.warn`, so an application's
+  warnings-as-errors policy can no longer make them hide bundled backends.
 - Redis blocking pop now polls the same atomic Lua pop used by the non-blocking
   path, eliminating the `BZPOPMIN` followed by payload-read crash window.
 - Kafka ack tokens include topic, partition, offset, and consumer generation;

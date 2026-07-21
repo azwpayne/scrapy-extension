@@ -25,11 +25,10 @@ Lazy-import invariant (load-bearing):
     :class:`BackendDescriptor`. ONE registration declares the backend class,
     settings class, AND capability matrix — no editing other registries.
 
-Precedence: bundled-wins on name conflict + ``UserWarning`` (deterministic,
-observable; the project's ``error::UserWarning`` pytest filter makes this
-load-bearing in tests). A broken plugin callable (any ``Exception``) is
-skipped + warned — never propagates — so one bad plugin can't break the
-bundled set.
+Precedence: bundled-wins on name conflict + warning log (deterministic and
+observable). A broken plugin callable (any ``Exception``) is skipped + logged —
+never propagated — so one bad plugin cannot break the bundled set even when an
+application promotes Python warnings to exceptions.
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import re
-import warnings
 from dataclasses import dataclass
 from typing import Final
 
@@ -180,7 +178,7 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
 
   Each entry-point's registration callable is invoked via ``ep.load()``.
   A broken callable (any ``Exception`` — typically ``ImportError`` when a
-  plugin's optional dep is missing) is logged + warned + SKIPPED. This is
+  plugin's optional dep is missing) is logged + SKIPPED. This is
   the load-bearing graceful-skip invariant: one bad plugin must never
   break the bundled set (round-5 R5-1 Test 5).
 
@@ -214,26 +212,46 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
     return {}
 
   discovered: dict[str, BackendDescriptor] = {}
+  discovered_sources: dict[str, str] = {}
+  conflicted_names: set[str] = set()
   for ep in eps:
     try:
       descriptor = _load_plugin_descriptor(ep)
     except Exception as exc:  # noqa: BLE001 - graceful-skip: never propagate
-      warnings.warn(
-        f"Skipping 3rd-party backend entry-point {ep.name!r} "
-        f"(group {_ENTRY_POINT_GROUP!r}): its registration callable raised "
-        f"{type(exc).__name__}: {exc}. Bundled backends remain available.",
-        UserWarning,
-        stacklevel=2,
-      )
       logger.warning(
-        "Skipping 3rd-party backend entry-point %r: %s: %s",
+        "Skipping 3rd-party backend entry-point %r (group %r): %s: %s; "
+        "bundled backends remain available.",
         ep.name,
+        _ENTRY_POINT_GROUP,
         type(exc).__name__,
         exc,
         exc_info=True,
       )
       continue
-    discovered[descriptor.backend_type] = descriptor
+    name = descriptor.backend_type
+    source = getattr(ep, "value", "<unknown>")
+    if name in conflicted_names:
+      logger.error(
+        "Skipping additional 3rd-party backend entry-point %r from %r: "
+        "the backend name is already conflicted.",
+        name,
+        source,
+      )
+      continue
+    if name in discovered:
+      previous_source = discovered_sources.pop(name)
+      discovered.pop(name)
+      conflicted_names.add(name)
+      logger.error(
+        "Skipping duplicate 3rd-party backend name %r: entry-points %r and "
+        "%r both claim it; neither plugin is registered.",
+        name,
+        previous_source,
+        source,
+      )
+      continue
+    discovered[name] = descriptor
+    discovered_sources[name] = source
   return discovered
 
 
@@ -243,7 +261,10 @@ def _load_plugin_descriptor(ep: importlib.metadata.EntryPoint) -> BackendDescrip
   Validation:
 
   - The callable returns a :class:`BackendDescriptor` instance.
-  - ``backend_type`` matches ``^[a-z][a-z0-9_]*$`` (the documented contract).
+  - The entry-point name and ``backend_type`` both match
+    ``^[a-z][a-z0-9_]*$`` and are equal.
+  - Both class paths are non-empty dotted Python identifier paths.
+  - ``capabilities`` is a frozen set of strings.
   - ``capabilities`` ⊆ ``{"queue", "set", "storage"}``.
 
   A validation failure raises ``ValueError``; the caller
@@ -270,12 +291,46 @@ def _load_plugin_descriptor(ep: importlib.metadata.EntryPoint) -> BackendDescrip
       f"{type(descriptor).__name__}, expected BackendDescriptor."
     )
     raise TypeError(msg)
-  if not _NAME_PATTERN.match(descriptor.backend_type):
+  if not isinstance(ep.name, str) or not _NAME_PATTERN.fullmatch(ep.name):
+    msg = (
+      f"Entry-point name {ep.name!r} must match {_NAME_PATTERN.pattern!r}."
+    )
+    raise ValueError(msg)
+  if not isinstance(descriptor.backend_type, str) or not _NAME_PATTERN.fullmatch(
+    descriptor.backend_type
+  ):
     msg = (
       f"Entry-point {ep.name!r} registered an invalid backend_type "
       f"{descriptor.backend_type!r}; must match {_NAME_PATTERN.pattern!r}."
     )
     raise ValueError(msg)
+  if descriptor.backend_type != ep.name:
+    msg = (
+      f"Entry-point name {ep.name!r} does not match descriptor backend_type "
+      f"{descriptor.backend_type!r}."
+    )
+    raise ValueError(msg)
+  for field_name, dotted_path in (
+    ("backend_cls_path", descriptor.backend_cls_path),
+    ("settings_cls_path", descriptor.settings_cls_path),
+  ):
+    if (
+      not isinstance(dotted_path, str)
+      or len(dotted_path.split(".")) < 2
+      or any(not part.isidentifier() for part in dotted_path.split("."))
+    ):
+      msg = (
+        f"Entry-point {ep.name!r} registered invalid {field_name} "
+        f"{dotted_path!r}; expected a dotted Python identifier path."
+      )
+      raise ValueError(msg)
+  if not isinstance(descriptor.capabilities, frozenset) or any(
+    not isinstance(capability, str) for capability in descriptor.capabilities
+  ):
+    msg = (
+      f"Entry-point {ep.name!r} capabilities must be a frozenset of strings."
+    )
+    raise TypeError(msg)
   invalid = descriptor.capabilities - _VALID_CAPABILITIES
   if invalid:
     msg = (
@@ -292,9 +347,9 @@ def get_registry() -> dict[str, BackendDescriptor]:
 
   Memoized on first call; subsequent calls return a fresh COPY so callers
   can't mutate the cached table. Bundled descriptors WIN on name conflict
-  — a 3rd-package entry-point shadowing a bundled name is dropped with a
-  ``UserWarning`` (deterministic + observable; the project's
-  ``error::UserWarning`` pytest filter makes the warning load-bearing).
+  — a 3rd-party entry-point shadowing a bundled name is dropped with a warning
+  log. Logging cannot be promoted into an exception by Python's warnings
+  filters, preserving the bundled-availability invariant.
 
   Returns:
       A fresh dict mapping backend-type string → :class:`BackendDescriptor`.
@@ -306,17 +361,11 @@ def get_registry() -> dict[str, BackendDescriptor]:
     for name, descriptor in discovered.items():
       if name in bundled:
         # Bundled-wins precedence: the bundled descriptor stays; the
-        # 3rd-party shadow is dropped. Warn so operators notice.
-        warnings.warn(
-          f"3rd-party backend entry-point {name!r} shadows a bundled "
-          f"backend; bundled descriptor wins (deterministic precedence). "
-          f"Rename the plugin's backend_type to avoid the conflict.",
-          UserWarning,
-          stacklevel=2,
-        )
+        # 3rd-party shadow is dropped. Log so operators notice without making
+        # registry availability depend on their Python warning filters.
         logger.warning(
           "3rd-party backend entry-point %r shadows bundled backend; "
-          "bundled wins.",
+          "bundled wins. Rename the plugin backend_type to avoid the conflict.",
           name,
         )
         continue

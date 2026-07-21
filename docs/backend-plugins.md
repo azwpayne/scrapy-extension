@@ -1,6 +1,6 @@
 # Backend Plugins — Authoring a 3rd-Party Backend
 
-> Back to [Project Overview](../.claude/CLAUDE.md) · [README](../README.md)
+> Back to [Codebase Overview](codebase-deep-insight.md) · [README](../README.md)
 
 `scrapy-extension` ships 10 bundled backends (Redis, MongoDB, Kafka, RabbitMQ,
 ElasticSearch, RocketMQ, Pulsar, SQS, Memcached, DynamoDB). You do **not** need to
@@ -20,8 +20,12 @@ records:
    imports of the backend modules happen at registry-build time).
 2. The framework then **discovers entry-points** in the `scrapy_extension.backends`
    group from every installed distribution and calls each registration callable.
-3. Each callable returns a `BackendDescriptor`. The descriptor is added to the
-   registry under its `backend_type` string.
+3. Each callable returns a validated `BackendDescriptor`. Its `backend_type`
+   must equal the entry-point name, and both class paths must be dotted Python
+   identifier paths.
+4. A unique descriptor is added under its `backend_type`. If multiple installed
+   distributions claim the same third-party name, the registry rejects all of
+   them rather than choosing one by environment-dependent discovery order.
 
 A plugin therefore consists of: a backend class, a pydantic-settings settings class,
 a tiny zero-arg registration callable, and one line in `pyproject.toml`.
@@ -61,7 +65,9 @@ class BackendDescriptor:
 - `backend_type` must match the entry-point name (and the `SCRAPY_BACKEND_TYPE`
   value).
 - `backend_cls_path` and `settings_cls_path` are **dotted-path strings**, not
-  classes — see the lazy-import rule below.
+  classes. Every dot-separated part must be a valid Python identifier, and the
+  path must contain at least a module and attribute — see the lazy-import rule
+  below.
 - `capabilities` declares which interfaces the backend implements. Selecting a
   backend for a capability it does not declare raises a `ConfigurationError`
   listing the capable backends.
@@ -101,16 +107,23 @@ lazily on first use of `mybackend`.
 
 If an entry-point name collides with a bundled backend (e.g. a plugin also calls
 itself `"redis"`), the **bundled descriptor wins** and the framework emits a
-`UserWarning`. This is deterministic and safe: a misbehaving plugin can never
-shadow a bundled backend. Rename your entry-point to avoid the warning
+warning log. This is deterministic and safe: a misbehaving plugin can never
+shadow a bundled backend, and an application's Python warning filters cannot
+turn discovery into an exception. Rename your entry-point to avoid the log
 (`"myredis"`, `"acme_redis"`, …).
+
+Two third-party entry-points with the same name are both rejected and logged as
+an error. This avoids silently selecting whichever distribution metadata happens
+to be enumerated last.
 
 ### Graceful skip on failure
 
 If your registration callable raises (e.g. `ImportError` because an optional
 helper is missing on the current platform), the framework **skips your plugin**
-and emits a warning. The bundled 10 backends are unaffected — one broken
-3rd-party plugin never breaks the registry.
+and emits a warning log. Invalid names, mismatched descriptor types, malformed
+class paths, and unsupported capabilities follow the same path. The bundled 10
+backends are unaffected — one broken 3rd-party plugin never breaks the registry,
+even in applications that treat Python warnings as errors.
 
 ## A Worked Example: `mybackend`
 
@@ -360,17 +373,19 @@ Also verify the lazy-import rule manually: importing `scrapy_extension.backends.
 - [ ] Entry-point group is exactly `scrapy_extension.backends`.
 - [ ] Entry-point name matches `^[a-z][a-z0-9_]*$` and equals `backend_type`.
 - [ ] Registration callable returns a `BackendDescriptor` (paths only).
+- [ ] `backend_cls_path` and `settings_cls_path` contain at least one dot and
+      only valid Python identifier parts.
 - [ ] Callable imports **only** `BackendDescriptor` from core — never the backend
       or settings module.
 - [ ] `capabilities` is a subset of `{"queue", "set", "storage"}`.
 - [ ] Compatibility smoke tests pass for registry discovery, capability selection, and unsupported-capability rejection.
 - [ ] Lazy-import smoke test confirms registry discovery does not import the backend driver module.
-- [ ] No name collision with a bundled backend (or accept the `UserWarning` and
-      that the bundled descriptor wins).
+- [ ] No name collision with a bundled or another third-party backend (bundled
+      wins its collision; duplicate third-party names are all rejected).
 
 ## See Also
 
-- [Project Overview (CLAUDE.md)](../.claude/CLAUDE.md) — backend implementation
+- [Codebase Overview](codebase-deep-insight.md) — backend implementation
   matrix, multi-mode support, connection management.
 - [README](../README.md) — installation, quick start, backend configuration.
 - `src/scrapy_extension/backends/base.py` — the `Backend` / `QueueBackend` /
