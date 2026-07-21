@@ -3,7 +3,7 @@
 Rewritten (#44) for the apache ``rocketmq-python-client`` 5.1.1 surface — the
 prior file patched fictional import paths (``rocketmq.client.Producer``,
 ``rocketmq.consumer.SimpleConsumer``, ``rocketmq.endpoint.Endpoint``) that
-matched no released client. These tests now patch the real top-level surface
+matched no released client. These tests now stub the real top-level surface
 (``rocketmq.Producer`` / ``rocketmq.SimpleConsumer`` / ``rocketmq.Message`` /
 ``rocketmq.ClientConfiguration`` / ``rocketmq.Credentials``) directly, mirroring
 ``test_rocketmq_backend._patch_rocketmq``.
@@ -25,6 +25,8 @@ load-bearing guard:
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,17 +37,21 @@ from scrapy_extension.settings import RocketMQSettings
 
 
 def _patch_rocketmq(mocker, *, producer=None, consumer=None) -> None:
-  """Patch the apache 5.1.1 top-level rocketmq client surface.
+  """Install a stub of the apache 5.1.1 top-level client surface.
 
   ``producer`` / ``consumer`` are what the mock ``Producer`` / ``SimpleConsumer``
   constructors RETURN — pass ``None`` to exercise the constructor-returned-None
   fail-fast; pass a ``MagicMock`` (or leave default) to connect cleanly.
   """
-  mock_producer_cls = mocker.patch("rocketmq.Producer")
-  mock_consumer_cls = mocker.patch("rocketmq.SimpleConsumer")
-  mocker.patch("rocketmq.Message")
-  mocker.patch("rocketmq.ClientConfiguration")
-  mocker.patch("rocketmq.Credentials")
+  rocketmq_module = ModuleType("rocketmq")
+  mock_producer_cls = MagicMock()
+  mock_consumer_cls = MagicMock()
+  rocketmq_module.Producer = mock_producer_cls
+  rocketmq_module.SimpleConsumer = mock_consumer_cls
+  rocketmq_module.Message = MagicMock()
+  rocketmq_module.ClientConfiguration = MagicMock()
+  rocketmq_module.Credentials = MagicMock()
+  mocker.patch.dict(sys.modules, {"rocketmq": rocketmq_module})
   mock_producer_cls.return_value = producer
   mock_consumer_cls.return_value = consumer
 

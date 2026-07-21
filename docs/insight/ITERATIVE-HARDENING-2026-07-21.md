@@ -108,7 +108,7 @@ speculative work.
 - [x] **TEST-01 — complete test dependency group.** Add direct test dependencies
   for every backend module exercised by public lazy imports; prove the tests pass
   in a fresh synced environment and in an adversarial order.
-- [ ] **TEST-02 — RocketMQ import isolation.** Replace unit-test patching that
+- [x] **TEST-02 — RocketMQ import isolation.** Replace unit-test patching that
   imports the real SDK with a controlled module stub. Run the one real SDK
   contract check in a subprocess with a temporary home directory.
 - [ ] **TEST-03 — supported-Python truth.** Correct the Hypothesis expected-meta
@@ -195,3 +195,15 @@ dependency group with the same constraints as their backend extras and refreshed
 the lockfile. A fresh temporary environment synced with `--locked --group test`,
 exported all three direct requirements, passed the adversarial 114-test slice,
 and passed the full suite with 2,905 tests and 44 documented skips.
+
+### I3 — hermetic RocketMQ SDK boundary
+
+Reproduced the import-time failure with a single connected-backend test and no
+home-directory override. Behavioural tests now inject a complete top-level
+`rocketmq` module stub instead of asking `unittest.mock` to import the real SDK.
+The real 5.1.1 method/property contract still runs in a subprocess whose `HOME`
+and working directory are pytest-owned. The same pass also moved `Message`
+loading behind the connected-state gate, so a disconnected `push` raises the
+documented `QueueError` without touching the optional dependency. Both RocketMQ
+files passed all 95 tests, and the full 2,905-test suite, Ruff, and strict mypy
+all passed without overriding `HOME`.

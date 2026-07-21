@@ -326,15 +326,13 @@ class RocketMQBackend(Backend, QueueBackend):
       QueueError: If push fails.
     """
     _validate_key_name(queue_name, "queue_name")
-    from rocketmq import Message
-
-    from scrapy_extension.exceptions import QueueError
-
     if not self.is_connected():
       msg = "Not connected to RocketMQ"
       raise QueueError(msg, queue_name=queue_name, operation="push")
 
     try:
+      from rocketmq import Message
+
       topic_name = self._get_topic_name(queue_name)
       msg = Message()
       msg.topic = topic_name

@@ -1,12 +1,16 @@
 """Tests for RocketMQ backend implementation (apache ``rocketmq-python-client`` 5.1.1 gRPC).
 
-Rewritten (#44) alongside the backend rewrite. The apache client is real-installed
-(``rocketmq-python-client`` 5.1.1), so the prior ``builtins.__import__``
-interception strategy is obsolete — these tests patch the top-level
-``rocketmq.Producer`` / ``rocketmq.SimpleConsumer`` / etc. directly.
+Rewritten (#44) alongside the backend rewrite. The apache client is installed for
+one isolated compatibility smoke, while behavioural unit tests install a module
+stub so importing the SDK cannot configure its process-global file logger.
 """
 
+import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
+from types import ModuleType
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -34,21 +38,26 @@ from scrapy_extension.settings import RocketMQMode, RocketMQSettings
 
 
 def _patch_rocketmq(mocker):
-  """Patch the apache 5.1.1 top-level rocketmq client surface.
+  """Install a stub of the apache 5.1.1 top-level client surface.
 
   Returns ``(mock_producer_cls, mock_consumer_cls, mock_message_cls,
   mock_config_cls, mock_credentials_cls)`` so tests can assert on construction
   args. Instances: ``mock_producer_cls.return_value`` / ``mock_consumer_cls.return_value``.
   """
+  rocketmq_module = ModuleType("rocketmq")
   mock_producer = mocker.MagicMock()
   mock_consumer = mocker.MagicMock()
-  mock_producer_cls = mocker.patch("rocketmq.Producer", return_value=mock_producer)
-  mock_consumer_cls = mocker.patch(
-    "rocketmq.SimpleConsumer", return_value=mock_consumer
-  )
-  mock_message_cls = mocker.patch("rocketmq.Message")
-  mock_config_cls = mocker.patch("rocketmq.ClientConfiguration")
-  mock_credentials_cls = mocker.patch("rocketmq.Credentials")
+  mock_producer_cls = mocker.MagicMock(return_value=mock_producer)
+  mock_consumer_cls = mocker.MagicMock(return_value=mock_consumer)
+  mock_message_cls = mocker.MagicMock()
+  mock_config_cls = mocker.MagicMock()
+  mock_credentials_cls = mocker.MagicMock()
+  rocketmq_module.Producer = mock_producer_cls
+  rocketmq_module.SimpleConsumer = mock_consumer_cls
+  rocketmq_module.Message = mock_message_cls
+  rocketmq_module.ClientConfiguration = mock_config_cls
+  rocketmq_module.Credentials = mock_credentials_cls
+  mocker.patch.dict(sys.modules, {"rocketmq": rocketmq_module})
   return (
     mock_producer_cls,
     mock_consumer_cls,
@@ -131,15 +140,30 @@ def test_rocketmq_backend_disconnect() -> None:
   assert backend._consumer is None
 
 
-def test_locked_sdk_exposes_wait_and_lease_mutation_contracts() -> None:
-  """The backend relies on both APIs; catch dependency drift before runtime."""
-  from rocketmq import SimpleConsumer
+def test_locked_sdk_exposes_wait_and_lease_mutation_contracts(tmp_path: Path) -> None:
+  """Check the real SDK surface without importing its file logger in pytest."""
+  script = "\n".join(
+    (
+      "from rocketmq import SimpleConsumer",
+      "consumer = object.__new__(SimpleConsumer)",
+      "consumer.await_duration = 0",
+      "assert consumer.await_duration == 0",
+      "assert callable(SimpleConsumer.change_invisible_duration)",
+    )
+  )
+  env = os.environ.copy()
+  env["HOME"] = str(tmp_path)
 
-  consumer = object.__new__(SimpleConsumer)
-  consumer.await_duration = 0
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    cwd=tmp_path,
+    env=env,
+    capture_output=True,
+    text=True,
+    check=False,
+  )
 
-  assert consumer.await_duration == 0
-  assert callable(SimpleConsumer.change_invisible_duration)
+  assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
