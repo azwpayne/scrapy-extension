@@ -151,7 +151,7 @@ Each strategy receives a `ConnectionManager` and drives the underlying QueueBack
 | Strategy | `SCRAPY_STORAGE_STRATEGY` | Behavior |
 |----------|---------------------------|----------|
 | `PassthroughStorageStrategy` | `passthrough` (default) | Direct write per item |
-| `BatchedStorageStrategy` | `batched` | Buffer + flush at threshold; at-least-once under partial failure (un-written tail re-enqueued); crash-before-flush loses in-flight batch (documented) |
+| `BatchedStorageStrategy` | `batched` | Global FIFO of backend-bound records; threshold/manual/age/close drains each record through its originating backend; ordinary partial failure re-enqueues the backend-bound unwritten tail; crash-before-flush loses the in-flight batch (documented) |
 
 **Backend-agnostic:** each `store()` call receives the `StorageBackend` (the pipeline owns the backend lifecycle). This is the cleanest of the three strategy layers.
 

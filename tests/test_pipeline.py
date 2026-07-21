@@ -786,6 +786,45 @@ class TestBackendPipelineStorageStrategy:
     assert store.call_count == 2
     assert strat.pending == 0
 
+  def test_shared_batched_strategy_preserves_pipeline_backend_affinity(self, mocker):
+    """Each pipeline item drains through the backend accepted with that item."""
+    from scrapy_extension.storage.strategies.batched import (
+      BatchedStorageStrategy,
+    )
+
+    backend_a = mocker.Mock()
+    backend_b = mocker.Mock()
+    manager_a = mocker.Mock()
+    manager_b = mocker.Mock()
+    manager_a.get_storage_backend.return_value = backend_a
+    manager_b.get_storage_backend.return_value = backend_b
+    strategy = BatchedStorageStrategy(threshold=2)
+    pipeline_a = BackendPipeline(
+      connection_manager=manager_a,
+      ttl=11,
+      storage_strategy=strategy,
+    )
+    pipeline_b = BackendPipeline(
+      connection_manager=manager_b,
+      ttl=22,
+      storage_strategy=strategy,
+    )
+    pipeline_a._storage_supported = True
+    pipeline_b._storage_supported = True
+    spider_a = mocker.Mock(name="spider_a")
+    spider_b = mocker.Mock(name="spider_b")
+    spider_a.name = "alpha"
+    spider_b.name = "beta"
+
+    pipeline_a.process_item(SampleItem(name="a", value=1), spider_a)
+    pipeline_b.process_item(SampleItem(name="b", value=2), spider_b)
+
+    backend_a.store.assert_called_once()
+    backend_b.store.assert_called_once()
+    assert backend_a.store.call_args.kwargs == {"ttl": 11}
+    assert backend_b.store.call_args.kwargs == {"ttl": 22}
+    assert strategy.pending == 0
+
   def test_batched_monitor_reports_only_durable_flushes(
     self, mock_connection_manager, mocker
   ):

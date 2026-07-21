@@ -1,13 +1,15 @@
-"""Batched storage strategy — buffers items and flushes in bulk.
+"""Batched storage strategy — buffers backend-bound items before flushing.
 
-Buffers ``(key, value, ttl)`` triples and writes them to the backend when the
-buffer reaches a configurable threshold or on ``close()``. Reduces per-item
-backend round-trips at the cost of delayed persistence (items are lost on
-crash before flush — a distinct failure mode from a store *exception*, which
-is handled with at-least-once re-enqueueing; see :meth:`_flush_to`).
+Each record retains the exact backend capability received by its ``store``
+call. Records are written in global insertion order when the buffer reaches a
+configurable threshold or on ``flush()`` / ``close()``. Persistence is delayed
+(items are lost on crash before flush — a distinct failure mode from a store
+*exception*, which is handled with at-least-once re-enqueueing; see
+:meth:`_flush`).
 Thread-safe via an internal lock — Scrapy pipelines are single-threaded per
 spider, but the guard makes the strategy safe under concurrent stores (e.g.
-concurrent item-processing pipelines feeding one shared strategy).
+concurrent item-processing callers feeding one shared strategy). Callers that
+share an instance must coordinate its single ``open`` / ``close`` lifecycle.
 
 Risk 2 (crash-before-flush loss window): when ``max_buffer_age_s`` is set, a
 daemon thread flushes once the oldest buffered item is older than the cap,
@@ -35,6 +37,8 @@ if TYPE_CHECKING:
 DEFAULT_BATCH_THRESHOLD = 100
 
 logger = logging.getLogger(__name__)
+
+_BufferedEntry = tuple["StorageBackend", str, bytes, int | None]
 
 
 class BatchedStorageStrategy(StorageStrategy):
@@ -84,14 +88,13 @@ class BatchedStorageStrategy(StorageStrategy):
       raise ValueError(msg)
     self.threshold = threshold
     self.max_buffer_age_s = max_buffer_age_s
-    self._buffer: list[tuple[str, bytes, int | None]] = []
+    self._buffer: list[_BufferedEntry] = []
     self._lock = threading.Lock()
     # Serializes the complete snapshot/write/requeue transaction. The buffer
     # lock alone cannot make close wait for a threshold flush after that flush
     # has detached its batch and started writing outside _lock.
     self._flush_lock = threading.Lock()
     self._closed = False
-    self._last_backend: StorageBackend | None = None
     self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
     # Risk 2: oldest-buffered-item timestamp (monotonic) + flusher lifecycle.
     # ``_oldest_ts`` is None whenever the buffer is empty; set on first append
@@ -142,14 +145,15 @@ class BatchedStorageStrategy(StorageStrategy):
   ) -> None:
     """Buffer one item; auto-flush when the buffer reaches the threshold.
 
-    Buffering is at-least-once for backend exceptions: ``_flush_to`` restores
+    Buffering is at-least-once for backend exceptions: ``_flush`` restores
     the unwritten tail before re-raising. Threshold-triggered failures propagate
     so ``BackendPipeline`` records a real persistence failure and its
     ``max_storage_errors`` guard remains effective; returning success here would
     emit ``on_store`` for data that exists only in volatile memory.
 
     Args:
-        storage_backend: The StorageBackend to flush to.
+        storage_backend: The exact caller-owned backend capability retained for
+            this entry until it is written or discarded with the strategy.
         key: The storage key.
         value: The serialized item bytes.
         ttl: Optional time-to-live in seconds.
@@ -158,8 +162,7 @@ class BatchedStorageStrategy(StorageStrategy):
     with self._lock:
       if self._closed:
         raise RuntimeError("batched storage strategy is closed")
-      self._buffer.append((key, value, ttl))
-      self._last_backend = storage_backend
+      self._buffer.append((storage_backend, key, value, ttl))
       if self._oldest_ts is None:
         self._oldest_ts = time.monotonic()
       depth = len(self._buffer)
@@ -171,18 +174,15 @@ class BatchedStorageStrategy(StorageStrategy):
     self._emit_buffer_depth(depth)
     self._ensure_flusher()
     if flush_now:
-      self._flush_to(storage_backend)
+      self._flush()
 
   def flush(self) -> None:
-    """Flush any buffered items to the last-seen backend.
+    """Flush buffered items to their per-entry backends in insertion order.
 
-    The batched strategy records the backend from each ``store`` call so
-    ``flush`` and ``close`` can drain without an explicit backend argument.
-    No-op if no backend has been seen yet or the buffer is empty.
+    The exact backend from every ``store`` call travels with that entry through
+    explicit, threshold, age, close, and retry drains. No-op when empty.
     """
-    backend = self._last_backend
-    if backend is not None:
-      self._flush_to(backend)
+    self._flush()
 
   def close(self) -> None:
     """Flush remaining buffered items, then release resources.
@@ -204,16 +204,17 @@ class BatchedStorageStrategy(StorageStrategy):
         )
     self.flush()
 
-  def _flush_to(self, storage_backend: StorageBackend) -> None:
-    """Drain the buffer, writing each item to the backend in insertion order.
+  def _flush(self) -> None:
+    """Drain the buffer to each entry's backend in insertion order.
 
     At-least-once under partial failure: the buffer is snapshotted and cleared
-    under the lock, then each item is written outside the lock. If
-    ``backend.store`` raises on item N, the un-written tail (items N..end) is
-    prepended back into ``_buffer`` under the lock and the exception is
-    re-raised so the caller knows the flush was partial. The previously
-    snapshotted items (already written) are not re-added — the tail carries
-    only what was not yet attempted.
+    under the lock, then each item is written through the exact backend
+    capability retained with it. If ``backend.store`` raises on item N, the
+    un-written backend-bound tail (items N..end) is prepended back into
+    ``_buffer`` under the lock and the exception is re-raised so the caller
+    knows the flush was partial. The previously snapshotted items (already
+    written) are not re-added — the tail carries only what was not yet
+    attempted.
 
     Note: this protects against store *exceptions*; a process *crash* before
     the flush completes still loses the in-flight batch (documented at module
@@ -221,16 +222,15 @@ class BatchedStorageStrategy(StorageStrategy):
     Risk 2's ``max_buffer_age_s`` bounds (but does not eliminate) that window.
     """
     with self._flush_lock:
-      self._flush_to_serialized(storage_backend)
+      self._flush_serialized()
 
-  def _flush_to_serialized(self, storage_backend: StorageBackend) -> None:
+  def _flush_serialized(self) -> None:
     """Run one flush while the caller owns ``_flush_lock``."""
     with self._lock:
       batch = list(self._buffer)
       self._buffer = []
       self._oldest_ts = None  # buffer drained; age resets on next append
-      self._last_backend = storage_backend
-    for i, (key, value, ttl) in enumerate(batch):
+    for i, (storage_backend, key, value, ttl) in enumerate(batch):
       try:
         storage_backend.store(key, value, ttl=ttl)
       except Exception:
@@ -272,7 +272,7 @@ class BatchedStorageStrategy(StorageStrategy):
     which a non-None ``max_buffer_age_s`` is configured. It runs until
     :meth:`close` sets ``_stop``. Pipelines are single-threaded per spider;
     the flusher is the only background thread and serializes flushes via
-    ``_lock`` + ``_flush_to``.
+    ``_lock`` + ``_flush``.
 
     R-flusher-1: the guard + create + start are performed UNDER ``self._lock``
     so concurrent stores (a documented-supported scenario — see module
@@ -306,7 +306,7 @@ class BatchedStorageStrategy(StorageStrategy):
     Bounds the crash-before-flush loss window to roughly ``max_buffer_age_s``:
     the loop wakes on the age interval and flushes if the oldest item is older
     than the cap. Uses ``_stop.wait(timeout=...)`` so :meth:`close` unblocks it
-    immediately on shutdown. All flush work goes through ``_flush_to``
+    immediately on shutdown. All flush work goes through ``_flush``
     (lock-guarded) so it composes safely with the store-path threshold flush.
     A transient flush failure is logged and the loop continues so a temporary
     outage does not permanently disable the flusher.
@@ -315,9 +315,6 @@ class BatchedStorageStrategy(StorageStrategy):
     if age is None:  # defensive — _ensure_flusher should have checked
       return
     while not self._stop.wait(timeout=age):
-      backend = self._last_backend
-      if backend is None:
-        continue
       with self._lock:
         need_flush = (
           bool(self._buffer)
@@ -326,7 +323,7 @@ class BatchedStorageStrategy(StorageStrategy):
         )
       if need_flush:
         try:
-          self._flush_to(backend)
+          self._flush()
         except Exception as exc:  # noqa: BLE001 — keep retry loop alive
           # the loop alive so a transient outage doesn't disable the flusher
           # and report a failure that has no synchronous pipeline caller.

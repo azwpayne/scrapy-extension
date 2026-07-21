@@ -164,19 +164,31 @@ speculative work.
   retry-allowance, and degraded-backend paths. Record events with the decision,
   release the lifecycle lock, then dispatch so a callback failure or re-entry
   cannot strand a fingerprint or deadlock duplicate-filter lifecycle work.
-- [ ] **RUN-13 — queue/pipeline telemetry re-entry.** Move queue and pipeline
-  callbacks outside their operation/lifecycle gates so `on_push`/`on_store`
-  observers cannot deadlock by synchronously waiting for close.
+- [ ] **RUN-13 — queue/pipeline/storage telemetry re-entry.** Move queue,
+  pipeline, and batched-storage callbacks outside their operation/lifecycle
+  gates so `on_push`/`on_store`/`on_buffer_depth` observers cannot deadlock by
+  re-entering flush or synchronously waiting for close. Guard age-worker
+  self-close without reordering durable writes.
 - [ ] **RUN-14 — spider queue identity.** Reject a second explicit logical queue
   name when a spider mixin already owns a differently bound queue, rather than
   silently returning the first queue and routing data to the wrong resource.
 - [ ] **RUN-15 — stateful registry callables.** Fail closed for closures, bound
   methods, partials, and callable objects that cannot have a stable explicit
   settings identity; type/name-only digests must not merge tenant credentials.
-- [ ] **STORAGE-01 — batched backend ownership.** Carry each buffered storage
+- [x] **STORAGE-01 — batched backend ownership.** Carry each buffered storage
   entry's backend through threshold, age, close, and partial-failure flushes so
   sharing a batch strategy cannot write an earlier entry to the later caller's
   backend.
+- [ ] **STORAGE-02 — shared strategy lifecycle ownership.** Either coordinate
+  shared batched-strategy owners or reject a second attachment explicitly, so
+  closing one pipeline cannot terminate another live pipeline's storage path.
+- [ ] **STORAGE-03 — retryable pipeline close.** Do not make a failed batched
+  close permanently terminal or release its manager while a retry tail remains;
+  a later close attempt must be able to drain before backend teardown.
+- [ ] **STORAGE-04 — process-control-safe detached batches.** Requeue the exact
+  failing backend-bound tail before propagating `BaseException`, and keep
+  observer dispatch outside the detached-batch transaction so an observer
+  cannot strand unattempted entries.
 - [x] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
   calls so a failure from an older CLOSED generation cannot reopen a breaker
   that has since completed an OPEN → HALF_OPEN → CLOSED recovery.
@@ -391,7 +403,9 @@ correctness work:
 - correct RabbitMQ/SQS clear semantics, Memcached >30-day TTL, Redis binary
   decode mode, MongoDB count truncation, SQS/Elasticsearch physical-name limits,
   and driver-exception normalization;
-- bound batched-storage shutdown even if its flusher owns the lock;
+- define batched-storage high-watermark/backpressure (including retained
+  per-call circuit-breaker proxies), make age deadlines precise, and bound
+  shutdown even if its flusher owns the lock;
 - make integration lanes fail rather than skip when a required broker is
   configured but unusable; add real import and sdist smoke tests;
 - reconcile the public `Settings` interface with Scrapy component factory
@@ -1712,3 +1726,63 @@ mypy, configured Bandit, lockfile validation, dependency audit, two-worker
 execution, and patch integrity remained green. Independently confirmed
 lifecycle, routing, backend, and release findings remain separate atomic
 iterations in the task register.
+
+### I45 — batched-storage per-entry backend affinity
+
+Six independent audits covered storage-strategy semantics, flush concurrency,
+pipeline/manager integration, adversarial backend identity, regression design,
+and public documentation. They reproduced one silent data-routing defect across
+every drain path: the buffer retained only `(key, value, ttl)`, while a mutable
+`_last_backend` or the threshold-triggering caller selected one backend for the
+whole batch. An item accepted through backend A could therefore be written to
+backend B during threshold, manual, age, or close drain; a partial-failure tail
+could later move again to backend C. Ordinary single-backend tests could not
+observe this dimension.
+
+The locked specification defines one immutable logical record as the exact
+caller-provided backend capability plus key, value, and TTL. Every drain trigger
+uses one backend-agnostic global FIFO transaction and invokes each record's own
+capability. It does not compare, group, or infer owners: third-party backends may
+compare equal, while one circuit-breaker generation may return distinct proxy
+objects on successive accessor calls. On the first ordinary store exception,
+the failing record and unattempted tail retain those exact capabilities and are
+prepended ahead of entries concurrently accepted after the snapshot; the
+successful prefix is not requeued, and the exception retains its existing
+caller-visible behavior. The strategy only retains routing capabilities and
+does not acquire their connection lifecycle. Callers sharing one strategy must
+still coordinate its single lifecycle.
+
+The implementation replaces `_last_backend` routing with backend-bound buffer
+records and a no-argument serialized drain. Threshold, explicit flush, close,
+and the age worker now share that path without changing public signatures,
+per-entry TTL values, global insertion order, or the ordinary trace when every
+call supplies the same backend capability. Six deterministic RED cases covered
+three synchronous drain triggers,
+the real age worker under a controlled monotonic clock, partial failure/retry,
+and a blocked flush with a third backend concurrently enqueued. All six failed
+on the prior implementation with last-backend routing and passed after the
+change. A pipeline-level regression additionally carries independent
+serialization and TTL calls through two managers into one shared strategy.
+
+The same audit confirmed separate lifecycle and exception-safety work rather
+than expanding this atomic data-routing patch: one pipeline can still close a
+shared strategy used by another; a failed pipeline close cannot retry its
+retained tail; process-control exceptions can bypass detached-batch cleanup;
+and storage monitor callbacks can re-enter the non-reentrant flush gate. These
+are registered as `STORAGE-02` through `STORAGE-04` and the expanded `RUN-13`.
+The already-known backpressure/shutdown P2 remains explicit, including the
+additional per-entry proxy retention introduced by correct affinity.
+
+The dedicated affinity class now contains seven cases, including an
+equal-but-distinct A/B/A interleave guard; the storage-strategy plus pipeline
+focus passed 104 tests. Four two-worker runs under independent random seeds
+each passed the 54 concurrency-relevant cases, and an independent reviewer
+repeated the age/concurrent/flusher-cleanup group twenty times without a leaked
+worker. Python 3.10 and 3.14 full suites each collected 3,618 tests and passed
+3,572 with 46 documented skips and three existing master-slave deprecation
+warnings. Whole-project Ruff, strict mypy over 76 source files, configured
+Bandit over 23,492 lines, lock validation, dependency audit, sdist/wheel build,
+and patch integrity remained green. The six-way post-implementation review
+found one over-broad changelog compatibility quantifier; after limiting it to
+calls that supply the same backend capability, every reviewer reported no
+remaining I45 blocker.

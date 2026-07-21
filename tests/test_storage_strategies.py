@@ -225,6 +225,198 @@ class TestBatchedStorageStrategy:
     assert len(keys) == total
 
 
+class TestBatchedStorageBackendAffinity:
+  """Every buffered item remains bound to the backend accepted with it."""
+
+  @pytest.mark.parametrize("drain", ["threshold", "flush", "close"])
+  def test_mixed_backends_keep_global_order_across_drains(self, mocker, drain) -> None:
+    trace: list[tuple[str, str, bytes, int | None]] = []
+    backend_a = mocker.Mock()
+    backend_b = mocker.Mock()
+    backend_a.store.side_effect = lambda key, value, ttl=None: trace.append(
+      ("a", key, value, ttl)
+    )
+    backend_b.store.side_effect = lambda key, value, ttl=None: trace.append(
+      ("b", key, value, ttl)
+    )
+    threshold = 2 if drain == "threshold" else 100
+    strat = BatchedStorageStrategy(threshold=threshold)
+
+    strat.store(backend_a, "a1", b"A", ttl=11)
+    strat.store(backend_b, "b1", b"B", ttl=22)
+    if drain == "flush":
+      strat.flush()
+    elif drain == "close":
+      strat.close()
+
+    assert trace == [
+      ("a", "a1", b"A", 11),
+      ("b", "b1", b"B", 22),
+    ]
+    assert strat.pending == 0
+
+  def test_age_worker_flushes_each_item_to_its_backend(self, mocker) -> None:
+    trace: list[tuple[str, str]] = []
+    trace_lock = threading.Lock()
+    drained = threading.Event()
+    clock = {"now": 0.0}
+
+    def record(owner: str):
+      def store(key, _value, ttl=None):  # noqa: ARG001
+        with trace_lock:
+          trace.append((owner, key))
+          if len(trace) == 2:
+            drained.set()
+
+      return store
+
+    backend_a = mocker.Mock()
+    backend_b = mocker.Mock()
+    backend_a.store.side_effect = record("a")
+    backend_b.store.side_effect = record("b")
+    mocker.patch(
+      "scrapy_extension.storage.strategies.batched.time.monotonic",
+      side_effect=lambda: clock["now"],
+    )
+    strat = BatchedStorageStrategy(threshold=100, max_buffer_age_s=0.01)
+
+    try:
+      strat.store(backend_a, "a1", b"A")
+      strat.store(backend_b, "b1", b"B")
+      clock["now"] = 1.0
+      assert drained.wait(timeout=1.0), "age worker did not drain both entries"
+    finally:
+      strat.close()
+
+    assert trace == [("a", "a1"), ("b", "b1")]
+
+  def test_equal_distinct_backends_are_not_grouped_or_reordered(self, mocker) -> None:
+    trace: list[tuple[str, str]] = []
+    backend_a = mocker.MagicMock()
+    backend_b = mocker.MagicMock()
+    backend_a.__eq__.return_value = True
+    backend_b.__eq__.return_value = True
+    backend_a.store.side_effect = lambda key, _value, ttl=None: trace.append(
+      ("a", key)
+    )
+    backend_b.store.side_effect = lambda key, _value, ttl=None: trace.append(
+      ("b", key)
+    )
+    strat = BatchedStorageStrategy(threshold=3)
+
+    assert backend_a is not backend_b
+    assert backend_a == backend_b
+    strat.store(backend_a, "a1", b"A")
+    strat.store(backend_b, "b1", b"B")
+    strat.store(backend_a, "a2", b"A")
+
+    assert trace == [("a", "a1"), ("b", "b1"), ("a", "a2")]
+    assert strat.pending == 0
+
+  def test_partial_failure_retries_tail_via_original_backends(self, mocker) -> None:
+    trace: list[tuple[str, str]] = []
+    failed = False
+
+    def record(owner: str):
+      def store(key, _value, ttl=None):  # noqa: ARG001
+        nonlocal failed
+        trace.append((owner, key))
+        if key == "b1" and not failed:
+          failed = True
+          raise RuntimeError("transient b1 failure")
+
+      return store
+
+    backend_a = mocker.Mock()
+    backend_b = mocker.Mock()
+    backend_c = mocker.Mock()
+    backend_d = mocker.Mock()
+    backend_a.store.side_effect = record("a")
+    backend_b.store.side_effect = record("b")
+    backend_c.store.side_effect = record("c")
+    backend_d.store.side_effect = record("d")
+    strat = BatchedStorageStrategy(threshold=3)
+
+    strat.store(backend_a, "a1", b"A")
+    strat.store(backend_b, "b1", b"B")
+    with pytest.raises(RuntimeError, match="transient b1 failure"):
+      strat.store(backend_c, "c1", b"C")
+
+    assert trace == [("a", "a1"), ("b", "b1")]
+    assert strat.pending == 2
+
+    # A third caller reaches the threshold while the retry tail is pending. It
+    # may trigger the drain, but it must not take ownership of the older items.
+    strat.store(backend_d, "d1", b"D")
+
+    assert trace == [
+      ("a", "a1"),
+      ("b", "b1"),
+      ("b", "b1"),
+      ("c", "c1"),
+      ("d", "d1"),
+    ]
+    assert strat.pending == 0
+
+  def test_failed_tail_stays_ahead_of_concurrent_new_backend(self, mocker) -> None:
+    trace: list[tuple[str, str]] = []
+    first_store_entered = threading.Event()
+    release_first_store = threading.Event()
+    failed = False
+    flush_errors: list[Exception] = []
+
+    def record(owner: str):
+      def store(key, _value, ttl=None):  # noqa: ARG001
+        nonlocal failed
+        trace.append((owner, key))
+        if key == "a1":
+          first_store_entered.set()
+          if not release_first_store.wait(timeout=2.0):
+            raise AssertionError("blocked backend store was not released")
+        if key == "b1" and not failed:
+          failed = True
+          raise RuntimeError("transient b1 failure")
+
+      return store
+
+    backend_a = mocker.Mock()
+    backend_b = mocker.Mock()
+    backend_c = mocker.Mock()
+    backend_a.store.side_effect = record("a")
+    backend_b.store.side_effect = record("b")
+    backend_c.store.side_effect = record("c")
+    strat = BatchedStorageStrategy(threshold=2)
+    strat.store(backend_a, "a1", b"A")
+
+    def trigger_flush() -> None:
+      try:
+        strat.store(backend_b, "b1", b"B")
+      except Exception as exc:
+        flush_errors.append(exc)
+
+    flush_thread = threading.Thread(target=trigger_flush, daemon=True)
+    flush_thread.start()
+    assert first_store_entered.wait(timeout=2.0)
+    strat.store(backend_c, "c1", b"C")
+    release_first_store.set()
+    flush_thread.join(timeout=2.0)
+
+    assert not flush_thread.is_alive()
+    assert len(flush_errors) == 1
+    assert isinstance(flush_errors[0], RuntimeError)
+    assert strat.pending == 2
+
+    strat.flush()
+
+    assert trace == [
+      ("a", "a1"),
+      ("b", "b1"),
+      ("b", "b1"),
+      ("c", "c1"),
+    ]
+    assert strat.pending == 0
+
+
 class TestBatchedStoragePartialFailure:
   """C4 — at-least-once flush: a mid-batch store failure must not silently
   drop the un-written tail (insight round-2, HIGH). The un-written items must
@@ -250,15 +442,9 @@ class TestBatchedStoragePartialFailure:
     with pytest.raises(RuntimeError, match="backend down on item 2"):
       strat.store(backend, "k3", b"v3")
 
-    # Items 2 (raised mid-flush) + 3 (never attempted) stay buffered for retry
-    # — NOT silently dropped (C4 at-least-once preserved).
-    buffered_keys = [k for k, _v, _t in strat._buffer]
-    assert "k2" in buffered_keys, (
-      f"regression: item k2 lost on partial flush; buffer={buffered_keys}"
-    )
-    assert "k3" in buffered_keys, (
-      f"regression: item k3 lost on partial flush; buffer={buffered_keys}"
-    )
+    # Item 2 (outcome unknown after the exception) + item 3 (never attempted)
+    # stay buffered for retry — NOT silently dropped (C4 at-least-once).
+    assert strat.pending == 2
     # Item 1 was written; item 2 raised; backend.store called exactly twice.
     assert backend.store.call_count == 2
 
@@ -297,11 +483,12 @@ class TestBatchedStoragePartialFailure:
     with pytest.raises(RuntimeError, match="transient item-2 failure"):
       strat.store(backend, "k3", b"v3")
 
-    # k3 buffered. Recover: a manual flush drains it.
+    # k2 (unknown outcome) and k3 (unattempted) are buffered. Recover: a manual
+    # flush retries both in their original order.
+    assert strat.pending == 2
     strat.flush()
-    # k3 (and only k3 — k1/k2 already attempted) now written.
     written_keys = [c.args[0] for c in backend.store.call_args_list]
-    assert "k3" in written_keys
+    assert written_keys == ["k1", "k2", "k2", "k3"]
     assert strat.pending == 0
 
   def test_threshold_flush_failure_propagates_without_losing_buffer(self, mocker) -> None:

@@ -501,6 +501,11 @@ upgrading.
 
 ### Fixed
 
+- Batched storage records now retain the exact caller-provided backend through
+  threshold, manual, age, close, and partial-failure retry drains. Mixed callers
+  can no longer redirect an earlier buffered item to the latest backend; global
+  insertion order, TTL values, and existing public signatures remain unchanged.
+  Calls that all supply the same backend capability retain their previous trace.
 - Duplicate-filter telemetry hooks can no longer interrupt scheduling after a
   fingerprint or retry reservation has already been recorded. Custom monitor
   events are recorded with the dedup decision and serialized through a shared

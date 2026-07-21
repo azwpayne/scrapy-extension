@@ -703,7 +703,7 @@ entries, but cannot lose the only copy of entries not yet processed.
 | Strategy | Behavior | Durability note |
 |----------|----------|-----------------|
 | `passthrough` (default) | writes each serialized item directly to the selected `StorageBackend` | backend durability applies immediately after `store()` returns |
-| `batched` | buffers `(key, value, ttl)` triples and flushes at threshold / spider close | improves throughput, but a hard crash before flush loses the in-process batch; store exceptions re-enqueue the unwritten tail |
+| `batched` | buffers backend-bound records and flushes them in global insertion order at threshold / spider close | every record retains the exact backend passed to its `store()` call through age/manual/close drains and partial-failure retry; a hard crash before flush still loses the in-process batch |
 
 Use `passthrough` when item loss is unacceptable. Use `batched` only when throughput is worth the crash-before-flush trade-off and duplicate writes are acceptable after partial flush retry.
 
@@ -716,7 +716,7 @@ Use `passthrough` when item loss is unacceptable. Use `batched` only when throug
 | SQS / RocketMQ queue pop | per-message token plus a finite broker visibility/invisibility lease | an unacked message becomes deliverable again when the lease expires, including while a slow download is still running | no automatic lease renewal; set the lease above maximum pop-to-response time. SQS nack is immediate; RocketMQ nack uses its 10-second floor |
 | Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |
 | Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives; a token-bearing replacement is rejected before entering volatile delay/time-wheel/round-robin/ring-buffer state | use a backend-durable push path (`passthrough`, `priority`, `work_stealing`, `throttle`, or zero effective delay) when replacing an unacked broker delivery |
-| `batched` storage | in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the unwritten tail | prefer `passthrough` when persistence must happen before item acknowledgement |
+| `batched` storage | backend-bound in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the backend-bound unwritten tail in global FIFO order | keep every caller-provided backend alive until drain; prefer `passthrough` when persistence must happen before item acknowledgement |
 
 Ack is tied to Scrapy downloader response delivery, not spider callback or item pipeline completion. If a crawl must tolerate process death after response download but before item persistence, make item processing idempotent and use a durable storage strategy/topology.
 

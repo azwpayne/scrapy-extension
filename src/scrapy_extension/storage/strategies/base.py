@@ -7,7 +7,9 @@ without changing the backend interface or the item-serialization layer.
 
 Mirrors the shape of :class:`~scrapy_extension.queue.strategies.base.QueueStrategy`.
 The strategy is backend-agnostic: it receives the ``StorageBackend`` on each
-``store`` call (the pipeline owns the backend / connection manager).
+``store`` call (the pipeline owns the backend / connection manager). A
+buffering strategy must preserve that per-entry backend affinity until the
+entry is written; retaining a capability does not transfer lifecycle ownership.
 """
 
 from __future__ import annotations
@@ -27,7 +29,8 @@ class StorageStrategy(ABC):
   A strategy owns how serialized items are persisted: direct writes
   (passthrough), buffered batched writes, etc. It is backend-agnostic — each
   ``store`` call receives the ``StorageBackend`` to delegate to, so the
-  pipeline retains ownership of the backend lifecycle.
+  pipeline retains ownership of the backend lifecycle. Buffered entries remain
+  bound to the exact backend capability supplied with their call.
   """
 
   #: True when the strategy emits ``Monitor.on_store`` at its actual durable
@@ -46,7 +49,8 @@ class StorageStrategy(ABC):
     """Persist one serialized item via the given backend.
 
     Args:
-        storage_backend: The StorageBackend to delegate to (owned by caller).
+        storage_backend: The exact StorageBackend capability to delegate this
+            item to. It remains owned by the caller.
         key: The storage key.
         value: The serialized item bytes.
         ttl: Optional time-to-live in seconds.
