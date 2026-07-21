@@ -325,12 +325,13 @@ class TestBackendDupeFilterOpenClose:
     membership_filter.close.assert_called_once_with()
     mock_connection_manager.close.assert_called_once_with()
 
-  def test_from_crawler_rethreads_resolved_monitor_to_memory_filter(
+  def test_from_crawler_keeps_memory_callback_inside_safe_local_sink(
     self, mock_connection_manager, mocker
   ):
     from scrapy_extension.dupefilter.filters.memory_filter import (
       MemoryMembershipFilter,
     )
+    from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 
     membership_filter = MemoryMembershipFilter(maxsize=1)
     dupefilter = BackendDupeFilter(
@@ -344,7 +345,8 @@ class TestBackendDupeFilterOpenClose:
 
     resolved = BackendDupeFilter.from_crawler(crawler)
 
-    assert membership_filter._monitor is resolved._monitor
+    assert isinstance(resolved._monitor, ScrapyStatsMonitor)
+    assert isinstance(membership_filter._monitor, NullMonitor)
 
 
 class TestBackendDupeFilterLog:

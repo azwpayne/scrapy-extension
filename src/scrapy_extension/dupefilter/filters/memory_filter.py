@@ -54,10 +54,11 @@ class MemoryMembershipFilter(MembershipFilter):
       _maxsize: Capacity cap; None = unbounded (advanced opt-out).
           Defaults to :data:`DEFAULT_MEMORY_MAXSIZE` (1_000_000).
       _data: Insertion/access-ordered mapping of fingerprints.
-      _monitor: Optional observability monitor threaded in by
+      _monitor: Optional standalone observability monitor. A containing
           :class:`~scrapy_extension.dupefilter.dupefilter.BackendDupeFilter`
-          so LRU eviction can emit ``on_filter_saturation`` (R14-D).
-          ``None`` (default) → eviction stays silent (logs only).
+          installs a ``NullMonitor`` here and records the equivalent event for
+          ordered dispatch after its lock is released. ``None`` (default)
+          means capacity events stay silent (the eviction warning still logs).
   """
 
   def __init__(self, *, maxsize: int | None = DEFAULT_MEMORY_MAXSIZE) -> None:
@@ -78,25 +79,52 @@ class MemoryMembershipFilter(MembershipFilter):
       )
     self._maxsize = maxsize
     self._data: OrderedDict[bytes, None] = OrderedDict()
-    # R14-D: monitor is threaded in AFTER construction by the dupefilter
-    # (which owns the monitor). Stays ``None`` when the filter is used
-    # standalone → eviction is silent (warn-only), preserving prior
-    # behavior outside the dupefilter context.
+    # Standalone filters may opt into direct saturation telemetry. A containing
+    # dupefilter installs NullMonitor and publishes its recorded equivalent
+    # outside the lifecycle lock instead.
     self._monitor: Monitor | None = None
 
   def set_monitor(self, monitor: Monitor) -> None:
-    """Thread the dupefilter's monitor so eviction can emit saturation (R14-D).
+    """Thread a monitor so finite-capacity saturation can be emitted (R14-D).
 
-    Called by :meth:`BackendDupeFilter.__init__
-    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.__init__>` once
-    it has resolved its own monitor. Idempotent; safe to call before or after
-    the first eviction. No-op effect on a NullMonitor (the no-op default) —
-    the eviction warning log is independent of this hook.
+    A containing :class:`BackendDupeFilter
+    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter>` installs a
+    ``NullMonitor`` because it dispatches the equivalent recorded event after
+    releasing its own lock. Standalone callers may provide a real monitor.
+    Idempotent; safe before or after the first capacity event. The eviction
+    warning log is independent of this hook.
 
     Args:
         monitor: The monitor to emit ``on_filter_saturation`` through.
     """
     self._monitor = monitor
+
+  def _emit_saturation(self, used: int, capacity: int) -> None:
+    """Publish saturation without letting telemetry reject an insertion."""
+    if self._monitor is None:
+      return
+    try:
+      self._monitor.on_filter_saturation(used, capacity)
+    except Exception:  # noqa: BLE001 - telemetry must not alter filter state
+      try:
+        logger.debug(
+          "Memory filter saturation monitor hook raised; ignored",
+          exc_info=True,
+        )
+      except Exception:  # noqa: BLE001 - diagnostics are best effort too
+        return
+
+  @property
+  def saturation(self) -> float | None:
+    """Return the finite-cap signal only once the filter is full."""
+    if self._maxsize is None or len(self._data) < self._maxsize:
+      return None
+    return 1.0
+
+  @property
+  def capacity(self) -> int | None:
+    """Return the configured finite item cap, or ``None`` when unbounded."""
+    return self._maxsize
 
   def _warn_evicted_once(self) -> None:
     """Emit a one-time per-process warning when LRU eviction first fires.
@@ -139,19 +167,17 @@ class MemoryMembershipFilter(MembershipFilter):
       self._data.popitem(last=False)  # evict least-recently-used
       self._warn_evicted_once()
     self._data[item] = None
-    # R14-D: emit ``on_filter_saturation`` when the filter is at cap (after
-    # the eviction + insert, len == maxsize). This is the saturation ceiling
-    # the operator cares about — "the filter is full and evicting". Emitted
-    # unconditionally when a maxsize is set AND the filter is at cap, so a
-    # sustained eviction storm keeps the gauge pinned at 1.0 (matching the
-    # cuckoo/bloom ``used/capacity`` contract). No-op when no monitor was
-    # threaded (standalone filter use).
+    # R14-D: emit after a successful insert first reaches or remains at cap,
+    # with or without an eviction (len == maxsize). This is the saturation
+    # ceiling the operator cares about. Sustained eviction keeps the gauge
+    # pinned at 1.0 (matching the cuckoo/bloom ``used/capacity`` contract).
+    # No-op when no monitor was threaded (standalone filter use).
     if (
       self._monitor is not None
       and self._maxsize is not None
       and len(self._data) >= self._maxsize
     ):
-      self._monitor.on_filter_saturation(len(self._data), self._maxsize)
+      self._emit_saturation(len(self._data), self._maxsize)
     return True
 
   def __contains__(self, item: bytes) -> bool:

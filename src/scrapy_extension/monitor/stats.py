@@ -93,8 +93,8 @@ class ScrapyStatsMonitor(Monitor):
     (U2 operability). Rises through 0.9 before ``dupefilter/filter_full``
     ever fires; leading indicator for raising filter capacity. ``0.0`` when
     the filter is unbounded or reports no capacity. Emitted by cuckoo and
-    bloom filters (via :meth:`BackendDupeFilter.request_seen`) and by the
-    memory filter at LRU-eviction time.
+    bloom filters (via :meth:`BackendDupeFilter.request_seen`) and by a bounded
+    memory filter when it first reaches its cap and during later evictions.
   - ``backend/connect_count`` (counter) — per successful backend connect
     (R14-D connection-lifecycle). Wired from ``ConnectionManager.connect``.
   - ``backend/disconnect_count`` (counter) — per backend disconnect
@@ -233,9 +233,10 @@ class ScrapyStatsMonitor(Monitor):
     Saturation is ``used / capacity`` clamped to ``[0.0, 1.0]``. An unbounded
     filter (``capacity is None``) reports ``0.0`` — it cannot be saturated, so
     the gauge stays at the floor and operators are not misled by a stale
-    nonzero reading. The dupefilter emits this after each add when the
-    underlying filter exposes a ``saturation`` property (cuckoo only); other
-    filters never emit, leaving the gauge at ``None`` (untouched).
+    nonzero reading. Cuckoo and Bloom filters report after each deduplication
+    decision. Bounded Memory filters report only when a successful insert
+    reaches or remains at the capacity ceiling (including eviction); duplicate
+    hits stay silent. Unsupported filters leave the gauge untouched.
 
     Args:
         used: Items currently recorded in the filter.

@@ -6,15 +6,19 @@ This module provides a Scrapy dupefilter component using backend set interfaces.
 from __future__ import annotations
 
 import logging
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from threading import Lock, RLock
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from weakref import WeakSet
 
 from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
-from scrapy_extension.dupefilter.filters.memory_filter import DEFAULT_MEMORY_MAXSIZE
+from scrapy_extension.dupefilter.filters.memory_filter import (
+  DEFAULT_MEMORY_MAXSIZE,
+  MemoryMembershipFilter,
+)
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions.base import BackendConnectionError, ConfigurationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
@@ -70,6 +74,20 @@ _backend_error_warned: bool = False
 # allowance per fingerprint instead. 1,024 limits failure-path memory while
 # covering a useful transient queue-outage window; overflow evicts FIFO.
 _DEFAULT_RETRY_ALLOWANCE_LIMIT = 1_024
+
+# A slow or stuck custom monitor must not turn the non-waiting telemetry FIFO
+# into an unbounded memory sink. Overflow drops whole decision batches (never a
+# partial hit/miss + saturation pair); deduplication state remains authoritative.
+_DEFAULT_MONITOR_EVENT_LIMIT = 1_024
+
+_MonitorHook = Literal[
+  "on_dedup_hit",
+  "on_dedup_miss",
+  "on_error",
+  "on_filter_full",
+  "on_filter_saturation",
+]
+_MonitorEvent = tuple[_MonitorHook, tuple[object, ...]]
 
 
 class BackendDupeFilter:
@@ -162,22 +180,77 @@ class BackendDupeFilter:
     self._manager_released = False
     self._owns_connection_manager = owns_connection_manager
     self._lifecycle_lock = RLock()
+    # Decisions enqueue complete telemetry batches under the lifecycle lock.
+    # One elected caller drains this shared FIFO outside the lock; peers never
+    # wait for that drainer. This preserves decision order and the monitor's
+    # historical single-caller contract without making a re-entrant callback
+    # deadlock on another request_seen call.
+    self._monitor_events: deque[_MonitorEvent] = deque()
+    self._monitor_drain_token: object | None = None
+    self._monitor_event_limit = _DEFAULT_MONITOR_EVENT_LIMIT
+    self._monitor_overflow_warned = False
     self._opened = False
     self._opened_spider: Spider | None = None
     self._closed = False
-    # R14-D: thread the monitor into MemoryMembershipFilter so its LRU
-    # eviction can emit ``on_filter_saturation`` (was log-warning only).
-    # ``set_monitor`` exists only on the memory filter; guard via hasattr so
-    # set/bloom/cuckoo filters are unaffected. The dupefilter owns the
-    # monitor, so the filter emits through the same channel as cuckoo
-    # saturation (which the dupefilter emits directly via getattr).
+    # A MemoryMembershipFilter can emit saturation from inside ``add``. Keep
+    # that internal callback on a NullMonitor while the filter is owned here;
+    # request_seen records the same event and dispatches it only after releasing
+    # the lifecycle lock, alongside Bloom/Cuckoo saturation.
     self._set_filter_monitor()
 
   def _set_filter_monitor(self) -> None:
-    """Thread the currently resolved monitor into filters that support it."""
-    set_monitor = getattr(self._filter, "set_monitor", None)
-    if callable(set_monitor):
-      set_monitor(self._monitor)
+    """Prevent built-in filter callbacks from escaping the lifecycle lock."""
+    if isinstance(self._filter, MemoryMembershipFilter):
+      self._filter.set_monitor(NullMonitor())
+
+  def _emit_monitor(self, event: _MonitorEvent) -> None:
+    """Dispatch one recorded hook outside locks and isolate ordinary errors."""
+    hook_name, args = event
+    try:
+      hook: Callable[..., None] = getattr(self._monitor, hook_name)
+      hook(*args)
+    except Exception:  # noqa: BLE001 - telemetry must not alter dedup state
+      try:
+        logger.debug("Dupefilter monitor hook raised; ignored", exc_info=True)
+      except Exception:  # noqa: BLE001 - diagnostics are best effort too
+        return
+
+  def _release_monitor_drainer(self, token: object) -> None:
+    """Release an election only if ``token`` still owns it."""
+    with self._lifecycle_lock:
+      if self._monitor_drain_token is token:
+        self._monitor_drain_token = None
+
+  def _drain_monitor_events(self, token: object) -> None:
+    """Drain the decision-ordered FIFO as its sole, non-waiting consumer."""
+    try:
+      while True:
+        with self._lifecycle_lock:
+          if self._monitor_drain_token is not token:
+            return
+          if not self._monitor_events:
+            self._monitor_drain_token = None
+            return
+          event = self._monitor_events.popleft()
+        self._emit_monitor(event)
+    except BaseException:
+      # Process-control exceptions deliberately escape. Release the complete
+      # owner lifecycle, including failures between dequeue operations. The
+      # token check cannot clear a replacement owner that won a later election.
+      self._release_monitor_drainer(token)
+      raise
+
+  def _warn_monitor_overflow(self) -> None:
+    """Log the bounded best-effort drop once without changing a decision."""
+    try:
+      logger.warning(
+        "Duplicate-filter monitor backlog would exceed the %s-event limit; "
+        "dropping complete telemetry batches until the active drainer catches "
+        "up. Duplicate-filter decisions are unaffected.",
+        self._monitor_event_limit,
+      )
+    except Exception:  # noqa: BLE001 - diagnostics cannot reject a decision
+      return
 
   @classmethod
   def from_settings(cls, settings: Settings) -> BackendDupeFilter:
@@ -506,13 +579,47 @@ class BackendDupeFilter:
       )
 
   def request_seen(self, request: Request) -> bool:
-    """Check whether a request was seen while the filter is active."""
-    with self._lifecycle_lock:
-      if self._closed:
-        raise RuntimeError("dupefilter is closed")
-      return self._request_seen_unlocked(request)
+    """Check a request and enqueue decision-ordered, lock-free telemetry."""
+    monitor_events: list[_MonitorEvent] = []
+    drain_token: object | None = None
+    should_warn_overflow = False
+    try:
+      with self._lifecycle_lock:
+        if self._closed:
+          raise RuntimeError("dupefilter is closed")
+        seen = self._request_seen_unlocked(request, monitor_events)
+        if (
+          len(self._monitor_events) + len(monitor_events)
+          <= self._monitor_event_limit
+        ):
+          self._monitor_events.extend(monitor_events)
+        elif not self._monitor_overflow_warned:
+          self._monitor_overflow_warned = True
+          should_warn_overflow = True
+        if (
+          self._monitor_events
+          and self._monitor_drain_token is None
+        ):
+          drain_token = object()
+          self._monitor_drain_token = drain_token
+      if should_warn_overflow:
+        self._warn_monitor_overflow()
+      if drain_token is not None:
+        self._drain_monitor_events(drain_token)
+      return seen
+    except BaseException:
+      # Cover the gap between election and entering the drain loop (including
+      # the one-time overflow diagnostic). A stale token cannot clear a newer
+      # owner if an asynchronous exception races the normal empty-queue release.
+      if drain_token is not None:
+        self._release_monitor_drainer(drain_token)
+      raise
 
-  def _request_seen_unlocked(self, request: Request) -> bool:
+  def _request_seen_unlocked(
+    self,
+    request: Request,
+    monitor_events: list[_MonitorEvent],
+  ) -> bool:
     """Check if a request has been seen before.
 
     Args:
@@ -532,7 +639,7 @@ class BackendDupeFilter:
     # makes every other caller a duplicate before and after that one retry.
     if self._consume_retry_allowance(encoded_fingerprint):
       self._pending_reservations.add(request)
-      self._monitor.on_dedup_miss(fingerprint)
+      monitor_events.append(("on_dedup_miss", (fingerprint,)))
       return False
 
     try:
@@ -561,7 +668,7 @@ class BackendDupeFilter:
       # full). ``FilterFull`` is caught by TYPE (not by string-matching the
       # message), so the cuckoo layer is free to reword its message without
       # silently disabling this guard.
-      self._handle_filter_full(fingerprint)
+      self._handle_filter_full(fingerprint, monitor_events)
       return False
     except (BackendConnectionError, CircuitBreakerOpenError) as exc:
       # Transient-backend-error graceful degradation (Risk 4).
@@ -578,30 +685,40 @@ class BackendDupeFilter:
       # strictly better than crawl death. Distinct from the NotImplementedError
       # arm (unsupported backend, still raises RuntimeError) and the FilterFull
       # arm (filter at capacity).
-      self._handle_backend_error(fingerprint, exc)
+      self._handle_backend_error(fingerprint, exc, monitor_events)
       return False
 
     # add() returns True when the item was newly added; a duplicate maps to False.
     if added:
       self._pending_reservations.add(request)
     seen = not added
+    # Memory historically emitted its at-cap signal inside ``add`` before the
+    # outer miss hook, and skipped it for the duplicate early-return. Preserve
+    # that cadence and ordering while deferring the callback outside the lock.
+    is_memory_filter = isinstance(self._filter, MemoryMembershipFilter)
+    saturation_event: _MonitorEvent | None = None
+    if not is_memory_filter or added:
+      sat = getattr(self._filter, "saturation", None)
+      if sat is not None:
+        cap = getattr(self._filter, "capacity", None)
+        saturation_event = (
+          "on_filter_saturation",
+          (len(self._filter), cap),
+        )
+    if is_memory_filter and saturation_event is not None:
+      monitor_events.append(saturation_event)
     if seen:
-      self._monitor.on_dedup_hit(fingerprint)
+      monitor_events.append(("on_dedup_hit", (fingerprint,)))
     else:
-      self._monitor.on_dedup_miss(fingerprint)
-    # U2 operability: if the filter exposes saturation (cuckoo + bloom as of
-    # R14-D), emit the leading fill-ratio signal after each add. Cheap (one
-    # property read + one monitor hook), and lets operators see the filter
-    # APPROACHING full (e.g. >0.9) before the FilterFull overflow path fires.
-    # Set/memory filters don't expose ``saturation`` here — memory instead
-    # emits ``on_filter_saturation`` directly at LRU-eviction time (R14-D),
-    # threaded via its own monitor ref. Filters with no ``saturation``
-    # property stay silent on this path; their gauge stays at ``None``
-    # (untouched), not misleadingly at 0.0.
-    sat = getattr(self._filter, "saturation", None)
-    if sat is not None:
-      cap = getattr(self._filter, "capacity", None)
-      self._monitor.on_filter_saturation(len(self._filter), cap)
+      monitor_events.append(("on_dedup_miss", (fingerprint,)))
+    # U2 operability: if the filter exposes saturation (Cuckoo, Bloom, and a
+    # bounded Memory filter at cap), emit the leading fill-ratio signal. This
+    # costs one property read plus one queued event and lets operators see the
+    # filter approaching full (e.g. >0.9) before FilterFull ever fires.
+    # Set filters do not expose ``saturation`` and stay silent. The Memory
+    # case was queued above to preserve its insertion-only event order.
+    if not is_memory_filter and saturation_event is not None:
+      monitor_events.append(saturation_event)
     return seen
 
   def consume_reservation(self, request: Request) -> bool:
@@ -685,7 +802,11 @@ class BackendDupeFilter:
       self._retry_allowances.clear()
     self._pending_reservations.clear()
 
-  def _handle_filter_full(self, fingerprint: str) -> None:
+  def _handle_filter_full(
+    self,
+    fingerprint: str,
+    monitor_events: list[_MonitorEvent],
+  ) -> None:
     """Degrade gracefully when the membership filter reports it is full.
 
     Warn once per process (module-level ``_filter_full_warned``), emit
@@ -710,12 +831,17 @@ class BackendDupeFilter:
     # Count the degradation via the monitor contract — ScrapyStatsMonitor
     # increments ``dupefilter/filter_full``; NullMonitor is a no-op. Replaces
     # an earlier reach into ``self._monitor._stats`` (private attribute).
-    self._monitor.on_filter_full()
+    monitor_events.append(("on_filter_full", ()))
     # Keep the monitor's dedup-miss accounting consistent with the not-seen
     # outcome the caller returns for the overflow item.
-    self._monitor.on_dedup_miss(fingerprint)
+    monitor_events.append(("on_dedup_miss", (fingerprint,)))
 
-  def _handle_backend_error(self, fingerprint: str, exc: BaseException) -> None:
+  def _handle_backend_error(
+    self,
+    fingerprint: str,
+    exc: BaseException,
+    monitor_events: list[_MonitorEvent],
+  ) -> None:
     """Degrade gracefully when the membership-filter backend is transiently down.
 
     Risk 4: a transient :class:`BackendConnectionError` or fail-fast
@@ -742,8 +868,8 @@ class BackendDupeFilter:
         "transient backend errors are counted via the errors/dedup stat only.",
         type(exc).__name__,
       )
-    self._monitor.on_error("dedup", exc)
-    self._monitor.on_dedup_miss(fingerprint)
+    monitor_events.append(("on_error", ("dedup", exc)))
+    monitor_events.append(("on_dedup_miss", (fingerprint,)))
 
   def request_fingerprint(self, request: Request) -> str:
     """Generate a fingerprint for a request.

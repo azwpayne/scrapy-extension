@@ -6,6 +6,11 @@ for operability (push, pop, dedup hit/miss, queue depth, store, error). A
 :class:`NullMonitor` is the safe default so components emit telemetry without
 crashing when no crawler / stats collector is wired.
 
+Component call sites isolate ordinary custom-monitor exceptions as well:
+telemetry is best effort and must never change an already-committed queue,
+storage, or duplicate-filter result. ``ScrapyStatsMonitor`` additionally
+isolates failures inside its wrapped stats collector.
+
 This mirrors the strategy-ABC + factory pattern already used for
 :class:`~scrapy_extension.dupefilter.filters.base.MembershipFilter` and
 :class:`~scrapy_extension.queue.strategies.base.QueueStrategy` — a pluggable
@@ -48,6 +53,16 @@ class Monitor:
   implementation of every hook is a no-op, so a bare ``Monitor()``
   (or :class:`NullMonitor`) is always safe to call from any component.
 
+  Duplicate-filter hooks are best-effort and serialized through one
+  decision-ordered FIFO outside the duplicate-filter lifecycle lock. A peer
+  ``request_seen`` call never waits for the elected drainer, so its hook may
+  finish after that call (or a concurrent ``close``) returns; ``close`` does
+  not provide a telemetry-flush barrier. The backlog is bounded and drops
+  complete event batches when full. A callback may call ``request_seen``
+  re-entrantly, but must not wait for that nested call's later telemetry.
+  A process-control exception from a deferred peer event necessarily surfaces
+  on the elected drainer's caller rather than on the peer that already returned.
+
   Why a concrete base class (not ``typing.Protocol``):
 
   - ``Protocol`` with ``runtime_checkable`` would let us duck-type, but
@@ -74,11 +89,12 @@ class Monitor:
     Emitted by ``BackendQueue.pop`` on a sampling cadence (NOT every pop);
     ``rate`` is pops per second over the trailing ``window_s`` window.
   - ``on_filter_saturation(used, capacity)`` — membership-filter fill ratio
-    (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` when the
-    underlying filter exposes a ``saturation`` property (cuckoo + bloom), and
-    by ``MemoryMembershipFilter`` directly at LRU-eviction time. Lets operators
-    see a filter APPROACHING full (e.g. >0.9) before the ``on_filter_full``
-    overflow signal fires.
+    (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` after the
+    deduplication decision when the underlying filter exposes saturation.
+    Cuckoo and Bloom filters report continuously; bounded Memory filters report
+    only after a successful insert reaches the capacity ceiling and during
+    later insert-and-evict cycles. Lets operators see a filter APPROACHING full
+    (e.g. >0.9) before the ``on_filter_full`` overflow signal fires.
   - ``on_error(operation, error)`` — an operation raised; record per-op.
     Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
     arms so serialization failures surface as ``errors/push`` /
@@ -184,12 +200,12 @@ class Monitor:
 
     Emitted by :meth:`BackendDupeFilter.request_seen
     <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
-    after each add when the underlying filter exposes a ``saturation``
-    property (currently only the cuckoo filter — set/memory/bloom do not
-    surface capacity and stay silent). This is the APPROACHING-full signal:
+    when the underlying filter exposes a ``saturation`` property (Cuckoo and
+    Bloom after every decision; bounded Memory only after successful inserts
+    at its cap). Set filters stay silent. This is the APPROACHING-full signal:
     it rises through 0.9 before :meth:`on_filter_full` ever fires, giving
-    operators a leading indicator to raise ``SCRAPY_DEDUP_CUCKOO_CAPACITY``
-    before the filter overflows and degrades to passthrough.
+    operators a leading indicator to raise the configured probabilistic-filter
+    capacity before the filter overflows and degrades to passthrough.
 
     Args:
         used: Number of items currently recorded in the filter.

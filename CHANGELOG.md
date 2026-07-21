@@ -501,6 +501,15 @@ upgrading.
 
 ### Fixed
 
+- Duplicate-filter telemetry hooks can no longer interrupt scheduling after a
+  fingerprint or retry reservation has already been recorded. Custom monitor
+  events are recorded with the dedup decision and serialized through a shared
+  FIFO after the lifecycle lock is released, preserving decision order without
+  making peer requests wait for a callback. The FIFO is bounded and drops
+  complete telemetry batches under a stuck observer instead of growing without
+  limit. Ordinary monitor failures are isolated across hit, miss, saturation,
+  capacity, and backend-outage paths, including hook lookup. The memory filter
+  retains its insertion-only, saturation-before-miss cadence.
 - The core Scrapy TLS identity dependency now requires `pyasn1>=0.6.4,<0.7`,
   excluding the long-form tag, OBJECT IDENTIFIER, and REAL decoder
   resource-exhaustion flaws reported against 0.6.3. The locked graph upgrades

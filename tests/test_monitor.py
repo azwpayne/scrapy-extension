@@ -546,7 +546,7 @@ class TestPopRateEmission:
 
 
 class TestFilterSaturationEmission:
-  """BackendDupeFilter emits on_filter_saturation for cuckoo filters (U2)."""
+  """BackendDupeFilter emits supported filter saturation telemetry (U2)."""
 
   def test_cuckoo_saturation_property_rises_with_load(self):
     """CuckooMembershipFilter.saturation = len / capacity, in [0, ~1]."""
@@ -585,7 +585,7 @@ class TestFilterSaturationEmission:
   def test_request_seen_silent_when_filter_has_no_saturation(
     self, mock_connection_manager
   ):
-    """Non-cuckoo filters (set/memory/bloom) do not emit on_filter_saturation.
+    """A set filter without saturation does not emit the saturation hook.
 
     The gauge stays at ``None`` (untouched), not misleadingly at 0.0 —
     a set filter cannot be saturated, so operators don't get a noisy
@@ -642,7 +642,7 @@ class TestFilterSaturationEmission:
 
 
 class TestR14DObservability:
-  """R14-D: on_error wiring, Bloom saturation, Memory eviction saturation,
+  """R14-D: on_error wiring, Bloom saturation, Memory cap saturation,
   connection-lifecycle hooks, on_pop stat rename.
 
   These tests pin the gaps the round-14 observability audit surfaced:
@@ -721,15 +721,15 @@ class TestR14DObservability:
     assert sat is not None
     assert sat > 0.0
 
-  def test_memory_filter_eviction_emits_saturation(
+  def test_memory_filter_at_cap_emits_saturation(
     self, mock_connection_manager
   ):
-    """MemoryMembershipFilter LRU eviction emits on_filter_saturation (R14-D).
+    """A bounded MemoryMembershipFilter emits saturation at its cap (R14-D).
 
-    Builds a tiny-cap memory filter, threads the dupefilter's monitor into
-    it (the dupefilter does this in __init__), and drives it past cap. The
-    eviction must fire ``on_filter_saturation(len, maxsize)`` → the gauge is
-    set. Before R14-D eviction was log-warning only.
+    Builds a tiny-cap memory filter whose containing dupefilter records the
+    saturation event for post-lock dispatch, then drives it to and past cap.
+    Reaching the cap must set the gauge; subsequent eviction keeps it at 1.0.
+    Before R14-D eviction was log-warning only.
     """
     from scrapy_extension.dupefilter.filters.memory_filter import (
       MemoryMembershipFilter,

@@ -159,6 +159,24 @@ speculative work.
 - [x] **RUN-10 — monitor callback lock isolation.** Dispatch connect, retry, and
   disconnect monitor hooks outside manager locks so a re-entrant observer
   cannot self-deadlock or publish a competing connection transaction.
+- [x] **RUN-12 — duplicate-filter telemetry isolation.** Treat custom monitor
+  callbacks as best-effort observations across normal, saturation, capacity,
+  retry-allowance, and degraded-backend paths. Record events with the decision,
+  release the lifecycle lock, then dispatch so a callback failure or re-entry
+  cannot strand a fingerprint or deadlock duplicate-filter lifecycle work.
+- [ ] **RUN-13 — queue/pipeline telemetry re-entry.** Move queue and pipeline
+  callbacks outside their operation/lifecycle gates so `on_push`/`on_store`
+  observers cannot deadlock by synchronously waiting for close.
+- [ ] **RUN-14 — spider queue identity.** Reject a second explicit logical queue
+  name when a spider mixin already owns a differently bound queue, rather than
+  silently returning the first queue and routing data to the wrong resource.
+- [ ] **RUN-15 — stateful registry callables.** Fail closed for closures, bound
+  methods, partials, and callable objects that cannot have a stable explicit
+  settings identity; type/name-only digests must not merge tenant credentials.
+- [ ] **STORAGE-01 — batched backend ownership.** Carry each buffered storage
+  entry's backend through threshold, age, close, and partial-failure flushes so
+  sharing a batch strategy cannot write an earlier entry to the later caller's
+  backend.
 - [x] **RUN-11 — circuit-breaker outcome epochs.** Attach an epoch to admitted
   calls so a failure from an older CLOSED generation cannot reopen a breaker
   that has since completed an OPEN → HALF_OPEN → CLOSED recovery.
@@ -268,12 +286,18 @@ speculative work.
 - [x] **BACKEND-07B — confirmed MongoDB mutations.** Reject unacknowledged write
   concerns so queue/set/storage success cannot mean only a local socket-buffer
   handoff.
+- [ ] **BACKEND-07C — primary MongoDB reads.** Require primary reads for queue,
+  set, and storage contracts so lagging replicas cannot report false emptiness
+  or violate read-your-confirmed-write behavior.
 - [x] **BACKEND-08A — conservative Kafka consumer-group lag.** Base depth on
   committed offsets, apply the configured reset policy for fresh groups, and
   serialize metadata calls with poll/settlement on the non-thread-safe client.
 - [ ] **BACKEND-08B — broker-safe logical queue names.** Map supported logical
   names such as `q:{spider}` and overlong values to stable Kafka/RocketMQ
   physical resources while preserving already-valid legacy names.
+- [ ] **BACKEND-08C — RocketMQ topic-bound consumption.** Bind one consumer
+  generation to one physical topic and fail before subscription when a second
+  logical queue would otherwise make `pop(A)` round-robin into topic B.
 - [x] **CONCURRENCY-01A — RocketMQ token terminality.** Serialize settlement on
   each delivery token so concurrent ack/nack can issue only one successful
   broker action, keep token-aware pops out of the legacy settlement slot, and
@@ -311,6 +335,10 @@ speculative work.
   Scrapy/service-identity dependency chain, and retain the separately
   documented no-fix Scrapy advisory rather than conflating it with
   fix-available findings.
+- [ ] **REL-01 — verify before immutable publication.** Build into an isolated
+  empty output directory, inspect and fresh-install the exact wheel/sdist, run
+  release gates, then create the protected tag and publish only those verified
+  artifact paths with trusted provenance.
 - [ ] **CONCURRENCY-01F — Kafka client generations.** Publish producer, admin,
   consumer, validated settings, and topic-policy caches as one generation;
   failed candidates must not clear a healthy generation.
@@ -1637,3 +1665,50 @@ that wheel with pyasn1 0.6.4 and imported the package successfully. Python
 Ruff, strict mypy, configured Bandit, lockfile validation, and patch integrity
 remained green. The next release-procedure and backend findings stay outside
 this dependency-only atomic iteration.
+
+### I44 — duplicate-filter telemetry isolation
+
+The fresh post-I43 core audit found that every duplicate-filter telemetry hook
+was invoked directly and inside the duplicate-filter lifecycle lock. A new
+fingerprint, retained Bloom marker with a one-shot retry allowance, or bounded
+memory insertion could commit state and then raise from a custom monitor before
+the scheduler reached queue publication. The next attempt could therefore see
+a duplicate that had never been queued. Filter-full and backend-outage paths do
+not retain fingerprints, but a monitor failure still defeated their deliberate
+allow-through result. A callback that waited for another thread to acquire the
+lifecycle lock could also self-deadlock.
+
+The specification records complete monitor-event batches while each dedup
+decision is linearized, then places them in one decision-ordered FIFO. One
+elected caller drains that FIFO outside the lifecycle lock; peer requests never
+wait for the active observer, and callbacks remain serialized without a simple
+dispatch lock's cross-thread re-entry deadlock. The FIFO is capped at 1,024
+events and drops a whole new batch when full, so a stuck custom monitor cannot
+create an unbounded telemetry sink. Each election has an identity token, and a
+token-aware outer guard releases ownership even if a process-control exception
+lands between election, warning, dequeue, and hook dispatch; stale cleanup
+cannot clear a replacement owner. Hook lookup itself is inside the exception
+boundary. Bounded Memory exposes saturation only for successful insertions at
+the existing cap/evict cadence and retains its saturation-before-miss order;
+while owned by a dupefilter its internal callback is a `NullMonitor`. Capacity
+lookup remains lazy when a pluggable filter reports no saturation. Only
+ordinary `Exception` subclasses are isolated; process-control exceptions
+remain observable. Filter/backend business evaluation stays outside the catch.
+
+Nine initial RED cases covered new/duplicate fingerprints, a retry allowance,
+both callbacks in the filter-full and backend-outage paths, and both saturation
+sources. The first implementation review added deterministic hook-attribute
+and cross-thread lock-entry REDs plus real Bloom-forget, Memory-eviction, and
+`BaseException` controls. Final independent review then reproduced completion-
+order inversion and concurrent observer entry, duplicate Memory saturation and
+event-order drift, and an eager custom-filter capacity failure after commit. It
+also added a bounded-backlog regression and a standalone Memory monitor-failure
+control. A final diagnostic-path check proved that even the debug log for a
+swallowed hook failure could itself raise; both outer and standalone Memory
+paths now isolate that secondary ordinary failure too. The dedicated safety
+file contains 22 cases; the focused suite passed 177 tests. Python 3.10 and
+3.14 full suites each passed 3,564 tests with 46 documented skips. Ruff, strict
+mypy, configured Bandit, lockfile validation, dependency audit, two-worker
+execution, and patch integrity remained green. Independently confirmed
+lifecycle, routing, backend, and release findings remain separate atomic
+iterations in the task register.
