@@ -21,7 +21,7 @@ required.
 
 | Strategy | When to use | Setting knobs |
 |---|---|---|
-| `set` (default) | Multi-worker exact dedup; cross-worker safe. | — |
+| `set` (default) | Exact cross-worker stored membership; crash-safe at-least-once enqueue. | — |
 | `memory` | Single-worker, in-process, optional LRU cap. | `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000) |
 | `bloom` | Single-worker, large cardinality, tolerates false positives. Never false-negatives. | `SCRAPY_DEDUP_BLOOM_CAPACITY`, `SCRAPY_DEDUP_BLOOM_ERROR_RATE` |
 | `cuckoo` | Single-worker, large cardinality, needs deletion. Never false-negatives. | `SCRAPY_DEDUP_CUCKOO_CAPACITY`, `SCRAPY_DEDUP_CUCKOO_ERROR_RATE` |
@@ -34,7 +34,10 @@ SCRAPY_DEDUP_CUCKOO_ERROR_RATE = 0.001
 ```
 
 **Caveat (see [Guarantees](../README.md#guarantees)):** `memory`, `bloom`,
-and `cuckoo` are per-process. For multi-worker exact dedup, use `set`.
+and `cuckoo` are per-process. For exact cross-worker stored membership, use
+`set`. The bundled scheduler deliberately uses membership read → durable queue
+push → marker publication; two workers racing on a fresh fingerprint may both
+enqueue, but a failed/crashed push cannot strand a marker with no queue copy.
 
 When Cuckoo hits capacity it raises `FilterFull`, which `BackendDupeFilter`
 catches, warn-once's, and degrades to passthrough for that fingerprint; the
@@ -64,12 +67,30 @@ SCRAPY_QUEUE_DELAY_DEFAULT = 2.0  # seconds
 
 **Caveat:** every non-`passthrough` queue strategy keeps at least some state in-process. Only `passthrough` is distributed-exact. Treat delay heaps, timing wheels, rate limiters, work-stealing cursors, and ring buffers as performance/fairness tools rather than durable scheduling logs.
 
+When a strategy accepts only into process-local state, the bundled duplicate
+filter records a lifecycle-local shadow instead of a persistent marker. The
+shadow is capped at 65,536 fingerprints; oldest-first eviction can increase
+safe replay but cannot hide lost work after a crash. A replacement that still
+owns a broker ACK token is rejected before volatile strategy mutation.
+
+A custom `QueueStrategy` is volatile by default. It must override
+`is_push_durable(*, delay, source)` and return the literal `True` only after all
+successful pushes for that route cross a crash-durable backend boundary. Older
+duck-typed strategies without the hook remain usable for ordinary requests but
+receive the local-shadow behavior; source-token transfers fail closed before
+their `push` method runs.
+
 `priority` and `work_stealing` create multiple physical queues. Their factories
 raise `ConfigurationError` with Kafka and RocketMQ because those backends use a
 single consumer that cannot isolate a pop to the requested strategy topic.
 `round_robin` and `ring_buffer` are fully local: pairing them with an MQ backend
 intentionally bypasses broker durability. Other bundled backend-delegating
 strategies preserve per-message ack tokens.
+
+`ring_buffer` with `full_policy=drop_oldest` is intentionally lossy. The
+overwritten request remains suppressed by the lifecycle-local dedup shadow
+until the 65,536-entry shadow evicts it or the queue lifecycle ends. Choose
+`reject` or a durable strategy if eviction must leave the request retryable.
 
 ### Snapshot ownership
 
@@ -570,6 +591,8 @@ from the existing monitor stats:
 | `scheduler/queue/empty_payload_dropped` | A broker record with a real ack token but no request payload (for example a Kafka tombstone) was terminally consumed. |
 | `scheduler/queue/replacement_poison_dropped` | A retry/redirect replacement was locally invalid, so its original broker delivery was terminally consumed. |
 | `scheduler/queue/volatile_replacement_rejected` | A replacement still owned an unacked broker source but its selected strategy would retain it only in process. The push was rejected before local mutation; use a backend-durable strategy/path. |
+| `scheduler/dupefilter_volatile_marker` | A volatile queue push was accepted and received a lifecycle-local dedup shadow instead of a persistent marker. |
+| `scheduler/dupefilter_volatile_unmarked` | A third-party atomic dupefilter lacked the optional volatile-shadow extension; the accepted local item remains deliberately unmarked and may replay. |
 
 Differential diagnosis:
 
@@ -589,8 +612,9 @@ Differential diagnosis:
   may keep delivery moving, but duplicates rise —
   check broker connectivity/permissions and watch `dupefilter/filtered` for the
   redelivery side-effect. If the failure follows a committed retry/redirect
-  replacement, that replacement remains accepted and dedup-reserved; the source
-  token stays unresolved so broker redelivery can reach the duplicate-ack path.
+  replacement, that replacement remains accepted and dedup-recorded; the source
+  token stays unresolved. Broker redelivery receives another durable queue
+  handoff before its own ACK, which may replay work but cannot lose the source.
 
 ## Poison payload handling
 

@@ -512,18 +512,42 @@ upgrading.
 
 ### Fixed
 
+- `BackendScheduler` now performs a read-only duplicate check, publishes the
+  request to a crash-durable queue boundary, and only then records the
+  persistent fingerprint. Failed or interrupted pushes discard local intent
+  without removing another worker's marker, eliminating ghost fingerprints for
+  work no queue accepted. Concurrent workers may enqueue the same absent
+  fingerprint (safe at-least-once replay); process-local queue strategies use a
+  bounded lifecycle-local dedup shadow instead of a persistent marker. Broker
+  redeliveries carrying source tokens receive another durable handoff before
+  ACK. `BackendQueue.push()` retains its stable `None` return, Scrapy's boolean
+  `request_seen()` contract is unchanged, and custom queue/dupefilter fallbacks
+  retain their public API and capability-selection shapes. The no-ghost
+  guarantee applies only to the bundled atomic pair (or an explicit compatible
+  atomic dupefilter); legacy boolean-only fallback keeps best-effort rollback.
+  Third-party `QueueStrategy` durability now fails closed: the base hook returns
+  `False`, older duck-typed strategies without the hook are also volatile, and
+  only a literal `True` opts a route into persistent marker publication and
+  broker-source transfer. Bundled backend-delegating strategies declare their
+  durable routes explicitly. Class-level `BackendQueue.push` monkeypatches are
+  honored by a definition-time identity fence. Reservation reprs omit request
+  and owner data, monitor fences use invocation identity instead of reusable
+  frame IDs, and failed custom-filter close keeps its manager alive for retry.
+  With lossy `ring_buffer` `drop_oldest`, the overwritten request remains in
+  the bounded local shadow until shadow eviction or lifecycle end.
 - Batched storage records now retain the exact caller-provided backend through
   threshold, manual, age, close, and partial-failure retry drains. Mixed callers
   can no longer redirect an earlier buffered item to the latest backend; global
   insertion order, TTL values, and existing public signatures remain unchanged.
   Calls that all supply the same backend capability retain their previous trace.
-- Duplicate-filter telemetry hooks can no longer interrupt scheduling after a
-  fingerprint or retry reservation has already been recorded. Custom monitor
-  events are recorded with the dedup decision and serialized through a shared
-  FIFO after the lifecycle lock is released, preserving decision order without
-  making peer requests wait for a callback. The FIFO is bounded and drops
-  complete telemetry batches under a stuck observer instead of growing without
-  limit. Ordinary monitor failures are isolated across hit, miss, saturation,
+- Ordinary duplicate-filter telemetry failures can no longer invalidate an
+  already-recorded fingerprint or retry reservation. Custom monitor events are
+  serialized through a shared FIFO after the lifecycle lock is released,
+  preserving event enqueue order without making peer requests wait for a
+  callback. Transactional misses now settle after queue success/failure and are
+  therefore outcome-ordered. The FIFO is bounded and drops complete telemetry
+  batches under a stuck observer instead of growing without limit. Ordinary
+  monitor failures are isolated across hit, miss, saturation,
   capacity, and backend-outage paths, including hook lookup. The memory filter
   retains its insertion-only, saturation-before-miss cadence.
 - The core Scrapy TLS identity dependency now requires `pyasn1>=0.6.4,<0.7`,

@@ -180,14 +180,15 @@ class QueueStrategy(ABC):
   def is_push_durable(self, *, delay: float, source: str) -> bool:
     """Whether a successful push crossed a crash-durable backend boundary.
 
-    Backend-delegating strategies inherit ``True``. Strategies that can retain
-    the item only in process must override this for the applicable routing
-    inputs. ``BackendQueue`` uses the answer solely for source-delivery
-    transfers: acknowledging an MQ source after a volatile local append would
-    lose both source and replacement on a hard crash.
+    The conservative extension default is ``False``: a strategy must opt in
+    explicitly after every successful route has crossed a crash-durable
+    boundary. ``BackendQueue`` uses the answer to reject volatile
+    source-delivery transfers and to let the bundled scheduler choose a
+    lifecycle-local rather than persistent dedup marker after ordinary
+    volatile pushes.
     """
     del delay, source
-    return True
+    return False
 
   @abstractmethod
   def push(

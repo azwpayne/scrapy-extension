@@ -24,6 +24,11 @@ class PassthroughQueueStrategy(QueueStrategy):
   the default and is fully backward-compatible. ``delay`` is ignored.
   """
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Report that every accepted item is stored by the queue backend."""
+    del delay, source
+    return True
+
   def push(
     self,
     queue_name: str,

@@ -105,6 +105,7 @@ global gates, then perform a fresh audit before selecting the next item.
 | I44 | Isolate duplicate-filter telemetry from durable decisions | observer failures cannot strand a committed fingerprint or deadlock lifecycle work |
 | I45 | Bind each batched-storage entry to its caller's backend capability | every drain preserves per-entry routing, order, TTL, and retry-tail ownership |
 | I46 | Isolate MongoDB queue/set/storage physical collections | local collisions fail before SDK I/O; majority-durable, shard-safe markers reject cross-instance reuse |
+| I47 | Publish dedup markers only after queue durability | a failed/crashed push cannot strand a marker; volatile queues use bounded lifecycle-local shadows |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -132,6 +133,11 @@ speculative work.
 - [x] **PLUGIN-01 — descriptor boundary.** Validate entry-point name,
   `backend_type`, dotted class paths, and duplicates. Logging a broken plugin
   must not become an exception under warnings-as-errors.
+- [ ] **PLUGIN-CONFIG-01 — preserve selected plugin settings.** Resolve the
+  selected third-party settings model before splitting manager and backend
+  configuration, so plugin fields named `retry_attempts` or `retry_delay` are
+  not silently stripped and reinterpreted as manager retry policy. Manager
+  aliases must remain explicit and built-in settings behavior unchanged.
 - [x] **RUN-01 — circuit-breaker boundary.** Treat breaker-open queue reads and
   dedup checks as expected temporary backend failures rather than scheduler
   crashes.
@@ -191,15 +197,35 @@ speculative work.
 - [ ] **RUN-19 — duplicate-filter introspection isolation.** Once add/seen and
   reservation state are decided, treat saturation/capacity/length diagnostics
   as best-effort telemetry that cannot change control flow or strand rollback.
+- [x] **RUN-20 — post-queue dedup publication.** The bundled scheduler performs
+  a read-only membership decision, pushes first, and publishes the persistent
+  marker only after a crash-durable queue boundary. Failed pushes discard only
+  local intent; volatile strategies receive a bounded lifecycle-local shadow.
+  Preserve Scrapy's boolean API and the stable `BackendQueue.push() -> None`
+  contract, and keep third-party scheduler/dupefilter fallbacks compatible.
+- [ ] **RUN-21 — injective recovery-snapshot identity.** Replace the ambiguous
+  colon-concatenated spider/queue key with a versioned injective encoding and a
+  one-time legacy migration, so distinct logical pairs cannot restore or delete
+  one another's local recovery snapshots.
+- [ ] **RUN-22 — scheduler statistics isolation.** Treat stats increments as
+  best-effort observations after committed queue and acknowledgement effects;
+  a custom collector failure must not report an accepted push as rejected or
+  discard a token that has already been popped.
 - [ ] **QUEUE-01 — process-control-safe time-wheel drain.** Restore the exact
   failing item and unattempted slot tail in order before propagating a
   `BaseException`; never requeue the successful prefix.
+- [ ] **QUEUE-02 — collision-free strategy resources.** Give priority and
+  work-stealing fan-out queues a versioned physical namespace derived from the
+  complete logical identity, with an explicit one-time legacy migration, so a
+  generated level such as `jobs:p0` cannot alias a caller's literal queue.
 - [ ] **ACK-PLUGIN-02 — truthful deferred-ack plugin capability.** Require a
   `requires_ack` backend to override pop-with-token, ack, and nack, and reject a
-  delivered item with no token at runtime.
+  delivered item with no token at runtime. Treat `(None, token)` as a real
+  delivery that must be settled rather than scanning past and losing ownership.
 - [ ] **OBS-01 — truthful queue-stall telemetry.** Count failed pop attempts and
   errors, expose attempt freshness, and stop promising that an event-driven
-  rate gauge decays without another event.
+  rate gauge decays without another event. Invalidate or decrement a cached
+  nonzero depth immediately after a successful pop.
 - [ ] **DOC-DEDUP-01 — bounded no-false-negative promise.** Limit the Cuckoo
   guarantee to fingerprints successfully inserted before full degradation and
   document that overflow requests can pass repeatedly.
@@ -231,7 +257,7 @@ speculative work.
 - [x] **RUN-04A — post-commit source acknowledgement.** Once a replacement is
   durably pushed, a source-token ack failure remains observable but cannot
   reject the push or roll back its dedup reservation; retain the unresolved
-  token and let broker redelivery reach the duplicate-ack path.
+  token so broker redelivery receives another durable handoff before ACK.
 - [x] **RUN-04B — errback replacement acknowledgement.** Transfer/defer the
   source token for requests and iterables returned by user errbacks until each
   replacement is durably accepted. Explicitly document the unavoidable
@@ -303,6 +329,16 @@ speculative work.
 - [ ] **SEC-03B2B3 — remaining validated connection snapshots.** Apply copied,
   revalidated connection snapshots and sanitized URL/URI failures to Kafka,
   MongoDB, and Elasticsearch.
+- [ ] **SEC-03C — atomic mutable-configuration snapshots.** Copy the selected
+  settings model's field mapping once before revalidation and SDK use, then
+  freeze nested endpoint collections, so concurrent field mutation cannot
+  construct a generation from values that were never jointly validated. Begin
+  with Memcached endpoint plus destructive-remote policy and carry the same
+  invariant through SQS, DynamoDB, RabbitMQ, Pulsar, and RocketMQ.
+- [ ] **CONN-SEC-01 — static connection-manager diagnostics.** Do not interpolate
+  arbitrary backend exception text or attach raw tracebacks to public manager
+  errors and ordinary logs; preserve the original exception as the cause while
+  emitting only static, non-secret-bearing context.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.
@@ -387,6 +423,15 @@ speculative work.
 - [x] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
   all SDK handles to a leased generation so clear and blocking-pop loops cannot
   cross reconnect or lazily resurrect themselves after disconnect.
+- [ ] **CONCURRENCY-01J — Pulsar client-generation barrier.** Fence queued
+  connect intents, publish one immutable client/producer/consumer generation,
+  lease every send/receive/settle operation, and make disconnect wait for the
+  retired generation so it cannot return before an older connect publishes or
+  route an old token through a replacement consumer.
+- [ ] **CONCURRENCY-01K — Memcached poisoned-socket retirement.** If any
+  published socket operation exits through `BaseException`, retire that exact
+  client before propagating so a protocol-desynchronized connection cannot be
+  reused; preserve unfinished teardown ownership when close is interrupted.
 - [x] **BACKEND-09A — Redis outcome-ambiguous retry policy.** Give standalone,
   Sentinel-master, and Cluster data clients an explicit no-replay SDK retry
   policy so a response timeout after a committed queue Lua script cannot push
@@ -402,11 +447,20 @@ speculative work.
   endpoints and sanitize direct settings-validation failures so an endpoint
   cannot retain or disclose embedded credentials. Unsupported settings must
   not remain accepted no-ops.
+- [ ] **BACKEND-09C — Redis orphan-pop progress.** Distinguish an empty queue,
+  an orphaned metadata entry, and a delivered value in the nonblocking Lua
+  result; immediately rescan after bounded orphan cleanup and raise `QueueError`
+  if the corruption budget is exhausted instead of returning a false empty.
 - [x] **DEP-01 — pyasn1 advisory refresh.** Move the transitive lock from
   pyasn1 0.6.3 to a fixed compatible release, verify the
   Scrapy/service-identity dependency chain, and retain the separately
   documented no-fix Scrapy advisory rather than conflating it with
   fix-available findings.
+- [ ] **DEP-02A — truthful Pydantic compatibility floor.** Keep registered
+  plugin backend strings from being swallowed by the `BackendType` enum branch
+  on the declared Pydantic 2.7.0 floor (for example, by ordering the string
+  union first), and prove both built-in normalization and third-party names on
+  the exact minimum dependency set.
 - [ ] **REL-01 — verify before immutable publication.** Build into an isolated
   empty output directory, inspect and fresh-install the exact wheel/sdist, run
   release gates, then create the protected tag and publish only those verified
@@ -428,7 +482,9 @@ speculative work.
   queue solely because optimistic-claim conflicts exhausted a small retry
   count. Give pushes stable identities, make claim/delete/set writes safe under
   ambiguous transport outcomes, reject partial search/count results, and make
-  clear cover unrefreshed writes.
+  clear cover unrefreshed writes. Structurally distinguish a missing document
+  from a missing index: index-level 404s during queue, set, or storage reads are
+  typed backend failures rather than ordinary absent values.
 - [x] **BACKEND-03A — DynamoDB consistency and clear scope.** Use consistent
   reads where the storage contract promises immediate visibility, including
   every paginated scan, and reserve whole-table clear for an explicit `None`;
@@ -480,6 +536,20 @@ correctness work:
   traceback on every scheduler heartbeat;
 - align examples, release runbook commands, plugin example semantics, and
   remaining historical-document links with current behaviour.
+- make the stable spider mixin accept Scrapy's positional `name`, annotate the
+  documented third-party backend string without breaking `get_type_hints`, and
+  reject a second owner attaching to one lifecycle-owning in-process queue
+  strategy while retaining supported shared backend-delegating strategies;
+- correct RocketMQ's millisecond-to-SDK-seconds timeout conversion, reject
+  nonpositive values, raise the nonexistent `pulsar-client>=2.11.0` floor to
+  the first real 3.x release with an upper major bound, and isolate unit tests
+  from ambient production `SCRAPY_*` variables;
+- add explicit CI infrastructure canaries for DynamoDB, Memcached, Pulsar, and
+  SQS instead of allowing their integration modules to remain permanently
+  disabled; validate DynamoDB response keys and existing table schema, persisted
+  MongoDB/Elasticsearch payload shapes, positive Elasticsearch timeouts, strict
+  Memcached plaintext booleans, and original-error preservation when a failed
+  Redis candidate also fails to close.
 - make the integration opt-in gate independent of benchmark-plugin branches;
   add the global opt-in to every published integration command; isolate Redis
   Cluster unit tests from DNS under pytest-socket 0.8; replace Dependabot's
@@ -1919,3 +1989,87 @@ Whole-project Ruff, strict mypy over 76 source files, configured Bandit over
 integrity all passed. After majority durability, shard routing, cleanup logging,
 documentation, and the cursor false-positive were corrected, three independent
 final reviewers reported no remaining I46 finding.
+
+### I47 — post-queue duplicate-marker publication
+
+Seven independent audit routes covered scheduler/acknowledgement flow, public
+API and architecture, message and data backends, security, tests/releases, and
+adversarial runtime behavior. The triggering `RUN-20` loss was deterministic:
+the legacy path inserted a marker before queue publication and stored rollback
+provenance in a shared `WeakSet`; same-`Request` monitor re-entry could erase
+that provenance, so a failed push left a persistent fingerprint for work that
+no queue had accepted.
+
+The first receipt design retained the pre-queue mutation and attempted to make
+its compensation exact. Repeated fresh review disproved that architecture:
+ambiguous remote removal, process interruption, lifecycle transitions, and a
+second worker committing the same fingerprint could still turn compensation
+into durable loss. The locked design therefore changes the boundary itself:
+
+1. The bundled scheduler obtains an owner-fenced, read-only membership decision.
+2. It publishes the request to the queue before mutating persistent membership.
+3. A crash-durable push commits the marker; any push failure discards only the
+   local intent. A competing worker's committed marker is never removed.
+4. A process-local queue strategy commits only a bounded lifecycle-local shadow
+   marker (65,536 fingerprints, oldest-first safe eviction), so a hard crash
+   loses the volatile item and its marker together. Broker-token replacements
+   are still rejected before entering volatile state.
+
+This is an explicit at-least-once trade-off. Two workers that concurrently read
+the same absent persistent marker may both enqueue before either publishes it;
+membership remains exact after publication, but scheduling is no longer a
+cross-worker single-winner transaction. That replay is preferable to a ghost
+marker with no queued work. The same-process volatile shadow prevents continuous
+duplicates without copying an unbounded remote set into worker memory.
+
+Compatibility fences preserve `BackendQueue.push() -> None`; the scheduler uses
+a package-private durability result only for the exact bundled queue method.
+Custom queues, subclasses overriding `push`, Scrapy's boolean `request_seen`,
+legacy `consume_reservation`, and class-declared third-party atomic filters keep
+their prior fallback shapes. Autospec and per-instance monkeypatches cannot be
+misdetected as explicit atomic capabilities. Duplicate broker deliveries with a
+source token take another durable handoff before ACK, accepting replay instead
+of treating a marker as proof that another queue copy exists.
+
+Fresh review closed four capability and interruption gaps in that boundary.
+`QueueStrategy.is_push_durable()` now defaults to `False`; bundled backend
+strategies opt in explicitly, and an older duck-typed strategy with no hook is
+also treated as volatile. A definition-time `BackendQueue.push` identity keeps
+class-level patches on the public path. Scheduler owner intent remains live
+through post-push finalization, including serialization and process-control
+failures, while commit releases receipt bookkeeping before any interruptible
+marker/shadow publication. Process-control cleanup uses the silent owner fence
+and retries it once without allowing cleanup or diagnostic failures to replace
+the primary signal.
+
+Transactional miss telemetry settles at commit or rollback, so the shared FIFO
+is event-enqueue/outcome ordered rather than initial-decision ordered. A miss now
+means the membership check admitted an attempt, not necessarily that a
+persistent marker was written. Memory retains saturation-before-miss; Bloom and
+Cuckoo retain miss-before-saturation and hit-before-saturation. Backend errors
+count once per failing membership operation and one miss per admitted attempt.
+Interrupted owner cleanup emits no monitor event, eliminating the nested-RLock
+re-entry deadlock. A direct `BackendDupeFilter.close()` failure remains terminal
+to operations but can be retried until its owned resources are released;
+scheduler-wide retryable teardown remains the independent `RUN-18` slice.
+Custom filter failure now defers manager release until the filter retry
+succeeds. Monitor hook and drainer ownership use an invocation-identity token
+visible only on the live call stack, avoiding both fallible-finally cleanup and
+frame-id ABA; stale weak-origin fences fail open even when runtime frame
+inspection is denied. Reservation reprs are opaque, and cleanup logging across
+factory/open/signal-registration paths cannot replace the primary exception.
+
+The regression matrix covers failed and process-control pushes, monitor
+re-entry on the same and distinct `Request`, owner interruption, empty monitor
+fences, cross-instance plain and token-bearing races, abandoned intents,
+volatile real strategies and bounded shadow eviction, backend-outage telemetry,
+Memory/Bloom event cadence, close retries, autospec/custom extension fallbacks,
+legacy custom queue strategies, class-level public-hook patches, secret-safe
+receipt reprs, frame-identity ABA, denied frame inspection, and the stable queue
+return contract. The frozen Python 3.10 and 3.14 focused matrices each passed
+349 tests. The full Python 3.10 suite passed 3,653 tests with 46 documented
+skips and three deprecation warnings. Ruff, strict mypy, configured Bandit,
+lockfile validation, sdist/wheel construction, and a fresh Python 3.10 wheel
+install/import/API smoke all passed. Dependency audit reports only Scrapy's
+documented historical `PYSEC-2017-83`, for which no fixed release exists. Two
+independent final reviewers found no remaining unregistered I47 P0/P1/P2.

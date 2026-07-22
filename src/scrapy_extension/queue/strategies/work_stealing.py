@@ -156,6 +156,11 @@ class WorkStealingQueueStrategy(QueueStrategy):
       return 0.0
     return max(0.0, deadline - time.monotonic())
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Report that each worker queue is backed by durable queue storage."""
+    del delay, source
+    return True
+
   def push(
     self,
     queue_name: str,

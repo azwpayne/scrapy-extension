@@ -6,11 +6,13 @@ This module provides a Scrapy dupefilter component using backend set interfaces.
 from __future__ import annotations
 
 import logging
+import sys
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from threading import Lock, RLock
+from dataclasses import dataclass
+from threading import Lock, RLock, get_ident
 from typing import TYPE_CHECKING, Literal, Protocol
-from weakref import WeakSet
+from weakref import ReferenceType, WeakSet, ref
 
 from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
@@ -75,6 +77,12 @@ _backend_error_warned: bool = False
 # covering a useful transient queue-outage window; overflow evicts FIFO.
 _DEFAULT_RETRY_ALLOWANCE_LIMIT = 1_024
 
+# Volatile queue strategies need a process-local dedup shadow rather than a
+# persistent marker. Bound it so a remote Set + local routing strategy does not
+# duplicate the entire crawl frontier in process memory. Eviction admits replay
+# but cannot lose queued work.
+_DEFAULT_VOLATILE_MARKER_LIMIT = 65_536
+
 # A slow or stuck custom monitor must not turn the non-waiting telemetry FIFO
 # into an unbounded memory sink. Overflow drops whole decision batches (never a
 # partial hit/miss + saturation pair); deduplication state remains authoritative.
@@ -87,7 +95,58 @@ _MonitorHook = Literal[
   "on_filter_full",
   "on_filter_saturation",
 ]
-_MonitorEvent = tuple[_MonitorHook, tuple[object, ...]]
+_PendingMonitorEvent = tuple[_MonitorHook, tuple[object, ...]]
+_MonitorEvent = tuple[_MonitorHook, tuple[object, ...], object]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _MonitorFenceToken:
+  """Hook/drainer liveness derived from an invocation-unique local token."""
+
+  thread_id: int
+  local_name: str
+
+  @property
+  def active(self) -> bool:
+    """Whether a live owner frame still holds this exact token identity."""
+    try:
+      frame = sys._current_frames().get(self.thread_id)  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - an audit hook must fail scheduling open
+      return False
+    while frame is not None:
+      try:
+        if frame.f_locals.get(self.local_name) is self:
+          return True
+      except Exception:  # noqa: BLE001 - stale telemetry cannot reject work
+        return False
+      frame = frame.f_back
+    return False
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _DedupReservation:
+  """Opaque intent to publish a marker after a durable queue push."""
+
+  fingerprint: bytes
+  epoch: int
+  owner: object
+  request: object
+  fingerprint_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class DedupDecision:
+  """Atomic scheduler decision for the bundled duplicate filter.
+
+  ``observational`` marks re-entry by the exact request whose monitor callback
+  is active. It is not a business duplicate and must not enqueue or settle a
+  broker token. ``reservation`` is an invocation-scoped intent to publish a
+  marker after the queue accepts the request.
+  """
+
+  seen: bool
+  reservation: object | None = None
+  observational: bool = False
 
 
 class BackendDupeFilter:
@@ -180,18 +239,45 @@ class BackendDupeFilter:
     self._manager_released = False
     self._owns_connection_manager = owns_connection_manager
     self._lifecycle_lock = RLock()
-    # Decisions enqueue complete telemetry batches under the lifecycle lock.
+    # Operations enqueue complete telemetry batches under the lifecycle lock.
     # One elected caller drains this shared FIFO outside the lock; peers never
-    # wait for that drainer. This preserves decision order and the monitor's
+    # wait for that drainer. This preserves enqueue order and the monitor's
     # historical single-caller contract without making a re-entrant callback
-    # deadlock on another request_seen call.
+    # deadlock on another request_seen call. Transactional miss telemetry is
+    # settled after push, so its order is outcome order rather than initial
+    # membership-check order.
     self._monitor_events: deque[_MonitorEvent] = deque()
-    self._monitor_drain_token: object | None = None
+    self._monitor_drain_token: _MonitorFenceToken | None = None
     self._monitor_event_limit = _DEFAULT_MONITOR_EVENT_LIMIT
     self._monitor_overflow_warned = False
+    # Scheduler calls retain an opaque commit intent until their queue push
+    # succeeds or fails. The marker is published only on commit, so a failed or
+    # crashed push cannot leave a ghost fingerprint. Receipts are keyed by
+    # identity and fenced by the lifecycle epoch.
+    self._active_reservations: dict[int, _DedupReservation] = {}
+    self._reservations_by_owner: dict[int, _DedupReservation] = {}
+    self._reservation_epoch = 0
+    # A process-local queue strategy cannot safely publish into a persistent
+    # membership backend: a hard crash would lose the queued item but retain
+    # the marker. Keep a lifecycle-local shadow instead. It filters repeated
+    # work in this process and disappears with the volatile queue on crash.
+    self._volatile_fingerprints: OrderedDict[bytes, None] = OrderedDict()
+    self._volatile_fingerprint_limit = _DEFAULT_VOLATILE_MARKER_LIMIT
+    self._volatile_fingerprint_overflow_warned = False
+    # During a monitor hook, direct re-entry (including a joined worker thread)
+    # with the exact originating Request is observational. Calls made after the
+    # hook returns are ordinary dedup operations; monitors must not launch
+    # detached request_seen calls. A different Request with the same fingerprint
+    # is always independent work.
+    self._active_monitor_requests: dict[
+      int,
+      tuple[ReferenceType[object], set[_MonitorFenceToken]],
+    ] = {}
     self._opened = False
     self._opened_spider: Spider | None = None
     self._closed = False
+    self._closing = False
+    self._filter_released = False
     # A MemoryMembershipFilter can emit saturation from inside ``add``. Keep
     # that internal callback on a NullMonitor while the filter is owned here;
     # request_seen records the same event and dispatches it only after releasing
@@ -205,40 +291,138 @@ class BackendDupeFilter:
 
   def _emit_monitor(self, event: _MonitorEvent) -> None:
     """Dispatch one recorded hook outside locks and isolate ordinary errors."""
-    hook_name, args = event
+    hook_name, args, origin_request = event
+    event_token = _MonitorFenceToken(get_ident(), "event_token")
+    primary: BaseException | None = None
     try:
-      hook: Callable[..., None] = getattr(self._monitor, hook_name)
-      hook(*args)
-    except Exception:  # noqa: BLE001 - telemetry must not alter dedup state
+      with self._lifecycle_lock:
+        request_id = id(origin_request)
+        active = self._active_monitor_requests.get(request_id)
+        if active is None or active[0]() is not origin_request:
+          active_tokens: set[_MonitorFenceToken] = set()
+          self._active_monitor_requests[request_id] = (
+            self._monitor_origin_ref(origin_request),
+            active_tokens,
+          )
+        else:
+          active_tokens = active[1]
+        active_tokens.add(event_token)
       try:
-        logger.debug("Dupefilter monitor hook raised; ignored", exc_info=True)
-      except Exception:  # noqa: BLE001 - diagnostics are best effort too
-        return
-
-  def _release_monitor_drainer(self, token: object) -> None:
-    """Release an election only if ``token`` still owns it."""
-    with self._lifecycle_lock:
-      if self._monitor_drain_token is token:
-        self._monitor_drain_token = None
-
-  def _drain_monitor_events(self, token: object) -> None:
-    """Drain the decision-ordered FIFO as its sole, non-waiting consumer."""
+        hook: Callable[..., None] = getattr(self._monitor, hook_name)
+        hook(*args)
+      except Exception:  # noqa: BLE001 - telemetry must not alter dedup state
+        try:
+          logger.debug("Dupefilter monitor hook raised; ignored", exc_info=True)
+        except Exception:  # noqa: BLE001 - diagnostics are best effort too
+          _diagnostic_failed = True
+    except BaseException as exc:
+      primary = exc
     try:
-      while True:
-        with self._lifecycle_lock:
-          if self._monitor_drain_token is not token:
-            return
-          if not self._monitor_events:
-            self._monitor_drain_token = None
-            return
-          event = self._monitor_events.popleft()
-        self._emit_monitor(event)
-    except BaseException:
-      # Process-control exceptions deliberately escape. Release the complete
-      # owner lifecycle, including failures between dequeue operations. The
-      # token check cannot clear a replacement owner that won a later election.
-      self._release_monitor_drainer(token)
-      raise
+      with self._lifecycle_lock:
+        active = self._active_monitor_requests.get(id(origin_request))
+        if active is not None and active[0]() is origin_request:
+          active[1].discard(event_token)
+          if not active[1]:
+            del self._active_monitor_requests[id(origin_request)]
+    except BaseException as cleanup_error:
+      # A custom mapping or asynchronous interruption may fail the normal
+      # ``get`` path. Try direct indexing once so an origin Request that never
+      # retries is not retained indefinitely; never remove another live token.
+      try:
+        active = self._active_monitor_requests[id(origin_request)]
+        if active[0]() is origin_request:
+          active[1].discard(event_token)
+          if not active[1]:
+            del self._active_monitor_requests[id(origin_request)]
+      except BaseException:
+        _fallback_cleanup_failed = True
+      if primary is None:
+        raise cleanup_error
+      try:
+        logger.debug(
+          "Failed to clear monitor observer fence while preserving signal",
+          exc_info=(
+            type(cleanup_error),
+            cleanup_error,
+            cleanup_error.__traceback__,
+          ),
+        )
+      except BaseException:
+        _diagnostic_failed = True
+    if primary is not None:
+      raise primary
+
+  def _monitor_origin_ref(self, origin_request: object) -> ReferenceType[object]:
+    """Create a weak origin reference that removes an abandoned fence entry."""
+    request_id = id(origin_request)
+    owner_ref = ref(self)
+
+    def remove_stale_origin(dead_ref: ReferenceType[object]) -> None:
+      owner = owner_ref()
+      if owner is None:
+        return
+      try:
+        with owner._lifecycle_lock:
+          active = owner._active_monitor_requests.get(request_id)
+          if active is not None and active[0] is dead_ref:
+            del owner._active_monitor_requests[request_id]
+      except BaseException:
+        _weakref_cleanup_failed = True
+
+    return ref(origin_request, remove_stale_origin)
+
+  def _queue_monitor_events_unlocked(
+    self,
+    origin_request: object,
+    pending_events: list[_PendingMonitorEvent],
+  ) -> tuple[_MonitorFenceToken | None, bool]:
+    """Append one complete telemetry batch while lifecycle state is locked."""
+    monitor_events = [
+      (hook_name, args, origin_request)
+      for hook_name, args in pending_events
+    ]
+    should_warn_overflow = False
+    if len(self._monitor_events) + len(monitor_events) <= self._monitor_event_limit:
+      self._monitor_events.extend(monitor_events)
+    elif not self._monitor_overflow_warned:
+      self._monitor_overflow_warned = True
+      should_warn_overflow = True
+    drain_token: _MonitorFenceToken | None = None
+    if (
+      self._monitor_drain_token is not None
+      and not self._monitor_drain_token.active
+    ):
+      self._monitor_drain_token = None
+    if self._monitor_events and self._monitor_drain_token is None:
+      # The caller assigns the returned token to its ``drain_token`` local
+      # before releasing ``_lifecycle_lock``. Liveness therefore follows the
+      # complete operation frame without a fallible finally/cleanup window.
+      drain_token = _MonitorFenceToken(get_ident(), "drain_token")
+      self._monitor_drain_token = drain_token
+    return drain_token, should_warn_overflow
+
+  def _dispatch_queued_monitor_events(
+    self,
+    drain_token: _MonitorFenceToken | None,
+    should_warn_overflow: bool,
+  ) -> None:
+    """Run an elected telemetry drain outside lifecycle locks."""
+    if should_warn_overflow:
+      self._warn_monitor_overflow()
+    if drain_token is not None:
+      self._drain_monitor_events(drain_token)
+
+  def _drain_monitor_events(self, token: _MonitorFenceToken) -> None:
+    """Drain the event-enqueue-ordered FIFO as its sole consumer."""
+    while True:
+      with self._lifecycle_lock:
+        if self._monitor_drain_token is not token:
+          return
+        if not self._monitor_events:
+          self._monitor_drain_token = None
+          return
+        event = self._monitor_events.popleft()
+      self._emit_monitor(event)
 
   def _warn_monitor_overflow(self) -> None:
     """Log the bounded best-effort drop once without changing a decision."""
@@ -406,9 +590,12 @@ class BackendDupeFilter:
       try:
         manager.close()
       except BaseException:
-        logger.exception(
-          "Failed to release ConnectionManager after dupefilter factory failure"
-        )
+        try:
+          logger.exception(
+            "Failed to release ConnectionManager after dupefilter factory failure"
+          )
+        except BaseException:
+          pass
       raise
 
   @classmethod
@@ -440,9 +627,12 @@ class BackendDupeFilter:
       try:
         dupefilter.close("crawler-factory-failed")
       except BaseException:
-        logger.exception(
-          "Failed to release ConnectionManager after dupefilter crawler factory failure"
-        )
+        try:
+          logger.exception(
+            "Failed to release ConnectionManager after dupefilter crawler factory failure"
+          )
+        except BaseException:
+          pass
       raise
 
   def open(self, spider: Spider | None = None) -> None:
@@ -469,8 +659,8 @@ class BackendDupeFilter:
         spider: The spider opening the crawl (optional).
     """
     with self._lifecycle_lock:
-      if self._closed:
-        raise RuntimeError("dupefilter is closed")
+      if self._closed or self._closing:
+        raise RuntimeError("dupefilter is closing or closed")
       if self._opened:
         if spider is self._opened_spider:
           return
@@ -487,7 +677,10 @@ class BackendDupeFilter:
         try:
           self._close_locked()
         except BaseException:
-          logger.exception("Failed to clean up dupefilter after open failure")
+          try:
+            logger.exception("Failed to clean up dupefilter after open failure")
+          except BaseException:
+            pass
         raise
       self._opened = True
       self._opened_spider = spider
@@ -528,28 +721,49 @@ class BackendDupeFilter:
     """Release one dupefilter lifecycle while ``_lifecycle_lock`` is held."""
     if self._closed:
       return
-    self._closed = True
+    self._closing = True
     self._opened = False
     self._opened_spider = None
+    # Active receipts have not crossed the queue commit boundary and therefore
+    # own no marker. Discard them before closing without backend cleanup.
+    for reservation in tuple(self._active_reservations.values()):
+      self._discard_reservation(reservation)
     self._clear_retry_allowances()
-    filter_failed = False
-    try:
-      self._filter.close()
-    except BaseException:
-      filter_failed = True
-      raise
-    finally:
-      if self._owns_connection_manager and not self._manager_released:
-        self._manager_released = True
-        try:
-          self.connection_manager.close()
-        except BaseException:
-          if filter_failed:
-            logger.exception(
-              "ConnectionManager close failed while propagating filter close error"
+    primary_error: BaseException | None = None
+    if not self._filter_released:
+      try:
+        self._filter.close()
+      except BaseException as exc:
+        primary_error = exc
+      else:
+        self._filter_released = True
+    if (
+      self._filter_released
+      and self._owns_connection_manager
+      and not self._manager_released
+    ):
+      try:
+        self.connection_manager.close()
+      except BaseException as exc:
+        if primary_error is None:
+          primary_error = exc
+        else:
+          try:
+            logger.error(
+              "ConnectionManager close failed while preserving filter close error",
+              exc_info=(type(exc), exc, exc.__traceback__),
             )
-          else:
-            raise
+          except BaseException:
+            pass
+      else:
+        self._manager_released = True
+    if self._filter_released and (
+      not self._owns_connection_manager or self._manager_released
+    ):
+      self._closed = True
+      self._closing = False
+    if primary_error is not None:
+      raise primary_error
 
   def clear(self) -> None:
     """Clear all tracked fingerprints via the membership filter.
@@ -559,10 +773,13 @@ class BackendDupeFilter:
     concrete filter (set/memory/bloom/cuckoo) supports it.
     """
     with self._lifecycle_lock:
-      if self._closed:
-        raise RuntimeError("dupefilter is closed")
-      self._clear_retry_allowances()
+      if self._closed or self._closing:
+        raise RuntimeError("dupefilter is closing or closed")
       self._filter.clear()
+      # Publish the new generation only after the filter clear succeeds. If a
+      # remote clear fails, existing receipts must remain able to compensate
+      # their still-present markers.
+      self._clear_retry_allowances()
 
   def log(self, request: Request, spider: Spider) -> None:
     """Log a filtered request.
@@ -579,58 +796,173 @@ class BackendDupeFilter:
       )
 
   def request_seen(self, request: Request) -> bool:
-    """Check a request and enqueue decision-ordered, lock-free telemetry."""
-    monitor_events: list[_MonitorEvent] = []
-    drain_token: object | None = None
+    """Check a request through Scrapy's boolean duplicate-filter contract."""
+    decision = self._request_seen_decision(
+      request,
+      transactional=False,
+    )
+    return decision.seen
+
+  # Preserve the original stable hook identity so the scheduler can detect a
+  # direct class-level monkeypatch. Instance and subclass overrides already
+  # have closer declaration ranks; this also covers tests/integrations that
+  # patch ``BackendDupeFilter.request_seen`` on the class itself.
+  _atomic_protocol_request_seen = request_seen
+
+  def request_seen_with_reservation(
+    self,
+    request: Request,
+    owner: object | None = None,
+  ) -> DedupDecision:
+    """Return one invocation's transactional scheduler decision.
+
+    The caller supplies a unique owner intent before entering this method. A
+    read-only reservation is published against that intent before consulting
+    membership, closing the callee-return/caller-assignment interruption
+    window. No marker is recorded for a miss yet: a failed push calls
+    :meth:`rollback_reservation`, while a durable push calls
+    :meth:`commit_reservation`. The public :meth:`request_seen` API remains
+    Scrapy's boolean contract.
+
+    Returns:
+        An atomic decision containing seen state, an optional opaque rollback
+        receipt, and monitor-observer status.
+    """
+    if owner is None:
+      owner = object()
+    return self._request_seen_decision(
+      request,
+      transactional=True,
+      owner=owner,
+    )
+
+  def _request_seen_decision(
+    self,
+    request: Request,
+    *,
+    transactional: bool,
+    owner: object | None = None,
+  ) -> DedupDecision:
+    """Linearize one decision and dispatch its telemetry outside locks."""
+    pending_monitor_events: list[_PendingMonitorEvent] = []
+    drain_token: _MonitorFenceToken | None = None
     should_warn_overflow = False
+    reservation: _DedupReservation | None = None
+    published_owner: object | None = None
+    compensated_under_lock = False
     try:
       with self._lifecycle_lock:
-        if self._closed:
-          raise RuntimeError("dupefilter is closed")
-        seen = self._request_seen_unlocked(request, monitor_events)
-        if (
-          len(self._monitor_events) + len(monitor_events)
-          <= self._monitor_event_limit
-        ):
-          self._monitor_events.extend(monitor_events)
-        elif not self._monitor_overflow_warned:
-          self._monitor_overflow_warned = True
-          should_warn_overflow = True
-        if (
-          self._monitor_events
-          and self._monitor_drain_token is None
-        ):
-          drain_token = object()
-          self._monitor_drain_token = drain_token
-      if should_warn_overflow:
-        self._warn_monitor_overflow()
-      if drain_token is not None:
-        self._drain_monitor_events(drain_token)
-      return seen
+        try:
+          if self._closed or self._closing:
+            raise RuntimeError("dupefilter is closing or closed")
+          fingerprint = self.request_fingerprint(request)
+          encoded_fingerprint = fingerprint.encode()
+
+          request_id = id(request)
+          active_monitor = self._active_monitor_requests.get(request_id)
+          if active_monitor is not None and active_monitor[0]() is request:
+            active_tokens = active_monitor[1]
+            for stale_token in tuple(active_tokens):
+              if not stale_token.active:
+                active_tokens.discard(stale_token)
+            if active_tokens:
+              return DedupDecision(seen=True, observational=True)
+            del self._active_monitor_requests[request_id]
+          elif active_monitor is not None:
+            # Dead weak origin or recycled object id: stale telemetry state
+            # must never suppress an unrelated Request.
+            del self._active_monitor_requests[request_id]
+
+          self._pending_reservations.discard(request)
+          if transactional:
+            assert owner is not None  # nosec B101 - normalized by caller
+            existing = self._reservations_by_owner.get(id(owner))
+            if existing is not None and existing.owner is owner:
+              raise RuntimeError("duplicate-filter owner intent is already active")
+            reservation = _DedupReservation(
+              encoded_fingerprint,
+              self._reservation_epoch,
+              owner,
+              request,
+              fingerprint,
+            )
+            self._active_reservations[id(reservation)] = reservation
+            self._reservations_by_owner[id(owner)] = reservation
+            published_owner = owner
+
+          if transactional:
+            seen = self._request_seen_for_scheduler_unlocked(
+              fingerprint,
+              encoded_fingerprint,
+              pending_monitor_events,
+            )
+            if seen:
+              assert reservation is not None  # nosec B101 - published above
+              self._discard_reservation(reservation)
+              reservation = None
+          else:
+            seen, reservation_state = self._request_seen_unlocked(
+              request,
+              fingerprint,
+              encoded_fingerprint,
+              pending_monitor_events,
+            )
+            if reservation_state is not None:
+              self._pending_reservations.add(request)
+
+          drain_token, should_warn_overflow = (
+            self._queue_monitor_events_unlocked(
+              request,
+              pending_monitor_events,
+            )
+          )
+        except BaseException:
+          if transactional:
+            self._compensate_interrupted_decision(
+              reservation,
+              published_owner,
+            )
+            compensated_under_lock = True
+          raise
+      self._dispatch_queued_monitor_events(
+        drain_token,
+        should_warn_overflow,
+      )
+      return DedupDecision(
+        seen=seen,
+        reservation=reservation,
+      )
     except BaseException:
-      # Cover the gap between election and entering the drain loop (including
-      # the one-time overflow diagnostic). A stale token cannot clear a newer
-      # owner if an asynchronous exception races the normal empty-queue release.
-      if drain_token is not None:
-        self._release_monitor_drainer(drain_token)
+      # The caller never received the opaque receipt. Compensate immediately;
+      # putting it back into the legacy WeakSet would be unusable because the
+      # next request_seen call clears that side channel before checking state.
+      if transactional and not compensated_under_lock:
+        self._compensate_interrupted_decision(
+          reservation,
+          published_owner,
+        )
       raise
 
   def _request_seen_unlocked(
     self,
     request: Request,
-    monitor_events: list[_MonitorEvent],
-  ) -> bool:
+    fingerprint: str,
+    encoded_fingerprint: bytes,
+    monitor_events: list[_PendingMonitorEvent],
+  ) -> tuple[bool, Literal["added", "allowance"] | None]:
     """Check if a request has been seen before.
 
     Args:
         request: The request to check.
 
     Returns:
-        True if the request is a duplicate, False otherwise.
+        ``(seen, reservation_state)`` for this invocation only.
     """
-    fingerprint = self.request_fingerprint(request)
-    encoded_fingerprint = fingerprint.encode()
-    self._pending_reservations.discard(request)
+    del request
+
+    if encoded_fingerprint in self._volatile_fingerprints:
+      monitor_events.append(("on_dedup_hit", (fingerprint,)))
+      return True, None
 
     # Non-removable filters retain their original bit/fingerprint after a
     # failed queue push. ``forget`` grants exactly one retry miss; deletion
@@ -638,9 +970,8 @@ class BackendDupeFilter:
     # cannot consume the same allowance twice. The underlying retained marker
     # makes every other caller a duplicate before and after that one retry.
     if self._consume_retry_allowance(encoded_fingerprint):
-      self._pending_reservations.add(request)
       monitor_events.append(("on_dedup_miss", (fingerprint,)))
-      return False
+      return False, "allowance"
 
     try:
       added = self._filter.add(encoded_fingerprint)
@@ -669,7 +1000,7 @@ class BackendDupeFilter:
       # message), so the cuckoo layer is free to reword its message without
       # silently disabling this guard.
       self._handle_filter_full(fingerprint, monitor_events)
-      return False
+      return False, None
     except (BackendConnectionError, CircuitBreakerOpenError) as exc:
       # Transient-backend-error graceful degradation (Risk 4).
       #
@@ -686,17 +1017,15 @@ class BackendDupeFilter:
       # arm (unsupported backend, still raises RuntimeError) and the FilterFull
       # arm (filter at capacity).
       self._handle_backend_error(fingerprint, exc, monitor_events)
-      return False
+      return False, None
 
     # add() returns True when the item was newly added; a duplicate maps to False.
-    if added:
-      self._pending_reservations.add(request)
     seen = not added
     # Memory historically emitted its at-cap signal inside ``add`` before the
     # outer miss hook, and skipped it for the duplicate early-return. Preserve
     # that cadence and ordering while deferring the callback outside the lock.
     is_memory_filter = isinstance(self._filter, MemoryMembershipFilter)
-    saturation_event: _MonitorEvent | None = None
+    saturation_event: _PendingMonitorEvent | None = None
     if not is_memory_filter or added:
       sat = getattr(self._filter, "saturation", None)
       if sat is not None:
@@ -719,7 +1048,228 @@ class BackendDupeFilter:
     # case was queued above to preserve its insertion-only event order.
     if not is_memory_filter and saturation_event is not None:
       monitor_events.append(saturation_event)
+    return seen, "added" if added else None
+
+  def _request_seen_for_scheduler_unlocked(
+    self,
+    fingerprint: str,
+    encoded_fingerprint: bytes,
+    monitor_events: list[_PendingMonitorEvent],
+  ) -> bool:
+    """Read dedup state without publishing a pre-queue marker.
+
+    The scheduler may enqueue concurrent duplicates, but a failed push or hard
+    crash can never strand a marker that has no durable queue item. The later
+    :meth:`commit_reservation` call publishes the marker after queue success.
+    """
+    if encoded_fingerprint in self._volatile_fingerprints:
+      monitor_events.append(("on_dedup_hit", (fingerprint,)))
+      return True
+
+    try:
+      seen = encoded_fingerprint in self._filter
+    except NotImplementedError as exc:
+      raise RuntimeError(
+        "Configured backend does not support set/duplicate filtering; "
+        "use a backend with SetBackend or disable BackendDupeFilter."
+      ) from exc
+    except (BackendConnectionError, CircuitBreakerOpenError) as exc:
+      self._handle_backend_error(
+        fingerprint,
+        exc,
+        monitor_events,
+        include_miss=False,
+      )
+      return False
+
+    if seen:
+      monitor_events.append(("on_dedup_hit", (fingerprint,)))
+      if not isinstance(self._filter, MemoryMembershipFilter):
+        saturation = getattr(self._filter, "saturation", None)
+        if saturation is not None:
+          capacity = getattr(self._filter, "capacity", None)
+          monitor_events.append(
+            ("on_filter_saturation", (len(self._filter), capacity))
+          )
     return seen
+
+  def commit_reservation(self, reservation: object) -> None:
+    """Publish a marker only after the owning queue push is durable."""
+    if not isinstance(reservation, _DedupReservation):
+      raise TypeError("invalid duplicate-filter reservation receipt")
+    pending_monitor_events: list[_PendingMonitorEvent] = []
+    drain_token: _MonitorFenceToken | None = None
+    should_warn_overflow = False
+    with self._lifecycle_lock:
+      if (
+        reservation.epoch != self._reservation_epoch
+        or self._active_reservations.get(id(reservation)) is not reservation
+      ):
+        self._discard_reservation(reservation)
+        return
+      # The queue copy is already authoritative. Release bookkeeping before
+      # the backend write so an interruption at any later opcode can cause at
+      # most replay, never retain the Request/owner until close.
+      self._discard_reservation(reservation)
+      try:
+        added = self._filter.add(reservation.fingerprint)
+      except FilterFull:
+        self._handle_filter_full(
+          reservation.fingerprint_text,
+          pending_monitor_events,
+        )
+      except (BackendConnectionError, CircuitBreakerOpenError) as exc:
+        self._handle_backend_error(
+          reservation.fingerprint_text,
+          exc,
+          pending_monitor_events,
+        )
+      else:
+        saturation_event: _PendingMonitorEvent | None = None
+        is_memory_filter = isinstance(self._filter, MemoryMembershipFilter)
+        if not is_memory_filter or added:
+          saturation = getattr(self._filter, "saturation", None)
+          if saturation is not None:
+            capacity = getattr(self._filter, "capacity", None)
+            saturation_event = (
+              "on_filter_saturation",
+              (len(self._filter), capacity),
+            )
+        if (
+          is_memory_filter
+          and saturation_event is not None
+        ):
+          pending_monitor_events.append(saturation_event)
+        pending_monitor_events.append(
+          ("on_dedup_miss", (reservation.fingerprint_text,))
+        )
+        if (
+          not is_memory_filter
+          and saturation_event is not None
+        ):
+          pending_monitor_events.append(saturation_event)
+      drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
+        reservation.request,
+        pending_monitor_events,
+      )
+    self._dispatch_queued_monitor_events(
+      drain_token,
+      should_warn_overflow,
+    )
+
+  def commit_volatile_reservation(self, reservation: object) -> None:
+    """Publish a lifecycle-local marker for a process-local queue push."""
+    if not isinstance(reservation, _DedupReservation):
+      raise TypeError("invalid duplicate-filter reservation receipt")
+    drain_token: _MonitorFenceToken | None = None
+    should_warn_overflow = False
+    should_warn_marker_overflow = False
+    with self._lifecycle_lock:
+      if (
+        reservation.epoch != self._reservation_epoch
+        or self._active_reservations.get(id(reservation)) is not reservation
+      ):
+        self._discard_reservation(reservation)
+        return
+      # As for the durable commit path, release the receipt before any
+      # interruptible publication. Losing this process-local shadow can admit
+      # replay but cannot lose the item already held by the local strategy.
+      self._discard_reservation(reservation)
+      fingerprint = reservation.fingerprint
+      if fingerprint in self._volatile_fingerprints:
+        self._volatile_fingerprints.move_to_end(fingerprint)
+      else:
+        if (
+          len(self._volatile_fingerprints)
+          >= self._volatile_fingerprint_limit
+        ):
+          self._volatile_fingerprints.popitem(last=False)
+          if not self._volatile_fingerprint_overflow_warned:
+            self._volatile_fingerprint_overflow_warned = True
+            should_warn_marker_overflow = True
+        self._volatile_fingerprints[fingerprint] = None
+      drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
+        reservation.request,
+        [("on_dedup_miss", (reservation.fingerprint_text,))],
+      )
+    self._dispatch_queued_monitor_events(
+      drain_token,
+      should_warn_overflow,
+    )
+    if should_warn_marker_overflow:
+      logger.warning(
+        "Volatile queue dedup shadow reached the %d-entry bound; evicting "
+        "the oldest marker may admit safe at-least-once replay",
+        self._volatile_fingerprint_limit,
+      )
+
+  def rollback_reservation(self, reservation: object) -> None:
+    """Discard one uncommitted intent; no membership mutation has occurred."""
+    if not isinstance(reservation, _DedupReservation):
+      raise TypeError("invalid duplicate-filter reservation receipt")
+    drain_token: _MonitorFenceToken | None = None
+    should_warn_overflow = False
+    with self._lifecycle_lock:
+      if (
+        reservation.epoch != self._reservation_epoch
+        or self._active_reservations.get(id(reservation)) is not reservation
+      ):
+        self._discard_reservation(reservation)
+        return
+      self._discard_reservation(reservation)
+      drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
+        reservation.request,
+        [("on_dedup_miss", (reservation.fingerprint_text,))],
+      )
+    self._dispatch_queued_monitor_events(
+      drain_token,
+      should_warn_overflow,
+    )
+
+  def rollback_reservation_intent(self, owner: object) -> None:
+    """Discard a receipt whose return handoff was interrupted.
+
+    No caller observed a miss decision, so this cleanup intentionally emits no
+    monitor event. Keeping it side-effect-free also prevents monitor re-entry
+    while an outer lifecycle-lock frame is still active.
+    """
+    with self._lifecycle_lock:
+      reservation = self._reservations_by_owner.get(id(owner))
+      if reservation is None or reservation.owner is not owner:
+        return
+      self._discard_reservation(reservation)
+
+  def _compensate_interrupted_decision(
+    self,
+    reservation: _DedupReservation | None,
+    owner: object | None,
+  ) -> None:
+    """Discard an unreturned intent without telemetry or membership writes."""
+    try:
+      with self._lifecycle_lock:
+        if reservation is not None:
+          self._discard_reservation(reservation)
+          return
+        if owner is not None:
+          owner_reservation = self._reservations_by_owner.get(id(owner))
+          if owner_reservation is not None and owner_reservation.owner is owner:
+            self._discard_reservation(owner_reservation)
+    except BaseException:
+      try:
+        logger.debug(
+          "Failed to compensate interrupted duplicate-filter decision",
+          exc_info=True,
+        )
+      except BaseException:
+        return
+
+  def _discard_reservation(self, reservation: _DedupReservation) -> None:
+    """Forget one receipt without mutating membership state."""
+    if self._active_reservations.get(id(reservation)) is reservation:
+      del self._active_reservations[id(reservation)]
+    owner_reservation = self._reservations_by_owner.get(id(reservation.owner))
+    if owner_reservation is reservation:
+      del self._reservations_by_owner[id(reservation.owner)]
 
   def consume_reservation(self, request: Request) -> bool:
     """Consume whether the latest check reserved state for ``request``.
@@ -759,8 +1309,8 @@ class BackendDupeFilter:
         request: The request whose newly-added fingerprint must be compensated.
     """
     with self._lifecycle_lock:
-      if self._closed:
-        raise RuntimeError("dupefilter is closed")
+      if self._closed or self._closing:
+        raise RuntimeError("dupefilter is closing or closed")
       self._pending_reservations.discard(request)
       fingerprint = self.request_fingerprint(request).encode()
       try:
@@ -801,11 +1351,16 @@ class BackendDupeFilter:
     with self._retry_allowance_lock:
       self._retry_allowances.clear()
     self._pending_reservations.clear()
+    self._active_reservations.clear()
+    self._reservations_by_owner.clear()
+    self._volatile_fingerprints.clear()
+    self._volatile_fingerprint_overflow_warned = False
+    self._reservation_epoch += 1
 
   def _handle_filter_full(
     self,
     fingerprint: str,
-    monitor_events: list[_MonitorEvent],
+    monitor_events: list[_PendingMonitorEvent],
   ) -> None:
     """Degrade gracefully when the membership filter reports it is full.
 
@@ -840,7 +1395,9 @@ class BackendDupeFilter:
     self,
     fingerprint: str,
     exc: BaseException,
-    monitor_events: list[_MonitorEvent],
+    monitor_events: list[_PendingMonitorEvent],
+    *,
+    include_miss: bool = True,
   ) -> None:
     """Degrade gracefully when the membership-filter backend is transiently down.
 
@@ -869,7 +1426,8 @@ class BackendDupeFilter:
         type(exc).__name__,
       )
     monitor_events.append(("on_error", ("dedup", exc)))
-    monitor_events.append(("on_dedup_miss", (fingerprint,)))
+    if include_miss:
+      monitor_events.append(("on_dedup_miss", (fingerprint,)))
 
   def request_fingerprint(self, request: Request) -> str:
     """Generate a fingerprint for a request.

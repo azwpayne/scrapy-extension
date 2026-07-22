@@ -126,6 +126,11 @@ class PriorityQueueStrategy(QueueStrategy):
       legacy_name=f"{queue_name}:p{level}",
     )
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Report that priority buckets are all backend-backed queues."""
+    del delay, source
+    return True
+
   def push(
     self,
     queue_name: str,

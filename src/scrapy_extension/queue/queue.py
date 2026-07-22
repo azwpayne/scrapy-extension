@@ -274,13 +274,31 @@ class BackendQueue:
     Raises:
         SerializationError: If the request cannot be serialized.
     """
+    self._push_with_durability(request, priority)
+
+  # Preserve the stable public hook identity so scheduler dispatch cannot
+  # bypass a direct class-level monkeypatch of ``BackendQueue.push``.
+  _scheduler_protocol_push = push
+
+  def _push_with_durability(
+    self,
+    request: Request,
+    priority: float = 0.0,
+  ) -> bool:
+    """Push and report durability to the bundled scheduler.
+
+    ``push`` intentionally retains its stable ``None`` return contract. This
+    package-private extension lets :class:`BackendScheduler` decide whether a
+    persistent dedup marker is safe after a strategy accepts into process-local
+    state.
+    """
     self._begin_operation("push")
     try:
-      self._push(request, priority)
+      return self._push(request, priority)
     finally:
       self._end_operation()
 
-  def _push(self, request: Request, priority: float) -> None:
+  def _push(self, request: Request, priority: float) -> bool:
     """Execute an admitted push operation."""
     replacement_ack_token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
     raw_delay = request.meta.get("delay", 0.0)
@@ -313,10 +331,13 @@ class BackendQueue:
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise error from e
-    if replacement_ack_token is not None and not self._strategy.is_push_durable(
-      delay=delay,
-      source=source,
-    ):
+    durability_probe = getattr(self._strategy, "is_push_durable", None)
+    push_is_durable = (
+      durability_probe(delay=delay, source=source) is True
+      if callable(durability_probe)
+      else False
+    )
+    if replacement_ack_token is not None and not push_is_durable:
       # A source delivery can be terminated only after its replacement crosses
       # a crash-durable boundary. Delay/time-wheel holding state, round-robin
       # deques, and ring buffers are process-local; accepting into them and then
@@ -388,8 +409,9 @@ class BackendQueue:
         # failed enqueue makes the scheduler roll back its dedup reservation
         # and can let the broker's source redelivery publish a second
         # replacement. Keep the token unresolved, report the terminal failure,
-        # and return success for the durable replacement. A later redelivery is
-        # filtered as a duplicate and gets another chance to ack its own token.
+        # and return success for the durable replacement. A later redelivery
+        # carrying its own token is durably handed off again before that token
+        # is acked; this can replay work but cannot lose the source delivery.
         self._inc_stat("scheduler/ack_error")
         logger.exception(
           "Failed to acknowledge source delivery after replacement committed "
@@ -402,6 +424,7 @@ class BackendQueue:
       self._monitor.on_push(self.queue_name, priority)
     except Exception:  # noqa: BLE001 - enqueue has already committed
       logger.debug("monitor.on_push raised; ignored", exc_info=True)
+    return push_is_durable
 
   def pop(self, timeout: float = 0.0) -> Request | None:
     """Pop a request from the queue.

@@ -54,12 +54,15 @@ class Monitor:
   (or :class:`NullMonitor`) is always safe to call from any component.
 
   Duplicate-filter hooks are best-effort and serialized through one
-  decision-ordered FIFO outside the duplicate-filter lifecycle lock. A peer
+  event-enqueue-ordered FIFO outside the duplicate-filter lifecycle lock. A peer
   ``request_seen`` call never waits for the elected drainer, so its hook may
   finish after that call (or a concurrent ``close``) returns; ``close`` does
   not provide a telemetry-flush barrier. The backlog is bounded and drops
   complete event batches when full. A callback may call ``request_seen``
-  re-entrantly, but must not wait for that nested call's later telemetry.
+  re-entrantly, but must not wait for that nested call's later telemetry. If a
+  callback delegates ``request_seen`` for the originating ``Request`` to
+  another thread, that call must finish before the hook returns; detached work
+  runs outside the identity fence and is treated as an ordinary dedup attempt.
   A process-control exception from a deferred peer event necessarily surfaces
   on the elected drainer's caller rather than on the peer that already returned.
 
@@ -81,7 +84,9 @@ class Monitor:
     ``queue/pop_attempt_count`` (renamed from ``queue/pop_count`` in R14-D so
     the key matches behavior).
   - ``on_dedup_hit(key)`` — request fingerprint was already seen.
-  - ``on_dedup_miss(key)`` — request fingerprint was newly recorded.
+  - ``on_dedup_miss(key)`` — a membership check admitted the request. On the
+    bundled scheduler's two-phase path this is settled after queue success or
+    failure and does not imply that a persistent marker was written.
   - ``on_queue_depth(queue_name, depth)`` — current pending depth (gauge).
   - ``on_store(key)`` — after a successful storage write (pipeline lane).
   - ``on_filter_full()`` — membership filter at capacity; caller degrades.
@@ -140,10 +145,12 @@ class Monitor:
     """
 
   def on_dedup_miss(self, key: str) -> None:
-    """Record a dedup miss (request newly recorded).
+    """Record a dedup miss (membership check admitted the request).
 
     Args:
-        key: The request fingerprint that was newly added.
+        key: The request fingerprint that was absent or admitted in degraded
+            mode. A later queue failure or volatile strategy may leave it
+            without a persistent membership marker.
     """
 
   def on_queue_depth(self, queue_name: str, depth: int) -> None:

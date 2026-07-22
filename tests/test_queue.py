@@ -27,6 +27,31 @@ class _QueueTestSpider(Spider):
     return failure
 
 
+class _LegacyLocalQueueStrategy:
+  """Pre-durability-extension custom strategy with process-local storage."""
+
+  def __init__(self) -> None:
+    self.items: list[bytes] = []
+
+  def bind(self, queue_name: str) -> None:
+    del queue_name
+
+  def open(self) -> None:
+    return None
+
+  def push(
+    self,
+    queue_name: str,
+    item: bytes,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> None:
+    del queue_name, priority, delay, source
+    self.items.append(item)
+
+
 class TestBackendQueueInit:
   """Test BackendQueue initialization."""
 
@@ -423,6 +448,19 @@ class TestBackendQueuePush:
     assert isinstance(call_args[0][1], bytes)
     assert call_args[0][2] == 5.0
 
+  def test_push_retains_stable_none_return_contract(
+    self,
+    mock_connection_manager,
+    mock_spider,
+  ):
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=mock_spider,
+    )
+
+    assert queue.push(Request("https://example.com/stable-return")) is None
+
   def test_push_rejects_callback_that_cannot_be_restored(
     self, mock_connection_manager
   ):
@@ -725,11 +763,47 @@ class TestBackendQueuePush:
 
     assert exc_info.value is backend_error
 
+  def test_legacy_custom_strategy_without_durability_hook_is_volatile(
+    self, mock_connection_manager
+  ):
+    strategy = _LegacyLocalQueueStrategy()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,  # type: ignore[arg-type]
+    )
+
+    durable = queue._push_with_durability(Request("https://example.com/legacy"))
+
+    assert durable is False
+    assert len(strategy.items) == 1
+
+  def test_legacy_custom_strategy_rejects_source_transfer_before_mutation(
+    self, mock_connection_manager
+  ):
+    strategy = _LegacyLocalQueueStrategy()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,  # type: ignore[arg-type]
+    )
+    request = Request(
+      "https://example.com/legacy-replacement",
+      meta={"_backend_ack_token": "source-token"},
+    )
+
+    with pytest.raises(QueueError, match="in-process queue strategy"):
+      queue.push(request)
+
+    assert strategy.items == []
+    mock_connection_manager.get_queue_backend().ack.assert_not_called()
+
   def test_push_replacement_acks_consumed_delivery_token_after_enqueue(
     self, mock_connection_manager, mock_spider, mocker
   ):
     """A retry/redirect replacement must terminate its original MQ delivery."""
     strategy = mocker.MagicMock()
+    strategy.is_push_durable.return_value = True
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
       queue_name="test_queue",
@@ -754,6 +828,7 @@ class TestBackendQueuePush:
   ):
     """A post-commit ack failure must not reclassify the push as rejected."""
     strategy = mocker.MagicMock()
+    strategy.is_push_durable.return_value = True
     backend = mock_connection_manager.get_queue_backend.return_value
     backend.ack.side_effect = QueueError("source ack failed")
     spider = mocker.Mock()
@@ -780,6 +855,7 @@ class TestBackendQueuePush:
   ):
     """The original delivery remains recoverable until replacement enqueue commits."""
     strategy = mocker.MagicMock()
+    strategy.is_push_durable.return_value = True
     strategy.push.side_effect = QueueError("push failed")
     queue = BackendQueue(
       connection_manager=mock_connection_manager,

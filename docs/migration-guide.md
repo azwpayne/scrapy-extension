@@ -295,11 +295,32 @@ replacement publish and source ACK cannot be atomic across brokers, so a crash
 between them can still redeliver the source and create a duplicate; retain
 deduplication or make `dont_filter=True` replacements idempotent.
 
+The bundled scheduler now checks dedup membership, durably pushes, and only
+then publishes a persistent marker. This closes the failed-push ghost-marker
+window but intentionally changes concurrent admission: two workers that both
+observe a fresh fingerprint may enqueue it before either marker is visible.
+Treat callbacks and item writes as idempotent under at-least-once replay. Queue
+strategies that accept only into process-local state use a bounded local dedup
+shadow instead of publishing a persistent marker.
+
+Custom `QueueStrategy` plugins must now opt in to durable publication. Override
+`is_push_durable(*, delay, source)` and return the literal `True` only for routes
+whose successful push is already crash-durable. The inherited default and a
+missing hook on older duck-typed plugins are treated as volatile: ordinary
+requests use the bundled dupefilter's lifecycle-local shadow, while a request
+carrying an unacknowledged source token fails closed before plugin mutation.
+
 A replacement carrying an unacknowledged source token is now rejected before
 it enters volatile `delay`/`time_wheel` holding state (positive effective
 delay), `round_robin`, or `ring_buffer`. Migrate those flows to a
 backend-durable strategy/path; a zero effective delay remains a direct backend
 push.
+
+If `ring_buffer` uses `full_policy=drop_oldest`, the overwritten request's
+volatile dedup shadow is intentionally retained until bounded-shadow eviction
+or lifecycle end. Upgrading does not turn that explicitly lossy policy into an
+automatic retry mechanism; use `reject` or a durable strategy when dropped work
+must be resubmitted.
 
 JSON is a wire format, not encryption. Queue payloads can contain request
 bodies, metadata, callback arguments, cookies, tokens, or personal data. Use

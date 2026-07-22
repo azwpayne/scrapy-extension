@@ -14,20 +14,23 @@ Mock-queue only — no real backend. Mirrors the pattern in
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from scrapy import Request, Spider
 
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+from scrapy_extension.dupefilter.filters.base import MembershipFilter
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 from scrapy_extension.exceptions import (
   BackendConnectionError,
   QueueError,
   SerializationError,
 )
+from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.schedule import scheduler as scheduler_module
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -94,6 +97,236 @@ class _SelfDrainingQueue(_LenControllableQueue):
     request = Request(f"https://example.com/{self._depth}")
     self._depth -= 1
     return request
+
+
+class _SameRequestReentrantMonitor(Monitor):
+  """Re-enter one miss with the exact Request whose push has not run yet."""
+
+  def __init__(self) -> None:
+    self._dupefilter: BackendDupeFilter | None = None
+    self._request: Request | None = None
+    self._reentered = False
+    self.nested_results: list[bool] = []
+
+  def bind(self, dupefilter: BackendDupeFilter, request: Request) -> None:
+    self._dupefilter = dupefilter
+    self._request = request
+
+  def on_dedup_miss(self, key: str) -> None:
+    del key
+    if self._reentered:
+      return
+    self._reentered = True
+    if self._dupefilter is None or self._request is None:
+      raise RuntimeError("reentrant monitor is not bound")
+    self.nested_results.append(
+      self._dupefilter.request_seen(self._request)
+    )
+
+
+class _SameRequestSchedulerMonitor(Monitor):
+  """Re-enter the complete scheduler while its fingerprint is provisional."""
+
+  def __init__(self) -> None:
+    self._scheduler: BackendScheduler | None = None
+    self._request: Request | None = None
+    self._reentered = False
+    self.nested_results: list[bool] = []
+
+  def bind(self, scheduler: BackendScheduler, request: Request) -> None:
+    self._scheduler = scheduler
+    self._request = request
+
+  def on_dedup_miss(self, key: str) -> None:
+    del key
+    if self._reentered:
+      return
+    self._reentered = True
+    if self._scheduler is None or self._request is None:
+      raise RuntimeError("scheduler monitor is not bound")
+    self.nested_results.append(
+      self._scheduler.enqueue_request(self._request)
+    )
+
+
+class _BackendErrorReentrantMonitor(Monitor):
+  """Re-enter the same request while an outage miss is being observed."""
+
+  def __init__(self) -> None:
+    self._dupefilter: BackendDupeFilter | None = None
+    self._request: Request | None = None
+    self._reentered = False
+    self.nested_results: list[bool] = []
+
+  def bind(self, dupefilter: BackendDupeFilter, request: Request) -> None:
+    self._dupefilter = dupefilter
+    self._request = request
+
+  def on_error(self, operation: str, error: BaseException) -> None:
+    del operation, error
+    if self._reentered:
+      return
+    self._reentered = True
+    if self._dupefilter is None or self._request is None:
+      raise RuntimeError("backend-error monitor is not bound")
+    self.nested_results.append(
+      self._dupefilter.request_seen(self._request)
+    )
+
+
+class _SchedulerStop(BaseException):
+  """Process-control sentinel used to verify scheduler receipt ownership."""
+
+
+class _OneShotSchedulerStopMonitor(Monitor):
+  def __init__(self, signal: BaseException) -> None:
+    self._signal = signal
+    self._raised = False
+
+  def on_dedup_miss(self, key: str) -> None:
+    del key
+    if not self._raised:
+      self._raised = True
+      raise self._signal
+
+
+class _LegacyRequestSeenOverride(BackendDupeFilter):
+  """Model a pre-extension subclass overriding only Scrapy's stable hook."""
+
+  def __init__(self, *args: Any, seen: bool, **kwargs: Any) -> None:
+    super().__init__(*args, **kwargs)
+    self._seen = seen
+    self.calls = 0
+
+  def request_seen(self, request: Request) -> bool:
+    del request
+    self.calls += 1
+    return self._seen
+
+
+class _HandoffInterruptingDupeFilter(BackendDupeFilter):
+  """Interrupt after the base method publishes but before the caller receives."""
+
+  def __init__(
+    self,
+    *args: Any,
+    signal: BaseException,
+    **kwargs: Any,
+  ) -> None:
+    super().__init__(*args, **kwargs)
+    self._signal = signal
+    self._raised = False
+
+  def request_seen_with_reservation(
+    self,
+    request: Request,
+    owner: object | None = None,
+  ) -> Any:
+    decision = super().request_seen_with_reservation(request, owner)
+    if not self._raised:
+      self._raised = True
+      raise self._signal
+    return decision
+
+
+class _SerializationAfterReservationDupeFilter(BackendDupeFilter):
+  """Fail after publishing owner intent but before returning its receipt."""
+
+  def request_seen_with_reservation(
+    self,
+    request: Request,
+    owner: object | None = None,
+  ) -> Any:
+    super().request_seen_with_reservation(request, owner)
+    raise SerializationError("decision serialization failed")
+
+
+class _CommitInterruptingDupeFilter(BackendDupeFilter):
+  """Interrupt finalization after a durable queue push."""
+
+  def __init__(self, *args: Any, signal: BaseException, **kwargs: Any) -> None:
+    super().__init__(*args, **kwargs)
+    self._signal = signal
+
+  def commit_reservation(self, reservation: object) -> None:
+    del reservation
+    raise self._signal
+
+
+class _IntentCleanupInterruptingDupeFilter(BackendDupeFilter):
+  """Interrupt the first silent owner cleanup before delegating on retry."""
+
+  def __init__(self, *args: Any, signal: BaseException, **kwargs: Any) -> None:
+    super().__init__(*args, **kwargs)
+    self._signal = signal
+    self.cleanup_calls = 0
+
+  def rollback_reservation_intent(self, owner: object) -> None:
+    self.cleanup_calls += 1
+    if self.cleanup_calls == 1:
+      raise self._signal
+    super().rollback_reservation_intent(owner)
+
+
+class _CustomAtomicDecision:
+  def __init__(
+    self,
+    *,
+    seen: bool,
+    reservation: object | None,
+    provisional: bool,
+  ) -> None:
+    self.seen = seen
+    self.reservation = reservation
+    self.observational = provisional
+
+
+class _ExplicitAtomicDupeFilter:
+  """Independent structural implementation of the transactional extension."""
+
+  def __init__(self) -> None:
+    self.receipt = object()
+    self.atomic_calls = 0
+    self.legacy_calls = 0
+    self.commits: list[object] = []
+    self.rollbacks: list[object] = []
+    self.intent_rollbacks: list[object] = []
+
+  def request_seen(self, request: Request) -> bool:
+    del request
+    self.legacy_calls += 1
+    return True
+
+  def request_seen_with_reservation(
+    self,
+    request: Request,
+    owner: object,
+  ) -> _CustomAtomicDecision:
+    del request, owner
+    self.atomic_calls += 1
+    return _CustomAtomicDecision(
+      seen=False,
+      reservation=self.receipt,
+      provisional=False,
+    )
+
+  def commit_reservation(self, reservation: object) -> None:
+    self.commits.append(reservation)
+
+  def rollback_reservation(self, reservation: object) -> None:
+    self.rollbacks.append(reservation)
+
+  def rollback_reservation_intent(self, owner: object) -> None:
+    self.intent_rollbacks.append(owner)
+
+  def log(self, request: Request, spider: Spider) -> None:
+    del request, spider
+
+
+class _CommitFailingExplicitAtomicDupeFilter(_ExplicitAtomicDupeFilter):
+  def commit_reservation(self, reservation: object) -> None:
+    del reservation
+    raise QueueError("commit bookkeeping unavailable")
 
 
 class TestBackpressureDefaultOff:
@@ -466,14 +699,781 @@ class TestEnqueueDedupReservation:
     assert len(membership_filter) == 1
     assert queue.push.call_count == 2
 
+  def test_same_request_monitor_reentry_cannot_erase_rollback_receipt(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    monitor = _SameRequestReentrantMonitor()
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      monitor=monitor,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = [QueueError("queue unavailable"), None]
+    scheduler._queue = queue
+    request = Request("https://example.com/reentrant-reservation")
+    monitor.bind(dupefilter, request)
+
+    assert scheduler.enqueue_request(request) is False
+    assert monitor.nested_results == [True]
+    assert len(membership_filter) == 0
+
+    retry = Request(request.url)
+    assert scheduler.enqueue_request(retry) is True
+    assert len(membership_filter) == 1
+    assert queue.push.call_count == 2
+
+  def test_observational_monitor_reentry_never_settles_source(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    monitor = _SameRequestSchedulerMonitor()
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      monitor=monitor,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("queue unavailable")
+    scheduler._queue = queue
+    request = Request(
+      "https://example.com/provisional-source",
+      meta={"_backend_ack_token": "source-token"},
+    )
+    monitor.bind(scheduler, request)
+
+    assert scheduler.enqueue_request(request) is False
+    assert monitor.nested_results == [False]
+    queue.ack.assert_not_called()
+    assert request.meta["_backend_ack_token"] == "source-token"
+    assert len(membership_filter) == 0
+
+  def test_cross_instance_duplicate_source_gets_durable_handoff(
+    self,
+    mocker,
+  ) -> None:
+    shared_membership = MemoryMembershipFilter(maxsize=None)
+    manager_a = MagicMock(name="ConnectionManagerA")
+    dupefilter_a = BackendDupeFilter(
+      connection_manager=manager_a,
+      membership_filter=shared_membership,
+    )
+    owner_request = Request("https://example.com/cross-worker")
+    owner_decision = dupefilter_a.request_seen_with_reservation(owner_request)
+    assert owner_decision.reservation is not None
+
+    manager_b = MagicMock(name="ConnectionManagerB")
+    backend_b = manager_b.get_queue_backend.return_value
+    strategy_b = MagicMock(name="DurableQueueStrategy")
+    strategy_b.is_push_durable.return_value = True
+    spider = mocker.Mock(name="Spider")
+    spider.crawler.stats = None
+    queue_b = BackendQueue(
+      connection_manager=manager_b,
+      queue_name="cross-worker-queue",
+      spider=spider,
+      queue_strategy=strategy_b,
+    )
+    dupefilter_b = BackendDupeFilter(
+      connection_manager=manager_b,
+      membership_filter=shared_membership,
+    )
+    scheduler_b = BackendScheduler(
+      connection_manager=manager_b,
+      dupefilter=dupefilter_b,
+    )
+    scheduler_b._queue = queue_b
+    competing = Request(
+      owner_request.url,
+      meta={"_backend_ack_token": "source-b"},
+    )
+
+    assert scheduler_b.enqueue_request(competing) is True
+
+    strategy_b.push.assert_called_once()
+    backend_b.ack.assert_called_once_with(
+      "cross-worker-queue",
+      token="source-b",
+    )
+    assert "_backend_ack_token" not in competing.meta
+
+    # Worker A owned only a local intent. Its later failure cannot erase the
+    # marker worker B published after crossing its durable strategy boundary.
+    dupefilter_a.rollback_reservation(owner_decision.reservation)
+    assert len(shared_membership) == 1
+
+  def test_cross_instance_plain_request_marker_survives_other_intent_rollback(
+    self,
+  ) -> None:
+    shared_membership = MemoryMembershipFilter(maxsize=None)
+    manager_a = MagicMock(name="ConnectionManagerA")
+    dupefilter_a = BackendDupeFilter(
+      connection_manager=manager_a,
+      membership_filter=shared_membership,
+    )
+    request = Request("https://example.com/cross-worker-plain")
+    owner_decision = dupefilter_a.request_seen_with_reservation(request)
+    assert owner_decision.reservation is not None
+    assert len(shared_membership) == 0
+
+    manager_b = MagicMock(name="ConnectionManagerB")
+    dupefilter_b = BackendDupeFilter(
+      connection_manager=manager_b,
+      membership_filter=shared_membership,
+    )
+    scheduler_b = BackendScheduler(
+      connection_manager=manager_b,
+      dupefilter=dupefilter_b,
+    )
+    queue_b = MagicMock(name="BackendQueueB")
+    scheduler_b._queue = queue_b
+
+    assert scheduler_b.enqueue_request(request.replace()) is True
+    queue_b.push.assert_called_once()
+    assert len(shared_membership) == 1
+
+    dupefilter_a.rollback_reservation(owner_decision.reservation)
+    assert len(shared_membership) == 1
+
+  def test_unreturned_intent_never_creates_cross_worker_ghost_marker(
+    self,
+  ) -> None:
+    shared_membership = MemoryMembershipFilter(maxsize=None)
+    manager_a = MagicMock(name="ConnectionManagerA")
+    dupefilter_a = BackendDupeFilter(
+      connection_manager=manager_a,
+      membership_filter=shared_membership,
+    )
+    request = Request("https://example.com/cross-worker-crash")
+
+    abandoned = dupefilter_a.request_seen_with_reservation(request)
+    assert abandoned.reservation is not None
+    assert len(shared_membership) == 0
+
+    manager_b = MagicMock(name="ConnectionManagerB")
+    dupefilter_b = BackendDupeFilter(
+      connection_manager=manager_b,
+      membership_filter=shared_membership,
+    )
+    scheduler_b = BackendScheduler(
+      connection_manager=manager_b,
+      dupefilter=dupefilter_b,
+    )
+    queue_b = MagicMock(name="BackendQueueB")
+    scheduler_b._queue = queue_b
+
+    assert scheduler_b.enqueue_request(request.replace()) is True
+    assert len(shared_membership) == 1
+
+  def test_volatile_strategy_uses_local_shadow_not_persistent_marker(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    strategy = MagicMock(name="VolatileQueueStrategy")
+    strategy.is_push_durable.return_value = False
+    spider = mocker.Mock(name="Spider")
+    spider.crawler.stats = None
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="volatile-queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    membership = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    scheduler._queue = queue
+    request = Request("https://example.com/volatile")
+
+    assert scheduler.enqueue_request(request) is True
+    assert len(membership) == 0
+    assert len(dupefilter._volatile_fingerprints) == 1
+
+    assert scheduler.enqueue_request(request.replace()) is False
+    strategy.push.assert_called_once()
+
+  def test_custom_queue_return_value_does_not_redefine_push_durability(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="CustomQueue")
+    queue.push.return_value = False
+    scheduler._queue = queue
+
+    assert scheduler.enqueue_request(
+      Request("https://example.com/custom-queue-return")
+    ) is True
+    assert len(membership) == 1
+
+  def test_duplicate_deferred_child_completes_after_durable_handoff(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    backend = manager.get_queue_backend.return_value
+    strategy = MagicMock(name="DurableQueueStrategy")
+    strategy.is_push_durable.return_value = True
+    spider = mocker.Mock(name="Spider")
+    spider.crawler.stats = None
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="deferred-child-queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    membership = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    scheduler._queue = queue
+    original = Request("https://example.com/deferred-duplicate")
+    initial = dupefilter.request_seen_with_reservation(original)
+    assert initial.reservation is not None
+    dupefilter.commit_reservation(initial.reservation)
+    group = scheduler_module._DeferredReplacementAckGroup(
+      scheduler,
+      "source-token",
+    )
+    child = group.new_child()
+    assert child is not None
+    group.seal()
+    replacement = original.replace(
+      meta={"_backend_ack_token": child},
+    )
+
+    assert scheduler.enqueue_request(replacement) is True
+
+    strategy.push.assert_called_once()
+    backend.ack.assert_called_once_with(
+      "deferred-child-queue",
+      token="source-token",
+    )
+    assert group._pending == set()
+    assert group._terminal is True
+    assert "_backend_ack_token" not in replacement.meta
+
+  def test_monitor_process_control_compensates_before_scheduler_retry(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    signal = _SchedulerStop()
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      monitor=_OneShotSchedulerStopMonitor(signal),
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = [QueueError("queue unavailable"), None]
+    scheduler._queue = queue
+    request = Request("https://example.com/monitor-stop")
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(request)
+    assert raised.value is signal
+    assert queue.push.call_count == 1
+    assert len(membership_filter) == 0
+
+    assert scheduler.enqueue_request(request.replace()) is True
+    assert queue.push.call_count == 2
+    assert len(membership_filter) == 1
+
+  def test_push_process_control_rolls_back_without_masking_signal(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    signal = _SchedulerStop()
+    queue.push.side_effect = [signal, None]
+    scheduler._queue = queue
+    request = Request("https://example.com/push-stop")
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(request)
+    assert raised.value is signal
+    assert len(membership_filter) == 0
+
+    assert scheduler.enqueue_request(request.replace()) is True
+    assert queue.push.call_count == 2
+    assert len(membership_filter) == 1
+
+  def test_interrupted_receipt_handoff_rolls_back_by_owner_intent(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    signal = _SchedulerStop()
+    dupefilter = _HandoffInterruptingDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      signal=signal,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request("https://example.com/handoff-stop")
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(request)
+    assert raised.value is signal
+    queue.push.assert_not_called()
+    assert len(membership_filter) == 0
+
+    assert scheduler.enqueue_request(request.replace()) is True
+    queue.push.assert_called_once()
+    assert len(membership_filter) == 1
+
+  def test_serialization_error_after_intent_publication_cleans_owner_maps(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    dupefilter = _SerializationAfterReservationDupeFilter(
+      connection_manager=manager,
+      membership_filter=MemoryMembershipFilter(maxsize=None),
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    for attempt in range(3):
+      request = Request(f"https://example.com/intent-error/{attempt}")
+      assert scheduler.enqueue_request(request) is False
+      assert dupefilter._active_reservations == {}
+      assert dupefilter._reservations_by_owner == {}
+
+    queue.push.assert_not_called()
+
+  def test_durable_push_commit_interruption_cleans_by_owner_intent(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    strategy = MagicMock(name="DurableQueueStrategy")
+    strategy.is_push_durable.return_value = True
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="commit-interruption",
+      queue_strategy=strategy,
+    )
+    signal = _SchedulerStop()
+    membership = MemoryMembershipFilter(maxsize=None)
+    dupefilter = _CommitInterruptingDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership,
+      signal=signal,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    scheduler._queue = queue
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(Request("https://example.com/commit-stop"))
+
+    assert raised.value is signal
+    strategy.push.assert_called_once()
+    assert len(membership) == 0
+    assert dupefilter._active_reservations == {}
+    assert dupefilter._reservations_by_owner == {}
+
+  def test_class_level_queue_push_monkeypatch_is_not_bypassed(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    strategy = MagicMock(name="DurableQueueStrategy")
+    strategy.is_push_durable.return_value = True
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="class-patched-push",
+      queue_strategy=strategy,
+    )
+    membership = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    scheduler._queue = queue
+    patched_push = mocker.patch.object(
+      BackendQueue,
+      "push",
+      side_effect=QueueError("patched public push failed"),
+    )
+    request = Request("https://example.com/class-patched-push")
+
+    assert scheduler.enqueue_request(request) is False
+
+    patched_push.assert_called_once_with(request, priority=0)
+    strategy.push.assert_not_called()
+    assert len(membership) == 0
+    assert dupefilter._active_reservations == {}
+    assert dupefilter._reservations_by_owner == {}
+
+  def test_process_control_uses_silent_intent_cleanup_and_preserves_signal(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = mocker.MagicMock(spec=MembershipFilter)
+    membership_filter.__contains__.return_value = False
+    membership_filter.add.return_value = True
+    membership_filter.saturation = None
+    original = _SchedulerStop()
+    cleanup = _SchedulerStop()
+    monitor = _OneShotSchedulerStopMonitor(cleanup)
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      monitor=monitor,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = [original, None]
+    scheduler._queue = queue
+    request = Request("https://example.com/cleanup-stop")
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(request)
+    assert raised.value is original
+    assert queue.push.call_count == 1
+    membership_filter.remove.assert_not_called()
+    assert monitor._raised is False
+
+    monitor._raised = True
+    assert scheduler.enqueue_request(request.replace()) is True
+    assert queue.push.call_count == 2
+
+  def test_secondary_cleanup_signal_cannot_replace_primary_or_leak_receipt(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    original = _SchedulerStop()
+    cleanup = _SchedulerStop()
+    dupefilter = _IntentCleanupInterruptingDupeFilter(
+      connection_manager=manager,
+      membership_filter=MemoryMembershipFilter(maxsize=None),
+      signal=cleanup,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = original
+    scheduler._queue = queue
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(Request("https://example.com/double-stop"))
+
+    assert raised.value is original
+    assert dupefilter.cleanup_calls == 2
+    assert dupefilter._active_reservations == {}
+    assert dupefilter._reservations_by_owner == {}
+
+  def test_cleanup_process_control_after_queue_error_propagates(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = mocker.MagicMock(spec=MembershipFilter)
+    membership_filter.__contains__.return_value = False
+    membership_filter.add.return_value = True
+    membership_filter.saturation = None
+    cleanup = _SchedulerStop()
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      monitor=_OneShotSchedulerStopMonitor(cleanup),
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = QueueError("queue unavailable")
+    scheduler._queue = queue
+
+    with pytest.raises(_SchedulerStop) as raised:
+      scheduler.enqueue_request(Request("https://example.com/cleanup-primary"))
+
+    assert raised.value is cleanup
+    membership_filter.remove.assert_not_called()
+
+  def test_failed_push_does_not_mutate_membership_before_retry(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = mocker.MagicMock(spec=MembershipFilter)
+    membership_filter.__contains__.return_value = False
+    membership_filter.add.return_value = True
+    membership_filter.saturation = None
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = [QueueError("queue unavailable"), None]
+    scheduler._queue = queue
+    request = Request("https://example.com/rollback-retry")
+
+    assert scheduler.enqueue_request(request) is False
+    membership_filter.add.assert_not_called()
+    membership_filter.remove.assert_not_called()
+
+    assert scheduler.enqueue_request(request.replace()) is True
+    assert membership_filter.__contains__.call_count == 2
+    assert membership_filter.add.call_count == 1
+    membership_filter.remove.assert_not_called()
+    assert queue.push.call_count == 2
+
+  def test_degraded_monitor_reentry_cannot_create_hidden_reservation(
+    self,
+    mocker,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = mocker.MagicMock(spec=MembershipFilter)
+    membership_filter.__contains__.side_effect = [
+      BackendConnectionError("backend unavailable", backend_type="redis"),
+      False,
+    ]
+    membership_filter.add.return_value = True
+    membership_filter.saturation = None
+    monitor = _BackendErrorReentrantMonitor()
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      monitor=monitor,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    queue.push.side_effect = [QueueError("queue unavailable"), None]
+    scheduler._queue = queue
+    request = Request("https://example.com/degraded-reentry")
+    monitor.bind(dupefilter, request)
+
+    assert scheduler.enqueue_request(request) is False
+    assert monitor.nested_results == [True]
+    membership_filter.remove.assert_not_called()
+
+    assert scheduler.enqueue_request(request.replace()) is True
+    assert queue.push.call_count == 2
+    assert membership_filter.__contains__.call_count == 2
+    assert membership_filter.add.call_count == 1
+
+  def test_inherited_atomic_extension_does_not_bypass_seen_override(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    dupefilter = _LegacyRequestSeenOverride(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      seen=True,
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    assert scheduler.enqueue_request(Request("https://example.com/custom")) is False
+    assert dupefilter.calls == 1
+    queue.push.assert_not_called()
+
+  def test_seen_override_can_allow_base_filter_duplicate(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    membership_filter = MemoryMembershipFilter(maxsize=None)
+    request = Request("https://example.com/custom-allow")
+    dupefilter = _LegacyRequestSeenOverride(
+      connection_manager=manager,
+      membership_filter=membership_filter,
+      seen=False,
+    )
+    membership_filter.add(dupefilter.request_fingerprint(request).encode())
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    assert scheduler.enqueue_request(request) is True
+    assert dupefilter.calls == 1
+    queue.push.assert_called_once()
+
+  def test_autospec_dupefilter_uses_stable_scrapy_hook(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    dupefilter = create_autospec(BackendDupeFilter, instance=True)
+    dupefilter.request_seen.return_value = False
+    dupefilter.consume_reservation.return_value = False
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request("https://example.com/autospec")
+
+    assert scheduler.enqueue_request(request) is True
+    dupefilter.request_seen.assert_called_once_with(request)
+    dupefilter.request_seen_with_reservation.assert_not_called()
+    queue.push.assert_called_once_with(request, priority=0)
+
+  def test_instance_seen_override_is_not_bypassed(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=MemoryMembershipFilter(maxsize=None),
+    )
+    stable_hook = MagicMock(return_value=True)
+    dupefilter.request_seen = stable_hook  # type: ignore[method-assign]
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request("https://example.com/instance-override")
+
+    assert scheduler.enqueue_request(request) is False
+    stable_hook.assert_called_once_with(request)
+    queue.push.assert_not_called()
+
+  def test_class_level_seen_monkeypatch_is_not_bypassed(self, mocker) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    stable_hook = mocker.patch.object(
+      BackendDupeFilter,
+      "request_seen",
+      return_value=False,
+    )
+    dupefilter = BackendDupeFilter(
+      connection_manager=manager,
+      membership_filter=MemoryMembershipFilter(maxsize=None),
+    )
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+    request = Request("https://example.com/class-override")
+
+    assert scheduler.enqueue_request(request) is True
+    stable_hook.assert_called_once_with(request)
+    queue.push.assert_called_once_with(request, priority=0)
+
+  def test_explicit_independent_atomic_protocol_is_honored(self) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    dupefilter = _ExplicitAtomicDupeFilter()
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    assert scheduler.enqueue_request(Request("https://example.com/atomic")) is True
+    assert dupefilter.atomic_calls == 1
+    assert dupefilter.legacy_calls == 0
+    assert dupefilter.commits == [dupefilter.receipt]
+    assert not dupefilter.rollbacks
+    assert not dupefilter.intent_rollbacks
+
+  def test_post_push_commit_error_does_not_reclassify_durable_enqueue(
+    self,
+  ) -> None:
+    manager = MagicMock(name="ConnectionManager")
+    counts, stats = _stats_counter()
+    dupefilter = _CommitFailingExplicitAtomicDupeFilter()
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      dupefilter=dupefilter,
+      stats=stats,
+    )
+    queue = MagicMock(name="BackendQueue")
+    scheduler._queue = queue
+
+    assert scheduler.enqueue_request(Request("https://example.com/commit")) is True
+
+    queue.push.assert_called_once()
+    assert not dupefilter.rollbacks
+    assert not dupefilter.intent_rollbacks
+    assert counts.get("scheduler/dupefilter_commit_error") == 1
+    assert counts.get("scheduler/enqueued") == 1
+
   def test_degraded_dedup_miss_does_not_roll_back_uncreated_reservation(
     self,
     mocker,
   ) -> None:
-    """An open circuit admits a request but creates no fingerprint to undo."""
+    """An open circuit admits intent without mutating membership on failure."""
     manager = MagicMock(name="ConnectionManager")
-    membership_filter = mocker.Mock(name="membership_filter")
-    membership_filter.add.side_effect = CircuitBreakerOpenError("redis-set")
+    membership_filter = mocker.MagicMock(spec=MembershipFilter)
+    membership_filter.__contains__.side_effect = CircuitBreakerOpenError(
+      "redis-set"
+    )
     membership_filter.saturation = None
     dupefilter = BackendDupeFilter(
       connection_manager=manager,
@@ -489,6 +1489,7 @@ class TestEnqueueDedupReservation:
 
     request = Request("https://example.com/no-reservation")
     assert scheduler.enqueue_request(request) is False
+    membership_filter.add.assert_not_called()
     membership_filter.remove.assert_not_called()
 
   def test_committed_replacement_ack_failure_keeps_dedup_reservation(
@@ -500,6 +1501,7 @@ class TestEnqueueDedupReservation:
     backend = manager.get_queue_backend.return_value
     backend.ack.side_effect = QueueError("source ack failed")
     strategy = MagicMock(name="QueueStrategy")
+    strategy.is_push_durable.return_value = True
     membership_filter = MemoryMembershipFilter(maxsize=None)
     dupefilter = BackendDupeFilter(
       connection_manager=manager,
@@ -533,7 +1535,7 @@ class TestEnqueueDedupReservation:
     assert counts.get("scheduler/queue_error") is None
     assert request.meta["_backend_ack_token"] == "old-token"
 
-  def test_reservation_precedes_push_and_filters_reentrant_duplicate(self) -> None:
+  def test_reentrant_push_can_complete_two_at_least_once_attempts(self) -> None:
     manager = MagicMock(name="ConnectionManager")
     membership_filter = MemoryMembershipFilter(maxsize=None)
     dupefilter = BackendDupeFilter(
@@ -548,16 +1550,21 @@ class TestEnqueueDedupReservation:
     scheduler._queue = queue
     request = Request("https://example.com/concurrent")
     nested_results: list[bool] = []
+    reentered = False
 
     def push(_request: Request, *, priority: float = 0.0) -> None:
+      nonlocal reentered
       del _request, priority
+      if reentered:
+        return
+      reentered = True
       nested_results.append(scheduler.enqueue_request(request.replace()))
 
     queue.push.side_effect = push
 
     assert scheduler.enqueue_request(request) is True
-    assert nested_results == [False]
-    assert queue.push.call_count == 1
+    assert nested_results == [True]
+    assert queue.push.call_count == 2
     assert len(membership_filter) == 1
 
   def test_custom_dupefilter_without_forget_records_rollback_error(self) -> None:

@@ -112,6 +112,11 @@ class ThrottleQueueStrategy(QueueStrategy):
     self._last_pop: float | None = None
     self._gate_lock = threading.Lock()
 
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    """Report that throttling affects pops, never backend push durability."""
+    del delay, source
+    return True
+
   def push(
     self,
     queue_name: str,

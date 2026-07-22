@@ -9,8 +9,8 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import AsyncIterable, Iterable, Mapping
-from inspect import isawaitable
+from collections.abc import AsyncIterable, Callable, Iterable, Mapping
+from inspect import getattr_static, isawaitable
 from typing import TYPE_CHECKING, Any
 
 from scrapy import signals
@@ -58,6 +58,137 @@ logger = logging.getLogger(__name__)
 _LIFECYCLE_NEW = "new"
 _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
+_MISSING_STATIC_ATTRIBUTE = object()
+
+
+def _static_declaration_rank(component: object, name: str) -> int | None:
+  """Return how close a class-declared capability is in the concrete MRO.
+
+  Per-instance attributes (including autospec-created ``MagicMock`` methods)
+  and dynamic ``__getattr__`` values are not stable protocol declarations.
+  """
+  if (
+    getattr_static(component, name, _MISSING_STATIC_ATTRIBUTE)
+    is _MISSING_STATIC_ATTRIBUTE
+  ):
+    return None
+  for index, cls in enumerate(type(component).__mro__):
+    if name in vars(cls):
+      return index
+  return None
+
+
+def _atomic_dupefilter_methods(
+  dupefilter: object,
+) -> tuple[
+  Callable[[Request, object], Any],
+  Callable[[object], None],
+  Callable[[object], None] | None,
+  Callable[[object], None],
+  Callable[[object], None],
+] | None:
+  """Resolve an explicitly compatible transactional dupefilter extension."""
+  try:
+    instance_attributes = object.__getattribute__(dupefilter, "__dict__")
+  except (AttributeError, TypeError):
+    instance_attributes = {}
+  protocol_names = (
+    "request_seen_with_reservation",
+    "commit_reservation",
+    "rollback_reservation",
+    "rollback_reservation_intent",
+  )
+  if isinstance(instance_attributes, Mapping) and any(
+    name in instance_attributes for name in protocol_names
+  ):
+    # A coherent extension is a class-level protocol. Per-instance shadows
+    # (including autospec mocks) can expose an arbitrary partial combination.
+    return None
+  if isinstance(instance_attributes, Mapping) and "request_seen" in instance_attributes:
+    # Scrapy's stable hook is intentionally monkeypatchable per instance. An
+    # inherited extension must not bypass that closer policy override.
+    return None
+  atomic_rank = _static_declaration_rank(
+    dupefilter,
+    "request_seen_with_reservation",
+  )
+  commit_rank = _static_declaration_rank(dupefilter, "commit_reservation")
+  rollback_rank = _static_declaration_rank(dupefilter, "rollback_reservation")
+  intent_rank = _static_declaration_rank(
+    dupefilter,
+    "rollback_reservation_intent",
+  )
+  if (
+    atomic_rank is None
+    or commit_rank is None
+    or rollback_rank is None
+    or intent_rank is None
+  ):
+    return None
+
+  # Existing BackendDupeFilter subclasses may override only Scrapy's stable
+  # request_seen() hook. An inherited newer extension must not bypass that
+  # custom policy unless the subclass also declares the atomic method at least
+  # as close in the MRO.
+  standard_rank = _static_declaration_rank(dupefilter, "request_seen")
+  if standard_rank is not None and standard_rank < atomic_rank:
+    return None
+  canonical_rank = _static_declaration_rank(
+    dupefilter,
+    "_atomic_protocol_request_seen",
+  )
+  if canonical_rank is not None and canonical_rank == standard_rank:
+    canonical_standard = getattr_static(
+      dupefilter,
+      "_atomic_protocol_request_seen",
+    )
+    current_standard = getattr_static(dupefilter, "request_seen")
+    if current_standard is not canonical_standard:
+      return None
+
+  atomic = getattr(dupefilter, "request_seen_with_reservation")
+  commit = getattr(dupefilter, "commit_reservation")
+  volatile_commit: Callable[[object], None] | None = None
+  if _static_declaration_rank(dupefilter, "commit_volatile_reservation") is not None:
+    candidate = getattr(dupefilter, "commit_volatile_reservation")
+    if callable(candidate):
+      volatile_commit = candidate
+  rollback = getattr(dupefilter, "rollback_reservation")
+  rollback_intent = getattr(dupefilter, "rollback_reservation_intent")
+  if (
+    not callable(atomic)
+    or not callable(commit)
+    or not callable(rollback)
+    or not callable(rollback_intent)
+  ):
+    return None
+  return atomic, commit, volatile_commit, rollback, rollback_intent
+
+
+def _push_queue_with_durability(
+  queue: object,
+  request: Request,
+  *,
+  priority: float,
+) -> bool | None:
+  """Push while preserving the stable public queue return contract.
+
+  The bundled queue exposes a package-private durability result. A custom
+  queue, subclass override, or instance monkeypatch continues through its
+  public ``push`` method and is treated as having unknown durability for
+  backward compatibility.
+  """
+  declared_push = getattr_static(queue, "push", _MISSING_STATIC_ATTRIBUTE)
+  canonical_push = getattr_static(
+    queue,
+    "_scheduler_protocol_push",
+    _MISSING_STATIC_ATTRIBUTE,
+  )
+  if isinstance(queue, BackendQueue) and declared_push is canonical_push:
+    return queue._push_with_durability(request, priority=priority)
+  push = getattr(queue, "push")
+  push(request, priority=priority)
+  return None
 
 
 class _DeferredReplacementAckGroup:
@@ -65,7 +196,7 @@ class _DeferredReplacementAckGroup:
 
   Each replacement request gets a distinct child token. A child becomes
   complete only when ``BackendQueue.push`` reaches its commit boundary (or the
-  scheduler terminates it as a duplicate/invalid replacement). The source is
+  scheduler terminally rejects an invalid replacement). The source is
   acknowledged after the output iterable is exhausted *and* every registered
   child is complete. An output-iteration failure aborts the group with a nack.
   """
@@ -880,9 +1011,12 @@ class BackendScheduler:
       try:
         manager.close()
       except BaseException:
-        logger.exception(
-          "Failed to release ConnectionManager after scheduler factory failure"
-        )
+        try:
+          logger.exception(
+            "Failed to release ConnectionManager after scheduler factory failure"
+          )
+        except BaseException:
+          pass
       raise
 
   @staticmethod
@@ -1053,9 +1187,12 @@ class BackendScheduler:
       try:
         scheduler.close("crawler-factory-failed")
       except BaseException:
-        logger.exception(
-          "Failed to close scheduler after crawler factory failure"
-        )
+        try:
+          logger.exception(
+            "Failed to close scheduler after crawler factory failure"
+          )
+        except BaseException:
+          pass
       raise
 
   @staticmethod
@@ -1156,7 +1293,10 @@ class BackendScheduler:
         try:
           self._close_locked("open-failed")
         except BaseException:
-          logger.exception("Failed to clean up scheduler after open failure")
+          try:
+            logger.exception("Failed to clean up scheduler after open failure")
+          except BaseException:
+            pass
         raise
 
       # Reset backpressure gate for a clean per-spider start (round-4 BP-2).
@@ -1199,10 +1339,13 @@ class BackendScheduler:
         try:
           sig.disconnect(handler, signal=signal)
         except Exception:
-          logger.exception(
-            "Failed to roll back %s after signal registration failure",
-            signal,
-          )
+          try:
+            logger.exception(
+              "Failed to roll back %s after signal registration failure",
+              signal,
+            )
+          except BaseException:
+            pass
       raise
     self._connected_signals = sig
     self._signals_connected = True
@@ -1395,11 +1538,18 @@ class BackendScheduler:
     # Retry/redirect middleware copies the popped request, including our
     # transient errback wrapper. Restore the user's serializable errback before
     # duplicate filtering or queue serialization. The old ack token remains in
-    # meta until the replacement push (or duplicate drop) commits.
+    # meta until the replacement push, durable duplicate handoff, or ordinary
+    # tokenless duplicate drop commits.
     self._restore_original_errback(request)
     priority = request.priority
     phase = "dedup"
     dedup_reserved = False
+    reservation: object | None = None
+    reservation_intent: object | None = None
+    commit_reservation: Callable[[object], None] | None = None
+    commit_volatile_reservation: Callable[[object], None] | None = None
+    rollback_reservation: Callable[[object], None] | None = None
+    rollback_reservation_intent: Callable[[object], None] | None = None
     try:
       # Dedup check is INSIDE the try (round-2 C6 fix) so a dedup-backend
       # outage degrades to default-enqueue instead of crashing the spider.
@@ -1407,42 +1557,113 @@ class BackendScheduler:
       # attributed correctly (review follow-up: the prior branch couldn't
       # tell a dedup raise from a push raise → wrong stat + redundant retry).
       if self.dupefilter is not None and not request.dont_filter:
-        if self.dupefilter.request_seen(request):
-          # A retry/redirect replacement may still carry the delivery token of
-          # its source request. Once business dedup decides to drop that
-          # replacement, no later response signal can terminate the source, so
-          # ack it here exactly once.
-          self._ack_request_token(
-            request,
-            log_message="Failed to ack duplicate replacement request",
-          )
-          if self._spider is not None:
-            self.dupefilter.log(request, self._spider)
-          return False
-        # request_seen atomically reserves a new fingerprint before push. Keep
-        # that ordering so concurrent producers cannot both enqueue the same
-        # request; compensate the reservation if the later push fails.
-        consume_reservation = getattr(
-          self.dupefilter,
-          "consume_reservation",
-          None,
-        )
-        # Scrapy's standard dupefilter protocol has no reservation-result API.
-        # Bundled BackendDupeFilter exposes the precise result so degraded
-        # not-seen outcomes (open circuit / filter full) are never rolled back.
-        # Preserve legacy behavior for custom dupefilters that implement
-        # ``forget`` but not this optional extension.
-        dedup_reserved = (
-          bool(consume_reservation(request))
-          if callable(consume_reservation)
-          else True
-        )
+        atomic_methods = _atomic_dupefilter_methods(self.dupefilter)
+        if atomic_methods is not None:
+          (
+            atomic_decision,
+            commit_reservation,
+            commit_volatile_reservation,
+            rollback_reservation,
+            rollback_reservation_intent,
+          ) = atomic_methods
+          reservation_intent = object()
+          decision = atomic_decision(request, reservation_intent)
+          seen = bool(decision.seen)
+          reservation = decision.reservation
+          observational = bool(getattr(decision, "observational", False))
+        else:
+          observational = False
+          seen = self.dupefilter.request_seen(request)
+          if not seen:
+            consume_reservation = getattr(
+              self.dupefilter,
+              "consume_reservation",
+              None,
+            )
+            # Scrapy's standard dupefilter protocol has no reservation-result
+            # API. Preserve the precise legacy extension when available and
+            # the historical conservative rollback for custom filters that
+            # provide neither optional method.
+            dedup_reserved = (
+              bool(consume_reservation(request))
+              if callable(consume_reservation)
+              else True
+            )
+        if seen:
+          # Monitor callbacks are telemetry, not new scheduling attempts. The
+          # exact originating Request is suppressed without touching its token;
+          # the outer enqueue still owns the durable handoff.
+          if observational:
+            return False
+          if request.meta.get(BACKEND_ACK_TOKEN_META_KEY) is None:
+            if self._spider is not None:
+              self.dupefilter.log(request, self._spider)
+            return False
+          # A marker alone cannot prove that another worker's queue push has
+          # committed. For a broker-sourced replacement, transfer the request
+          # to durable queue storage before BackendQueue acknowledges its token.
+          # This may replay a committed duplicate, but cannot lose the source.
       phase = "push"
-      queue.push(request, priority=priority)
+      push_is_durable = _push_queue_with_durability(
+        queue,
+        request,
+        priority=priority,
+      )
+      if (
+        reservation is not None
+        and commit_reservation is not None
+        and rollback_reservation is not None
+      ):
+        completed_reservation = reservation
+        reservation = None
+        if push_is_durable is False:
+          # A process-local strategy accepted the request, but publishing a
+          # persistent dedup marker would turn a hard crash into permanent
+          # loss. The bundled filter records only a lifecycle-local shadow;
+          # third-party atomic filters without that extension remain unmarked.
+          if commit_volatile_reservation is not None:
+            self._commit_atomic_reservation(
+              completed_reservation,
+              commit_volatile_reservation,
+            )
+            if self.stats:
+              self.stats.inc_value("scheduler/dupefilter_volatile_marker")
+          else:
+            self._rollback_atomic_reservation(
+              completed_reservation,
+              rollback_reservation,
+              preserve_primary=False,
+            )
+            if self.stats:
+              self.stats.inc_value("scheduler/dupefilter_volatile_unmarked")
+        else:
+          self._commit_atomic_reservation(
+            completed_reservation,
+            commit_reservation,
+          )
+        # Retain the owner intent until the commit/rollback call returns. If a
+        # process-control signal interrupts finalization, the outer handler can
+        # still discard bookkeeping without touching an ambiguous marker.
+        reservation_intent = None
       if self.stats:
         self.stats.inc_value("scheduler/enqueued")
     except SerializationError:
-      if dedup_reserved:
+      if reservation is not None and rollback_reservation is not None:
+        self._rollback_atomic_reservation(
+          reservation,
+          rollback_reservation,
+          preserve_primary=False,
+        )
+      elif (
+        reservation_intent is not None
+        and rollback_reservation_intent is not None
+      ):
+        self._rollback_atomic_reservation(
+          reservation_intent,
+          rollback_reservation_intent,
+          preserve_primary=False,
+        )
+      elif dedup_reserved:
         self._rollback_dupefilter_reservation(request)
       logger.exception("Failed to serialize request for enqueue")
       if self.stats:
@@ -1450,6 +1671,15 @@ class BackendScheduler:
       return False
     except (QueueError, BackendError):
       if phase == "dedup":
+        if (
+          reservation_intent is not None
+          and rollback_reservation_intent is not None
+        ):
+          self._rollback_atomic_reservation(
+            reservation_intent,
+            rollback_reservation_intent,
+            preserve_primary=False,
+          )
         # Dedup-backend outage: degrade to enqueue (don't lose the URL),
         # attribute to the dedup-error stat.
         logger.exception("Failed to consult dupefilter; defaulting to enqueue")
@@ -1464,16 +1694,133 @@ class BackendScheduler:
           return False
         return True
       # phase == "push": a plain queue-push failure (not a dedup outage).
-      if dedup_reserved:
+      if reservation is not None and rollback_reservation is not None:
+        self._rollback_atomic_reservation(
+          reservation,
+          rollback_reservation,
+          preserve_primary=False,
+        )
+      elif (
+        reservation_intent is not None
+        and rollback_reservation_intent is not None
+      ):
+        self._rollback_atomic_reservation(
+          reservation_intent,
+          rollback_reservation_intent,
+          preserve_primary=False,
+        )
+      elif dedup_reserved:
         self._rollback_dupefilter_reservation(request)
       logger.exception("Failed to enqueue request")
       if self.stats:
         self.stats.inc_value("scheduler/queue_error")
       return False
+    except BaseException:
+      # Process-control interruption after receipt handoff but before a
+      # confirmed push follows the package's at-least-once policy: compensate
+      # best-effort, preserve the original signal, and accept possible replay
+      # rather than leave a permanent ghost fingerprint.
+      try:
+        if (
+          reservation_intent is not None
+          and rollback_reservation_intent is not None
+        ):
+          # Intent rollback is deliberately telemetry-free and cannot remove
+          # an ambiguous marker. It is therefore the safest process-control
+          # cleanup both before and after the queue commit boundary.
+          rollback_reservation_intent(reservation_intent)
+        elif reservation is not None and rollback_reservation is not None:
+          self._rollback_atomic_reservation(
+            reservation,
+            rollback_reservation,
+            preserve_primary=True,
+          )
+        elif dedup_reserved:
+          self._rollback_dupefilter_reservation(request, preserve_primary=True)
+      except BaseException:
+        # This outer guard also covers an asynchronous signal before the
+        # cleanup callee establishes its own try-region. Retry the silent
+        # owner fence once; it is idempotent and does not mutate membership.
+        if (
+          reservation_intent is not None
+          and rollback_reservation_intent is not None
+        ):
+          try:
+            rollback_reservation_intent(reservation_intent)
+          except BaseException:
+            pass
+        try:
+          logger.exception(
+            "Failed to compensate enqueue interruption while preserving signal"
+          )
+        except BaseException:
+          pass
+      raise
     else:
       return True
 
-  def _rollback_dupefilter_reservation(self, request: Request) -> None:
+  def _rollback_atomic_reservation(
+    self,
+    reservation: object,
+    rollback: Callable[[object], None],
+    *,
+    preserve_primary: bool,
+  ) -> None:
+    """Roll back one receipt with explicit process-control precedence."""
+    try:
+      rollback(reservation)
+    except Exception:  # noqa: BLE001 - preserve the triggering queue failure
+      if preserve_primary:
+        try:
+          logger.exception("Failed to roll back atomic dupefilter reservation")
+          if self.stats:
+            self.stats.inc_value("scheduler/dupefilter_rollback_error")
+        except BaseException:
+          pass
+      else:
+        logger.exception("Failed to roll back atomic dupefilter reservation")
+        if self.stats:
+          self.stats.inc_value("scheduler/dupefilter_rollback_error")
+    except BaseException:
+      if not preserve_primary:
+        raise
+      try:
+        logger.exception("Failed to roll back atomic dupefilter reservation")
+      except BaseException:
+        pass
+      try:
+        if self.stats:
+          self.stats.inc_value("scheduler/dupefilter_rollback_error")
+      except BaseException:
+        pass
+
+  def _commit_atomic_reservation(
+    self,
+    reservation: object,
+    commit: Callable[[object], None],
+  ) -> None:
+    """Finalize receipt bookkeeping after the queue commit boundary.
+
+    An ordinary bookkeeping failure cannot reclassify an already durable push.
+    Process-control signals still propagate, with caller state already cleared
+    so the outer handler cannot roll back the committed marker.
+    """
+    try:
+      commit(reservation)
+    except Exception:  # noqa: BLE001 - queue durability is authoritative
+      try:
+        logger.exception("Failed to finalize atomic dupefilter reservation")
+      except BaseException:
+        pass
+      if self.stats:
+        self.stats.inc_value("scheduler/dupefilter_commit_error")
+
+  def _rollback_dupefilter_reservation(
+    self,
+    request: Request,
+    *,
+    preserve_primary: bool = False,
+  ) -> None:
     """Best-effort compensation for request_seen followed by a failed push.
 
     ``forget`` is an optional extension to Scrapy's dupefilter protocol. The
@@ -1494,10 +1841,30 @@ class BackendScheduler:
 
     try:
       forget(request)
-    except Exception:  # noqa: BLE001 - compensation must not hide push failure
-      logger.exception("Failed to roll back dupefilter reservation")
-      if self.stats:
-        self.stats.inc_value("scheduler/dupefilter_rollback_error")
+    except Exception:  # noqa: BLE001 - preserve the triggering queue failure
+      if preserve_primary:
+        try:
+          logger.exception("Failed to roll back dupefilter reservation")
+          if self.stats:
+            self.stats.inc_value("scheduler/dupefilter_rollback_error")
+        except BaseException:
+          pass
+      else:
+        logger.exception("Failed to roll back dupefilter reservation")
+        if self.stats:
+          self.stats.inc_value("scheduler/dupefilter_rollback_error")
+    except BaseException:  # compensation must not hide process-control primary
+      if not preserve_primary:
+        raise
+      try:
+        logger.exception("Failed to roll back dupefilter reservation")
+      except BaseException:
+        pass
+      try:
+        if self.stats:
+          self.stats.inc_value("scheduler/dupefilter_rollback_error")
+      except BaseException:
+        pass
 
   def next_request(self) -> Request | None:
     """Get the next request from the queue.

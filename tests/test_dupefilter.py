@@ -306,7 +306,7 @@ class TestBackendDupeFilterOpenClose:
       else:
         getattr(dupefilter, operation)()
 
-  def test_filter_close_error_is_not_masked_by_manager_close_error(
+  def test_filter_close_error_defers_manager_release_until_filter_retry(
     self, mock_connection_manager, mocker
   ):
     membership_filter = mocker.MagicMock()
@@ -323,7 +323,80 @@ class TestBackendDupeFilterOpenClose:
       dupefilter.close("finished")
 
     membership_filter.close.assert_called_once_with()
+    mock_connection_manager.close.assert_not_called()
+
+    membership_filter.close.side_effect = None
+    with pytest.raises(ConnectionError, match="manager close failed"):
+      dupefilter.close("filter-retry")
+
+    assert membership_filter.close.call_count == 2
     mock_connection_manager.close.assert_called_once_with()
+
+  def test_open_primary_signal_survives_cleanup_and_diagnostic_failures(
+    self, mock_connection_manager, mocker
+  ):
+    signal = KeyboardInterrupt("open interrupted")
+    membership_filter = mocker.MagicMock()
+    membership_filter.open.side_effect = signal
+    membership_filter.close.side_effect = RuntimeError("cleanup failed")
+    diagnostic = mocker.patch(
+      "scrapy_extension.dupefilter.dupefilter.logger.exception",
+      side_effect=SystemExit("logger failed"),
+    )
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      dupefilter.open()
+
+    assert raised.value is signal
+    diagnostic.assert_called_once()
+    mock_connection_manager.close.assert_not_called()
+
+  def test_failed_filter_close_can_be_retried(
+    self,
+    mock_connection_manager,
+    mocker,
+  ):
+    membership_filter = mocker.MagicMock()
+    membership_filter.close.side_effect = [RuntimeError("close failed"), None]
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+      dupefilter.close("first")
+    with pytest.raises(RuntimeError, match="closing"):
+      dupefilter.request_seen(Request("https://example.com/closing"))
+
+    dupefilter.close("retry")
+    assert membership_filter.close.call_count == 2
+    mock_connection_manager.close.assert_called_once_with()
+
+  def test_failed_manager_close_can_be_retried_without_reclosing_filter(
+    self,
+    mock_connection_manager,
+    mocker,
+  ):
+    membership_filter = mocker.MagicMock()
+    mock_connection_manager.close.side_effect = [
+      ConnectionError("manager close failed"),
+      None,
+    ]
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      membership_filter=membership_filter,
+    )
+
+    with pytest.raises(ConnectionError, match="manager close failed"):
+      dupefilter.close("first")
+    dupefilter.close("retry")
+
+    membership_filter.close.assert_called_once_with()
+    assert mock_connection_manager.close.call_count == 2
 
   def test_from_crawler_keeps_memory_callback_inside_safe_local_sink(
     self, mock_connection_manager, mocker

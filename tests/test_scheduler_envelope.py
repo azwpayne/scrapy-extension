@@ -235,7 +235,7 @@ class TestEnqueueBranchClosure:
     dupefilter.log.assert_not_called()  # _spider None → log skipped
     assert not counts, f"dedup-hit should bump no stats, got {counts}"
 
-  def test_duplicate_replacement_acks_its_original_delivery(self) -> None:
+  def test_duplicate_replacement_uses_durable_push_handoff(self) -> None:
     manager = MagicMock(name="ConnectionManager")
     dupefilter = MagicMock(name="DupeFilter")
     dupefilter.request_seen.return_value = True
@@ -249,11 +249,12 @@ class TestEnqueueBranchClosure:
       meta={BACKEND_ACK_TOKEN_META_KEY: "old-token"},
     )
 
-    assert scheduler.enqueue_request(request) is False
+    assert scheduler.enqueue_request(request) is True
 
-    queue.ack.assert_called_once_with(token="old-token")
-    queue.push.assert_not_called()
-    assert BACKEND_ACK_TOKEN_META_KEY not in request.meta
+    queue.push.assert_called_once_with(request, priority=0)
+    queue.ack.assert_not_called()
+    # A real BackendQueue consumes this token only after its strategy push.
+    assert request.meta[BACKEND_ACK_TOKEN_META_KEY] == "old-token"
 
   def test_final_download_failure_nacks_before_calling_original_errback(self) -> None:
     manager = MagicMock(name="ConnectionManager")

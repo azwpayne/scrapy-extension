@@ -25,7 +25,8 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 - **Pluggable Queue Semantics**: 8 strategies — Passthrough / **Delay** / **RoundRobin** / **Throttle** / **Priority** / **TimeWheel** / **WorkStealing** / **RingBuffer** via `SCRAPY_QUEUE_STRATEGY`
 - **Multi-Backend Coexistence**: bind queue / dedup / storage to *different* backends via `SCRAPY_{QUEUE,SET,STORAGE}_BACKEND_TYPE` (e.g. queue in Redis, dedup + data in MongoDB)
 - **Distributed Queue**: Priority-based request queue across spiders
-- **Duplicate Filtering**: Cross-instance URL deduplication (default: `SetBackend`)
+- **Duplicate Filtering**: Exact cross-instance stored membership (default:
+  `SetBackend`) with crash-safe at-least-once scheduler admission
 - **Item Storage**: Key-value storage with TTL support via `StorageBackend`
 - **Type Safe**: Full type annotations, `py.typed` marker
 - **Secure**: Input validation on key names, topic names, and queue identifiers
@@ -580,13 +581,20 @@ What the library contractually promises — and just as importantly, what it doe
 | Queue | `time_wheel` | Per-process | Timing wheel and overflow heap are local; the same snapshot capability and owner requirements as `delay` apply. |
 | Queue | `work_stealing` | Yes, with explicit topology | Worker queues live in the backend; use stable worker IDs and a complete peer list. Kafka and RocketMQ are rejected. |
 | Queue | `ring_buffer` | Per-process | The bounded in-process buffer is the queue; the backend is intentionally bypassed. |
-| Dedup | `set` (default) | Yes — exact | Backend `SADD`/`SISMEMBER` semantics; byte-identical to pre-strategy behavior (`dupefilter/filters/set_filter.py`). |
+| Dedup | `set` (default) | Yes — exact stored membership | The bundled scheduler checks membership, durably pushes, then publishes the backend marker. Two workers concurrently observing an absent marker may both enqueue; after publication, backend membership is exact. |
 | Dedup | `memory` | Per-process | In-process; optional LRU cap via `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000; round-9 U5). |
 | Dedup | `bloom` | Per-process | Pure-stdlib bit-vector; **never produces false negatives** (a seen URL is always reported seen); false-positive rate is configurable. |
 | Dedup | `cuckoo` | Per-process | Pure-stdlib; **never produces false negatives**; supports deletion; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
 | Storage | all storage-capable backends | Yes | Via the `StorageBackend` KV+TTL contract. |
 
-**Defaults are distributed-exact.** `set` dedup + `passthrough` queue are safe for multi-worker crawls out of the box. `delay` / `throttle` / `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo` are **per-process opt-in**. `priority` and correctly configured `work_stealing` retain backend-side payload durability.
+**Defaults are distributed and crash-safe at-least-once.** `set` dedup +
+`passthrough` queue are safe for multi-worker crawls out of the box: a failed or
+crashed push cannot leave a persistent marker for work no queue accepted. This
+does not promise a cross-worker single winner for a brand-new fingerprint;
+concurrent misses may enqueue safe replay. `delay` / `throttle` /
+`round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo`
+are **per-process opt-in**. `priority` and correctly configured
+`work_stealing` retain backend-side payload durability.
 
 ### Contractual promises
 
@@ -597,6 +605,7 @@ What the library contractually promises — and just as importantly, what it doe
 | **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends.base.JSONSerializer` |
 | **Input names are validated.** Queue / set / index / topic names match the documented safe subsets; injection-shaped inputs are rejected before use. | `backends.base._validate_key_name` and backend topic validators |
 | **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) carry a per-message ack token so the *specific* popped message is acked. Kafka additionally fences tokens by consumer generation, assignment epoch, and unique delivery attempt, preventing a late completion from committing a same-offset redelivery after nack/rebalance. Retry/redirect replacements transfer the token through their queue commit; user errbacks returning one or many requests use child tokens and settle the source only after every replacement is accepted. The scheduler's `from_settings` gate refuses a backend/plugin that declares single-slot ack unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py` (`QueueBackend` ack contract), `backends/kafka.py`, `schedule/scheduler.py` |
+| **Queue-before-marker publication.** On the bundled atomic scheduler/dupefilter path, a persistent dedup marker is published only after a crash-durable queue push. Failed pushes discard local intent without deleting a competing worker's marker. Volatile queue strategies use a bounded lifecycle-local shadow; broker-token replacements are rejected before volatile acceptance. | `schedule/scheduler.py`, `dupefilter/dupefilter.py`, `queue/queue.py` |
 | **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | package and backends `__getattr__` implementations |
 | **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
 | **Backend capability honesty.** A backend never silently no-ops on an unsupported interface: queue-only backends omit `SetBackend`/`StorageBackend` entirely; RocketMQ set/storage are rejected at config time (`ConfigurationError` guard). The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
@@ -605,6 +614,15 @@ What the library contractually promises — and just as importantly, what it doe
 ### What is **not** promised
 
 - **Cross-worker behavior of `delay` / `throttle` / `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo` strategies** — they are per-process by design (see table above).
+- **Cross-worker single-winner enqueue for a new fingerprint.** The safe order
+  is membership read → durable queue push → marker publication, so concurrent
+  workers may both enqueue before either marker exists. Consumers must tolerate
+  at-least-once replay.
+- **Post-queue marker safety for legacy boolean-only dupefilters.** The guarantee
+  applies to the bundled atomic `BackendScheduler` + `BackendDupeFilter` path
+  (and explicit implementations of that extension). Compatibility fallback to
+  `request_seen` / `consume_reservation` / `forget` retains its historical
+  add-before-push, best-effort rollback behavior.
 - **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md).
 - **Stability of fresh hooks** — `on_filter_full` (round-7) and `backpressure_pause_at` / `backpressure_resume_at` (round-4) are new; the hook signatures and setting semantics may evolve in a minor bump.
 - **Wire compatibility for the SQS / Memcached / DynamoDB LocalStack paths** — exercised via LocalStack in CI; not certified against every AWS region or Memcached server version.
@@ -689,12 +707,24 @@ deduplicate across workers. For distributed exact dedup, bind
 
 `delay`, `round_robin`, `throttle`, `time_wheel`, `work_stealing`, and `ring_buffer` keep some state in-process. `passthrough` is the distributed-exact default. See [Ack and durability matrix](#ack-and-durability-matrix) before using a stateful strategy in production.
 
+Third-party `QueueStrategy` implementations are conservatively volatile unless
+they explicitly override `is_push_durable(*, delay, source)` and return the
+literal `True` for that route. Inheriting the base implementation—or omitting
+the hook in an older duck-typed strategy—keeps ordinary requests on the local
+dedup-shadow path and rejects source-token transfers before strategy mutation.
+Return `True` only when every successful `push` for those inputs has crossed a
+crash-durable backend boundary.
+
 `priority` and `work_stealing` fan out one logical queue into multiple physical
 queues. They fail fast with Kafka and RocketMQ because those backends cannot
 isolate a pop to one strategy-selected topic. Backend-delegating strategies
 (`passthrough`, `delay`, `throttle`, `priority`, `time_wheel`, and
 `work_stealing`) preserve MQ ack tokens where supported. `round_robin` and
 `ring_buffer` are fully local and intentionally bypass broker durability.
+With `ring_buffer`'s explicitly lossy `drop_oldest` policy, an overwritten
+request remains in the lifecycle-local dedup shadow until that bounded shadow
+evicts it or the queue lifecycle ends; the drop is therefore terminal for that
+worker lifecycle rather than an automatic retry signal.
 
 `delay`, `round_robin`, `time_wheel`, and `ring_buffer` implement clean-close
 snapshots. Persistence is available only when the queue's connection manager
