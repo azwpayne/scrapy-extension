@@ -41,6 +41,21 @@ def _assert_secret_free(error: BaseException, marker: str = _SECRET) -> None:
   assert marker not in "".join(traceback.format_exception(error))
 
 
+@pytest.fixture(autouse=True)
+def _short_circuit_localhost_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+  # redis-py's ClusterNode.__init__ canonicalises a literal "localhost" host
+  # via socket.gethostbyname at construction time. pytest-socket >=0.8.0
+  # blocks gethostbyname (0.7.0 did not), so cluster-mode connect() — which
+  # builds ClusterNode startup nodes before the mocked RedisCluster is
+  # returned — raised SocketBlockedError under --disable-socket (the project
+  # default in [tool.pytest.ini_options]), wrapping as BackendConnectionError
+  # in 20 cluster contract cases. These tests mock the SDK and never intend
+  # real I/O; map gethostbyname to an identity so connect() reaches the mocked
+  # client. Real socket.socket() connects stay blocked, so accidental live
+  # Redis traffic is still caught.
+  monkeypatch.setattr("socket.gethostbyname", lambda host, *args: host)
+
+
 @pytest.mark.parametrize(
   ("field_name", "kwargs"),
   [
