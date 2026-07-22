@@ -65,6 +65,14 @@ _queue_len_warned: bool = False
 # lease. Zero-delay nack is not supported by the broker.
 _MIN_INVISIBLE_DURATION = 10
 
+# RocketMQ Proxy clamps every SimpleConsumer request to at least five seconds
+# (``grpcClientConsumerMinLongPollingTimeoutMillis``). Sending a shorter SDK
+# await duration also shortens the gRPC deadline; the proxy then rejects the
+# request with 40018 before checking the queue because the deadline cannot cover
+# its polling floor. Match that server contract so short/non-blocking interface
+# requests remain consumable instead of failing deterministically.
+_MIN_LONG_POLL_DURATION = 5
+
 
 class _RocketMQAckToken:
   """Consumer-generation-scoped token for one RocketMQ delivery."""
@@ -208,9 +216,9 @@ class RocketMQBackend(Backend, QueueBackend):
         raise BackendConnectionError(msg, backend_type="rocketmq")
       self._producer.startup()
 
-      # QueueBackend defines ``pop(timeout=0)`` as non-blocking. The client
-      # defaults await_duration to 20 seconds, so initialize it explicitly to
-      # zero; each receive updates the public property from that pop's timeout.
+      # The client defaults await_duration to 20 seconds, so initialize it to
+      # zero; each receive replaces it with the requested duration clamped to
+      # RocketMQ Proxy's five-second server floor.
       self._consumer = SimpleConsumer(
         config_obj,
         consumer_group,
@@ -395,7 +403,10 @@ class RocketMQBackend(Backend, QueueBackend):
         error = "RocketMQBackend not connected: consumer is None"
         raise QueueError(error, queue_name=queue_name, operation="pop")
       self._ensure_subscribed(topic_name, queue_name, consumer)
-      await_duration = math.ceil(timeout) if timeout > 0 else 0
+      await_duration = max(
+        _MIN_LONG_POLL_DURATION,
+        math.ceil(timeout) if timeout > 0 else 0,
+      )
       with self._receive_lock:
         consumer.await_duration = await_duration
         messages = consumer.receive(1, self.config.invisible_duration)
@@ -417,7 +428,8 @@ class RocketMQBackend(Backend, QueueBackend):
       queue_name: Name of the queue.
       timeout: Seconds to wait for a message. The SDK exposes this as the
         consumer's ``await_duration`` property, separate from the processing
-        lease passed to ``receive``.
+        lease passed to ``receive``. RocketMQ Proxy applies a five-second
+        minimum even when the interface requests a shorter wait.
 
     Returns:
       The received message object, or None if no message was available.
@@ -442,7 +454,8 @@ class RocketMQBackend(Backend, QueueBackend):
 
     Args:
       queue_name: Name of the queue.
-      timeout: Seconds to wait (0 = non-blocking).
+      timeout: Requested seconds to wait. RocketMQ Proxy enforces a five-second
+        minimum long-poll window.
 
     Returns:
       Popped item, or None if queue is empty.
@@ -466,7 +479,8 @@ class RocketMQBackend(Backend, QueueBackend):
 
     Args:
       queue_name: Name of the queue.
-      timeout: Seconds to wait (0 = non-blocking).
+      timeout: Requested seconds to wait. RocketMQ Proxy enforces a five-second
+        minimum long-poll window.
 
     Returns:
       ``(body_bytes, msg_token)`` or ``(None, None)`` when empty.

@@ -664,9 +664,9 @@ def test_pop_returns_message(mocker) -> None:
   result = backend.pop("my_queue")
 
   assert result == b"hello-world"
-  # Waiting and processing lease are independent: non-blocking pop uses an
-  # await duration of zero while the default processing lease is 300 seconds.
-  assert mock_consumer.await_duration == 0
+  # Waiting and processing lease are independent. RocketMQ Proxy enforces a
+  # five-second long-poll floor while the processing lease remains 300 seconds.
+  assert mock_consumer.await_duration == 5
   mock_consumer.receive.assert_called_once_with(1, 300)
   mock_consumer.ack.assert_not_called()  # deferred-ack: no inline ack
 
@@ -693,25 +693,27 @@ def test_pop_timeout_controls_await_duration_not_processing_lease(mocker) -> Non
   mock_consumer.receive.assert_called_once_with(1, 90)
 
 
-def test_pop_fractional_timeout_rounds_up_to_sdk_second(mocker) -> None:
-  """The SDK duration is whole seconds; never return before a positive wait."""
+def test_pop_fractional_timeout_clamps_to_proxy_floor(mocker) -> None:
+  """The SDK wait honors RocketMQ Proxy's five-second polling floor."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_consumer.receive.return_value = []
 
   backend.pop("my_queue", timeout=0.1)
 
-  assert mock_consumer.await_duration == 1
+  assert mock_consumer.await_duration == 5
   mock_consumer.receive.assert_called_once_with(1, 300)
 
 
-def test_pop_zero_timeout_is_nonblocking_with_default_processing_lease(mocker) -> None:
-  """Scheduler ``timeout=0`` must not inherit the SDK's 20s long poll."""
+def test_pop_zero_timeout_uses_proxy_floor_with_default_processing_lease(
+  mocker,
+) -> None:
+  """Scheduler ``timeout=0`` uses the proxy floor, not the SDK's 20s default."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)
   mock_consumer.receive.return_value = []
 
   backend.pop("my_queue", timeout=0.0)
 
-  assert mock_consumer.await_duration == 0
+  assert mock_consumer.await_duration == 5
   mock_consumer.receive.assert_called_once_with(1, 300)
 
 
@@ -750,7 +752,7 @@ def test_concurrent_pop_cannot_overwrite_another_calls_await_duration(mocker) ->
 
   assert not short.is_alive()
   assert not long.is_alive()
-  assert observed == [("short-wait", 1), ("long-wait", 7)]
+  assert observed == [("short-wait", 5), ("long-wait", 7)]
 
 
 def test_pop_receive_failure(mocker) -> None:

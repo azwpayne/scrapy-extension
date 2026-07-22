@@ -14,8 +14,8 @@ apache rocketmq-python-client 5.1.1 gRPC):
   body WITHOUT acking; the caller acks via ``ack(token=msg)``. A crash before
   ack → the broker's invisible-duration window redelivers (at-least-once).
   ``_drain`` acks each message as it arrives.
-- ``pop(timeout=t)`` passes ``t`` as the invisible-duration (seconds; default
-  15s when t=0). ``receive`` long-polls up to the consumer's await_duration.
+- ``pop(timeout=t)`` controls the receive wait independently from the message
+  processing lease. RocketMQ Proxy enforces a five-second long-poll floor.
 - ``queue_len`` raises ``NotImplementedError`` (no broker-side depth RPC) so
   unknown depth cannot be mistaken for an empty queue.
 - Topic name is ``{topic_prefix}_{queue_name}``. **RocketMQ topic names
@@ -87,7 +87,7 @@ def _drain(backend, queue: str, n: int, deadline_s: float = 15.0):  # type: igno
   deadline = time.time() + deadline_s
   while len(received) < n and time.time() < deadline:
     try:
-      body, token = backend.pop_with_ack(queue, timeout=1.0)  # 1s receive window
+      body, token = backend.pop_with_ack(queue, timeout=1.0)
     except QueueError as exc:
       # apache rocketmq 5.x proxy has two broker-side propagation races:
       # NPE in ReceiveMessageActivity (delivery race), and "no topic to
