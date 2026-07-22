@@ -107,8 +107,8 @@ Apache gRPC client and requires the broker proxy endpoint (usually
 
 ## Architecture & rationale
 
-- [`.claude/CLAUDE.md`](.claude/CLAUDE.md) — project overview, backend/component
+- [`.claude/CLAUDE.md`](../.claude/CLAUDE.md) — project overview, backend/component
   structure, multi-mode support, lazy imports.
-- [`docs/code-review-2026-06-15.md`](docs/code-review-2026-06-15.md) — the
+- [`docs/code-review-2026-06-15.md`](../docs/code-review-2026-06-15.md) — the
   multi-round adversarial review record: design rationale, every fixed bug, and
   the contract decisions the test suite enforces. The authoritative deep-dive.

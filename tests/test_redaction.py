@@ -83,7 +83,9 @@ def test_redacted_str_ordinary_string_paths_expose_underlying_value() -> None:
 
 def test_security_policy_matches_repr_only_redaction_boundary() -> None:
   """Keep the normative policy aligned with the executable string contract."""
-  policy = (Path(__file__).resolve().parents[1] / "SECURITY.md").read_text(
+  policy = (
+    Path(__file__).resolve().parents[1] / ".github" / "SECURITY.md"
+  ).read_text(
     encoding="utf-8"
   )
   credential_section = policy.split("### Credential redaction", 1)[1].split(

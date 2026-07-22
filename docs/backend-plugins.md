@@ -8,7 +8,7 @@ fork the package to add another — any installed distribution can register a ba
 through the `scrapy_extension.backends` entry-point group, and it is then selectable
 via `SCRAPY_BACKEND_TYPE` exactly like a bundled one.
 
-This document is the authoring contract for 3rd-party plugin authors. `BackendDescriptor` entry-point registration is currently **Experimental** (see [`STABILITY.md`](../STABILITY.md)): usable, tested, and intended for plugin authors, but still allowed to evolve in a minor `0.x` release until a third-party ecosystem validates the surface. The guide covers the entry-point shape, the descriptor dataclass, the lazy-import rule, bundled-wins precedence, and a worked end-to-end example.
+This document is the authoring contract for 3rd-party plugin authors. `BackendDescriptor` entry-point registration is currently **Experimental** (see [`STABILITY.md`](../.github/STABILITY.md)): usable, tested, and intended for plugin authors, but still allowed to evolve in a minor `0.x` release until a third-party ecosystem validates the surface. The guide covers the entry-point shape, the descriptor dataclass, the lazy-import rule, bundled-wins precedence, and a worked end-to-end example.
 
 ## How Registration Works
 

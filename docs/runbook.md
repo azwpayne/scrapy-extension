@@ -679,7 +679,7 @@ exist; this is the canonical procedure until it lands):
 1. **Bump version:** `uv version <bump>` (or edit `pyproject.toml`
    `[project] version`).
 2. **Sync lockfile:** `uv lock` (verify `uv lock --check` passes).
-3. **Update CHANGELOG:** move the [`Unreleased`](../CHANGELOG.md) entries
+3. **Update CHANGELOG:** move the [`Unreleased`](../.github/CHANGELOG.md) entries
    into a new `## [X.Y.Z] — YYYY-MM-DD` section.
 4. **Tag:** `git tag vX.Y.Z` and push the tag.
 5. **Publish:** `uv build && uv publish`.
@@ -692,4 +692,4 @@ exist; this is the canonical procedure until it lands):
    import the package + one backend; confirm `__version__` matches.
 
 For the stability commitment each release makes, see
-[`STABILITY.md`](../STABILITY.md).
+[`STABILITY.md`](../.github/STABILITY.md).

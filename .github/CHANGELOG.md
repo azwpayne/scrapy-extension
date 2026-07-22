@@ -20,7 +20,7 @@ upgrading.
   database must choose distinct `SCRAPY_REDIS_NAMESPACE` values. There is no
   implicit legacy fallback because it could read or delete another
   application's key. Drain or explicitly migrate persistent data before
-  upgrading; see [`docs/migration-guide.md`](docs/migration-guide.md).
+  upgrading; see [`docs/migration-guide.md`](../docs/migration-guide.md).
 - **Redis clients and namespaces now belong to immutable connection
   generations.** While a generation is published, `connect()` is idempotent
   instead of replacing its client; use `disconnect()` / `connect()` after a
@@ -209,7 +209,7 @@ upgrading.
   Botocore FIPS/dual-stack selection remains available when the SQS endpoint
   is unset. Code that depended on `boto3.setup_default_session(...)` or event
   hooks registered only on that global Session must migrate; see
-  [`docs/migration-guide.md`](docs/migration-guide.md).
+  [`docs/migration-guide.md`](../docs/migration-guide.md).
 - **DynamoDB Session/Resource/Table handles now belong to one generation.**
   Every candidate owns a private boto3 Session instead of the process-wide
   default. A live `connect()` is idempotent and candidates are published only
@@ -280,7 +280,7 @@ upgrading.
   repr-redacted snapshot for client and subscription construction, and public
   startup tracebacks suppress driver text. Service URLs are normalized to the
   SDK's case-sensitive scheme and single-prefix cluster syntax; see
-  [`docs/migration-guide.md`](docs/migration-guide.md).
+  [`docs/migration-guide.md`](../docs/migration-guide.md).
 - **Remote Memcached plaintext is now explicit.** Memcached exposes neither
   authentication nor transport encryption through this backend, so a
   non-loopback host now requires
@@ -712,7 +712,7 @@ upgrading.
 - **Added:** entry-point plugin registration — 3rd-party backends register
   via `[project.entry-points."scrapy_extension.backends"]`; the bundled 10
   are statically seeded in `backends/registry.py` as dotted-path strings
-  (lazy-import preserved). See [`docs/backend-plugins.md`](docs/backend-plugins.md).
+  (lazy-import preserved). See [`docs/backend-plugins.md`](../docs/backend-plugins.md).
 - **Added:** backend-plugin author contract documentation.
 - **Added:** `BackendSpiderMixin` shortcut attributes for ElasticSearch +
   RocketMQ (cloud_id / api_key / namesrv_address / access_key / secret_key).

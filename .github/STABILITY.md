@@ -167,6 +167,6 @@ correctness-motivated; none are revertible without re-opening the footgun.
   `SerializationError`, and counted rather than redelivered forever.
 
 See the **Breaking** section of [`CHANGELOG.md`](CHANGELOG.md) `[Unreleased]`
-and the [migration guide](docs/migration-guide.md) for operator steps.
+and the [migration guide](../docs/migration-guide.md) for operator steps.
 
 For the full change history, see [`CHANGELOG.md`](CHANGELOG.md).

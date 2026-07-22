@@ -1,6 +1,6 @@
 # Deep Insight — scrapy-extension (2026-06-24)
 
-> **Maintainer history, not a public roadmap.** This file is a dated execution-era deep-dive. For current public behavior see [`../../README.md`](../../README.md); for API/maturity guarantees see [`../../STABILITY.md`](../../STABILITY.md); for operations see [`../runbook.md`](../runbook.md). Treat the findings below as historical context unless a current issue/PR explicitly revives an item.
+> **Maintainer history, not a public roadmap.** This file is a dated execution-era deep-dive. For current public behavior see [`../../README.md`](../../README.md); for API/maturity guarantees see [`../../STABILITY.md`](../../.github/STABILITY.md); for operations see [`../runbook.md`](../runbook.md). Treat the findings below as historical context unless a current issue/PR explicitly revives an item.
 
 Structured deep-dive by 5 parallel Claude-Code agents (architect/opus, code-reviewer/opus,
 security-reviewer/sonnet, test-engineer/sonnet, explore/haiku) + orchestrator fact-check.

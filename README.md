@@ -15,7 +15,7 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 - [Architecture](#architecture) · [Scrapy Components](#scrapy-components) · [Exceptions](#exceptions)
 - [Examples](#examples) · [Security](#security) · [Testing](#testing) · [License](#license)
 
-> **Deeper docs:** [operations](https://github.com/azwpayne/scrapy-extension/blob/main/docs/runbook.md) · [upgrade and backlog migration](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md) · [plugin authors](https://github.com/azwpayne/scrapy-extension/blob/main/docs/backend-plugins.md) · [API/maturity](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md) · [runnable examples](https://github.com/azwpayne/scrapy-extension/tree/main/examples)
+> **Deeper docs:** [operations](https://github.com/azwpayne/scrapy-extension/blob/main/docs/runbook.md) · [upgrade and backlog migration](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md) · [plugin authors](https://github.com/azwpayne/scrapy-extension/blob/main/docs/backend-plugins.md) · [API/maturity](https://github.com/azwpayne/scrapy-extension/blob/main/.github/STABILITY.md) · [runnable examples](https://github.com/azwpayne/scrapy-extension/tree/main/examples)
 
 ## Features
 
@@ -600,7 +600,7 @@ are **per-process opt-in**. `priority` and correctly configured
 
 | Promise | Where enforced |
 |---|---|
-| **Fail-fast configuration.** Unknown nested fields and typoed flat `SCRAPY_<BACKEND>_*` names raise `ConfigurationError` with a suggestion. Project cross-field/capability checks also raise `ConfigurationError`; Pydantic type/range/enum validation raises `ValidationError`. `ConfigurationError.setting_name` / `.setting_value` are Stable attributes, and sensitive setting names are redacted. | `backends.connectors.resolve_backend_config`, backend settings models; see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md) |
+| **Fail-fast configuration.** Unknown nested fields and typoed flat `SCRAPY_<BACKEND>_*` names raise `ConfigurationError` with a suggestion. Project cross-field/capability checks also raise `ConfigurationError`; Pydantic type/range/enum validation raises `ValidationError`. `ConfigurationError.setting_name` / `.setting_value` are Stable attributes, and sensitive setting names are redacted. | `backends.connectors.resolve_backend_config`, backend settings models; see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/.github/STABILITY.md) |
 | **Structured credential redaction.** Password/token/API-key fields use `SecretStr`; selected SDK-bound values are additionally wrapped in a repr-redacting `str` subclass. That wrapper masks `repr(...)`, `!r`, and repr-based container displays only. Ordinary `str`, default/`!s` f-string, `%s`, formatting, and serialization paths expose the underlying value required for authentication. This does not cover credentials embedded in plain URI fields, caller-owned dictionaries, broker logs, or arbitrary third-party tracebacks; do not log those values. | backend settings models and `backends._redaction` |
 | **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends.base.JSONSerializer` |
 | **Input names are validated.** Queue / set / index / topic names match the documented safe subsets; injection-shaped inputs are rejected before use. | `backends.base._validate_key_name` and backend topic validators |
@@ -623,11 +623,11 @@ are **per-process opt-in**. `priority` and correctly configured
   (and explicit implementations of that extension). Compatibility fallback to
   `request_seen` / `consume_reservation` / `forget` retains its historical
   add-before-push, best-effort rollback behavior.
-- **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md).
+- **Stability of the entry-point registration API** (`BackendDescriptor`) — round-5 surface, no 3rd-party ecosystem yet; expect possible minor-bump changes. See [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/.github/STABILITY.md).
 - **Stability of fresh hooks** — `on_filter_full` (round-7) and `backpressure_pause_at` / `backpressure_resume_at` (round-4) are new; the hook signatures and setting semantics may evolve in a minor bump.
 - **Wire compatibility for the SQS / Memcached / DynamoDB LocalStack paths** — exercised via LocalStack in CI; not certified against every AWS region or Memcached server version.
 
-For the full stability/maturity tiering per backend, see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/STABILITY.md). To report a security issue, see [SECURITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/SECURITY.md). For what changed in each release, see [CHANGELOG.md](https://github.com/azwpayne/scrapy-extension/blob/main/CHANGELOG.md).
+For the full stability/maturity tiering per backend, see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/.github/STABILITY.md). To report a security issue, see [SECURITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/.github/SECURITY.md). For what changed in each release, see [CHANGELOG.md](https://github.com/azwpayne/scrapy-extension/blob/main/.github/CHANGELOG.md).
 
 ## Multi-Backend Coexistence
 
@@ -963,7 +963,7 @@ stored payloads unless the application encrypts them before handing them to the
 extension. Credentials embedded in plain DSN/URI strings are caller-owned and
 must not be logged.
 
-See the complete [security policy](https://github.com/azwpayne/scrapy-extension/blob/main/SECURITY.md).
+See the complete [security policy](https://github.com/azwpayne/scrapy-extension/blob/main/.github/SECURITY.md).
 
 ## Testing
 

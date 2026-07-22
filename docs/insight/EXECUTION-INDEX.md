@@ -1,6 +1,6 @@
 # EXECUTION-INDEX — Maintainer Execution History
 
-> This directory is maintainer planning/history, not the user-facing source of truth. For current public behavior use [`../../README.md`](../../README.md); for API/maturity guarantees use [`../../STABILITY.md`](../../STABILITY.md); for operations use [`../runbook.md`](../runbook.md); for plugin authors use [`../backend-plugins.md`](../backend-plugins.md). Treat the round tables below as historical context unless a current issue/PR explicitly revives an item.
+> This directory is maintainer planning/history, not the user-facing source of truth. For current public behavior use [`../../README.md`](../../README.md); for API/maturity guarantees use [`../../STABILITY.md`](../../.github/STABILITY.md); for operations use [`../runbook.md`](../runbook.md); for plugin authors use [`../backend-plugins.md`](../backend-plugins.md). Treat the round tables below as historical context unless a current issue/PR explicitly revives an item.
 
 Single-page consolidated, prioritized, dependency-ordered index of every executable
 unit discovered across rounds 1-8. Supersedes cross-reading 5 docs. Source SPECs:

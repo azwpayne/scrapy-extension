@@ -53,7 +53,7 @@ dependencies = [
 Homepage = "https://github.com/azwpayne/scrapy-extension"
 Repository = "https://github.com/azwpayne/scrapy-extension"
 Issues = "https://github.com/azwpayne/scrapy-extension/issues"
-Changelog = "https://github.com/azwpayne/scrapy-extension/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/azwpayne/scrapy-extension/blob/main/.github/CHANGELOG.md"
 
 [project.optional-dependencies]
 # NOTE: Backends use PEP 562 lazy imports — deps are loaded on demand.
@@ -66,7 +66,7 @@ rocketmq = ["rocketmq-python-client>=5.1.1,<6"]
 pulsar = ["pulsar-client>=2.11.0,<4"]
 # Experimental — supply-chain caveat: pymemcache is unmaintained (last release
 # 2022-10-17, ~1300+ days stale). The `memcached` extra is storage-only (KV+TTL).
-# See STABILITY.md "Memcached" row for status; tracked as U20.
+# See .github/STABILITY.md "Memcached" row for status; tracked as U20.
 memcached = ["pymemcache>=4.0,<5"]
 sqs = ["boto3>=1.34,<2"]
 dynamodb = ["boto3>=1.34,<2"]
@@ -128,10 +128,10 @@ default-groups = ["dev", "test"]
 
 [tool.uv.build-backend]
 source-include = [
-    "CHANGELOG.md",
-    "CONTRIBUTING.md",
-    "SECURITY.md",
-    "STABILITY.md",
+    ".github/CHANGELOG.md",
+    ".github/CONTRIBUTING.md",
+    ".github/SECURITY.md",
+    ".github/STABILITY.md",
     "docs/**",
     "examples/**",
     "tests/**",
