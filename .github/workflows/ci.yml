@@ -3,13 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  # Fast unit job — runs on every push/PR. No external services required.
+  # Fast unit job — runs on every push to main. No external services required.
   # Integration tests (tests/integration/, marker `integration`) are
   # deselected here; they need live backends and are run in the parallel
   # integration-tests job below.
