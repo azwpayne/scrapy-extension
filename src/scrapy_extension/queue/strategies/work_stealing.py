@@ -45,6 +45,7 @@ from scrapy_extension.queue.strategies._names import (
 )
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
+  _PreparedQueuePush,
   normalize_queue_timeout,
 )
 
@@ -160,6 +161,21 @@ class WorkStealingQueueStrategy(QueueStrategy):
     """Report that each worker queue is backed by durable queue storage."""
     del delay, source
     return True
+
+  def _prepare_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    """Freeze this worker's physical queue before request serialization."""
+    del delay, source
+    return self._prepare_backend_push(
+      self._own_queue(queue_name),
+      priority=priority,
+    )
 
   def push(
     self,

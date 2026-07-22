@@ -82,6 +82,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       _db: The MongoDB database instance.
   """
 
+  _push_is_durable = True
+
   # Read preference mapping - defined as class constant to avoid recreating
   _READ_PREF_MAP: ClassVar[dict[str, str]] = {
     "primary": "primary",

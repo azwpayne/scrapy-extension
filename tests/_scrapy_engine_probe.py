@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from scrapy import Request, Spider, signals
 from scrapy.crawler import CrawlerProcess
 
-from scrapy_extension.backends.base import QueueBackend
+from scrapy_extension.backends.base import QueueBackend, _QueuePushReceipt
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 from scrapy_extension.exceptions import QueueError
@@ -115,6 +115,9 @@ class LoopbackHandler(BaseHTTPRequestHandler):
 class InMemoryAckBackend(QueueBackend):
     """FIFO MQ boundary with explicit, per-delivery ack tokens."""
 
+    # This test double models an external broker boundary even though its
+    # deterministic storage lives in the child probe process.
+    _push_is_durable = True
     requires_ack = True
     supports_concurrent_ack = True
 
@@ -216,6 +219,22 @@ class ProbeManager:
     def get_queue_backend(self) -> InMemoryAckBackend:
         self.connect()
         return BACKEND
+
+    def _push_queue_with_durability(
+        self,
+        queue_name: str,
+        item: bytes,
+        priority: float = 0.0,
+        *,
+        require_durable: bool = False,
+    ) -> _QueuePushReceipt:
+        self.connect()
+        return BACKEND._push_with_durability(
+            queue_name,
+            item,
+            priority,
+            require_durable=require_durable,
+        )
 
     def get_storage_backend(self) -> None:
         raise NotImplementedError

@@ -73,12 +73,21 @@ shadow is capped at 65,536 fingerprints; oldest-first eviction can increase
 safe replay but cannot hide lost work after a crash. A replacement that still
 owns a broker ACK token is rejected before volatile strategy mutation.
 
-A custom `QueueStrategy` is volatile by default. It must override
-`is_push_durable(*, delay, source)` and return the literal `True` only after all
-successful pushes for that route cross a crash-durable backend boundary. Older
-duck-typed strategies without the hook remain usable for ordinary requests but
-receive the local-shadow behavior; source-token transfers fail closed before
-their `push` method runs.
+A custom `QueueStrategy` is volatile by default. The legacy
+`is_push_durable(*, delay, source)` hook is no longer permission to publish a
+persistent marker: a claim made before serialization cannot prove which route
+or backend generation actually accepted the item. Older and claim-only
+strategies remain usable for ordinary requests with the local-shadow behavior;
+source-token transfers fail closed before local mutation. Use a bundled
+backend-delegating strategy when the transfer must acknowledge a broker source.
+
+The bundled path freezes the strategy route before serialization and executes
+one operation-bound backend push. Unknown/third-party backends default to a
+volatile receipt. RabbitMQ is durable only when the connected generation has a
+durable, non-auto-delete, non-exclusive queue and persistent delivery mode 2;
+publisher confirmation alone is not sufficient. A rejected durability policy
+does not count as a circuit-breaker failure and leaves the source token and
+routing metadata available for replay.
 
 `priority` and `work_stealing` create multiple physical queues. Their factories
 raise `ConfigurationError` with Kafka and RocketMQ because those backends use a

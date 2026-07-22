@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any
 
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
+  _PreparedQueuePush,
   normalize_queue_timeout,
 )
 
@@ -229,6 +230,59 @@ class TimeWheelQueueStrategy(QueueStrategy):
     del source
     effective = delay if delay > 0 else self._default_delay
     return effective <= 0
+
+  def _prepare_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    """Freeze the live-backend versus wheel/overflow route exactly once."""
+    del source
+    self.bind(queue_name)
+    effective = delay if delay > 0 else self._default_delay
+
+    if effective <= 0:
+
+      def commit(item: bytes, require_durable: bool) -> bool:
+        normalized_priority = _finite_number(priority, "priority")
+        normalized_delay = _finite_number(delay, "delay")
+        if normalized_delay < 0:
+          raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+        return self._push_backend_prepared(
+          queue_name,
+          item,
+          priority=normalized_priority,
+          require_durable=require_durable,
+        )
+
+      return _PreparedQueuePush(backend_route=True, _commit=commit)
+
+    def publish(item: bytes) -> None:
+      normalized_priority = _finite_number(priority, "priority")
+      normalized_delay = _finite_number(delay, "delay")
+      if normalized_delay < 0:
+        raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+      with self._state_lock:
+        ready_at = self._clock_now() + effective
+        if not math.isfinite(ready_at):
+          raise ValueError(f"ready time must be finite, got {ready_at}")
+        if effective <= self._wheel_duration:
+          slot = self._slot_at(ready_at)
+          self._wheel[slot].append((ready_at, item, normalized_priority))
+        else:
+          heapq.heappush(
+            self._overflow,
+            (ready_at, next(self._seq), item, normalized_priority),
+          )
+
+    return _PreparedQueuePush.local(
+      queue_name=queue_name,
+      strategy_name=type(self).__name__,
+      publish=publish,
+    )
 
   # ------------------------------------------------------------------ pop
 

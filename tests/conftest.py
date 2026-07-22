@@ -12,10 +12,26 @@ def mock_redis_client(mocker):
 @pytest.fixture
 def mock_connection_manager(mocker):
   """Create a mock connection manager."""
+  from scrapy_extension.backends.base import _QueuePushReceipt
+
   manager = mocker.MagicMock()
-  manager.get_queue_backend.return_value = mocker.Mock()
+  queue_backend = mocker.Mock()
+  manager.get_queue_backend.return_value = queue_backend
   manager.get_set_backend.return_value = mocker.Mock()
   manager.get_storage_backend.return_value = mocker.Mock()
+
+  def push_queue_with_durability(
+    queue_name,
+    item,
+    priority=0.0,
+    *,
+    require_durable=False,
+  ):
+    del require_durable
+    queue_backend.push(queue_name, item, priority)
+    return _QueuePushReceipt(worker_crash_durable=True)
+
+  manager._push_queue_with_durability.side_effect = push_queue_with_durability
   return manager
 
 

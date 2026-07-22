@@ -31,7 +31,7 @@ comes from this document; being exported does not automatically make it Stable.
 | `BackendPipeline` (`pipeline/pipeline.py`) | Stable | |
 | `BackendQueue` (`queue/queue.py`) | Stable | `depth_sample_every` (round-9 U4) is Stable with a safe default. |
 | `BackendSpiderMixin` (`spider/spider_mixin.py`) | Stable | |
-| `Backend` / `QueueBackend` / `SetBackend` / `StorageBackend` ABCs | Stable | The abstract contract 3rd-party backends implement. |
+| `Backend` / `QueueBackend` / `SetBackend` / `StorageBackend` ABCs | Stable | The abstract contract 3rd-party backends implement. `QueueBackend.push()` retains its stable signature/`None` return; the `_`-prefixed operation-bound durability receipt is Internal and existing plugins inherit a source-compatible volatile default. |
 | `ConnectionManager` (`backends/connectors.py`) | Stable | Lazy shared registry keyed by `backend_type:settings_digest`. Each `get_manager()` acquisition requires exactly one `close()` release. |
 | `scrapy_extension.backends.connectors.resolve_backend_config()` | Stable | Public fully qualified import used by all three component factories. |
 | `scrapy_extension.monitor.Monitor` / `NullMonitor` / `ScrapyStatsMonitor` | Stable | Public subpackage exports. The hook set is additive; fresh hooks are tiered below. |
@@ -91,7 +91,7 @@ release.
 | MongoDB | Yes | Yes | Yes | Stable — full | Acknowledged writes (`w>=1`/`majority`); TLS/auth; 4 modes (standalone, replica_set, sharded_cluster, atlas). |
 | ElasticSearch | Yes | Yes | Yes | Stable — full | 2 modes (standalone, cloud). |
 | Kafka | Yes | No | No | Stable — queue-only | Mechanism-aware SASL/SSL (PLAIN, SCRAM, ambient GSSAPI; OAUTH provider unsupported); broker-confirmed sends (`acks=1/all`), configured topic durability, conservative committed-offset group lag, and concurrent-safe per-message tokens. `priority`/`work_stealing` strategies are rejected. |
-| RabbitMQ | Yes | No | No | Stable — queue-only | Priority queues; per-message channel-generation tokens; mandatory synchronous publisher confirms. HA policy remains operator-managed. |
+| RabbitMQ | Yes | No | No | Stable — queue-only | Priority queues; per-message channel-generation tokens; mandatory synchronous publisher confirms. A worker-crash durable push receipt additionally requires the connected snapshot to be durable, non-auto-delete, non-exclusive, and delivery mode 2. HA policy remains operator-managed. |
 | Pulsar | Yes | No | No | Stable — queue-only | Topic-bound concurrent ack tokens. Queue depth and purge require an admin API and are unsupported here. |
 | SQS | Yes | No | No | Stable — queue-only | Standard queues; LocalStack + AWS; per-message receipt tokens; approximate depth; finite visibility lease without auto-renewal. |
 | RocketMQ | Yes | Guard | Guard | Stable — queue-only | gRPC proxy (`--enable-proxy`, port 8081); single-outcome per-message deferred ack; finite invisibility lease; queue depth unsupported; `priority`/`work_stealing` rejected. |

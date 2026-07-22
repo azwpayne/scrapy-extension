@@ -208,6 +208,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       _sentinel: Sentinel instance for sentinel mode.
   """
 
+  _push_is_durable = True
+
   def __init__(self, config: RedisSettings) -> None:
     """Initialize Redis backend.
 

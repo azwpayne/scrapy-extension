@@ -289,6 +289,27 @@ class MyBackend(QueueBackend, SetBackend, StorageBackend):
                 del self._store[key]
 ```
 
+### Queue push durability
+
+The concrete `QueueBackend.push()` contract is unchanged. The bundled
+scheduler now classifies durability from a package-private receipt returned by
+the exact backend/breaker generation that performs the push. Existing
+third-party backends inherit a fail-closed implementation:
+
+- an ordinary push calls the plugin's public `push()` exactly once and is
+  treated as volatile for dedup-marker publication;
+- a push that must replace and acknowledge an unacked broker delivery is
+  rejected before the plugin's `push()` mutates its queue;
+- publisher success, a strategy's legacy `is_push_durable()` claim, and custom
+  queue return values are not substitutes for the operation receipt.
+
+The in-process example above is intentionally volatile. There is currently no
+Stable public opt-in for a third-party backend to mint the private receipt; do
+not import or override `_QueuePushReceipt` in a published plugin. Use a bundled
+backend for source-token handoff that must cross a worker-crash durable
+boundary. A future plugin capability will need to bind any opt-in to the exact
+connected generation/configuration rather than expose a separate probe.
+
 ### Selecting it
 
 Once `mybackend-plugin` is installed in the same environment as your Scrapy
@@ -378,6 +399,9 @@ Also verify the lazy-import rule manually: importing `scrapy_extension.backends.
 - [ ] Callable imports **only** `BackendDescriptor` from core — never the backend
       or settings module.
 - [ ] `capabilities` is a subset of `{"queue", "set", "storage"}`.
+- [ ] Queue-capable plugins accept the conservative volatile-receipt behavior;
+      they do not rely on `QueueStrategy.is_push_durable()` to publish a
+      persistent dedup marker or acknowledge a broker source.
 - [ ] Compatibility smoke tests pass for registry discovery, capability selection, and unsupported-capability rejection.
 - [ ] Lazy-import smoke test confirms registry discovery does not import the backend driver module.
 - [ ] No name collision with a bundled or another third-party backend (bundled

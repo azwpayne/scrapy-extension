@@ -8,9 +8,14 @@ from scrapy import Spider
 from scrapy.http import JsonRequest, Request
 from scrapy.utils.request import request_from_dict
 
-from scrapy_extension.backends.base import JSONSerializer
+from scrapy_extension.backends.base import (
+  JSONSerializer,
+  QueueBackend,
+  _DurablePushRequired,
+)
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.strategies.base import QueueStrategy, _PreparedQueuePush
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
@@ -50,6 +55,98 @@ class _LegacyLocalQueueStrategy:
   ) -> None:
     del queue_name, priority, delay, source
     self.items.append(item)
+
+
+class _LyingLocalQueueStrategy(_LegacyLocalQueueStrategy):
+  """Legacy strategy whose old route claim must no longer prove commit."""
+
+  def is_push_durable(self, *, delay: float, source: str) -> bool:
+    del delay, source
+    return True
+
+
+class _MemoryQueueBackend(QueueBackend):
+  """Process-local backend exercising the additive default-false contract."""
+
+  def __init__(self) -> None:
+    self.items: list[bytes] = []
+
+  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    del queue_name, priority
+    self.items.append(item)
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    del queue_name, timeout
+    return self.items.pop(0) if self.items else None
+
+  def queue_len(self, queue_name: str) -> int:
+    del queue_name
+    return len(self.items)
+
+  def clear_queue(self, queue_name: str) -> None:
+    del queue_name
+    self.items.clear()
+
+
+class _DurableMemoryQueueBackend(_MemoryQueueBackend):
+  """Test double for a backend with an invariant durable generation."""
+
+  _push_is_durable = True
+
+
+def _bind_queue_push_operation(manager: Any, backend: QueueBackend) -> None:
+  """Give a lightweight manager the production operation-bound contract."""
+
+  def operation(
+    queue_name: str,
+    item: bytes,
+    priority: float = 0.0,
+    *,
+    require_durable: bool = False,
+  ):
+    try:
+      return backend._push_with_durability(
+        queue_name,
+        item,
+        priority,
+        require_durable=require_durable,
+      )
+    except _DurablePushRequired as e:
+      raise QueueError(
+        "Selected queue backend generation is not worker-crash durable",
+        queue_name=queue_name,
+        operation="push",
+      ) from e
+
+  manager._push_queue_with_durability.side_effect = operation
+
+
+def _durable_strategy_mock(mocker: Any) -> Any:
+  """Mock a strategy that adopts the private operation-bound receipt protocol."""
+  strategy = mocker.MagicMock(spec=QueueStrategy)
+
+  def prepare(
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    def commit(item: bytes, require_durable: bool) -> bool:
+      del require_durable
+      strategy.push(
+        queue_name,
+        item,
+        priority=priority,
+        delay=delay,
+        source=source,
+      )
+      return True
+
+    return _PreparedQueuePush(backend_route=True, _commit=commit)
+
+  strategy._prepare_push.side_effect = prepare
+  return strategy
 
 
 class TestBackendQueueInit:
@@ -792,18 +889,152 @@ class TestBackendQueuePush:
       meta={"_backend_ack_token": "source-token"},
     )
 
-    with pytest.raises(QueueError, match="in-process queue strategy"):
+    with pytest.raises(QueueError, match="not worker-crash durable"):
       queue.push(request)
 
     assert strategy.items == []
     mock_connection_manager.get_queue_backend().ack.assert_not_called()
 
+  def test_legacy_true_route_claim_cannot_create_durable_commit(
+    self, mock_connection_manager
+  ):
+    strategy = _LyingLocalQueueStrategy()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,  # type: ignore[arg-type]
+    )
+
+    durable = queue._push_with_durability(Request("https://example.com/lying"))
+
+    assert durable is False
+    assert len(strategy.items) == 1
+
+  def test_passthrough_old_backend_defaults_to_volatile(self, mocker):
+    backend = _MemoryQueueBackend()
+    manager = mocker.MagicMock(name="ConnectionManager")
+    manager.get_queue_backend.return_value = backend
+    _bind_queue_push_operation(manager, backend)
+    queue = BackendQueue(connection_manager=manager, queue_name="test_queue")
+
+    durable = queue._push_with_durability(
+      Request("https://example.com/volatile-backend")
+    )
+
+    assert durable is False
+    assert len(backend.items) == 1
+
+  def test_passthrough_old_backend_rejects_source_before_push(self, mocker):
+    backend = _MemoryQueueBackend()
+    manager = mocker.MagicMock(name="ConnectionManager")
+    manager.get_queue_backend.return_value = backend
+    _bind_queue_push_operation(manager, backend)
+    queue = BackendQueue(connection_manager=manager, queue_name="test_queue")
+    request = Request(
+      "https://example.com/volatile-replacement",
+      meta={"_backend_ack_token": "source-token"},
+    )
+
+    with pytest.raises(QueueError, match="worker-crash durable"):
+      queue.push(request)
+
+    assert backend.items == []
+    assert request.meta["_backend_ack_token"] == "source-token"
+
+  def test_passthrough_binds_durability_and_push_to_one_backend(self, mocker):
+    first = _DurableMemoryQueueBackend()
+    second = _MemoryQueueBackend()
+    manager = mocker.MagicMock(name="ConnectionManager")
+    manager.get_queue_backend.side_effect = [first, second]
+    _bind_queue_push_operation(manager, first)
+    queue = BackendQueue(connection_manager=manager, queue_name="test_queue")
+
+    durable = queue._push_with_durability(
+      Request("https://example.com/exact-generation")
+    )
+
+    assert durable is True
+    assert len(first.items) == 1
+    assert second.items == []
+    manager._push_queue_with_durability.assert_called_once()
+    manager.get_queue_backend.assert_not_called()
+
+  @pytest.mark.parametrize("strategy_cls", [DelayQueueStrategy, TimeWheelQueueStrategy])
+  def test_backend_route_is_frozen_before_serialization_side_effects(
+    self,
+    mocker,
+    strategy_cls,
+  ):
+    backend = _DurableMemoryQueueBackend()
+    manager = mocker.MagicMock(name="ConnectionManager")
+    manager.get_queue_backend.return_value = backend
+    _bind_queue_push_operation(manager, backend)
+    strategy = strategy_cls(manager, default_delay=0.0)
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+
+    class MutatingSerializer(JSONSerializer):
+      def serialize(self, data: Any) -> bytes:
+        strategy._default_delay = 60.0
+        return super().serialize(data)
+
+    queue.__dict__["_serializer"] = MutatingSerializer()
+
+    durable = queue._push_with_durability(
+      Request("https://example.com/frozen-route")
+    )
+
+    assert durable is True
+    assert len(backend.items) == 1
+    if isinstance(strategy, DelayQueueStrategy):
+      assert strategy._holding == []
+    else:
+      assert not any(strategy._wheel)
+      assert strategy._overflow == []
+
+  @pytest.mark.parametrize("strategy_cls", [DelayQueueStrategy, TimeWheelQueueStrategy])
+  def test_local_route_is_frozen_before_serialization_side_effects(
+    self,
+    mocker,
+    strategy_cls,
+  ):
+    backend = _DurableMemoryQueueBackend()
+    manager = mocker.MagicMock(name="ConnectionManager")
+    manager.get_queue_backend.return_value = backend
+    _bind_queue_push_operation(manager, backend)
+    strategy = strategy_cls(manager, default_delay=60.0)
+    queue = BackendQueue(
+      connection_manager=manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+
+    class MutatingSerializer(JSONSerializer):
+      def serialize(self, data: Any) -> bytes:
+        strategy._default_delay = 0.0
+        return super().serialize(data)
+
+    queue.__dict__["_serializer"] = MutatingSerializer()
+
+    durable = queue._push_with_durability(
+      Request("https://example.com/frozen-local-route")
+    )
+
+    assert durable is False
+    assert backend.items == []
+    if isinstance(strategy, DelayQueueStrategy):
+      assert len(strategy._holding) == 1
+    else:
+      assert sum(len(slot) for slot in strategy._wheel) + len(strategy._overflow) == 1
+
   def test_push_replacement_acks_consumed_delivery_token_after_enqueue(
     self, mock_connection_manager, mock_spider, mocker
   ):
     """A retry/redirect replacement must terminate its original MQ delivery."""
-    strategy = mocker.MagicMock()
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock(mocker)
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
       queue_name="test_queue",
@@ -827,8 +1058,7 @@ class TestBackendQueuePush:
     self, mock_connection_manager, mocker
   ):
     """A post-commit ack failure must not reclassify the push as rejected."""
-    strategy = mocker.MagicMock()
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock(mocker)
     backend = mock_connection_manager.get_queue_backend.return_value
     backend.ack.side_effect = QueueError("source ack failed")
     spider = mocker.Mock()
@@ -854,8 +1084,7 @@ class TestBackendQueuePush:
     self, mock_connection_manager, mock_spider, mocker
   ):
     """The original delivery remains recoverable until replacement enqueue commits."""
-    strategy = mocker.MagicMock()
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock(mocker)
     strategy.push.side_effect = QueueError("push failed")
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
@@ -900,7 +1129,7 @@ class TestBackendQueuePush:
       meta={"_backend_ack_token": "old-token"},
     )
 
-    with pytest.raises(QueueError, match="in-process queue strategy"):
+    with pytest.raises(QueueError, match="not worker-crash durable"):
       queue.push(request)
 
     assert strategy.queue_len("test_queue") == 0

@@ -36,6 +36,8 @@ from scrapy_extension.backends.base import (
     Backend,
     BackendType,
     QueueBackend,
+    _DurablePushRequired,
+    _QueuePushReceipt,
     _validate_key_name,
     secret_value,
 )
@@ -928,8 +930,36 @@ class RabbitMQBackend(Backend, QueueBackend):
         QueueError: If the push operation fails.
         ValueError: If queue_name contains invalid characters.
     """
+    self._push_with_durability(queue_name, item, priority)
+
+  def _push_with_durability(
+    self,
+    queue_name: str,
+    item: bytes,
+    priority: float = 0.0,
+    *,
+    require_durable: bool = False,
+  ) -> _QueuePushReceipt:
+    """Publish and classify durability under one delivery-session lock.
+
+    Publisher confirmation proves broker acceptance, not persistence.  A
+    worker-crash durable receipt additionally requires the exact connected
+    generation to use a durable, non-auto-delete, non-exclusive queue and
+    persistent messages.  Synthetic/private sessions without a validated
+    connection snapshot are therefore always classified as volatile.
+    """
     _validate_key_name(queue_name, "queue_name")
     with self._delivery_lock:
+      snapshot = self._connection_snapshot
+      durable = (
+        snapshot is not None
+        and snapshot.durable is True
+        and snapshot.auto_delete is False
+        and snapshot.exclusive is False
+        and snapshot.delivery_mode == 2
+      )
+      if require_durable and not durable:
+        raise _DurablePushRequired
       channel = self._channel
       if channel is None:
         msg = "Not connected to RabbitMQ"
@@ -972,6 +1002,7 @@ class RabbitMQBackend(Backend, QueueBackend):
           queue_name=queue_name,
           operation="push",
         ) from e
+      return _QueuePushReceipt(worker_crash_durable=durable)
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.

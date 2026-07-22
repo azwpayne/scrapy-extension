@@ -214,6 +214,7 @@ class KafkaBackend(Backend, QueueBackend):
       _known_topics: Set of topics known to exist (cached to avoid repeated checks).
   """
 
+  _push_is_durable = True
   requires_ack = True
   supports_concurrent_ack = True
 

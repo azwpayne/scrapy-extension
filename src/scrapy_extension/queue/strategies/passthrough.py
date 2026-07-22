@@ -13,6 +13,7 @@ from typing import Any
 
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
+  _PreparedQueuePush,
   normalize_queue_timeout,
 )
 
@@ -28,6 +29,18 @@ class PassthroughQueueStrategy(QueueStrategy):
     """Report that every accepted item is stored by the queue backend."""
     del delay, source
     return True
+
+  def _prepare_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    """Freeze the passthrough route; durability comes from the exact push."""
+    del delay, source
+    return self._prepare_backend_push(queue_name, priority=priority)
 
   def push(
     self,

@@ -512,6 +512,22 @@ upgrading.
 
 ### Fixed
 
+- Queue publication durability is now proved by the same operation that pushes
+  through one exact backend/circuit-breaker generation. Strategy routes are
+  frozen before serialization, so mutable delay defaults cannot flip a probed
+  backend route into process-local holding (or the reverse). Legacy
+  `QueueStrategy.is_push_durable()` claims and custom queue return values no
+  longer authorize persistent dedup markers; only a literal operation receipt
+  does. Existing third-party `QueueBackend.push()` implementations remain
+  source compatible and default to volatile, with durability-required transfers
+  rejected before mutation. Redis, MongoDB, ElasticSearch, Kafka, RocketMQ,
+  Pulsar, and SQS opt into worker-crash durability. RabbitMQ does so per
+  connected snapshot only when the queue is durable, non-auto-delete,
+  non-exclusive, and uses persistent delivery mode 2; publisher confirmation
+  alone is insufficient. Circuit-breaker proxies now wrap the combined
+  operation and forward `requires_ack` / `supports_concurrent_ack` without ABC
+  defaults shadowing the backend. Unknown custom queue results (`False`, `True`,
+  `None`, or another truthy value) all take the volatile marker path.
 - Time-wheel slot drains now retain ownership until each live-backend push
   returns. A backend or process-control failure keeps the failing entry and the
   unattempted tail in their original order without restoring the successfully
@@ -532,11 +548,10 @@ upgrading.
   retain their public API and capability-selection shapes. The no-ghost
   guarantee applies only to the bundled atomic pair (or an explicit compatible
   atomic dupefilter); legacy boolean-only fallback keeps best-effort rollback.
-  Third-party `QueueStrategy` durability now fails closed: the base hook returns
+  Third-party `QueueStrategy` durability fails closed: the base hook returns
   `False`, older duck-typed strategies without the hook are also volatile, and
-  only a literal `True` opts a route into persistent marker publication and
-  broker-source transfer. Bundled backend-delegating strategies declare their
-  durable routes explicitly. Class-level `BackendQueue.push` monkeypatches are
+  the later operation-bound receipt hardening above supersedes pre-push hook
+  claims entirely. Class-level `BackendQueue.push` monkeypatches are
   honored by a definition-time identity fence. Reservation reprs omit request
   and owner data, monitor fences use invocation identity instead of reusable
   frame IDs, and failed custom-filter close keeps its manager alive for retry.

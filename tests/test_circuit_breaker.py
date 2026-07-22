@@ -649,6 +649,12 @@ class _FakeMQBackend(_FakeQueueBackend):
     return (b"ACK-PATH", "REAL-TOKEN")
 
 
+class _FakeDurableSingleSlotBackend(_FakeQueueBackend):
+  requires_ack = True
+  supports_concurrent_ack = False
+  _push_is_durable = True
+
+
 class _FakeSetBackend(SetBackend):
   def __init__(self) -> None:
     self.added: list[bytes] = []
@@ -778,6 +784,25 @@ class TestQueueBackendProxy:
     wrapped.push("q1", b"a", 5.0)
     assert backend.pushed == [("q1", b"a", 5.0)]
     assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+
+  def test_semantic_capabilities_and_durable_push_follow_raw_backend(self):
+    backend = _FakeDurableSingleSlotBackend()
+    breaker = CircuitBreaker("q", failure_threshold=3)
+    wrapped = wrap_queue_backend(backend, breaker)
+
+    assert wrapped.requires_ack is True
+    assert wrapped.supports_concurrent_ack is False
+    assert (
+      wrapped._push_with_durability(
+        "q1",
+        b"a",
+        2.0,
+        require_durable=True,
+      ).worker_crash_durable
+      is True
+    )
+    assert backend.pushed == [("q1", b"a", 2.0)]
     assert breaker.failure_count == 0
 
   def test_pop_with_ack_success_dispatches_to_override_and_preserves_token(self):

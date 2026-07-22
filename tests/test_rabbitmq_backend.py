@@ -5,6 +5,7 @@ import ssl
 import pika.exceptions
 import pytest
 
+from scrapy_extension.backends.base import _DurablePushRequired
 from scrapy_extension.backends.rabbitmq import RabbitMQBackend
 from scrapy_extension.exceptions import (
   BackendConnectionError,
@@ -155,6 +156,57 @@ def test_rabbitmq_backend_push(mocker):
   assert call_kwargs["routing_key"] == "test_queue"
   assert call_kwargs["body"] == b"test_item"
   assert call_kwargs["mandatory"] is True
+
+
+@pytest.mark.parametrize(
+  ("policy", "expected_durable"),
+  [
+    ({}, True),
+    ({"durable": False}, False),
+    ({"auto_delete": True}, False),
+    ({"exclusive": True}, False),
+    ({"delivery_mode": 1}, False),
+  ],
+)
+def test_rabbitmq_operation_bound_durability_uses_frozen_policy(
+  mocker, policy, expected_durable
+):
+  backend = RabbitMQBackend(RabbitMQSettings(**policy))
+  connection = mocker.MagicMock(is_open=True)
+  channel = mocker.MagicMock(is_open=True)
+  channel.basic_publish.return_value = None
+  connection.channel.return_value = channel
+  mocker.patch("pika.BlockingConnection", return_value=connection)
+  backend.connect()
+
+  assert (
+    backend._push_with_durability(
+      "q", b"item", require_durable=False
+    ).worker_crash_durable
+    is expected_durable
+  )
+  first_publish_count = channel.basic_publish.call_count
+
+  if expected_durable:
+    assert backend._push_with_durability(
+      "q", b"required", require_durable=True
+    ).worker_crash_durable
+    assert channel.basic_publish.call_count == first_publish_count + 1
+  else:
+    with pytest.raises(_DurablePushRequired):
+      backend._push_with_durability("q", b"required", require_durable=True)
+    assert channel.basic_publish.call_count == first_publish_count
+
+
+def test_rabbitmq_synthetic_session_cannot_claim_durable_push(mocker):
+  backend = RabbitMQBackend(RabbitMQSettings())
+  channel = mocker.MagicMock(is_open=True)
+  backend._activate_channel(mocker.MagicMock(is_open=True), channel)
+
+  with pytest.raises(_DurablePushRequired):
+    backend._push_with_durability("q", b"item", require_durable=True)
+
+  channel.basic_publish.assert_not_called()
 
 
 @pytest.mark.parametrize(

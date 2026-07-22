@@ -114,6 +114,7 @@ class RocketMQBackend(Backend, QueueBackend):
   ``ConfigurationError`` in ``__init__``).
   """
 
+  _push_is_durable = True
   # Ack capability (initiative #4 — at-least-once): the apache SimpleConsumer
   # uses a deferred-ack model. ``receive`` yields messages WITHOUT acking; the
   # caller acks via the opaque token after processing. A crash before ack →

@@ -30,6 +30,7 @@ from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
   _BoundQueueAckToken,
+  _PreparedQueuePush,
   _QueueAckToken,
   normalize_queue_timeout,
 )
@@ -331,13 +332,32 @@ class BackendQueue:
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise error from e
-    durability_probe = getattr(self._strategy, "is_push_durable", None)
-    push_is_durable = (
-      durability_probe(delay=delay, source=source) is True
-      if callable(durability_probe)
-      else False
-    )
-    if replacement_ack_token is not None and not push_is_durable:
+    if isinstance(self._strategy, QueueStrategy):
+      prepared_push = self._strategy._prepare_push(
+        self.queue_name,
+        priority=priority,
+        delay=delay,
+        source=source,
+      )
+    else:
+      # Legacy duck-typed strategies remain usable for ordinary pushes, but
+      # their historical ``is_push_durable`` claim is not commit evidence.
+      def publish_legacy(item: bytes) -> None:
+        self._strategy.push(
+          self.queue_name,
+          item,
+          priority=priority,
+          delay=delay,
+          source=source,
+        )
+
+      prepared_push = _PreparedQueuePush.local(
+        queue_name=self.queue_name,
+        strategy_name=type(self._strategy).__name__,
+        publish=publish_legacy,
+      )
+
+    if replacement_ack_token is not None and not prepared_push.backend_route:
       # A source delivery can be terminated only after its replacement crosses
       # a crash-durable boundary. Delay/time-wheel holding state, round-robin
       # deques, and ring buffers are process-local; accepting into them and then
@@ -347,9 +367,9 @@ class BackendQueue:
       # broker redelivery can retry under a durable strategy/configuration.
       self._inc_stat("scheduler/queue/volatile_replacement_rejected")
       raise QueueError(
-        f"Cannot transfer a broker source delivery into in-process queue "
-        f"strategy {type(self._strategy).__name__}; use a backend-durable "
-        "strategy or remove the local delay/source routing",
+        "Cannot transfer a broker source delivery through the selected "
+        f"{type(self._strategy).__name__} route because it is not "
+        "worker-crash durable",
         queue_name=self.queue_name,
         operation="push",
       )
@@ -390,9 +410,20 @@ class BackendQueue:
     # (which would defeat round-robin fairness on the retry path). Callers
     # that want delay/source on every push must re-set them between pushes
     # — see the breaking-change note in the docstring.
-    self._strategy.push(
-      self.queue_name, data, priority=priority, delay=delay, source=source
+    push_is_durable = prepared_push.commit(
+      data,
+      require_durable=replacement_ack_token is not None,
     )
+    if replacement_ack_token is not None and push_is_durable is not True:
+      # Defense in depth for a malformed custom prepared route. The item may
+      # have been published, so keep the source unresolved and permit replay;
+      # never acknowledge it or promote an unknown result to durable proof.
+      self._inc_stat("scheduler/queue/volatile_replacement_rejected")
+      raise QueueError(
+        "Queue push returned no valid worker-crash durability receipt",
+        queue_name=self.queue_name,
+        operation="push",
+      )
     # Routing controls are consumed only after the enqueue commits. If the
     # strategy/backend rejects the push, the caller can retry the same Request
     # without silently losing its delay or source semantics.

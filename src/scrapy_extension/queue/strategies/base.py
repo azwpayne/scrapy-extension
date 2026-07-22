@@ -13,7 +13,11 @@ __all__ = ["QueueStrategy", "normalize_queue_timeout"]
 import math
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from scrapy_extension.exceptions import QueueError
 
 if TYPE_CHECKING:
   from scrapy_extension.backends.base import QueueBackend
@@ -134,6 +138,40 @@ class _BoundQueueAckToken(_QueueAckToken):
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedQueuePush:
+  """One immutable strategy route whose commit returns exact durability."""
+
+  backend_route: bool
+  _commit: Callable[[bytes, bool], bool] = field(repr=False, compare=False)
+
+  def commit(self, item: bytes, *, require_durable: bool = False) -> bool:
+    """Commit ``item`` once; only literal ``True`` is durability evidence."""
+    return self._commit(item, require_durable) is True
+
+  @classmethod
+  def local(
+    cls,
+    *,
+    queue_name: str,
+    strategy_name: str,
+    publish: Callable[[bytes], None],
+  ) -> _PreparedQueuePush:
+    """Build a known-process-local route with a pre-mutation durability gate."""
+
+    def commit(item: bytes, require_durable: bool) -> bool:
+      if require_durable:
+        raise QueueError(
+          f"Selected queue route {strategy_name} is not worker-crash durable",
+          queue_name=queue_name,
+          operation="push",
+        )
+      publish(item)
+      return False
+
+    return cls(backend_route=False, _commit=commit)
+
+
 class QueueStrategy(ABC):
   """Strategy interface for task-queue push/pop semantics.
 
@@ -178,17 +216,82 @@ class QueueStrategy(ABC):
         )
 
   def is_push_durable(self, *, delay: float, source: str) -> bool:
-    """Whether a successful push crossed a crash-durable backend boundary.
+    """Legacy route hint retained for source compatibility.
 
-    The conservative extension default is ``False``: a strategy must opt in
-    explicitly after every successful route has crossed a crash-durable
-    boundary. ``BackendQueue`` uses the answer to reject volatile
-    source-delivery transfers and to let the bundled scheduler choose a
-    lifecycle-local rather than persistent dedup marker after ordinary
-    volatile pushes.
+    The conservative default remains ``False``, but this pre-operation claim
+    is no longer trusted as commit evidence: serialization callbacks can
+    change a strategy route, and a backend generation can change before a
+    later push. ``BackendQueue`` instead uses the private prepared-route
+    operation, which binds the actual push to its durability receipt.
     """
     del delay, source
     return False
+
+  def _prepare_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    """Freeze a conservative route for one later serialized-item commit.
+
+    The default intentionally ignores the legacy ``is_push_durable`` claim.
+    Existing custom strategies keep working for ordinary pushes, but they do
+    not gain authority to acknowledge a broker source or publish a persistent
+    dedup marker without adopting this private operation-bound protocol.
+    """
+
+    def publish(item: bytes) -> None:
+      self.push(
+        queue_name,
+        item,
+        priority=priority,
+        delay=delay,
+        source=source,
+      )
+
+    return _PreparedQueuePush.local(
+      queue_name=queue_name,
+      strategy_name=type(self).__name__,
+      publish=publish,
+    )
+
+  def _prepare_backend_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+  ) -> _PreparedQueuePush:
+    """Freeze a physical backend route and bind receipt to its exact push."""
+
+    def commit(item: bytes, require_durable: bool) -> bool:
+      return self._push_backend_prepared(
+        queue_name,
+        item,
+        priority=priority,
+        require_durable=require_durable,
+      )
+
+    return _PreparedQueuePush(backend_route=True, _commit=commit)
+
+  def _push_backend_prepared(
+    self,
+    queue_name: str,
+    item: bytes,
+    *,
+    priority: float = 0.0,
+    require_durable: bool = False,
+  ) -> bool:
+    """Execute one prepared backend push and normalize its private receipt."""
+    receipt = self._connection_manager._push_queue_with_durability(
+      queue_name,
+      item,
+      priority,
+      require_durable=require_durable,
+    )
+    return receipt.worker_crash_durable is True
 
   @abstractmethod
   def push(

@@ -47,6 +47,8 @@ from scrapy_extension.backends.base import (
   QueueBackend,
   SetBackend,
   StorageBackend,
+  _DurablePushRequired,
+  _QueuePushReceipt,
 )
 from scrapy_extension.backends.circuit_breaker import CircuitBreaker
 from scrapy_extension.backends.registry import (
@@ -59,6 +61,7 @@ from scrapy_extension.exceptions import (
   BackendConnectionError,
   BackendError,
   ConfigurationError,
+  QueueError,
 )
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 
@@ -1608,6 +1611,66 @@ class ConnectionManager:
     from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
 
     return wrap_queue_backend(backend, breaker)
+
+  def _push_queue_with_durability(
+    self,
+    queue_name: str,
+    item: bytes,
+    priority: float = 0.0,
+    *,
+    require_durable: bool = False,
+  ) -> _QueuePushReceipt:
+    """Push through one exact backend/breaker generation and return its receipt.
+
+    The backend identity and its breaker are snapshotted together before the
+    operation.  A concurrent reconnect may retire that generation, but it
+    cannot redirect the admitted push to a replacement backend after the
+    durability decision has been made.
+
+    A backend's ``_DurablePushRequired`` is an input-policy rejection rather
+    than a network failure.  It passes through the breaker uncounted and is
+    translated here, outside the breaker, to the queue-facing error contract.
+    """
+    backend, breaker = self._get_backend_breaker_snapshot()
+    if not isinstance(backend, QueueBackend):
+      msg = f"Backend {backend.__class__.__name__} does not support queue operations"
+      raise NotImplementedError(msg)
+
+    published_backend: QueueBackend
+    if breaker is None:
+      published_backend = backend
+    else:
+      from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
+
+      published_backend = wrap_queue_backend(backend, breaker)
+
+    try:
+      raw_receipt = published_backend._push_with_durability(
+        queue_name,
+        item,
+        priority,
+        require_durable=require_durable,
+      )
+    except _DurablePushRequired as e:
+      raise QueueError(
+        "Selected queue backend generation is not worker-crash durable",
+        queue_name=queue_name,
+        operation="push",
+      ) from e
+
+    # A malformed future/plugin override must never promote an unknown value
+    # (including truthy sentinels) into commit evidence.
+    durable = (
+      isinstance(raw_receipt, _QueuePushReceipt)
+      and raw_receipt.worker_crash_durable is True
+    )
+    if require_durable and not durable:
+      raise QueueError(
+        "Queue backend returned no valid worker-crash durability receipt",
+        queue_name=queue_name,
+        operation="push",
+      )
+    return _QueuePushReceipt(worker_crash_durable=durable)
 
   def get_set_backend(self) -> SetBackend:
     """Get the set backend interface.

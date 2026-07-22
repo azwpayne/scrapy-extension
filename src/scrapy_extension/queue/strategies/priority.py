@@ -39,6 +39,7 @@ from scrapy_extension.queue.strategies._names import (
 )
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
+  _PreparedQueuePush,
   normalize_queue_timeout,
 )
 
@@ -130,6 +131,27 @@ class PriorityQueueStrategy(QueueStrategy):
     """Report that priority buckets are all backend-backed queues."""
     del delay, source
     return True
+
+  def _prepare_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    """Freeze a backend route while retaining serializer-first validation."""
+    del delay, source
+
+    def commit(item: bytes, require_durable: bool) -> bool:
+      level = self._level_for(priority)
+      return self._push_backend_prepared(
+        self._bucket_queue(queue_name, level),
+        item,
+        require_durable=require_durable,
+      )
+
+    return _PreparedQueuePush(backend_route=True, _commit=commit)
 
   def push(
     self,

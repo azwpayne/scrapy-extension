@@ -1616,7 +1616,7 @@ class BackendScheduler:
       ):
         completed_reservation = reservation
         reservation = None
-        if push_is_durable is False:
+        if push_is_durable is not True:
           # A process-local strategy accepted the request, but publishing a
           # persistent dedup marker would turn a hard crash into permanent
           # loss. The bundled filter records only a lifecycle-local shadow;

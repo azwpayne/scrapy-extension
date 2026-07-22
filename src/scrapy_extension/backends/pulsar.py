@@ -279,6 +279,7 @@ class PulsarBackend(Backend, QueueBackend):
       _in_flight: Diagnostic set of popped-but-unacked ack tokens.
   """
 
+  _push_is_durable = True
   requires_ack = True
   supports_concurrent_ack = True
 

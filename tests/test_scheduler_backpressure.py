@@ -30,6 +30,7 @@ from scrapy_extension.exceptions import (
 )
 from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.strategies.base import QueueStrategy, _PreparedQueuePush
 from scrapy_extension.schedule import scheduler as scheduler_module
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
@@ -81,6 +82,49 @@ class _LenControllableQueue:
 
   def set_depth(self, depth: int) -> None:
     self._depth = depth
+
+
+def _durable_queue_mock(name: str = "BackendQueue") -> MagicMock:
+  """Model the bundled queue's private receipt while retaining a push spy."""
+  queue = MagicMock(spec=BackendQueue, name=name)
+
+  def push_with_durability(
+    request: Request,
+    priority: float = 0.0,
+  ) -> bool:
+    queue.push(request, priority=priority)
+    return True
+
+  queue._push_with_durability.side_effect = push_with_durability
+  return queue
+
+
+def _durable_strategy_mock(name: str = "DurableQueueStrategy") -> MagicMock:
+  """Model a custom strategy that implements the private receipt protocol."""
+  strategy = MagicMock(spec=QueueStrategy, name=name)
+
+  def prepare(
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    def commit(item: bytes, require_durable: bool) -> bool:
+      del require_durable
+      strategy.push(
+        queue_name,
+        item,
+        priority=priority,
+        delay=delay,
+        source=source,
+      )
+      return True
+
+    return _PreparedQueuePush(backend_route=True, _commit=commit)
+
+  strategy._prepare_push.side_effect = prepare
+  return strategy
 
 
 class _SelfDrainingQueue(_LenControllableQueue):
@@ -508,7 +552,7 @@ class TestBackpressureLenErrorDegradesToPop:
       stats=stats,
       backpressure_pause_at=10,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.__len__ = MagicMock(side_effect=QueueError("len unavailable"))
     queue.pop = MagicMock(return_value=None)
     scheduler._queue = queue
@@ -529,7 +573,7 @@ class TestBackpressureLenErrorDegradesToPop:
       stats=stats,
       backpressure_pause_at=10,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.__len__ = MagicMock(side_effect=NotImplementedError("rocketmq queue_len"))
     queue.pop = MagicMock(return_value=None)
     scheduler._queue = queue
@@ -553,7 +597,7 @@ def test_next_request_degrades_during_transient_backend_outage(
   """Circuit rejection or failed reconnect is an empty poll, not a crash."""
   manager = MagicMock(name="ConnectionManager")
   scheduler = BackendScheduler(connection_manager=manager)
-  queue = MagicMock(name="BackendQueue")
+  queue = _durable_queue_mock()
   queue.pop.side_effect = transient_error
   scheduler._queue = queue
 
@@ -574,7 +618,7 @@ def test_has_pending_requests_stays_conservative_during_transient_outage(
   """An unavailable depth source must never make Scrapy declare idle."""
   manager = MagicMock(name="ConnectionManager")
   scheduler = BackendScheduler(connection_manager=manager)
-  queue = MagicMock(name="BackendQueue")
+  queue = _durable_queue_mock()
   queue.__len__.side_effect = transient_error
   scheduler._queue = queue
 
@@ -687,7 +731,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = [push_error, None]
     scheduler._queue = queue
     request = Request("https://example.com/retry")
@@ -714,7 +758,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = [QueueError("queue unavailable"), None]
     scheduler._queue = queue
     request = Request("https://example.com/reentrant-reservation")
@@ -744,7 +788,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = QueueError("queue unavailable")
     scheduler._queue = queue
     request = Request(
@@ -775,8 +819,7 @@ class TestEnqueueDedupReservation:
 
     manager_b = MagicMock(name="ConnectionManagerB")
     backend_b = manager_b.get_queue_backend.return_value
-    strategy_b = MagicMock(name="DurableQueueStrategy")
-    strategy_b.is_push_durable.return_value = True
+    strategy_b = _durable_strategy_mock()
     spider = mocker.Mock(name="Spider")
     spider.crawler.stats = None
     queue_b = BackendQueue(
@@ -836,7 +879,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager_b,
       dupefilter=dupefilter_b,
     )
-    queue_b = MagicMock(name="BackendQueueB")
+    queue_b = _durable_queue_mock("BackendQueueB")
     scheduler_b._queue = queue_b
 
     assert scheduler_b.enqueue_request(request.replace()) is True
@@ -870,7 +913,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager_b,
       dupefilter=dupefilter_b,
     )
-    queue_b = MagicMock(name="BackendQueueB")
+    queue_b = _durable_queue_mock("BackendQueueB")
     scheduler_b._queue = queue_b
 
     assert scheduler_b.enqueue_request(request.replace()) is True
@@ -910,8 +953,10 @@ class TestEnqueueDedupReservation:
     assert scheduler.enqueue_request(request.replace()) is False
     strategy.push.assert_called_once()
 
+  @pytest.mark.parametrize("public_result", [False, True, None])
   def test_custom_queue_return_value_does_not_redefine_push_durability(
     self,
+    public_result,
   ) -> None:
     manager = MagicMock(name="ConnectionManager")
     membership = MemoryMembershipFilter(maxsize=None)
@@ -924,13 +969,14 @@ class TestEnqueueDedupReservation:
       dupefilter=dupefilter,
     )
     queue = MagicMock(name="CustomQueue")
-    queue.push.return_value = False
+    queue.push.return_value = public_result
     scheduler._queue = queue
 
     assert scheduler.enqueue_request(
       Request("https://example.com/custom-queue-return")
     ) is True
-    assert len(membership) == 1
+    assert len(membership) == 0
+    assert len(dupefilter._volatile_fingerprints) == 1
 
   def test_duplicate_deferred_child_completes_after_durable_handoff(
     self,
@@ -938,8 +984,7 @@ class TestEnqueueDedupReservation:
   ) -> None:
     manager = MagicMock(name="ConnectionManager")
     backend = manager.get_queue_backend.return_value
-    strategy = MagicMock(name="DurableQueueStrategy")
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock()
     spider = mocker.Mock(name="Spider")
     spider.crawler.stats = None
     queue = BackendQueue(
@@ -999,7 +1044,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = [QueueError("queue unavailable"), None]
     scheduler._queue = queue
     request = Request("https://example.com/monitor-stop")
@@ -1025,7 +1070,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     signal = _SchedulerStop()
     queue.push.side_effect = [signal, None]
     scheduler._queue = queue
@@ -1053,7 +1098,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
     request = Request("https://example.com/handoff-stop")
 
@@ -1079,7 +1124,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
 
     for attempt in range(3):
@@ -1094,8 +1139,7 @@ class TestEnqueueDedupReservation:
     self,
   ) -> None:
     manager = MagicMock(name="ConnectionManager")
-    strategy = MagicMock(name="DurableQueueStrategy")
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock()
     queue = BackendQueue(
       connection_manager=manager,
       queue_name="commit-interruption",
@@ -1128,8 +1172,7 @@ class TestEnqueueDedupReservation:
     mocker,
   ) -> None:
     manager = MagicMock(name="ConnectionManager")
-    strategy = MagicMock(name="DurableQueueStrategy")
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock()
     queue = BackendQueue(
       connection_manager=manager,
       queue_name="class-patched-push",
@@ -1181,7 +1224,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = [original, None]
     scheduler._queue = queue
     request = Request("https://example.com/cleanup-stop")
@@ -1212,7 +1255,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = original
     scheduler._queue = queue
 
@@ -1243,7 +1286,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = QueueError("queue unavailable")
     scheduler._queue = queue
 
@@ -1270,7 +1313,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = [QueueError("queue unavailable"), None]
     scheduler._queue = queue
     request = Request("https://example.com/rollback-retry")
@@ -1307,7 +1350,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = [QueueError("queue unavailable"), None]
     scheduler._queue = queue
     request = Request("https://example.com/degraded-reentry")
@@ -1336,7 +1379,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
 
     assert scheduler.enqueue_request(Request("https://example.com/custom")) is False
@@ -1357,7 +1400,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
 
     assert scheduler.enqueue_request(request) is True
@@ -1373,7 +1416,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
     request = Request("https://example.com/autospec")
 
@@ -1394,7 +1437,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
     request = Request("https://example.com/instance-override")
 
@@ -1417,7 +1460,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
     request = Request("https://example.com/class-override")
 
@@ -1432,7 +1475,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
 
     assert scheduler.enqueue_request(Request("https://example.com/atomic")) is True
@@ -1453,7 +1496,7 @@ class TestEnqueueDedupReservation:
       dupefilter=dupefilter,
       stats=stats,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
 
     assert scheduler.enqueue_request(Request("https://example.com/commit")) is True
@@ -1483,7 +1526,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = QueueError("queue unavailable")
     scheduler._queue = queue
 
@@ -1500,8 +1543,7 @@ class TestEnqueueDedupReservation:
     manager = MagicMock(name="ConnectionManager")
     backend = manager.get_queue_backend.return_value
     backend.ack.side_effect = QueueError("source ack failed")
-    strategy = MagicMock(name="QueueStrategy")
-    strategy.is_push_durable.return_value = True
+    strategy = _durable_strategy_mock("QueueStrategy")
     membership_filter = MemoryMembershipFilter(maxsize=None)
     dupefilter = BackendDupeFilter(
       connection_manager=manager,
@@ -1546,7 +1588,7 @@ class TestEnqueueDedupReservation:
       connection_manager=manager,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     scheduler._queue = queue
     request = Request("https://example.com/concurrent")
     nested_results: list[bool] = []
@@ -1577,7 +1619,7 @@ class TestEnqueueDedupReservation:
       stats=stats,
       dupefilter=dupefilter,
     )
-    queue = MagicMock(name="BackendQueue")
+    queue = _durable_queue_mock()
     queue.push.side_effect = QueueError("queue unavailable")
     scheduler._queue = queue
 

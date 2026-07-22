@@ -303,12 +303,23 @@ Treat callbacks and item writes as idempotent under at-least-once replay. Queue
 strategies that accept only into process-local state use a bounded local dedup
 shadow instead of publishing a persistent marker.
 
-Custom `QueueStrategy` plugins must now opt in to durable publication. Override
-`is_push_durable(*, delay, source)` and return the literal `True` only for routes
-whose successful push is already crash-durable. The inherited default and a
-missing hook on older duck-typed plugins are treated as volatile: ordinary
-requests use the bundled dupefilter's lifecycle-local shadow, while a request
-carrying an unacknowledged source token fails closed before plugin mutation.
+Custom `QueueStrategy.is_push_durable(*, delay, source)` claims are no longer
+accepted as durable commit evidence. They are evaluated before the item is
+serialized and cannot bind a later route or backend generation to the actual
+push. The hook remains callable for compatibility, but inherited, missing, and
+literal-`True` implementations are all treated as volatile by the bundled
+scheduler unless the strategy participates in its private operation-bound
+prepared route. Ordinary requests use the bundled dupefilter's lifecycle-local
+shadow; requests carrying an unacknowledged source token fail closed before
+plugin-local mutation. Prefer a bundled backend-delegating strategy for those
+transfers; private receipt APIs have no compatibility promise.
+
+Third-party `QueueBackend` implementations remain source compatible because
+the new push operation has a concrete default. Ordinary pushes still call the
+existing public `push()` once, but receive a volatile receipt; a
+durability-required source transfer is rejected before `push()` mutates the
+backend. Custom queue objects keep their public return contract, and `False`,
+`True`, `None`, or another truthy return value is ignored for durability.
 
 A replacement carrying an unacknowledged source token is now rejected before
 it enters volatile `delay`/`time_wheel` holding state (positive effective

@@ -407,14 +407,17 @@ class _BackendProxyBase:
     object.__setattr__(self, "_backend", backend)
     object.__setattr__(self, "_breaker", breaker)
     for method_name in self._HOT_PATH:
-      if not hasattr(backend, method_name):
+      try:
+        bound = getattr(backend, method_name)
+      except AttributeError:
         continue
-      bound = getattr(backend, method_name)
       object.__setattr__(self, method_name, _wrap_bound(breaker, bound))
     for method_name in self._FORWARDED:
-      if not hasattr(backend, method_name):
+      try:
+        forwarded = getattr(backend, method_name)
+      except AttributeError:
         continue
-      object.__setattr__(self, method_name, getattr(backend, method_name))
+      object.__setattr__(self, method_name, forwarded)
 
   def __getattr__(self, name: str) -> Any:
     # Fires only for attributes NOT on the class MRO and NOT bound in __init__
@@ -460,8 +463,10 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
   ``SCRAPY_CIRCUIT_BREAKER_ENABLED``.
   """
 
-  _HOT_PATH = ("push", "pop", "pop_with_ack")
+  _HOT_PATH = ("push", "_push_with_durability", "pop", "pop_with_ack")
   _FORWARDED = (
+    "requires_ack",
+    "supports_concurrent_ack",
     "queue_len",
     "clear_queue",
     "ack",

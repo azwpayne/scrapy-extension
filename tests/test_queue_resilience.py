@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 from scrapy.http import Request
 
+from scrapy_extension.backends.base import _QueuePushReceipt
 from scrapy_extension.exceptions import SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
@@ -63,7 +64,21 @@ def _cm(
     cm.get_storage_backend.return_value = (
       storage if storage is not None else MagicMock(name="StorageBackend")
     )
-  cm.get_queue_backend.return_value = queue_backend or MagicMock(name="QueueBackend")
+  resolved_queue_backend = queue_backend or MagicMock(name="QueueBackend")
+  cm.get_queue_backend.return_value = resolved_queue_backend
+
+  def push_queue_with_durability(
+    queue_name: str,
+    item: bytes,
+    priority: float = 0.0,
+    *,
+    require_durable: bool = False,
+  ) -> _QueuePushReceipt:
+    del require_durable
+    resolved_queue_backend.push(queue_name, item, priority)
+    return _QueuePushReceipt(worker_crash_durable=True)
+
+  cm._push_queue_with_durability.side_effect = push_queue_with_durability
   return cm
 
 

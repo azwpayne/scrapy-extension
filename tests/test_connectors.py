@@ -1314,6 +1314,119 @@ class TestCircuitBreakerWiringDefaultOff:
       manager.close()
       ConnectionManager.clear_registry()
 
+
+class TestOperationBoundQueueDurability:
+  """Durability proof stays attached to one backend/breaker operation."""
+
+  @staticmethod
+  def _manager(backend: QueueBackend) -> ConnectionManager:
+    manager = ConnectionManager(BackendType.REDIS)
+    manager._backend = backend  # type: ignore[assignment]
+    manager._breaker_configured = True
+    manager._breaker = None
+    return manager
+
+  def test_legacy_backend_is_volatile_and_rejects_required_push_before_mutation(
+    self,
+  ) -> None:
+    backend = _FakeRedisQueueBackend()
+    manager = self._manager(backend)
+    try:
+      receipt = manager._push_queue_with_durability("q", b"ordinary")
+
+      assert receipt.worker_crash_durable is False
+      assert backend.pushed == [("q", b"ordinary", 0.0)]
+
+      with pytest.raises(QueueError, match="worker-crash durable"):
+        manager._push_queue_with_durability(
+          "q",
+          b"replacement",
+          require_durable=True,
+        )
+      assert backend.pushed == [("q", b"ordinary", 0.0)]
+    finally:
+      manager.close()
+
+  def test_backend_replacement_after_snapshot_cannot_redirect_push(self, mocker) -> None:
+    first = _DurableFakeRedisQueueBackend()
+    replacement = _FakeRedisQueueBackend()
+    manager = self._manager(first)
+    original_snapshot = manager._get_backend_breaker_snapshot
+
+    def replace_after_snapshot():
+      snapshot = original_snapshot()
+      manager._backend = replacement
+      return snapshot
+
+    mocker.patch.object(
+      manager,
+      "_get_backend_breaker_snapshot",
+      side_effect=replace_after_snapshot,
+    )
+    try:
+      receipt = manager._push_queue_with_durability(
+        "q",
+        b"item",
+        require_durable=True,
+      )
+
+      assert receipt.worker_crash_durable is True
+      assert first.pushed == [("q", b"item", 0.0)]
+      assert replacement.pushed == []
+    finally:
+      manager.close()
+
+  def test_policy_rejection_does_not_trip_or_close_breaker(self, monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    backend = _FakeRedisQueueBackend()
+    manager = ConnectionManager(BackendType.REDIS)
+    manager._backend = backend
+    try:
+      with pytest.raises(QueueError, match="worker-crash durable"):
+        manager._push_queue_with_durability(
+          "q",
+          b"item",
+          require_durable=True,
+        )
+
+      assert manager._breaker is not None
+      assert manager._breaker.state.value == "closed"
+      assert manager._breaker.failure_count == 0
+      assert backend.pushed == []
+    finally:
+      manager.close()
+
+  def test_malformed_truthy_receipt_is_rejected_after_safe_replay_boundary(
+    self,
+  ) -> None:
+    class MalformedReceiptBackend(_FakeRedisQueueBackend):
+      def _push_with_durability(  # type: ignore[override]
+        self,
+        queue_name,
+        item,
+        priority=0.0,
+        *,
+        require_durable=False,
+      ):
+        del require_durable
+        self.push(queue_name, item, priority)
+        return True
+
+    backend = MalformedReceiptBackend()
+    manager = self._manager(backend)
+    try:
+      with pytest.raises(QueueError, match="no valid worker-crash"):
+        manager._push_queue_with_durability(
+          "q",
+          b"item",
+          require_durable=True,
+        )
+      # The source would remain unacked; replay is allowed, loss is not.
+      assert backend.pushed == [("q", b"item", 0.0)]
+    finally:
+      manager.close()
+
   def test_disabled_get_queue_backend_returns_identity(self, monkeypatch):
     """Disabled path returns the SAME object the backend property yields.
 
@@ -1436,6 +1549,7 @@ class _FakeRedisQueueBackend(QueueBackend):
   def __init__(self) -> None:
     self.clear_calls = 0
     self.ack_calls = 0
+    self.pushed: list[tuple[str, bytes, float]] = []
 
   def connect(self) -> None: ...
   def disconnect(self) -> None: ...
@@ -1449,7 +1563,8 @@ class _FakeRedisQueueBackend(QueueBackend):
   def backend_type(self):
     return BackendType.REDIS
 
-  def push(self, queue_name, item, priority=0.0) -> None: ...
+  def push(self, queue_name, item, priority=0.0) -> None:
+    self.pushed.append((queue_name, item, priority))
   def pop(self, queue_name, timeout=0.0):
     return None
 
@@ -1461,6 +1576,10 @@ class _FakeRedisQueueBackend(QueueBackend):
 
   def ack(self, queue_name) -> None:
     self.ack_calls += 1
+
+
+class _DurableFakeRedisQueueBackend(_FakeRedisQueueBackend):
+  _push_is_durable = True
 
 
 class _FailingRedisQueueBackend(_FakeRedisQueueBackend):

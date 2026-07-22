@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
+  _PreparedQueuePush,
   normalize_queue_timeout,
 )
 
@@ -200,6 +201,61 @@ class DelayQueueStrategy(QueueStrategy):
     del source
     effective = delay if delay > 0 else self._default_delay
     return effective <= 0
+
+  def _prepare_push(
+    self,
+    queue_name: str,
+    *,
+    priority: float = 0.0,
+    delay: float = 0.0,
+    source: str = "default",
+  ) -> _PreparedQueuePush:
+    """Freeze the zero-delay/backend versus held/local route exactly once."""
+    del source
+    self.bind(queue_name)
+    effective = delay if delay > 0 else self._default_delay
+
+    if effective <= 0:
+
+      def commit(item: bytes, require_durable: bool) -> bool:
+        normalized_delay = _require_finite(delay, "delay")
+        normalized_priority = _require_finite(priority, "priority")
+        if normalized_delay < 0:
+          raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+        with self._state_lock:
+          return self._push_backend_prepared(
+            queue_name,
+            item,
+            priority=normalized_priority,
+            require_durable=require_durable,
+          )
+
+      return _PreparedQueuePush(backend_route=True, _commit=commit)
+
+    def publish(item: bytes) -> None:
+      normalized_delay = _require_finite(delay, "delay")
+      normalized_priority = _require_finite(priority, "priority")
+      if normalized_delay < 0:
+        raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+      with self._state_lock:
+        now = _require_finite(self._clock(), "clock value")
+        ready_at = _require_finite(now + effective, "ready_at")
+        heapq.heappush(
+          self._holding,
+          (ready_at, next(self._seq), item, normalized_priority),
+        )
+        held = len(self._holding)
+      try:
+        self._monitor.on_delay_depth(held)
+      except Exception:  # noqa: BLE001 — monitor must never crash push
+        logger.debug("on_delay_depth hook raised", exc_info=True)
+      self._warn_over_cap_once(held)
+
+    return _PreparedQueuePush.local(
+      queue_name=queue_name,
+      strategy_name=type(self).__name__,
+      publish=publish,
+    )
 
   def _warn_over_cap_once(self, held: int) -> None:
     """Emit a one-time per-process WARNING when the holding heap exceeds cap.

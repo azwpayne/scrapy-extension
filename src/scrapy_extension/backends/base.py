@@ -24,11 +24,12 @@ import math
 import re
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from pydantic import SecretStr
 
@@ -510,6 +511,22 @@ class Backend(ABC):
     """
 
 
+@dataclass(frozen=True, slots=True)
+class _QueuePushReceipt:
+  """Internal proof returned by the exact backend push operation.
+
+  ``worker_crash_durable`` means the accepted item survives loss of the
+  current crawler process.  It deliberately says nothing about a storage
+  cluster or broker losing its own durable state.
+  """
+
+  worker_crash_durable: bool
+
+
+class _DurablePushRequired(Exception):
+  """Internal policy rejection that must not count as a backend failure."""
+
+
 class QueueBackend(ABC):
   """Interface for queue operations.
 
@@ -550,6 +567,31 @@ class QueueBackend(ABC):
 
   supports_concurrent_ack: bool = True
   """True if ack is correct under ``CONCURRENT_REQUESTS > 1`` (real in-flight set)."""
+
+  _push_is_durable: ClassVar[bool] = False
+  """Whether this backend invariably crosses a worker-crash durable boundary."""
+
+  def _push_with_durability(
+    self,
+    queue_name: str,
+    item: bytes,
+    priority: float = 0.0,
+    *,
+    require_durable: bool = False,
+  ) -> _QueuePushReceipt:
+    """Push once and return operation-bound worker-crash durability.
+
+    This concrete, package-private extension keeps pre-existing third-party
+    ``QueueBackend`` implementations source compatible.  Their inherited
+    default is fail-closed: ordinary pushes still delegate to the stable
+    public :meth:`push`, while a durable-required transfer is rejected before
+    the backend can mutate any process-local queue.
+    """
+    durable = self._push_is_durable is True
+    if require_durable and not durable:
+      raise _DurablePushRequired
+    self.push(queue_name, item, priority)
+    return _QueuePushReceipt(worker_crash_durable=durable)
 
   @abstractmethod
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:

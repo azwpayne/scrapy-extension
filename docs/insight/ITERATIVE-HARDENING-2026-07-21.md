@@ -227,7 +227,7 @@ speculative work.
   owned until a backend pop is known to have returned and make `drop_oldest`
   replacement transactional, so interruption cannot lose the old item while
   its volatile dedup shadow continues to suppress recovery.
-- [ ] **QUEUE-04 — backend-aware push durability.** Classify a push using both
+- [x] **QUEUE-04 — backend-aware push durability.** Classify a push using both
   its strategy route and the exact backend generation/configuration; unknown,
   in-memory, non-durable RabbitMQ, and third-party backends fail closed. Make
   circuit-breaker proxies forward every semantic capability explicitly rather
@@ -2075,7 +2075,8 @@ of treating a marker as proof that another queue copy exists.
 Fresh review closed four capability and interruption gaps in that boundary.
 `QueueStrategy.is_push_durable()` now defaults to `False`; bundled backend
 strategies opt in explicitly, and an older duck-typed strategy with no hook is
-also treated as volatile. A definition-time `BackendQueue.push` identity keeps
+also treated as volatile. I49 later supersedes every pre-push hook claim with
+an operation-bound backend receipt. A definition-time `BackendQueue.push` identity keeps
 class-level patches on the public path. Scheduler owner intent remains live
 through post-push finalization, including serialization and process-control
 failures, while commit releases receipt bookkeeping before any interruptible

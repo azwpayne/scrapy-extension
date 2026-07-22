@@ -85,11 +85,14 @@ supports_concurrent_ack: bool = True  # True for ALL bundled backends — no bun
 - **Atomic-pop backends** (Redis, MongoDB, ElasticSearch): `requires_ack=False`. Their `pop` removes the item in one step; `ack`/`nack` are no-ops; `pop_with_ack` returns `(item, None)`.
 - **Per-message-ack (MQ) backends** (Kafka, RabbitMQ, **RocketMQ**, **SQS**, **Pulsar**): `requires_ack=True`, `supports_concurrent_ack=True` — **all five** MQ backends carry a per-message token (`pop_with_ack` returns `(item, token)`), so each pop is ackable independently and correctness holds under `CONCURRENT_REQUESTS > 1`. The scheduler carries the token in `request.meta["_backend_ack_token"]` and hands it to `ack(token=...)`. Per-backend ack mechanism: Kafka = contiguous-offset watermark commit (`kafka.py:678-687`); RabbitMQ = per-message delivery tag; RocketMQ = apache 5.1.1 gRPC `consumer.ack(msg)` over an invisible-duration window; SQS = per-message `ReceiptHandle` (`sqs.py:120-128`); Pulsar = per-message `MessageId` over a Shared subscription (`pulsar.py:182-193`).
 
-> **Historical note (corrected 2026-07-10, parallel multi-agent verification):** earlier doc versions described a third "single-slot ack" bucket (SQS, Pulsar) with `supports_concurrent_ack=False` plus a scheduler `from_settings` gate that raised `ConfigurationError` under `CONCURRENT_REQUESTS > 1`. That classification is **stale** — SQS (`sqs.py:140`) and Pulsar (`pulsar.py:205`) both set `supports_concurrent_ack=True` with per-message tokens, so the single-slot bucket is **empty for every bundled backend**; there are now **two** buckets, not three. `_enforce_ack_concurrency_gate` (`scheduler.py:388`) is unreachable for all 10 bundled backends (it remains a defensive backstop for a hypothetical 3rd-party single-slot backend). Its error message (`scheduler.py:408`) still names only Kafka/RabbitMQ as concurrency-safe — stale, since SQS/Pulsar are also safe. The stale three-bucket model also persists in the `QueueBackend` ABC docstring (`base.py:388-404`) and the in-repo scheduler docstring (`scheduler.py:368`) — both still need correction.
->
-> **⚠ Hidden interaction (the doc previously missed entirely):** per-message ack correlation is only honored when the queue strategy is `PassthroughQueueStrategy`. ANY non-passthrough strategy (delay / round_robin / throttle / priority / time_wheel / work_stealing / ring_buffer) paired with ANY MQ backend makes `BackendQueue._pop_with_ack` (`queue.py:374`) return `token=None` — silently dropping back into the backend's legacy/no-token ack path (an at-least-once hazard). 7 strategies × 5 MQ backends = 35 silent-misconfig combinations, with no config-time gate. See [`docs/insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md`](insight/DEEP-INSIGHT-2026-07-10-parallel-verified.md) §B.
+> **Historical note (corrected 2026-07-10):** earlier versions described SQS
+> and Pulsar as single-slot ack backends and allowed only passthrough strategy
+> pops to preserve tokens. Both defects are closed. Every bundled MQ backend
+> now has a per-message token, and every backend-delegating queue strategy uses
+> the shared incarnation-bound `pop_with_ack` path. Fully local strategies
+> (`round_robin`, `ring_buffer`) do not pop a broker delivery at all.
 
-This contract is the reason the package can claim correct at-least-once semantics across heterogeneous MQ backends. It is non-obvious and load-bearing — touching it requires understanding both buckets (and the strategy×MQ caveat above).
+This contract is the reason the package can claim correct at-least-once semantics across heterogeneous MQ backends. It is non-obvious and load-bearing — touching it requires understanding both buckets and the backend-incarnation token fence.
 
 ### 3.3 Serialization
 
@@ -139,12 +142,23 @@ Eight strategies — the original four (default / delay / fairness / rate-limit)
 | `DelayQueueStrategy` | `delay` | In-process binary heap (`O(log n)`); pop blocks until ready | ✅ versioned JSON heap |
 | `RoundRobinQueueStrategy` | `round_robin` | Push-side fairness across `source` tags | — |
 | `ThrottleQueueStrategy` | `throttle` | Rate-limited pop (min seconds between pops) | — |
-| `PriorityQueueStrategy` | `priority` | N-level physical buckets `<name>:p<level>` — strategy-layer priority that works on backends WITHOUT native priority (SQS Standard, Kafka). Higher caller priority → lower level index → popped first. | — (state backend-side) |
+| `PriorityQueueStrategy` | `priority` | N-level physical buckets — strategy-layer priority that works on isolated-queue backends including SQS Standard; Kafka/RocketMQ are rejected because their consumers cannot isolate bucket scans. Higher caller priority → lower level index → popped first. | — (state backend-side) |
 | `TimeWheelQueueStrategy` | `time_wheel` | `O(1)` hashed timing wheel + overflow heap for long delays. Faster than `delay`'s heap on workloads with many short-delay items. | ✅ versioned JSON (wheel + overflow) |
 | `WorkStealingQueueStrategy` | `work_stealing` | Pop-side load balancing — own queue `<name>:<worker_id>` first, steal from peer queues round-robin when idle. Composes with `round_robin` (push-side). | — (state backend-side) |
 | `RingBufferQueueStrategy` | `ring_buffer` | Bounded in-process circular buffer with overflow policy (`reject` / `drop_oldest` / `block`). Buffer IS the storage (backend QueueBackend ignored). Items lost on crash (documented). | ✅ versioned JSON (buffer + dropped count) |
 
 Each strategy receives a `ConnectionManager` and drives the underlying QueueBackend (and StorageBackend where needed) — except `RingBufferQueueStrategy`, which ignores the backend entirely (the buffer is the storage). **Snapshot/restore** (`snapshot()` / `restore()`, initiative #3) lets strategies with in-process held state (`Delay` / `TimeWheel` / `RingBuffer`) persist state for crash/restart recovery — `BackendQueue` calls `snapshot()` on `close()` and `restore()` on startup. Default is `None` (nothing to persist). `Priority` and `WorkStealing` carry no in-process state (all state lives in backend-side physical queues).
+
+Push durability is not a strategy capability probe. `BackendQueue` prepares one
+immutable local/backend route before serialization, then commits the serialized
+item through that route. Backend routes call one `ConnectionManager` operation
+that snapshots the exact raw backend and circuit breaker, performs the push,
+and returns a private worker-crash durability receipt. Only literal `True`
+publishes a persistent dedup marker or permits source ACK. Delay/time-wheel
+default changes cannot flip the prepared branch; older strategy claims,
+third-party backends, and custom queue return values fail closed to the
+lifecycle-local shadow. RabbitMQ derives the receipt under its delivery lock
+from the connected queue/message policy, not from publisher confirmation alone.
 
 ### 4.3 ③ Storage — `StorageStrategy` (`storage/strategies/`)
 
@@ -163,7 +177,7 @@ All five follow Scrapy's `from_settings()` / `from_crawler()` factory pattern.
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| `BackendScheduler` | `schedule/scheduler.py` (806 LOC) | Scrapy scheduler; uses `BackendQueue` + dedup; ack-concurrency gate (unreachable for bundled backends post-2026-07-10 — see §3.2) + strategy+MQ ack-bypass warning (2026-07-11); backpressure pause/resume |
+| `BackendScheduler` | `schedule/scheduler.py` (806 LOC) | Scrapy scheduler; uses `BackendQueue` + dedup; defensive third-party ack-concurrency gate; backpressure pause/resume |
 | `BackendDupeFilter` | `dupefilter/dupefilter.py` (403 LOC) | Delegates to a `MembershipFilter`; handles `FilterFull` gracefully |
 | `BackendQueue` | `queue/queue.py` (725 LOC) | Request serialization/deserialization; delegates push/pop to a `QueueStrategy`; carries ack tokens in `request.meta`; depth-probe sampling (U4) |
 | `BackendPipeline` | `pipeline/pipeline.py` (351 LOC) | Item storage via a `StorageStrategy` + `StorageBackend`; C2 escalation (max consecutive errors) |

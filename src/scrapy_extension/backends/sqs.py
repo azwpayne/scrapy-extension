@@ -331,6 +331,7 @@ class SqsBackend(Backend, QueueBackend):
           (legacy ``ack(token=None)`` fallback only).
   """
 
+  _push_is_durable = True
   requires_ack = True
   supports_concurrent_ack = True
 

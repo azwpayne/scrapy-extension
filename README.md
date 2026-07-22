@@ -707,13 +707,17 @@ deduplicate across workers. For distributed exact dedup, bind
 
 `delay`, `round_robin`, `throttle`, `time_wheel`, `work_stealing`, and `ring_buffer` keep some state in-process. `passthrough` is the distributed-exact default. See [Ack and durability matrix](#ack-and-durability-matrix) before using a stateful strategy in production.
 
-Third-party `QueueStrategy` implementations are conservatively volatile unless
-they explicitly override `is_push_durable(*, delay, source)` and return the
-literal `True` for that route. Inheriting the base implementation—or omitting
-the hook in an older duck-typed strategy—keeps ordinary requests on the local
-dedup-shadow path and rejects source-token transfers before strategy mutation.
-Return `True` only when every successful `push` for those inputs has crossed a
-crash-durable backend boundary.
+Push durability is operation-bound. `BackendQueue` freezes the selected
+strategy route before serialization, then obtains a receipt from the exact
+backend/breaker generation that performs the push. Only a literal receipt
+value of `True` permits a persistent dedup marker or source-token ACK. Unknown
+custom queues, older third-party backends, and custom `QueueStrategy`
+implementations remain conservatively volatile. The legacy
+`is_push_durable(*, delay, source)` hook is retained for compatibility but is
+not commit evidence; overriding it alone no longer opts a route into durable
+publication. Ordinary volatile pushes remain usable through the lifecycle-local
+dedup shadow, while source-token transfers fail closed before local mutation or
+remain unacked after a backend policy rejection.
 
 `priority` and `work_stealing` fan out one logical queue into multiple physical
 queues. They fail fast with Kafka and RocketMQ because those backends cannot
@@ -751,7 +755,7 @@ Use `passthrough` when item loss is unacceptable. Use `batched` only when throug
 | Surface | Ack / state boundary | Crash behavior | Operational guidance |
 |---|---|---|---|
 | Redis / MongoDB / ElasticSearch queue pop | atomic backend pop; scheduler ack is inert; Redis does not replay an outcome-ambiguous transport failure | item is removed once popped; a later callback/pipeline crash can lose downstream item work. A lost Redis response may hide one already-consumed item, but the SDK will not consume a second item in the same call | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters; reconcile an ambiguous Redis failure before another pop |
-| Kafka / RabbitMQ / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; RabbitMQ push also waits for publisher confirmation |
+| Kafka / RabbitMQ / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; RabbitMQ push waits for publisher confirmation, but a durable receipt additionally requires `durable=True`, `auto_delete=False`, `exclusive=False`, and `delivery_mode=2` on the connected generation |
 | SQS / RocketMQ queue pop | per-message token plus a finite broker visibility/invisibility lease | an unacked message becomes deliverable again when the lease expires, including while a slow download is still running | no automatic lease renewal; set the lease above maximum pop-to-response time. SQS nack is immediate; RocketMQ nack uses its 10-second floor |
 | Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |
 | Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives; a token-bearing replacement is rejected before entering volatile delay/time-wheel/round-robin/ring-buffer state | use a backend-durable push path (`passthrough`, `priority`, `work_stealing`, `throttle`, or zero effective delay) when replacing an unacked broker delivery |
