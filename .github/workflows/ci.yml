@@ -117,7 +117,13 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       elasticsearch:
-        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+        # Match the elasticsearch-py client major (9.x, bumped in 4a686f8).
+        # client 9 sends `Accept: ...compatible-with=9`, which ES server 8.x
+        # rejects with HTTP 400 ("Accept version must be either version 8 or
+        # 7, but found 9"), so every request — including ping() — failed and
+        # the integration suite couldn't connect. Validated locally: all ES
+        # integration tests pass against this 9.4.1 image.
+        image: docker.elastic.co/elasticsearch/elasticsearch:9.4.1
         env:
           discovery.type: single-node
           xpack.security.enabled: "false"
