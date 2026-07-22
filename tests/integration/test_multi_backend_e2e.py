@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from types import MethodType
 from typing import TYPE_CHECKING
 
 import pytest
@@ -71,7 +72,8 @@ def _e2e_callback(*args: object, **kwargs: object) -> None:
   spider during deserialize (``request_from_dict`` → ``getattr(spider, name)``).
   A lambda's name is ``'<lambda>'`` — unresolvable, so a round-tripped request
   raises ``ValueError: Method '<lambda>' not found``. Each test binds this
-  function onto its spider instance so the name resolves.
+  function as a bound method on its spider instance so Scrapy can discover its
+  method name during serialization and resolve it again during deserialization.
   """
   return None
 
@@ -224,7 +226,10 @@ def test_three_backends_coexist_one_request_flow(unique_prefix):
     crawler = _make_crawler(settings, "e2e_multi_backend")
 
     spider = Spider("e2e_multi_backend")
-    spider._e2e_callback = _e2e_callback  # noqa: SLF001 — bind so request_from_dict resolves the callback name
+    spider._e2e_callback = MethodType(  # type: ignore[attr-defined]
+        _e2e_callback,
+        spider,
+    )
     spider.crawler = crawler  # type: ignore[attr-defined]
 
     scheduler = BackendScheduler.from_crawler(crawler)
@@ -251,7 +256,7 @@ def test_three_backends_coexist_one_request_flow(unique_prefix):
         n = 5
         urls = [f"https://example.com/e2e/{unique_prefix}/{i}" for i in range(n)]
         for url in urls:
-            req = Request(url=url, priority=0, callback=_e2e_callback)
+            req = Request(url=url, priority=0, callback=spider._e2e_callback)
             assert scheduler.enqueue_request(req) is True
 
         # 3. Drain via next_request → FIFO within priority preserved.
@@ -314,7 +319,10 @@ def test_dedup_hits_on_second_run(fresh_prefix):
     settings = _build_settings(fresh_prefix)
     crawler = _make_crawler(settings, "e2e_dedup")
     spider = Spider("e2e_dedup")
-    spider._e2e_callback = _e2e_callback  # noqa: SLF001 — bind so request_from_dict resolves the callback name
+    spider._e2e_callback = MethodType(  # type: ignore[attr-defined]
+        _e2e_callback,
+        spider,
+    )
     spider.crawler = crawler  # type: ignore[attr-defined]
 
     # First instance: enqueue one request → fingerprint lands in MongoDB.
@@ -327,7 +335,7 @@ def test_dedup_hits_on_second_run(fresh_prefix):
         req = Request(
             url=f"https://example.com/dedup/{fresh_prefix}",
             priority=0,
-            callback=_e2e_callback,
+            callback=spider._e2e_callback,
         )
         assert scheduler_a.enqueue_request(req) is True  # first time → enqueued
         # Drain so the queue is clean for the second instance.
@@ -347,7 +355,7 @@ def test_dedup_hits_on_second_run(fresh_prefix):
         same_req = Request(
             url=f"https://example.com/dedup/{fresh_prefix}",
             priority=0,
-            callback=_e2e_callback,
+            callback=spider._e2e_callback,
         )
         assert dupefilter_b.request_seen(same_req) is True  # seen in MongoDB
     finally:
