@@ -540,7 +540,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -1264,16 +1264,16 @@ wheels = [
 
 [[package]]
 name = "poethepoet"
-version = "0.44.0"
+version = "0.48.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pastel" },
     { name = "pyyaml" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/a4/e487662f12a5ecd2ac4d77f7697e4bda481953bb80032b158e5ab55173d4/poethepoet-0.44.0.tar.gz", hash = "sha256:c2667b513621788fb46482e371cdf81c0b04344e0e0bcb7aa8af45f84c2fce7b", size = 96040, upload-time = "2026-04-06T19:40:58.908Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/92/93a4af9511b8c7c647874521d9e6c904266be98067c2ee1eb2e74520d208/poethepoet-0.48.0.tar.gz", hash = "sha256:a06f49d244fadfc2e2e7faa78b54e64a9694727e4ce1d50e08f23cea3ded74f1", size = 148679, upload-time = "2026-07-05T21:48:30.106Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/b7/503b7d3a51b0de9a329f1323048d166e309a97bb31bdc60e6acd11d2c71f/poethepoet-0.44.0-py3-none-any.whl", hash = "sha256:36d3d834708ed069ac1e4f8ed77915c55265b7b6e01aeb2fe617c9fe9cfd524a", size = 122873, upload-time = "2026-04-06T19:40:57.369Z" },
+    { url = "https://files.pythonhosted.org/packages/59/8d/d7c9455b15f8d2d7ce57e7b71a8ef8d02d9992ae4283c9777120620c9022/poethepoet-0.48.0-py3-none-any.whl", hash = "sha256:98da6096d060f49b8d84034770265863fb7dc92a40233b7694b9d216ac68737d", size = 185808, upload-time = "2026-07-05T21:48:28.601Z" },
 ]
 
 [[package]]
