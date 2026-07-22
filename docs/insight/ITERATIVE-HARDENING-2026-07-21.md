@@ -106,6 +106,7 @@ global gates, then perform a fresh audit before selecting the next item.
 | I45 | Bind each batched-storage entry to its caller's backend capability | every drain preserves per-entry routing, order, TTL, and retry-tail ownership |
 | I46 | Isolate MongoDB queue/set/storage physical collections | local collisions fail before SDK I/O; majority-durable, shard-safe markers reject cross-instance reuse |
 | I47 | Publish dedup markers only after queue durability | a failed/crashed push cannot strand a marker; volatile queues use bounded lifecycle-local shadows |
+| I48 | Preserve TimeWheel slot ownership across interrupted drains | only a confirmed backend push removes an entry; the failing item and untouched tail remain retryable in order |
 
 The order may change when a regression test disproves a hypothesis or exposes a
 smaller prerequisite. A disproved finding is removed rather than replaced with
@@ -211,13 +212,43 @@ speculative work.
   best-effort observations after committed queue and acknowledgement effects;
   a custom collector failure must not report an accepted push as rejected or
   discard a token that has already been popped.
-- [ ] **QUEUE-01 — process-control-safe time-wheel drain.** Restore the exact
+- [ ] **RUN-23 — Scrapy-compatible dupefilter lifecycle.** Invoke standard
+  zero-argument and bundled spider-argument `open` hooks by inspected signature,
+  never by catching an internal `TypeError`; await legal Deferred results from
+  both open and close before publishing scheduler state or releasing managers.
+- [x] **QUEUE-01 — process-control-safe time-wheel drain.** Restore the exact
   failing item and unattempted slot tail in order before propagating a
   `BaseException`; never requeue the successful prefix.
 - [ ] **QUEUE-02 — collision-free strategy resources.** Give priority and
   work-stealing fan-out queues a versioned physical namespace derived from the
   complete logical identity, with an explicit one-time legacy migration, so a
   generated level such as `jobs:p0` cannot alias a caller's literal queue.
+- [ ] **QUEUE-03 — process-control-safe ring-buffer mutation.** Keep an entry
+  owned until a backend pop is known to have returned and make `drop_oldest`
+  replacement transactional, so interruption cannot lose the old item while
+  its volatile dedup shadow continues to suppress recovery.
+- [ ] **QUEUE-04 — backend-aware push durability.** Classify a push using both
+  its strategy route and the exact backend generation/configuration; unknown,
+  in-memory, non-durable RabbitMQ, and third-party backends fail closed. Make
+  circuit-breaker proxies forward every semantic capability explicitly rather
+  than inheriting contradictory ABC defaults.
+- [ ] **COMPAT-02 — Stable scheduler factory signatures.** Pass the additive
+  `spider_name` keyword only when an overridden `from_settings` signature
+  accepts it, without catching and retrying an internal `TypeError` or
+  duplicating construction side effects.
+- [ ] **COMPAT-03 — dynamic Stable hook dispatch.** Before using bundled
+  private fast paths, compare the resolved bound queue/dedup hook with its
+  canonical implementation so a policy supplied through `__getattribute__`
+  is not silently bypassed.
+- [ ] **OBS-02 — mutation-adjacent diagnostic isolation.** Publish scheduler
+  and broker ownership before fallible stats/logging, move callbacks out of
+  locks and deferred-ack group transitions, and make secondary diagnostic
+  logging no-throw. In particular, MQ cap warnings must not orphan a popped
+  token and Memory-filter warnings must follow the complete mutation.
+- [ ] **REDIS-02 — strict connection-capacity input.** Preserve the explicit
+  unlimited sentinel across supported redis-py versions while rejecting bool,
+  float, bytes, signed, padded, or otherwise coercive `max_connections`
+  values; cover real standalone, Sentinel, and Cluster pools symmetrically.
 - [ ] **ACK-PLUGIN-02 — truthful deferred-ack plugin capability.** Require a
   `requires_ack` backend to override pop-with-token, ack, and nack, and reject a
   delivered item with no token at runtime. Treat `(None, token)` as a real
@@ -369,6 +400,11 @@ speculative work.
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
   message limit before issuing network calls.
+- [ ] **BACKEND-05B — injective SQS physical ownership.** Prevent an invalid
+  logical name's hashed form from aliasing a valid logical name preserved under
+  the same prefix. Bind a versioned complete logical identity to the physical
+  queue and fail closed on a conflicting owner before pop, clear, or depth can
+  cross queue boundaries.
 - [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
   default noreply mode so storage mutation success is based on a parsed server
   response rather than an unconfirmed socket write.
@@ -423,6 +459,11 @@ speculative work.
 - [x] **CONCURRENCY-01E — Redis connection generations.** Bind namespace and
   all SDK handles to a leased generation so clear and blocking-pop loops cannot
   cross reconnect or lazily resurrect themselves after disconnect.
+- [ ] **CONCURRENCY-01M — MongoDB connection generations.** Build and validate
+  a complete client/database/collection candidate privately, publish it
+  atomically, and lease one immutable generation for every operation. A failed
+  reconnect must preserve a healthy generation; disconnect must wait for old
+  leases before closing their client.
 - [ ] **CONCURRENCY-01J — Pulsar client-generation barrier.** Fence queued
   connect intents, publish one immutable client/producer/consumer generation,
   lease every send/receive/settle operation, and make disconnect wait for the
@@ -2073,3 +2114,49 @@ lockfile validation, sdist/wheel construction, and a fresh Python 3.10 wheel
 install/import/API smoke all passed. Dependency audit reports only Scrapy's
 documented historical `PYSEC-2017-83`, for which no fixed release exists. Two
 independent final reviewers found no remaining unregistered I47 P0/P1/P2.
+
+### I48 — process-control-safe TimeWheel slot drain
+
+The fresh queue-strategy audit reproduced a P1 ownership loss in the wheel-slot
+drain. The old implementation copied a slot, cleared the live deque, and only
+restored an ordinary-`Exception` tail. If a backend push raised a
+process-control `BaseException` after one due item succeeded, both the failing
+item and every unattempted item disappeared from the strategy while I47's
+volatile duplicate shadow still suppressed re-admission.
+
+The locked boundary is per entry: the slot owns an item until its live-backend
+push returns; only then may the item be removed. A failed push propagates the
+original exception with the failing item and untouched tail still present and
+in order, while the confirmed prefix stays removed. If a remote backend accepts
+the current push and an asynchronous signal lands before local removal, that
+single outcome-ambiguous item remains for safe at-least-once replay.
+
+The implementation scans the original deque by index. Future entries never
+move, and a due entry is deleted only after its push returns, so there is no
+temporary invalid slot state and no compensating cleanup that another signal
+could interrupt. The normal all-due path repeatedly deletes index zero in
+constant time; only the rare long-idle slot containing interleaved future and
+due entries pays indexed-deque deletion cost. The strategy lock continues to
+serialize the whole drain against push, pop, length, clear, snapshot, and close.
+
+Two RED regressions lock the contract: one backend raises the exact
+`BaseException` object on the second of three due entries, and one mixed slot
+forbids deque rotation while a later due entry passes an earlier future entry.
+The first retry publishes only the failing item and tail; the second leaves the
+future survivor in its exact original position. Independent final review then
+exhausted 2,303 due/future layouts and synchronous failure points plus 29
+line-level single-`KeyboardInterrupt` injection points. Every surviving copy
+remained an ordered valid tuple; the only replay was the declared
+backend-return-to-delete ambiguity, and no same-domain P0/P1/P2 remained.
+
+The TimeWheel/strategy contract matrix passed 155 tests on frozen Python 3.10
+and isolated Python 3.14 environments. The full Python 3.10 suite passed 3,655
+tests with 46 documented skips and three deprecation warnings. Whole-project
+Ruff, strict mypy over 76 source files, configured Bandit, lock validation,
+patch-integrity checking, sdist/wheel construction, and a fresh Python 3.10
+wheel install/import/API smoke all passed. Dependency audit is clean when the
+documented no-fix Scrapy `PYSEC-2017-83` is ignored and reports only that
+advisory otherwise. Fresh fan-out registered independent next slices for
+RingBuffer interruption, backend-aware durability, SQS name ownership, MongoDB
+generations, Scrapy dupefilter lifecycle, deferred ACK ownership, lifecycle
+teardown, and observation isolation; none changes the bounded I48 contract.

@@ -286,6 +286,12 @@ expect one in-flight operation per connected backend generation.
 | Stateful queue strategies | In-process scheduling/fairness/rate state. | Hard crash can lose held strategy state; a token-bearing replacement is rejected before it enters volatile delay/time-wheel/round-robin/ring-buffer state. | Use a backend-durable push path when replacing an unacked broker delivery; zero effective delay remains a direct backend push. |
 | `batched` storage | Backend-bound in-process write buffer. | Hard crash before flush loses buffered items; an ordinary partial failure retries the failing item and tail against their original backends. | Keep caller-owned backends alive through drain and coordinate one shared strategy lifecycle; prefer `passthrough` when persistence must happen before item acknowledgement. |
 
+For TimeWheel specifically, a failed live-backend publication leaves the
+failing slot entry and its untouched tail in original order; entries whose push
+already returned are not restored. An accept-then-process-control interruption
+before local removal is outcome-ambiguous and may replay the current entry, so
+downstream handling must be idempotent.
+
 All five bundled deferred-ack backends use per-message tokens and support
 `CONCURRENT_REQUESTS > 1`. The unsafe-concurrency gate remains for third-party
 plugins that explicitly declare `supports_concurrent_ack=False`.

@@ -291,17 +291,23 @@ class TimeWheelQueueStrategy(QueueStrategy):
         # elapses. In normal operation (span < wheel_size) the filter is a no-op:
         # a slot is only reached when its tick is in the drain window, at which
         # point ready_at <= now.
-        entries = tuple(dq)
-        dq.clear()
-        for entry_index, (ready_at_h, item, priority) in enumerate(entries):
-          if ready_at_h <= now:
-            try:
-              qb.push(queue_name, item, priority)
-            except Exception:
-              dq.extend(entries[entry_index:])
-              raise
-          else:
-            dq.append((ready_at_h, item, priority))
+        # Keep every entry in the slot until its backend push returns. Future
+        # entries remain in place, so interruption never needs compensating
+        # cleanup and the deque always contains only valid business entries.
+        # Successfully published due entries alone are removed. A signal after
+        # backend acceptance but before deletion may replay that one ambiguous
+        # entry, which is the safe at-least-once side of the remote commit
+        # boundary. The common all-due path deletes index zero in O(1); only the
+        # rare mixed future/due catch-up path pays indexed-deque deletion cost.
+        entry_index = 0
+        entries_to_scan = len(dq)
+        for _ in range(entries_to_scan):
+          ready_at_h, item, priority = dq[entry_index]
+          if ready_at_h > now:
+            entry_index += 1
+            continue
+          qb.push(queue_name, item, priority)
+          del dq[entry_index]
       # Drain due overflow. The lock spans backend push through heap removal:
       # another pop must not publish the same uncommitted heap head.
       while self._overflow and self._overflow[0][0] <= now:

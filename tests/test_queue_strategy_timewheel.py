@@ -187,6 +187,76 @@ def test_failed_wheel_drain_keeps_due_item_for_retry():
   assert qb.push.call_count == 2
 
 
+def test_process_control_wheel_drain_keeps_failing_item_and_tail_in_order():
+  """A process-control signal must remove only the successfully pushed prefix."""
+
+  class DrainStop(BaseException):
+    pass
+
+  s, qb, clock = _strategy(wheel_size=10, clock_value=0.0)
+  for item in (b"prefix", b"failing", b"tail"):
+    s.push("q", item, delay=1.0)
+  clock[0] = 1.0
+  signal = DrainStop()
+  failed_once = False
+  accepted: list[bytes] = []
+
+  def publish(_queue_name: str, item: bytes, _priority: float) -> None:
+    nonlocal failed_once
+    if item == b"failing" and not failed_once:
+      failed_once = True
+      raise signal
+    accepted.append(item)
+
+  qb.push.side_effect = publish
+
+  with pytest.raises(DrainStop) as raised:
+    s.pop("q")
+
+  assert raised.value is signal
+  assert accepted == [b"prefix"]
+  assert [item for _ready_at, item, _priority in s._wheel[1]] == [
+    b"failing",
+    b"tail",
+  ]
+
+  s.pop("q")
+
+  assert accepted == [b"prefix", b"failing", b"tail"]
+  assert not s._wheel[1]
+
+
+def test_mixed_future_slot_drain_never_rotates_business_entries():
+  """Future entries stay in place while a later due entry is published."""
+
+  class RotationForbiddenDeque(deque):
+    def rotate(self, n: int = 1) -> None:
+      raise AssertionError(f"slot drain must not rotate by {n}")
+
+  s, qb, clock = _strategy(wheel_size=4, clock_value=0.0)
+  clock[0] = 100.0
+  s.push("q", b"first", delay=0.9)  # ready=100.9, slot=1
+  clock[0] = 100.1
+  s.push("q", b"second", delay=0.3)  # ready=100.4, slot=1
+  s._wheel[1] = RotationForbiddenDeque(s._wheel[1])
+
+  clock[0] = 100.5
+  s.pop("q")
+
+  assert [item for _ready_at, item, _priority in s._wheel[1]] == [
+    b"first",
+  ]
+  assert [published.args[1] for published in qb.push.call_args_list] == [b"second"]
+
+  clock[0] = 101.0
+  s.pop("q")
+
+  assert [published.args[1] for published in qb.push.call_args_list] == [
+    b"second",
+    b"first",
+  ]
+
+
 def test_failed_overflow_drain_keeps_due_item_for_retry():
   """Overflow entries follow the same commit-after-live-push rule."""
   s, qb, clock = _strategy(wheel_size=10, clock_value=0.0)
@@ -252,27 +322,29 @@ def test_concurrent_pops_submit_due_overflow_item_exactly_once():
   assert s._overflow == []
 
 
-def test_concurrent_push_cannot_be_cleared_between_slot_copy_and_clear():
-  """A push racing a drain must remain held instead of being silently lost."""
+def test_concurrent_push_waits_for_slot_drain_and_remains_held():
+  """A push racing a drain remains serialized behind the slot transition."""
   s, qb, clock = _strategy(wheel_size=4, clock_value=0.0)
   s.push("q", b"due", delay=1.0)
   clock[0] = 1.0
-  snapshot_captured = threading.Event()
-  release_snapshot = threading.Event()
+  entry_read = threading.Event()
+  release_entry = threading.Event()
   append_completed = threading.Event()
   errors: list[BaseException] = []
 
   class PausingDeque(deque):
-    def __iter__(self):
-      snapshot = tuple(super().__iter__())
-      snapshot_captured.set()
-      if not release_snapshot.wait(timeout=2.0):
-        raise AssertionError("slot snapshot was not released")
-      return iter(snapshot)
+    def __getitem__(self, index):
+      value = super().__getitem__(index)
+      if index == 0:
+        entry_read.set()
+        if not release_entry.wait(timeout=2.0):
+          raise AssertionError("slot entry read was not released")
+      return value
 
     def append(self, value):
       super().append(value)
-      append_completed.set()
+      if isinstance(value, tuple):
+        append_completed.set()
 
   s._wheel[1] = PausingDeque(s._wheel[1])
 
@@ -292,10 +364,10 @@ def test_concurrent_push_cannot_be_cleared_between_slot_copy_and_clear():
   pop_thread = threading.Thread(target=pop, daemon=True)
   push_thread = threading.Thread(target=push, daemon=True)
   pop_thread.start()
-  assert snapshot_captured.wait(timeout=2.0)
+  assert entry_read.wait(timeout=2.0)
   push_thread.start()
-  append_completed.wait(timeout=0.25)
-  release_snapshot.set()
+  assert not append_completed.wait(timeout=0.25)
+  release_entry.set()
   pop_thread.join(timeout=2.0)
   push_thread.join(timeout=2.0)
 

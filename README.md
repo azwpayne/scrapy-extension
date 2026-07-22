@@ -757,6 +757,12 @@ Use `passthrough` when item loss is unacceptable. Use `batched` only when throug
 | Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives; a token-bearing replacement is rejected before entering volatile delay/time-wheel/round-robin/ring-buffer state | use a backend-durable push path (`passthrough`, `priority`, `work_stealing`, `throttle`, or zero effective delay) when replacing an unacked broker delivery |
 | `batched` storage | backend-bound in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the backend-bound unwritten tail in global FIFO order | keep every caller-provided backend alive until drain; prefer `passthrough` when persistence must happen before item acknowledgement |
 
+Within a live TimeWheel drain, each slot entry remains owned until its backend
+push returns. A failure keeps the failing item and untouched tail in their
+original order, while a confirmed prefix is removed. If the backend accepts an
+item and a process-control signal arrives before local removal, retry may
+publish that one item again; consumers must retain at-least-once idempotence.
+
 Ack is tied to Scrapy downloader response delivery, not spider callback or item pipeline completion. If a crawl must tolerate process death after response download but before item persistence, make item processing idempotent and use a durable storage strategy/topology.
 
 Replacement publication and source acknowledgement are two broker operations,

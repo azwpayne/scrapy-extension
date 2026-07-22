@@ -512,6 +512,13 @@ upgrading.
 
 ### Fixed
 
+- Time-wheel slot drains now retain ownership until each live-backend push
+  returns. A backend or process-control failure keeps the failing entry and the
+  unattempted tail in their original order without restoring the successfully
+  published prefix. Future entries remain in place throughout the scan, so an
+  asynchronous signal cannot strand a cleanup marker or a partial rotation; an
+  accept-then-interrupt boundary may replay only the ambiguous current entry,
+  preserving the documented at-least-once bias.
 - `BackendScheduler` now performs a read-only duplicate check, publishes the
   request to a crash-durable queue boundary, and only then records the
   persistent fingerprint. Failed or interrupted pushes discard local intent
