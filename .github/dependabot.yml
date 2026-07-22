@@ -8,7 +8,7 @@ updates:
     open-pull-requests-limit: 10
     rebase-strategy: disabled
 
-  - package-ecosystem: npm
+  - package-ecosystem: uv
     directory: "/"
     schedule:
       interval: daily
