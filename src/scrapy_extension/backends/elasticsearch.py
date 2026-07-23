@@ -122,6 +122,18 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self._discard_client()
       msg = f"Failed to connect to ElasticSearch ({self.config.mode.value}): {e}"
       raise BackendConnectionError(msg, backend_type="elasticsearch") from e
+    except Exception as e:
+      # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
+      # raised after self._client was assigned: discard the half-initialized
+      # client so is_connected() cannot lie True. Mirrors mongodb/kafka connect().
+      self._discard_client()
+      msg = f"Failed to connect to ElasticSearch ({self.config.mode.value}): {e}"
+      raise BackendConnectionError(msg, backend_type="elasticsearch") from e
+    except BaseException:
+      # Ctrl-C / SystemExit during connect: still discard the client, then
+      # re-signal. Mirrors mongodb.connect() (BaseException arm).
+      self._discard_client()
+      raise
 
   def _discard_client(self) -> None:
     """Clear and best-effort close a failed or retired client."""
