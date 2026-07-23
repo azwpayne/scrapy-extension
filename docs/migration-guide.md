@@ -446,7 +446,7 @@ retryable. `pop_with_ack()` no longer also populates the legacy tokenless slot,
 so direct integrations must retain and settle the returned token; code that
 intentionally uses tokenless settlement must continue to call `pop()`.
 
-Kafka `clear_queue()` now raises `NotImplementedError`. The previous
+Kafka `clear_queue()` now raises `QueueError`. The previous
 delete-and-immediately-recreate sequence was not a completion barrier: topic
 deletion propagates asynchronously, newly accepted records can race the old
 delete, and a reused consumer group can carry incompatible offsets into the
