@@ -60,7 +60,7 @@ Changelog = "https://github.com/azwpayne/scrapy-extension/blob/main/.github/CHAN
 redis = ["redis>=7.3.0,<9"]
 mongodb = ["pymongo>=4.8.0,<5"]
 kafka = ["kafka-python-ng>=2.2.2,<3"]
-rabbitmq = ["pika>=1.4.1,<2"]
+rabbitmq = ["pika>=1.4.2,<2"]
 elasticsearch = ["elasticsearch>=9.4.1,<10"]
 rocketmq = ["rocketmq-python-client>=5.1.1,<6"]
 pulsar = ["pulsar-client>=3.13.0,<4"]
@@ -74,7 +74,7 @@ all = [
     "redis>=7.3.0,<9",
     "pymongo>=4.8.0,<5",
     "kafka-python-ng>=2.2.2,<3",
-    "pika>=1.4.1,<2",
+    "pika>=1.4.2,<2",
     "elasticsearch>=9.4.1,<10",
     "rocketmq-python-client>=5.1.1,<6",
     "pulsar-client>=3.13.0,<4",
@@ -111,7 +111,7 @@ test = [
     "redis>=7.3.0,<9",
     "pymongo>=4.8.0,<5",
     "kafka-python-ng>=2.2.2,<3",
-    "pika>=1.4.1,<2",
+    "pika>=1.4.2,<2",
     "elasticsearch>=9.4.1,<10",
     # apache rocketmq-python-client is pure-Python (gRPC + protobuf, no native
     # lib) — installable in the test env without the librocketmq pain that
