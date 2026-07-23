@@ -859,21 +859,37 @@ class DynamoDBBackend(Backend, StorageBackend):
     if prefix is not None:
       scan_kwargs["FilterExpression"] = "begins_with(pk, :p)"
       scan_kwargs["ExpressionAttributeValues"] = {":p": prefix}
+    # Snapshot the issuing generation under the lock. Every scan page and batch
+    # delete below references this snapshot (never ``self._generation``), so a
+    # concurrent disconnect/reconnect cannot mix a stale scan with a fresh
+    # table. Only the state reads (generation snapshot + each scan page) hold
+    # ``_operation_lock``; each ``_delete_batch_with_backoff`` call -- the slow
+    # ``batch_write_item`` network I/O plus its full-jitter ``time.sleep``
+    # retry -- runs OUTSIDE the lock, mirroring ``connectors.py``'s
+    # release-lock-before-slow-work discipline so a throttled clear cannot stall
+    # concurrent store/retrieve/delete/exists/ttl or shutdown disconnect.
     with self._operation_lock:
       generation = self._generation_for_operation_locked("clear_storage", None)
       table = generation.table
       client = generation.resource.meta.client
       table_name = generation.snapshot.table_name
-      try:
-        # Paginate: a single ``scan`` returns at most ~1 MB per page; without
-        # following ``LastEvaluatedKey`` a large table is silently partial-clear
-        # (#31). Loop until the scan reports no further page. The operation lock
-        # pins every page and batch flush to this exact Table generation.
-        last_key: dict[str, Any] | None = None
-        # Retain fixed-size digests rather than up to 2 KiB of raw key text per
-        # page while detecting non-adjacent pagination cycles.
-        seen_cursor_digests: set[bytes] = set()
-        while True:
+      request_epoch = self._lifecycle_epoch
+    try:
+      # Paginate: a single ``scan`` returns at most ~1 MB per page; without
+      # following ``LastEvaluatedKey`` a large table is silently partial-clear
+      # (#31). Loop until the scan reports no further page.
+      last_key: dict[str, Any] | None = None
+      # Retain fixed-size digests rather than up to 2 KiB of raw key text per
+      # page while detecting non-adjacent pagination cycles.
+      seen_cursor_digests: set[bytes] = set()
+      while True:
+        with self._operation_lock:
+          # A disconnect between pages retires this generation; abort gracefully
+          # (the snapshot's client may already be closed) rather than scan a
+          # stale table. The snapshot stays pinned to the issuing generation
+          # either way, so no cross-generation mixing is possible.
+          if self._lifecycle_epoch != request_epoch:
+            return
           scan = table.scan(
             **scan_kwargs,
             **({"ExclusiveStartKey": last_key} if last_key else {}),
@@ -900,23 +916,32 @@ class DynamoDBBackend(Backend, StorageBackend):
                 key=None,
               )
             seen_cursor_digests.add(cursor_digest)
-          requests = [{"DeleteRequest": {"Key": {"pk": item["pk"]}}} for item in items]
-          for offset in range(0, len(requests), _DDB_BATCH_WRITE_LIMIT):
-            self._delete_batch_with_backoff(
-              client,
-              table_name,
-              requests[offset : offset + _DDB_BATCH_WRITE_LIMIT],
-            )
-          last_key = next_key
-          if not last_key:
-            break
-      except StorageError:
-        raise
-      except Exception as e:
-        # Preserve the driver error as the cause without copying endpoint,
-        # prefix, key, or credential-shaped text into the public exception.
-        msg = "Failed to clear DynamoDB table; the clear may be partially complete"
-        raise StorageError(msg, operation="clear_storage", key=None) from e
+          requests = [
+            {"DeleteRequest": {"Key": {"pk": item["pk"]}}} for item in items
+          ]
+        # ``_operation_lock`` released: run each physical batch's slow
+        # ``batch_write_item`` + backoff outside the lock so concurrent storage
+        # ops are not blocked. Re-validate the epoch before each batch; a
+        # mid-clear retirement aborts before touching the closed client.
+        for offset in range(0, len(requests), _DDB_BATCH_WRITE_LIMIT):
+          with self._operation_lock:
+            if self._lifecycle_epoch != request_epoch:
+              return
+          self._delete_batch_with_backoff(
+            client,
+            table_name,
+            requests[offset : offset + _DDB_BATCH_WRITE_LIMIT],
+          )
+        last_key = next_key
+        if not last_key:
+          break
+    except StorageError:
+      raise
+    except Exception as e:
+      # Preserve the driver error as the cause without copying endpoint,
+      # prefix, key, or credential-shaped text into the public exception.
+      msg = "Failed to clear DynamoDB table; the clear may be partially complete"
+      raise StorageError(msg, operation="clear_storage", key=None) from e
 
 
 class _swallow:

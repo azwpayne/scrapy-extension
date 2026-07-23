@@ -51,36 +51,6 @@ def _join(thread: threading.Thread) -> None:
   assert not thread.is_alive()
 
 
-class _ObservedRLock:
-  """RLock wrapper that exposes when a named thread reaches admission."""
-
-  def __init__(self) -> None:
-    self._lock = threading.RLock()
-    self._observed: dict[str, threading.Event] = {}
-    self.contended: dict[str, bool] = {}
-
-  def observe(self, thread_name: str) -> threading.Event:
-    event = threading.Event()
-    self._observed[thread_name] = event
-    return event
-
-  def __enter__(self) -> _ObservedRLock:
-    thread_name = threading.current_thread().name
-    event = self._observed.get(thread_name)
-    if event is not None:
-      acquired = self._lock.acquire(blocking=False)
-      self.contended[thread_name] = not acquired
-      event.set()
-      if not acquired:
-        self._lock.acquire()
-    else:
-      self._lock.acquire()
-    return self
-
-  def __exit__(self, *_args: object) -> None:
-    self._lock.release()
-
-
 def test_clear_chunks_low_level_batch_writes_at_25_items(mocker) -> None:
   backend, table, client, _resource = _connected(mocker)
   keys = [f"key-{index}" for index in range(60)]
@@ -474,14 +444,22 @@ def test_clear_skips_batch_api_for_empty_scan_pages(mocker) -> None:
   table.batch_writer.assert_not_called()
 
 
-def test_disconnect_waits_through_clear_retry_backoff(mocker) -> None:
+def test_disconnect_proceeds_during_clear_retry_backoff(mocker) -> None:
+  # U2: clear_storage releases _operation_lock around each batch_write + its
+  # full-jitter backoff sleep, so a concurrent disconnect is NOT blocked -- it
+  # retires the generation and closes the client mid-clear. The clear then
+  # re-validates the lifecycle epoch before the next page/batch and aborts
+  # gracefully (no StorageError, no further scan) rather than touch the closed
+  # client. Pre-fix the lock was held across the whole loop, freezing shutdown.
   backend, table, client, resource = _connected(mocker)
-  observed_lock = _ObservedRLock()
-  disconnect_attempted = observed_lock.observe("disconnect")
-  backend._operation_lock = observed_lock
   request = _delete_request("key")
   timeline: list[str] = []
-  table.scan.return_value = {"Items": [{"pk": "key"}]}
+  # Two pages: page 1's batch retries through one backoff; disconnect retires
+  # the generation during that sleep, so the clear aborts before scanning p2.
+  table.scan.side_effect = [
+    {"Items": [{"pk": "key"}], "LastEvaluatedKey": {"pk": "page2"}},
+    {"Items": [{"pk": "second"}]},
+  ]
   responses = iter([
     {"UnprocessedItems": {_TABLE_NAME: [request]}},
     {"UnprocessedItems": {}},
@@ -521,7 +499,7 @@ def test_disconnect_waits_through_clear_retry_backoff(mocker) -> None:
     target=lambda: run(backend.clear_storage), name="clear"
   )
   clear_thread.start()
-  entered = sleep_entered.wait(timeout=5)
+  assert sleep_entered.wait(timeout=5)
   disconnect_returned = threading.Event()
 
   def disconnect() -> None:
@@ -532,40 +510,40 @@ def test_disconnect_waits_through_clear_retry_backoff(mocker) -> None:
     target=lambda: run(disconnect), name="disconnect"
   )
   disconnect_thread.start()
-  attempted = disconnect_attempted.wait(timeout=5)
-  returned_while_backing_off = disconnect_returned.is_set()
+  disconnect_thread.join(timeout=2.0)
+  disconnect_blocked = disconnect_thread.is_alive()
   close_calls_while_backing_off = resource.meta.client.close.call_count
   sleep_release.set()
   _join(clear_thread)
   _join(disconnect_thread)
 
-  assert entered
-  assert attempted
-  assert observed_lock.contended["disconnect"] is True
-  assert returned_while_backing_off is False
-  assert close_calls_while_backing_off == 0
+  assert not disconnect_blocked, (
+    "disconnect() was blocked while clear_storage was parked in backoff sleep"
+  )
+  # disconnect retired the generation and closed the client during the backoff.
+  assert close_calls_while_backing_off == 1
+  # The clear completed page 1's batch retry, then re-validated the epoch before
+  # page 2 and aborted gracefully -- page 2 was never scanned, no error raised.
   assert errors == []
-  assert [
-    call.kwargs["RequestItems"] for call in client.batch_write_item.call_args_list
-  ] == [
-    {_TABLE_NAME: [request]},
-    {_TABLE_NAME: [request]},
-  ]
+  assert table.scan.call_count == 1
+  assert client.batch_write_item.call_count == 2
+  resource.meta.client.close.assert_called_once_with()
+  assert backend.is_connected() is False
   assert timeline == [
     "batch",
     "sleep-enter",
+    "close",
     "sleep-exit",
     "batch",
-    "close",
   ]
-  resource.meta.client.close.assert_called_once_with()
 
 
-def test_store_waits_through_clear_retry_backoff(mocker) -> None:
+def test_store_proceeds_during_clear_retry_backoff(mocker) -> None:
+  # U2: clear_storage releases _operation_lock around each batch_write + its
+  # full-jitter backoff sleep, so a concurrent store is NOT blocked while the
+  # clear is parked retrying UnprocessedItems. Pre-fix the lock was held across
+  # the whole paginated scan + batch loop, freezing the storage pipeline.
   backend, table, client, _resource = _connected(mocker)
-  observed_lock = _ObservedRLock()
-  store_attempted = observed_lock.observe("store")
-  backend._operation_lock = observed_lock
   request = _delete_request("clear-key")
   timeline: list[str] = []
   table.scan.return_value = {"Items": [{"pk": "clear-key"}]}
@@ -609,28 +587,35 @@ def test_store_waits_through_clear_retry_backoff(mocker) -> None:
   )
   clear_thread.start()
   assert sleep_entered.wait(timeout=5)
+  # The clear is parked in its backoff sleep with the lock released; a concurrent
+  # store must slip through and complete immediately (not wait for sleep-exit).
   store_thread = threading.Thread(
     target=lambda: run(lambda: backend.store("stored-after", b"value")),
     name="store",
   )
   store_thread.start()
-  assert store_attempted.wait(timeout=5)
-  assert observed_lock.contended["store"] is True
+  store_thread.join(timeout=2.0)
+  store_blocked = store_thread.is_alive()
   put_calls_while_backing_off = table.put_item.call_count
   sleep_release.set()
   _join(clear_thread)
   _join(store_thread)
 
-  assert put_calls_while_backing_off == 0
+  assert not store_blocked, (
+    "store() was blocked while clear_storage was parked in backoff sleep"
+  )
+  assert put_calls_while_backing_off == 1
   assert errors == []
   assert timeline == [
     "batch",
     "sleep-enter",
+    "store",
     "sleep-exit",
     "batch",
-    "store",
   ]
-  table.put_item.assert_called_once_with(Item={"pk": "stored-after", "value": b"value"})
+  table.put_item.assert_called_once_with(
+    Item={"pk": "stored-after", "value": b"value"}
+  )
 
 
 @pytest.mark.parametrize("injection_point", ["batch", "jitter", "sleep"])
