@@ -478,6 +478,15 @@ the end, and `none` raises `QueueError` when no committed offset exists. Callers
 must not convert that error to zero; scheduler pending detection deliberately
 stays conservative.
 
+Pulsar and RocketMQ `queue_len()` now raise `NotImplementedError` instead of
+returning a false zero. Broker-side depth requires the Pulsar admin API or a
+RocketMQ depth RPC that these clients do not expose, so a number could not be
+reported honestly. The `queue/depth` Scrapy stat no longer emits for these two
+backends, and depth-based backpressure (`SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD`)
+is skipped per poll — scheduler pending and idle detection deliberately stay
+conservative. Monitor load via pop-rate and broker-native tooling, and catch
+`NotImplementedError` wherever `queue_len()` is called directly.
+
 MongoDB `w=0` and negative write concerns are no longer accepted because an
 unacknowledged PyMongo result cannot satisfy queue, set, or storage mutation
 success. Use a positive integer or `"majority"`; custom replica-set tag names

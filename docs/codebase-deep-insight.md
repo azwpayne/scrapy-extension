@@ -1,5 +1,15 @@
 # scrapy-extension — Codebase Deep Insight
 
+> ⚠️ **HISTORICAL — pre-v1-hardening snapshot (last updated 2026-07-11).** This
+> document predates the 2026-07-21 v1-hardening line, which introduced
+> generation-fencing, durability-bound push, single-outcome token settlement, and
+> capability isolation. The layered model in §2 and several per-backend notes no
+> longer reflect current behavior; read this as historical context, not a current
+> description. For the current architectural record see
+> [`insight/ITERATIVE-HARDENING-2026-07-21.md`](insight/ITERATIVE-HARDENING-2026-07-21.md);
+> for the active frontier/closeout see
+> [`insight/SPEC-2026-07-23-post-hardening-frontier.md`](insight/SPEC-2026-07-23-post-hardening-frontier.md).
+
 > **Generated:** 2026-07-05 (incremental from `/loop` + author deep-read of core ABCs)
 > **Updated:** 2026-07-09 — §3.2 RocketMQ ack model corrected (it is **deferred-ack**, not atomic-pop; matches `rocketmq.py:66 requires_ack=True`); §3.3 serialization is now **symmetric** (P0 landed, `{"__b64__":...}` marker); test counts refreshed (1,972 passed). For the verified implementation-level risk register, see [`docs/insight/DEEP-INSIGHT-2026-07-09-parallel-verified.md`](insight/DEEP-INSIGHT-2026-07-09-parallel-verified.md).
 > **Updated:** 2026-07-11 — in-session follow-up landed three TDD fixes (adversarially reviewed): (1) circuit breaker now wraps `pop_with_ack` AND `queue.py:_pop_with_ack` unwraps the breaker proxy so MQ per-message ack tokens survive under `SCRAPY_CIRCUIT_BREAKER_ENABLED`; (2) `BackendScheduler.from_settings` warns on strategy+MQ ack bypass; (3) `BackendSpiderMixin.setup_backend` acquires via the `ConnectionManager.get_manager` singleton. Suite re-synced: **2,026 collected / 1,989 passed / 37 skipped; coverage 99.42%; ruff + mypy --strict clean**. Remaining open: spider_mixin `from_settings` routing (issue), ES `StorageError`/`ttl()` (issue).
