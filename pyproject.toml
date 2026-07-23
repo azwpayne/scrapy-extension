@@ -68,8 +68,8 @@ pulsar = ["pulsar-client>=3.13.0,<4"]
 # 2022-10-17, ~1300+ days stale). The `memcached` extra is storage-only (KV+TTL).
 # See .github/STABILITY.md "Memcached" row for status; tracked as U20.
 memcached = ["pymemcache>=4.0,<5"]
-sqs = ["boto3>=1.34,<2"]
-dynamodb = ["boto3>=1.34,<2"]
+sqs = ["boto3>=1.43.55,<2"]
+dynamodb = ["boto3>=1.43.55,<2"]
 all = [
     "redis>=7.3.0,<9",
     "pymongo>=4.8.0,<5",
@@ -79,7 +79,7 @@ all = [
     "rocketmq-python-client>=5.1.1,<6",
     "pulsar-client>=3.13.0,<4",
     "pymemcache>=4.0,<5",
-    "boto3>=1.34,<2",
+    "boto3>=1.43.55,<2",
 ]
 
 [dependency-groups]
@@ -120,7 +120,7 @@ test = [
     "rocketmq-python-client>=5.1.1,<6",
     "pulsar-client>=3.13.0,<4",
     "pymemcache>=4.0,<5",
-    "boto3>=1.34,<2",
+    "boto3>=1.43.55,<2",
 ]
 
 [tool.uv]
