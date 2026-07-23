@@ -380,9 +380,14 @@ def test_T10_backend_property_owner_error_propagates_to_all_waiters():
   barrier = threading.Barrier(3)
   errors: list[BaseException] = []
   errors_lock = threading.Lock()
+  past_barrier = 0
+  past_barrier_lock = threading.Lock()
 
   def worker():
+    nonlocal past_barrier
     barrier.wait(timeout=5)
+    with past_barrier_lock:
+      past_barrier += 1
     try:
       _ = m.backend  # property access triggers connect (raises); assign silences ruff B018
     except BaseException as e:  # noqa: BLE001
@@ -393,14 +398,18 @@ def test_T10_backend_property_owner_error_propagates_to_all_waiters():
   for t in threads:
     t.start()
 
-  # Hold the owner inside connect() long enough for the other two workers to
-  # enter the manager's waiter path. Releasing this gate produces one failed
-  # connection attempt whose result must be shared by the whole cohort.
+  # Wait until every peer has passed the barrier AND the owner is blocked in
+  # connect(). Once both hold, each peer is guaranteed to observe _connecting=True
+  # (the owner cannot clear it while blocked on connect_block), so releasing the
+  # gate fans one failed attempt out to the whole cohort. Replaces a blind fixed
+  # sleep that could let a slow peer miss the cohort under CI load.
   deadline = time.monotonic() + 5
-  while fake.connect_calls < 1 and time.monotonic() < deadline:
+  while (
+    fake.connect_calls < 1 or past_barrier < 3
+  ) and time.monotonic() < deadline:
     time.sleep(0.01)
   assert fake.connect_calls == 1, "owner did not enter connect()"
-  time.sleep(0.05)
+  assert past_barrier == 3, "peers did not pass the barrier"
   connect_block.set()
 
   for t in threads:
