@@ -1348,12 +1348,16 @@ class KafkaBackend(Backend, QueueBackend):
 
     Raises:
         ValueError: If queue_name contains invalid characters.
-        NotImplementedError: Always, after validating ``queue_name``.
+        QueueError: Always, after validating ``queue_name``. Parity with
+            pulsar/rocketmq: a caller's ``except QueueError`` arm for the
+            unsupported-clear contract catches Kafka's rejection too.
     """
     _validate_topic_name(queue_name)
-    raise NotImplementedError(
+    raise QueueError(
       "Kafka clear_queue is unsupported: asynchronous topic delete/recreate "
       "cannot preserve active consumer-group offsets or protect messages "
       "accepted after clear returns. Stop and drain the queue with an "
-      "operator-controlled Kafka maintenance workflow instead."
+      "operator-controlled Kafka maintenance workflow instead.",
+      queue_name=queue_name,
+      operation="clear_queue",
     )

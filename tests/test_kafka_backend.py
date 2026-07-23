@@ -1430,7 +1430,7 @@ class TestKafkaBackendClearQueue:
     mock_admin = mocker.MagicMock()
     backend._admin_client = mock_admin
 
-    with pytest.raises(NotImplementedError, match="Kafka"):
+    with pytest.raises(QueueError, match="Kafka clear_queue is unsupported"):
       backend.clear_queue("testq")
 
     mock_admin.delete_topics.assert_not_called()
@@ -1441,6 +1441,24 @@ class TestKafkaBackendClearQueue:
 
     with pytest.raises(ValueError, match="Invalid topic"):
       backend.clear_queue("bad queue")
+
+  def test_clear_queue_raises_queue_error_for_unsupported_purge(self, mocker):
+    """U3: clear_queue raises QueueError, parity with pulsar/rocketmq.
+
+    A caller using ``except QueueError`` to handle the unsupported-clear
+    contract (which pulsar.py and rocketmq.py already honor) must catch
+    Kafka's rejection too. A bare ``NotImplementedError`` escapes that
+    ``except QueueError`` arm uncaught.
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    backend._admin_client = mocker.MagicMock()
+
+    with pytest.raises(QueueError, match="Kafka clear_queue is unsupported") as exc_info:
+      backend.clear_queue("testq")
+
+    assert exc_info.value.queue_name == "testq"
+    assert exc_info.value.operation == "clear_queue"
 
 
 class TestKafkaBackendBackendType:

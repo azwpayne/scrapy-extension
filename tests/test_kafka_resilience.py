@@ -146,7 +146,7 @@ def test_clear_queue_fails_closed_even_without_admin_client() -> None:
   """Kafka clear is unsupported instead of reporting an unsafe reset."""
   backend = _backend()
   backend._admin_client = None
-  with pytest.raises(NotImplementedError, match="Kafka"):
+  with pytest.raises(QueueError, match="Kafka clear_queue is unsupported"):
     backend.clear_queue("q")
 
 
