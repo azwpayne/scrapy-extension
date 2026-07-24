@@ -433,7 +433,7 @@ per-component config and is the single chokepoint for the fallback chain.
 | Setting | Default | Contract |
 |---|---:|---|
 | `SCRAPY_RETRY_ATTEMPTS` | `3` | Retries **after** the initial attempt; range 0..20. Default therefore permits at most four total attempts. |
-| `SCRAPY_RETRY_DELAY` | `1.0` | Base seconds for full-jitter exponential backoff: retry `n` sleeps uniformly between 0 and `base * 2**n`. Must be finite and non-negative. |
+| `SCRAPY_RETRY_DELAY` | `1.0` | Base seconds for full-jitter exponential backoff: retry `n` sleeps uniformly between 0 and `min(base * 2**n, 3600s)` — the 3600s ceiling (R21-C) prevents a large base from overflowing `time.sleep`. Must be finite and non-negative. |
 
 These are ConnectionManager-level controls. Backend-native retry settings are
 separate. In particular, `SCRAPY_RABBITMQ_CONNECTION_ATTEMPTS` and
@@ -566,7 +566,7 @@ Two unbounded-growth paths are now capped by default:
 | Surface | Default cap | Setting | Behavior on overflow |
 |---|---|---|---|
 | `MemoryMembershipFilter` | 1,000,000 entries | `SCRAPY_DEDUP_MEMORY_MAXSIZE` | LRU eviction (oldest entry dropped); warn-once at threshold |
-| `DelayQueueStrategy` holding heap | 100,000 items | `SCRAPY_QUEUE_DELAY_MAX_HELD` (soft cap; round-14 R14-C) | Warn-once; non-positive disables |
+| `DelayQueueStrategy` holding heap | 100,000 items | `SCRAPY_QUEUE_DELAY_MAX_HELD` (soft cap; round-14 R14-C) | Warn-once; non-positive disables. Alert on the live `queue/delay_depth` gauge (R21-B) to catch heap growth *before* the cap fires |
 
 **Advanced opt-out:** pass `maxsize=None` to `MemoryMembershipFilter` (or set
 `SCRAPY_DEDUP_MEMORY_MAXSIZE=None`) for unbounded growth — only do this if
@@ -575,14 +575,16 @@ finding (~366 MB @ 1M entries, ~3.58 GB @ 10M).
 
 ## The operability-monitor knobs (round-12 U2)
 
-`ScrapyStatsMonitor` surfaces two operability gauges whose thresholds are
-now operator-tunable (round-14 R14-C — round-12 shipped the gauges with
-constructor defaults only; the settings now exist):
+`ScrapyStatsMonitor` surfaces three operability gauges; the two depth/rate ones
+are operator-tunable (round-14 R14-C — round-12 shipped the gauges with
+constructor defaults only; the settings now exist), and `queue/delay_depth` is a
+read-only depth gauge (R21-B made it live):
 
 | Setting | Default | Surface |
 |---|---|---|
 | `SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD` | `1000` | Depth above which `queue/backpressure` flips on |
 | `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate_1m` gauge (window-tagged: `_1m` at the default 60s, `_{N}s` when overridden) |
+| `queue/delay_depth` (read-only gauge) | — | Live depth of the in-process `DelayQueueStrategy` holding heap (R21-B; emits via `ScrapyStatsMonitor.on_delay_depth`); alert here to catch delay-heap growth before `SCRAPY_QUEUE_DELAY_MAX_HELD` fires |
 
 Both are threaded by `BackendScheduler.from_settings` → the resolved
 `ScrapyStatsMonitor` (and `pop_rate_window_s` is also forwarded to
