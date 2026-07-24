@@ -599,7 +599,8 @@ diagnostics; the stats below add supporting depth:
 | Stat | What it tells you |
 |---|---|
 | `queue/depth` (sampled, U4) | Depth of a backend that supports `queue_len`. `0` = empty only when a sample was available; Pulsar/RocketMQ do not emit a broker depth. |
-| `dupefilter/filtered` | Count of duplicates filtered. High + rising = dedup saturated. |
+| `dupefilter/hit_count` | Per-duplicate request count (monitor/stats.py). High + rising = dedup actively filtering. |
+| `dupefilter/miss_count` | Per-newly-seen request count (monitor/stats.py). Complement to `hit_count` — rising = novel URLs still arriving. |
 | `dupefilter/filter_full` | Cuckoo filter hit capacity (each occurrence increments). Non-zero = Cuckoo at capacity, degrading to passthrough. |
 | `pipeline/storage_skipped` | Items skipped because backend has no `StorageBackend`. Non-zero on a storage-expected backend = misconfigured `SCRAPY_STORAGE_BACKEND_TYPE`. |
 | `scheduler/ack_error` | Ack commit to the queue backend failed (`QueueError` on `ack`). Non-zero on a deferred-ack backend means the broker is rejecting commits; native offset/unacked/visibility semantics may redeliver the message. |
@@ -627,7 +628,7 @@ Differential diagnosis:
 - **`scheduler/ack_error` or `scheduler/nack_error` rising** → the broker is
   rejecting ack/nack commits on a deferred-ack backend. Native broker redelivery
   may keep delivery moving, but duplicates rise —
-  check broker connectivity/permissions and watch `dupefilter/filtered` for the
+  check broker connectivity/permissions and watch `dupefilter/hit_count` for the
   redelivery side-effect. If the failure follows a committed retry/redirect
   replacement, that replacement remains accepted and dedup-recorded; the source
   token stays unresolved. Broker redelivery receives another durable queue
