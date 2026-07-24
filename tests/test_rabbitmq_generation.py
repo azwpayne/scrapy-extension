@@ -170,6 +170,48 @@ def test_connect_closes_candidate_on_baseexception_in_publish_window(mocker) -> 
   assert backend.is_connected() is False
 
 
+def test_publish_window_baseexception_after_publish_keeps_live_session(mocker) -> None:
+  """R18-C: a Ctrl+C AFTER publish completes must not close the now-live candidate.
+
+  R17-B's except-BaseException arm guarded on a ``published`` flag set AFTER
+  ``_publish_handles_locked`` returns — but that call installs the candidate as
+  the live ``self._connection``/``self._channel`` as a side-effect BEFORE
+  returning. A Ctrl+C in the ~1-opcode window between the call return and
+  ``published = True`` reached the arm with ``published`` still False while the
+  candidate WAS the live session, so the arm closed it — violating its own
+  "close ONLY when not published" invariant. The fix guards on actual state
+  (``self._connection is candidate.connection``), not the lagging flag.
+  """
+  backend = _backend()
+  candidate_connection, candidate_channel = _handles("candidate")
+  snapshot = backend._capture_connection_snapshot()
+  candidate = _RabbitMQCandidate(
+    connection=candidate_connection,
+    channel=candidate_channel,
+    snapshot=snapshot,
+  )
+  mocker.patch.object(backend, "_connect_standalone", return_value=candidate)
+  real_publish = backend._publish_handles_locked
+
+  def publish_then_interrupt(connection, channel, *, snapshot):
+    # Run the REAL publish (installs candidate as the live session) THEN raise,
+    # landing the interrupt after publish but before `published = True`.
+    real_publish(connection, channel, snapshot=snapshot)
+    raise KeyboardInterrupt
+
+  mocker.patch.object(
+    backend, "_publish_handles_locked", side_effect=publish_then_interrupt
+  )
+
+  with pytest.raises(KeyboardInterrupt):
+    backend.connect()
+
+  # The candidate was published — it IS the live session. The arm must NOT close it.
+  candidate_connection.close.assert_not_called()
+  candidate_channel.close.assert_not_called()
+  assert backend._connection is candidate_connection
+
+
 def test_disconnect_fences_in_progress_candidate(mocker) -> None:
   backend = _backend()
   candidate_connection, candidate_channel = _handles("candidate")

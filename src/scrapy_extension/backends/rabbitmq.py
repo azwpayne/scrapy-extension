@@ -538,15 +538,22 @@ class RabbitMQBackend(Backend, QueueBackend):
           keep_connection=candidate.connection,
         )
       except BaseException:
-        # R17-B: a Ctrl+C/SystemExit in the candidate→publish window must not
+        # R17-B/R18-C: a Ctrl+C/SystemExit in the candidate→publish window must not
         # leak the off-instance candidate — a pika BlockingConnection spawns a
         # background heartbeat/I/O thread + holds a TCP FD that survive to
-        # interpreter shutdown. Close it ONLY when it was not published; once
-        # published it is the live session. Resource leak, not wedge: the
-        # candidate never reaches instance state on this path, so
-        # ``is_connected()`` stays truthful. Mirrors the R16-A kafka/rocketmq
+        # interpreter shutdown. Close it ONLY when it is not already the live
+        # session: ``_publish_handles_locked`` installs the candidate as
+        # ``self._connection``/``self._channel`` as a side-effect BEFORE it
+        # returns, so the ``published`` flag (set after the call returns) lags
+        # the actual publish by ~1 opcode — a Ctrl+C in that window would see
+        # ``published`` still False while the candidate IS live, closing the
+        # just-published session. The identity guard reads actual post-publish
+        # state, so a published candidate (``self._connection is
+        # candidate.connection``) is never closed. Resource leak, not wedge:
+        # the candidate never reaches instance state on the un-published path,
+        # so ``is_connected()`` stays truthful. Mirrors the R16-A kafka/rocketmq
         # connect() abort contract.
-        if not published and candidate is not None:
+        if candidate is not None and self._connection is not candidate.connection:
           self._close_handles(candidate.channel, candidate.connection)
         raise
       logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
