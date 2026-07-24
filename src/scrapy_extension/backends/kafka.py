@@ -374,6 +374,16 @@ class KafkaBackend(Backend, QueueBackend):
         msg,
         backend_type="kafka",
       ) from e
+    except BaseException:
+      # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
+      # arms above cannot catch them — without this arm a Ctrl+C raised in the
+      # window between ``self._producer = ...`` and ``self._admin_client = ...``
+      # skips ``_abort_partial_connect()``, leaking the producer (TCP socket +
+      # bg thread) and leaving ``is_connected()`` lying True. Run the cleanup
+      # before re-raising. Mirrors mongodb.py / elasticsearch.py / dynamodb /
+      # redis ``except BaseException`` arms.
+      self._abort_partial_connect()
+      raise
 
   def _abort_partial_connect(self) -> None:
     """Close+null any clients assigned before ``connect()`` failed.

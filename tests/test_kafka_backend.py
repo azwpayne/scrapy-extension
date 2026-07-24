@@ -127,6 +127,39 @@ class TestKafkaBackendConnect:
     # No leak: the partially-assigned producer was closed before nulling.
     mock_producer.close.assert_called_once()
 
+  def test_connect_admin_client_baseexception_nulls_producer_no_wedge(self, mocker):
+    """R16-A: a BaseException mid-construction must not skip the abort arm.
+
+    A ``KeyboardInterrupt`` / ``SystemExit`` raised by ``KafkaAdminClient``
+    (after ``self._producer`` is assigned) is NOT an ``Exception`` subclass, so
+    the ``except KafkaError`` / ``except Exception`` arms cannot catch it.
+    Without an ``except BaseException`` arm the producer leaks and
+    ``is_connected()`` lies True — the R-mcc#60 / R-kacc#67 wedge class, the
+    BaseException variant. mongodb/es/dynamodb/redis all carry the BaseException
+    cleanup arm; kafka must too.
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+
+    mock_producer = mocker.MagicMock()
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer",
+      return_value=mock_producer,
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient",
+      side_effect=KeyboardInterrupt,
+    )
+
+    # The BaseException must propagate, not be swallowed into BackendConnectionError.
+    with pytest.raises(KeyboardInterrupt):
+      backend.connect()
+
+    # No wedge: abort ran, so the producer is closed+nulled and is_connected() is truthful.
+    assert backend.is_connected() is False
+    assert backend._producer is None
+    mock_producer.close.assert_called_once()
+
   def test_connect_rejects_mutated_unconfirmed_acks_before_sdk_io(self, mocker):
     config = KafkaSettings()
     backend = KafkaBackend(config)

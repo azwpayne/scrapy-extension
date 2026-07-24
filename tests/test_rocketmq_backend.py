@@ -501,6 +501,31 @@ def test_connect_consumer_startup_failure_cleans_both_clients(mocker) -> None:
   assert backend._consumer is None
 
 
+def test_connect_consumer_startup_baseexception_cleans_both_clients(mocker) -> None:
+  """R16-A: a BaseException mid-construction must not skip the abort arm.
+
+  A ``KeyboardInterrupt`` / ``SystemExit`` raised by ``consumer.startup()``
+  (after the producer is assigned and started) is NOT an ``Exception``
+  subclass, so the ``except BackendConnectionError`` / ``except Exception``
+  arms cannot catch it. Without an ``except BaseException`` arm both clients
+  leak and the backend wedges. Mirrors the kafka BaseException arm and the
+  mongodb/es ``except BaseException`` cleanup pattern.
+  """
+  mock_producer_cls, mock_consumer_cls, *_ = _patch_rocketmq(mocker)
+  mock_consumer_cls.return_value.startup.side_effect = KeyboardInterrupt
+  backend = RocketMQBackend(RocketMQSettings())
+
+  # The BaseException must propagate, not be swallowed into BackendConnectionError.
+  with pytest.raises(KeyboardInterrupt):
+    backend.connect()
+
+  # No wedge/leak: abort ran, so both clients are detached and best-effort stopped.
+  mock_consumer_cls.return_value.shutdown.assert_called_once()
+  mock_producer_cls.return_value.shutdown.assert_called_once()
+  assert backend._producer is None
+  assert backend._consumer is None
+
+
 def test_connect_unexpected_exception(mocker) -> None:
   """connect wraps any unexpected startup error in BackendConnectionError."""
   (

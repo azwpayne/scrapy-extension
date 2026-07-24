@@ -239,6 +239,16 @@ class RocketMQBackend(Backend, QueueBackend):
       self._abort_partial_connect()
       msg = "Failed to connect to RocketMQ."
       raise BackendConnectionError(msg, backend_type="rocketmq") from e
+    except BaseException:
+      # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
+      # arms above cannot catch them — without this arm a Ctrl+C raised after
+      # ``self._producer = Producer(...)`` / ``startup()`` skips
+      # ``_abort_partial_connect()``, leaking both clients (TCP sockets + bg
+      # threads) and wedging the backend. Detach the partially-built clients
+      # before re-raising. Mirrors mongodb.py / elasticsearch.py / kafka
+      # ``except BaseException`` arms.
+      self._abort_partial_connect()
+      raise
 
   def _abort_partial_connect(self) -> None:
     """Detach and best-effort stop clients created by a failed connect."""
