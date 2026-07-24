@@ -73,6 +73,15 @@ _MIN_INVISIBLE_DURATION = 10
 # requests remain consumable instead of failing deterministically.
 _MIN_LONG_POLL_DURATION = 5
 
+# R22-A: ceiling (seconds) for the gRPC per-RPC ``request_timeout`` derived from
+# ``send_timeout``. Matches the Field ``le=300_000`` (ms) in ``RocketMQSettings``
+# — both express the same 5 min ceiling in their native units. Defense-in-depth:
+# even if the Field is bypassed (raw dict config, a future settings source), the
+# conversion cannot push the per-RPC deadline past this and wedge the client on
+# a stalled broker. Mirrors the R21 cap discipline
+# (``CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S`` / ``_MAX_BACKOFF_S``).
+_MAX_REQUEST_TIMEOUT_S = 300
+
 
 class _RocketMQAckToken:
   """Consumer-generation-scoped token for one RocketMQ delivery."""
@@ -199,10 +208,9 @@ class RocketMQBackend(Backend, QueueBackend):
       # (``host:8081``). The field name is kept for settings-schema
       # compatibility; the value must point at the broker's gRPC proxy, NOT the
       # legacy NameServer (9876). The broker must run with ``--enable-proxy``.
-      request_timeout = (
-        send_timeout // 1000
-        if send_timeout >= 1000
-        else 3
+      request_timeout = min(
+        max(3, send_timeout // 1000),
+        _MAX_REQUEST_TIMEOUT_S,
       )
       config_obj = ClientConfiguration(
         endpoints=namesrv_address,

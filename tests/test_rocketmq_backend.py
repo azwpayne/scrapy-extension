@@ -15,7 +15,7 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
 from scrapy_extension.backends.connectors import (
@@ -407,6 +407,44 @@ def test_connect_uses_one_validated_settings_snapshot(mocker) -> None:
     await_duration=0,
     tls_enable=True,
   )
+
+
+def test_send_timeout_field_rejects_above_ceiling():
+  """R22-A: ``send_timeout`` has a 5 min (300_000 ms) ceiling so a stray-zero
+  typo (e.g. a microseconds copy-paste) cannot wedge the gRPC per-RPC deadline
+  for hours. Mirrors the cap discipline on ``invisible_duration`` (le=12*60*60)
+  and the R21 timeout caps (circuit_breaker/backoff/throttle)."""
+  with pytest.raises(ValidationError):
+    RocketMQSettings(send_timeout=300_001)
+
+
+def test_send_timeout_conversion_capped_at_max_request_timeout(mocker):
+  """R22-A: the backend conversion ``min(max(3, send_timeout // 1000),
+  _MAX_REQUEST_TIMEOUT_S)`` applies the ceiling defense-in-depth. A field-max
+  ``send_timeout`` (300_000 ms) converts to at most ``_MAX_REQUEST_TIMEOUT_S``
+  seconds; lowering the const via monkeypatch proves the ``min(...)`` arm caps
+  rather than passing the raw seconds through."""
+  from scrapy_extension.backends import rocketmq as rmq_mod
+
+  (
+    mock_producer_cls,
+    _mock_consumer_cls,
+    _mock_message_cls,
+    mock_config_cls,
+    _mock_credentials_cls,
+  ) = _patch_rocketmq(mocker)
+
+  # Field-max valid value (300_000 ms == 300 s); default const is 300 → 300.
+  config = RocketMQSettings(namesrv_address="localhost:8081", send_timeout=300_000)
+  RocketMQBackend(config).connect()
+  assert mock_config_cls.call_args.kwargs["request_timeout"] == 300
+
+  # Lower the ceiling: the same field-max value must now clamp to the const,
+  # not pass 300 through — proves the ``min(..., _MAX_REQUEST_TIMEOUT_S)`` arm.
+  mocker.patch.object(rmq_mod, "_MAX_REQUEST_TIMEOUT_S", 60)
+  mock_config_cls.reset_mock()
+  RocketMQBackend(config).connect()
+  assert mock_config_cls.call_args.kwargs["request_timeout"] == 60
 
 
 # ---------------------------------------------------------------------------

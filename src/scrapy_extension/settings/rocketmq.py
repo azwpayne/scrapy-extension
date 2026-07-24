@@ -139,8 +139,15 @@ class RocketMQSettings(BaseSettings):
     producer_group: str = Field(default="scrapy-extension-producer")
 
     # === Queue/Priority Settings ===
-    max_message_size: int = Field(default=1024 * 1024, ge=0)  # 1MB default
-    send_timeout: int = Field(default=3000, ge=0)  # ms
+    # 1MB default
+    max_message_size: int = Field(default=1024 * 1024, ge=0)
+    # ms. Ceiling 300_000 (5 min) mirrors the cap discipline on
+    # ``invisible_duration`` and the R21 timeout caps (circuit_breaker/backoff/
+    # throttle): without it a stray-zero typo (e.g. a microseconds copy-paste)
+    # flows through the ``request_timeout = send_timeout // 1000`` conversion
+    # into an unbounded gRPC per-RPC deadline that wedges the producer/consumer
+    # for hours on a stalled broker. Defense-in-depth cap in ``rocketmq.py``.
+    send_timeout: int = Field(default=3000, ge=0, le=300_000)  # ms
     invisible_duration: int = Field(
         default=300,
         ge=10,
