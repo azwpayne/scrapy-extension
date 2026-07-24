@@ -22,6 +22,7 @@ from __future__ import annotations
 __all__ = ["BatchedStorageStrategy"]
 
 import logging
+import math
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -80,11 +81,19 @@ class BatchedStorageStrategy(StorageStrategy):
         ValueError: If ``threshold`` is less than 1, or a configured
             ``max_buffer_age_s`` is not positive.
     """
+    # R21-D: NaN bypasses plain comparison guards (nan < 1 and nan <= 0 are both
+    # False) — reject non-finite values explicitly. Mirrors delay.py
+    # _require_finite / time_wheel.py _finite_number.
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or not math.isfinite(threshold):
+      msg = f"threshold must be a finite int >= 1, got {threshold!r}"
+      raise ValueError(msg)
     if threshold < 1:
       msg = f"threshold must be >= 1, got {threshold}"
       raise ValueError(msg)
-    if max_buffer_age_s is not None and max_buffer_age_s <= 0:
-      msg = f"max_buffer_age_s must be > 0, got {max_buffer_age_s}"
+    if max_buffer_age_s is not None and (
+      not math.isfinite(max_buffer_age_s) or max_buffer_age_s <= 0
+    ):
+      msg = f"max_buffer_age_s must be > 0 (and finite), got {max_buffer_age_s!r}"
       raise ValueError(msg)
     self.threshold = threshold
     self.max_buffer_age_s = max_buffer_age_s

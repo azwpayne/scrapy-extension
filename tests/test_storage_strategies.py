@@ -193,6 +193,18 @@ class TestBatchedStorageStrategy:
     with pytest.raises(ValueError, match="max_buffer_age_s must be > 0"):
       BatchedStorageStrategy(max_buffer_age_s=age)
 
+  def test_nan_max_buffer_age_raises(self) -> None:
+    """R21-D: NaN bypasses the '<= 0' guard (nan <= 0 is False) and would make
+    the age-flusher never fire + hot-spin on wait(timeout=nan)."""
+    with pytest.raises(ValueError, match="max_buffer_age_s"):
+      BatchedStorageStrategy(max_buffer_age_s=float("nan"))
+
+  def test_nan_threshold_raises(self) -> None:
+    """R21-D: NaN bypasses the '< 1' guard (nan < 1 is False) — same isfinite
+    discipline for consistency."""
+    with pytest.raises(ValueError, match="threshold"):
+      BatchedStorageStrategy(threshold=float("nan"))
+
   def test_thread_safety_no_corruption(self, mocker) -> None:
     """Concurrent stores + flushes don't lose or duplicate items."""
     backend = mocker.Mock()
