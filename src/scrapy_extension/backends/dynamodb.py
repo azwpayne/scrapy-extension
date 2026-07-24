@@ -921,8 +921,13 @@ class DynamoDBBackend(Backend, StorageBackend):
           ]
         # ``_operation_lock`` released: run each physical batch's slow
         # ``batch_write_item`` + backoff outside the lock so concurrent storage
-        # ops are not blocked. Re-validate the epoch before each batch; a
-        # mid-clear retirement aborts before touching the closed client.
+        # ops are not blocked. The per-batch epoch re-validation is best-effort,
+        # not a hard boundary: a retirement that lands between this check and the
+        # outside-lock ``batch_write_item`` can close the in-flight client before
+        # the call (at most one batch; it surfaces as the documented partial-clear
+        # ``StorageError``). Snapshot pinning still prevents cross-generation
+        # mixing — only lifecycle teardown can abort mid-clear, never data-plane
+        # corruption.
         for offset in range(0, len(requests), _DDB_BATCH_WRITE_LIMIT):
           with self._operation_lock:
             if self._lifecycle_epoch != request_epoch:
