@@ -590,9 +590,11 @@ Both are threaded by `BackendScheduler.from_settings` → the resolved
 
 ## Diagnose a stuck crawl (page on zero pop rate)
 
-Before round-10's operability signals (U2 — `on_pop_rate` /
-`on_filter_saturation`, not yet landed), a stuck crawl must be diagnosed
-from the existing monitor stats:
+The round-10 operability signals — `on_pop_rate` (the `queue/pop_rate` gauge)
+and `on_filter_saturation` (the `dupefilter/filter_saturation` gauge) — ARE
+landed and wired via `BackendScheduler.from_settings` (see
+`SCRAPY_MONITOR_POP_RATE_WINDOW_S` above). Use them as the primary stuck-crawl
+diagnostics; the stats below add supporting depth:
 
 | Stat | What it tells you |
 |---|---|

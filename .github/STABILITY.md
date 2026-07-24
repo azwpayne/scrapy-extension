@@ -74,6 +74,11 @@ comes from this document; being exported does not automatically make it Stable.
 | SQS/RocketMQ visibility/invisibility settings | Stable | Finite non-renewing lease semantics are operationally significant. |
 | `SCRAPY_RETRY_ATTEMPTS` / `SCRAPY_RETRY_DELAY` | Stable | Initial attempt plus bounded retries with full-jitter exponential backoff. |
 | `scrapy_extension.backends.registry.BackendDescriptor` entry-point registration | Experimental | Public fully qualified import; no broad 3rd-party ecosystem yet. |
+| `SCRAPY_CIRCUIT_BREAKER_ENABLED` (+ `_FAILURE_THRESHOLD`, `_RESET_TIMEOUT`) | Experimental | Opt-in 3-state breaker proxy (off by default); fresh failure-filter/admission contract may evolve. |
+| `SCRAPY_DEDUP_STRICT` | Experimental | Strict per-process dedup rejection semantics; fresh degrade contract. |
+| `SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` | Experimental | Best-effort storage-error escalation threshold for the pipeline. |
+| `SCRAPY_STORAGE_BUFFER_MAX_AGE_S` | Experimental | Bounds the batched-storage age-flush window (crash-before-flush loss surface). |
+| `SCRAPY_PIPELINE_MAX_ITEM_BYTES` | Experimental | Per-item serialized store cap (pipeline-side; distinct from queue-side `SCRAPY_QUEUE_MAX_ITEM_BYTES`). |
 
 ### Internal (no stability promise)
 
