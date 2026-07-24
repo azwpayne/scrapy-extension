@@ -524,7 +524,7 @@ See the [examples directory](https://github.com/azwpayne/scrapy-extension/tree/m
 
 **Kafka, RabbitMQ, Pulsar, SQS**: Queue-only. For deduplication and storage, use Redis, MongoDB, ElasticSearch, Memcached, or DynamoDB.
 
-**Kafka clear limitation**: `clear_queue()` raises `NotImplementedError`.
+**Kafka clear limitation**: `clear_queue()` raises `QueueError`.
 Deleting and recreating a topic is asynchronous and can reuse consumer-group
 offsets, so it cannot provide the queue abstraction's safe-clear boundary.
 Stop producers/consumers and use an operator-controlled Kafka maintenance or
