@@ -381,6 +381,16 @@ class RocketMQBackend(Backend, QueueBackend):
     if not self.is_connected():
       msg = "Not connected to RocketMQ"
       raise QueueError(msg, queue_name=queue_name, operation="push")
+    # R22-C: enforce the documented client-side size cap (fail-fast) so an
+    # operator who tightens ``max_message_size`` below ``queue_max_item_bytes``
+    # gets a clear QueueError at push, not an opaque broker-side rejection. The
+    # Field was previously dead config (declared, never read).
+    if len(item) > self.config.max_message_size:
+      msg = (
+        f"item size {len(item)} exceeds RocketMQ max_message_size "
+        f"{self.config.max_message_size}"
+      )
+      raise QueueError(msg, queue_name=queue_name, operation="push")
 
     try:
       from rocketmq import Message

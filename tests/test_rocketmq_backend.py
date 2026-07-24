@@ -704,6 +704,21 @@ def test_push_unexpected_error(mocker) -> None:
   assert "Failed to push to queue" in str(exc_info.value)
 
 
+def test_push_rejects_item_above_max_message_size(mocker) -> None:
+  """R22-C: push enforces RocketMQSettings.max_message_size client-side (fail-
+  fast) so the documented size cap is not silently ignored. An oversized item
+  raises QueueError BEFORE producer.send is called, mirroring BackendQueue's
+  queue_max_item_bytes gate. Pre-fix the Field was dead config (never read)."""
+  backend, mock_producer, _, _mock_message_cls = _make_connected_backend(
+    mocker, max_message_size=8
+  )
+
+  with pytest.raises(QueueError, match="max_message_size") as exc_info:
+    backend.push("my_queue", b"x" * 16)  # 16 > 8-byte cap
+  assert exc_info.value.operation == "push"
+  mock_producer.send.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # pop
 # ---------------------------------------------------------------------------
