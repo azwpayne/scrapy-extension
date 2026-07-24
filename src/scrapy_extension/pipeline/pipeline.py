@@ -415,8 +415,16 @@ class BackendPipeline:
     self._closed = True
     self._opened = False
     self._opened_spider = None
+    # R20-B: track the primary error so a BaseException from the manager close
+    # is never masked by the strategy error (and vice-versa), AND so a Ctrl+C /
+    # SystemExit during the (blocking) connection_manager.close() — when the
+    # strategy flush already succeeded — propagates instead of being swallowed.
+    # Mirror the dupefilter primary_error pattern (dupefilter.py, PR #63 sibling).
+    primary_error: BaseException | None = None
     try:
       self.storage_strategy.close()
+    except BaseException as exc:
+      primary_error = exc
     finally:
       # Teardown invariant: release the backend connection even if the final
       # flush raised (batched partial-flush, backend error). Without this, a
@@ -426,10 +434,22 @@ class BackendPipeline:
         self._manager_released = True
         try:
           self.connection_manager.close()
-        except BaseException:
-          # Never mask a strategy flush/open/factory error. When manager close
-          # is the only failure, shutdown remains best-effort as before.
-          logger.exception("connection_manager.close() failed during teardown")
+        except BaseException as exc:
+          # Never mask the strategy flush/open/factory error (primary_error).
+          # When manager close is the only failure — including a Ctrl+C during a
+          # hung disconnect — propagate it instead of swallowing.
+          if primary_error is None:
+            primary_error = exc
+          else:
+            try:
+              logger.exception(
+                "connection_manager.close() failed during teardown"
+              )
+            except BaseException:
+              # Logging must never mask the preserved primary error.
+              pass
+    if primary_error is not None:
+      raise primary_error
 
   def process_item(self, item: Any, spider: Spider | None = None) -> Any:
     """Process one item while excluding concurrent terminal teardown."""

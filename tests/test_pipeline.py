@@ -1167,3 +1167,47 @@ class TestBackendPipelineMonitorWiring:
     pipeline = BackendPipeline.from_crawler(mock_crawler)
 
     assert isinstance(pipeline._monitor, ScrapyStatsMonitor)
+
+
+class TestBackendPipelineCloseBaseException:
+  """R20-B: _close_locked must not swallow a BaseException from
+  connection_manager.close() when storage_strategy.close() succeeded."""
+
+  def test_close_locked_reraises_baseexception_when_no_primary_error(self, mocker) -> None:
+    """A Ctrl+C during connection_manager.close() (after the strategy flush
+    succeeded) must propagate, not be swallowed.
+
+    Pre-R20-B the manager close was wrapped in 'except BaseException:
+    logger.exception(...)' with no raise, so a KeyboardInterrupt during the
+    blocking backend disconnect was silently discarded — the operator could not
+    break a hung shutdown. Mirror the dupefilter primary_error pattern: when
+    manager close is the ONLY failure, re-raise it.
+    """
+    manager = mocker.MagicMock()
+    manager.close.side_effect = KeyboardInterrupt
+    strategy = mocker.MagicMock()  # close() is a no-op (succeeds)
+    pipeline = BackendPipeline(connection_manager=manager, storage_strategy=strategy)
+
+    with pytest.raises(KeyboardInterrupt):
+      pipeline._close_locked()
+
+    strategy.close.assert_called_once()
+    manager.close.assert_called_once()
+
+  def test_close_locked_preserves_strategy_error_over_manager_baseexception(
+    self, mocker
+  ) -> None:
+    """A strategy close error is the primary_error; a BaseException from the
+    later manager close must not mask it."""
+    manager = mocker.MagicMock()
+    manager.close.side_effect = SystemExit
+    strategy = mocker.MagicMock()
+    strategy.close.side_effect = RuntimeError("flush failed")
+    pipeline = BackendPipeline(connection_manager=manager, storage_strategy=strategy)
+
+    # The strategy RuntimeError is the primary error; the manager SystemExit is logged, not raised.
+    with pytest.raises(RuntimeError, match="flush failed"):
+      pipeline._close_locked()
+
+    strategy.close.assert_called_once()
+    manager.close.assert_called_once()
