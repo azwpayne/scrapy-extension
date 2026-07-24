@@ -151,6 +151,19 @@ class MemcachedBackend(Backend, StorageBackend):
         raise BackendConnectionError(
           "Failed to connect to Memcached.", backend_type="memcached"
         ) from None
+      except BaseException:
+        # R17-C: a Ctrl+C/SystemExit during the stats() probe (the first command
+        # to open the TCP socket — pymemcache is lazy) must still close the
+        # candidate socket. 'except Exception' cannot catch BaseException, so
+        # without this arm a KeyboardInterrupt raised by stats() escapes before
+        # candidate.close() runs, leaking the open FD. Candidate is never
+        # published (generation-fenced at the publish step below), so
+        # is_connected() stays truthful — bounded to a single FD per occurrence.
+        # Mirror the R16-A kafka/rocketmq/dynamodb connect() BaseException arms.
+        if candidate is not None:
+          with _swallow():
+            candidate.close()
+        raise
       with self._operation_lock:
         with self._lifecycle_lock:
           # A concurrent disconnect fences this private probe by advancing the

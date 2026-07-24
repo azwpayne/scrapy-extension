@@ -283,6 +283,27 @@ class TestMemcachedConnect:
     assert b.is_connected() is False
     client.close.assert_called_once()
 
+  def test_connect_stats_baseexception_closes_candidate(self, mocker) -> None:
+    """R17-C: a Ctrl+C during the stats() probe must close the candidate socket.
+
+    ``stats()`` is the first command to open the TCP socket (pymemcache is
+    lazy). The cleanup arm was ``except Exception``, which cannot catch
+    ``BaseException``, so a ``KeyboardInterrupt`` raised by ``stats()``
+    escaped before ``candidate.close()`` ran, leaking the open socket on the
+    local candidate. The candidate is never published (generation-fenced), so
+    ``is_connected()`` stays truthful — bounded to a single FD per occurrence.
+    R16-A parity: kafka/rocketmq/dynamodb carry the ``except BaseException``
+    connect arm; memcached was missed.
+    """
+    b = _make_backend()
+    client = mocker.MagicMock()
+    client.stats.side_effect = KeyboardInterrupt
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    with pytest.raises(KeyboardInterrupt):
+      b.connect()
+    assert b.is_connected() is False
+    client.close.assert_called_once()
+
   def test_disconnect_closes_client(self, mocker) -> None:
     b, client = _connected(mocker)
     b.disconnect()
