@@ -16,16 +16,17 @@ def mock_connection_manager(mocker):
   The ``push_queue_with_durability`` double mirrors the real
   ``ConnectionManager._push_queue_with_durability`` contract: it classifies a
   push as durable iff ``manager.push_is_durable`` is True (default True — these
-  mocks stand in for real durable backends) and raises ``_DurablePushRequired``
-  when a durable push is required of a non-durable backend. Without this the
-  fixture silently returned ``worker_crash_durable=True`` regardless of
-  ``require_durable``, masking any test trying to exercise the volatile
-  (non-durable) push path. Set ``manager.push_is_durable = False`` to opt in.
+  mocks stand in for real durable backends) and raises the public ``QueueError``
+  (not the internal ``_DurablePushRequired``) when a durable push is required of
+  a non-durable backend — exactly what the real ConnectionManager re-raises
+  (connectors.py catches ``_DurablePushRequired`` and translates it to
+  ``QueueError``). Without this the fixture silently returned
+  ``worker_crash_durable=True`` regardless of ``require_durable``, masking any
+  test trying to exercise the volatile (non-durable) push path. Set
+  ``manager.push_is_durable = False`` to opt in.
   """
-  from scrapy_extension.backends.base import (
-    _DurablePushRequired,
-    _QueuePushReceipt,
-  )
+  from scrapy_extension.backends.base import _QueuePushReceipt
+  from scrapy_extension.exceptions.base import QueueError
 
   manager = mocker.MagicMock()
   queue_backend = mocker.Mock()
@@ -43,7 +44,11 @@ def mock_connection_manager(mocker):
   ):
     durable = manager.push_is_durable is True
     if require_durable and not durable:
-      raise _DurablePushRequired
+      raise QueueError(
+        "mock queue backend is not worker-crash durable",
+        queue_name=queue_name,
+        operation="push",
+      )
     queue_backend.push(queue_name, item, priority)
     return _QueuePushReceipt(worker_crash_durable=durable)
 
