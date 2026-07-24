@@ -160,6 +160,51 @@ class TestKafkaBackendConnect:
     assert backend._producer is None
     mock_producer.close.assert_called_once()
 
+  def test_abort_partial_connect_nulls_before_close_so_second_interrupt_cannot_rewedge(
+    self, mocker
+  ):
+    """R17-A: a second BaseException during ``close()`` must not leave state set.
+
+    R16-A routes ``BaseException`` into ``_abort_partial_connect()`` while an
+    interrupt is already in flight. If the helper nulls AFTER ``close()`` under
+    ``contextlib.suppress(Exception)`` (which cannot catch ``BaseException``),
+    a second ``Ctrl+C`` raised by the blocking ``KafkaProducer.close()`` escapes
+    before ``self._producer = None`` runs — leaving ``_producer`` set so
+    ``is_connected()`` lies True and the producer leaks (the R-kacc wedge, re-opened
+    by R16-A's own arm). Nulling FIRST (mirror rocketmq ``_abort_partial_connect`` /
+    mongodb ``_discard_client``) makes ``is_connected()`` truthful the instant the
+    abort is entered, regardless of what ``close()`` raises.
+    """
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    backend._producer = mocker.MagicMock()
+    backend._admin_client = mocker.MagicMock()
+    backend._producer.close.side_effect = KeyboardInterrupt
+
+    # The close-time interrupt propagates (it is not masked)…
+    with pytest.raises(KeyboardInterrupt):
+      backend._abort_partial_connect()
+
+    # …but state was nulled BEFORE the close, so no wedge on either handle.
+    assert backend._producer is None
+    assert backend._admin_client is None
+
+  def test_abort_partial_connect_nulls_admin_first_when_producer_close_succeeds(
+    self, mocker
+  ):
+    """R17-A companion: a close-time interrupt on the admin client still nulls both."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
+    backend._producer = mocker.MagicMock()
+    backend._admin_client = mocker.MagicMock()
+    backend._admin_client.close.side_effect = SystemExit
+
+    with pytest.raises(SystemExit):
+      backend._abort_partial_connect()
+
+    assert backend._producer is None
+    assert backend._admin_client is None
+
   def test_connect_rejects_mutated_unconfirmed_acks_before_sdk_io(self, mocker):
     config = KafkaSettings()
     backend = KafkaBackend(config)

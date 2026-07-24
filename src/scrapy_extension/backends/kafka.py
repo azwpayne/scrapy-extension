@@ -394,18 +394,30 @@ class KafkaBackend(Backend, QueueBackend):
     :meth:`is_connected` lies ``True`` (silent wedge — backend reports
     connected but has no admin client, so ping/queue_len/clear_queue are
     dead) and the producer leaks under the ConnectionManager retry loop.
-    Mirror the R-mcc memcached connect-cleanup (PR #60): null the partial
-    state so ``is_connected()`` stays truthful. Idempotent and close-safe
-    (a failing ``close()`` during teardown cannot mask the original error).
+
+    R17-A: null FIRST, then best-effort close the captured locals (mirror
+    rocketmq ``_abort_partial_connect`` / mongodb ``_discard_client``). The
+    R16-A ``except BaseException`` arm routes into this helper while an
+    interrupt is already in flight; a prior close-then-null body closed under
+    ``contextlib.suppress(Exception)`` — which cannot catch ``BaseException`` —
+    so a second ``Ctrl+C`` raised by the blocking ``KafkaProducer.close()``
+    escaped before ``self._producer = None`` ran, re-wedging the backend.
+    Nulling first makes ``is_connected()`` truthful the instant the abort is
+    entered, regardless of what ``close()`` raises. Ordinary ``Exception``
+    failures from ``close()`` are swallowed (logged at debug); a
+    ``BaseException`` from ``close()`` still propagates, but state is already
+    detached so no wedge is possible.
     """
-    if self._producer is not None:
-      with contextlib.suppress(Exception):
-        self._producer.close()
-      self._producer = None
-    if self._admin_client is not None:
-      with contextlib.suppress(Exception):
-        self._admin_client.close()
-      self._admin_client = None
+    producer = self._producer
+    admin = self._admin_client
+    self._producer = None
+    self._admin_client = None
+    for closer in (producer, admin):
+      if closer is not None:
+        try:
+          closer.close()
+        except Exception:
+          logger.debug("Failed to abort partial Kafka client", exc_info=True)
 
   def _build_common_config(self) -> dict[str, Any]:
     """Build common Kafka client configuration.
