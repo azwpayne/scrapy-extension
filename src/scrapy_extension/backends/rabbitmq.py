@@ -488,6 +488,8 @@ class RabbitMQBackend(Backend, QueueBackend):
           "backend instance)"
         )
         self._ssl_warning_emitted = True
+      candidate: _RabbitMQCandidate | None = None
+      published = False
       try:
         if snapshot.mode == RabbitMQMode.STANDALONE:
           candidate = self._connect_standalone(snapshot)
@@ -507,31 +509,46 @@ class RabbitMQBackend(Backend, QueueBackend):
           backend_type="rabbitmq",
         ) from None
 
-      with self._retirement_lock:
-        with self._delivery_lock:
-          cancelled = request_epoch != self._lifecycle_epoch
-          peer_published = self._session_is_healthy_locked()
-          if not cancelled and not peer_published:
-            old_channel, old_connection = self._publish_handles_locked(
-              candidate.connection,
-              candidate.channel,
-              snapshot=candidate.snapshot,
-            )
-            published = True
-          else:
-            old_channel = None
-            old_connection = None
-            published = False
-
-      if not published:
-        self._close_handles(candidate.channel, candidate.connection)
-        return
-      self._close_handles(
-        old_channel,
-        old_connection,
-        keep_channel=candidate.channel,
-        keep_connection=candidate.connection,
-      )
+      try:
+        with self._retirement_lock:
+          with self._delivery_lock:
+            cancelled = request_epoch != self._lifecycle_epoch
+            peer_published = self._session_is_healthy_locked()
+            if not cancelled and not peer_published:
+              assert candidate is not None  # build try above assigned it
+              old_channel, old_connection = self._publish_handles_locked(
+                candidate.connection,
+                candidate.channel,
+                snapshot=candidate.snapshot,
+              )
+              published = True
+            else:
+              old_channel = None
+              old_connection = None
+              published = False
+        if not published:
+          assert candidate is not None  # build try above assigned it
+          self._close_handles(candidate.channel, candidate.connection)
+          return
+        assert candidate is not None  # build try above assigned it
+        self._close_handles(
+          old_channel,
+          old_connection,
+          keep_channel=candidate.channel,
+          keep_connection=candidate.connection,
+        )
+      except BaseException:
+        # R17-B: a Ctrl+C/SystemExit in the candidate→publish window must not
+        # leak the off-instance candidate — a pika BlockingConnection spawns a
+        # background heartbeat/I/O thread + holds a TCP FD that survive to
+        # interpreter shutdown. Close it ONLY when it was not published; once
+        # published it is the live session. Resource leak, not wedge: the
+        # candidate never reaches instance state on this path, so
+        # ``is_connected()`` stays truthful. Mirrors the R16-A kafka/rocketmq
+        # connect() abort contract.
+        if not published and candidate is not None:
+          self._close_handles(candidate.channel, candidate.connection)
+        raise
       logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
 
   def _get_ssl_verify_mode(self, mode: str | None = None) -> ssl.VerifyMode:
@@ -657,7 +674,12 @@ class RabbitMQBackend(Backend, QueueBackend):
       channel = connection.channel()
       self._prepare_channel(channel, snapshot=snapshot)
       return channel
-    except Exception:
+    except BaseException:
+      # R17-B: catch BaseException (not just Exception) so a Ctrl+C during the
+      # AMQP channel-open/confirm_delivery handshake still closes the connection
+      # built by the caller before re-raising — otherwise the BlockingConnection
+      # (background heartbeat/I/O thread + TCP FD) leaks. Mirror the R16-A
+      # kafka/rocketmq connect() abort contract.
       if channel is not None:
         with contextlib.suppress(Exception):
           channel.close()

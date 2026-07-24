@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pika.exceptions
 import pytest
 
-from scrapy_extension.backends.rabbitmq import RabbitMQBackend
+from scrapy_extension.backends.rabbitmq import RabbitMQBackend, _RabbitMQCandidate
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings import RabbitMQSettings
 
@@ -106,6 +106,68 @@ def test_failed_candidate_cannot_erase_peer_generation(mocker) -> None:
   candidate_connection.close.assert_called_once()
   peer_channel.close.assert_not_called()
   peer_connection.close.assert_not_called()
+
+
+def test_connect_closes_connection_on_baseexception_during_channel_open(mocker) -> None:
+  """R17-B: a Ctrl+C during channel-open must not leak the built connection.
+
+  ``_open_prepared_channel`` builds the ``pika.BlockingConnection`` first, then
+  opens/prepares the channel (real AMQP I/O — the natural landing point for an
+  operator Ctrl+C during a slow handshake). Its cleanup arm was
+  ``except Exception``, which cannot catch ``BaseException`` — so a
+  ``KeyboardInterrupt`` raised by ``connection.channel()`` escaped before
+  ``connection.close()`` ran, leaking the connection's background heartbeat/I/O
+  thread + TCP FD. The arm must clean up on ``BaseException`` too (R16-A
+  parity; mirror kafka/rocketmq/dynamodb connect arms).
+  """
+  backend = _backend()
+  candidate_connection, _candidate_channel = _handles("candidate")
+  candidate_connection.channel.side_effect = KeyboardInterrupt
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=candidate_connection,
+  )
+
+  with pytest.raises(KeyboardInterrupt):
+    backend.connect()
+
+  # The connection built before the interrupt is closed — no FD/thread leak.
+  candidate_connection.close.assert_called_once()
+  assert backend._connection is None
+  assert backend.is_connected() is False
+
+
+def test_connect_closes_candidate_on_baseexception_in_publish_window(mocker) -> None:
+  """R17-B: a Ctrl+C in the candidate→publish window must close the candidate.
+
+  ``connect()`` returns a fully-prepared candidate (live ``BlockingConnection``
+  + open channel) off-instance, then publishes it under lock. Neither the
+  build try nor the publish window carried an ``except BaseException`` arm, so
+  a ``Ctrl+C`` landing between candidate creation and publication bypassed the
+  ``except Exception`` arm and never reached the ``if not published`` close —
+  leaking the candidate. A ``BaseException`` arm must close the candidate when
+  it was not yet published (resource leak, not wedge: the candidate never
+  reaches instance state, so ``is_connected()`` stays truthful).
+  """
+  backend = _backend()
+  candidate_connection, candidate_channel = _handles("candidate")
+  snapshot = backend._capture_connection_snapshot()
+  candidate = _RabbitMQCandidate(
+    connection=candidate_connection,
+    channel=candidate_channel,
+    snapshot=snapshot,
+  )
+  mocker.patch.object(backend, "_connect_standalone", return_value=candidate)
+  mocker.patch.object(backend, "_publish_handles_locked", side_effect=KeyboardInterrupt)
+
+  with pytest.raises(KeyboardInterrupt):
+    backend.connect()
+
+  candidate_channel.close.assert_called_once()
+  candidate_connection.close.assert_called_once()
+  assert backend._connection is None
+  assert backend._channel is None
+  assert backend.is_connected() is False
 
 
 def test_disconnect_fences_in_progress_candidate(mocker) -> None:
