@@ -163,6 +163,15 @@ class BackendQueue:
     self._monitor: Monitor = (
       monitor if monitor is not None else self._resolve_monitor(spider)
     )
+    # R21-B: forward the monitor to strategies that own operability gauges
+    # (DelayQueueStrategy emits queue/delay_depth). Without this the strategy
+    # keeps its NullMonitor default and the gauge is silently dead in
+    # production. Generic getattr form (mirrors BackendPipeline) so strategies
+    # without a set_monitor hook (passthrough/round_robin/throttle/...) are
+    # unaffected.
+    strategy_set_monitor = getattr(self._strategy, "set_monitor", None)
+    if callable(strategy_set_monitor):
+      strategy_set_monitor(self._monitor)
     # U4 depth-sampling state — see ``_probe_depth``. ``None`` forces the next
     # probe through to the backend; a real ``0`` is always cached verbatim so
     # emptiness is never masked by a stale non-zero value.

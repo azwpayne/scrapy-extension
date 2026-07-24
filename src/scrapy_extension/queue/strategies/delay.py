@@ -150,6 +150,18 @@ class DelayQueueStrategy(QueueStrategy):
     """Bind this in-process heap to one logical queue."""
     self._bind_single_queue(queue_name)
 
+  def set_monitor(self, monitor: Monitor) -> None:
+    """Inject a monitor after construction (R21-B wiring).
+
+    Lets :class:`~scrapy_extension.queue.queue.BackendQueue` share its
+    (possibly late-wired) :class:`~scrapy_extension.monitor.Monitor` with the
+    strategy so ``on_delay_depth`` (the ``queue/delay_depth`` gauge) actually
+    emits in production. Without this the strategy keeps its ``NullMonitor``
+    default and the delay-heap leading indicator is silently dead. Mirrors
+    ``BatchedStorageStrategy.set_monitor``.
+    """
+    self._monitor = monitor
+
   def push(
     self,
     queue_name: str,

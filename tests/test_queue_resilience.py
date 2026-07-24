@@ -83,8 +83,36 @@ def _cm(
 
 
 # ---------------------------------------------------------------------------
-# _persist_snapshot resilience (close path)
+# R21-B: BackendQueue must forward its monitor to the delay strategy
 # ---------------------------------------------------------------------------
+
+
+def test_backend_queue_forwards_monitor_to_delay_strategy() -> None:
+  """R21-B: BackendQueue forwards its monitor to the delay strategy via
+  ``set_monitor`` so ``queue/delay_depth`` actually emits.
+
+  Pre-fix, BackendQueue stored its own ``_monitor`` but never forwarded it to
+  ``self._strategy``; DelayQueueStrategy kept its NullMonitor default and the
+  ``on_delay_depth`` gauge (the delay-heap leading indicator) never fired in
+  production. This exercises the PRODUCTION wiring (BackendQueue→strategy), not
+  ``DelayQueueStrategy(monitor=...)`` direct construction (which bypasses the gap
+  and is a false-green).
+  """
+  spy = MagicMock()
+  strategy = _delay()
+  BackendQueue(
+    connection_manager=_cm(),
+    queue_name="q",
+    queue_strategy=strategy,
+    monitor=spy,
+  )
+  # Push a held (delayed) item — on_delay_depth fires iff the strategy holds
+  # the BackendQueue's monitor, not its NullMonitor default.
+  strategy.push("q", b"x", delay=10.0)
+  spy.on_delay_depth.assert_called_once()
+
+
+
 
 
 def test_persist_snapshot_skips_when_strategy_snapshot_raises() -> None:
