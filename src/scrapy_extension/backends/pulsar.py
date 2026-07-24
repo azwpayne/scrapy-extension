@@ -400,6 +400,12 @@ class PulsarBackend(Backend, QueueBackend):
       if self._client is not None:
         return
     snapshot = self._capture_connection_snapshot()
+    # R19-B: hoist BEFORE the try so the ``except BaseException`` arm below can
+    # always reference ``client``. A Ctrl+C during kwargs-setup (notably the
+    # ``pulsar.AuthenticationToken()`` call) reaches the arm before this
+    # assignment otherwise, raising ``UnboundLocalError`` that masks the original
+    # interrupt. Mirror rabbitmq ``_open_prepared_channel`` (hoist before try).
+    client: Any = None
     try:
       kwargs: dict[str, Any] = {}
       # Keep the package's public compatibility names, but translate them to
@@ -419,7 +425,6 @@ class PulsarBackend(Backend, QueueBackend):
         kwargs["authentication"] = pulsar.AuthenticationToken(
           snapshot.auth_token
         )
-      client: Any = None
       with self._lifecycle_lock:
         # ``connect`` is idempotent and linearizes with ``disconnect``.  Keep
         # client construction inside the lifecycle boundary so a concurrent

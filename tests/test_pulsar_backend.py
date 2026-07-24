@@ -115,6 +115,28 @@ class TestPulsarConnect:
     assert b._client is None
     assert b.is_connected() is False
 
+  def test_connect_baseexception_during_kwargs_setup_reraises_original(self, mocker) -> None:
+    """R19-B: a Ctrl+C during kwargs-setup (before the client hoist) re-raises
+    the original BaseException, not UnboundLocalError.
+
+    R18-B hoisted ``client: Any = None`` INSIDE the try, AFTER the kwargs block —
+    which calls ``pulsar.AuthenticationToken()`` (a C++-backed constructor). A
+    Ctrl+C during that call reached the ``except BaseException`` arm before the
+    hoist ran, so the arm referenced an unbound ``client`` -> ``UnboundLocalError``,
+    masking the original ``KeyboardInterrupt``. The hoist must sit BEFORE the try
+    (mirror rabbitmq ``_open_prepared_channel``, which hoists ``channel`` before
+    its try). Requires auth_token so the AuthenticationToken call executes.
+    """
+    b = _make_backend(
+      service_url="pulsar+ssl://localhost:6651", auth_token="secret-token"
+    )
+    mocker.patch.object(pulsar, "AuthenticationToken", side_effect=KeyboardInterrupt)
+
+    # The original KeyboardInterrupt must propagate — NOT UnboundLocalError from
+    # the arm referencing an unbound `client`.
+    with pytest.raises(KeyboardInterrupt):
+      b.connect()
+
   def test_connect_with_auth_token(self, mocker) -> None:
     # SV3-2: auth_token requires pulsar+ssl:// (cleartext-token guard).
     b = _make_backend(
