@@ -36,3 +36,21 @@ class TestComputeFullJitterBackoff:
     for attempt in range(6):
       for _ in range(500):
         assert compute_full_jitter_backoff(attempt, 2.5) >= 0.0
+
+  def test_huge_base_delay_capped_not_overflow_to_inf(self) -> None:
+    """R21-C: a huge finite base_delay * 2**attempt must not overflow to inf.
+
+    Pre-fix, base_delay=1e303 * 2**18 overflowed IEEE-754 to inf, and
+    random.uniform(0, inf) returned inf, so time.sleep(inf) raised OverflowError
+    that aborted the retry loop with an opaque error. The computed delay is now
+    capped (mirror throttle's ceiling discipline) so the sleep stays finite.
+    """
+    import math
+
+    from scrapy_extension.backends._retry import _MAX_BACKOFF_S
+
+    for _ in range(500):
+      v = compute_full_jitter_backoff(20, 1e303)
+      assert math.isfinite(v), v
+      assert 0.0 <= v <= _MAX_BACKOFF_S, (v, _MAX_BACKOFF_S)
+
