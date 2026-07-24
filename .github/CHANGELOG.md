@@ -115,8 +115,9 @@ upgrading.
 - **Kafka `clear_queue()` is explicitly unsupported.** The former asynchronous
   topic delete/immediate recreate sequence could report success before deletion
   propagated, delete newly accepted work, or reuse old consumer-group offsets
-  against the replacement topic. It now fails before admin I/O; perform a
-  stopped, operator-controlled drain/reset instead. Topic creation also checks
+  against the replacement topic. It now raises `QueueError` before admin I/O
+  (parity with Pulsar/RocketMQ `clear_queue()`); perform a stopped,
+  operator-controlled drain/reset instead. Topic creation also checks
   the admin response's per-topic error code before caching success.
 - **Kafka authentication is now mechanism-complete.** SASL transports require
   an explicit mechanism; PLAIN/SCRAM require a non-empty username/password
