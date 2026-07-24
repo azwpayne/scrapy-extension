@@ -27,6 +27,7 @@ clock without ``time.sleep``.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -37,6 +38,7 @@ from scrapy_extension.backends.base import QueueBackend, SetBackend, StorageBack
 from scrapy_extension.exceptions import BackendError
 
 __all__ = [
+  "CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S",
   "BreakerState",
   "CircuitBreaker",
   "CircuitBreakerOpenError",
@@ -44,6 +46,13 @@ __all__ = [
   "wrap_set_backend",
   "wrap_storage_backend",
 ]
+
+# R21-A: upper bound on reset_timeout. An OPEN breaker recovers via
+# ``(now - opened_at) >= reset_timeout``; for ``inf`` (or any value exceeding the
+# process lifetime) that test is always False, so the breaker wedges OPEN
+# forever — permanent fail-fast with no self-heal. Mirrors throttle's
+# ``THROTTLE_MAX_MIN_INTERVAL_S`` ceiling discipline.
+CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S: float = 3600.0
 
 
 class BreakerState(str, Enum):
@@ -114,11 +123,20 @@ class CircuitBreaker:
     time_fn: Callable[[], float] | None = None,
     failure_exceptions: tuple[type[BaseException], ...] = (BaseException,),
   ) -> None:
+    if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int):
+      msg = f"failure_threshold must be an int >= 1, got {failure_threshold!r}"
+      raise ValueError(msg)
     if failure_threshold < 1:
       msg = f"failure_threshold must be >= 1, got {failure_threshold}"
       raise ValueError(msg)
-    if reset_timeout < 0:
-      msg = f"reset_timeout must be >= 0, got {reset_timeout}"
+    if not math.isfinite(reset_timeout) or reset_timeout < 0:
+      msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
+      raise ValueError(msg)
+    if reset_timeout > CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S:
+      msg = (
+        f"reset_timeout must be <= {CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S}s "
+        f"(an OPEN breaker must be able to recover), got {reset_timeout!r}"
+      )
       raise ValueError(msg)
     self.name = name
     self.failure_threshold = failure_threshold

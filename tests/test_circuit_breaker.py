@@ -76,6 +76,31 @@ class TestCircuitBreakerConstruction:
     with pytest.raises(ValueError, match="reset_timeout"):
       CircuitBreaker("x", reset_timeout=-1.0)
 
+  def test_inf_reset_timeout_raises(self):
+    """R21-A: inf reset_timeout would wedge an OPEN breaker forever (the
+    (now - opened_at) >= reset_timeout test is always False for inf)."""
+    with pytest.raises(ValueError, match="reset_timeout"):
+      CircuitBreaker("x", reset_timeout=float("inf"))
+
+  def test_huge_finite_reset_timeout_raises(self):
+    """R21-A: a huge finite reset_timeout (> the cap) effectively never recovers."""
+    with pytest.raises(ValueError, match="reset_timeout"):
+      CircuitBreaker("x", reset_timeout=1e308)
+
+  def test_bool_failure_threshold_raises(self):
+    """R21-A: bool is an int subclass but not a valid failure_threshold."""
+    with pytest.raises(ValueError, match="failure_threshold"):
+      CircuitBreaker("x", failure_threshold=True)
+
+  def test_cap_reset_timeout_accepted(self):
+    """R21-A: the cap value itself is accepted (boundary)."""
+    from scrapy_extension.backends.circuit_breaker import (
+      CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
+    )
+
+    b = CircuitBreaker("x", reset_timeout=CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S)
+    assert b.reset_timeout == CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S
+
 
 # ---------------------------------------------------------------------------
 # CLOSED → OPEN at threshold

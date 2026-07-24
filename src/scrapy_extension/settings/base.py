@@ -13,6 +13,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.backends.base import BackendType
+from scrapy_extension.backends.circuit_breaker import (
+  CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
+)
 from scrapy_extension.exceptions.base import ConfigurationError
 
 
@@ -220,9 +223,12 @@ class Settings(BaseSettings):
   circuit_breaker_reset_timeout: float = Field(
     default=30.0,
     ge=0,
+    le=CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
     description=(
       "Seconds an OPEN breaker waits before allowing a HALF_OPEN probe call. "
-      "Effective only when ``circuit_breaker_enabled`` is True."
+      "Effective only when ``circuit_breaker_enabled`` is True. Bounded above "
+      f"by CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S ({CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S}s) "
+      "so an OPEN breaker can always recover."
     ),
   )
   backpressure_pause_at: int | None = Field(
