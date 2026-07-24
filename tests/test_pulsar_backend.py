@@ -81,6 +81,40 @@ class TestPulsarConnect:
       b.connect()
     assert b.is_connected() is False
 
+  def test_connect_baseexception_after_client_build_closes_client(self, mocker) -> None:
+    """R18-B: a Ctrl+C after pulsar.Client(...) but before publish closes the client.
+
+    ``pulsar.Client`` starts C++ background IO/service threads in its constructor.
+    A Ctrl+C delivered between the constructor return (line 430) and the publish
+    (line 432) escapes the ``except Exception`` arm without closing the client;
+    it was never published to ``self._client`` so ``disconnect()`` cannot reach
+    it -> the C++ bg threads + lazy broker FD leak to interpreter shutdown. The
+    increment at line 431 sits in that window, so we make it raise KeyboardInterrupt
+    after the client is built. Mirror the R16-A/R17 connect() BaseException contract
+    (pulsar is the last connect()-capable backend to gain the arm).
+    """
+
+    class _InterruptOnIncrement:
+      def __add__(self, other):
+        raise KeyboardInterrupt
+
+      def __iadd__(self, other):
+        raise KeyboardInterrupt
+
+    b = _make_backend()
+    client = mocker.MagicMock()
+    mocker.patch.object(pulsar, "Client", return_value=client)
+    # Line 431 (`self._lifecycle_generation += 1`) is the post-build, pre-publish window.
+    b._lifecycle_generation = _InterruptOnIncrement()  # type: ignore[assignment]
+
+    with pytest.raises(KeyboardInterrupt):
+      b.connect()
+
+    # The built-but-un-published client is closed (no thread/FD leak).
+    client.close.assert_called_once()
+    assert b._client is None
+    assert b.is_connected() is False
+
   def test_connect_with_auth_token(self, mocker) -> None:
     # SV3-2: auth_token requires pulsar+ssl:// (cleartext-token guard).
     b = _make_backend(

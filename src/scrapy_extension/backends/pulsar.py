@@ -419,6 +419,7 @@ class PulsarBackend(Backend, QueueBackend):
         kwargs["authentication"] = pulsar.AuthenticationToken(
           snapshot.auth_token
         )
+      client: Any = None
       with self._lifecycle_lock:
         # ``connect`` is idempotent and linearizes with ``disconnect``.  Keep
         # client construction inside the lifecycle boundary so a concurrent
@@ -442,6 +443,22 @@ class PulsarBackend(Backend, QueueBackend):
       raise BackendConnectionError(
         "Failed to connect to Pulsar.", backend_type="pulsar"
       ) from None
+    except BaseException:
+      # R18-B: a Ctrl+C/SystemExit after ``pulsar.Client(...)`` returns (the C++
+      # binding starts its background IO/service threads in the constructor) but
+      # before the client is published to ``self._client`` must close the
+      # un-published client — otherwise ``disconnect()`` cannot reach it and the
+      # C++ bg threads + lazy broker FD leak to interpreter shutdown. Identity
+      # guard: ``self._client is client`` means it WAS published and disconnect()
+      # owns it, so don't double-close. Resource leak, not wedge: the client is
+      # never published on this path, so ``is_connected()`` stays truthful. The
+      # ``from None`` redaction above is untouched (deliberate secret-redaction).
+      # Mirror the R16-A/R17 connect() BaseException contract — pulsar was the
+      # last connect()-capable backend without this arm.
+      if client is not None and self._client is not client:
+        with _suppress_pulsar_errors():
+          client.close()
+      raise
 
   def disconnect(self) -> None:
     """Close the Pulsar client and release producers/consumers."""
