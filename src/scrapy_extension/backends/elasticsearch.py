@@ -186,7 +186,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     try:
       return self._client is not None and self._client.ping()
-    except TransportError:
+    except (ApiError, TransportError):
+      # R20-A: catch the broad ApiError (auth/permission/unsupported-product/server
+      # faults), not just TransportError — they are siblings, not parent/child, so a
+      # non-TransportError ApiError subclass otherwise escaped raw past the
+      # bool-return contract. Health-probe analog of R19-A (pop()); every other
+      # backend's ping uses a broad catch.
       return False
 
   def ping(self) -> bool:

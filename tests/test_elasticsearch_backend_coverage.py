@@ -171,6 +171,35 @@ class TestIsConnected:
     mock_client.ping.side_effect = TransportError("Ping failed")
     assert backend.is_connected() is False
 
+  def test_is_connected_api_error(self, mocker):
+    """R20-A: is_connected/ping returns False on a non-TransportError ApiError.
+
+    TransportError (transport-layer) and ApiError (HTTP-response hierarchy) are
+    siblings, not parent/child — so an AuthenticationException /
+    AuthorizationException / UnsupportedProductError raised by ping() escaped the
+    ``except TransportError`` arm raw, past the bool-return contract. This is the
+    health-probe analog of R19-A (which fixed pop()). Every other backend's ping
+    uses a broad catch; ES was the sole narrow-catch outlier.
+    """
+    mock_client = mocker.MagicMock(
+      ping=mocker.MagicMock(return_value=True),
+      indices=mocker.MagicMock(
+        exists=mocker.MagicMock(return_value=True),
+        create=mocker.MagicMock(),
+      ),
+    )
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
+    )
+
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    backend.connect()
+
+    mock_client.ping.side_effect = _make_api_error()
+    assert backend.is_connected() is False
+    assert backend.ping() is False
+
   def test_is_connected_none_client(self):
     """Test is_connected returns False when client is None."""
     backend = ElasticSearchBackend(ElasticSearchSettings())
