@@ -213,9 +213,11 @@ class ScrapyStatsMonitor(Monitor):
   def on_pop_rate(self, window_s: float, rate: float) -> None:
     """Set the ``queue/pop_rate_1m`` gauge.
 
-    The window tag is fixed at ``1m`` because :data:`DEFAULT_POP_RATE_WINDOW_S`
-    is 60s and ``BackendQueue`` always passes that window; the stat key name
-    documents the window an operator is looking at on the stats dump. ``rate``
+    The stat key is window-tagged: ``queue/pop_rate_1m`` at the default 60s
+    window, or ``queue/pop_rate_{N}s`` when
+    ``SCRAPY_MONITOR_POP_RATE_WINDOW_S`` is overridden. ``BackendQueue``
+    forwards its configured ``pop_rate_window_s`` here, so the key always
+    reflects the window an operator is looking at on the stats dump. ``rate``
     is pops per second over that trailing window.
 
     Args:
