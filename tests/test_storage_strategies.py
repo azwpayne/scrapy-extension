@@ -701,3 +701,65 @@ class TestBatchedStorageFlusherTOCTOU:
       )
     finally:
       strat.close()
+
+  def test_close_does_not_hang_when_age_flusher_wedges_on_flush_lock(
+    self, mocker
+  ) -> None:
+    """R22-B: ``close()`` must not block forever on ``_flush_lock`` when the
+    age-flusher is wedged mid-``store()`` against an unresponsive backend
+    (redis-py ``socket_timeout=None`` / pymongo ``socketTimeoutMS=None``).
+
+    Pre-fix, the post-join ``self.flush()`` re-entered ``with
+    self._flush_lock:`` and blocked indefinitely — the 5s join timeout was
+    theater and ``close_spider`` hung until SIGKILL. The durable fix (option a)
+    bounds the ``_flush_lock`` acquisition itself, so both ``close()`` and the
+    public ``flush()`` skip-and-log instead of hanging. This pins that close()
+    returns within a bounded window while the flusher still holds the lock.
+    """
+    from scrapy_extension.storage.strategies import batched as batched_mod
+
+    backend = mocker.Mock()
+    store_entered = threading.Event()
+    release_store = threading.Event()
+
+    def wedged_store(*_args, **_kwargs):
+      store_entered.set()
+      # Hold _flush_lock until the test releases us — simulates a backend that
+      # blocks without raising (no socket timeout configured).
+      release_store.wait(timeout=30.0)
+
+    backend.store.side_effect = wedged_store
+    strat = BatchedStorageStrategy(threshold=10**9, max_buffer_age_s=0.01)
+    # Shrink the acquire timeout so the post-join skip is fast; the 5s join
+    # timeout in close() still dominates the wall-clock.
+    if hasattr(batched_mod, "_FLUSH_LOCK_TIMEOUT_S"):
+      mocker.patch.object(batched_mod, "_FLUSH_LOCK_TIMEOUT_S", 0.3)
+
+    strat.store(backend, "k", b"v")  # append + spawn the age-flusher
+    # Wait until the flusher is mid-store(), holding _flush_lock.
+    assert store_entered.wait(timeout=2.0), "age-flusher never reached store()"
+
+    close_done = threading.Event()
+    close_errors: list[Exception] = []
+
+    def run_close() -> None:
+      try:
+        strat.close()
+      except Exception as exc:  # noqa: BLE001 — capture any close() failure
+        close_errors.append(exc)
+      finally:
+        close_done.set()
+
+    close_thread = threading.Thread(target=run_close, daemon=True)
+    close_thread.start()
+    try:
+      # join(5s) + acquire(0.3s) + slack; under the hang this never completes.
+      close_done.wait(timeout=7.0)
+      assert close_done.is_set(), (
+        "close() hung: the post-join flush() blocked on _flush_lock held by "
+        "the wedged age-flusher instead of bounding the acquisition (R22-B)"
+      )
+      assert close_errors == []
+    finally:
+      release_store.set()
+      close_thread.join(timeout=2.0)

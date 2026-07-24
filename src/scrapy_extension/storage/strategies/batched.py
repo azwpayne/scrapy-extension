@@ -37,6 +37,15 @@ if TYPE_CHECKING:
 #: batch" rule of thumb and to keep the docstring / factory default in sync.
 DEFAULT_BATCH_THRESHOLD = 100
 
+#: R22-B: ceiling (seconds) for acquiring ``_flush_lock`` in :meth:`_flush`.
+#: Bounds the shutdown/public-flush path so a wedged backend (redis-py default
+#: ``socket_timeout=None``, pymongo default ``socketTimeoutMS=None``) cannot hang
+#: ``close_spider`` forever: the age-flusher holds ``_flush_lock`` across the
+#: ``storage_backend.store()`` network-I/O loop, and the post-join ``flush()``
+#: used to re-block on it indefinitely. Healthy ``store()`` is milliseconds, so
+#: this timeout never fires in normal operation — it only bounds the wedge.
+_FLUSH_LOCK_TIMEOUT_S: float = 5.0
+
 logger = logging.getLogger(__name__)
 
 _BufferedEntry = tuple["StorageBackend", str, bytes, int | None]
@@ -229,9 +238,29 @@ class BatchedStorageStrategy(StorageStrategy):
     the flush completes still loses the in-flight batch (documented at module
     level) — that is a separate failure mode requiring durable buffering.
     Risk 2's ``max_buffer_age_s`` bounds (but does not eliminate) that window.
+
+    R22-B: the ``_flush_lock`` acquisition is *bounded* by
+    ``_FLUSH_LOCK_TIMEOUT_S``. If the age-flusher (or any concurrent holder) is
+    wedged mid-``store()`` against an unresponsive backend, ``_flush`` skips
+    with a warning instead of blocking forever — so :meth:`close` and the
+    public :meth:`flush` cannot hang ``close_spider``. The skipped items are
+    exactly those already conceded as "in-flight items may be lost" by the
+    join-timeout warning in :meth:`close`; no at-least-once guarantee is lost
+    that the wedge had not already forfeited.
     """
-    with self._flush_lock:
+    acquired = self._flush_lock.acquire(timeout=_FLUSH_LOCK_TIMEOUT_S)
+    if not acquired:
+      logger.warning(
+        "batched-storage flush lock not acquired within %.1fs; skipping "
+        "(a flush is in flight against an unresponsive backend — in-flight "
+        "items may be lost)",
+        _FLUSH_LOCK_TIMEOUT_S,
+      )
+      return
+    try:
       self._flush_serialized()
+    finally:
+      self._flush_lock.release()
 
   def _flush_serialized(self) -> None:
     """Run one flush while the caller owns ``_flush_lock``."""
