@@ -592,7 +592,7 @@ class BackendScheduler:
             ``queue/backpressure`` flips on. Forwarded to the resolved
             ``ScrapyStatsMonitor`` in ``open()``. Default ``1_000`` (U2).
         monitor_pop_rate_window_s: Round-14 R14-C — U2 trailing window
-            (seconds) for the ``queue/pop_rate`` gauge. Forwarded to both
+            (seconds) for the ``queue/pop_rate_1m`` gauge. Forwarded to both
             ``BackendQueue(pop_rate_window_s=…)`` and the resolved monitor
             in ``open()``. Default ``60.0`` (U2).
         queue_snapshot_owner: Stable per-worker identity for isolating local
@@ -1043,7 +1043,7 @@ class BackendScheduler:
         spider: The spider to resolve a stats collector from.
         backpressure_threshold: Depth above which ``queue/backpressure``
             flips on (forwarded to ``ScrapyStatsMonitor``).
-        pop_rate_window_s: Trailing window for ``queue/pop_rate`` (forwarded
+        pop_rate_window_s: Trailing window for ``queue/pop_rate_1m`` (forwarded
             to ``ScrapyStatsMonitor``).
 
     Returns:

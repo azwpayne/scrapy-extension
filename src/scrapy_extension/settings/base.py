@@ -289,7 +289,7 @@ class Settings(BaseSettings):
     default=60.0,
     gt=0,
     description=(
-      "Round-14 R14-C: rolling window (seconds) over which ``queue/pop_rate`` "
+      "Round-14 R14-C: rolling window (seconds) over which ``queue/pop_rate_1m`` "
       "is computed (round-12 U2 operability). Default ``60.0`` matches the "
       "architect's 'calls/sec over a 1m window' contract. Threaded by "
       "``BackendScheduler.from_settings`` → ``BackendQueue(pop_rate_window_s=…)`` "

@@ -582,7 +582,7 @@ constructor defaults only; the settings now exist):
 | Setting | Default | Surface |
 |---|---|---|
 | `SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD` | `1000` | Depth above which `queue/backpressure` flips on |
-| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate` gauge |
+| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate_1m` gauge (window-tagged: `_1m` at the default 60s, `_{N}s` when overridden) |
 
 Both are threaded by `BackendScheduler.from_settings` → the resolved
 `ScrapyStatsMonitor` (and `pop_rate_window_s` is also forwarded to
@@ -590,7 +590,7 @@ Both are threaded by `BackendScheduler.from_settings` → the resolved
 
 ## Diagnose a stuck crawl (page on zero pop rate)
 
-The round-10 operability signals — `on_pop_rate` (the `queue/pop_rate` gauge)
+The round-10 operability signals — `on_pop_rate` (the `queue/pop_rate_1m` gauge)
 and `on_filter_saturation` (the `dupefilter/filter_saturation` gauge) — ARE
 landed and wired via `BackendScheduler.from_settings` (see
 `SCRAPY_MONITOR_POP_RATE_WINDOW_S` above). Use them as the primary stuck-crawl

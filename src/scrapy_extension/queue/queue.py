@@ -124,7 +124,7 @@ class BackendQueue:
             stays correct — sampling only amortizes the RPC while the queue is
             observably non-empty (the active-crawl steady state).
         pop_rate_window_s: U2 operability — rolling window (seconds) over
-            which the ``queue/pop_rate`` gauge is computed. Default
+            which the ``queue/pop_rate_1m`` gauge is computed. Default
             :data:`~scrapy_extension.monitor.base.DEFAULT_POP_RATE_WINDOW_S`
             (60.0). Round-14 R14-C: threaded via
             ``BackendScheduler.from_settings`` so the window is tunable
