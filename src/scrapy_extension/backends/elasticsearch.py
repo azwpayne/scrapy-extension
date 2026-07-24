@@ -323,7 +323,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         return _b64decode(doc["_source"]["item"])
       except NotFoundError:
         return None
-      except TransportError as e:
+      except (ApiError, TransportError) as e:
+        # R19-A: catch the broad ApiError (auth/permission/server/query faults),
+        # not just TransportError — every sibling ES hot-path does. A non-NotFound,
+        # non-Conflict ApiError subclass otherwise escapes raw past the QueueError
+        # contract this method's docstring promises. (NotFoundError -> None above;
+        # ConflictError is handled by the inner delete try's `continue`.)
         raise QueueError(str(e), queue_name=queue_name, operation="pop") from e
     return None
 

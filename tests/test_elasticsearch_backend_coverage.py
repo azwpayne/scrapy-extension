@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from elasticsearch import NotFoundError, TransportError
+from elasticsearch import ApiError, NotFoundError, TransportError
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
@@ -28,6 +28,26 @@ def _make_not_found_error() -> NotFoundError:
     ),
   )
   return NotFoundError("not_found", meta, {})
+
+
+def _make_api_error() -> ApiError:
+  """Create a non-NotFound, non-Conflict ApiError (e.g. auth/server/query fault)."""
+  from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+
+  meta = ApiResponseMeta(
+    status=500,
+    http_version="1.1",
+    headers=HttpHeaders(),
+    duration=0.0,
+    node=NodeConfig(
+      "localhost",
+      "http",
+      9200,
+      path_prefix="",
+      headers=HttpHeaders(),
+    ),
+  )
+  return ApiError("api_failure", meta, {})
 
 
 class TestBuildKwargs:
@@ -189,6 +209,38 @@ class TestPop:
       ),
     )
     mock_client.search.side_effect = TransportError("Search failed")
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=mock_client,
+    )
+
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    backend.connect()
+    with pytest.raises(QueueError) as exc_info:
+      backend.pop("q")
+    assert exc_info.value.queue_name == "q"
+    assert exc_info.value.operation == "pop"
+
+  def test_pop_api_error_wrapped_as_queue_error(self, mocker):
+    """R19-A: a non-NotFound, non-Conflict ApiError subclass (auth/server/query
+    fault) during pop() must surface as QueueError, not propagate raw.
+
+    Every sibling ES hot-path catches (ApiError, TransportError); pop() was the
+    lone outlier (caught only TransportError). An AuthenticationError /
+    ServerError / RequestError raised by indices.refresh()/search()/delete()
+    escaped raw past the QueueError contract the docstring promises, breaking
+    caller error-handling (the queue contract is QueueError on operational
+    failure). NotFoundError (-> None) and ConflictError (inner -> continue)
+    are unaffected.
+    """
+    mock_client = mocker.MagicMock(
+      ping=mocker.MagicMock(return_value=True),
+      indices=mocker.MagicMock(
+        exists=mocker.MagicMock(return_value=True),
+        create=mocker.MagicMock(),
+      ),
+    )
+    mock_client.search.side_effect = _make_api_error()
     mocker.patch(
       "scrapy_extension.backends.elasticsearch.Elasticsearch",
       return_value=mock_client,
