@@ -664,3 +664,47 @@ class TestSnapshotRestore:
     strat.push("q", b"x")
     # Held item → on_delay_depth fires with the held count.
     monitor.on_delay_depth.assert_called_once_with(1)
+
+  def test_drain_emits_on_delay_depth_so_gauge_can_fall(
+    self, mock_connection_manager, mocker
+  ) -> None:
+    """R25-D: _drain_ready emits on_delay_depth(post-drain-held) so the
+    queue/delay_depth gauge can fall. Pre-fix the gauge was push-only and pegged
+    at peak — an operator's max-held alert could never clear."""
+    from scrapy_extension.monitor.base import Monitor
+
+    monitor = mocker.Mock(spec=Monitor)
+    now = [100.0]
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=10.0,
+      clock=_clock(now),
+      monitor=monitor,
+    )
+    strat.push("q", b"x")  # held -> on_delay_depth(1)
+    monitor.on_delay_depth.assert_called_once_with(1)
+    monitor.reset_mock()
+    # Advance clock past ready_at and pop -> _drain_ready drains the heap.
+    now[0] = 111.0
+    strat.pop("q")
+    # Post-drain the heap is empty -> gauge falls to 0 (was: never emitted).
+    monitor.on_delay_depth.assert_called_once_with(0)
+
+  def test_clear_emits_on_delay_depth_zero(
+    self, mock_connection_manager, mocker
+  ) -> None:
+    """R25-D: clear() emits on_delay_depth(0) so the gauge clears on an
+    explicit flush (was push-only; clear left it pegged at the pre-clear peak)."""
+    from scrapy_extension.monitor.base import Monitor
+
+    monitor = mocker.Mock(spec=Monitor)
+    strat = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=10.0,
+      clock=_clock([100.0]),
+      monitor=monitor,
+    )
+    strat.push("q", b"x")  # gauge reads 1
+    monitor.reset_mock()
+    strat.clear("q")
+    monitor.on_delay_depth.assert_called_once_with(0)

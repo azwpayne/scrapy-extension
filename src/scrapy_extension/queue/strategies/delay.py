@@ -350,6 +350,14 @@ class DelayQueueStrategy(QueueStrategy):
         _, _, item, priority = self._holding[0]
         qb.push(queue_name, item, priority)
         heapq.heappop(self._holding)
+      held = len(self._holding)  # R25-D: capture post-drain depth for the gauge
+    # R25-D: emit on drain so queue/delay_depth can fall — pre-fix the gauge was
+    # push-only and pegged at peak, unable to reflect a drained heap (so an
+    # operator's max-held alert could never clear).
+    try:
+      self._monitor.on_delay_depth(held)
+    except Exception:  # noqa: BLE001 - monitor must not break the drain path
+      logger.debug("on_delay_depth hook raised", exc_info=True)
 
   def queue_len(self, queue_name: str) -> int:
     """Return live-queue length plus held-item count.
@@ -380,6 +388,11 @@ class DelayQueueStrategy(QueueStrategy):
     with self._state_lock:
       self._connection_manager.get_queue_backend().clear_queue(queue_name)
       self._holding.clear()
+    # R25-D: emit 0 so the gauge clears on an explicit flush (was push-only).
+    try:
+      self._monitor.on_delay_depth(0)
+    except Exception:  # noqa: BLE001 - monitor must not break clear()
+      logger.debug("on_delay_depth hook raised", exc_info=True)
 
   def close(self) -> None:
     """Release resources, warning about any held (delayed) items.
