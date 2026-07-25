@@ -357,6 +357,60 @@ class TestStrategyCloseFailureIsNonFatal:
     assert scheduler._spider is None
 
 
+class TestStrategyCloseBaseExceptionStillReleasesManager:
+  """R26-G: a ``BaseException`` (Ctrl+C / SystemExit) during teardown must NOT
+  skip the ``connection_manager.close()`` release.
+
+  The pre-R26-G close path guarded the 3 teardown steps (signal disconnect,
+  queue.close, dupefilter.close) with ``except Exception`` — which does NOT
+  cover ``KeyboardInterrupt`` / ``SystemExit``. A BaseException escaping any of
+  those skipped ``connection_manager.close()`` entirely, pinning the manager
+  (its ``_users`` never decrements → socket/fd leak, registry pin toward
+  ``MAX_MANAGERS = 32``). R13/PR#54's close guard was complete on the Exception
+  axis but incomplete on the BaseException axis. R26-G mirrors pipeline R20-B:
+  capture the first BaseException into ``primary_error``, run the CM release in
+  a ``finally``, re-raise ``primary_error`` last.
+  """
+
+  def test_strategy_close_base_exception_still_releases_manager(
+    self, mock_connection_manager, mocker
+  ):
+    """A ``KeyboardInterrupt`` during strategy close is re-raised, but the
+    connection manager is STILL released (the BaseException axis of the close
+    guard). Pre-fix, the CM release was skipped."""
+    from scrapy_extension.queue.strategies.base import QueueStrategy
+
+    class _KeyboardInterruptingStrategy(QueueStrategy):
+      def push(self, queue_name, item, *, priority=0.0, delay=0.0, source="default"):  # noqa: ARG002
+        pass
+
+      def pop(self, queue_name, timeout=0.0):  # noqa: ARG002
+        return None
+
+      def queue_len(self, queue_name):  # noqa: ARG002
+        return 0
+
+      def clear(self, queue_name):  # noqa: ARG002
+        pass
+
+      def close(self) -> None:
+        raise KeyboardInterrupt("simulated Ctrl+C during strategy close")
+
+    scheduler, _ = _make_scheduler_with_queue(
+      mock_connection_manager,
+      mocker,
+      queue_strategy=_KeyboardInterruptingStrategy(mock_connection_manager),
+    )
+
+    # The KeyboardInterrupt is re-raised (primary_error), NOT swallowed.
+    with pytest.raises(KeyboardInterrupt):
+      scheduler.close("finished")
+
+    # CRITICAL: the connection manager was STILL released despite the
+    # BaseException during strategy close. Pre-fix this was skipped.
+    mock_connection_manager.close.assert_called_once_with()
+
+
 class TestSignalDisconnectFailureIsNonFatal:
   """Behavior #5 (exception-safety symmetry): a signal ``disconnect()`` raising
   does NOT block ``queue.close()`` (snapshot persist) or ``connection_manager.close()``.

@@ -1465,50 +1465,80 @@ class BackendScheduler:
       return None
     self._lifecycle_state = _LIFECYCLE_CLOSED
     logger.info("Scheduler closed: %s", reason)
-    if self._connected_signals is not None:
-      signal_handlers = (
-        (self._on_response_received, signals.response_received),
-        (self._on_spider_error, signals.spider_error),
-      )
-      for handler, signal in signal_handlers:
+    # R26-G: teardown must be BaseException-safe. The three teardown steps
+    # below (signal disconnect, queue.close, dupefilter.close) only catch
+    # ``Exception``; a ``BaseException`` (Ctrl+C / SystemExit) escaping any of
+    # them would otherwise skip ``connection_manager.close()`` and pin the
+    # shared manager (its ``_users`` never decrements → socket/fd leak,
+    # registry pin toward ``MAX_MANAGERS``). Capture the first BaseException
+    # into ``primary_error``, run the manager release in a ``finally``, and
+    # re-raise ``primary_error`` last. Mirrors pipeline._close_locked (R20-B).
+    primary_error: BaseException | None = None
+    try:
+      if self._connected_signals is not None:
+        signal_handlers = (
+          (self._on_response_received, signals.response_received),
+          (self._on_spider_error, signals.spider_error),
+        )
+        for handler, signal in signal_handlers:
+          try:
+            self._connected_signals.disconnect(handler, signal=signal)
+          except Exception:
+            # Each stale/already-disconnected tuple is independent: one failure
+            # must not leave the other handler registered or block later cleanup.
+            logger.exception("Failed to disconnect %s during shutdown", signal)
+      # Close the queue strategy FIRST so it can warn about / release any
+      # in-process held state (e.g. DelayQueueStrategy's delayed items) while
+      # the backend is still connected. Must precede connection_manager.close().
+      if self._queue is not None:
         try:
-          self._connected_signals.disconnect(handler, signal=signal)
+          self._queue.close()
         except Exception:
-          # Each stale/already-disconnected tuple is independent: one failure
-          # must not leave the other handler registered or block later cleanup.
-          logger.exception("Failed to disconnect %s during shutdown", signal)
-    # Close the queue strategy FIRST so it can warn about / release any
-    # in-process held state (e.g. DelayQueueStrategy's delayed items) while
-    # the backend is still connected. Must precede connection_manager.close().
-    if self._queue is not None:
-      try:
-        self._queue.close()
-      except Exception:
-        logger.exception("Failed to close queue strategy during shutdown")
-    if (
-      self._owns_dupefilter
-      and self.dupefilter is not None
-      and not self._dupefilter_released
-    ):
-      self._dupefilter_released = True
-      try:
-        self.dupefilter.close(reason)
-      except Exception:
-        logger.exception("Failed to close dupefilter during shutdown")
-      finally:
-        self._dupefilter_open = False
-    self._queue = None
-    self._spider = None
-    self._connected_signals = None
-    self._signals_connected = False
-    self._backpressure_paused = False
-    self._backpressure_probe_due = False
-    if self._owns_connection_manager and not self._manager_released:
-      # ``from_settings`` acquired one shared-manager reference for this
-      # scheduler. Pair it with exactly one release even if Scrapy (or a
-      # caller) delivers duplicate close notifications.
-      self._manager_released = True
-      self.connection_manager.close()
+          logger.exception("Failed to close queue strategy during shutdown")
+      if (
+        self._owns_dupefilter
+        and self.dupefilter is not None
+        and not self._dupefilter_released
+      ):
+        self._dupefilter_released = True
+        try:
+          self.dupefilter.close(reason)
+        except Exception:
+          logger.exception("Failed to close dupefilter during shutdown")
+        finally:
+          self._dupefilter_open = False
+      self._queue = None
+      self._spider = None
+      self._connected_signals = None
+      self._signals_connected = False
+      self._backpressure_paused = False
+      self._backpressure_probe_due = False
+    except BaseException as exc:  # noqa: BLE001 — capture Ctrl+C/SystemExit
+      # A BaseException (Ctrl+C / SystemExit) escaped a teardown step whose
+      # ``except Exception`` guard does not cover it. Capture it; the finally
+      # still releases the manager, then we re-raise so the signal is not lost.
+      primary_error = exc
+    finally:
+      if self._owns_connection_manager and not self._manager_released:
+        # ``from_settings`` acquired one shared-manager reference for this
+        # scheduler. Pair it with exactly one release even if Scrapy (or a
+        # caller) delivers duplicate close notifications — and even if a
+        # BaseException aborted teardown above.
+        self._manager_released = True
+        try:
+          self.connection_manager.close()
+        except BaseException as exc:  # noqa: BLE001 — release must not mask primary
+          if primary_error is None:
+            primary_error = exc
+          else:
+            try:
+              logger.exception(
+                "Failed to close connection manager during shutdown"
+              )
+            except BaseException:
+              pass  # noqa: BLE001 — never mask the primary error being re-raised
+    if primary_error is not None:
+      raise primary_error
     return None
 
   def enqueue_request(self, request: Request) -> bool:
