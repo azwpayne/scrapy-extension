@@ -22,6 +22,7 @@ from scrapy_extension.storage.strategies.batched import (
 from scrapy_extension.storage.strategies.passthrough import (
   PassthroughStorageStrategy,
 )
+from scrapy_extension.utils._config import parse_int_setting
 
 
 class StorageStrategyType(str, Enum):
@@ -71,8 +72,14 @@ def create_storage_strategy(name: str, **opts: Any) -> StorageStrategy:
   if strategy_type is StorageStrategyType.PASSTHROUGH:
     return PassthroughStorageStrategy()
   if strategy_type is StorageStrategyType.BATCHED:
-    threshold_raw = opts.get("threshold", DEFAULT_BATCH_THRESHOLD)
-    threshold = threshold_raw if isinstance(threshold_raw, int) else int(threshold_raw)
+    # R25-C: validate via parse_int_setting so a float threshold (e.g. 50.9) is
+    # rejected with ConfigurationError instead of silently truncating to 50
+    # (which subverted BatchedStorageStrategy.__init__'s R21-D strict-int guard)
+    # and bad types raise the codebase-standard ConfigurationError instead of a
+    # bare TypeError/ValueError.
+    threshold = parse_int_setting(
+      opts.get("threshold", DEFAULT_BATCH_THRESHOLD), "threshold", minimum=1
+    )
     # Risk 2: thread max_buffer_age_s + monitor through to the strategy so
     # the crash-before-flush loss window can be bounded from settings.
     kwargs: dict[str, Any] = {"threshold": threshold}

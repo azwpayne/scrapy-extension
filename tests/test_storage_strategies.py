@@ -620,6 +620,26 @@ class TestStorageStrategyFactory:
     assert isinstance(strat, BatchedStorageStrategy)
     assert strat.threshold == 50
 
+  def test_batched_rejects_float_threshold(self) -> None:
+    """R25-C: a float threshold must raise ConfigurationError, not silently
+    truncate (which subverted BatchedStorageStrategy.__init__'s R21-D
+    strict-int guard — 50.9 used to become 50 with no warning)."""
+    with pytest.raises(ConfigurationError):
+      create_storage_strategy("batched", threshold=50.9)
+
+  def test_batched_rejects_bad_threshold_type(self) -> None:
+    """R25-C: a non-numeric threshold raises the codebase-standard
+    ConfigurationError, not a bare TypeError/ValueError."""
+    with pytest.raises(ConfigurationError):
+      create_storage_strategy("batched", threshold="abc")
+    with pytest.raises(ConfigurationError):
+      create_storage_strategy("batched", threshold=None)
+
+  def test_batched_rejects_threshold_below_minimum(self) -> None:
+    """R25-C: threshold < 1 raises ConfigurationError (minimum=1)."""
+    with pytest.raises(ConfigurationError):
+      create_storage_strategy("batched", threshold=0)
+
   def test_returns_strategy_subclass(self) -> None:
     assert isinstance(create_storage_strategy("passthrough"), StorageStrategy)
     assert isinstance(create_storage_strategy("batched"), StorageStrategy)
