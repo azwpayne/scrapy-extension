@@ -211,8 +211,10 @@ class TestBatchedStorageStrategy:
         return not flusher_completed.is_set()
 
       def join(self, timeout: float | None = None) -> None:
-        # Returns immediately; close()'s drain loop re-checks is_alive().
-        return None
+        # Faithfully model Thread.join blocking semantics: block up to timeout
+        # for the flusher to complete, so the drain loop iterates on is_alive()
+        # rather than busy-spinning on an instant-return stub.
+        flusher_completed.wait(timeout=timeout)
 
     strat._flusher = _StubFlusher()
     # Simulate the flusher mid-store(): it holds _flush_lock.
