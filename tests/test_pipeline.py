@@ -1211,3 +1211,18 @@ class TestBackendPipelineCloseBaseException:
 
     strategy.close.assert_called_once()
     manager.close.assert_called_once()
+
+
+def test_from_crawler_wires_monitor_into_connection_manager(mocker) -> None:
+  """R25-F: from_crawler threads the ScrapyStatsMonitor into the pipeline's
+  ConnectionManager so backend lifecycle counters cover the storage backend in
+  multi-backend deployments (queue!=storage). Pre-fix only the scheduler's
+  manager was wired."""
+  mock_cm = mocker.MagicMock()
+  pipeline = BackendPipeline(connection_manager=mock_cm)
+  pipeline.storage_strategy = mocker.MagicMock()  # ensure attr present for from_crawler
+  mocker.patch.object(BackendPipeline, "from_settings", return_value=pipeline)
+  crawler = mocker.MagicMock()
+  result = BackendPipeline.from_crawler(crawler)
+  assert result is pipeline
+  mock_cm.set_monitor.assert_called_once()

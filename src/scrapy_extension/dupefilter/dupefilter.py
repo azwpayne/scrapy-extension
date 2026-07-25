@@ -622,6 +622,11 @@ class BackendDupeFilter:
       if stats is not None:
         dupefilter._monitor = ScrapyStatsMonitor(stats)
         dupefilter._set_filter_monitor()
+        # R25-F: thread the monitor into the dedup ConnectionManager so
+        # backend/{connect,disconnect,retry}_count cover the set backend in
+        # multi-backend deployments (queue≠dedup). All component monitors wrap
+        # the same crawler.stats, so counters aggregate across managers.
+        dupefilter.connection_manager.set_monitor(dupefilter._monitor)
       return dupefilter
     except BaseException:
       try:

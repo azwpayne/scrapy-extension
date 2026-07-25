@@ -306,6 +306,11 @@ class BackendPipeline:
       set_monitor = getattr(pipeline.storage_strategy, "set_monitor", None)
       if callable(set_monitor):
         set_monitor(pipeline._monitor)
+      # R25-F: also thread the monitor into the pipeline's ConnectionManager so
+      # backend/{connect,disconnect,retry}_count cover the storage backend in
+      # multi-backend deployments (queue≠storage). All component monitors wrap
+      # the same crawler.stats, so counters aggregate across managers.
+      pipeline.connection_manager.set_monitor(pipeline._monitor)
       return pipeline
     except BaseException:
       try:

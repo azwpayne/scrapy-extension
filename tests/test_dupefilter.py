@@ -1260,3 +1260,17 @@ class TestBackendDupeFilterTransientBackendError:
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "transiently unavailable" in warnings[0].message
+
+
+def test_from_crawler_wires_monitor_into_connection_manager(mocker) -> None:
+  """R25-F: from_crawler threads the ScrapyStatsMonitor into the dedup
+  ConnectionManager so backend/{connect,disconnect,retry}_count cover the set
+  backend in multi-backend deployments (queue!=dedup). Pre-fix only the
+  scheduler's (queue) manager was wired; the dedup manager stayed NullMonitor."""
+  mock_cm = mocker.MagicMock()
+  dupefilter = BackendDupeFilter(connection_manager=mock_cm)
+  mocker.patch.object(BackendDupeFilter, "from_settings", return_value=dupefilter)
+  crawler = mocker.MagicMock()
+  result = BackendDupeFilter.from_crawler(crawler)
+  assert result is dupefilter
+  mock_cm.set_monitor.assert_called_once()
