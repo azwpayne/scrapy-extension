@@ -525,13 +525,30 @@ class DynamoDBBackend(Backend, StorageBackend):
           "Failed to connect to DynamoDB.", backend_type="dynamodb"
         ) from exc
 
-      with self._operation_lock:
-        publish = (
-          request_epoch == self._lifecycle_epoch
-          and self._generation is None
-        )
-        if publish:
-          self._publish_generation_locked(candidate)
+      try:
+        with self._operation_lock:
+          publish = (
+            request_epoch == self._lifecycle_epoch
+            and self._generation is None
+          )
+          if publish:
+            self._publish_generation_locked(candidate)
+      except BaseException:
+        # R23-G: a Ctrl+C/SystemExit in the candidate→publish window must not
+        # leak the candidate's already-open HTTP client. _build_candidate opened
+        # the urllib3 connection pool via table.load()/wait_until_exists() (both
+        # network RPCs); the build arm (L327) only covers failures BEFORE the
+        # candidate returns, so this extends it to the post-build publish
+        # window. Close the candidate ONLY when it was not already published as
+        # the live generation — _publish_generation_locked installs it as
+        # self._generation as a side effect, so the identity guard reads actual
+        # post-publish state (a published candidate is the live session and
+        # must not be closed). Mirrors rabbitmq.py:540-558 + the redis
+        # publish-step arm. Resource leak, not wedge: an unpublished candidate
+        # never reaches instance state, so is_connected() stays truthful.
+        if self._generation is not candidate:
+          self._close_resource(candidate.resource)
+        raise
       if not publish:
         self._close_resource(candidate.resource)
         return

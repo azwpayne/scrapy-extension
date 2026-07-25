@@ -127,6 +127,38 @@ def test_candidate_is_private_until_ready_and_failure_closes_it(mocker) -> None:
   resource.meta.client.close.assert_called_once_with()
 
 
+def test_connect_closes_candidate_on_baseexception_in_publish_window(
+  mocker,
+) -> None:
+  """R23-G: a Ctrl+C/SystemExit in the candidate→publish window must close the
+  candidate's already-open HTTP client.
+
+  ``_build_candidate`` opens the urllib3 connection pool via
+  ``table.load()``/``wait_until_exists()`` (both network RPCs); the build arm
+  (dynamodb.py L327) only covers failures BEFORE the candidate returns. The
+  publish step previously had no ``except BaseException`` arm, so a Ctrl+C
+  between candidate-return and publication leaked the open client. The fix
+  closes the candidate ONLY when it was not already published (identity guard).
+  Mirrors rabbitmq.py:540-558 + the redis publish-step arm.
+  """
+  backend = _backend()
+  resource, _table = _resource(mocker)
+  _patch_resource(mocker, return_value=resource)
+  mocker.patch.object(
+    backend, "_publish_generation_locked", side_effect=KeyboardInterrupt
+  )
+
+  with pytest.raises(KeyboardInterrupt):
+    backend.connect()
+
+  # Candidate's HTTP client closed exactly once; backend never reached live state.
+  resource.meta.client.close.assert_called_once_with()
+  assert backend._generation is None
+  assert backend._resource is None
+  assert backend._table is None
+  assert backend.is_connected() is False
+
+
 def test_concurrent_connect_is_single_flight_and_live_connect_is_idempotent(
   mocker,
 ) -> None:
