@@ -736,6 +736,14 @@ upgrading.
 
 ### Removed
 
+- **RocketMQ dead config: `producer_group`, `set_topic_prefix`,
+  `storage_topic_prefix`** settings (R25-G/H). The apache rocketmq-python-client
+  5.1.1 gRPC `Producer` is group-less (group is consumer-side only), and
+  RocketMQ is queue-only by design (set/storage backends raise
+  `ConfigurationError` at config time). These Fields were declared with defaults
+  but had zero consumers — operators who set them got silent ignore. With
+  `extra="forbid"`, setting them now raises a clear `ValidationError` instead of
+  silently misconfiguring (fail-fast vs the prior silent footgun).
 - `BackendQueue.peek()` — non-atomic, documented as unsafe, no production
   callers.
 - 29 unused test dependencies (see Changed: test group trimmed).

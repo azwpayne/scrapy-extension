@@ -162,7 +162,6 @@ def rocketmq_backend():  # type: ignore[no-untyped-def]
   config = RocketMQSettings(
     namesrv_address=os.environ["SCRAPY_TEST_ROCKETMQ_NAMESRV"],
     consumer_group=f"inttest-cg-{suffix}",
-    producer_group=f"inttest-pg-{suffix}",
   )
   backend = RocketMQBackend(config)
   backend.connect()  # R7: starts producer AND consumer

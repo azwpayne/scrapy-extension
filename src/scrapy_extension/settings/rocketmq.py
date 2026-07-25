@@ -135,8 +135,12 @@ class RocketMQSettings(BaseSettings):
     )
 
     # === Consumer Group ===
+    # The apache rocketmq-python-client 5.1.1 gRPC Producer is group-less
+    # (group is consumer-side only in this client — Producer(config, topics,
+    # tls_enable) takes no group arg), so there is no producer_group setting.
+    # Do NOT re-add one without a wire at the Producer() construction in
+    # backends/rocketmq.py (R25-G removed a dead, unconsumed producer_group).
     consumer_group: str = Field(default="scrapy-extension-consumer")
-    producer_group: str = Field(default="scrapy-extension-producer")
 
     # === Queue/Priority Settings ===
     # 1MB default
@@ -159,9 +163,12 @@ class RocketMQSettings(BaseSettings):
     )
 
     # === Topic Settings ===
+    # RocketMQ is queue-only by design (RocketMQSetBackend / RocketMQStorageBackend
+    # raise ConfigurationError; resolve_backend_config excludes RocketMQ from
+    # SET_CAPABLE_BACKENDS / STORAGE_CAPABLE_BACKENDS), so there are no
+    # set_topic_prefix / storage_topic_prefix settings — do NOT re-add them
+    # (R25-H removed vestigial, unconsumed dead config).
     topic_prefix: str = Field(default="scrapy-queue")
-    set_topic_prefix: str = Field(default="scrapy-set")
-    storage_topic_prefix: str = Field(default="scrapy-storage")
 
     @model_validator(mode="after")
     def _validate_connection(self) -> Self:

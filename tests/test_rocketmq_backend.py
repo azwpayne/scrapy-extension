@@ -1412,10 +1412,7 @@ def test_rocketmq_settings_defaults() -> None:
   assert settings.mode == RocketMQMode.STANDALONE
   assert settings.namesrv_address == "localhost:8081"
   assert settings.consumer_group == "scrapy-extension-consumer"
-  assert settings.producer_group == "scrapy-extension-producer"
   assert settings.topic_prefix == "scrapy-queue"
-  assert settings.set_topic_prefix == "scrapy-set"
-  assert settings.storage_topic_prefix == "scrapy-storage"
   assert settings.max_message_size == 1024 * 1024
   assert settings.send_timeout == 3000
   assert settings.invisible_duration == 300
@@ -1431,7 +1428,6 @@ def test_rocketmq_settings_custom_values() -> None:
     secret_key=SecretStr("mysecret"),
     tls_enabled=True,
     consumer_group="my-consumer",
-    producer_group="my-producer",
     topic_prefix="my-queue",
     invisible_duration=600,
   )
