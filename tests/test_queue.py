@@ -31,6 +31,16 @@ class _QueueTestSpider(Spider):
   def handle_failure(self, failure):
     return failure
 
+  @staticmethod
+  def static_helper(response):
+    """Callable but NOT a bound instance method (``inspect.ismethod`` is False).
+
+    R26-B: lets test_pop_rejects_callable_non_method_attribute exercise the
+    ``inspect.ismethod`` guard arm (queue.py) — the realistic mistake of wiring
+    a static helper as a callback.
+    """
+    return response
+
 
 class _LegacyLocalQueueStrategy:
   """Pre-durability-extension custom strategy with process-local storage."""
@@ -1432,9 +1442,16 @@ class TestBackendQueuePop:
     assert result.callback == spider.parse_item
     assert result.errback == spider.handle_failure
 
-  def test_pop_rejects_callable_attribute_that_is_not_bound_spider_method(
+  def test_pop_rejects_non_callable_attribute(
     self, mock_connection_manager, mocker
   ):
+    """R26-B: a callback attribute that is NOT callable (the ``callable`` guard
+    arm, queue.py) is rejected. R25-A's payload swap moved this test from
+    ``__class__`` to ``name`` (a str) so it no longer trips the dunder reject;
+    the rename reflects that it now exercises the callable arm (the
+    ``inspect.ismethod`` arm is covered by
+    test_pop_rejects_callable_non_method_attribute).
+    """
     spider = _QueueTestSpider()
     strategy = mocker.MagicMock()
     queue = BackendQueue(
@@ -1444,10 +1461,40 @@ class TestBackendQueuePop:
       queue_strategy=strategy,
     )
     payload = queue._request_to_dict(Request("https://example.com"))
-    # R25-A: use a non-dunder non-callable attribute ('name' is a str) so this
-    # test still exercises the callable/ismethod guard downstream of the new
-    # dunder reject (which would otherwise catch '__class__' first).
-    payload["callback"] = "name"
+    payload["callback"] = "name"  # a str — callable() is False
+    strategy.pop_with_ack.return_value = (
+      JSONSerializer().serialize(payload),
+      "token-1",
+    )
+
+    with pytest.raises(SerializationError, match="instance method"):
+      queue.pop()
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
+
+  def test_pop_rejects_callable_non_method_attribute(
+    self, mock_connection_manager, mocker
+  ):
+    """R26-B: a callback attribute that IS callable but is NOT a bound instance
+    method (a ``staticmethod``) is rejected. R25-A's payload swap moved the
+    sibling test onto the non-callable path, leaving the ``callable-but-not-a-
+    method`` case uncovered; this pins the realistic mistake of wiring a static
+    helper as a callback. A staticmethod clears the ``callable`` arm but trips
+    ``inspect.ismethod`` (and, redundantly, the ``__self__ is spider`` arm — a
+    staticmethod has no ``__self__``); the payload is rejected either way.
+    """
+    spider = _QueueTestSpider()
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    payload = queue._request_to_dict(Request("https://example.com"))
+    payload["callback"] = "static_helper"  # callable, but not a bound method
     strategy.pop_with_ack.return_value = (
       JSONSerializer().serialize(payload),
       "token-1",

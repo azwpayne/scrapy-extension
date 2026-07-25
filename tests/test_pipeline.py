@@ -1226,3 +1226,10 @@ def test_from_crawler_wires_monitor_into_connection_manager(mocker) -> None:
   result = BackendPipeline.from_crawler(crawler)
   assert result is pipeline
   mock_cm.set_monitor.assert_called_once()
+  # R26-C: assert the wired monitor is a ScrapyStatsMonitor (not a NullMonitor
+  # left by a refactor mistake) — assert_called_once() alone would pass either.
+  from scrapy_extension.monitor.stats import ScrapyStatsMonitor
+
+  assert isinstance(
+    mock_cm.set_monitor.call_args[0][0], ScrapyStatsMonitor
+  )
