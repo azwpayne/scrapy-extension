@@ -738,6 +738,13 @@ class BackendQueue:
     require_type("dont_filter", bool)
     require_type("flags", list)
     require_type("_class", str)
+    # R26-D: dumps_kwargs is the lone JsonRequest-specific attribute Scrapy
+    # round-trips through request_from_dict (.get(..., {}) then iterates it).
+    # A crafted non-dict value passes the other checks and would surface as an
+    # opaque AttributeError deep in deserialization; validate it here for a
+    # clean TypeError naming the field. Gated on field presence, so ordinary
+    # (non-JsonRequest) payloads are unaffected.
+    require_type("dumps_kwargs", dict)
 
     flags = request_dict.get("flags")
     if isinstance(flags, list) and not all(isinstance(flag, str) for flag in flags):

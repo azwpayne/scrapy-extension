@@ -1065,6 +1065,18 @@ def test_queue_wire_validator_accepts_scalar_and_list_header_values() -> None:
   assert payload["priority"] == 0
 
 
+def test_queue_wire_validator_rejects_non_dict_dumps_kwargs() -> None:
+  """R26-D: a crafted JsonRequest payload with non-dict ``dumps_kwargs`` must
+  fail at the validate layer (clean ``TypeError`` naming the field), not
+  surface later as an opaque ``AttributeError`` in ``_request_from_dict``
+  (Scrapy reads ``dumps_kwargs`` via ``.get(..., {})`` and iterates it). The
+  helper's ``if field in request_dict`` gate means non-JsonRequest payloads
+  (no ``dumps_kwargs`` key) are unaffected.
+  """
+  with pytest.raises(TypeError, match="dumps_kwargs"):
+    BackendQueue._validate_request_dict({"dumps_kwargs": "not-a-dict"})
+
+
 def test_queue_body_codec_and_callback_validation_fail_closed() -> None:
   with pytest.raises(SerializationError, match="Unsupported queued request body codec"):
     BackendQueue._decode_body({"_scrapy_extension_body_codec": "future"})
