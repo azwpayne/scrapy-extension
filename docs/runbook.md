@@ -559,6 +559,20 @@ backends. (Round-14 R14-C: this setting was deferred in round-9 — the
 constructor default was the only path; the setting now exists and is
 threaded by `BackendScheduler.from_settings` → `BackendQueue(max_item_bytes=…)`.)
 
+## RocketMQ push-time caps (round-22)
+
+RocketMQ has two backend-specific caps that fail fast rather than wedging or
+dropping silently:
+
+- `SCRAPY_ROCKETMQ_SEND_TIMEOUT` (default 3000 ms) is capped at 300000 ms
+  (5 min) — a stray-zero typo (e.g. `36000000`) can no longer wedge the gRPC
+  per-RPC deadline for hours (R22-A).
+- `SCRAPY_ROCKETMQ_MAX_MESSAGE_SIZE` (default 1 MiB) is enforced at push time:
+  items exceeding it raise `QueueError(operation="push")` client-side rather
+  than surfacing as an opaque broker error (R22-C). It was previously a
+  declared-but-unconsumed dead config. Note `=0` is allowed by the Field and
+  rejects every non-empty push (use it only to deliberately fail-fast).
+
 ## The memory-cap knobs (round-9 U5)
 
 Two unbounded-growth paths are now capped by default:
@@ -583,7 +597,7 @@ read-only depth gauge (R21-B made it live):
 | Setting | Default | Surface |
 |---|---|---|
 | `SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD` | `1000` | Depth above which `queue/backpressure` flips on |
-| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate_1m` gauge (window-tagged: `_1m` at the default 60s, `_{N}s` when overridden) |
+| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate_1m` gauge (window-tagged: `_1m` at the default 60s, `_{N}s` when overridden); capped at 86400 s (24 h) — R23-E: an unbounded window was a soft-OOM foot-gun (the pop-timestamp deque grows without eviction) |
 | `queue/delay_depth` (read-only gauge) | — | Live depth of the in-process `DelayQueueStrategy` holding heap (R21-B; emits via `ScrapyStatsMonitor.on_delay_depth`); alert here to catch delay-heap growth before `SCRAPY_QUEUE_DELAY_MAX_HELD` fires |
 
 Both are threaded by `BackendScheduler.from_settings` → the resolved
