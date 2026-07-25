@@ -972,6 +972,7 @@ class BackendScheduler:
         "SCRAPY_MONITOR_POP_RATE_WINDOW_S",
         minimum=0.0,
         minimum_exclusive=True,
+        maximum=86400.0,
       )
       snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
       queue_snapshot_owner = (

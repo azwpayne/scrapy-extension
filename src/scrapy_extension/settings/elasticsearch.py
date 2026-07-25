@@ -105,6 +105,7 @@ class ElasticSearchSettings(BaseSettings):
   request_timeout: float = Field(
     default=30.0,
     ge=0,
+    le=86400,
     description="Request timeout in seconds",
   )
   max_retries: int = Field(

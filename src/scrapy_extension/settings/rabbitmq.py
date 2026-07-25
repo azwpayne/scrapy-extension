@@ -329,7 +329,8 @@ class RabbitMQSettings(BaseSettings):
   heartbeat: int = Field(
     default=600,
     ge=0,
-    description="Heartbeat interval in seconds",
+    le=65535,
+    description="Heartbeat interval in seconds (AMQP Tune-Ok encodes as unsigned short, 0-65535)",
   )
   blocked_connection_timeout: int = Field(
     default=300,

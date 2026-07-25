@@ -310,11 +310,13 @@ class RedisSettings(BaseSettings):
   socket_timeout: float | None = Field(
     default=30.0,
     ge=0,
+    le=86400,
     description="Socket timeout in seconds",
   )
   socket_connect_timeout: float | None = Field(
     default=5.0,
     ge=0,
+    le=86400,
     description="Socket connection timeout in seconds",
   )
   retry_on_timeout: bool = Field(

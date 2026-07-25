@@ -294,11 +294,15 @@ class Settings(BaseSettings):
   monitor_pop_rate_window_s: float = Field(
     default=60.0,
     gt=0,
+    le=86400.0,
     description=(
       "Round-14 R14-C: rolling window (seconds) over which ``queue/pop_rate_1m`` "
       "is computed (round-12 U2 operability). Default ``60.0`` matches the "
-      "architect's 'calls/sec over a 1m window' contract. Threaded by "
-      "``BackendScheduler.from_settings`` → ``BackendQueue(pop_rate_window_s=…)`` "
+      "architect's 'calls/sec over a 1m window' contract. R23-E: capped at "
+      "86400.0 (24h) — the pop-timestamp deque holds ~pop_rate x window_s "
+      "entries, so an unbounded window is a soft-OOM foot-gun; 24h covers any "
+      "legit rolling-rate window while rejecting pathological values. Threaded "
+      "by ``BackendScheduler.from_settings`` → ``BackendQueue(pop_rate_window_s=…)`` "
       "+ ``ScrapyStatsMonitor(pop_rate_window_s=…)``."
     ),
   )

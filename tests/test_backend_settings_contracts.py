@@ -460,7 +460,64 @@ def test_global_retry_settings_reach_connection_manager() -> None:
   assert manager._retry_policy() == (7, 0.125)
 
 
-def test_rabbitmq_retry_delay_is_independent_from_manager_retry_delay() -> None:
+def test_redis_socket_timeouts_reject_non_finite_and_over_cap() -> None:
+  """R23-B: socket_timeout/socket_connect_timeout used Field(ge=0) which accepts
+  inf/NaN/huge-finite; redis-py then calls socket.settimeout(inf) which raises
+  OverflowError (an ArithmeticError, NOT an OSError) that escapes redis-py's
+  except-OSError trap and wedges connect retries. le=86400 rejects inf/NaN
+  (inf<=86400 is False, nan<=86400 is False) and caps at a 24h ceiling."""
+  with pytest.raises(ValidationError):
+    RedisSettings(socket_timeout=float("inf"))
+  with pytest.raises(ValidationError):
+    RedisSettings(socket_timeout=float("nan"))
+  with pytest.raises(ValidationError):
+    RedisSettings(socket_timeout=1e10)
+  with pytest.raises(ValidationError):
+    RedisSettings(socket_connect_timeout=float("inf"))
+  ok = RedisSettings(socket_timeout=86400.0, socket_connect_timeout=30.0)
+  assert ok.socket_timeout == 86400.0
+
+
+def test_elasticsearch_request_timeout_rejects_non_finite_and_over_cap() -> None:
+  """R23-C: request_timeout used Field(ge=0) which accepted inf; the ES client
+  transport converts it to a socket timeout and socket.settimeout(inf) raises
+  OverflowError, wrapping every op (push/pop/store/etc) in ConnectionError.
+  le=86400 rejects inf/NaN/huge-finite."""
+  with pytest.raises(ValidationError):
+    ElasticSearchSettings(request_timeout=float("inf"))
+  with pytest.raises(ValidationError):
+    ElasticSearchSettings(request_timeout=float("nan"))
+  with pytest.raises(ValidationError):
+    ElasticSearchSettings(request_timeout=1e10)
+  assert ElasticSearchSettings(request_timeout=86400.0).request_timeout == 86400.0
+
+
+def test_rabbitmq_heartbeat_caps_at_amqp_unsigned_short_bound() -> None:
+  """R23-D: heartbeat used Field(ge=0) with no upper bound; the AMQP
+  Connection.Tune-Ok frame marshals heartbeat as struct.pack('>H', heartbeat),
+  so any value >65535 crashes negotiation with an opaque struct.error deep in
+  pika. le=65535 mirrors the sibling max_priority le=255 (same file) which
+  already enforces its AMQP protocol bound."""
+  with pytest.raises(ValidationError):
+    RabbitMQSettings(heartbeat=70000)
+  assert RabbitMQSettings(heartbeat=65535).heartbeat == 65535
+  assert RabbitMQSettings(heartbeat=0).heartbeat == 0
+
+
+def test_monitor_pop_rate_window_capped_at_24h() -> None:
+  """R23-E: monitor_pop_rate_window_s was unbounded (gt=0 only); the
+  pop-timestamp deque retains ~pop_rate x window_s entries, so a huge-finite
+  window disables eviction and grows without bound (soft-OOM-by-misconfig).
+  le=86400.0 (24h) covers any legit rolling-rate window while rejecting the
+  pathological case."""
+  with pytest.raises(ValidationError):
+    Settings(monitor_pop_rate_window_s=1e6)
+  with pytest.raises(ValidationError):
+    Settings(monitor_pop_rate_window_s=float("inf"))
+  assert (
+    Settings(monitor_pop_rate_window_s=86400.0).monitor_pop_rate_window_s
+    == 86400.0
+  )
   settings = ScrapySettings(
     {
       "SCRAPY_BACKEND_TYPE": "rabbitmq",
