@@ -496,13 +496,33 @@ class TestKafkaModeConditional:
     assert exc_info.value.setting_name == setting_name
 
   def test_confluent_accepts_key_and_secret(self) -> None:
-    """CONFLUENT + key + secret is valid (the intended Confluent Cloud path)."""
+    """CONFLUENT + key + secret + a real endpoint is valid (the intended
+    Confluent Cloud path). R26-E: the endpoint must not be the localhost
+    default — see test_confluent_rejects_localhost_default_endpoint."""
     s = KafkaSettings(
       mode=KafkaMode.CONFLUENT,
       confluent_api_key="key",  # type: ignore[arg-type]
       confluent_api_secret="secret",  # type: ignore[arg-type]
+      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
     )
     assert s.confluent_api_key is not None
+
+  def test_confluent_rejects_localhost_default_endpoint(self) -> None:
+    """R26-E: CONFLUENT mode still pointing at the localhost:9092 STANDALONE
+    default (no confluent_bootstrap_servers, no bootstrap_servers override)
+    fails at construction. Pre-R26-E this passed and surfaced at connect()
+    as an opaque SASL_SSL/PLAIN handshake error against localhost. R9b closed
+    the PLAINTEXT dimension; R26-E closes the localhost-default-endpoint
+    dimension. A real endpoint in either field is accepted.
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        mode=KafkaMode.CONFLUENT,
+        confluent_api_key="key",  # type: ignore[arg-type]
+        confluent_api_secret="secret",  # type: ignore[arg-type]
+        # no confluent_bootstrap_servers, bootstrap_servers stays localhost:9092
+      )
+    assert exc_info.value.setting_name == "bootstrap_servers"
 
   def test_non_confluent_rejects_ignored_confluent_credentials(self) -> None:
     """Dedicated cloud credentials cannot be silently ignored in another mode."""

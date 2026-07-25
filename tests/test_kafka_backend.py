@@ -309,6 +309,7 @@ class TestKafkaBackendBuildCommonConfig:
       mode=KafkaMode.CONFLUENT,
       confluent_api_key="key",
       confluent_api_secret="secret",
+      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
     )
     backend = KafkaBackend(config)
     config.confluent_api_secret = ""  # type: ignore[assignment]

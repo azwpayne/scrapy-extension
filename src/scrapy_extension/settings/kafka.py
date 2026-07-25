@@ -447,6 +447,31 @@ class KafkaSettings(BaseSettings):
     return self
 
   @model_validator(mode="after")
+  def _validate_confluent_endpoint(self) -> KafkaSettings:
+    """R26-E: CONFLUENT mode must not silently point at the localhost default.
+
+    ``_bootstrap_servers`` resolves CONFLUENT via
+    ``confluent_bootstrap_servers or bootstrap_servers``. If neither is set,
+    CONFLUENT inherits the STANDALONE ``localhost:9092`` default and surfaces
+    at connect() as an opaque SASL_SSL/PLAIN handshake error against
+    localhost. R9b closed the PLAINTEXT dimension; R26-E closes the
+    localhost-default-endpoint dimension. A real Confluent endpoint in
+    EITHER field is accepted (the documented "reuse ``bootstrap_servers``"
+    pattern is preserved); only the unchanged localhost default is rejected.
+    """
+    if self.mode == KafkaMode.CONFLUENT and not self.confluent_bootstrap_servers:
+      if self.bootstrap_servers == "localhost:9092":
+        raise ConfigurationError(
+          "Kafka CONFLUENT mode requires a real Confluent Cloud endpoint: set "
+          "'confluent_bootstrap_servers' (e.g. "
+          "pkc-xxx.us-east-1.aws.confluent.cloud:9092) or override "
+          "'bootstrap_servers'. The default localhost:9092 is the STANDALONE "
+          "default and cannot reach Confluent Cloud.",
+          setting_name="bootstrap_servers",
+        )
+    return self
+
+  @model_validator(mode="after")
   def _validate_delivery_policy(self) -> KafkaSettings:
     """Require confirmed sends and a coherent new-topic durability policy."""
     validate_kafka_delivery_policy(
