@@ -87,7 +87,9 @@ class TestConnection:
     )
 
     backend = ElasticSearchBackend(
-      ElasticSearchSettings(mode=ElasticSearchMode.CLOUD, cloud_id="test:abc")
+      ElasticSearchSettings(
+        mode=ElasticSearchMode.CLOUD, cloud_id="test:abc", api_key="test_key"
+      )
     )
     backend.connect()
 
@@ -105,6 +107,24 @@ class TestConnection:
 
     with pytest.raises(ValidationError, match="cloud_id"):
       ElasticSearchSettings(mode=ElasticSearchMode.CLOUD)
+
+  def test_cloud_mode_without_auth_fails_at_construction(self):
+    """R26-F: CLOUD mode with cloud_id but NO auth method fails at construction.
+
+    Elastic Cloud always 401s an anonymous client, so a no-auth CLOUD config
+    previously surfaced as an opaque ``BackendConnectionError('health check
+    returned false')`` at connect() (ping returns false on 401). The R52
+    validator required cloud_id but left the auth axis open. R26-F requires at
+    least one auth method (``api_key`` OR ``username``+``password``) in CLOUD
+    mode so the misconfiguration fails fast at construction.
+    """
+    from pydantic import ValidationError
+
+    # cloud_id present but no api_key and no basic_auth → must fail.
+    with pytest.raises(ValidationError, match="auth"):
+      ElasticSearchSettings(
+        mode=ElasticSearchMode.CLOUD, cloud_id="test:abc"
+      )
 
   def test_disconnect(self, mocker):
     mock_client = mocker.MagicMock(

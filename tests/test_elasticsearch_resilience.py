@@ -42,7 +42,11 @@ def test_connect_cloud_mode_requires_cloud_id() -> None:
   (bypassing settings validation) still fails fast rather than building a
   broken client. Reached by constructing with cloud_id then clearing it."""
   backend = ElasticSearchBackend(
-    ElasticSearchSettings(mode=ElasticSearchMode.CLOUD, cloud_id="dummy-cloud-id")
+    ElasticSearchSettings(
+      mode=ElasticSearchMode.CLOUD,
+      cloud_id="dummy-cloud-id",
+      api_key="dummy-cloud-key",  # type: ignore[arg-type]
+    )
   )
   backend.config.cloud_id = None  # bypass settings validation
   with pytest.raises(BackendConnectionError, match="Cloud mode requires 'cloud_id'"):

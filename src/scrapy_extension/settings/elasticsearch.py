@@ -163,25 +163,42 @@ class ElasticSearchSettings(BaseSettings):
 
   @model_validator(mode="after")
   def validate_mode_requirements(self) -> ElasticSearchSettings:
-    """Fail-fast: CLOUD mode requires ``cloud_id``.
+    """Fail-fast: CLOUD mode requires ``cloud_id`` AND an auth method.
 
     Mirrors the Redis SENTINEL validator (R8). Without this, the error
     surfaced at ``connect()`` time (BackendConnectionError) rather than at
     construction — far from the misconfiguration. Verified against
     ``connect()`` (which already rejects CLOUD-without-cloud_id), so this
     only moves the failure earlier; no valid configuration is newly
-    rejected. ``api_key`` is intentionally NOT required — CLOUD can
-    authenticate via basic_auth too (per ``_build_kwargs``).
+    rejected.
+
+    R26-F: Elastic Cloud always 401s an anonymous client, so CLOUD mode also
+    requires at least one auth method — ``api_key`` OR basic auth
+    (``username`` + ``password``). Pre-R26-F a no-auth CLOUD config surfaced
+    as an opaque ``BackendConnectionError('health check returned false')``
+    (ping returns false on 401); now it fails fast at construction.
 
     Raises:
-        ValueError: If CLOUD mode is selected without ``cloud_id``.
+        ValueError: If CLOUD mode is selected without ``cloud_id`` or without
+            any auth method.
     """
-    if self.mode == ElasticSearchMode.CLOUD and not self.cloud_id:
-      msg = (
-        "ElasticSearch CLOUD mode requires 'cloud_id' to be set. "
-        f"Got cloud_id={self.cloud_id!r}."
-      )
-      raise ValueError(msg)
+    if self.mode == ElasticSearchMode.CLOUD:
+      if not self.cloud_id:
+        msg = (
+          "ElasticSearch CLOUD mode requires 'cloud_id' to be set. "
+          f"Got cloud_id={self.cloud_id!r}."
+        )
+        raise ValueError(msg)
+      has_api_key = self.api_key is not None
+      has_basic_auth = self.username is not None and self.password is not None
+      if not (has_api_key or has_basic_auth):
+        msg = (
+          "ElasticSearch CLOUD mode requires an auth method: set 'api_key' "
+          "or both 'username' and 'password'. Elastic Cloud always rejects "
+          "an anonymous client (401), so a no-auth config would surface as "
+          "an opaque health-check failure at connect() rather than here."
+        )
+        raise ValueError(msg)
     return self
 
   @model_validator(mode="after")
