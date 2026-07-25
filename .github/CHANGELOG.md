@@ -513,6 +513,45 @@ upgrading.
 
 ### Fixed
 
+- **R22-C: RocketMQ `max_message_size` is now enforced at push time.** The
+  setting was previously declared but unconsumed (a dead config); oversized
+  items now raise `QueueError(operation="push")` client-side instead of
+  surfacing later as an opaque broker error.
+- **R22-A: RocketMQ `send_timeout` is capped at 300,000 ms** (and the
+  per-request timeout at `_MAX_REQUEST_TIMEOUT_S=300` s) so a stray-zero typo
+  cannot wedge the gRPC per-RPC deadline for hours.
+- **R23-B/C: Redis socket timeouts and ElasticSearch `request_timeout` reject
+  non-finite values and are capped at 86,400 s.** Previously `Field(ge=0)`
+  accepted `inf`, which made the underlying driver call `socket.settimeout(inf)`
+  and raise an `OverflowError` (an `ArithmeticError`, not an `OSError`) that
+  escaped the driver's `OSError` trap and wedged connect retries.
+- **R23-D: RabbitMQ `heartbeat` is capped at 65,535** to match the AMQP
+  `Tune-Ok` unsigned-short bound (sibling to the existing `max_priority`
+  `le=255`); larger values previously crashed connection negotiation with an
+  opaque `struct.error`.
+- **R23-E: `monitor_pop_rate_window_s` is capped at 86,400 s (24h).** An
+  unbounded window previously let the pop-timestamp deque grow without
+  eviction (soft-OOM by misconfiguration).
+- **R22-B/R23-A: `BatchedStorageStrategy` no longer hangs `close_spider` on a
+  wedged backend, and no longer abandons buffered items on a slow-but-healthy
+  one.** The `_flush_lock` acquisition is bounded (`_FLUSH_LOCK_TIMEOUT_S`),
+  and `close()` loops the age-flusher join to a hard `_CLOSE_DRAIN_DEADLINE_S`
+  (30s) so a progressing flush completes and the final drain runs.
+- **R21-C: full-jitter connection backoff is capped at `_MAX_BACKOFF_S=3600`**
+  so a huge `SCRAPY_RETRY_DELAY` cannot overflow `time.sleep` to `inf`.
+- **R21-A: `SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT` is bounded by
+  `CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S=3600`** (and a boolean
+  `failure_threshold` is rejected); previously `inf` wedged the breaker OPEN
+  forever with no self-heal.
+- **R21-D: `BatchedStorageStrategy` rejects NaN `threshold`/`max_buffer_age_s`.**
+- **R21-B: `DelayQueueStrategy.set_monitor` is wired** so the
+  `queue/delay_depth` operability gauge actually emits.
+- **R17–R20, R23-G: all nine connect()-capable backends carry an
+  `except BaseException` cleanup arm** (Ctrl+C/SystemExit during connect no
+  longer leaks half-constructed clients/producers/threads), ElasticSearch
+  `pop()`/`is_connected()`/`ping()` catch the broad `(ApiError, TransportError)`
+  tuple, and R23-G extended the BaseException cleanup to the DynamoDB
+  candidate→publish window (mirror of rabbitmq/redis).
 - Queue publication durability is now proved by the same operation that pushes
   through one exact backend/circuit-breaker generation. Strategy routes are
   frozen before serialization, so mutable delay defaults cannot flip a probed
