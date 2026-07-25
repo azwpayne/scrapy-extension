@@ -42,9 +42,24 @@ DEFAULT_BATCH_THRESHOLD = 100
 #: ``socket_timeout=None``, pymongo default ``socketTimeoutMS=None``) cannot hang
 #: ``close_spider`` forever: the age-flusher holds ``_flush_lock`` across the
 #: ``storage_backend.store()`` network-I/O loop, and the post-join ``flush()``
-#: used to re-block on it indefinitely. Healthy ``store()`` is milliseconds, so
-#: this timeout never fires in normal operation — it only bounds the wedge.
+#: used to re-block on it indefinitely. This bound only fires when a flush
+#: exceeds it (e.g. a large batch against a high-latency cross-region backend);
+#: healthy ``store()`` is milliseconds, so in normal operation the lock is free
+#: and the acquire returns instantly.
 _FLUSH_LOCK_TIMEOUT_S: float = 5.0
+
+#: R23-A: hard ceiling (seconds) for :meth:`close` to wait for the age-flusher
+#: to RELEASE ``_flush_lock`` before the final drain. Pre-R23 :meth:`close` did
+#: a single fixed ``join(5.0)``; a slow-but-healthy cross-region flush (e.g.
+#: Mongo Atlas at ~150ms/store x threshold=100 = ~15s) left the flusher alive
+#: past that window, so the subsequent ``flush()`` lost the bounded
+#: ``_flush_lock`` race and SKIPPED, abandoning items still in ``_buffer``.
+#: Looping the join to this deadline lets a progressing flush complete (the
+#: flusher exits promptly once its in-flight ``store()`` returns, because
+#: ``_stop`` is set) so the final ``flush()`` acquires the now-free lock and
+#: drains the remainder. A genuinely-wedged backend is still bounded (R22-B's
+#: anti-hang guarantee preserved, at a 30s ceiling instead of the old 10s).
+_CLOSE_DRAIN_DEADLINE_S: float = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -214,11 +229,24 @@ class BatchedStorageStrategy(StorageStrategy):
     self._stop.set()
     flusher = self._flusher
     if flusher is not None and flusher.is_alive():
-      flusher.join(timeout=5.0)
+      # R23-A: wait for the age-flusher to RELEASE _flush_lock (it holds it
+      # across the slow storage_backend.store() loop) before the final
+      # self.flush() below. Pre-R23 a single fixed join(5.0) timed out for a
+      # slow-but-healthy cross-region flush, leaving the flusher alive; the
+      # subsequent flush() then lost the _flush_lock race and SKIPPED,
+      # abandoning items still in _buffer. Loop the join up to a hard deadline
+      # so a progressing flush completes (the flusher exits promptly once its
+      # in-flight store() returns, because _stop is set); a genuinely-wedged
+      # backend is bounded by the deadline (R22-B's anti-hang guarantee
+      # preserved, at a 30s ceiling instead of the old 10s).
+      deadline = time.monotonic() + _CLOSE_DRAIN_DEADLINE_S
+      while flusher.is_alive() and time.monotonic() < deadline:
+        flusher.join(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
       if flusher.is_alive():
         logger.warning(
-          "batched-storage-age-flush did not exit within 5.0s; "
-          "in-flight items may be lost"
+          "batched-storage-age-flush did not exit within %.1fs; "
+          "buffered items may be lost",
+          _CLOSE_DRAIN_DEADLINE_S,
         )
     self.flush()
 
@@ -243,10 +271,13 @@ class BatchedStorageStrategy(StorageStrategy):
     ``_FLUSH_LOCK_TIMEOUT_S``. If the age-flusher (or any concurrent holder) is
     wedged mid-``store()`` against an unresponsive backend, ``_flush`` skips
     with a warning instead of blocking forever — so :meth:`close` and the
-    public :meth:`flush` cannot hang ``close_spider``. The skipped items are
-    exactly those already conceded as "in-flight items may be lost" by the
-    join-timeout warning in :meth:`close`; no at-least-once guarantee is lost
-    that the wedge had not already forfeited.
+    public :meth:`flush` cannot hang ``close_spider``. R23-A tightens the
+    close path further: :meth:`close` loops the age-flusher join to a hard
+    ``_CLOSE_DRAIN_DEADLINE_S`` so a slow-but-healthy flush completes and
+    releases ``_flush_lock`` before this final ``flush()`` runs — the skip
+    therefore only concedes items when the flusher is genuinely wedged past
+    that deadline, not merely slow. The public :meth:`flush` path (no join
+    loop) still skips on the per-acquire bound.
     """
     acquired = self._flush_lock.acquire(timeout=_FLUSH_LOCK_TIMEOUT_S)
     if not acquired:

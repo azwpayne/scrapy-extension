@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -13,6 +14,7 @@ from scrapy_extension.storage.strategies import (
   StorageStrategy,
   create_storage_strategy,
 )
+from scrapy_extension.storage.strategies import batched as batched_module
 
 
 class TestPassthroughStorageStrategy:
@@ -166,6 +168,87 @@ class TestBatchedStorageStrategy:
     assert not close_thread.is_alive()
     assert store_errors == []
     assert close_errors == []
+
+  def test_close_drains_buffer_when_flusher_completes_after_old_join_window(
+    self, monkeypatch, mocker
+  ) -> None:
+    """R23-A: close() must drain buffered items when the age-flusher is
+    mid-flush (holding _flush_lock) and completes shortly AFTER the pre-R23
+    fixed join window would have expired.
+
+    Pre-R23 close() did a single ``join(5.0)`` then ``flush()`` with a bounded
+    ``_flush_lock`` acquire; if the flusher still held the lock when that
+    acquire fired, the flush SKIPPED and items still in ``_buffer`` were
+    abandoned (a data-loss regression vs the pre-R22-B blocking acquire, real
+    for slow-but-healthy cross-region backends whose flush exceeds 10s). R23
+    loops the join to a hard ``_CLOSE_DRAIN_DEADLINE_S`` so a progressing flush
+    completes and releases ``_flush_lock`` before the final drain.
+
+    The original >10s timing is impractical to reproduce in a unit test, so
+    this guard uses a stub flusher (``join`` returns instantly; ``is_alive``
+    flips on an event) + a manually-held ``_flush_lock``. Against the pre-R23
+    close() the stub's instant ``join`` + held lock make the bounded acquire
+    skip immediately -> both buffered items are lost (call_count == 0). Against
+    R23's drain loop, close() waits; once the stub "completes" (lock released +
+    is_alive False) the final flush() drains both items (call_count == 2).
+    """
+    monkeypatch.setattr(batched_module, "_FLUSH_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(batched_module, "_CLOSE_DRAIN_DEADLINE_S", 1.0)
+
+    backend = mocker.Mock()
+    # threshold=100 + no max_buffer_age_s -> no real age-flusher is started;
+    # we install a stub below to stand in for a flusher mid-store().
+    strat = BatchedStorageStrategy(threshold=100)
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+
+    flusher_completed = threading.Event()
+
+    class _StubFlusher:
+      """Stands in for the age-flusher blocked mid-store() holding _flush_lock."""
+
+      def is_alive(self) -> bool:
+        return not flusher_completed.is_set()
+
+      def join(self, timeout: float | None = None) -> None:
+        # Returns immediately; close()'s drain loop re-checks is_alive().
+        return None
+
+    strat._flusher = _StubFlusher()
+    # Simulate the flusher mid-store(): it holds _flush_lock.
+    strat._flush_lock.acquire()
+
+    close_done = threading.Event()
+    close_errors: list[Exception] = []
+
+    def run_close() -> None:
+      try:
+        strat.close()
+      except Exception as exc:  # noqa: BLE001 - record any failure
+        close_errors.append(exc)
+      finally:
+        close_done.set()
+
+    close_thread = threading.Thread(target=run_close, daemon=True)
+    close_thread.start()
+
+    # Let close() reach its drain wait. (Pre-R23 close() returns here almost
+    # instantly: stub join() returns, the bounded _flush_lock acquire times
+    # out at 0.05s and skips.)
+    time.sleep(0.15)
+    # The flusher now "completes": release the lock and mark it dead. R23's
+    # drain loop is still waiting (deadline 1.0s) -> it sees the flusher dead,
+    # exits the loop, and the final flush() acquires the now-free lock and
+    # drains both buffered items.
+    strat._flush_lock.release()
+    flusher_completed.set()
+
+    assert close_done.wait(timeout=2.0), "close() did not return"
+    close_thread.join(timeout=2.0)
+    assert close_errors == []
+    assert backend.store.call_count == 2, (
+      f"expected both buffered items drained, got {backend.store.call_count}"
+    )
 
   def test_store_after_close_is_rejected(self, mocker) -> None:
     backend = mocker.Mock()
@@ -730,10 +813,13 @@ class TestBatchedStorageFlusherTOCTOU:
 
     backend.store.side_effect = wedged_store
     strat = BatchedStorageStrategy(threshold=10**9, max_buffer_age_s=0.01)
-    # Shrink the acquire timeout so the post-join skip is fast; the 5s join
-    # timeout in close() still dominates the wall-clock.
+    # Shrink both bounds so the wedge case is fast: the per-acquire timeout
+    # (_FLUSH_LOCK_TIMEOUT_S) and R23-A's close drain deadline
+    # (_CLOSE_DRAIN_DEADLINE_S, which replaced the old fixed 5s join).
     if hasattr(batched_mod, "_FLUSH_LOCK_TIMEOUT_S"):
       mocker.patch.object(batched_mod, "_FLUSH_LOCK_TIMEOUT_S", 0.3)
+    if hasattr(batched_mod, "_CLOSE_DRAIN_DEADLINE_S"):
+      mocker.patch.object(batched_mod, "_CLOSE_DRAIN_DEADLINE_S", 1.0)
 
     strat.store(backend, "k", b"v")  # append + spawn the age-flusher
     # Wait until the flusher is mid-store(), holding _flush_lock.
@@ -753,11 +839,12 @@ class TestBatchedStorageFlusherTOCTOU:
     close_thread = threading.Thread(target=run_close, daemon=True)
     close_thread.start()
     try:
-      # join(5s) + acquire(0.3s) + slack; under the hang this never completes.
+      # drain deadline (1.0s) + acquire (0.3s) + slack; under the hang this
+      # never completes.
       close_done.wait(timeout=7.0)
       assert close_done.is_set(), (
-        "close() hung: the post-join flush() blocked on _flush_lock held by "
-        "the wedged age-flusher instead of bounding the acquisition (R22-B)"
+        "close() hung: the post-drain flush() blocked on _flush_lock held by "
+        "the wedged age-flusher instead of bounding the acquisition (R22-B/R23-A)"
       )
       assert close_errors == []
     finally:
