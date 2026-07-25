@@ -46,13 +46,18 @@ logger = logging.getLogger(__name__)
 #: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
 DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
 
-#: R25-B: ceiling (bytes) for a restored strategy snapshot. A corrupt or
+#: R25-B/R26-A: ceiling (bytes) for a restored strategy snapshot. A corrupt or
 #: malicious multi-GB blob at the snapshot key would OOM-kill worker startup
 #: (``bytes(state)`` copy + ``json.loads`` full materialization) before the
-#: ``except`` in :meth:`BackendQueue._restore_snapshot` can recover. 16 MiB is
-#: orders of magnitude above any legitimate in-process strategy state and well
-#: below the memory danger zone; mirrors the push-path ``max_item_bytes`` guard.
-_MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+#: ``except`` in :meth:`BackendQueue._restore_snapshot` can recover. 128 MiB
+#: sits well above any legitimate in-process strategy state (a delay heap at
+#: the ``queue_delay_max_held`` default of 100k items x ~2.7 KB/entry tops out
+#: around 270 MB only when completely full; realistic held sets are far
+#: smaller) and well below the memory danger zone; mirrors the push-path
+#: ``max_item_bytes`` guard. R26-A raised this from the original 16 MiB, which
+#: silently dropped legitimate large delay-heap snapshots on restart (persist
+#: was uncapped, restore was capped → asymmetric data-loss trap).
+_MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 
 #: Meta key carrying the backend ack token from pop → request → response → ack.
 #: Atomic-pop backends set this to ``None`` (harmless); message-queue backends
@@ -1175,6 +1180,22 @@ class BackendQueue:
       )
       return
     snapshot_key = self._snapshot_key()
+    # R26-A: warn at persist time when the snapshot exceeds the restore cap, so
+    # the operator learns at close — not on the NEXT restart's restore-skip
+    # WARNING — that the blob will be dropped. Persist is uncapped while restore
+    # is capped; without this the asymmetry is a silent data-loss trap for
+    # legitimate large delay heaps. Persist anyway: the operator may raise the
+    # cap or shrink the held heap (e.g. lower queue_delay_max_held) before the
+    # restart, in which case the snapshot restores cleanly.
+    if state is not None and len(state) > _MAX_SNAPSHOT_BYTES:
+      logger.warning(
+        "Strategy snapshot for queue %r is %d bytes (restore cap %d); it will "
+        "be DROPPED on restart. Reduce the held heap (e.g. queue_delay_max_held) "
+        "or raise the cap before the next restart to preserve it.",
+        self.queue_name,
+        len(state),
+        _MAX_SNAPSHOT_BYTES,
+      )
     try:
       if state is None:
         storage.delete(snapshot_key)

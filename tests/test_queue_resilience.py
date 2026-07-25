@@ -20,6 +20,7 @@ docstrings promise and production relies on.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -319,18 +320,23 @@ def test_decode_body_non_str_invalid_base64_raises_serialization_error() -> None
     BackendQueue._decode_body({"body": b"!!not-valid-base64!!"})
 
 
-def test_restore_snapshot_skips_oversized_blob() -> None:
+def test_restore_snapshot_skips_oversized_blob(monkeypatch: pytest.MonkeyPatch) -> None:
   """R25-B: a snapshot blob exceeding ``_MAX_SNAPSHOT_BYTES`` is skipped
   (warn + start clean) so a corrupt/malicious multi-GB value cannot OOM-kill
   startup via the ``bytes(state)`` copy + ``json.loads`` materialization.
   Mirrors the push-path ``max_item_bytes`` guard (the lone previously-unbounded
   storage-retrieve→deserialize surface).
+
+  R26-A: the cap is monkeypatched to a tiny value so the test does not allocate
+  the real 128 MiB cap on every run.
   """
-  from scrapy_extension.queue.queue import _MAX_SNAPSHOT_BYTES
+  import scrapy_extension.queue.queue as queue_mod
+
+  monkeypatch.setattr(queue_mod, "_MAX_SNAPSHOT_BYTES", 8)
 
   strategy = _delay()
   strategy.restore = MagicMock()  # type: ignore[method-assign]
-  oversized = b"x" * (_MAX_SNAPSHOT_BYTES + 1)
+  oversized = b"x" * (queue_mod._MAX_SNAPSHOT_BYTES + 1)
   BackendQueue(
     connection_manager=_cm(storage=_storage(retrieve_return=oversized)),
     queue_name="q",
@@ -338,3 +344,39 @@ def test_restore_snapshot_skips_oversized_blob() -> None:
   )
   # _restore_snapshot ran at __init__; the oversized blob is skipped, not restored.
   strategy.restore.assert_not_called()
+
+
+def test_persist_snapshot_warns_when_over_cap(
+  monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+  """R26-A: when ``strategy.snapshot()`` returns bytes larger than the restore
+  cap, ``_persist_snapshot`` must WARN at close time — otherwise the operator
+  only discovers the drop on the NEXT restart (asymmetric: persist is uncapped,
+  restore is capped → silent data-loss trap for legit large delay heaps). The
+  snapshot is still persisted so the operator can raise the cap / shrink the
+  heap before restart. Pre-fix, no warning fired at persist time.
+  """
+  import scrapy_extension.queue.queue as queue_mod
+
+  monkeypatch.setattr(queue_mod, "_MAX_SNAPSHOT_BYTES", 8)
+
+  strategy = _delay()
+  strategy.snapshot = MagicMock(  # type: ignore[method-assign]
+    return_value=b"x" * (queue_mod._MAX_SNAPSHOT_BYTES + 1)
+  )
+  storage = _storage()
+  bq = BackendQueue(
+    connection_manager=_cm(storage=storage),
+    queue_name="q",
+    queue_strategy=strategy,
+    monitor=MagicMock(),
+  )
+  with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.queue"):
+    bq.close()  # must not raise
+  # The over-cap warning fired at persist (close) time, not deferred to restore.
+  assert any(
+    "DROPPED on restart" in r.message and r.levelno == logging.WARNING
+    for r in caplog.records
+  ), [r.message for r in caplog.records]
+  # Persist still happened (operator gets a chance to act before restart).
+  storage.store.assert_called_once()

@@ -123,6 +123,16 @@ for single-worker compatibility. A successful restore consumes and deletes the
 snapshot; the next clean close writes current state again. Hard crashes can
 still lose changes since the last close.
 
+Restored snapshots are capped at **128 MiB** (`_MAX_SNAPSHOT_BYTES`): a blob
+above the cap is dropped at restore time (warn + start clean) so a corrupt or
+malicious value cannot OOM-kill worker startup. Persist is *not* capped — if a
+close writes a snapshot larger than the restore cap, a WARNING fires at close
+(`... will be DROPPED on restart`) so the operator can act (lower
+`SCRAPY_QUEUE_DELAY_MAX_HELD` to shrink the delay heap, or raise the cap)
+before the next restart. At the `queue_delay_max_held` default of 100k items
+× ~2.7 KB/entry, a completely full heap reaches ~270 MB and would trip the
+cap; realistic held sets are far smaller.
+
 ## Switch storage strategy
 
 Select a `StorageStrategy` via `SCRAPY_STORAGE_STRATEGY` — no code change required.
