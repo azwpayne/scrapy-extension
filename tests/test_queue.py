@@ -1444,13 +1444,49 @@ class TestBackendQueuePop:
       queue_strategy=strategy,
     )
     payload = queue._request_to_dict(Request("https://example.com"))
-    payload["callback"] = "__class__"
+    # R25-A: use a non-dunder non-callable attribute ('name' is a str) so this
+    # test still exercises the callable/ismethod guard downstream of the new
+    # dunder reject (which would otherwise catch '__class__' first).
+    payload["callback"] = "name"
     strategy.pop_with_ack.return_value = (
       JSONSerializer().serialize(payload),
       "token-1",
     )
 
     with pytest.raises(SerializationError, match="instance method"):
+      queue.pop()
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="token-1"
+    )
+
+  def test_pop_rejects_dunder_callback_that_would_reinit_spider(
+    self, mock_connection_manager, mocker
+  ):
+    """R25-A: a crafted payload with callback='__init__' must be rejected
+    BEFORE getattr. ``getattr(spider, '__init__')`` is a bound method whose
+    ``__self__`` is the spider, so the existing instance-method guard does NOT
+    catch it — without the dunder reject, Scrapy would dispatch
+    ``spider.__init__(response)``, re-initializing the spider and corrupting
+    crawler state. Single-underscore private callbacks remain allowed (the
+    guard scopes to ``__``-prefixed dunders only).
+    """
+    spider = _QueueTestSpider()
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      spider=spider,
+      queue_strategy=strategy,
+    )
+    payload = queue._request_to_dict(Request("https://example.com"))
+    payload["callback"] = "__init__"
+    strategy.pop_with_ack.return_value = (
+      JSONSerializer().serialize(payload),
+      "token-1",
+    )
+
+    with pytest.raises(SerializationError, match="dunder"):
       queue.pop()
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(

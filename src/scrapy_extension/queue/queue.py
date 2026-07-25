@@ -46,6 +46,14 @@ logger = logging.getLogger(__name__)
 #: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
 DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
 
+#: R25-B: ceiling (bytes) for a restored strategy snapshot. A corrupt or
+#: malicious multi-GB blob at the snapshot key would OOM-kill worker startup
+#: (``bytes(state)`` copy + ``json.loads`` full materialization) before the
+#: ``except`` in :meth:`BackendQueue._restore_snapshot` can recover. 16 MiB is
+#: orders of magnitude above any legitimate in-process strategy state and well
+#: below the memory danger zone; mirrors the push-path ``max_item_bytes`` guard.
+_MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+
 #: Meta key carrying the backend ack token from pop → request → response → ack.
 #: Atomic-pop backends set this to ``None`` (harmless); message-queue backends
 #: set it to an opaque token bound to the issuing backend incarnation and
@@ -774,6 +782,18 @@ class BackendQueue:
     for field in ("callback", "errback"):
       method_name = request_dict.get(field)
       if method_name and self._spider is not None:
+        # R25-A: reject dunder names (__init__, __reduce__, __setstate__, ...)
+        # before getattr. A crafted/migrated payload carrying callback='__init__'
+        # would otherwise pass the __self__-is-spider guard — getattr(spider,
+        # '__init__') is a bound method whose __self__ is the spider — and let
+        # Scrapy dispatch spider.__init__(response), re-initializing the spider
+        # and corrupting crawler state. Single-underscore private callbacks
+        # (_cb) remain allowed. Defense-in-depth (requires queue write access).
+        if isinstance(method_name, str) and method_name.startswith("__"):
+          raise ValueError(
+            f"Request {field} {method_name!r} must not be a dunder method "
+            f"of: {self._spider}"
+          )
         try:
           method = getattr(self._spider, method_name)
         except AttributeError:
@@ -1205,6 +1225,17 @@ class BackendQueue:
     # Only restore real bytes — None (no prior snapshot) or any non-bytes
     # value (unexpected type / mock) is a no-op, never passed to restore().
     if not isinstance(state, (bytes, bytearray)):
+      return
+    # R25-B: bound the snapshot blob before the bytes(state) copy + json.loads
+    # materialization so a corrupt/malicious value cannot OOM-kill startup.
+    if len(state) > _MAX_SNAPSHOT_BYTES:
+      logger.warning(
+        "Strategy snapshot for queue %r is %d bytes (cap %d); starting clean "
+        "to avoid OOM during restore.",
+        self.queue_name,
+        len(state),
+        _MAX_SNAPSHOT_BYTES,
+      )
       return
     try:
       self._strategy.restore(bytes(state))

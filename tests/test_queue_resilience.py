@@ -317,3 +317,24 @@ def test_decode_body_non_str_invalid_base64_raises_serialization_error() -> None
   ``SerializationError`` rather than surfacing the raw ``binascii.Error``."""
   with pytest.raises(SerializationError):
     BackendQueue._decode_body({"body": b"!!not-valid-base64!!"})
+
+
+def test_restore_snapshot_skips_oversized_blob() -> None:
+  """R25-B: a snapshot blob exceeding ``_MAX_SNAPSHOT_BYTES`` is skipped
+  (warn + start clean) so a corrupt/malicious multi-GB value cannot OOM-kill
+  startup via the ``bytes(state)`` copy + ``json.loads`` materialization.
+  Mirrors the push-path ``max_item_bytes`` guard (the lone previously-unbounded
+  storage-retrieve→deserialize surface).
+  """
+  from scrapy_extension.queue.queue import _MAX_SNAPSHOT_BYTES
+
+  strategy = _delay()
+  strategy.restore = MagicMock()  # type: ignore[method-assign]
+  oversized = b"x" * (_MAX_SNAPSHOT_BYTES + 1)
+  BackendQueue(
+    connection_manager=_cm(storage=_storage(retrieve_return=oversized)),
+    queue_name="q",
+    queue_strategy=strategy,
+  )
+  # _restore_snapshot ran at __init__; the oversized blob is skipped, not restored.
+  strategy.restore.assert_not_called()
