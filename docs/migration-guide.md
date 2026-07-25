@@ -404,6 +404,18 @@ Field type, range, enum, and Pydantic extra-field failures raise
 `pydantic.ValidationError`. Unknown adapter settings, unsupported capabilities,
 and project cross-field constraints raise `ConfigurationError`.
 
+Several timeout settings now reject non-finite values and are capped at 86400 s
+(24 h), so a deployment carrying `SCRAPY_REDIS_SOCKET_TIMEOUT=inf`,
+`SCRAPY_REDIS_SOCKET_CONNECT_TIMEOUT=inf`, or `SCRAPY_ELASTICSEARCH_REQUEST_TIMEOUT=inf`
+(or any huge finite value above 86400 s) now fails at config load with a
+`pydantic.ValidationError`. Previously `Field(ge=0)` accepted `inf`, which made
+the underlying driver call `socket.settimeout(inf)` and raise an `OverflowError`
+(an `ArithmeticError`, not an `OSError`) that escaped the driver's `OSError`
+trap and wedged connect retries. Pick a finite value ≤ 86400 s (the defaults —
+Redis 30 s / 5 s, ElasticSearch 30 s — are unaffected). The RabbitMQ
+`SCRAPY_RABBITMQ_HEARTBEAT` cap (≤ 65535, the AMQP `Tune-Ok` unsigned-short
+bound) is enforced the same way and surfaces in the `ValidationError`.
+
 For Redis Sentinel, `ssl_enabled=True` now applies to Sentinel discovery as
 well as the discovered master. Verify every Sentinel endpoint presents a
 certificate trusted by `ssl_cafile` and covered by hostname validation. mTLS
