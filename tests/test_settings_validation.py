@@ -46,7 +46,7 @@ from scrapy_extension.settings import (
 )
 from scrapy_extension.settings.base import Settings
 from scrapy_extension.settings.dynamodb import DynamoDBSettings
-from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
+from scrapy_extension.settings.elasticsearch import ElasticSearchMode, ElasticSearchSettings
 from scrapy_extension.settings.kafka import KafkaMode
 from scrapy_extension.settings.mongodb import MongoDBMode
 from scrapy_extension.settings.pulsar import PulsarMode
@@ -762,6 +762,36 @@ class TestElasticSearchHostsScheme:
   def test_hosts_accepts_valid_schemes(self, hosts: list[str]) -> None:
     """All-valid ``http://`` / ``https://`` lists stay accepted."""
     assert ElasticSearchSettings(hosts=hosts).hosts == hosts
+
+  def test_standalone_empty_hosts_list_rejected(self) -> None:
+    """R28-B: STANDALONE ``hosts=[]`` must reject — opaque client error otherwise.
+
+    ``_validate_hosts_scheme`` filtered each entry's scheme but not the empty
+    list itself, so ``hosts=[]`` (e.g. ``SCRAPY_ELASTICSEARCH_HOSTS=`` set to
+    an empty value) trivially passed and surfaced as an opaque elasticsearch-py
+    client error at connect(). The validator's docstring said "Empty strings
+    are rejected" but an empty LIST was not.
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(mode=ElasticSearchMode.STANDALONE, hosts=[])
+    assert exc_info.value.setting_name == "hosts"
+
+  def test_cloud_empty_hosts_list_accepted(self) -> None:
+    """R28-B: CLOUD ``hosts=[]`` is fine — CLOUD uses ``cloud_id``, not hosts.
+
+    Locks the mode-gate intent: the empty-list guard is STANDALONE-only so it
+    cannot false-positive a CLOUD config that happens to carry an empty hosts
+    list (hosts is unused in CLOUD).
+    """
+    from pydantic import SecretStr
+
+    s = ElasticSearchSettings(
+      mode=ElasticSearchMode.CLOUD,
+      cloud_id="test:abc",
+      api_key=SecretStr("k"),
+      hosts=[],
+    )
+    assert s.cloud_id == "test:abc"
 
 
 class TestAwsRegionNameFormat:

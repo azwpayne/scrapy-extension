@@ -145,6 +145,20 @@ class ElasticSearchSettings(BaseSettings):
     Raises:
         ConfigurationError: if any host entry lacks a valid scheme.
     """
+    # R28-B: STANDALONE targets the cluster via ``hosts``; an empty list
+    # (e.g. ``SCRAPY_ELASTICSEARCH_HOSTS=`` set to an empty value) otherwise
+    # surfaces as an opaque elasticsearch-py client error at connect().
+    # CLOUD mode is unaffected — it uses ``cloud_id``, not hosts.
+    if self.mode == ElasticSearchMode.STANDALONE and not self.hosts:
+      raise ConfigurationError(
+        (
+          "STANDALONE mode requires at least one 'hosts' entry "
+          "(e.g. http://host:9200 or https://host:9200). Got hosts=[]. "
+          "CLOUD mode uses 'cloud_id' and does not require hosts."
+        ),
+        setting_name="hosts",
+        setting_value=self.hosts,
+      )
     bad = [
       host
       for host in self.hosts
