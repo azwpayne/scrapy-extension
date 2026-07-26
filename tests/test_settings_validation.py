@@ -1189,6 +1189,44 @@ class TestSV3ElasticsearchAuthExclusivity:
     assert s.username == "user"
     assert s.api_key is None
 
+  def test_empty_api_key_with_basic_auth_accepted(self) -> None:
+    """R28-A: an empty ``api_key`` must NOT trip the exclusivity guard.
+
+    R27-A fixed ``is not None``→truthiness in two of three ES validators but
+    missed ``_validate_auth_method_exclusivity``. With ``api_key=SecretStr("")``
+    (env-var set but unpopulated) + real basic_auth, the stale ``is not None``
+    check treated the empty key as set and raised "mutually exclusive" — yet
+    ``_build_kwargs`` drops the empty key (truthiness) and uses basic_auth, so
+    the config is valid. This completes R27-A's stated "all three sites" intent.
+    """
+    from pydantic import SecretStr
+
+    s = ElasticSearchSettings(
+      hosts=["https://es:9200"],
+      api_key=SecretStr(""),
+      username="user",
+      password=SecretStr("p"),
+    )
+    # empty api_key is treated as absent → basic_auth is the active method,
+    # no false "mutually exclusive" rejection.
+    assert s.username == "user"
+
+  def test_real_api_key_with_empty_password_accepted(self) -> None:
+    """R28-A: a real ``api_key`` + empty ``password`` must NOT trip the guard.
+
+    Symmetric to the empty-api_key case: ``_build_kwargs`` uses the real api_key
+    and never reads the empty password, so the config is valid (api_key auth).
+    The stale ``password is not None`` check falsely raised "mutually exclusive".
+    """
+    from pydantic import SecretStr
+
+    s = ElasticSearchSettings(
+      hosts=["https://es:9200"],
+      api_key=SecretStr("real-key"),
+      password=SecretStr(""),
+    )
+    assert s.api_key is not None
+
 
 class TestSV3SqsAwsCredsBothOrNeither:
   """SV3-6a (M): SQS AWS creds must be both-set or both-unset.

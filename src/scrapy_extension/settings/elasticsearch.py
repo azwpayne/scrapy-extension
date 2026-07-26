@@ -265,18 +265,24 @@ class ElasticSearchSettings(BaseSettings):
         ConfigurationError: if ``api_key`` is set and either ``username`` or
             ``password`` is also set.
     """
-    if self.api_key is None:
+    # R28-A: truthiness (not ``is not None``) mirrors R27-A's two other ES
+    # validators so an empty-string secret (env var set but unpopulated) is
+    # treated as absent. Pre-R28-A an empty ``api_key`` + basic_auth was
+    # falsely rejected as "mutually exclusive" even though ``_build_kwargs``
+    # drops the empty key and uses basic_auth. Completes R27-A's stated
+    # "all three sites" intent (this is the third validator).
+    if not self.api_key:
       return self
-    if self.username is not None or self.password is not None:
+    if bool(self.username) or bool(self.password):
       raise ConfigurationError(
         (
           "api_key and basic-auth (username/password) are mutually "
           "exclusive — when both are set, api_key is used and basic_auth "
           "is silently dropped (auth-method ambiguity). Remove one "
           "authentication method. "
-          f"Got api_key={'<set>' if self.api_key is not None else None}, "
+          f"Got api_key={'<set>' if self.api_key else None}, "
           f"username={self.username!r}, password="
-          f"{'<set>' if self.password is not None else None}."
+          f"{'<set>' if self.password else None}."
         ),
         setting_name="api_key",
         setting_value=self.api_key,
