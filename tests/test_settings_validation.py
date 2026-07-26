@@ -46,7 +46,10 @@ from scrapy_extension.settings import (
 )
 from scrapy_extension.settings.base import Settings
 from scrapy_extension.settings.dynamodb import DynamoDBSettings
-from scrapy_extension.settings.elasticsearch import ElasticSearchMode, ElasticSearchSettings
+from scrapy_extension.settings.elasticsearch import (
+  ElasticSearchMode,
+  ElasticSearchSettings,
+)
 from scrapy_extension.settings.kafka import KafkaMode
 from scrapy_extension.settings.mongodb import MongoDBMode
 from scrapy_extension.settings.pulsar import PulsarMode
