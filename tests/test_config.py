@@ -173,6 +173,52 @@ class TestMongoDBSettings:
       assert marker not in repr(exc_info.value)
 
 
+def test_mongodb_collection_names_empty_rejected():
+  """R29-A: empty collection name must reject — opaque pymongo InvalidName at
+  connect otherwise. The validator checked type + distinctness but not
+  non-empty, so ``('', 'sets', 'storage')`` passed (3 distinct values)."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(queue_collection="")
+  assert exc_info.value.setting_name == "collection_names"
+
+
+def test_mongodb_collection_names_whitespace_rejected():
+  """R29-A: whitespace-only collection names also reject (strip-aware)."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(set_collection="   ")
+
+
+def test_mongodb_database_empty_rejected():
+  """R29-C: empty/whitespace database name must reject — opaque InvalidName at
+  ``_initialize_collections`` otherwise (no validator on the field)."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(database="")
+
+
+def test_mongodb_replica_set_members_empty_element_rejected():
+  """R29-B: empty/whitespace elements in replica_set_members/mongos_routers
+  build a malformed ``mongodb://`` URI → opaque InvalidURI otherwise."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(replica_set_members=["host1:27017", ""])
+
+
+def test_mongodb_replica_set_name_whitespace_rejected():
+  """R29-D: whitespace ``replica_set_name`` bypasses the REPLICA_SET truthiness
+  check (``not '  '`` is False) → opaque discovery error with ``replicaSet='  '``."""
+  from scrapy_extension.settings import MongoDBMode, MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(mode=MongoDBMode.REPLICA_SET, replica_set_name="   ")
+
+
 def test_kafka_settings_defaults():
   from scrapy_extension.settings import KafkaSettings
 

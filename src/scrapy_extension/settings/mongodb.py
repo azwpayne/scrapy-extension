@@ -42,6 +42,16 @@ def validate_mongodb_collection_domains(
       setting_name="collection_names",
     )
   validated_names = cast(tuple[str, str, str], collection_names)
+  # R29-A: reject empty/whitespace collection names — otherwise pymongo raises
+  # InvalidName deep in _initialize_collections/_create_indexes at connect,
+  # wrapped as a network-flavored BackendConnectionError (the opaque-at-connect
+  # footgun this validator layer exists to prevent). ``('', 'sets', 'storage')``
+  # is 3 distinct values, so the distinctness check below does not catch it.
+  if not all(name and name.strip() for name in validated_names):
+    raise ConfigurationError(
+      "MongoDB capability collection names must be non-empty.",
+      setting_name="collection_names",
+    )
   if len(set(validated_names)) != len(validated_names):
     raise ConfigurationError(
       (
@@ -356,6 +366,35 @@ class MongoDBSettings(BaseSettings):
     validate_mongodb_write_concern(self.w, self.w_timeout_ms)
     return self
 
+  @field_validator("database", mode="after")
+  @classmethod
+  def _reject_blank_database(cls, value: str) -> str:
+    """R29-C: reject empty/whitespace ``database`` — pymongo raises InvalidName
+    at ``_initialize_collections`` otherwise (no Field constraint on the field).
+    """
+    if not value or not value.strip():
+      raise ConfigurationError(
+        "MongoDB 'database' name must be non-empty.",
+        setting_name="database",
+        setting_value=value,
+      )
+    return value
+
+  @field_validator("replica_set_members", "mongos_routers", mode="after")
+  @classmethod
+  def _reject_blank_member_elements(cls, value: list[str]) -> list[str]:
+    """R29-B: reject empty/whitespace elements in replica_set_members /
+    mongos_routers — they build a malformed ``mongodb://`` URI and surface as
+    an opaque InvalidURI at connect.
+    """
+    if any((not element) or (not element.strip()) for element in value):
+      raise ConfigurationError(
+        "MongoDB replica_set_members/mongos_routers entries must be non-empty.",
+        setting_name="replica_set_members",
+        setting_value=value,
+      )
+    return value
+
   @model_validator(mode="after")
   def _validate_collection_domains(self) -> Self:
     """Keep queue, set, and storage documents in isolated collections."""
@@ -445,7 +484,12 @@ class MongoDBSettings(BaseSettings):
     """
     if self.mode == MongoDBMode.REPLICA_SET:
       uri_has_rs = "replicaSet=" in self.uri
-      if not self.replica_set_name and not uri_has_rs:
+      # R29-D: strip-aware — a whitespace ``replica_set_name`` (``not "  "`` is
+      # False) otherwise bypasses this truthiness check and surfaces at connect
+      # as an opaque discovery error with ``replicaSet='  '``.
+      name = self.replica_set_name
+      name_set = name is not None and bool(name.strip())
+      if not name_set and not uri_has_rs:
         raise ConfigurationError(
           (
             "MongoDB REPLICA_SET mode requires 'replica_set_name' to be set, "
