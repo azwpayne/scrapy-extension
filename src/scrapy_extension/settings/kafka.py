@@ -459,14 +459,23 @@ class KafkaSettings(BaseSettings):
     EITHER field is accepted (the documented "reuse ``bootstrap_servers``"
     pattern is preserved); only the unchanged localhost default is rejected.
     """
-    if self.mode == KafkaMode.CONFLUENT and not self.confluent_bootstrap_servers:
-      if self.bootstrap_servers == "localhost:9092":
+    # R28-C: tighten to ``.strip()`` so an empty OR whitespace endpoint on
+    # either field is treated as "no real endpoint". Pre-R28-C only the
+    # literal ``localhost:9092`` default was rejected (R26-E), so empty /
+    # whitespace ``bootstrap_servers`` / ``confluent_bootstrap_servers``
+    # slipped through and surfaced at connect() as an opaque kafka-python
+    # error.
+    if self.mode == KafkaMode.CONFLUENT and not (
+      self.confluent_bootstrap_servers or ""
+    ).strip():
+      if (self.bootstrap_servers or "").strip() in ("", "localhost:9092"):
         raise ConfigurationError(
           "Kafka CONFLUENT mode requires a real Confluent Cloud endpoint: set "
           "'confluent_bootstrap_servers' (e.g. "
           "pkc-xxx.us-east-1.aws.confluent.cloud:9092) or override "
-          "'bootstrap_servers'. The default localhost:9092 is the STANDALONE "
-          "default and cannot reach Confluent Cloud.",
+          "'bootstrap_servers' with a real endpoint. An empty, whitespace, or "
+          "localhost:9092 (the STANDALONE default) value cannot reach "
+          "Confluent Cloud.",
           setting_name="bootstrap_servers",
         )
     return self

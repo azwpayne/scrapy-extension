@@ -524,6 +524,39 @@ class TestKafkaModeConditional:
       )
     assert exc_info.value.setting_name == "bootstrap_servers"
 
+  def test_confluent_rejects_empty_bootstrap_servers(self) -> None:
+    """R28-C: CONFLUENT + empty ``bootstrap_servers`` must reject.
+
+    R26-E's guard only rejected the literal ``localhost:9092`` default, so an
+    empty ``bootstrap_servers`` (e.g. ``SCRAPY_KAFKA_BOOTSTRAP_SERVERS=`` set
+    to an empty value) with no ``confluent_bootstrap_servers`` slipped through
+    and surfaced at connect() as an opaque kafka-python error. Same fail-fast
+    promise as R26-E, gap on the empty-value axis.
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        mode=KafkaMode.CONFLUENT,
+        confluent_api_key="key",  # type: ignore[arg-type]
+        confluent_api_secret="secret",  # type: ignore[arg-type]
+        bootstrap_servers="",
+      )
+    assert exc_info.value.setting_name == "bootstrap_servers"
+
+  def test_confluent_rejects_whitespace_endpoint(self) -> None:
+    """R28-C: CONFLUENT + whitespace-only endpoint must reject.
+
+    A whitespace ``confluent_bootstrap_servers`` is not a real endpoint; pre-R28-C
+    it slipped through (``not "   "`` is False, so the outer guard was skipped
+    entirely). Tightening to ``.strip()`` catches whitespace on either field.
+    """
+    with pytest.raises(ConfigurationError):
+      KafkaSettings(
+        mode=KafkaMode.CONFLUENT,
+        confluent_api_key="key",  # type: ignore[arg-type]
+        confluent_api_secret="secret",  # type: ignore[arg-type]
+        confluent_bootstrap_servers="   ",
+      )
+
   def test_non_confluent_rejects_ignored_confluent_credentials(self) -> None:
     """Dedicated cloud credentials cannot be silently ignored in another mode."""
     with pytest.raises(ConfigurationError) as exc_info:
