@@ -763,6 +763,39 @@ class TestRocketMQNamesrvFormat:
     assert RocketMQSettings(namesrv_address=addr).namesrv_address == addr
 
 
+class TestRocketMQConfigEdges:
+  """R27-RMQ-1/2: rocketmq config-edge guards (zero floor, blank name)."""
+
+  def test_max_message_size_zero_rejected(self) -> None:
+    """R27-RMQ-1: ``max_message_size=0`` must reject — every non-empty push
+    would fail (backend unusable). Pre-R27-RMQ-1 ``ge=0`` accepted zero."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+      RocketMQSettings(max_message_size=0)  # type: ignore[arg-type]
+
+  def test_max_message_size_negative_rejected(self) -> None:
+    """Negative also rejected by the ``gt=0`` floor."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+      RocketMQSettings(max_message_size=-1)  # type: ignore[arg-type]
+
+  def test_consumer_group_empty_rejected(self) -> None:
+    """R27-RMQ-2: empty ``consumer_group`` must reject (``min_length=1``) —
+    opaque SimpleConsumer error at connect otherwise."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+      RocketMQSettings(consumer_group="")
+
+  def test_consumer_group_whitespace_rejected(self) -> None:
+    """R27-RMQ-2: whitespace ``consumer_group`` must reject — ``min_length``
+    alone admits ``"   "``; the field_validator strips and raises."""
+    with pytest.raises(ConfigurationError):
+      RocketMQSettings(consumer_group="   ")
+
+
 class TestElasticSearchHostsScheme:
   """ElasticSearchSettings.hosts SV4 scheme guard (no-creds case)."""
 

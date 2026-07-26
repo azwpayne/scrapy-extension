@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
 
@@ -140,11 +140,14 @@ class RocketMQSettings(BaseSettings):
     # tls_enable) takes no group arg), so there is no producer_group setting.
     # Do NOT re-add one without a wire at the Producer() construction in
     # backends/rocketmq.py (R25-G removed a dead, unconsumed producer_group).
-    consumer_group: str = Field(default="scrapy-extension-consumer")
+    # R27-RMQ-2: min_length=1 rejects empty; the field_validator below rejects
+    # whitespace — both surface as opaque SimpleConsumer errors at connect.
+    consumer_group: str = Field(default="scrapy-extension-consumer", min_length=1)
 
     # === Queue/Priority Settings ===
     # 1MB default
-    max_message_size: int = Field(default=1024 * 1024, ge=0)
+    # R27-RMQ-1: gt=0 (not ge=0) — zero would make every non-empty push fail.
+    max_message_size: int = Field(default=1024 * 1024, gt=0)
     # ms. Ceiling 300_000 (5 min) mirrors the cap discipline on
     # ``invisible_duration`` and the R21 timeout caps (circuit_breaker/backoff/
     # throttle): without it a stray-zero typo (e.g. a microseconds copy-paste)
@@ -169,6 +172,20 @@ class RocketMQSettings(BaseSettings):
     # set_topic_prefix / storage_topic_prefix settings — do NOT re-add them
     # (R25-H removed vestigial, unconsumed dead config).
     topic_prefix: str = Field(default="scrapy-queue")
+
+    @field_validator("consumer_group", mode="after")
+    @classmethod
+    def _reject_blank_consumer_group(cls, value: str) -> str:
+        """R27-RMQ-2: reject whitespace ``consumer_group`` (``min_length=1`` on
+        the field admits ``"   "``) — opaque SimpleConsumer error at connect.
+        """
+        if not value.strip():
+            raise ConfigurationError(
+                "RocketMQ 'consumer_group' must be non-empty.",
+                setting_name="consumer_group",
+                setting_value=value,
+            )
+        return value
 
     @model_validator(mode="after")
     def _validate_connection(self) -> Self:
