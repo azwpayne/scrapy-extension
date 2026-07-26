@@ -398,6 +398,31 @@ class TestKafkaBackendClusterMode:
 class TestKafkaBackendConfluentMode:
   """Tests for _connect_confluent method."""
 
+  def test_bootstrap_servers_strips_whitespace_confluent(self):
+    """R28-C-1: a whitespace ``confluent_bootstrap_servers`` must fall back to
+    ``bootstrap_servers`` at RUNTIME, matching the R28-C validator's ``.strip()``
+    semantics.
+
+    R28-C made the *validator* treat whitespace confluent as "no real endpoint"
+    (accepting the config when bootstrap_servers holds a real endpoint), but the
+    *runtime* resolver ``_bootstrap_servers`` used bare ``or`` — so the whitespace
+    string was returned to kafka-python and connect() failed with the exact opaque
+    error R28-C exists to prevent. Validator-runtime mismatch; this completes R28-C.
+    """
+    config = KafkaSettings(
+      mode=KafkaMode.CONFLUENT,
+      confluent_api_key="K",  # type: ignore[arg-type]
+      confluent_api_secret="S",  # type: ignore[arg-type]
+      confluent_bootstrap_servers="   ",
+      bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+    )
+    backend = KafkaBackend(config)
+    # Runtime must skip the whitespace confluent value and use the real endpoint.
+    assert (
+      backend._bootstrap_servers()
+      == "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+    )
+
   def test_connect_confluent_with_api_key_secret(self, mocker):
     """Test _connect_confluent uses API key/secret when provided."""
     config = KafkaSettings(

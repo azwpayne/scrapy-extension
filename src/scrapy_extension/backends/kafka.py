@@ -493,7 +493,13 @@ class KafkaBackend(Backend, QueueBackend):
     if self.config.mode == KafkaMode.CLUSTER and self.config.cluster_brokers:
       return ",".join(self.config.cluster_brokers)
     if self.config.mode == KafkaMode.CONFLUENT:
-      return self.config.confluent_bootstrap_servers or self.config.bootstrap_servers
+      # R28-C-1: `.strip()` so a whitespace-only ``confluent_bootstrap_servers``
+      # falls back to ``bootstrap_servers`` — matching the R28-C validator's
+      # semantics. Pre-R28-C-1 bare ``or`` returned the whitespace string to
+      # kafka-python → opaque connect error despite the validator passing.
+      return (self.config.confluent_bootstrap_servers or "").strip() or (
+        self.config.bootstrap_servers
+      )
     return self.config.bootstrap_servers
 
   def _build_client_security_config(self) -> dict[str, Any]:
