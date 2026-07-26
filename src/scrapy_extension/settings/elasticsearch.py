@@ -189,8 +189,13 @@ class ElasticSearchSettings(BaseSettings):
           f"Got cloud_id={self.cloud_id!r}."
         )
         raise ValueError(msg)
-      has_api_key = self.api_key is not None
-      has_basic_auth = self.username is not None and self.password is not None
+      # R27-A: truthiness (not ``is not None``) so an empty-string secret —
+      # e.g. ``SCRAPY_ELASTICSEARCH_API_KEY=""`` (env var set but unpopulated)
+      # — is treated as absent, matching ``_build_kwargs`` (which uses
+      # ``if self.config.api_key:``). Pre-R27-A an empty secret passed this
+      # check but was dropped at build time → anonymous client → 401.
+      has_api_key = bool(self.api_key)
+      has_basic_auth = bool(self.username) and bool(self.password)
       if not (has_api_key or has_basic_auth):
         msg = (
           "ElasticSearch CLOUD mode requires an auth method: set 'api_key' "
@@ -222,7 +227,11 @@ class ElasticSearchSettings(BaseSettings):
     if self.mode == ElasticSearchMode.CLOUD:
       return self
 
-    has_credential = self.api_key is not None or self.password is not None
+    # R27-A: truthiness mirrors the CLOUD auth check above so an empty
+    # ``api_key``/``password`` is not treated as a credential present (which
+    # would false-positive the cleartext guard on a permitted no-auth http dev
+    # node — the validator's own docstring allows ``http://`` with no creds).
+    has_credential = bool(self.api_key) or bool(self.password)
     if not has_credential:
       return self
     has_http_host = any(

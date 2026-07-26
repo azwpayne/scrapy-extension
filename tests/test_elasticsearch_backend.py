@@ -126,6 +126,57 @@ class TestConnection:
         mode=ElasticSearchMode.CLOUD, cloud_id="test:abc"
       )
 
+  def test_cloud_mode_empty_api_key_fails_at_construction(self):
+    """R27-A: an empty-string ``api_key`` must fail CLOUD construction.
+
+    R26-F used ``is not None``, so ``SecretStr("")`` — an env var set but
+    unpopulated (e.g. ``SCRAPY_ELASTICSEARCH_API_KEY=""`` in CI drift) — passed
+    fail-fast validation. But ``_build_kwargs`` uses truthiness and skipped the
+    empty key, constructing an *anonymous* client that Elastic Cloud 401s on
+    ping → the exact opaque ``BackendConnectionError('health check returned
+    false')`` R26-F exists to surface at config time. An empty value is the
+    same operator error as an unset one and must fail at the same point.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="auth"):
+      ElasticSearchSettings(
+        mode=ElasticSearchMode.CLOUD, cloud_id="test:abc", api_key=""
+      )
+
+  def test_cloud_mode_empty_basic_auth_fails_at_construction(self):
+    """R27-A: empty-string ``username``/``password`` must fail CLOUD construction.
+
+    Same root cause as the empty api_key case: ``is not None`` treats
+    ``username=""`` / ``password=SecretStr("")`` as present, but
+    ``_build_kwargs`` drops them via truthiness → anonymous client → 401.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="auth"):
+      ElasticSearchSettings(
+        mode=ElasticSearchMode.CLOUD,
+        cloud_id="test:abc",
+        username="",
+        password="",
+      )
+
+  def test_standalone_empty_api_key_http_not_blocked(self):
+    """R27-A: an empty ``api_key`` must not trip the cleartext-credentials guard.
+
+    ``_validate_no_cleartext_credentials`` also used ``is not None``, so
+    ``api_key=SecretStr("")`` + an ``http://`` host (the STANDALONE default)
+    raised "don't send credentials over cleartext" — a false positive, since
+    there are no real credentials to leak. The validator's own docstring
+    permits ``http://`` with no creds (no-auth local dev node). After the
+    truthiness fix, empty key = no credential = allowed. The real-key-over-http
+    guard is unchanged (``bool(SecretStr("real"))`` is still truthy).
+    """
+    # No exception: default http://localhost:9200 + empty api_key is a permitted
+    # no-auth dev config (the validator's docstring allows it).
+    settings = ElasticSearchSettings(mode=ElasticSearchMode.STANDALONE, api_key="")
+    assert settings.api_key.get_secret_value() == ""
+
   def test_disconnect(self, mocker):
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
