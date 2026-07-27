@@ -201,6 +201,27 @@ def test_mongodb_database_empty_rejected():
     MongoDBSettings(database="")
 
 
+def test_mongodb_auth_source_empty_rejected():
+  """R31-A: empty ``auth_source`` must reject at the settings layer — consistent
+  with R29-C ``database``. (Empty-string is benign at the backend — falsy →
+  skipped → pymongo default — but reject at settings for consistency.)"""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(auth_source="")
+
+
+def test_mongodb_auth_source_whitespace_rejected():
+  """R31-A: whitespace ``auth_source`` must reject — the backend's bare-truthiness
+  ``if self.config.auth_source:`` lets ``"   "`` through (truthy) and passes it
+  verbatim as ``authSource='   '`` to MongoClient → opaque authentication failure.
+  R29's whitespace sweep missed this field."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(auth_source="   ")
+
+
 def test_mongodb_replica_set_members_empty_element_rejected():
   """R29-B: empty/whitespace elements in replica_set_members/mongos_routers
   build a malformed ``mongodb://`` URI → opaque InvalidURI otherwise."""

@@ -380,6 +380,23 @@ class MongoDBSettings(BaseSettings):
       )
     return value
 
+  @field_validator("auth_source", mode="after")
+  @classmethod
+  def _reject_blank_auth_source(cls, value: str) -> str:
+    """R31-A: reject empty/whitespace ``auth_source`` — the backend's
+    ``_auth_kwargs`` uses bare truthiness (``if self.config.auth_source:``), so a
+    whitespace value is truthy and passed verbatim as ``authSource='   '`` to
+    MongoClient → opaque authentication failure. R29's whitespace sweep missed
+    this field. Mirrors R29-C ``database``.
+    """
+    if not value or not value.strip():
+      raise ConfigurationError(
+        "MongoDB 'auth_source' must be non-empty.",
+        setting_name="auth_source",
+        setting_value=value,
+      )
+    return value
+
   @field_validator("replica_set_members", "mongos_routers", mode="after")
   @classmethod
   def _reject_blank_member_elements(cls, value: list[str]) -> list[str]:
