@@ -534,7 +534,7 @@ class RedisSettings(BaseSettings):
       missing = []
       if not self.sentinels:
         missing.append("sentinels")
-      if not self.sentinel_master_name:
+      if not self.sentinel_master_name.strip():
         missing.append("sentinel_master_name")
       if missing:
         fields = " and ".join(missing)

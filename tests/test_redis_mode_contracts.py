@@ -290,6 +290,20 @@ def test_sentinel_required_field_error_never_echoes_endpoints() -> None:
   assert "sentinel.internal" not in str(exc_info.value)
 
 
+def test_sentinel_master_name_whitespace_rejected() -> None:
+  """R30-C: whitespace ``sentinel_master_name`` must reject — the SENTINEL
+  missing-field check used bare truthiness (``not sentinel_master_name``), so
+  ``"   "`` / ``"\\t\\n"`` bypassed it and surfaced as an opaque sentinel
+  discovery error. Mirrors R29-D's strip-aware fix."""
+  with pytest.raises(ConfigurationError) as exc_info:
+    RedisSettings(
+      mode=RedisMode.SENTINEL,
+      sentinels=["sentinel.internal:26379"],
+      sentinel_master_name="   ",
+    )
+  assert exc_info.value.setting_name == "sentinel_master_name"
+
+
 @pytest.mark.parametrize("field_name", ["masters", "Masters", "MASTERS"])
 def test_ghost_masters_field_is_rejected_without_retaining_endpoint(
   field_name: str,
