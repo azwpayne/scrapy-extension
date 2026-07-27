@@ -222,6 +222,31 @@ def test_mongodb_auth_source_whitespace_rejected():
     MongoDBSettings(auth_source="   ")
 
 
+def test_mongodb_username_whitespace_rejected():
+  """R32-A: whitespace ``username`` must reject — the backend's _auth_kwargs gates
+  on bare truthiness (``if not (username and password)``), so a whitespace value
+  is truthy and passed verbatim to MongoClient → opaque auth failure. R31-A's
+  sweep covered auth_source but missed the username/password siblings."""
+  from pydantic import SecretStr
+
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(username="   ", password=SecretStr("real-pw"))
+
+
+def test_mongodb_password_whitespace_rejected():
+  """R32-A: whitespace ``password`` (SecretStr) must reject — same rationale as
+  username; ``SecretStr('   ')`` is truthy so it bypasses the both-or-neither
+  gate and reaches MongoClient verbatim → opaque auth failure."""
+  from pydantic import SecretStr
+
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError):
+    MongoDBSettings(username="real-user", password=SecretStr("   "))
+
+
 def test_mongodb_replica_set_members_empty_element_rejected():
   """R29-B: empty/whitespace elements in replica_set_members/mongos_routers
   build a malformed ``mongodb://`` URI → opaque InvalidURI otherwise."""

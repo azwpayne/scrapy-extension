@@ -397,6 +397,38 @@ class MongoDBSettings(BaseSettings):
       )
     return value
 
+  @field_validator("username", mode="after")
+  @classmethod
+  def _reject_blank_username(cls, value: str | None) -> str | None:
+    """R32-A: reject empty/whitespace ``username`` — the backend's ``_auth_kwargs``
+    gates on bare truthiness (``if not (username and password)``), so a whitespace
+    value is truthy and passed verbatim to MongoClient → opaque auth failure.
+    R31-A's sweep covered auth_source but missed the username/password siblings.
+    None is allowed (credential unset).
+    """
+    if value is not None and not value.strip():
+      raise ConfigurationError(
+        "MongoDB 'username' must be non-empty.",
+        setting_name="username",
+        setting_value=value,
+      )
+    return value
+
+  @field_validator("password", mode="after")
+  @classmethod
+  def _reject_blank_password(cls, value: SecretStr | None) -> SecretStr | None:
+    """R32-A: reject empty/whitespace ``password`` — ``SecretStr('   ')`` is truthy
+    so it bypasses the backend's both-or-neither gate and reaches MongoClient
+    verbatim → opaque auth failure. Same rationale as ``username``. None is allowed.
+    ``setting_value`` is intentionally omitted (secret — never surface in errors).
+    """
+    if value is not None and not value.get_secret_value().strip():
+      raise ConfigurationError(
+        "MongoDB 'password' must be non-empty.",
+        setting_name="password",
+      )
+    return value
+
   @field_validator("replica_set_members", "mongos_routers", mode="after")
   @classmethod
   def _reject_blank_member_elements(cls, value: list[str]) -> list[str]:
