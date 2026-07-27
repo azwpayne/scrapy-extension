@@ -1242,6 +1242,32 @@ def test_rabbitmq_backend_mirrored_queues_no_ha_mode(mocker):
   blocking_connection.assert_not_called()
 
 
+def test_rabbitmq_snapshot_rejects_whitespace_virtual_host():
+  """R30-A: a whitespace ``virtual_host`` must reject at snapshot-capture
+  (connect-time revalidation), not pass through to an opaque AMQP error.
+  The validator used bare truthiness (``not virtual_host``), so ``"   "`` passed.
+  """
+  config = RabbitMQSettings()
+  config.virtual_host = "   "
+  backend = RabbitMQBackend(config)
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend._capture_connection_snapshot()
+  assert exc_info.value.setting_name == "virtual_host"
+
+
+def test_rabbitmq_snapshot_rejects_whitespace_ha_mode():
+  """R30-B: whitespace ``ha_mode`` in MIRRORED_QUEUES must reject at snapshot-capture
+  (the backend-side sibling of the settings validator). Bare truthiness let it pass.
+  """
+  config = RabbitMQSettings()
+  config.mode = RabbitMQMode.MIRRORED_QUEUES
+  config.ha_mode = "   "
+  backend = RabbitMQBackend(config)
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend._capture_connection_snapshot()
+  assert exc_info.value.setting_name == "ha_mode"
+
+
 def test_rabbitmq_backend_mirrored_queues_ha_params_non_digit(mocker):
   """Test _connect_mirrored_queues with non-digit ha_params (line 250)."""
   config = RabbitMQSettings()

@@ -646,6 +646,19 @@ class TestRabbitMQModeConditional:
     )
     assert s.ha_mode == "all"
 
+  def test_mirrored_queues_ha_mode_whitespace_rejected(self) -> None:
+    """R30-B: whitespace ``ha_mode`` must reject — the check used bare truthiness
+    (``not self.ha_mode``), so ``"   "`` bypassed it and surfaced later as a
+    misleading 'ha_mode required' at connect. Strip-aware (mirrors R29-D)."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      RabbitMQSettings(
+        username="u",
+        password="p",
+        mode=RabbitMQMode.MIRRORED_QUEUES,
+        ha_mode="   ",
+      )
+    assert exc_info.value.setting_name == "ha_mode"
+
 
 # ---------------------------------------------------------------------------
 # SV4 — URL/scheme format guards (round 9b)

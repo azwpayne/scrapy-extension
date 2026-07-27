@@ -466,9 +466,13 @@ class RabbitMQSettings(BaseSettings):
         setting_name="cluster_nodes",
         setting_value=self.cluster_nodes,
       )
+    # R30-B: strip-aware — whitespace ``ha_mode`` (``not "  "`` is False)
+    # bypassed the bare truthiness check and surfaced later as a misleading
+    # 'ha_mode required' at connect. Mirrors R29-D's pattern.
+    ha_mode = self.ha_mode
     if (
       self.mode == RabbitMQMode.MIRRORED_QUEUES
-      and not self.ha_mode
+      and (ha_mode is None or not ha_mode.strip())
     ):
       raise ConfigurationError(
         (

@@ -369,12 +369,12 @@ class RabbitMQBackend(Backend, QueueBackend):
         "RabbitMQ CLUSTER mode requires at least one cluster node.",
         setting_name="cluster_nodes",
       )
-    if mode == RabbitMQMode.MIRRORED_QUEUES and not ha_mode:
+    if mode == RabbitMQMode.MIRRORED_QUEUES and (not ha_mode or not ha_mode.strip()):
       raise ConfigurationError(
         "RabbitMQ MIRRORED_QUEUES mode requires ha_mode.",
         setting_name="ha_mode",
       )
-    if not isinstance(virtual_host, str) or not virtual_host:
+    if not isinstance(virtual_host, str) or not virtual_host.strip():
       raise ConfigurationError(
         "RabbitMQ virtual_host must be a non-empty string.",
         setting_name="virtual_host",
