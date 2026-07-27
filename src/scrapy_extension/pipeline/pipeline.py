@@ -539,6 +539,15 @@ class BackendPipeline:
         e,
       )
       self._inc_stat(spider, "pipeline/storage_errors")
+      # R32-B: emit on_error("store", e) for observability parity with the
+      # sibling serialization arm (above), the batched age-flusher, queue, and
+      # dupefilter — so a ScrapyStatsMonitor increments the documented
+      # ``errors/store`` counter for synchronous store failures (the most common
+      # storage failure mode), not just serialization + batched-flush failures.
+      try:
+        self._monitor.on_error("store", e)
+      except Exception:  # noqa: BLE001 - telemetry cannot mask storage
+        logger.debug("monitor.on_error(store) raised; ignored", exc_info=True)
       # C2: opt-in loud-fail. Default (max_storage_errors=None) keeps the
       # best-effort swallow-and-stat behavior — zero compat break. When set,
       # track consecutive failures and re-raise once the count exceeds N so a

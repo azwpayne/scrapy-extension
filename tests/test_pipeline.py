@@ -1112,6 +1112,34 @@ class TestBackendPipelineMonitorWiring:
 
     monitor.on_store.assert_not_called()
 
+  def test_storage_failure_emits_monitor_on_error(
+    self, mock_connection_manager, mocker
+  ):
+    """R32-B: a storage failure must emit ``monitor.on_error('store', e)`` —
+    consistent with the sibling serialization arm (line 494), the batched
+    age-flusher, queue, and dupefilter. Pre-R32-B the storage arm only
+    incremented ``pipeline/storage_errors``, so an operator alerting on the
+    documented ``errors/store`` counter missed synchronous store failures."""
+    monitor = mocker.Mock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+
+    sentinel = RuntimeError("connection refused")
+    mock_storage = mock_connection_manager.get_storage_backend()
+    mock_storage.store.side_effect = sentinel
+
+    mock_spider = mocker.Mock()
+    mock_spider.name = "s"
+
+    pipeline.process_item(SampleItem(name="x", value=1), mock_spider)
+
+    monitor.on_error.assert_called_once()
+    assert monitor.on_error.call_args[0][0] == "store"
+    assert monitor.on_error.call_args[0][1] is sentinel
+
   def test_on_store_failure_does_not_fail_already_persisted_item(
     self, mock_connection_manager, mocker
   ):
