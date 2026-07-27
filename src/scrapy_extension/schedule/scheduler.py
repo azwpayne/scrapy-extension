@@ -1615,6 +1615,18 @@ class BackendScheduler:
             # API. Preserve the precise legacy extension when available and
             # the historical conservative rollback for custom filters that
             # provide neither optional method.
+            # Pre-arm the rollback gate BEFORE the interruptible call: an
+            # add-on-check filter (bundled BackendDupeFilter's legacy arm, and
+            # the common SADD-style custom filter) has ALREADY recorded the
+            # fingerprint inside ``request_seen`` above. ``dedup_reserved`` is
+            # the gate every cleanup arm uses to call ``forget``; assigning it
+            # only after ``consume_reservation`` returns would leave it ``False``
+            # if a BaseException (or any non-(QueueError/BackendError/
+            # SerializationError) exception) lands during that call, leaking the
+            # fingerprint as a permanent ghost marker. Pre-arm, then refine on
+            # success — ``_rollback_dupefilter_reservation``→``forget`` is
+            # guarded for the filter-full-miss case where nothing was recorded.
+            dedup_reserved = True
             dedup_reserved = (
               bool(consume_reservation(request))
               if callable(consume_reservation)

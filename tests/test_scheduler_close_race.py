@@ -411,6 +411,80 @@ class TestStrategyCloseBaseExceptionStillReleasesManager:
     mock_connection_manager.close.assert_called_once_with()
 
 
+class TestEnqueueBaseExceptionDuringConsumeReservationForgetsFingerprint:
+  """R34 / SCHED-EXC-CATCH-1: a ``BaseException`` (Ctrl+C / SystemExit) during
+  a legacy dupefilter's ``consume_reservation`` must STILL call ``forget()`` so
+  the fingerprint ``request_seen`` just recorded does not become permanent.
+
+  WHY THIS MATTERS (intent, not just behavior): the bundled ``BackendDupeFilter``
+  is an add-on-check filter — ``request_seen`` records the fingerprint into the
+  membership set at the moment of the check (``_request_seen_unlocked``:
+  ``self._filter.add(encoded_fingerprint)``). The scheduler then calls
+  ``consume_reservation`` to learn whether a reservation was actually written;
+  ``dedup_reserved`` is the gate every cleanup arm uses to decide whether to
+  call ``forget``. Pre-R34, ``dedup_reserved`` was assigned AFTER the
+  interruptible ``consume_reservation(request)`` call, so a BaseException during
+  that call left it ``False`` and the ``except BaseException`` rollback gate
+  never fired. Result: the recorded fingerprint was never forgotten (ghost) and,
+  because the push never happened either, the URL was permanently lost with a
+  marker blocking redelivery — a direct violation of the documented at-least-
+  once policy ("accept possible replay rather than leave a permanent ghost
+  fingerprint").
+
+  This test would fail to encode anything meaningful if ``consume_reservation``
+  raising were indistinguishable from ``request_seen`` raising — so the custom
+  filter records the fingerprint (returns not-seen) BEFORE the interrupting call.
+  """
+
+  def test_keyboard_interrupt_during_consume_reservation_calls_forget(
+    self, mock_connection_manager, mocker
+  ):
+    """Pre-fix: ``forget`` is NOT called (gate inactive). Post-fix: called once."""
+
+    class _AddOnCheckInterruptingDupeFilter:
+      """Legacy add-on-check dupefilter whose consume_reservation is interrupted.
+
+      Mirrors the SADD-style custom filter (and the bundled BackendDupeFilter's
+      own legacy arm): ``request_seen`` records the fingerprint and returns
+      not-seen; ``consume_reservation`` would normally report the reservation,
+      but here it is interrupted by a process-control signal.
+      """
+
+      def __init__(self) -> None:
+        self.request_seen_count = 0
+        self.forget = mocker.MagicMock(name="forget")
+
+      # No request_seen_with_reservation / commit_reservation /
+      # rollback_reservation → _atomic_dupefilter_methods returns None → the
+      # scheduler takes the legacy (non-atomic) arm under test.
+      def request_seen(self, request):  # noqa: ARG002
+        # Add-on-check: records the fingerprint (simulated), returns not-seen.
+        self.request_seen_count += 1
+        return False
+
+      def consume_reservation(self, request):  # noqa: ARG002
+        raise KeyboardInterrupt("simulated Ctrl+C during consume_reservation")
+
+    dupefilter = _AddOnCheckInterruptingDupeFilter()
+    scheduler, _ = _make_scheduler_with_queue(mock_connection_manager, mocker)
+    # Inject the legacy dupefilter after open() (the fixture leaves it None).
+    scheduler.dupefilter = dupefilter
+
+    request = Request(url="https://example.com/r34-ghost")
+
+    # The KeyboardInterrupt is re-raised (primary signal preserved), NOT
+    # swallowed — consistent with the at-least-once cleanup contract.
+    with pytest.raises(KeyboardInterrupt):
+      scheduler.enqueue_request(request)
+
+    # The fingerprint was recorded by request_seen exactly once.
+    assert dupefilter.request_seen_count == 1
+    # CRITICAL: forget() was called despite the BaseException landing during
+    # consume_reservation — pre-fix, dedup_reserved was still False here and
+    # this assertion failed (the ghost-fingerprint window).
+    dupefilter.forget.assert_called_once_with(request)
+
+
 class TestSignalDisconnectFailureIsNonFatal:
   """Behavior #5 (exception-safety symmetry): a signal ``disconnect()`` raising
   does NOT block ``queue.close()`` (snapshot persist) or ``connection_manager.close()``.
