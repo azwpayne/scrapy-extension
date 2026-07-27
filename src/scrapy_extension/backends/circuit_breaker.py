@@ -129,6 +129,15 @@ class CircuitBreaker:
     if failure_threshold < 1:
       msg = f"failure_threshold must be >= 1, got {failure_threshold}"
       raise ValueError(msg)
+    # R34-B: reject bool — ``math.isfinite(True)`` is True and ``True < 0`` is
+    # False, so without this guard ``reset_timeout=True`` is silently accepted
+    # and stored as boolean ``True`` (the OPEN breaker then waits ~1s). Mirror
+    # the R21-A failure_threshold bool guard. Production is neutralized by
+    # pydantic float-coercion on the settings field, but direct construction
+    # (plugins / YAML bools / test doubles) must still reject it.
+    if isinstance(reset_timeout, bool):
+      msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
+      raise ValueError(msg)
     if not math.isfinite(reset_timeout) or reset_timeout < 0:
       msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
       raise ValueError(msg)
@@ -383,10 +392,11 @@ class CircuitBreaker:
 # A proxy wraps the backend's *hot-path* (network-touching) methods under a
 # shared breaker while transparently forwarding every other attribute to the
 # underlying backend. Non-network methods (``is_connected``, ``backend_type``,
-# ``ack``/``nack`` no-ops on atomic backends, ``clear_queue``/``clear_set``/
-# ``clear_storage`` which are administrative) deliberately bypass the breaker
-# so that an OPEN breaker does not, e.g., block a ``is_connected()`` health
-# probe or a shutdown-time ``clear_*``.
+# ``clear_queue``/``clear_set``/``clear_storage`` which are administrative)
+# deliberately bypass the breaker so that an OPEN breaker does not, e.g., block
+# an ``is_connected()`` health probe or a shutdown-time ``clear_*``. Note
+# ``ack``/``nack`` are NOT administrative on MQ backends (R34-C) and are in
+# ``_QueueBackendProxy._HOT_PATH``; see its docstring.
 #
 # The proxies subclass the interface ABCs purely so ``isinstance(proxy,
 # QueueBackend)`` etc. continue to hold — existing code (and the
@@ -479,16 +489,27 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
   this the override is shadowed by the ABC default ``pop_with_ack → (self.pop,
   None)`` and MQ tokens silently become ``None`` under
   ``SCRAPY_CIRCUIT_BREAKER_ENABLED``.
+
+  ``ack``/``nack`` (R34-C) are in the hot path for the same reason
+  ``pop_with_ack`` is: on the 5 MQ backends they are real network ops
+  (``consumer.commit`` / ``basic_ack`` / ``delete_message`` / broker ack) that
+  raise ``QueueError`` (a ``BackendError``). The 2026-07-10 rationale applies
+  identically — an ack-path-only broker degradation (e.g. a Kafka
+  group-coordinator partitioned while partition leaders keep serving push) must
+  trip the breaker, and once OPEN, ack must fail fast with
+  ``CircuitBreakerOpenError`` instead of blocking on the broker commit
+  timeout. Atomic-pop backends (Redis/MongoDB/ES) inherit the ABC no-op ack, so
+  wrapping them is a no-op for breaker state. ``CircuitBreakerOpenError``
+  subclasses ``BackendError``, so the scheduler's existing
+  ``(QueueError, BackendError)`` ack-error handling covers the fail-fast path.
   """
 
-  _HOT_PATH = ("push", "_push_with_durability", "pop", "pop_with_ack")
+  _HOT_PATH = ("push", "_push_with_durability", "pop", "pop_with_ack", "ack", "nack")
   _FORWARDED = (
     "requires_ack",
     "supports_concurrent_ack",
     "queue_len",
     "clear_queue",
-    "ack",
-    "nack",
     "connect",
     "disconnect",
     "is_connected",

@@ -92,6 +92,20 @@ class TestCircuitBreakerConstruction:
     with pytest.raises(ValueError, match="failure_threshold"):
       CircuitBreaker("x", failure_threshold=True)
 
+  def test_bool_reset_timeout_raises(self):
+    """R34-B: bool is an int subclass but not a valid reset_timeout.
+
+    Asymmetric with the R21-A failure_threshold guard: ``math.isfinite(True)``
+    is True and ``True < 0`` is False, so ``reset_timeout=True`` was silently
+    accepted and stored as boolean ``True`` (the OPEN breaker then waited ~1s
+    instead of the intended value). Production is neutralized by pydantic
+    float-coercion on the settings field, but direct ``CircuitBreaker()``
+    construction (third-party plugins, YAML ``on``/``off`` parsed as bool,
+    test doubles) must still reject it — mirror the failure_threshold guard.
+    """
+    with pytest.raises(ValueError, match="reset_timeout"):
+      CircuitBreaker("x", reset_timeout=True)
+
   def test_cap_reset_timeout_accepted(self):
     """R21-A: the cap value itself is accepted (boundary)."""
     from scrapy_extension.backends.circuit_breaker import (
@@ -794,13 +808,56 @@ class TestQueueBackendProxy:
       wrapped.pop("q")
     assert breaker.state is BreakerState.OPEN
 
-    # Non-network methods must still work — they are NOT blocked by the breaker.
+    # Non-network admin methods must still work — they are NOT blocked by the
+    # breaker (clear_queue is administrative; is_connected is a health probe).
     wrapped.clear_queue("q")
-    wrapped.ack("q")
     assert backend.clear_calls == 1
-    assert backend.ack_calls == 1
     # is_connected forwards to the wrapped backend.
     assert wrapped.is_connected() is True
+
+  def test_ack_failure_trips_breaker_and_fail_fast_when_open(self):
+    """R34-C: ack() is a real network op on the 5 MQ backends (kafka
+    ``consumer.commit``, rabbitmq ``basic_ack``, sqs ``delete_message``,
+    rocketmq/pulsar ack all raise ``QueueError`` — a ``BackendError``). Pre-fix
+    ack/nack were in ``_FORWARDED``, so:
+
+    (a) ack-path-only broker degradation (e.g. Kafka group-coordinator /
+        ``__consumer_offsets`` broker partitioned while partition leaders keep
+        serving push/pop_with_ack) raised QueueError that NEVER reached
+        ``breaker.call`` → ``_failure_count`` never incremented → the breaker
+        never tripped → zero operator signal; and
+    (b) once OPEN via a later push/pop, forwarded ack() STILL hit the dead
+        broker and blocked on the commit timeout (librdmka ~60s) instead of
+        failing fast — tying up CONCURRENT_REQUESTS workers.
+
+    The 2026-07-10 fix already wrapped ``pop_with_ack`` for the identical
+    rationale ("a broker degradation on the MQ ack-pop path trips the
+    breaker"); R34-C extends that to ack/nack themselves. Atomic-pop backends
+    (Redis/MongoDB/ES) inherit the ABC no-op ack → wrapping is a no-op for
+    their breaker state. ``CircuitBreakerOpenError`` subclasses ``BackendError``,
+    so the scheduler's existing ``(QueueError, BackendError)`` ack-error
+    handling covers the fail-fast path unchanged.
+    """
+    from scrapy_extension.exceptions import QueueError
+
+    def _ack_fails(*_args: Any, **_kwargs: Any) -> None:
+      raise QueueError("broker commit failed")
+
+    backend = _FakeQueueBackend()
+    backend.ack = _ack_fails  # type: ignore[method-assign]
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    wrapped = wrap_queue_backend(backend, breaker)
+
+    # (a) ack failure now trips the breaker.
+    #     Pre-fix: forwarded → QueueError propagated but breaker stayed CLOSED.
+    with pytest.raises(QueueError):
+      wrapped.ack("q")
+    assert breaker.state is BreakerState.OPEN
+
+    # (b) once OPEN, ack fails fast with CircuitBreakerOpenError instead of
+    #     re-hitting the dead broker. Pre-fix: forwarded → QueueError again.
+    with pytest.raises(CircuitBreakerOpenError):
+      wrapped.ack("q")
 
   def test_success_path_delegates(self):
     backend = _FakeQueueBackend()
