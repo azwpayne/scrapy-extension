@@ -148,3 +148,63 @@ dedup_reserved = (
 
 `uv run ruff check` → `uv run mypy --strict src/scrapy_extension` →
 `uv run pytest` (target ≥ R33's 3830 pass + the 1 new test).
+
+---
+
+# Addendum — R34-B + R34-C (circuit_breaker.py focused scan)
+
+After R34-A shipped, a focused ultracode scan of the previously-un-audited
+`backends/circuit_breaker.py` (3 finder lenses + adversarial verify, opus, 5
+agents / 0 errors / ~917k tokens) surfaced 2 more confirmed findings. Both
+shipped in the same round.
+
+## R34-C (MED) — `_QueueBackendProxy` forwards ack/nack outside the breaker
+
+`_QueueBackendProxy._FORWARDED` included `ack`/`nack` (lines 490-491),
+justified by a comment calling them "no-ops on atomic backends." That is true
+for Redis/MongoDB/ES (they inherit the ABC no-op ack) but **FALSE for the 5 MQ
+backends** — `ack()` is a real network op there (`kafka consumer.commit`,
+`rabbitmq basic_ack`, `sqs delete_message`, `rocketmq`/`pulsar` ack) that
+raises `QueueError` (a `BackendError`). Two failure modes:
+
+- **(a) ack-path-only degradation invisible.** A broker degradation isolated
+  to the ack path (e.g. Kafka group-coordinator / `__consumer_offsets` broker
+  partitioned while partition leaders keep serving `push`/`pop_with_ack`)
+  raised `QueueError` that never reached `breaker.call` → `_failure_count`
+  never incremented → breaker never tripped → **zero operator signal**.
+- **(b) no fail-fast when OPEN.** Once tripped via a later `push`/`pop`,
+  forwarded `ack()` still hit the dead broker and blocked on the commit
+  timeout (librdkafka ~60s) instead of failing fast → tied up
+  `CONCURRENT_REQUESTS` workers, defeating the breaker's contract on the ack
+  path.
+
+The 2026-07-10 fix already wrapped `pop_with_ack` for the **identical
+rationle** ("a broker degradation on the MQ ack-pop path trips the breaker");
+R34-C extends it to `ack`/`nack`. **Fix:** move `ack`/`nack` from `_FORWARDED`
+to `_HOT_PATH`. Safe because (1) atomic-pop backends' ack is an ABC no-op →
+wrapping is a no-op for their breaker state, and (2) `CircuitBreakerOpenError`
+subclasses `BackendError` → the scheduler's existing
+`(QueueError, BackendError)` ack-error handling covers the fail-fast path
+unchanged. Updated `test_non_hot_path_methods_forwarded_unchanged` (it used a
+fake no-op ack that encoded the wrong assumption) and added
+`test_ack_failure_trips_breaker_and_fail_fast_when_open`.
+
+## R34-B (LOW) — `reset_timeout` accepts bool silently
+
+`reset_timeout` validation (line 132) used `math.isfinite(x) or x < 0`, which
+does NOT reject bool (`math.isfinite(True)` is True, `True < 0` is False) →
+`reset_timeout=True` was silently stored as boolean `True` (the OPEN breaker
+then waited ~1s). Asymmetric with the R21-A `failure_threshold` bool guard
+(line 126). **Production-unreachable** (pydantic float-coerces the settings
+field `True→1.0`), but direct `CircuitBreaker(...)` construction (third-party
+plugins, YAML `on`/`off` parsed as bool, test doubles) must still reject it.
+**Fix:** one-line `isinstance(x, bool)` mirror of the R21-A guard +
+`test_bool_reset_timeout_raises`.
+
+## Round-34 totals
+
+3 findings (R34-A LOW-MED scheduler + R34-B LOW cb-bool + R34-C MED cb-ack),
+all TDD RED→GREEN, all 3 gates green (ruff / mypy --strict 76 files / pytest
+**3833 passed** = R33's 3830 + 3). The 4×-deferred SCHED-EXC-CATCH-1 debt is
+cleared, and the previously-un-audited `circuit_breaker.py` is now covered.
+
