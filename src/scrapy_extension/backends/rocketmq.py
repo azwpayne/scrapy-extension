@@ -323,12 +323,19 @@ class RocketMQBackend(Backend, QueueBackend):
         try:
           closer.shutdown()
         except Exception:
-          if suppress_control_errors:
-            logger.debug("Failed to abort partial RocketMQ client", exc_info=True)
-          else:
-            logger.warning(
-              "RocketMQ %s shutdown raised; ignoring", label, exc_info=True
-            )
+          # Cleanup diagnostics are strictly best-effort.  A misbehaving
+          # logging handler can raise a control exception; it must neither
+          # interrupt cleanup of later detached clients nor replace the
+          # failed-connect error that caused this abort.
+          try:
+            if suppress_control_errors:
+              logger.debug("Failed to abort partial RocketMQ client", exc_info=True)
+            else:
+              logger.warning(
+                "RocketMQ %s shutdown raised; ignoring", label, exc_info=True
+              )
+          except BaseException:
+            pass
         except BaseException as error:
           if primary_error is None:
             primary_error = error

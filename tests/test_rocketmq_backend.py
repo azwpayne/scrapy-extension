@@ -659,6 +659,28 @@ def test_connect_consumer_startup_failure_cleans_both_clients(mocker) -> None:
   assert backend._consumer is None
 
 
+def test_connect_failure_keeps_primary_when_abort_logging_is_interrupted(mocker) -> None:
+  """An abort diagnostic must not mask startup failure or skip sibling cleanup."""
+  mock_producer_cls, mock_consumer_cls, *_ = _patch_rocketmq(mocker)
+  startup_error = RuntimeError("consumer down")
+  mock_consumer_cls.return_value.startup.side_effect = startup_error
+  mock_consumer_cls.return_value.shutdown.side_effect = RuntimeError("close down")
+  mocker.patch(
+    "scrapy_extension.backends.rocketmq.logger.debug",
+    side_effect=KeyboardInterrupt(),
+  )
+  backend = RocketMQBackend(RocketMQSettings())
+
+  with pytest.raises(BackendConnectionError) as raised:
+    backend.connect()
+
+  assert raised.value.__cause__ is startup_error
+  mock_consumer_cls.return_value.shutdown.assert_called_once_with()
+  mock_producer_cls.return_value.shutdown.assert_called_once_with()
+  assert backend._producer is None
+  assert backend._consumer is None
+
+
 def test_connect_consumer_startup_baseexception_cleans_both_clients(mocker) -> None:
   """R16-A: a BaseException mid-construction must not skip the abort arm.
 
@@ -734,6 +756,21 @@ def test_disconnect_best_effort_on_shutdown_failure(mocker) -> None:
   mock_producer.shutdown.assert_called_once()
   mock_consumer.shutdown.assert_called_once()  # still attempted
   assert backend._producer is None
+
+
+def test_disconnect_continues_when_shutdown_warning_is_interrupted(mocker) -> None:
+  """A cleanup warning must not stop sibling shutdown."""
+  backend, producer, consumer, _ = _make_connected_backend(mocker)
+  producer.shutdown.side_effect = RuntimeError("boom")
+  mocker.patch(
+    "scrapy_extension.backends.rocketmq.logger.warning",
+    side_effect=KeyboardInterrupt(),
+  )
+
+  backend.disconnect()
+
+  producer.shutdown.assert_called_once_with()
+  consumer.shutdown.assert_called_once_with()
 
 
 def test_disconnect_closes_all_clients_after_baseexception(mocker) -> None:
