@@ -180,59 +180,80 @@ class RoundRobinQueueStrategy(QueueStrategy):
     try:
       data = json.loads(state.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-      logger.warning(
-        "RoundRobinQueueStrategy restore: corrupt snapshot (%s); starting clean.",
-        e,
-      )
+      try:
+        logger.warning(
+          "RoundRobinQueueStrategy restore: corrupt snapshot (%s); starting clean.",
+          e,
+        )
+      except BaseException:
+        pass
       return
     if (
       not isinstance(data, dict)
       or data.get("strategy") != "round_robin"
       or data.get("version") != 1
     ):
-      logger.warning(
-        "RoundRobinQueueStrategy restore: unknown snapshot format; starting clean."
-      )
+      try:
+        logger.warning(
+          "RoundRobinQueueStrategy restore: unknown snapshot format; starting clean."
+        )
+      except BaseException:
+        pass
       return
     raw_sources = data.get("sources")
     if not isinstance(raw_sources, list):
-      logger.warning(
-        "RoundRobinQueueStrategy restore: snapshot 'sources' not a list; "
-        "starting clean."
-      )
+      try:
+        logger.warning(
+          "RoundRobinQueueStrategy restore: snapshot 'sources' not a list; "
+          "starting clean."
+        )
+      except BaseException:
+        pass
       return
 
     recovered: OrderedDict[str, deque[bytes]] = OrderedDict()
     for entry in raw_sources:
       if not isinstance(entry, dict):
-        logger.warning(
-          "RoundRobinQueueStrategy restore: skipping malformed source entry."
-        )
+        try:
+          logger.warning(
+            "RoundRobinQueueStrategy restore: skipping malformed source entry."
+          )
+        except BaseException:
+          pass
         continue
       source = entry.get("source")
       raw_items = entry.get("items")
       if not isinstance(source, str) or not isinstance(raw_items, list):
-        logger.warning(
-          "RoundRobinQueueStrategy restore: skipping malformed source entry."
-        )
+        try:
+          logger.warning(
+            "RoundRobinQueueStrategy restore: skipping malformed source entry."
+          )
+        except BaseException:
+          pass
         continue
       if source in recovered:
-        logger.warning(
-          "RoundRobinQueueStrategy restore: skipping duplicate source %r.",
-          source,
-        )
+        try:
+          logger.warning(
+            "RoundRobinQueueStrategy restore: skipping duplicate source %r.",
+            source,
+          )
+        except BaseException:
+          pass
         continue
       items: deque[bytes] = deque()
       for raw_item in raw_items:
         try:
           items.append(base64.b64decode(raw_item, validate=True))
         except (binascii.Error, TypeError, ValueError) as e:
-          logger.warning(
-            "RoundRobinQueueStrategy restore: skipping malformed item for "
-            "source %r (%s).",
-            source,
-            e,
-          )
+          try:
+            logger.warning(
+              "RoundRobinQueueStrategy restore: skipping malformed item for "
+              "source %r (%s).",
+              source,
+              e,
+            )
+          except BaseException:
+            pass
       if items:
         recovered[source] = items
 
@@ -241,8 +262,11 @@ class RoundRobinQueueStrategy(QueueStrategy):
     with self._lock:
       self._sources = recovered
     if recovered_sources:
-      logger.info(
-        "RoundRobinQueueStrategy restore: recovered %d item(s) across %d source(s).",
-        recovered_count,
-        recovered_sources,
-      )
+      try:
+        logger.info(
+          "RoundRobinQueueStrategy restore: recovered %d item(s) across %d source(s).",
+          recovered_count,
+          recovered_sources,
+        )
+      except BaseException:
+        pass

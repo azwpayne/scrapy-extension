@@ -470,21 +470,27 @@ class DelayQueueStrategy(QueueStrategy):
     """Release resources, warning about any held (delayed) items.
 
     Held items live in-process, so any still-pending delayed items are
-    lost on close/restart. Make that loss non-silent: emit a WARNING with
-    the discarded count, then clear the holding heap.
+    lost on close/restart. Clear the holding heap atomically, then make that
+    loss non-silent with a best-effort WARNING containing the discarded count.
 
     If ``_holding`` is empty, this is a quiet no-op (clears nothing).
     """
     with self._state_lock:
       held = len(self._holding)
-      if held > 0:
+      self._holding.clear()
+
+    if held > 0:
+      try:
         logger.warning(
           "DelayQueueStrategy close: discarding %d held delayed item(s) "
           "from the in-process holding queue; these delayed items are lost "
           "on close/restart (non-silent data loss).",
           held,
         )
-      self._holding.clear()
+      except BaseException:
+        # The terminal state is already committed; warning handlers are
+        # advisory and must not revive held work or make close fail.
+        pass
 
   def snapshot(self) -> bytes | None:
     """Serialize the holding heap for restart recovery (initiative #3).
@@ -537,36 +543,48 @@ class DelayQueueStrategy(QueueStrategy):
     try:
       data = json.loads(state.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-      logger.warning(
-        "DelayQueueStrategy restore: corrupt snapshot (%s); starting clean.", e
-      )
+      try:
+        logger.warning(
+          "DelayQueueStrategy restore: corrupt snapshot (%s); starting clean.", e
+        )
+      except BaseException:
+        pass
       return
     if (
       not isinstance(data, dict)
       or data.get("strategy") != "delay"
       or data.get("version") not in (1, 2)
     ):
-      logger.warning(
-        "DelayQueueStrategy restore: unknown snapshot format "
-        "(strategy=%r, version=%r); starting clean.",
-        data.get("strategy") if isinstance(data, dict) else None,
-        data.get("version") if isinstance(data, dict) else None,
-      )
+      try:
+        logger.warning(
+          "DelayQueueStrategy restore: unknown snapshot format "
+          "(strategy=%r, version=%r); starting clean.",
+          data.get("strategy") if isinstance(data, dict) else None,
+          data.get("version") if isinstance(data, dict) else None,
+        )
+      except BaseException:
+        pass
       return
     items = data.get("items")
     if not isinstance(items, list):
-      logger.warning(
-        "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
-      )
+      try:
+        logger.warning(
+          "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
+        )
+      except BaseException:
+        pass
       return
     version = int(data["version"])
     try:
       now = _require_finite(self._clock(), "clock value")
     except (TypeError, ValueError) as e:
-      logger.warning(
-        "DelayQueueStrategy restore: invalid clock metadata (%s); starting clean.",
-        e,
-      )
+      try:
+        logger.warning(
+          "DelayQueueStrategy restore: invalid clock metadata (%s); starting clean.",
+          e,
+        )
+      except BaseException:
+        pass
       return
     downtime = 0.0
     if version == 2:
@@ -579,10 +597,13 @@ class DelayQueueStrategy(QueueStrategy):
           raise ValueError("wall clock is not finite")
         downtime = max(0.0, current_wall_time - snapshot_wall_time)
       except (KeyError, TypeError, ValueError) as e:
-        logger.warning(
-          "DelayQueueStrategy restore: invalid v2 clock metadata (%s); starting clean.",
-          e,
-        )
+        try:
+          logger.warning(
+            "DelayQueueStrategy restore: invalid v2 clock metadata (%s); starting clean.",
+            e,
+          )
+        except BaseException:
+          pass
         return
 
     recovered_entries: list[tuple[float, float, int, bytes, float]] = []
@@ -607,7 +628,10 @@ class DelayQueueStrategy(QueueStrategy):
         priority = float(entry["priority"])
         _require_finite(priority, "priority")
       except (KeyError, TypeError, ValueError, binascii.Error) as e:
-        logger.warning("DelayQueueStrategy restore: skipping malformed entry (%s).", e)
+        try:
+          logger.warning("DelayQueueStrategy restore: skipping malformed entry (%s).", e)
+        except BaseException:
+          pass
         continue
       recovered_entries.append(
         (ready_at, original_deadline, input_order, item, priority)
@@ -629,7 +653,10 @@ class DelayQueueStrategy(QueueStrategy):
       self._seq = itertools.count(len(rebuilt))
     recovered = len(recovered_entries)
     if recovered:
-      logger.info(
-        "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",
-        recovered,
-      )
+      try:
+        logger.info(
+          "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",
+          recovered,
+        )
+      except BaseException:
+        pass

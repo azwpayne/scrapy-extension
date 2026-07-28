@@ -275,45 +275,60 @@ class RingBufferQueueStrategy(QueueStrategy):
     try:
       data = json.loads(state.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-      logger.warning(
-        "RingBufferQueueStrategy restore: corrupt snapshot (%s); starting clean.",
-        e,
-      )
+      try:
+        logger.warning(
+          "RingBufferQueueStrategy restore: corrupt snapshot (%s); starting clean.",
+          e,
+        )
+      except BaseException:
+        pass
       return
     if (
       not isinstance(data, dict)
       or data.get("strategy") != "ring_buffer"
       or data.get("version") != 1
     ):
-      logger.warning(
-        "RingBufferQueueStrategy restore: unknown snapshot format; starting clean."
-      )
+      try:
+        logger.warning(
+          "RingBufferQueueStrategy restore: unknown snapshot format; starting clean."
+        )
+      except BaseException:
+        pass
       return
     raw_items = data.get("items")
     if not isinstance(raw_items, list):
-      logger.warning(
-        "RingBufferQueueStrategy restore: snapshot 'items' not a list; starting clean."
-      )
+      try:
+        logger.warning(
+          "RingBufferQueueStrategy restore: snapshot 'items' not a list; starting clean."
+        )
+      except BaseException:
+        pass
       return
     decoded: list[bytes] = []
     for entry in raw_items:
       try:
         decoded.append(base64.b64decode(entry, validate=True))
       except (binascii.Error, TypeError, ValueError) as e:
-        logger.warning(
-          "RingBufferQueueStrategy restore: skipping malformed item (%s).", e
-        )
+        try:
+          logger.warning(
+            "RingBufferQueueStrategy restore: skipping malformed item (%s).", e
+          )
+        except BaseException:
+          pass
         continue
     # Truncate oldest if the snapshot carries more than capacity.
     if len(decoded) > self._capacity:
       dropped = len(decoded) - self._capacity
-      logger.warning(
-        "RingBufferQueueStrategy restore: snapshot had %d items, capacity=%d; "
-        "truncating the OLDEST %d item(s).",
-        len(decoded),
-        self._capacity,
-        dropped,
-      )
+      try:
+        logger.warning(
+          "RingBufferQueueStrategy restore: snapshot had %d items, capacity=%d; "
+          "truncating the OLDEST %d item(s).",
+          len(decoded),
+          self._capacity,
+          dropped,
+        )
+      except BaseException:
+        pass
       decoded = decoded[dropped:]
     with self._not_full:
       self._buffer.clear()
@@ -327,7 +342,10 @@ class RingBufferQueueStrategy(QueueStrategy):
       # pushers cannot miss the state transition.
       self._not_full.notify_all()
       if decoded:
-        logger.info(
-          "RingBufferQueueStrategy restore: recovered %d item(s) from snapshot.",
-          len(decoded),
-        )
+        try:
+          logger.info(
+            "RingBufferQueueStrategy restore: recovered %d item(s) from snapshot.",
+            len(decoded),
+          )
+        except BaseException:
+          pass

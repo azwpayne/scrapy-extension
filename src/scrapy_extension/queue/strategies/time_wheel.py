@@ -448,16 +448,22 @@ class TimeWheelQueueStrategy(QueueStrategy):
     """Warn about any held items being discarded at shutdown."""
     with self._state_lock:
       held = sum(len(slot) for slot in self._wheel) + len(self._overflow)
-      if held > 0:
+      for slot in self._wheel:
+        slot.clear()
+      self._overflow.clear()
+
+    if held > 0:
+      try:
         logger.warning(
           "TimeWheelQueueStrategy close: discarding %d held delayed item(s) "
           "from the in-process wheel + overflow; these are lost on close/restart "
           "(non-silent data loss).",
           held,
         )
-      for slot in self._wheel:
-        slot.clear()
-      self._overflow.clear()
+      except BaseException:
+        # State was detached under the lock; shutdown diagnostics must not
+        # replace that completed terminal transition.
+        pass
 
   # ------------------------------------------------------------------ snapshot/restore
 
@@ -526,27 +532,36 @@ class TimeWheelQueueStrategy(QueueStrategy):
     try:
       data = json.loads(state.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-      logger.warning(
-        "TimeWheelQueueStrategy restore: corrupt snapshot (%s); starting clean.",
-        e,
-      )
+      try:
+        logger.warning(
+          "TimeWheelQueueStrategy restore: corrupt snapshot (%s); starting clean.",
+          e,
+        )
+      except BaseException:
+        pass
       return
     if (
       not isinstance(data, dict)
       or data.get("strategy") != "time_wheel"
       or data.get("version") not in (1, 2)
     ):
-      logger.warning(
-        "TimeWheelQueueStrategy restore: unknown snapshot format; starting clean."
-      )
+      try:
+        logger.warning(
+          "TimeWheelQueueStrategy restore: unknown snapshot format; starting clean."
+        )
+      except BaseException:
+        pass
       return
     slots_flat = data.get("slots_flat")
     overflow_entries = data.get("overflow")
     if not isinstance(slots_flat, list) or not isinstance(overflow_entries, list):
-      logger.warning(
-        "TimeWheelQueueStrategy restore: snapshot collections must be lists; "
-        "starting clean."
-      )
+      try:
+        logger.warning(
+          "TimeWheelQueueStrategy restore: snapshot collections must be lists; "
+          "starting clean."
+        )
+      except BaseException:
+        pass
       return
     version = int(data["version"])
     with self._state_lock:
@@ -562,11 +577,14 @@ class TimeWheelQueueStrategy(QueueStrategy):
             raise ValueError("wall clock is not finite")
           downtime = max(0.0, current_wall_time - snapshot_wall_time)
         except (KeyError, TypeError, ValueError) as e:
-          logger.warning(
-            "TimeWheelQueueStrategy restore: invalid v2 clock metadata (%s); "
-            "starting clean.",
-            e,
-          )
+          try:
+            logger.warning(
+              "TimeWheelQueueStrategy restore: invalid v2 clock metadata (%s); "
+              "starting clean.",
+              e,
+            )
+          except BaseException:
+            pass
           return
 
       def restored_timing(entry: dict[str, Any]) -> tuple[float, float]:
@@ -598,10 +616,13 @@ class TimeWheelQueueStrategy(QueueStrategy):
             raise ValueError("priority is not finite")
           ready_at, original_deadline = restored_timing(entry)
         except (KeyError, TypeError, ValueError, binascii.Error) as e:
-          logger.warning(
-            "TimeWheelQueueStrategy restore: skipping malformed wheel entry (%s).",
-            e,
-          )
+          try:
+            logger.warning(
+              "TimeWheelQueueStrategy restore: skipping malformed wheel entry (%s).",
+              e,
+            )
+          except BaseException:
+            pass
           continue
         staged.append((ready_at, original_deadline, entry_order, item, priority))
       for entry in overflow_entries:
@@ -614,10 +635,13 @@ class TimeWheelQueueStrategy(QueueStrategy):
           if not math.isfinite(priority):
             raise ValueError("priority is not finite")
         except (KeyError, TypeError, ValueError, binascii.Error) as e:
-          logger.warning(
-            "TimeWheelQueueStrategy restore: skipping malformed overflow entry (%s).",
-            e,
-          )
+          try:
+            logger.warning(
+              "TimeWheelQueueStrategy restore: skipping malformed overflow entry (%s).",
+              e,
+            )
+          except BaseException:
+            pass
           continue
         staged.append((ready_at, original_deadline, entry_order, item, priority))
 
@@ -654,7 +678,10 @@ class TimeWheelQueueStrategy(QueueStrategy):
       self._last_tick = self._tick_at(now)
       recovered = len(staged)
     if recovered:
-      logger.info(
-        "TimeWheelQueueStrategy restore: recovered %d held item(s) from snapshot.",
-        recovered,
-      )
+      try:
+        logger.info(
+          "TimeWheelQueueStrategy restore: recovered %d held item(s) from snapshot.",
+          recovered,
+        )
+      except BaseException:
+        pass

@@ -13,6 +13,8 @@ import json
 import logging
 from unittest.mock import MagicMock
 
+import pytest
+
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
 
@@ -47,6 +49,33 @@ def test_timewheel_close_silent_when_empty(caplog):
   with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.strategies.time_wheel"):
     s.close()
   assert not caplog.records
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("warning handler failed"),
+    KeyboardInterrupt("warning handler interrupted"),
+    SystemExit("warning handler exited"),
+  ],
+)
+def test_timewheel_close_clears_all_held_state_when_warning_handler_fails(
+  mocker, diagnostic_error
+):
+  """R126: a diagnostic handler cannot interrupt the terminal clear."""
+  s = _timewheel(clock_value=100.0)
+  s.push("q", b"wheel", delay=10.0)
+  s.push("q", b"overflow", delay=200.0)
+  warning = mocker.patch(
+    "scrapy_extension.queue.strategies.time_wheel.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  s.close()
+
+  assert all(not slot for slot in s._wheel)
+  assert s._overflow == []
+  warning.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

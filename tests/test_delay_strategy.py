@@ -116,6 +116,32 @@ class TestDelayQueueStrategy:
     assert warnings == []
 
   @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning handler failed"),
+      KeyboardInterrupt("warning handler interrupted"),
+      SystemExit("warning handler exited"),
+    ],
+  )
+  def test_close_clears_held_items_when_warning_handler_fails(
+    self, mock_connection_manager, mocker, diagnostic_error
+  ) -> None:
+    """R126: diagnostic failures cannot prevent the close state transition."""
+    strat = DelayQueueStrategy(
+      mock_connection_manager, default_delay=10.0, clock=lambda: 100.0
+    )
+    strat.push("q", b"held")
+    warning = mocker.patch(
+      "scrapy_extension.queue.strategies.delay.logger.warning",
+      side_effect=diagnostic_error,
+    )
+
+    strat.close()
+
+    assert strat._holding == []
+    warning.assert_called_once()
+
+  @pytest.mark.parametrize(
     "default_delay",
     [True, -0.01, -1.0, float("nan"), float("inf"), float("-inf")],
   )
