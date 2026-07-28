@@ -220,6 +220,37 @@ def test_publish_failure_keeps_primary_error_when_candidate_close_is_interrupted
   assert backend.is_connected() is False
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging failed"),
+    KeyboardInterrupt("logging interrupted"),
+    SystemExit("logging exited"),
+  ],
+)
+def test_post_publish_diagnostic_failure_preserves_live_generation(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """Success logging cannot undo a DynamoDB generation already made live."""
+  backend = _backend()
+  resource, table = _resource(mocker)
+  _patch_resource(mocker, return_value=resource)
+  debug = mocker.patch.object(
+    dynamodb_module.logger, "debug", side_effect=diagnostic_error
+  )
+
+  backend.connect()
+
+  assert backend._generation is not None
+  assert backend._generation.resource is resource
+  assert backend._generation.table is table
+  assert backend._resource is resource
+  assert backend._table is table
+  assert backend.is_connected() is True
+  resource.meta.client.close.assert_not_called()
+  debug.assert_called_once_with("Connected to DynamoDB table %s", "scrapy-extension")
+
+
 def test_disconnect_suppresses_ordinary_close_diagnostic_interrupt(
   mocker,
 ) -> None:

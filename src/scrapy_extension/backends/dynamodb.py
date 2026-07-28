@@ -579,7 +579,13 @@ class DynamoDBBackend(Backend, StorageBackend):
       if not publish:
         self._close_resource(candidate.resource)
         return
-      logger.debug("Connected to DynamoDB table %s", snapshot.table_name)
+      # Publication is the lifecycle linearization point. A success-only
+      # diagnostic handler is outside that transaction: it must not make
+      # connect() report a false failure or retire the now-live generation.
+      try:
+        logger.debug("Connected to DynamoDB table %s", snapshot.table_name)
+      except BaseException:
+        pass
 
   def disconnect(self) -> None:
     """Fence connect intents, drain operations, and close the retired client."""
