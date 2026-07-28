@@ -358,34 +358,62 @@ class BatchedStorageStrategy(StorageStrategy):
         # KeyboardInterrupt/SystemExit the caller still receives the control
         # signal, but the unattempted tail must not have been silently lost.
         # At-least-once: no silent loss.
-        tail = batch[i:]
-        with self._lock:
-          # New items may have been appended between the snapshot and the
-          # failure — preserve them by extending the tail with current buffer.
-          tail.extend(self._buffer)
-          self._buffer = tail
-          # Re-enqueued tail's oldest is approximately now (per-item
-          # timestamps aren't tracked) — conservative for the age-flusher so
-          # it gives the retried tail a fresh age budget.
-          if self._buffer:
-            self._oldest_ts = time.monotonic()
-          requeued_depth = len(self._buffer)
-        logger.warning(
-          "batched flush partial: %d/%d items written, %d re-enqueued",
-          i,
-          len(batch),
-          len(batch) - i,
-        )
-        self._emit_buffer_depth(requeued_depth)
+        requeued_depth = self._requeue_tail(batch[i:])
+        try:
+          logger.warning(
+            "batched flush partial: %d/%d items written, %d re-enqueued",
+            i,
+            len(batch),
+            len(batch) - i,
+          )
+        except BaseException:
+          # Recovery diagnostics must not replace the backend failure after
+          # its retry tail is safely restored.
+          pass
+        try:
+          self._emit_buffer_depth(requeued_depth)
+        except BaseException:
+          # This telemetry follows safe requeue while the backend failure is
+          # active; neither monitor nor diagnostic code may replace it.
+          pass
         raise
       try:
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - persistence already succeeded
-        logger.debug("on_store hook raised", exc_info=True)
+        try:
+          logger.debug("on_store hook raised", exc_info=True)
+        except BaseException:
+          # A diagnostic handler cannot be allowed to interrupt the remaining
+          # snapshot after the monitor's ordinary failure was intentionally
+          # ignored.
+          pass
+      except BaseException:
+        # This item is already durable, but its remaining snapshot tail has
+        # not yet been attempted.  Preserve precisely that tail before
+        # honoring a control exception from the monitor.  Do not requeue the
+        # current item: retrying it would convert a successful write into an
+        # avoidable duplicate.
+        if i + 1 < len(batch):
+          self._requeue_tail(batch[i + 1 :])
+        raise
     if batch:
       with self._lock:
         remaining_depth = len(self._buffer)
       self._emit_buffer_depth(remaining_depth)
+
+  def _requeue_tail(self, tail: list[_BufferedEntry]) -> int:
+    """Prepend an unattempted snapshot tail without changing entry identity."""
+    with self._lock:
+      # New items may have been appended between the snapshot and a failure —
+      # preserve them after the earlier snapshot tail.  ``tail`` contains the
+      # original entry tuples, so each carries its exact backend capability.
+      tail.extend(self._buffer)
+      self._buffer = tail
+      # Re-enqueued tail's oldest is approximately now (per-item timestamps
+      # aren't tracked), giving retries a fresh conservative age budget.
+      if self._buffer:
+        self._oldest_ts = time.monotonic()
+      return len(self._buffer)
 
   def _ensure_flusher(self) -> None:
     """Start the age-based background flusher (Risk 2), exactly once.

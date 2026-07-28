@@ -701,6 +701,71 @@ class TestBatchedStoragePartialFailure:
     assert attempts == ["k1", "k2", "k2", "k3"]
     assert strat.pending == 0
 
+  def test_on_store_keyboard_interrupt_requeues_only_unreported_tail(self, mocker) -> None:
+    """A post-write control signal must retain the exact unreported tail.
+
+    ``k2`` has already reached durable storage when its monitor callback is
+    interrupted, so retrying it would create an avoidable duplicate.  ``k3``
+    has not been attempted and must remain retryable with its original backend
+    capability.
+    """
+    backend = mocker.Mock()
+    monitor = mocker.Mock()
+
+    def interrupt_second_notification(key: str) -> None:
+      if key == "k2":
+        raise KeyboardInterrupt("stop after k2 persisted")
+
+    monitor.on_store.side_effect = interrupt_second_notification
+    strat = BatchedStorageStrategy(threshold=3, monitor=monitor)
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+
+    with pytest.raises(KeyboardInterrupt, match="stop after k2 persisted"):
+      strat.store(backend, "k3", b"v3")
+
+    assert strat.pending == 1
+    tail_backend, tail_key, tail_value, tail_ttl = strat._buffer[0]
+    assert tail_backend is backend
+    assert (tail_key, tail_value, tail_ttl) == ("k3", b"v3", None)
+
+    monitor.on_store.side_effect = None
+    strat.flush()
+
+    assert [call.args[0] for call in backend.store.call_args_list] == [
+      "k1",
+      "k2",
+      "k3",
+    ]
+    assert strat.pending == 0
+
+  def test_backend_primary_survives_warning_and_depth_control_errors(self, mocker) -> None:
+    """Recovery diagnostics must not replace the causal backend exception."""
+    backend = mocker.Mock()
+    backend.store.side_effect = RuntimeError("backend down")
+    monitor = mocker.Mock()
+
+    def interrupt_requeue_depth(depth: int) -> None:
+      # The second threshold store emits depth=2 before persistence.  Raise
+      # only during the recovery depth emission, after backend.store failed.
+      if depth == 2 and backend.store.call_count:
+        raise SystemExit("monitor must not mask backend failure")
+
+    monitor.on_buffer_depth.side_effect = interrupt_requeue_depth
+    strat = BatchedStorageStrategy(threshold=2, monitor=monitor)
+    strat.store(backend, "k1", b"v1")
+    mocker.patch.object(
+      batched_module.logger,
+      "warning",
+      side_effect=KeyboardInterrupt("warning must not mask backend failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="backend down"):
+      strat.store(backend, "k2", b"v2")
+
+    assert strat.pending == 2
+    assert all(entry[0] is backend for entry in strat._buffer)
+
   def test_threshold_flush_failure_propagates_without_losing_buffer(self, mocker) -> None:
     """Sustained failure stays retryable while remaining visible to callers."""
     backend = mocker.Mock()
