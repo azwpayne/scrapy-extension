@@ -91,6 +91,34 @@ class TestMemcachedConnect:
     client.stats.assert_called_once()
     assert b.is_connected() is True
 
+  def test_connect_keeps_remote_client_live_when_warning_interrupts(
+    self, mocker
+  ) -> None:
+    backend = _make_backend(host="cache.internal", allow_remote_plaintext=True)
+    client = mocker.MagicMock(name="client")
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    mocker.patch.object(memcached_mod.logger, "warning", side_effect=KeyboardInterrupt)
+
+    backend.connect()
+
+    assert backend.is_connected() is True
+    assert backend._client is client
+    client.close.assert_not_called()
+
+  def test_connect_keeps_loopback_client_live_when_debug_interrupts(
+    self, mocker
+  ) -> None:
+    backend = _make_backend()
+    client = mocker.MagicMock(name="client")
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    mocker.patch.object(memcached_mod.logger, "debug", side_effect=KeyboardInterrupt)
+
+    backend.connect()
+
+    assert backend.is_connected() is True
+    assert backend._client is client
+    client.close.assert_not_called()
+
   def test_connect_is_idempotent_while_connected(self, mocker) -> None:
     b, client = _connected(mocker)
 

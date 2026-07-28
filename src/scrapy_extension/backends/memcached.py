@@ -175,15 +175,23 @@ class MemcachedBackend(Backend, StorageBackend):
           candidate.close()
         return
       if not is_memcached_loopback(snapshot.host):
-        logger.warning(
-          "Remote Memcached plaintext was explicitly enabled for %s:%d; "
-          "use only an isolated trusted network.",
-          snapshot.host,
-          snapshot.port,
+        # The client is already live. Diagnostics must not make a successful
+        # connect appear to fail or cause callers to roll back this generation.
+        try:
+          logger.warning(
+            "Remote Memcached plaintext was explicitly enabled for %s:%d; "
+            "use only an isolated trusted network.",
+            snapshot.host,
+            snapshot.port,
+          )
+        except BaseException:
+          pass
+      try:
+        logger.debug(
+          "Connected to Memcached at %s:%s", snapshot.host, snapshot.port
         )
-      logger.debug(
-        "Connected to Memcached at %s:%s", snapshot.host, snapshot.port
-      )
+      except BaseException:
+        pass
 
   def disconnect(self) -> None:
     """Close the Memcached client."""
