@@ -361,6 +361,42 @@ class TestKafkaBackendConnect:
     assert backend._producer is None
     assert backend._admin_client is None
 
+  def test_failed_connect_ignores_abort_diagnostic_control_error_and_closes_siblings(
+    self, mocker
+  ):
+    """Abort diagnostics cannot replace the causal connect interrupt.
+
+    An ordinary producer-close error is diagnostic-only.  If a custom logging
+    handler raises while reporting it, teardown must still offer ``close()`` to
+    the admin sibling and re-raise the original failed-connect interrupt.
+    """
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    connect_error = KeyboardInterrupt("connect interrupted")
+    producer.close.side_effect = RuntimeError("producer close failed")
+
+    def fail_after_assigning_both_clients() -> None:
+      backend._producer = producer
+      backend._admin_client = admin
+      raise connect_error
+
+    mocker.patch.object(
+      backend, "_connect_standalone", side_effect=fail_after_assigning_both_clients
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.logger.debug", side_effect=SystemExit("log")
+    )
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      backend.connect()
+
+    assert exc_info.value is connect_error
+    producer.close.assert_called_once_with()
+    admin.close.assert_called_once_with()
+    assert backend._producer is None
+    assert backend._admin_client is None
+
   def test_residual_cleanup_control_error_does_not_prevent_new_generation(
     self, mocker
   ):

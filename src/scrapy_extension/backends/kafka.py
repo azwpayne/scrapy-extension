@@ -438,7 +438,15 @@ class KafkaBackend(Backend, QueueBackend):
         try:
           closer.close()
         except Exception:
-          logger.debug("Failed to abort partial Kafka client", exc_info=True)
+          # A logging handler is application code and may itself raise a
+          # process-control exception.  This abort path is used while a
+          # connect failure is already in flight, so diagnostics must not
+          # interrupt teardown of the remaining detached sibling or replace
+          # that causal failure.
+          try:
+            logger.debug("Failed to abort partial Kafka client", exc_info=True)
+          except BaseException:
+            pass
         except BaseException as error:
           if primary_error is None:
             primary_error = error
