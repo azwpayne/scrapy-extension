@@ -367,13 +367,23 @@ class _BackendDownloadFailureErrback:
     """Attach one commit-tracking child without overwriting another delivery."""
     existing = replacement.meta.get(BACKEND_ACK_TOKEN_META_KEY)
     if existing is not None and existing is not source_token:
-      logger.error(
-        "Errback replacement already carries a different backend ack token; "
-        "nacking the source instead of overwriting either delivery"
-      )
-      if self.scheduler.stats:
-        self.scheduler.stats.inc_value("scheduler/ack_transfer_conflict")
+      # The replacement owns another live delivery, so source settlement is
+      # already decided: nack it before emitting best-effort diagnostics.
+      # A logging handler or stats collector can raise BaseException; neither
+      # may leave the deferred source group pending and later ackable.
       group.abort()
+      try:
+        logger.error(
+          "Errback replacement already carries a different backend ack token; "
+          "nacking the source instead of overwriting either delivery"
+        )
+      except BaseException:
+        pass
+      if self.scheduler.stats:
+        try:
+          self.scheduler.stats.inc_value("scheduler/ack_transfer_conflict")
+        except BaseException:
+          pass
       return
     child = group.new_child()
     if child is not None:
@@ -1309,7 +1319,13 @@ class BackendScheduler:
       self._backpressure_paused = False
       self._backpressure_probe_due = False
       self._lifecycle_state = _LIFECYCLE_OPEN
-      logger.info("Scheduler opened for spider %s", spider.name)
+      # OPEN is the lifecycle linearization point. Success telemetry is
+      # observational and must not make a fully published scheduler appear to
+      # have failed when a custom logging handler raises BaseException.
+      try:
+        logger.info("Scheduler opened for spider %s", spider.name)
+      except BaseException:
+        pass
       return None
 
   def _connect_ack_signals(self, spider: Spider) -> None:

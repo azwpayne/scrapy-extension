@@ -143,6 +143,52 @@ class _SelfDrainingQueue(_LenControllableQueue):
     return request
 
 
+@pytest.mark.parametrize(
+  ("diagnostic", "diagnostic_error"),
+  [
+    ("logger", RuntimeError("logger unavailable")),
+    ("logger", KeyboardInterrupt("logger interrupted")),
+    ("logger", SystemExit("logger exited")),
+    ("stats", RuntimeError("stats unavailable")),
+    ("stats", KeyboardInterrupt("stats interrupted")),
+    ("stats", SystemExit("stats exited")),
+  ],
+)
+def test_errback_replacement_token_conflict_nacks_source_before_diagnostics(
+  mocker, diagnostic: str, diagnostic_error: BaseException
+) -> None:
+  """R117: telemetry cannot leave a conflicting source ack group unsettled."""
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    stats=MagicMock(name="Stats"),
+  )
+  queue = MagicMock(name="BackendQueue")
+  scheduler._queue = queue
+  source = Request(
+    "https://example.com/source",
+    meta={"_backend_ack_token": "source-token"},
+  )
+  replacement = Request(
+    "https://example.com/replacement",
+    meta={"_backend_ack_token": "replacement-token"},
+  )
+  wrapper = scheduler_module._BackendDownloadFailureErrback(scheduler, None)
+
+  if diagnostic == "logger":
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.logger.error",
+      side_effect=diagnostic_error,
+    )
+  else:
+    scheduler.stats.inc_value.side_effect = diagnostic_error
+
+  assert wrapper._transfer_request(source, replacement) is replacement
+
+  queue.nack.assert_called_once_with(token="source-token")
+  assert "_backend_ack_token" not in source.meta
+  assert replacement.meta["_backend_ack_token"] == "replacement-token"
+
+
 class _SameRequestReentrantMonitor(Monitor):
   """Re-enter one miss with the exact Request whose push has not run yet."""
 

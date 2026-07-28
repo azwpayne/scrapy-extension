@@ -738,3 +738,72 @@ class TestSnapshotRestore:
     monitor.reset_mock()
     strat.clear("q")
     monitor.on_delay_depth.assert_called_once_with(0)
+
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logger extension failed"),
+      KeyboardInterrupt("logger interrupted"),
+      SystemExit("logger exited"),
+    ],
+  )
+  @pytest.mark.parametrize(
+    "site",
+    ["push", "prepared-push", "soft-cap", "drain", "clear"],
+  )
+  def test_fallback_diagnostic_failure_preserves_completed_delay_state(
+    self,
+    mock_connection_manager,
+    mocker,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    diagnostic_error: BaseException,
+  ) -> None:
+    """R119: fallback diagnostics cannot falsify completed heap transitions.
+
+    Direct monitor control-flow exceptions remain observable: every branch
+    below first injects an ordinary monitor failure, then proves that only the
+    subsequent best-effort logger failure is isolated.
+    """
+    import scrapy_extension.queue.strategies.delay as delay_module
+
+    now = [100.0]
+    monitor = mocker.Mock()
+    strategy = DelayQueueStrategy(
+      mock_connection_manager,
+      default_delay=10.0,
+      max_held=1,
+      clock=_clock(now),
+      monitor=monitor,
+    )
+
+    if site == "soft-cap":
+      monkeypatch.setattr(delay_module, "_over_cap_warned", False)
+      mocker.patch.object(delay_module.logger, "warning", side_effect=diagnostic_error)
+      strategy.push("q", b"first")
+      strategy.push("q", b"second")
+      assert [entry[2] for entry in strategy._holding] == [b"first", b"second"]
+      assert delay_module._over_cap_warned is True
+      return
+
+    strategy.push("q", b"held")
+    monitor.on_delay_depth.side_effect = RuntimeError("monitor failed")
+    mocker.patch.object(delay_module.logger, "debug", side_effect=diagnostic_error)
+
+    if site == "push":
+      strategy.push("q", b"pushed")
+      assert [entry[2] for entry in strategy._holding] == [b"held", b"pushed"]
+    elif site == "prepared-push":
+      strategy._prepare_push("q", delay=10.0).commit(b"prepared")
+      assert [entry[2] for entry in strategy._holding] == [b"held", b"prepared"]
+    elif site == "drain":
+      now[0] = 110.0
+      strategy._drain_ready("q")
+      assert strategy._holding == []
+      mock_connection_manager.get_queue_backend().push.assert_called_once_with(
+        "q", b"held", 0.0
+      )
+    else:
+      strategy.clear("q")
+      assert strategy._holding == []
+      mock_connection_manager.get_queue_backend().clear_queue.assert_called_once_with("q")

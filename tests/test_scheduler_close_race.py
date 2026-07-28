@@ -39,6 +39,7 @@ from unittest.mock import ANY, call
 import pytest
 from scrapy.http import Request
 
+from scrapy_extension.schedule import scheduler as scheduler_module
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -91,6 +92,36 @@ def _make_from_crawler_scheduler_with_dupefilter(mocker):
 
 class TestOwnedDupeFilterLifecycle:
   """A scheduler-created dupefilter follows the scheduler's lifecycle."""
+
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logger unavailable"),
+      KeyboardInterrupt("logger interrupted"),
+      SystemExit("logger exited"),
+    ],
+  )
+  def test_open_success_diagnostic_interruption_preserves_open_state(
+    self, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """R117: post-publication success logging cannot roll back OPEN state."""
+    manager = mocker.MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(connection_manager=manager, queue_key="test:queue")
+    spider = mocker.MagicMock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.MagicMock()
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.logger.info",
+      side_effect=diagnostic_error,
+    )
+
+    assert scheduler.open(spider) is None
+
+    assert scheduler._lifecycle_state == scheduler_module._LIFECYCLE_OPEN
+    assert scheduler._queue is not None
+    assert scheduler.open(spider) is None
+    scheduler.close("finished")
+    manager.close.assert_called_once_with()
 
   def test_open_opens_owned_dupefilter_with_spider(self, mocker):
     scheduler, dupefilter, _ = _make_from_crawler_scheduler_with_dupefilter(mocker)

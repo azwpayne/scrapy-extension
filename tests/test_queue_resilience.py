@@ -24,6 +24,7 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 from scrapy.http import Request
 
 from scrapy_extension.backends.base import _QueuePushReceipt
@@ -329,6 +330,55 @@ def test_push_survives_monitor_failure_after_enqueue() -> None:
   bq.push(Request("https://example.com"))
 
   qb.push.assert_called_once()
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
+)
+def test_committed_replacement_survives_ack_failure_logger_diagnostic(
+  mocker: MockerFixture, diagnostic_error: BaseException
+) -> None:
+  """A logger handler cannot reject a replacement already committed durably."""
+  qb = MagicMock(name="QueueBackend")
+  qb.ack.side_effect = RuntimeError("source ack boom")
+  bq = BackendQueue(connection_manager=_cm(queue_backend=qb), queue_name="q")
+  request = Request(
+    "https://example.com/retry", meta={"_backend_ack_token": "old-token"}
+  )
+  mocker.patch(
+    "scrapy_extension.queue.queue.logger.exception", side_effect=diagnostic_error
+  )
+
+  bq.push(request)
+
+  qb.push.assert_called_once()
+  qb.ack.assert_called_once_with("q", token="old-token")
+  assert request.meta["_backend_ack_token"] == "old-token"
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
+)
+def test_push_survives_monitor_failure_logger_diagnostic(
+  mocker: MockerFixture, diagnostic_error: BaseException
+) -> None:
+  """Fallback debug failures cannot reject an enqueue already committed."""
+  qb = MagicMock(name="QueueBackend")
+  monitor = MagicMock()
+  monitor.on_push.side_effect = RuntimeError("push monitor boom")
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb), queue_name="q", monitor=monitor
+  )
+  mocker.patch(
+    "scrapy_extension.queue.queue.logger.debug", side_effect=diagnostic_error
+  )
+
+  bq.push(Request("https://example.com"))
+
+  qb.push.assert_called_once()
+  monitor.on_push.assert_called_once_with("q", 0.0)
 
 
 def test_pop_survives_monitor_failure_after_atomic_pop() -> None:

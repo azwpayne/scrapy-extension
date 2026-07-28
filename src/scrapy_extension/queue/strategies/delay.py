@@ -205,7 +205,12 @@ class DelayQueueStrategy(QueueStrategy):
     try:
       self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 — monitor must never crash push
-      logger.debug("on_delay_depth hook raised", exc_info=True)
+      try:
+        logger.debug("on_delay_depth hook raised", exc_info=True)
+      except BaseException:
+        # This is fallback telemetry after the held item is already published.
+        # A diagnostic handler must not turn the successful push into a failure.
+        pass
     self._warn_over_cap_once(held)
 
   def is_push_durable(self, *, delay: float, source: str) -> bool:
@@ -260,7 +265,12 @@ class DelayQueueStrategy(QueueStrategy):
       try:
         self._monitor.on_delay_depth(held)
       except Exception:  # noqa: BLE001 — monitor must never crash push
-        logger.debug("on_delay_depth hook raised", exc_info=True)
+        try:
+          logger.debug("on_delay_depth hook raised", exc_info=True)
+        except BaseException:
+          # This is fallback telemetry after the held item is already published.
+          # A diagnostic handler must not turn the successful push into a failure.
+          pass
       self._warn_over_cap_once(held)
 
     return _PreparedQueuePush.local(
@@ -288,16 +298,21 @@ class DelayQueueStrategy(QueueStrategy):
       if _over_cap_warned:
         return
       _over_cap_warned = True
-    logger.warning(
-      "DelayQueueStrategy holding heap exceeded max_held=%d items "
-      "(now=%d). The in-process heap grows unboundedly when push-rate "
-      "outpaces ready-rate; long bursts of long-delay items can exhaust "
-      "memory. This is a SOFT cap — items are NOT dropped. Raise "
-      "max_held, drain sooner, or wait for distributed-delay support "
-      "(roadmap U10).",
-      self._max_held,
-      held,
-    )
+    try:
+      logger.warning(
+        "DelayQueueStrategy holding heap exceeded max_held=%d items "
+        "(now=%d). The in-process heap grows unboundedly when push-rate "
+        "outpaces ready-rate; long bursts of long-delay items can exhaust "
+        "memory. This is a SOFT cap — items are NOT dropped. Raise "
+        "max_held, drain sooner, or wait for distributed-delay support "
+        "(roadmap U10).",
+        self._max_held,
+        held,
+      )
+    except BaseException:
+      # The held item is already published and the soft-cap flag is already
+      # recorded. This warning is observability only, never a refusal signal.
+      pass
 
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Drain due held items, then pop the live queue.
@@ -405,7 +420,12 @@ class DelayQueueStrategy(QueueStrategy):
     try:
       self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 - monitor must not break the drain path
-      logger.debug("on_delay_depth hook raised", exc_info=True)
+      try:
+        logger.debug("on_delay_depth hook raised", exc_info=True)
+      except BaseException:
+        # The held-to-live transfer already completed; fallback telemetry must
+        # not report that successful drain as a failure.
+        pass
 
   def queue_len(self, queue_name: str) -> int:
     """Return live-queue length plus held-item count.
@@ -440,7 +460,11 @@ class DelayQueueStrategy(QueueStrategy):
     try:
       self._monitor.on_delay_depth(0)
     except Exception:  # noqa: BLE001 - monitor must not break clear()
-      logger.debug("on_delay_depth hook raised", exc_info=True)
+      try:
+        logger.debug("on_delay_depth hook raised", exc_info=True)
+      except BaseException:
+        # The explicit clear already completed; fallback telemetry is best effort.
+        pass
 
   def close(self) -> None:
     """Release resources, warning about any held (delayed) items.

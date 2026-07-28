@@ -499,17 +499,27 @@ class BackendQueue:
         # carrying its own token is durably handed off again before that token
         # is acked; this can replay work but cannot lose the source delivery.
         self._inc_stat("scheduler/ack_error")
-        logger.exception(
-          "Failed to acknowledge source delivery after replacement committed "
-          "to queue %r",
-          self.queue_name,
-        )
+        # The replacement commit is already visible. A broken logging handler
+        # must not reclassify that committed enqueue as a failed push.
+        try:
+          logger.exception(
+            "Failed to acknowledge source delivery after replacement committed "
+            "to queue %r",
+            self.queue_name,
+          )
+        except BaseException:
+          pass
       else:
         request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
     try:
       self._monitor.on_push(self.queue_name, priority)
     except Exception:  # noqa: BLE001 - enqueue has already committed
-      logger.debug("monitor.on_push raised; ignored", exc_info=True)
+      # Keep the monitor's ordinary failure swallowed even when its fallback
+      # diagnostic handler raises a control-flow exception.
+      try:
+        logger.debug("monitor.on_push raised; ignored", exc_info=True)
+      except BaseException:
+        pass
     return push_is_durable
 
   def pop(self, timeout: float = 0.0) -> Request | None:
