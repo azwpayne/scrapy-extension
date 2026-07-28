@@ -442,11 +442,17 @@ class PulsarBackend(Backend, QueueBackend):
         published_generation = self._lifecycle_generation
         self._client = client
         self._connection_snapshot = snapshot
-      logger.debug(
-        "Connected to Pulsar at %s (%s)",
-        snapshot.service_url,
-        snapshot.mode.value,
-      )
+      # Publication above is the linearization point for this generation.
+      # This message is only telemetry: a custom log handler must not turn a
+      # completed connection into a failed one, nor abort its live client.
+      try:
+        logger.debug(
+          "Connected to Pulsar at %s (%s)",
+          snapshot.service_url,
+          snapshot.mode.value,
+        )
+      except BaseException:
+        pass
     except ConfigurationError:
       raise
     except Exception:
@@ -455,10 +461,11 @@ class PulsarBackend(Backend, QueueBackend):
         "Failed to connect to Pulsar.", backend_type="pulsar"
       ) from None
     except BaseException:
-      # R18-B/R72: a Ctrl+C/SystemExit after ``pulsar.Client(...)`` returns (the
-      # C++ binding starts background IO/service threads in its constructor), or
-      # after publication from a user-installed logging handler, must not leak a
-      # client generation.  Cleanup never masks the original control signal.
+      # R18-B/R106: a Ctrl+C/SystemExit after ``pulsar.Client(...)`` returns
+      # (the C++ binding starts background IO/service threads in its
+      # constructor) but before publication must not leak a private candidate.
+      # Pure post-publication diagnostics are isolated above, so they never
+      # enter this abort path. Cleanup never masks the original control signal.
       self._abort_failed_connect(client, published_generation)
       raise
 
@@ -467,11 +474,12 @@ class PulsarBackend(Backend, QueueBackend):
   ) -> None:
     """Detach and best-effort close only this failed connect generation.
 
-    A normal connection failure commonly happens before publication.  Less
-    obvious extension points (notably logging handlers) can fail after the
-    client, snapshot, and generation have become visible.  In that case detach
-    only when both the client object and generation still match: a concurrent
-    disconnect/reconnect may already own and have replaced the old client.
+    A normal connection failure commonly happens before publication.  The
+    guarded published-generation branch remains for non-diagnostic failures
+    in or around publication: detach only when both the client object and
+    generation still match, because a concurrent disconnect/reconnect may
+    already own and have replaced the old client. Pure post-publication
+    telemetry is isolated by :meth:`connect` and must not reach this helper.
     Cleanup intentionally swallows *all* exceptions, including control-flow
     exceptions from driver ``close()``, because this helper runs while another
     connection failure is already propagating.

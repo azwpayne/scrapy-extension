@@ -108,74 +108,31 @@ class TestPulsarConnect:
       b.connect()
     assert b.is_connected() is False
 
-  def test_post_publish_logger_failure_rolls_back_live_client(self, mocker) -> None:
-    """R72: a logging extension cannot leave a zombie client generation."""
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [RuntimeError("logger extension failed"), KeyboardInterrupt(), SystemExit()],
+  )
+  def test_post_publish_logger_failure_keeps_live_client(
+    self, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """R106: post-publication diagnostics cannot abort a live generation."""
     b = _make_backend()
     client = mocker.MagicMock(name="candidate")
     mocker.patch.object(pulsar, "Client", return_value=client)
     mocker.patch(
       "scrapy_extension.backends.pulsar.logger.debug",
-      side_effect=RuntimeError("logger extension failed"),
+      side_effect=diagnostic_error,
     )
 
-    with pytest.raises(BackendConnectionError):
-      b.connect()
+    b.connect()
 
-    assert b._client is None
-    assert b._connection_snapshot is None
-    assert b._lifecycle_generation == 2
-    client.close.assert_called_once_with()
-
-  def test_post_publish_control_failure_preserves_primary_over_close_error(
-    self, mocker
-  ) -> None:
-    """R72: candidate cleanup never masks the logging control-flow failure."""
-    b = _make_backend()
-    client = mocker.MagicMock(name="candidate")
-    client.close.side_effect = SystemExit("close must not mask primary")
-    mocker.patch.object(pulsar, "Client", return_value=client)
-    mocker.patch(
-      "scrapy_extension.backends.pulsar.logger.debug",
-      side_effect=KeyboardInterrupt("primary logging failure"),
-    )
-
-    with pytest.raises(KeyboardInterrupt, match="primary logging failure"):
-      b.connect()
-
-    assert b._client is None
-    assert b._connection_snapshot is None
-    client.close.assert_called_once_with()
-
-  def test_failed_connect_cleanup_does_not_detach_replacement_generation(
-    self, mocker
-  ) -> None:
-    """R72: stale post-publication failure cleanup is guarded by identity."""
-    b = _make_backend()
-    old_client = mocker.MagicMock(name="old_client")
-    new_client = mocker.MagicMock(name="new_client")
-    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
-    calls = 0
-
-    def replace_then_fail(*_args, **_kwargs) -> None:
-      nonlocal calls
-      calls += 1
-      if calls == 1:
-        b.disconnect()
-        b.connect()
-        raise KeyboardInterrupt("primary logging failure")
-
-    mocker.patch(
-      "scrapy_extension.backends.pulsar.logger.debug",
-      side_effect=replace_then_fail,
-    )
-
-    with pytest.raises(KeyboardInterrupt, match="primary logging failure"):
-      b.connect()
-
-    assert b._client is new_client
+    assert b._client is client
     assert b._connection_snapshot is not None
-    old_client.close.assert_called_once_with()
-    new_client.close.assert_not_called()
+    assert b._lifecycle_generation == 1
+    client.close.assert_not_called()
+
+    b.disconnect()
+    client.close.assert_called_once_with()
 
   def test_connect_baseexception_after_client_build_closes_client(self, mocker) -> None:
     """R18-B: a Ctrl+C after pulsar.Client(...) but before publish closes the client.
