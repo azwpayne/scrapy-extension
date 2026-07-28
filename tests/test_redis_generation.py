@@ -168,6 +168,25 @@ def test_failed_candidate_closes_locally_and_retry_publishes_fresh_client(
   healthy.close.assert_not_called()
 
 
+def test_failed_candidate_cleanup_cannot_mask_ping_interrupt(mocker) -> None:
+  candidate = _client(mocker, "interrupted-candidate")
+  interrupt = KeyboardInterrupt()
+  candidate.ping.side_effect = interrupt
+  candidate.close.side_effect = SystemExit
+  mocker.patch("scrapy_extension.backends.redis.Redis", return_value=candidate)
+  backend = RedisBackend(RedisSettings())
+
+  with pytest.raises(KeyboardInterrupt) as exc_info:
+    backend.connect()
+
+  assert exc_info.value is interrupt
+  candidate.close.assert_called_once()
+  assert backend._generation is None
+  assert backend._client is None
+  assert backend._master_client is None
+  assert backend._sentinel is None
+
+
 def test_interrupted_candidate_publication_rolls_back_and_closes(mocker) -> None:
   interrupted = _client(mocker, "interrupted")
   healthy = _client(mocker, "healthy")

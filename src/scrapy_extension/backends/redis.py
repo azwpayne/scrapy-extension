@@ -584,7 +584,15 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return candidate
     except BaseException:
       if not published:
-        self._close_handles(client, master_client, sentinel)
+        # A failed, unpublished candidate has no externally observable
+        # ownership. Its cleanup must not replace the connection failure (in
+        # particular a process-control signal from the health check). Public
+        # disconnect deliberately retains _close_handles' BaseException
+        # behavior for an already published generation.
+        try:
+          self._close_handles(client, master_client, sentinel)
+        except BaseException:
+          pass
       raise
 
   def _connect_for_epoch(self, request_epoch: int) -> bool:
