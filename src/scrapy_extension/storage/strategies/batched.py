@@ -158,7 +158,14 @@ class BatchedStorageStrategy(StorageStrategy):
     try:
       self._monitor.on_buffer_depth(depth)
     except Exception:  # noqa: BLE001 - monitor must never crash storage
-      logger.debug("on_buffer_depth hook raised", exc_info=True)
+      try:
+        logger.debug("on_buffer_depth hook raised", exc_info=True)
+      except BaseException:
+        # This is only fallback diagnostics after an ordinary monitor failure.
+        # It must not interrupt a synchronous store or the age-flush daemon.
+        # A direct control exception from the monitor still bypasses the outer
+        # ``except Exception`` and remains observable to its caller.
+        pass
 
   def _emit_error(self, operation: str, error: Exception) -> None:
     """Publish an error without allowing telemetry to stop retry processing."""

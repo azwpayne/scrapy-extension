@@ -875,6 +875,22 @@ class TestBatchedStorageRisk2:
     strat.store(backend, "k", b"v")
     monitor.on_buffer_depth.assert_called_once_with(1)
 
+  def test_buffer_depth_monitor_control_exception_still_propagates(self, mocker) -> None:
+    """R100: direct monitor control exceptions retain their public meaning."""
+    from scrapy_extension.monitor.base import Monitor
+
+    backend = mocker.Mock()
+    monitor = mocker.Mock(spec=Monitor)
+    monitor.on_buffer_depth.side_effect = KeyboardInterrupt("stop store")
+    strat = BatchedStorageStrategy(threshold=10, monitor=monitor)
+
+    with pytest.raises(KeyboardInterrupt, match="stop store"):
+      strat.store(backend, "k", b"v")
+
+    # The item was buffered before telemetry ran, so a caller that handles the
+    # control signal can retry the persistence lifecycle without losing it.
+    assert strat.pending == 1
+
   def test_max_buffer_age_s_none_starts_no_flusher(self, mocker) -> None:
     """Disabled (None) → no background flusher thread (byte-identical to old)."""
     backend = mocker.Mock()
@@ -987,6 +1003,77 @@ class TestBatchedStorageRisk2:
     monitor.on_error.assert_called_once_with("store", failure)
     assert backend.store.call_count == 2
     assert strat.pending == 0
+
+  def test_age_flush_buffer_depth_fallback_debug_interrupt_keeps_two_cycles_alive(
+    self, monkeypatch, mocker
+  ) -> None:
+    """R100: fallback depth diagnostics cannot terminate the age-flusher."""
+    from scrapy_extension.monitor.base import Monitor
+
+    backend = mocker.Mock()
+    monitor = mocker.Mock(spec=Monitor)
+    monitor.on_buffer_depth.side_effect = RuntimeError("monitor down")
+    strat = BatchedStorageStrategy(
+      threshold=1000,
+      max_buffer_age_s=0.1,
+      monitor=monitor,
+    )
+    with strat._lock:
+      strat._buffer.append((backend, "k1", b"v1", None))
+      strat._oldest_ts = 0.0
+
+    def store_second_batch(key, _value, *, ttl=None):  # noqa: ARG001
+      if key == "k1":
+        with strat._lock:
+          strat._buffer.append((backend, "k2", b"v2", None))
+          strat._oldest_ts = 0.0
+
+    backend.store.side_effect = store_second_batch
+    stop = mocker.Mock()
+    stop.wait.side_effect = [False, False, True]
+    strat._stop = stop
+    monkeypatch.setattr(
+      batched_module.time,
+      "monotonic",
+      mocker.Mock(side_effect=[1.0, 1.0]),
+    )
+    mocker.patch.object(
+      batched_module.logger,
+      "debug",
+      side_effect=KeyboardInterrupt("fallback diagnostic interrupted"),
+    )
+
+    strat._age_flush_loop()
+
+    assert [call.args[0] for call in backend.store.call_args_list] == ["k1", "k2"]
+    assert strat.pending == 0
+
+  def test_age_flush_buffer_depth_monitor_control_exception_propagates(
+    self, monkeypatch, mocker
+  ) -> None:
+    """R100: direct buffer-depth control exceptions are not swallowed."""
+    from scrapy_extension.monitor.base import Monitor
+
+    backend = mocker.Mock()
+    monitor = mocker.Mock(spec=Monitor)
+    monitor.on_buffer_depth.side_effect = SystemExit("stop flusher")
+    strat = BatchedStorageStrategy(
+      threshold=1000,
+      max_buffer_age_s=0.1,
+      monitor=monitor,
+    )
+    with strat._lock:
+      strat._buffer.append((backend, "k", b"v", None))
+      strat._oldest_ts = 0.0
+    stop = mocker.Mock()
+    stop.wait.side_effect = [False]
+    strat._stop = stop
+    monkeypatch.setattr(batched_module.time, "monotonic", mocker.Mock(return_value=1.0))
+
+    with pytest.raises(SystemExit, match="stop flusher"):
+      strat._age_flush_loop()
+
+    backend.store.assert_called_once_with("k", b"v", ttl=None)
 
 
 class TestBatchedStorageFlusherTOCTOU:
