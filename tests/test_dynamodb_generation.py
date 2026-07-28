@@ -220,6 +220,49 @@ def test_publish_failure_keeps_primary_error_when_candidate_close_is_interrupted
   assert backend.is_connected() is False
 
 
+def test_disconnect_suppresses_ordinary_close_diagnostic_interrupt(
+  mocker,
+) -> None:
+  """A diagnostic interrupt cannot turn an ordinary close failure into one."""
+  backend = _backend()
+  resource, _table = _resource(mocker)
+  _patch_resource(mocker, return_value=resource)
+  backend.connect()
+  resource.meta.client.close.side_effect = RuntimeError("close failed")
+  debug = mocker.patch.object(
+    dynamodb_module.logger, "debug", side_effect=KeyboardInterrupt
+  )
+
+  backend.disconnect()
+
+  resource.meta.client.close.assert_called_once_with()
+  debug.assert_called_once_with("Suppressed DynamoDB resource close error: %s", mocker.ANY)
+  assert backend._generation is None
+  assert backend._resource is None
+  assert backend._table is None
+  assert backend.is_connected() is False
+
+
+def test_disconnect_propagates_direct_close_control_after_detach(mocker) -> None:
+  """A direct SDK control exception remains observable after state retirement."""
+  backend = _backend()
+  resource, _table = _resource(mocker)
+  _patch_resource(mocker, return_value=resource)
+  backend.connect()
+  interrupt = KeyboardInterrupt("close interrupted")
+  resource.meta.client.close.side_effect = interrupt
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    backend.disconnect()
+
+  assert raised.value is interrupt
+  resource.meta.client.close.assert_called_once_with()
+  assert backend._generation is None
+  assert backend._resource is None
+  assert backend._table is None
+  assert backend.is_connected() is False
+
+
 def test_concurrent_connect_is_single_flight_and_live_connect_is_idempotent(
   mocker,
 ) -> None:

@@ -257,7 +257,14 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       resource.meta.client.close()
     except Exception as exc:
-      logger.debug("Suppressed DynamoDB resource close error: %s", exc)
+      # Closing a retired resource is best-effort. A logging handler is also
+      # diagnostic-only here, so it cannot turn an ordinary close failure into
+      # a lifecycle control failure. Do not cover ``close()`` itself: direct
+      # KeyboardInterrupt/SystemExit remains observable to the caller.
+      try:
+        logger.debug("Suppressed DynamoDB resource close error: %s", exc)
+      except BaseException:
+        pass
 
   @classmethod
   def _close_aborted_resource(cls, resource: Any) -> None:
@@ -1001,5 +1008,11 @@ class _swallow:
     # delete_item (the operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    logger.debug("Suppressed dynamodb cleanup error: %s", exc)
+    # Expired-item reaping is best-effort. Keep an ordinary delete failure
+    # suppressed even if a diagnostic logging handler raises a control error;
+    # direct BaseException from delete_item returned above remains observable.
+    try:
+      logger.debug("Suppressed dynamodb cleanup error: %s", exc)
+    except BaseException:
+      pass
     return True

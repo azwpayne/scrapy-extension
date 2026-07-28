@@ -517,6 +517,57 @@ class TestDynamoDBStorageOps:
       ExpressionAttributeValues={":exp": 1.0},
     )
 
+  @pytest.mark.parametrize(
+    ("operation", "expected"),
+    [("retrieve", None), ("exists", False), ("ttl", None)],
+  )
+  def test_expired_lazy_reap_retains_absent_result_when_diagnostic_interrupts(
+    self, mocker, operation: str, expected: object
+  ) -> None:
+    """Best-effort reap keeps expired-as-absent semantics through logging failure."""
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}
+    }
+    table.delete_item.side_effect = RuntimeError("conditional cleanup failed")
+    debug = mocker.patch(
+      "scrapy_extension.backends.dynamodb.logger.debug",
+      side_effect=KeyboardInterrupt,
+    )
+
+    assert getattr(b, operation)("k") is expected
+
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "k"},
+      ConditionExpression="expire_at = :exp",
+      ExpressionAttributeValues={":exp": 1.0},
+    )
+    debug.assert_called_once_with("Suppressed dynamodb cleanup error: %s", mocker.ANY)
+
+  @pytest.mark.parametrize("operation", ["retrieve", "exists", "ttl"])
+  def test_expired_lazy_reap_propagates_direct_cleanup_control(
+    self, mocker, operation: str
+  ) -> None:
+    """A direct delete control signal is not swallowed as a cleanup failure."""
+    b, table = _connected(mocker)
+    table.get_item.return_value = {
+      "Item": {"pk": "k", "value": b"x", "expire_at": 1.0}
+    }
+    interrupt = KeyboardInterrupt("cleanup interrupted")
+    table.delete_item.side_effect = interrupt
+    debug = mocker.patch("scrapy_extension.backends.dynamodb.logger.debug")
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      getattr(b, operation)("k")
+
+    assert raised.value is interrupt
+    table.delete_item.assert_called_once_with(
+      Key={"pk": "k"},
+      ConditionExpression="expire_at = :exp",
+      ExpressionAttributeValues={":exp": 1.0},
+    )
+    debug.assert_not_called()
+
   def test_lazy_reap_delete_is_conditional_cas(self, mocker) -> None:
     """R-dyncas: the lazy-reap delete must be a CAS on ``expire_at``.
 
