@@ -358,10 +358,19 @@ class BackendSpiderMixin(Spider):
         signal_manager.connect(handler, signal)
         connected.append((handler, signal))
     except BaseException:
-      self._disconnect_lifecycle_signals(
-        signal_manager,
-        handlers=tuple(reversed(connected)),
-      )
+      # The registration failure is the operation's primary error.  A control
+      # signal raised while undoing the successfully registered handlers must
+      # not replace it, but every registered handler still needs an attempt.
+      try:
+        self._disconnect_lifecycle_signals(
+          signal_manager,
+          handlers=tuple(reversed(connected)),
+        )
+      except BaseException:  # noqa: BLE001 - preserve registration failure
+        try:
+          logger.exception("Failed to roll back backend lifecycle signals")
+        except BaseException:
+          pass
       raise
     self._connected_signals = signal_manager
     self._signals_connected = True
@@ -381,11 +390,24 @@ class BackendSpiderMixin(Spider):
         (self._on_spider_closed, signals.spider_closed),
       )
     )
+    primary_error: BaseException | None = None
     for handler, signal in targets:
       try:
         signal_manager.disconnect(handler, signal)
       except Exception:
-        logger.exception("Failed to disconnect backend lifecycle signal")
+        try:
+          logger.exception("Failed to disconnect backend lifecycle signal")
+        except BaseException:
+          pass
+      except BaseException as exc:  # noqa: BLE001 - finish sibling cleanup
+        try:
+          logger.exception("Failed to disconnect backend lifecycle signal")
+        except BaseException:
+          pass
+        if primary_error is None:
+          primary_error = exc
+    if primary_error is not None:
+      raise primary_error
 
   def _on_spider_opened(self, spider: Spider) -> None:
     """Handle spider_opened signal.

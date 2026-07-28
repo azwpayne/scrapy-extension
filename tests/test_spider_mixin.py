@@ -975,6 +975,49 @@ class TestConnectSignals:
     # Should not raise
     spider._connect_signals()
 
+  def test_signal_registration_failure_survives_rollback_baseexception(self, mocker):
+    """R73: rollback cleanup cannot replace the failed registration error."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    signal_manager.connect.side_effect = [None, RuntimeError("registration failed")]
+    signal_manager.disconnect.side_effect = KeyboardInterrupt()
+    spider.crawler = mocker.MagicMock(signals=signal_manager)
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+      spider._connect_signals()
+
+    signal_manager.disconnect.assert_called_once_with(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    assert spider._signals_connected is False
+    assert spider._connected_signals is None
+
+  def test_disconnect_lifecycle_signals_finishes_after_baseexception(self, mocker):
+    """R73: a control error cannot skip the sibling lifecycle handler."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    signal_manager.disconnect.side_effect = [KeyboardInterrupt(), SystemExit(2)]
+
+    with pytest.raises(KeyboardInterrupt):
+      spider._disconnect_lifecycle_signals(signal_manager)
+
+    assert signal_manager.disconnect.call_count == 2
+    signal_manager.disconnect.assert_any_call(
+      spider._on_spider_opened, signals.spider_opened
+    )
+    signal_manager.disconnect.assert_any_call(
+      spider._on_spider_closed, signals.spider_closed
+    )
+
 
 class TestOnSpiderOpened:
   """Test _on_spider_opened method."""
