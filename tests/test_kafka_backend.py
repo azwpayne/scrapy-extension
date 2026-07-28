@@ -21,6 +21,62 @@ from scrapy_extension.settings import KafkaMode, KafkaSettings
 class TestKafkaBackendConnect:
   """Tests for connect() method and its helper methods."""
 
+  @staticmethod
+  def _settings_for_connect_diagnostic_mode(mode: KafkaMode) -> KafkaSettings:
+    """Return a valid configuration for each mode-specific connect helper."""
+    if mode == KafkaMode.CLUSTER:
+      return KafkaSettings(mode=mode, cluster_brokers=["broker:9092"])
+    if mode == KafkaMode.CONFLUENT:
+      return KafkaSettings(
+        mode=mode,
+        confluent_api_key="key",
+        confluent_api_secret="secret",
+        confluent_bootstrap_servers="broker:9092",
+      )
+    return KafkaSettings(mode=mode)
+
+  @pytest.mark.parametrize(
+    ("mode", "diagnostic_error"),
+    [
+      (mode, error)
+      for mode in KafkaMode
+      for error in (
+        RuntimeError("diagnostic failed"),
+        KeyboardInterrupt("diagnostic interrupted"),
+        SystemExit("diagnostic exited"),
+      )
+    ],
+  )
+  @pytest.mark.parametrize("diagnostic_position", ["helper", "outer"])
+  def test_connect_success_diagnostics_cannot_abort_published_generation(
+    self, mocker, mode, diagnostic_error, diagnostic_position
+  ):
+    """Every mode keeps its complete graph despite success-log failures."""
+    backend = KafkaBackend(self._settings_for_connect_diagnostic_mode(mode))
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+    )
+    logger_debug = mocker.patch("scrapy_extension.backends.kafka.logger.debug")
+    logger_debug.side_effect = (
+      [diagnostic_error, None]
+      if diagnostic_position == "helper"
+      else [None, diagnostic_error]
+    )
+
+    backend.connect()
+
+    assert backend._producer is producer
+    assert backend._admin_client is admin
+    assert backend.is_connected() is True
+    assert logger_debug.call_count == 2
+    producer.close.assert_not_called()
+    admin.close.assert_not_called()
+
   def test_backend_rejects_auto_commit_with_explicit_ack_contract(self):
     """KafkaBackend requires application-level ack, so auto-commit is unsafe."""
     config = KafkaSettings(enable_auto_commit=True)

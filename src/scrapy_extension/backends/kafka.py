@@ -332,6 +332,19 @@ class KafkaBackend(Backend, QueueBackend):
     if self._active_attempts.get(key) == token.delivery_attempt:
       self._active_attempts.pop(key, None)
 
+  @staticmethod
+  def _log_connect_success(message: str, *args: object) -> None:
+    """Emit a best-effort diagnostic after a complete generation publishes.
+
+    Logging handlers are application code.  A handler failure after both Kafka
+    clients have been assigned must not turn a completed connection into a
+    failed attempt and abort that live generation.
+    """
+    try:
+      logger.debug(message, *args)
+    except BaseException:
+      pass
+
   def connect(self) -> None:
     """Establish connection to Kafka based on deployment mode.
 
@@ -375,7 +388,9 @@ class KafkaBackend(Backend, QueueBackend):
           self._connect_cluster()
         else:
           self._connect_confluent()
-        logger.debug("Connected to Kafka in %s mode", self.config.mode.value)
+        self._log_connect_success(
+          "Connected to Kafka in %s mode", self.config.mode.value
+        )
       except KafkaError as e:
         self._abort_partial_connect(suppress_process_control=True)
         msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
@@ -586,7 +601,7 @@ class KafkaBackend(Backend, QueueBackend):
       client_id="scrapy-extension-admin",
       **client_security_config,
     )
-    logger.debug("Connected to standalone Kafka at %s", bootstrap)
+    self._log_connect_success("Connected to standalone Kafka at %s", bootstrap)
 
   def _connect_cluster(self) -> None:
     """Connect to Kafka cluster.
@@ -603,7 +618,7 @@ class KafkaBackend(Backend, QueueBackend):
       client_id="scrapy-extension-admin",
       **client_security_config,
     )
-    logger.debug("Connected to Kafka cluster at %s", bootstrap)
+    self._log_connect_success("Connected to Kafka cluster at %s", bootstrap)
 
   def _connect_confluent(self) -> None:
     """Connect to Confluent Cloud.
@@ -620,7 +635,7 @@ class KafkaBackend(Backend, QueueBackend):
       client_id="scrapy-extension-admin",
       **client_security_config,
     )
-    logger.debug("Connected to Confluent Cloud at %s", bootstrap)
+    self._log_connect_success("Connected to Confluent Cloud at %s", bootstrap)
 
   def disconnect(self) -> None:
     """Close Kafka connection."""
