@@ -426,6 +426,8 @@ class SqsBackend(Backend, QueueBackend):
         if self._generation is not None:
           return
       snapshot, kwargs = self._capture_connection_snapshot()
+      candidate: Any | None = None
+      generation: _SqsClientGeneration | None = None
       try:
         # The module-level boto3.client() alias shares boto3's process-wide
         # default Session, which is not safe for concurrent client creation.
@@ -433,20 +435,35 @@ class SqsBackend(Backend, QueueBackend):
         # normal operations share only the low-level client.
         session = boto3.session.Session()
         candidate = session.client("sqs", **kwargs)
-      except Exception as e:
+        generation = _SqsClientGeneration(
+          key=object(), session=session, client=candidate, snapshot=snapshot
+        )
+        with self._generation_condition:
+          self._generation = generation
+          self._client = candidate
+          self._queue_urls = generation.queue_urls
+          self._queue_lifecycles = generation.queue_lifecycles
+          self._queue_lifecycles_lock = generation.cache_lock
+          self._generation_condition.notify_all()
+      except BaseException as error:
+        # ``session.client`` has already opened the candidate by the time a
+        # generation object or one of the publication mirrors can fail.  Only
+        # close a candidate that never became the authoritative generation:
+        # a post-publication control-flow error must not tear down live work.
+        with self._generation_condition:
+          published = generation is not None and self._generation is generation
+        if candidate is not None and not published:
+          try:
+            candidate.close()
+          except BaseException:
+            # Failed-candidate cleanup is best-effort and must never mask the
+            # construction/publication failure that triggered it.
+            pass
+        if not isinstance(error, Exception):
+          raise
         raise BackendConnectionError(
-          f"Failed to create SQS client: {e}", backend_type="sqs"
-        ) from e
-      generation = _SqsClientGeneration(
-        key=object(), session=session, client=candidate, snapshot=snapshot
-      )
-      with self._generation_condition:
-        self._generation = generation
-        self._client = candidate
-        self._queue_urls = generation.queue_urls
-        self._queue_lifecycles = generation.queue_lifecycles
-        self._queue_lifecycles_lock = generation.cache_lock
-        self._generation_condition.notify_all()
+          f"Failed to create SQS client: {error}", backend_type="sqs"
+        ) from error
       logger.debug(
         "Connected to SQS (%s, %s)",
         snapshot.mode.value,

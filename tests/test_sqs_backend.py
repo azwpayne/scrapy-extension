@@ -225,6 +225,62 @@ class TestSqsConnect:
     assert b._generation.client is recovered_client
     default_client.assert_not_called()
 
+  def test_candidate_generation_interrupt_closes_private_client(self, mocker) -> None:
+    """A control-flow failure before publication cannot leak the candidate."""
+    b = _make_backend()
+    client = mocker.MagicMock(name="candidate-client")
+    _patch_client(mocker, return_value=client)
+    interrupt = KeyboardInterrupt()
+    mocker.patch(
+      "scrapy_extension.backends.sqs._SqsClientGeneration",
+      side_effect=interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.connect()
+
+    assert raised.value is interrupt
+    client.close.assert_called_once_with()
+    assert b._generation is None
+    assert b._client is None
+
+  def test_candidate_cleanup_does_not_mask_generation_interrupt(self, mocker) -> None:
+    """Candidate close is best-effort when the pre-publication arm fails."""
+    b = _make_backend()
+    client = mocker.MagicMock(name="candidate-client")
+    client.close.side_effect = SystemExit("cleanup")
+    _patch_client(mocker, return_value=client)
+    interrupt = KeyboardInterrupt()
+    mocker.patch(
+      "scrapy_extension.backends.sqs._SqsClientGeneration",
+      side_effect=interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.connect()
+
+    assert raised.value is interrupt
+    client.close.assert_called_once_with()
+    assert b._generation is None
+
+  def test_postpublish_interrupt_keeps_live_candidate_open(self, mocker) -> None:
+    """A published identity is never treated as a failed private candidate."""
+    b = _make_backend()
+    client = mocker.MagicMock(name="live-client")
+    _patch_client(mocker, return_value=client)
+    interrupt = KeyboardInterrupt()
+    mocker.patch.object(
+      b._generation_condition, "notify_all", side_effect=interrupt
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.connect()
+
+    assert raised.value is interrupt
+    assert b._generation is not None
+    assert b._generation.client is client
+    client.close.assert_not_called()
+
   def test_private_session_construction_failure_is_retryable(
     self, mocker
   ) -> None:
