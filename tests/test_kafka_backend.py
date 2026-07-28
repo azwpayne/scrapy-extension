@@ -66,6 +66,133 @@ class TestKafkaBackendConnect:
     assert backend.is_connected()
     mock_producer_instance.send.assert_not_called()
 
+  def test_connect_is_idempotent_for_a_complete_client_graph(self, mocker):
+    """A second connect must retain the established producer/admin pair."""
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    producer_factory = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+    )
+    admin_factory = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+    )
+
+    backend.connect()
+    backend.connect()
+
+    assert backend._producer is producer
+    assert backend._admin_client is admin
+    producer_factory.assert_called_once()
+    admin_factory.assert_called_once()
+    producer.close.assert_not_called()
+    admin.close.assert_not_called()
+
+  def test_connect_retires_one_sided_residual_before_new_generation(self, mocker):
+    """An interrupted prior generation cannot be overwritten and leaked."""
+    backend = KafkaBackend(KafkaSettings())
+    residual_producer = mocker.MagicMock()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    backend._producer = residual_producer
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+    )
+
+    backend.connect()
+
+    residual_producer.close.assert_called_once_with()
+    assert backend._producer is producer
+    assert backend._admin_client is admin
+
+  def test_overlapping_connects_create_one_complete_generation(self, mocker):
+    """The second connect waits for the first and reuses its completed graph."""
+    backend = KafkaBackend(KafkaSettings())
+    producer_started = Event()
+    release_producer = Event()
+    second_finished = Event()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+
+    def make_producer(**_kwargs):
+      producer_started.set()
+      assert release_producer.wait(timeout=1.0)
+      return producer
+
+    producer_factory = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", side_effect=make_producer
+    )
+    admin_factory = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+    )
+    first = Thread(target=backend.connect)
+    second = Thread(target=lambda: (backend.connect(), second_finished.set()))
+
+    first.start()
+    assert producer_started.wait(timeout=1.0)
+    second.start()
+    assert second_finished.wait(timeout=0.05) is False
+    assert producer_factory.call_count == 1
+
+    release_producer.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert second_finished.is_set()
+    assert backend._producer is producer
+    assert backend._admin_client is admin
+    producer_factory.assert_called_once()
+    admin_factory.assert_called_once()
+
+  def test_disconnect_waits_for_connect_generation_then_detaches_it(self, mocker):
+    """Disconnect cannot observe or close a half-published connect graph."""
+    backend = KafkaBackend(KafkaSettings())
+    producer_started = Event()
+    release_producer = Event()
+    disconnect_finished = Event()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+
+    def make_producer(**_kwargs):
+      producer_started.set()
+      assert release_producer.wait(timeout=1.0)
+      return producer
+
+    producer_factory = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", side_effect=make_producer
+    )
+    admin_factory = mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+    )
+    connect_thread = Thread(target=backend.connect)
+    disconnect_thread = Thread(
+      target=lambda: (backend.disconnect(), disconnect_finished.set())
+    )
+
+    connect_thread.start()
+    assert producer_started.wait(timeout=1.0)
+    disconnect_thread.start()
+    assert disconnect_finished.wait(timeout=0.05) is False
+
+    release_producer.set()
+    connect_thread.join(timeout=1.0)
+    disconnect_thread.join(timeout=1.0)
+
+    assert connect_thread.is_alive() is False
+    assert disconnect_thread.is_alive() is False
+    assert disconnect_finished.is_set()
+    producer_factory.assert_called_once()
+    admin_factory.assert_called_once()
+    producer.close.assert_called_once_with()
+    admin.close.assert_called_once_with()
+    assert backend._producer is None
+    assert backend._admin_client is None
+
   def test_connect_standalone_kafka_error(self, mocker):
     """Test connect raises BackendConnectionError on KafkaError."""
     config = KafkaSettings()

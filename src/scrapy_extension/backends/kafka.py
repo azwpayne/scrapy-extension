@@ -235,6 +235,11 @@ class KafkaBackend(Backend, QueueBackend):
         setting_value=True,
       )
     self.config = config
+    # Kafka producer/admin construction is a single connection generation.
+    # Keep it separate from ``_delivery_lock``: connection setup and client
+    # teardown can block on SDK I/O, whereas delivery-token bookkeeping must
+    # remain a short critical section for ack/rebalance callbacks.
+    self._connection_lock = threading.RLock()
     self._producer: KafkaProducer | None = None
     self._consumer: KafkaConsumer | None = None
     self._consumer_auto_offset_reset: str | None = None
@@ -336,54 +341,66 @@ class KafkaBackend(Backend, QueueBackend):
         BackendConnectionError: If the connection cannot be established.
         ConfigurationError: If the configuration is invalid for the mode.
     """
-    if self.config.mode not in (
-      KafkaMode.STANDALONE,
-      KafkaMode.CLUSTER,
-      KafkaMode.CONFLUENT,
-    ):
-      msg = f"Unsupported Kafka mode: {_get_mode_text(self.config.mode)}"
-      raise ConfigurationError(
-        msg,
-        setting_name="mode",
-        setting_value=self.config.mode,
-      )
-    # Pydantic models are mutable after construction. Revalidate auth before
-    # any SDK object can observe a post-construction downgrade.
-    self._validated_authentication()
-    self._validated_delivery_policy()
-    try:
-      if self.config.mode == KafkaMode.STANDALONE:
-        self._connect_standalone()
-      elif self.config.mode == KafkaMode.CLUSTER:
-        self._connect_cluster()
-      else:
-        self._connect_confluent()
-      logger.debug("Connected to Kafka in %s mode", self.config.mode.value)
-    except KafkaError as e:
-      self._abort_partial_connect()
-      msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
-      raise BackendConnectionError(
-        msg,
-        backend_type="kafka",
-      ) from e
-    except Exception as e:
-      self._abort_partial_connect()
-      # Unexpected errors (e.g., RuntimeError from mocking in tests)
-      msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
-      raise BackendConnectionError(
-        msg,
-        backend_type="kafka",
-      ) from e
-    except BaseException:
-      # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
-      # arms above cannot catch them — without this arm a Ctrl+C raised in the
-      # window between ``self._producer = ...`` and ``self._admin_client = ...``
-      # skips ``_abort_partial_connect()``, leaking the producer (TCP socket +
-      # bg thread) and leaving ``is_connected()`` lying True. Run the cleanup
-      # before re-raising. Mirrors mongodb.py / elasticsearch.py / dynamodb /
-      # redis ``except BaseException`` arms.
-      self._abort_partial_connect()
-      raise
+    with self._connection_lock:
+      # A complete producer/admin graph belongs to the current generation and
+      # must never be replaced by a redundant or overlapping connect().
+      if self._producer is not None and self._admin_client is not None:
+        return
+
+      # A prior interrupted attempt can leave exactly one handle assigned.
+      # Detach it before beginning a fresh generation; otherwise a successful
+      # retry would overwrite and leak that residual client.
+      if self._producer is not None or self._admin_client is not None:
+        self._abort_partial_connect()
+
+      if self.config.mode not in (
+        KafkaMode.STANDALONE,
+        KafkaMode.CLUSTER,
+        KafkaMode.CONFLUENT,
+      ):
+        msg = f"Unsupported Kafka mode: {_get_mode_text(self.config.mode)}"
+        raise ConfigurationError(
+          msg,
+          setting_name="mode",
+          setting_value=self.config.mode,
+        )
+      # Pydantic models are mutable after construction. Revalidate auth before
+      # any SDK object can observe a post-construction downgrade.
+      self._validated_authentication()
+      self._validated_delivery_policy()
+      try:
+        if self.config.mode == KafkaMode.STANDALONE:
+          self._connect_standalone()
+        elif self.config.mode == KafkaMode.CLUSTER:
+          self._connect_cluster()
+        else:
+          self._connect_confluent()
+        logger.debug("Connected to Kafka in %s mode", self.config.mode.value)
+      except KafkaError as e:
+        self._abort_partial_connect()
+        msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
+        raise BackendConnectionError(
+          msg,
+          backend_type="kafka",
+        ) from e
+      except Exception as e:
+        self._abort_partial_connect()
+        # Unexpected errors (e.g., RuntimeError from mocking in tests)
+        msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
+        raise BackendConnectionError(
+          msg,
+          backend_type="kafka",
+        ) from e
+      except BaseException:
+        # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
+        # arms above cannot catch them — without this arm a Ctrl+C raised in the
+        # window between ``self._producer = ...`` and ``self._admin_client = ...``
+        # skips ``_abort_partial_connect()``, leaking the producer (TCP socket +
+        # bg thread) and leaving ``is_connected()`` lying True. Run the cleanup
+        # before re-raising. Mirrors mongodb.py / elasticsearch.py / dynamodb /
+        # redis ``except BaseException`` arms.
+        self._abort_partial_connect()
+        raise
 
   def _abort_partial_connect(self) -> None:
     """Close+null any clients assigned before ``connect()`` failed.
@@ -590,26 +607,31 @@ class KafkaBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Close Kafka connection."""
-    with self._delivery_lock:
-      producer = self._producer
-      consumer = self._consumer
-      admin_client = self._admin_client
+    # Hold the generation lock through client close so a new connect cannot
+    # publish its clients while callbacks from an old consumer are still being
+    # torn down. Delivery state is detached under its own short-lived lock;
+    # potentially blocking close() calls deliberately happen after releasing it.
+    with self._connection_lock:
+      with self._delivery_lock:
+        producer = self._producer
+        consumer = self._consumer
+        admin_client = self._admin_client
 
-      # Invalidate state before closing handles. A close failure cannot leave a
-      # half-connected backend, and a late completion cannot be redirected to a
-      # later consumer generation.
-      self._producer = None
-      self._consumer = None
-      self._consumer_auto_offset_reset = None
-      self._admin_client = None
-      self._consumer_generation += 1
-      self._assignment_epoch += 1
-      self._subscribed_topic = None
-      self._clear_delivery_state_locked()
-      self._known_topics.clear()
-      self._known_topic_policies.clear()
+        # Invalidate state before closing handles. A close failure cannot leave a
+        # half-connected backend, and a late completion cannot be redirected to a
+        # later consumer generation.
+        self._producer = None
+        self._consumer = None
+        self._consumer_auto_offset_reset = None
+        self._admin_client = None
+        self._consumer_generation += 1
+        self._assignment_epoch += 1
+        self._subscribed_topic = None
+        self._clear_delivery_state_locked()
+        self._known_topics.clear()
+        self._known_topic_policies.clear()
 
-    self._close_detached_clients(producer, consumer, admin_client)
+      self._close_detached_clients(producer, consumer, admin_client)
 
   @staticmethod
   def _close_detached_clients(*clients: Any) -> None:
