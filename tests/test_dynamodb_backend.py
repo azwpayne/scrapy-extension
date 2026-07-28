@@ -687,6 +687,53 @@ class TestDynamoDBStorageErrorContract:
     assert error.key == "key1"
     assert error.__cause__ is failure
 
+  @pytest.mark.parametrize(
+    ("operation", "table_method", "invoke"),
+    [
+      ("store", "put_item", lambda backend: backend.store("key1", b"value")),
+      ("retrieve", "get_item", lambda backend: backend.retrieve("key1")),
+      ("exists", "get_item", lambda backend: backend.exists("key1")),
+      ("ttl", "get_item", lambda backend: backend.ttl("key1")),
+    ],
+  )
+  def test_operation_sdk_failure_preserves_cause_without_copying_message(
+    self, mocker, operation: str, table_method: str, invoke
+  ) -> None:
+    marker = "operator-secret-in-sdk-diagnostic"
+    b, table = _connected(mocker)
+    failure = RuntimeError(f"request failed at https://user:{marker}@host")
+    getattr(table, table_method).side_effect = failure
+
+    with pytest.raises(StorageError) as exc_info:
+      invoke(b)
+
+    error = exc_info.value
+    assert marker not in str(error)
+    assert marker not in repr(vars(error))
+    assert error.operation == operation
+    assert error.key == "key1"
+    assert error.__cause__ is failure
+
+  def test_store_resource_not_found_preserves_cause_without_copying_message(
+    self, mocker
+  ) -> None:
+    marker = "operator-secret-in-sdk-diagnostic"
+    b, table = _connected(mocker)
+    failure = _make_client_error("ResourceNotFoundException")
+    failure.args = (f"DynamoDB endpoint has {marker}",)
+    table.put_item.side_effect = failure
+
+    with pytest.raises(StorageError) as exc_info:
+      b.store("key1", b"value")
+
+    error = exc_info.value
+    assert "table not found" in str(error)
+    assert marker not in str(error)
+    assert marker not in repr(vars(error))
+    assert error.operation == "store"
+    assert error.key == "key1"
+    assert error.__cause__ is failure
+
   def test_store_provisioned_throughput_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)
     table.put_item.side_effect = _make_client_error(

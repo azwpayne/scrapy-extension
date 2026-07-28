@@ -717,9 +717,9 @@ class DynamoDBBackend(Backend, StorageBackend):
         if _is_resource_not_found(e):
           # Table vanished mid-operation — treat as storage failure too, but
           # callers checking existence after will see the table gone.
-          msg = f"DynamoDB table not found while storing key {key!r}: {e}"
+          msg = f"DynamoDB table not found while storing key {key!r}"
         else:
-          msg = f"Failed to store key {key!r} in DynamoDB: {e}"
+          msg = f"Failed to store key {key!r} in DynamoDB"
         raise StorageError(msg, operation="store", key=key) from e
 
   def retrieve(self, key: str) -> bytes | None:
@@ -742,7 +742,7 @@ class DynamoDBBackend(Backend, StorageBackend):
       try:
         resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
       except Exception as e:
-        msg = f"Failed to retrieve key {key!r} from DynamoDB: {e}"
+        msg = f"Failed to retrieve key {key!r} from DynamoDB"
         raise StorageError(msg, operation="retrieve", key=key) from e
       item = self._response_item(resp, "retrieve", key)
       if item is None:
@@ -810,7 +810,7 @@ class DynamoDBBackend(Backend, StorageBackend):
       try:
         resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
       except Exception as e:
-        msg = f"Failed to check existence of key {key!r} in DynamoDB: {e}"
+        msg = f"Failed to check existence of key {key!r} in DynamoDB"
         raise StorageError(msg, operation="exists", key=key) from e
       item = self._response_item(resp, "exists", key)
       if item is None:
@@ -838,7 +838,7 @@ class DynamoDBBackend(Backend, StorageBackend):
       try:
         resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
       except Exception as e:
-        msg = f"Failed to read TTL of key {key!r} in DynamoDB: {e}"
+        msg = f"Failed to read TTL of key {key!r} in DynamoDB"
         raise StorageError(msg, operation="ttl", key=key) from e
       item = self._response_item(resp, "ttl", key)
       if item is None:
