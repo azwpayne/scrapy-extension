@@ -178,6 +178,29 @@ def test_build_failure_keeps_primary_error_when_candidate_close_is_interrupted(
   assert backend.is_connected() is False
 
 
+def test_build_failure_keeps_primary_error_when_aborted_close_diagnostic_interrupts(
+  mocker,
+) -> None:
+  """Aborted-candidate diagnostics cannot replace the original SDK failure."""
+  backend = _backend()
+  resource, table = _resource(mocker)
+  failure = RuntimeError("load failed")
+  table.load.side_effect = failure
+  resource.meta.client.close.side_effect = SystemExit
+  _patch_resource(mocker, return_value=resource)
+  debug = mocker.patch.object(dynamodb_module.logger, "debug", side_effect=KeyboardInterrupt)
+
+  with pytest.raises(BackendConnectionError) as raised:
+    backend.connect()
+
+  assert raised.value.__cause__ is failure
+  resource.meta.client.close.assert_called_once_with()
+  debug.assert_called_once_with(
+    "Suppressed aborted DynamoDB resource close error: %s", mocker.ANY
+  )
+  assert backend.is_connected() is False
+
+
 def test_publish_failure_keeps_primary_error_when_candidate_close_is_interrupted(
   mocker,
 ) -> None:

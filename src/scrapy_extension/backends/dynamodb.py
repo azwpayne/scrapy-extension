@@ -271,7 +271,13 @@ class DynamoDBBackend(Backend, StorageBackend):
     try:
       cls._close_resource(resource)
     except BaseException as exc:
-      logger.debug("Suppressed aborted DynamoDB resource close error: %s", exc)
+      # This diagnostic runs after construction/publication has already failed.
+      # A user logging handler can itself raise a control exception, which must
+      # not replace that causal failure while the candidate remains private.
+      try:
+        logger.debug("Suppressed aborted DynamoDB resource close error: %s", exc)
+      except BaseException:
+        pass
 
   def _build_candidate(
     self,
