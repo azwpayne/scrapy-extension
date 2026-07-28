@@ -1455,3 +1455,44 @@ class TestPulsarInFlightCap:
     # The one-shot warning fired.
     assert b._in_flight_overflow_warned is True
     assert any("at cap" in r.message for r in caplog.records)
+
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("diagnostic failure"),
+      KeyboardInterrupt("diagnostic interruption"),
+      SystemExit("diagnostic exit"),
+    ],
+  )
+  def test_overflow_warning_failure_preserves_delivery_and_ack(
+    self, mocker, diagnostic_error
+  ) -> None:
+    """R124: post-delivery diagnostics cannot prevent the token's broker ack."""
+    from scrapy_extension.backends.pulsar import _MAX_IN_FLIGHT
+
+    msg = mocker.MagicMock(name="delivered_message")
+    msg.data.return_value = b"hello"
+    msg_id = mocker.MagicMock(name="delivered_message_id")
+    msg.message_id.return_value = msg_id
+    consumer = mocker.MagicMock(name="delivering_consumer")
+    consumer.receive.return_value = msg
+    b, _client = _connected(mocker, subscribe=consumer)
+    b._in_flight = {
+      _PulsarAckToken(message_id=object(), topic=f"t{i}")
+      for i in range(_MAX_IN_FLIGHT)
+    }
+    mocker.patch(
+      "scrapy_extension.backends.pulsar.logger.warning",
+      side_effect=diagnostic_error,
+    )
+
+    value, token = b.pop_with_ack("queue1", timeout=1.0)
+    b.ack("queue1", token=token)
+
+    assert value == b"hello"
+    assert isinstance(token, _PulsarAckToken)
+    assert token.message_id is msg_id
+    assert token not in b._in_flight
+    assert len(b._in_flight) == _MAX_IN_FLIGHT
+    assert b._in_flight_overflow_warned is True
+    consumer.acknowledge.assert_called_once_with(msg_id)

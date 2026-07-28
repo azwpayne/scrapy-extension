@@ -493,11 +493,16 @@ class RabbitMQBackend(Backend, QueueBackend):
           return
       snapshot = self._capture_connection_snapshot()
       if not snapshot.ssl_enabled and not self._ssl_warning_emitted:
-        logger.warning(
-          "RabbitMQ loopback connection is using plaintext transport. "
-          "Remote endpoints require verified TLS. (warning emitted once per "
-          "backend instance)"
-        )
+        # This is advisory only.  A custom logging handler must not prevent a
+        # legitimate loopback connection from being attempted.
+        try:
+          logger.warning(
+            "RabbitMQ loopback connection is using plaintext transport. "
+            "Remote endpoints require verified TLS. (warning emitted once per "
+            "backend instance)"
+          )
+        except BaseException:
+          pass
         self._ssl_warning_emitted = True
       candidate: _RabbitMQCandidate | None = None
       published = False
@@ -679,14 +684,22 @@ class RabbitMQBackend(Backend, QueueBackend):
         )
         all_hosts.append(f"{host}:{port}")
 
-      logger.debug("Connecting to RabbitMQ cluster with hosts: %s", all_hosts)
+      # Host-list rendering is diagnostics, not part of failover construction.
+      try:
+        logger.debug("Connecting to RabbitMQ cluster with hosts: %s", all_hosts)
+      except BaseException:
+        pass
       connection_parameters: pika.ConnectionParameters | list[pika.ConnectionParameters] = (
         parameters
       )
     else:
-      logger.debug(
-        "Connecting to RabbitMQ cluster at %s:%s", snapshot.host, snapshot.port
-      )
+      # This branch's endpoint diagnostic is likewise non-causal.
+      try:
+        logger.debug(
+          "Connecting to RabbitMQ cluster at %s:%s", snapshot.host, snapshot.port
+        )
+      except BaseException:
+        pass
       connection_parameters = self._build_common_parameters(snapshot=snapshot)
 
     connection = pika.BlockingConnection(connection_parameters)

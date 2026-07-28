@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pika.exceptions
@@ -10,7 +11,7 @@ import pytest
 
 from scrapy_extension.backends.rabbitmq import RabbitMQBackend, _RabbitMQCandidate
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
-from scrapy_extension.settings import RabbitMQSettings
+from scrapy_extension.settings import RabbitMQMode, RabbitMQSettings
 
 
 def _backend() -> RabbitMQBackend:
@@ -264,6 +265,91 @@ def test_post_publish_success_logger_failure_keeps_live_session(
   assert backend._connection is candidate_connection
   assert backend._channel is candidate_channel
   assert backend.is_connected() is True
+  candidate_connection.close.assert_not_called()
+  candidate_channel.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("warning handler failed"),
+    KeyboardInterrupt("warning interrupted"),
+    SystemExit("warning exited"),
+  ],
+)
+def test_plaintext_warning_failure_keeps_standalone_connect_live(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """A plaintext advisory cannot prevent a standalone session from publishing."""
+  backend = _backend()
+  candidate_connection, candidate_channel = _handles("candidate")
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=candidate_connection,
+  )
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  backend.connect()
+
+  assert backend._ssl_warning_emitted is True
+  assert backend._connection is candidate_connection
+  assert backend._channel is candidate_channel
+  assert backend.is_connected() is True
+  candidate_connection.close.assert_not_called()
+  candidate_channel.close.assert_not_called()
+
+
+@pytest.mark.parametrize("has_extra_nodes", [False, True])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("debug handler failed"),
+    KeyboardInterrupt("debug interrupted"),
+    SystemExit("debug exited"),
+  ],
+)
+def test_cluster_host_diagnostic_failure_keeps_connect_live(
+  mocker, has_extra_nodes: bool, diagnostic_error: BaseException
+) -> None:
+  """Both cluster-host diagnostic branches remain advisory during connect."""
+  backend = RabbitMQBackend(
+    RabbitMQSettings(
+      mode=RabbitMQMode.CLUSTER,
+      ssl_enabled=True,
+      cluster_nodes=["node2:5672"],
+      username="user",
+      password="pass",
+    )
+  )
+  candidate_connection, candidate_channel = _handles("candidate")
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=candidate_connection,
+  )
+  logger_debug = mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.debug",
+    side_effect=diagnostic_error,
+  )
+
+  if has_extra_nodes:
+    backend.connect()
+    assert backend._connection is candidate_connection
+    assert backend._channel is candidate_channel
+    assert backend.is_connected() is True
+    assert logger_debug.call_count == 2  # host-list + published-session diagnostics
+  else:
+    # ``connect`` intentionally rejects empty cluster topology snapshots;
+    # exercise the retained endpoint-only candidate branch directly.
+    snapshot = replace(backend._capture_connection_snapshot(), cluster_nodes=())
+    candidate = backend._connect_cluster(snapshot)
+    assert candidate.connection is candidate_connection
+    assert candidate.channel is candidate_channel
+    logger_debug.assert_called_once_with(
+      "Connecting to RabbitMQ cluster at %s:%s", "localhost", 5672
+    )
   candidate_connection.close.assert_not_called()
   candidate_channel.close.assert_not_called()
 

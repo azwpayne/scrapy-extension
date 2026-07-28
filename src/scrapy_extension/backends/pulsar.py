@@ -787,13 +787,19 @@ class PulsarBackend(Backend, QueueBackend):
         return
       if not self._in_flight_overflow_warned:
         self._in_flight_overflow_warned = True
-        logger.warning(
-          "Pulsar in-flight ack-token set at cap (%d) — further unacked "
-          "pops will not be tracked in the diagnostic set. This indicates "
-          "slow acks or an ack leak; the broker still tracks message_ids "
-          "so ack correctness is unaffected.",
-          _MAX_IN_FLIGHT,
-        )
+        # The message and its settlement token already belong to the caller.
+        # A broken logging handler is pure diagnostics and must not turn that
+        # broker-confirmed delivery into a failed pop (or prevent its ack).
+        try:
+          logger.warning(
+            "Pulsar in-flight ack-token set at cap (%d) — further unacked "
+            "pops will not be tracked in the diagnostic set. This indicates "
+            "slow acks or an ack leak; the broker still tracks message_ids "
+            "so ack correctness is unaffected.",
+            _MAX_IN_FLIGHT,
+          )
+        except BaseException:
+          pass
 
   def _receive(self, queue_name: str, timeout: float) -> tuple[Any, Any]:
     """Receive one message and return it with the consumer that delivered it.
