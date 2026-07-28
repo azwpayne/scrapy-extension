@@ -11,6 +11,8 @@ import subprocess
 import sys
 import traceback
 from threading import Event, Lock, Thread
+from types import TracebackType
+from typing import Any
 from unittest.mock import MagicMock
 
 import pulsar
@@ -47,6 +49,31 @@ def _connected(mocker, **client_children):
   mocker.patch.object(pulsar, "Client", return_value=client)
   b.connect()
   return b, client
+
+
+class _InterruptOnLifecycleEntry:
+  """Lock proxy that raises at a deterministic lifecycle-lock entry."""
+
+  def __init__(self, lock: Any, interrupt_on_entry: int) -> None:
+    self._lock = lock
+    self._interrupt_on_entry = interrupt_on_entry
+    self._entries = 0
+
+  def __enter__(self) -> _InterruptOnLifecycleEntry:
+    self._entries += 1
+    if self._entries == self._interrupt_on_entry:
+      raise KeyboardInterrupt("lifecycle publication interrupted")
+    self._lock.acquire()
+    return self
+
+  def __exit__(
+    self,
+    exc_type: type[BaseException] | None,
+    exc_value: BaseException | None,
+    traceback: TracebackType | None,
+  ) -> None:
+    del exc_type, exc_value, traceback
+    self._lock.release()
 
 
 class TestPulsarBackendType:
@@ -489,6 +516,22 @@ class TestPulsarPush:
     producer.send.assert_not_called()
     assert b._producers == {}
 
+  def test_push_lifecycle_interrupt_after_creation_closes_candidate(
+    self, mocker
+  ) -> None:
+    """R74: a private producer is closed when publication is interrupted."""
+    producer = mocker.MagicMock(name="unpublished_producer")
+    producer.close.side_effect = SystemExit("cleanup must not mask interrupt")
+    b, _ = _connected(mocker, create_producer=producer)
+    b._lifecycle_lock = _InterruptOnLifecycleEntry(b._lifecycle_lock, 2)
+
+    with pytest.raises(KeyboardInterrupt, match="publication interrupted"):
+      b.push("queue", b"payload")
+
+    producer.close.assert_called_once_with()
+    producer.send.assert_not_called()
+    assert b._producers == {}
+
 
 class TestPulsarPop:
   def _msg(self, mocker, payload=b"hello"):
@@ -646,6 +689,23 @@ class TestPulsarPop:
     assert isinstance(errors[0], QueueError)
     assert errors[0].operation == "pop"
     consumer.close.assert_called_once_with()
+    assert b._consumers == {}
+    assert b._consumer is None
+
+  def test_pop_lifecycle_interrupt_after_creation_closes_candidate(
+    self, mocker
+  ) -> None:
+    """R74: a private consumer is closed when publication is interrupted."""
+    consumer = mocker.MagicMock(name="unpublished_consumer")
+    consumer.close.side_effect = SystemExit("cleanup must not mask interrupt")
+    b, _ = _connected(mocker, subscribe=consumer)
+    b._lifecycle_lock = _InterruptOnLifecycleEntry(b._lifecycle_lock, 2)
+
+    with pytest.raises(KeyboardInterrupt, match="publication interrupted"):
+      b.pop("queue")
+
+    consumer.close.assert_called_once_with()
+    consumer.receive.assert_not_called()
     assert b._consumers == {}
     assert b._consumer is None
 

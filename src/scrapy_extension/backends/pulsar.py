@@ -564,6 +564,19 @@ class PulsarBackend(Backend, QueueBackend):
     if primary_error is not None:
       raise primary_error
 
+  @staticmethod
+  def _close_aborted_handle(handle: Any) -> None:
+    """Best-effort close for a private candidate that never became live.
+
+    This helper runs while a primary exception is already propagating.  Unlike
+    normal teardown, including a control-flow exception from a driver close
+    must not replace that primary error.
+    """
+    try:
+      handle.close()
+    except BaseException:
+      pass
+
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
     return self._client is not None
@@ -629,10 +642,24 @@ class PulsarBackend(Backend, QueueBackend):
           queue_name=topic,
           operation="push",
         ) from e
-      with self._lifecycle_lock:
-        if self._client is client and self._lifecycle_generation == generation:
-          self._producers[topic] = producer
-          return producer
+      published = False
+      try:
+        with self._lifecycle_lock:
+          if self._client is client and self._lifecycle_generation == generation:
+            self._producers[topic] = producer
+            # Mark publication before the context manager exits: an extension
+            # lock may raise from ``__exit__`` after the live cache has taken
+            # ownership.  That handle belongs to the active generation and
+            # must not be closed by this candidate-abort path.
+            published = True
+            return producer
+      except BaseException:
+        # The SDK constructor can have allocated native resources before a
+        # control-flow exception interrupts cache publication.  Once a handle
+        # is published the generation owns it; otherwise this creator does.
+        if not published:
+          self._close_aborted_handle(producer)
+        raise
       with _suppress_pulsar_errors():
         producer.close()
       raise QueueError(
@@ -1040,12 +1067,21 @@ class PulsarBackend(Backend, QueueBackend):
           queue_name=topic,
           operation="pop",
         ) from e
-      with self._lifecycle_lock:
-        if self._client is client and self._lifecycle_generation == generation:
-          self._consumers[topic] = consumer
-          self._consumer = consumer
-          self._subscribed_topic = topic
-          return consumer
+      published = False
+      try:
+        with self._lifecycle_lock:
+          if self._client is client and self._lifecycle_generation == generation:
+            self._consumers[topic] = consumer
+            self._consumer = consumer
+            self._subscribed_topic = topic
+            # See ``_producer_for``: a context-manager failure after this
+            # point must leave the active generation's handle untouched.
+            published = True
+            return consumer
+      except BaseException:
+        if not published:
+          self._close_aborted_handle(consumer)
+        raise
       with _suppress_pulsar_errors():
         consumer.close()
       raise QueueError(
