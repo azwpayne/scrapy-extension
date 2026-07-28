@@ -925,6 +925,69 @@ class TestBatchedStorageRisk2:
 
     monitor.on_error.assert_called_once_with("store", failure)
 
+  def test_age_flush_warning_keyboardinterrupt_does_not_stop_retry_cycle(
+    self, monkeypatch, mocker
+  ) -> None:
+    """R90: warning diagnostics cannot strand a recovered age-flush tail."""
+    failure = RuntimeError("backend down")
+    backend = mocker.Mock()
+    backend.store.side_effect = [failure, None]
+    strat = BatchedStorageStrategy(threshold=1000, max_buffer_age_s=0.1)
+    with strat._lock:
+      strat._buffer.append((backend, "k", b"v", None))
+      strat._oldest_ts = 0.0
+    stop = mocker.Mock()
+    stop.wait.side_effect = [False, False, True]
+    strat._stop = stop
+    monotonic = mocker.Mock(side_effect=[1.0, 0.0, 1.0])
+    monkeypatch.setattr(batched_module.time, "monotonic", monotonic)
+    mocker.patch.object(
+      batched_module.logger,
+      "warning",
+      side_effect=KeyboardInterrupt("diagnostic interrupted"),
+    )
+
+    strat._age_flush_loop()
+
+    assert backend.store.call_count == 2
+    assert strat.pending == 0
+
+  def test_age_flush_monitor_fallback_debug_interrupt_does_not_stop_retry_cycle(
+    self, monkeypatch, mocker
+  ) -> None:
+    """R90: a monitor's ordinary error plus debug interruption is non-fatal."""
+    from scrapy_extension.monitor.base import Monitor
+
+    failure = RuntimeError("backend down")
+    backend = mocker.Mock()
+    backend.store.side_effect = [failure, None]
+    monitor = mocker.Mock(spec=Monitor)
+    monitor.on_error.side_effect = RuntimeError("monitor down")
+    strat = BatchedStorageStrategy(
+      threshold=1000,
+      max_buffer_age_s=0.1,
+      monitor=monitor,
+    )
+    with strat._lock:
+      strat._buffer.append((backend, "k", b"v", None))
+      strat._oldest_ts = 0.0
+    stop = mocker.Mock()
+    stop.wait.side_effect = [False, False, True]
+    strat._stop = stop
+    monotonic = mocker.Mock(side_effect=[1.0, 0.0, 1.0])
+    monkeypatch.setattr(batched_module.time, "monotonic", monotonic)
+    mocker.patch.object(
+      batched_module.logger,
+      "debug",
+      side_effect=KeyboardInterrupt("diagnostic interrupted"),
+    )
+
+    strat._age_flush_loop()
+
+    monitor.on_error.assert_called_once_with("store", failure)
+    assert backend.store.call_count == 2
+    assert strat.pending == 0
+
 
 class TestBatchedStorageFlusherTOCTOU:
   """R-flusher-1: ``_ensure_flusher``'s guard + create + start must be ATOMIC

@@ -165,7 +165,14 @@ class BatchedStorageStrategy(StorageStrategy):
     try:
       self._monitor.on_error(operation, error)
     except Exception:  # noqa: BLE001 - monitor must never crash storage
-      logger.debug("on_error hook raised", exc_info=True)
+      try:
+        logger.debug("on_error hook raised", exc_info=True)
+      except BaseException:
+        # This is a fallback diagnostic after an ordinary monitor failure.
+        # It must not terminate the age-flush retry daemon and strand its
+        # re-enqueued batch. A direct control exception from the monitor is
+        # still intentionally not caught by the outer ``except Exception``.
+        pass
 
   def store(
     self,
@@ -485,7 +492,12 @@ class BatchedStorageStrategy(StorageStrategy):
           # the loop alive so a transient outage doesn't disable the flusher
           # and report a failure that has no synchronous pipeline caller.
           self._emit_error("store", exc)
-          logger.warning(
-            "age-based flush failed; will retry next cycle (loss window "
-            "may grow until the backend recovers)"
-          )
+          try:
+            logger.warning(
+              "age-based flush failed; will retry next cycle (loss window "
+              "may grow until the backend recovers)"
+            )
+          except BaseException:
+            # The backend failure was already recovered into the retry buffer.
+            # Diagnostics must not kill the daemon before its next cycle.
+            pass
