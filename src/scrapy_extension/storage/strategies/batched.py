@@ -262,7 +262,8 @@ class BatchedStorageStrategy(StorageStrategy):
     written) are not re-added — the tail carries only what was not yet
     attempted.
 
-    Note: this protects against store *exceptions*; a process *crash* before
+    Note: this protects against store failures, including process-control
+    signals such as ``KeyboardInterrupt``; a process *crash* before
     the flush completes still loses the in-flight batch (documented at module
     level) — that is a separate failure mode requiring durable buffering.
     Risk 2's ``max_buffer_age_s`` bounds (but does not eliminate) that window.
@@ -302,9 +303,12 @@ class BatchedStorageStrategy(StorageStrategy):
     for i, (storage_backend, key, value, ttl) in enumerate(batch):
       try:
         storage_backend.store(key, value, ttl=ttl)
-      except Exception:
+      except BaseException:
         # Re-enqueue the un-written tail (this item + remaining) so the next
-        # flush retries them. At-least-once: no silent loss.
+        # flush retries them. This must include BaseException: after a
+        # KeyboardInterrupt/SystemExit the caller still receives the control
+        # signal, but the unattempted tail must not have been silently lost.
+        # At-least-once: no silent loss.
         tail = batch[i:]
         with self._lock:
           # New items may have been appended between the snapshot and the

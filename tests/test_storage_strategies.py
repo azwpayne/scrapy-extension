@@ -588,6 +588,36 @@ class TestBatchedStoragePartialFailure:
     assert written_keys == ["k1", "k2", "k2", "k3"]
     assert strat.pending == 0
 
+  def test_keyboard_interrupt_requeues_unwritten_tail_before_reraising(
+    self, mocker
+  ) -> None:
+    """A control signal must preserve the same at-least-once retry tail."""
+    backend = mocker.Mock()
+    attempts: list[str] = []
+    interrupted = False
+
+    def interrupt_second_store(key, value, ttl=None):  # noqa: ARG001
+      nonlocal interrupted
+      attempts.append(key)
+      if key == "k2" and not interrupted:
+        interrupted = True
+        raise KeyboardInterrupt("stop after item 1")
+
+    backend.store.side_effect = interrupt_second_store
+    strat = BatchedStorageStrategy(threshold=3)
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+
+    with pytest.raises(KeyboardInterrupt, match="stop after item 1"):
+      strat.store(backend, "k3", b"v3")
+
+    assert strat.pending == 2
+
+    strat.flush()
+
+    assert attempts == ["k1", "k2", "k2", "k3"]
+    assert strat.pending == 0
+
   def test_threshold_flush_failure_propagates_without_losing_buffer(self, mocker) -> None:
     """Sustained failure stays retryable while remaining visible to callers."""
     backend = mocker.Mock()
