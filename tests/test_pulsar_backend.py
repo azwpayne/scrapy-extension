@@ -303,6 +303,28 @@ class TestPulsarConnect:
     assert b._consumer is None
     assert b._subscribed_topic is None
 
+  def test_disconnect_closes_every_handle_after_baseexception(self, mocker) -> None:
+    b, client = _connected(mocker)
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    producer_a = mocker.MagicMock(name="producer_a")
+    producer_b = mocker.MagicMock(name="producer_b")
+    first = KeyboardInterrupt()
+    consumer_a.close.side_effect = first
+    producer_a.close.side_effect = SystemExit(2)
+    b._consumers = {"topic_a": consumer_a, "topic_b": consumer_b}
+    b._producers = {"topic_a": producer_a, "topic_b": producer_b}
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.disconnect()
+
+    assert raised.value is first
+    for handle in (consumer_a, consumer_b, producer_a, producer_b, client):
+      handle.close.assert_called_once_with()
+    assert b._consumers == {}
+    assert b._producers == {}
+    assert b._client is None
+
   def test_reconnect_during_disconnect_does_not_close_new_client(self, mocker) -> None:
     close_started = Event()
     release_close = Event()

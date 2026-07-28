@@ -486,15 +486,24 @@ class PulsarBackend(Backend, QueueBackend):
       self._last_delivery = None
       with self._in_flight_lock:
         self._in_flight.clear()
-    for consumer in consumers.values():
-      with _suppress_pulsar_errors():
-        consumer.close()
-    for producer in producers.values():
-      with _suppress_pulsar_errors():
-        producer.close()
+    handles = [*consumers.values(), *producers.values()]
     if client is not None:
-      with _suppress_pulsar_errors():
-        client.close()
+      handles.append(client)
+    self._close_detached_handles(*handles)
+
+  @staticmethod
+  def _close_detached_handles(*handles: Any) -> None:
+    """Close every detached handle, retaining the first control exception."""
+    primary_error: BaseException | None = None
+    for handle in handles:
+      try:
+        with _suppress_pulsar_errors():
+          handle.close()
+      except BaseException as error:
+        if primary_error is None:
+          primary_error = error
+    if primary_error is not None:
+      raise primary_error
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
