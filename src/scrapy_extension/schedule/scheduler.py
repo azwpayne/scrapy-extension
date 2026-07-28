@@ -1507,18 +1507,22 @@ class BackendScheduler:
           logger.exception("Failed to close dupefilter during shutdown")
         finally:
           self._dupefilter_open = False
-      self._queue = None
-      self._spider = None
-      self._connected_signals = None
-      self._signals_connected = False
-      self._backpressure_paused = False
-      self._backpressure_probe_due = False
     except BaseException as exc:  # noqa: BLE001 — capture Ctrl+C/SystemExit
       # A BaseException (Ctrl+C / SystemExit) escaped a teardown step whose
       # ``except Exception`` guard does not cover it. Capture it; the finally
       # still releases the manager, then we re-raise so the signal is not lost.
       primary_error = exc
     finally:
+      # R35-F7: state-reset tail moved here so it runs even if BaseException
+      # aborts teardown mid-try. Idempotent: assigning None / False on
+      # already-None is a no-op; a re-entrant close() short-circuits at the
+      # lifecycle_state guard before reaching here, so no double-reset risk.
+      self._queue = None
+      self._spider = None
+      self._connected_signals = None
+      self._signals_connected = False
+      self._backpressure_paused = False
+      self._backpressure_probe_due = False
       if self._owns_connection_manager and not self._manager_released:
         # ``from_settings`` acquired one shared-manager reference for this
         # scheduler. Pair it with exactly one release even if Scrapy (or a
