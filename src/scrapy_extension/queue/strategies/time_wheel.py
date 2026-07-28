@@ -44,7 +44,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.queue.strategies.base import (
   QueueStrategy,
@@ -298,8 +298,14 @@ class TimeWheelQueueStrategy(QueueStrategy):
     """
     timeout = normalize_queue_timeout(timeout)
     self.bind(queue_name)
-    self._drain_ready(queue_name)
-    return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
+    return cast(
+      bytes | None,
+      self._pop_until_deadline(
+        queue_name,
+        timeout,
+        lambda wait: self._connection_manager.get_queue_backend().pop(queue_name, wait),
+      ),
+    )
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
@@ -312,8 +318,57 @@ class TimeWheelQueueStrategy(QueueStrategy):
     """
     timeout = normalize_queue_timeout(timeout)
     self.bind(queue_name)
-    self._drain_ready(queue_name)
-    return self._pop_backend_with_ack(queue_name, timeout)
+    return cast(
+      tuple[bytes | None, object | None],
+      self._pop_until_deadline(
+        queue_name,
+        timeout,
+        lambda wait: self._pop_backend_with_ack(queue_name, wait),
+        has_item=lambda result: result[0] is not None,
+        empty=(None, None),
+      ),
+    )
+
+  def _next_release_at(self) -> float | None:
+    """Return the next local release, respecting wheel tick granularity."""
+    with self._state_lock:
+      candidates = [
+        math.ceil(ready_at * self._ticks_per_second) / self._ticks_per_second
+        for slot in self._wheel
+        for ready_at, _item, _priority in slot
+      ]
+      if self._overflow:
+        candidates.append(self._overflow[0][0])
+      return min(candidates) if candidates else None
+
+  def _pop_until_deadline(
+    self,
+    queue_name: str,
+    timeout: float,
+    backend_pop: Callable[[float], Any],
+    *,
+    has_item: Callable[[Any], bool] | None = None,
+    empty: Any = None,
+  ) -> Any:
+    """Drain at local release deadlines without exceeding the caller budget."""
+    is_item = has_item if has_item is not None else lambda item: item is not None
+    deadline: float | None = None
+    while True:
+      self._drain_ready(queue_name)
+      before = self._clock_now()
+      if deadline is None:
+        deadline = before + timeout
+      remaining = max(0.0, deadline - before)
+      next_release = self._next_release_at()
+      wait = remaining
+      if next_release is not None:
+        wait = min(wait, max(0.0, next_release - before))
+      result = backend_pop(wait)
+      if is_item(result):
+        return result
+      after = self._clock_now()
+      if timeout == 0.0 or after >= deadline or after <= before:
+        return empty
 
   def _drain_ready(self, queue_name: str) -> None:
     """Move all due held items (wheel + overflow) into the live queue.

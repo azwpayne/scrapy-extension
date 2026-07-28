@@ -67,6 +67,31 @@ def test_push_no_delay_goes_straight_to_live():
   qb.push.assert_called_once_with("q", b"now", 1.0)
 
 
+def test_pop_drains_item_that_becomes_ready_during_timeout():
+  """R46: a positive timeout is split at the next wheel release tick."""
+  s, qb, clock = _strategy(wheel_size=60, clock_value=0.0)
+  s.push("q", b"held", delay=5.0)
+  qb.pop.side_effect = lambda _q, wait: (
+    clock.__setitem__(0, clock[0] + wait) or (None if clock[0] == 5.0 else b"held")
+  )
+
+  assert s.pop("q", timeout=10.0) == b"held"
+  assert qb.pop.call_args_list[0].args == ("q", 5.0)
+
+
+def test_pop_with_ack_preserves_token_after_local_deadline(mocker):
+  s, _qb, clock = _strategy(wheel_size=60, clock_value=0.0)
+  s.push("q", b"held", delay=5.0)
+
+  def backend_pop(_q: str, wait: float):
+    clock[0] += wait
+    return (None, None) if clock[0] == 5.0 else (b"held", "token")
+
+  delegated = mocker.patch.object(s, "_pop_backend_with_ack", side_effect=backend_pop)
+  assert s.pop_with_ack("q", timeout=10.0) == (b"held", "token")
+  assert delegated.call_args_list[0].args == ("q", 5.0)
+
+
 def test_push_default_delay_when_omitted():
   s, qb, _ = _strategy(default_delay=5.0, clock_value=100.0)
   s.push("q", b"x")  # no explicit delay → default_delay

@@ -20,6 +20,36 @@ def _clock(now: list[float]):
 
 
 class TestDelayQueueStrategy:
+  def test_pop_drains_item_that_becomes_ready_during_timeout(
+    self, mock_connection_manager
+  ) -> None:
+    """R46: backend waits stop at the next local deadline, then re-drain."""
+    now = [0.0]
+    strat = DelayQueueStrategy(mock_connection_manager, clock=_clock(now))
+    strat.push("q", b"held", delay=5.0)
+    backend = mock_connection_manager.get_queue_backend()
+    backend.pop.side_effect = lambda _q, wait: (
+      now.__setitem__(0, now[0] + wait) or (None if now[0] == 5.0 else b"held")
+    )
+
+    assert strat.pop("q", timeout=10.0) == b"held"
+    assert backend.pop.call_args_list[0].args == ("q", 5.0)
+
+  def test_pop_with_ack_preserves_token_after_local_deadline(
+    self, mock_connection_manager, mocker
+  ) -> None:
+    now = [0.0]
+    strat = DelayQueueStrategy(mock_connection_manager, clock=_clock(now))
+    strat.push("q", b"held", delay=5.0)
+
+    def backend_pop(_queue_name: str, wait: float):
+      now[0] += wait
+      return (None, None) if now[0] == 5.0 else (b"held", "token")
+
+    delegated = mocker.patch.object(strat, "_pop_backend_with_ack", side_effect=backend_pop)
+    assert strat.pop_with_ack("q", timeout=10.0) == (b"held", "token")
+    assert delegated.call_args_list[0].args == ("q", 5.0)
+
   def test_push_holds_until_ready(self, mock_connection_manager) -> None:
     now = [100.0]
     strat = DelayQueueStrategy(

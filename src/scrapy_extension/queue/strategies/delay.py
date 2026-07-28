@@ -21,7 +21,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.queue.strategies.base import (
@@ -311,8 +311,14 @@ class DelayQueueStrategy(QueueStrategy):
     """
     timeout = normalize_queue_timeout(timeout)
     self.bind(queue_name)
-    self._drain_ready(queue_name)
-    return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
+    return cast(
+      bytes | None,
+      self._pop_until_deadline(
+        queue_name,
+        timeout,
+        lambda wait: self._connection_manager.get_queue_backend().pop(queue_name, wait),
+      ),
+    )
 
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
@@ -327,8 +333,50 @@ class DelayQueueStrategy(QueueStrategy):
     """
     timeout = normalize_queue_timeout(timeout)
     self.bind(queue_name)
-    self._drain_ready(queue_name)
-    return self._pop_backend_with_ack(queue_name, timeout)
+    return cast(
+      tuple[bytes | None, Any | None],
+      self._pop_until_deadline(
+        queue_name,
+        timeout,
+        lambda wait: self._pop_backend_with_ack(queue_name, wait),
+        has_item=lambda result: result[0] is not None,
+        empty=(None, None),
+      ),
+    )
+
+  def _next_ready_at(self) -> float | None:
+    """Return the next held deadline while keeping heap access synchronized."""
+    with self._state_lock:
+      return self._holding[0][0] if self._holding else None
+
+  def _pop_until_deadline(
+    self,
+    queue_name: str,
+    timeout: float,
+    backend_pop: Callable[[float], Any],
+    *,
+    has_item: Callable[[Any], bool] | None = None,
+    empty: Any = None,
+  ) -> Any:
+    """Drain at local deadlines without exceeding one caller timeout budget."""
+    is_item = has_item if has_item is not None else lambda item: item is not None
+    deadline: float | None = None
+    while True:
+      self._drain_ready(queue_name)
+      before = _require_finite(self._clock(), "clock value")
+      if deadline is None:
+        deadline = _require_finite(before + timeout, "deadline")
+      remaining = max(0.0, deadline - before)
+      next_ready = self._next_ready_at()
+      wait = remaining
+      if next_ready is not None:
+        wait = min(wait, max(0.0, next_ready - before))
+      result = backend_pop(wait)
+      if is_item(result):
+        return result
+      after = _require_finite(self._clock(), "clock value")
+      if timeout == 0.0 or after >= deadline or after <= before:
+        return empty
 
   def _drain_ready(self, queue_name: str) -> None:
     """Move all due held items into the live queue.
