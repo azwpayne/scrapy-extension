@@ -1511,6 +1511,51 @@ class TestCloseBackend:
     manager.close.assert_called_once_with()
     assert caplog.text.count("Failed to disconnect backend lifecycle signal") == 2
 
+  def test_close_backend_releases_manager_after_component_baseexception(self, mocker):
+    """R47: Ctrl-C in one close hook cannot leak the shared manager acquire."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    scheduler = mocker.MagicMock()
+    queue = mocker.MagicMock()
+    dupefilter = mocker.MagicMock()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._scheduler = scheduler
+    spider._queue = queue
+    spider._dupefilter = dupefilter
+    spider._connection_manager = manager
+    scheduler.close.side_effect = KeyboardInterrupt()
+    manager.close.side_effect = SystemExit(2)
+
+    with pytest.raises(KeyboardInterrupt):
+      spider.close_backend()
+
+    queue.close.assert_called_once_with()
+    dupefilter.close.assert_called_once_with("spider-mixin-close")
+    manager.close.assert_called_once_with()
+    assert spider._connection_manager is None
+
+  def test_close_backend_reraises_manager_baseexception_after_components(self, mocker):
+    """R47: manager process-control errors retain their original semantics."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    queue = mocker.MagicMock()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._queue = queue
+    spider._connection_manager = manager
+    manager.close.side_effect = SystemExit(2)
+
+    with pytest.raises(SystemExit, match="2"):
+      spider.close_backend()
+
+    queue.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+
   def test_close_backend_reentrant_component_close_is_idempotent(self, mocker):
     """A component close hook may safely trigger duplicate spider shutdown."""
 

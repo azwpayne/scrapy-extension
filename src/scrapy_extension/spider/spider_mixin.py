@@ -611,8 +611,12 @@ class BackendSpiderMixin(Spider):
       self._connection_manager = None
       self._consumer_queue_name = None
 
+      primary_error: BaseException | None = None
       if signal_manager is not None:
-        self._disconnect_lifecycle_signals(signal_manager)
+        try:
+          self._disconnect_lifecycle_signals(signal_manager)
+        except BaseException as exc:  # noqa: BLE001 - manager release is mandatory
+          primary_error = exc
 
       # Components borrow the mixin's single manager acquire, so each must
       # quiesce its own resources without releasing the manager. The final
@@ -628,12 +632,20 @@ class BackendSpiderMixin(Spider):
           component.close(*args)
         except Exception:
           logger.exception("Failed to close backend %s", label)
+        except BaseException as exc:  # noqa: BLE001 - preserve process control
+          if primary_error is None:
+            primary_error = exc
 
       if manager is not None:
         try:
           manager.close()
         except Exception:
           logger.exception("Failed to close backend connection manager")
+        except BaseException as exc:  # noqa: BLE001 - do not mask component error
+          if primary_error is None:
+            primary_error = exc
+      if primary_error is not None:
+        raise primary_error
 
   @property
   def connection_manager(self) -> ConnectionManager:
