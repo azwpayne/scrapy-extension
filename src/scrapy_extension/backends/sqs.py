@@ -981,10 +981,16 @@ class SqsBackend(Backend, QueueBackend):
               QueueUrl=url, ReceiptHandle=receipt
             )
           except Exception:  # noqa: BLE001 - preserve the decode failure below
-            logger.exception(
-              "Failed to delete malformed SQS message from queue %r",
-              queue_name,
-            )
+            # Diagnostic handlers are user-configurable and can themselves
+            # raise a control exception. The malformed body is the causal
+            # failure here, so logging must not replace its QueueError.
+            try:
+              logger.exception(
+                "Failed to delete malformed SQS message from queue %r",
+                queue_name,
+              )
+            except BaseException:  # noqa: BLE001 - retain decode failure
+              pass
           raise QueueError(
             f"Invalid base64 body in SQS queue {queue_name}: {e}",
             queue_name=queue_name,

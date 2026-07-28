@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import binascii
 import threading
 from contextlib import contextmanager
 from unittest.mock import MagicMock
@@ -868,6 +869,50 @@ class TestSqsPushPop:
       QueueUrl="https://sqs/test",
       ReceiptHandle="rh",
     )
+
+  def test_pop_malformed_body_preserves_decode_error_when_delete_diagnostic_interrupts(
+    self, mocker
+  ) -> None:
+    """The poison-message cleanup diagnostic cannot replace the decode error."""
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "not-base64!", "ReceiptHandle": "rh"}]
+    }
+    client.delete_message.side_effect = RuntimeError("delete failed")
+    diagnostic = mocker.patch(
+      "scrapy_extension.backends.sqs.logger.exception",
+      side_effect=KeyboardInterrupt("diagnostic interrupted"),
+    )
+
+    with pytest.raises(QueueError) as raised:
+      b.pop("queue1")
+
+    assert raised.value.operation == "pop"
+    assert isinstance(raised.value.__cause__, binascii.Error)
+    client.delete_message.assert_called_once_with(
+      QueueUrl="https://sqs/test", ReceiptHandle="rh"
+    )
+    diagnostic.assert_called_once_with(
+      "Failed to delete malformed SQS message from queue %r", "queue1"
+    )
+
+  def test_pop_malformed_body_propagates_direct_delete_interrupt(
+    self, mocker
+  ) -> None:
+    """A control exception from the broker deletion remains causal."""
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": "not-base64!", "ReceiptHandle": "rh"}]
+    }
+    interrupt = KeyboardInterrupt("delete interrupted")
+    client.delete_message.side_effect = interrupt
+    diagnostic = mocker.patch("scrapy_extension.backends.sqs.logger.exception")
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.pop("queue1")
+
+    assert raised.value is interrupt
+    diagnostic.assert_not_called()
 
   def test_pop_caps_wait_at_20(self, mocker) -> None:
     b, client = _connected(mocker)
