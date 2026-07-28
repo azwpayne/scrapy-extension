@@ -380,6 +380,8 @@ SCRAPY_PULSAR_TLS_TRUST_CERTS_FILE = "/etc/ssl/private-pki-ca.pem"
 Authenticated connections reject blank tokens, URL userinfo,
 `SCRAPY_PULSAR_ALLOW_INSECURE_CONNECTION=True`, and
 `SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=False`.
+Clusters use one scheme followed by comma-separated `host[:port]` members;
+ports must be numeric and in range, and IPv6 members must be bracketed.
 
 ### Amazon SQS (standalone=LocalStack, cloud=AWS)
 

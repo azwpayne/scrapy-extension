@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -90,6 +91,37 @@ def validate_pulsar_connection(
       "auth_token separately.",
       setting_name="service_url",
     )
+  for endpoint in endpoints:
+    try:
+      parsed = urlsplit(f"//{endpoint}")
+      _ = parsed.port
+    except ValueError:
+      raise ConfigurationError(
+        "Each Pulsar endpoint must be a host with an optional valid port.",
+        setting_name="service_url",
+      ) from None
+    netloc = parsed.netloc
+    port_text = (
+      netloc[netloc.rfind("]") + 2 :]
+      if netloc.startswith("[") and "]" in netloc and len(netloc) > netloc.rfind("]") + 1
+      else netloc.rsplit(":", 1)[1] if ":" in netloc else None
+    )
+    if (
+      not parsed.hostname
+      or parsed.username is not None
+      or parsed.password is not None
+      or parsed.path
+      or parsed.query
+      or parsed.fragment
+      or (
+        port_text is not None
+        and (not port_text.isascii() or not port_text.isdecimal() or not 1 <= int(port_text) <= 65535)
+      )
+    ):
+      raise ConfigurationError(
+        "Each Pulsar endpoint must be a host with an optional valid port.",
+        setting_name="service_url",
+      )
 
   if tls_trust_certs_file is not None and (
     not isinstance(tls_trust_certs_file, str)

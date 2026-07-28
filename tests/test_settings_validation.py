@@ -742,6 +742,28 @@ class TestPulsarServiceUrlScheme:
         service_url="pulsar://one:6650,pulsar://two:6650",
       )
 
+  @pytest.mark.parametrize(
+    "url",
+    [
+      "pulsar://broker:abc",
+      "pulsar://broker:",
+      "pulsar://broker:0",
+      "pulsar://broker: 6650",
+      "pulsar://one:6650,two:bad",
+      "pulsar://:6650",
+      "pulsar://broker:70000",
+      "pulsar://broker/path",
+      "pulsar://broker:6650?secret=value",
+    ],
+  )
+  def test_service_url_rejects_malformed_endpoint_member(self, url: str) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      PulsarSettings(service_url=url)
+    assert exc_info.value.setting_name == "service_url"
+
+  def test_service_url_accepts_bracketed_ipv6_endpoint(self) -> None:
+    assert PulsarSettings(service_url="pulsar://[::1]:6650").service_url
+
 
 class TestRocketMQNamesrvFormat:
   """RocketMQSettings.namesrv_address SV4 ``host:port`` guard."""

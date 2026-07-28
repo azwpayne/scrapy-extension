@@ -51,6 +51,9 @@ before client construction. Cluster discovery uses one prefix:
 `pulsar://broker-one:6650,broker-two:6650`. A repeated form such as
 `pulsar://broker-one:6650,pulsar://broker-two:6650` is rejected at startup
 because the SDK interprets the second prefix as an invalid hostname.
+Malformed or empty endpoint members, nonnumeric/out-of-range ports, URL
+userinfo, paths, queries, and fragments now fail at startup; correct the
+service URL before upgrading.
 Connection setup revalidates one captured settings snapshot and uses it for
 both client and later subscription construction. Public startup errors no
 longer include raw driver text or the service URL.
