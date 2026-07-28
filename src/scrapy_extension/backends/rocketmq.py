@@ -268,12 +268,11 @@ class RocketMQBackend(Backend, QueueBackend):
     self._subscribed_topics.clear()
     self._last_msg = None
     self._last_delivery = None
-    for closer in (consumer, producer):
-      if closer is not None:
-        try:
-          closer.shutdown()
-        except Exception:
-          logger.debug("Failed to abort partial RocketMQ client", exc_info=True)
+    self._shutdown_detached_clients(
+      (consumer, "consumer"),
+      (producer, "producer"),
+      suppress_control_errors=True,
+    )
 
   def disconnect(self) -> None:
     """Close RocketMQ connections (shutdown producer + consumer)."""
@@ -287,15 +286,32 @@ class RocketMQBackend(Backend, QueueBackend):
     self._subscribed_topics.clear()
     self._last_msg = None
     self._last_delivery = None
-    for closer, label in ((producer, "producer"), (consumer, "consumer")):
+    self._shutdown_detached_clients((producer, "producer"), (consumer, "consumer"))
+    logger.debug("Disconnected from RocketMQ")
+
+  @staticmethod
+  def _shutdown_detached_clients(
+    *clients: tuple[Any | None, str],
+    suppress_control_errors: bool = False,
+  ) -> None:
+    """Shut down every detached client, retaining the first control exception."""
+    primary_error: BaseException | None = None
+    for closer, label in clients:
       if closer is not None:
         try:
           closer.shutdown()
-        except Exception:  # noqa: BLE001 - disconnect must not raise
-          logger.warning(
-            "RocketMQ %s shutdown raised; ignoring", label, exc_info=True
-          )
-    logger.debug("Disconnected from RocketMQ")
+        except Exception:
+          if suppress_control_errors:
+            logger.debug("Failed to abort partial RocketMQ client", exc_info=True)
+          else:
+            logger.warning(
+              "RocketMQ %s shutdown raised; ignoring", label, exc_info=True
+            )
+        except BaseException as error:
+          if primary_error is None:
+            primary_error = error
+    if primary_error is not None and not suppress_control_errors:
+      raise primary_error
 
   def is_connected(self) -> bool:
     """Check if RocketMQ is connected (both clients running).

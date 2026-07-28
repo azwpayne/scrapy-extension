@@ -550,13 +550,16 @@ def test_connect_consumer_startup_baseexception_cleans_both_clients(mocker) -> N
   mongodb/es ``except BaseException`` cleanup pattern.
   """
   mock_producer_cls, mock_consumer_cls, *_ = _patch_rocketmq(mocker)
-  mock_consumer_cls.return_value.startup.side_effect = KeyboardInterrupt
+  startup_error = KeyboardInterrupt()
+  mock_consumer_cls.return_value.startup.side_effect = startup_error
+  mock_consumer_cls.return_value.shutdown.side_effect = SystemExit(2)
   backend = RocketMQBackend(RocketMQSettings())
 
   # The BaseException must propagate, not be swallowed into BackendConnectionError.
-  with pytest.raises(KeyboardInterrupt):
+  with pytest.raises(KeyboardInterrupt) as raised:
     backend.connect()
 
+  assert raised.value is startup_error
   # No wedge/leak: abort ran, so both clients are detached and best-effort stopped.
   mock_consumer_cls.return_value.shutdown.assert_called_once()
   mock_producer_cls.return_value.shutdown.assert_called_once()
@@ -611,6 +614,22 @@ def test_disconnect_best_effort_on_shutdown_failure(mocker) -> None:
   mock_producer.shutdown.assert_called_once()
   mock_consumer.shutdown.assert_called_once()  # still attempted
   assert backend._producer is None
+
+
+def test_disconnect_closes_all_clients_after_baseexception(mocker) -> None:
+  backend, producer, consumer, _ = _make_connected_backend(mocker)
+  first = KeyboardInterrupt()
+  producer.shutdown.side_effect = first
+  consumer.shutdown.side_effect = SystemExit(2)
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    backend.disconnect()
+
+  assert raised.value is first
+  producer.shutdown.assert_called_once_with()
+  consumer.shutdown.assert_called_once_with()
+  assert backend._producer is None
+  assert backend._consumer is None
 
 
 # ---------------------------------------------------------------------------
