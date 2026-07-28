@@ -258,6 +258,53 @@ def test_attempt_connection_close_wins_preserves_discard_error(mocker):
   assert manager._backend is None
 
 
+def test_attempt_connection_close_wins_preserves_discard_error_when_warning_interrupts(
+  mocker,
+):
+  """Close-winning error survives a control exception from cleanup diagnostics."""
+  import threading
+
+  manager = ConnectionManager(BackendType.REDIS)
+  connect_entered = threading.Event()
+  allow_connect_return = threading.Event()
+
+  def _connect() -> None:
+    connect_entered.set()
+    assert allow_connect_return.wait(timeout=5), "test did not release connect"
+
+  backend = mocker.MagicMock()
+  backend.connect.side_effect = _connect
+  backend.disconnect.side_effect = RuntimeError("cleanup failure")
+  mocker.patch.object(manager, "_create_backend", return_value=backend)
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.warning",
+    side_effect=SystemExit("diagnostic interruption"),
+  )
+
+  outcome: list[BaseException] = []
+
+  def _attempt() -> None:
+    try:
+      manager._attempt_connection()
+    except BaseException as exc:  # noqa: BLE001 - capture the thread outcome
+      outcome.append(exc)
+
+  worker = threading.Thread(target=_attempt)
+  worker.start()
+  assert connect_entered.wait(timeout=5), "backend.connect() was not entered"
+
+  manager.close()
+  allow_connect_return.set()
+  worker.join(timeout=5)
+
+  assert not worker.is_alive(), "connection attempt did not finish"
+  assert len(outcome) == 1
+  assert isinstance(outcome[0], BackendConnectionError)
+  assert "backend discarded" in str(outcome[0])
+  backend.disconnect.assert_called_once_with()
+  assert manager._backend is None
+
+
 def test_close_swallows_backend_disconnect_error_and_still_evicts(mocker):
   """R44-A1: close() must not propagate a backend-specific disconnect error.
 

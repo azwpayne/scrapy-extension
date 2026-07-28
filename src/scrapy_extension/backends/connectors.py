@@ -1251,7 +1251,13 @@ class ConnectionManager:
       # This teardown is best-effort.  In particular, a control-flow signal
       # from a broken backend must not replace the typed error which explains
       # why the successful connection was discarded.
-      logger.warning("Error disconnecting released backend: %s", exc)
+      try:
+        logger.warning("Error disconnecting released backend: %s", exc)
+      except BaseException:
+        # Diagnostics are also best-effort: a custom logging handler can raise
+        # a control-flow signal, but close winning the publication race remains
+        # the causal terminal condition for this connection attempt.
+        pass
     raise BackendConnectionError(
       "Connection completed after ConnectionManager release; backend discarded",
       backend_type=str(self.backend_type),
