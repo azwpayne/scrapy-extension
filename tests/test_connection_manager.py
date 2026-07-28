@@ -188,6 +188,23 @@ def test_attempt_connection_disconnect_failure_is_swallowed(mocker):
     manager._attempt_connection()
 
 
+def test_attempt_connection_cleans_up_after_baseexception(mocker):
+  """A control-flow interruption still releases a half-built backend."""
+  manager = ConnectionManager(BackendType.REDIS)
+  mock_backend = mocker.MagicMock()
+  original = KeyboardInterrupt()
+  mock_backend.connect.side_effect = original
+  mock_backend.disconnect.side_effect = SystemExit(2)
+  mocker.patch.object(manager, "_create_backend", return_value=mock_backend)
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    manager._attempt_connection()
+
+  assert raised.value is original
+  mock_backend.disconnect.assert_called_once_with()
+  assert manager._backend is None
+
+
 def test_close_swallows_backend_disconnect_error_and_still_evicts(mocker):
   """R44-A1: close() must not propagate a backend-specific disconnect error.
 

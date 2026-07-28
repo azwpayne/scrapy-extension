@@ -1215,9 +1215,12 @@ class ConnectionManager:
     backend = self._create_backend()
     try:
       backend.connect()
-    except Exception:
-      with contextlib.suppress(Exception):
+    except BaseException:
+      try:
         backend.disconnect()
+      except BaseException:
+        # Cleanup must never replace the original failed connection signal.
+        pass
       raise
     with self._lock:
       if not self._retired:
