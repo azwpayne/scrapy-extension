@@ -440,7 +440,10 @@ class BackendQueue:
       try:
         self._monitor.on_error("push", e)
       except Exception:  # noqa: BLE001 - telemetry cannot mask the real error
-        logger.debug("monitor.on_error(push) raised; ignored", exc_info=True)
+        try:
+          logger.debug("monitor.on_error(push) raised; ignored", exc_info=True)
+        except BaseException:
+          pass
       msg = f"Failed to serialize request: {e}"
       raise SerializationError(
         msg,
@@ -631,10 +634,13 @@ class BackendQueue:
             # Preserve redelivery when the terminal commit itself failed.
             self._nack(token=ack_token)
           except Exception:  # noqa: BLE001 - preserve the ack failure
-            logger.exception(
-              "Failed to nack empty payload after ack failure from queue %r",
-              self.queue_name,
-            )
+            try:
+              logger.exception(
+                "Failed to nack empty payload after ack failure from queue %r",
+                self.queue_name,
+              )
+            except BaseException:
+              pass
           raise
         self._inc_stat("scheduler/queue/empty_payload_dropped")
       return None
@@ -667,10 +673,13 @@ class BackendQueue:
           self._ack(token=ack_token)
           poison_terminated = True
         except Exception:  # noqa: BLE001 - preserve the deserialize failure
-          logger.exception(
-            "Failed to acknowledge malformed payload from queue %r",
-            self.queue_name,
-          )
+          try:
+            logger.exception(
+              "Failed to acknowledge malformed payload from queue %r",
+              self.queue_name,
+            )
+          except BaseException:
+            pass
       if poison_terminated:
         self._inc_stat("scheduler/queue/poison_dropped")
       # R14-D: emit on_error so deserialize failures surface as ``errors/pop``
@@ -679,7 +688,10 @@ class BackendQueue:
       try:
         self._monitor.on_error("pop", e)
       except Exception:  # noqa: BLE001 - telemetry cannot mask the real error
-        logger.debug("monitor.on_error(pop) raised; ignored", exc_info=True)
+        try:
+          logger.debug("monitor.on_error(pop) raised; ignored", exc_info=True)
+        except BaseException:
+          pass
       msg = f"Failed to deserialize request: {e}"
       raise SerializationError(
         msg,
@@ -1076,10 +1088,13 @@ class BackendQueue:
     try:
       self._ack(token=token)
     except Exception:  # noqa: BLE001 - preserve the local validation error
-      logger.exception(
-        "Failed to acknowledge invalid replacement from queue %r",
-        self.queue_name,
-      )
+      try:
+        logger.exception(
+          "Failed to acknowledge invalid replacement from queue %r",
+          self.queue_name,
+        )
+      except BaseException:
+        pass
       return
     request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
     self._inc_stat("scheduler/queue/replacement_poison_dropped")
@@ -1103,7 +1118,10 @@ class BackendQueue:
       try:
         stats.inc_value(stat_name)
       except Exception:  # noqa: BLE001 - stats cannot mask the queue result
-        logger.debug("stats.inc_value(%s) raised; ignored", stat_name, exc_info=True)
+        try:
+          logger.debug("stats.inc_value(%s) raised; ignored", stat_name, exc_info=True)
+        except BaseException:
+          pass
 
   @staticmethod
   def _resolve_monitor(spider: Spider | None) -> Monitor:

@@ -28,7 +28,7 @@ from pytest_mock import MockerFixture
 from scrapy.http import Request
 
 from scrapy_extension.backends.base import _QueuePushReceipt
-from scrapy_extension.exceptions import SerializationError
+from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 
@@ -634,6 +634,134 @@ def test_error_monitor_failure_does_not_mask_serialization_error() -> None:
 
   with pytest.raises(SerializationError, match="Failed to serialize request"):
     bq.push(Request("https://example.com", meta={"bad": object()}))
+
+
+@pytest.mark.parametrize("operation", ["push", "pop"])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
+)
+def test_error_monitor_fallback_diagnostic_preserves_serialization_error(
+  mocker: MockerFixture, operation: str, diagnostic_error: BaseException
+) -> None:
+  """Logger failures cannot replace an already-selected serialization error."""
+  monitor = MagicMock()
+  monitor.on_error.side_effect = RuntimeError("monitor boom")
+  qb = MagicMock(name="QueueBackend")
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb), queue_name="q", monitor=monitor
+  )
+  logger_debug = mocker.patch(
+    "scrapy_extension.queue.queue.logger.debug", side_effect=diagnostic_error
+  )
+
+  if operation == "push":
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
+      bq.push(Request("https://example.com", meta={"bad": object()}))
+  else:
+    qb.pop.return_value = b"not valid JSON"
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
+      bq.pop()
+
+  monitor.on_error.assert_called_once()
+  logger_debug.assert_called_once()
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
+)
+@pytest.mark.parametrize(
+  "failure_site",
+  [
+    pytest.param("empty-nack", id="empty-ack-failure"),
+    pytest.param("malformed-ack", id="malformed-payload"),
+    pytest.param("invalid-replacement", id="invalid-replacement"),
+  ],
+)
+def test_terminal_ack_fallback_diagnostic_preserves_primary_outcome(
+  mocker: MockerFixture,
+  diagnostic_error: BaseException,
+  failure_site: str,
+) -> None:
+  """Fallback logs do not replace an ack error or preselected queue error."""
+  qb = MagicMock(name="QueueBackend")
+  strategy = MagicMock(name="QueueStrategy")
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb),
+    queue_name="q",
+    queue_strategy=strategy,
+  )
+  logger_exception = mocker.patch(
+    "scrapy_extension.queue.queue.logger.exception", side_effect=diagnostic_error
+  )
+
+  if failure_site == "empty-nack":
+    primary = RuntimeError("ack boom")
+    strategy.pop_with_ack.return_value = (None, "token")
+    qb.ack.side_effect = primary
+    qb.nack.side_effect = RuntimeError("nack boom")
+    with pytest.raises(RuntimeError) as raised:
+      bq.pop()
+    assert raised.value is primary
+  elif failure_site == "malformed-ack":
+    strategy.pop_with_ack.return_value = (b"not valid JSON", "token")
+    qb.ack.side_effect = RuntimeError("ack boom")
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
+      bq.pop()
+  else:
+    assert failure_site == "invalid-replacement"
+    qb.ack.side_effect = RuntimeError("ack boom")
+    with pytest.raises(QueueError, match="Invalid queue delay"):
+      bq.push(
+        Request(
+          "https://example.com",
+          meta={"_backend_ack_token": "token", "delay": "not-a-number"},
+        )
+      )
+
+  logger_exception.assert_called_once()
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
+)
+def test_stats_fallback_diagnostic_preserves_best_effort_primary_result(
+  mocker: MockerFixture, diagnostic_error: BaseException
+) -> None:
+  """A failed stats fallback remains secondary to the queue's primary result."""
+  spider = MagicMock()
+  spider.crawler.stats.inc_value.side_effect = RuntimeError("stats boom")
+  bq = BackendQueue(
+    connection_manager=_cm(), queue_name="q", spider=spider, max_item_bytes=1
+  )
+  logger_debug = mocker.patch(
+    "scrapy_extension.queue.queue.logger.debug", side_effect=diagnostic_error
+  )
+
+  with pytest.raises(SerializationError, match="exceeds max_item_bytes"):
+    bq.push(Request("https://example.com", body=b"too large"))
+
+  spider.crawler.stats.inc_value.assert_called_once_with(
+    "scheduler/queue/oversize_dropped"
+  )
+  logger_debug.assert_called_once()
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt(), SystemExit()])
+def test_direct_ack_control_exception_remains_observable(
+  control_error: BaseException,
+) -> None:
+  """Only diagnostic fallbacks are isolated; direct ack controls propagate."""
+  qb = MagicMock(name="QueueBackend")
+  qb.ack.side_effect = control_error
+  bq = BackendQueue(connection_manager=_cm(queue_backend=qb), queue_name="q")
+
+  with pytest.raises(type(control_error)) as raised:
+    bq.ack(token="token")
+
+  assert raised.value is control_error
 
 
 # ---------------------------------------------------------------------------
