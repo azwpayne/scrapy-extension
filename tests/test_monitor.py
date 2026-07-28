@@ -959,3 +959,30 @@ class TestScrapyStatsMonitorResilience:
     assert any(hook in m and "ignored" in m for m in debug_msgs), (
       f"expected debug log for {hook} failure; got: {debug_msgs}"
     )
+
+  def test_stats_failure_remains_suppressed_when_debug_handler_interrupts(
+    self, mocker
+  ) -> None:
+    """R102: fallback diagnostics cannot expose a swallowed stats failure."""
+    stats = MagicMock()
+    stats.inc_value.side_effect = RuntimeError("stats backend down")
+    monitor = ScrapyStatsMonitor(stats)
+    mocker.patch(
+      "scrapy_extension.monitor.stats.logger.debug",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+
+    assert monitor.on_store("k") is None
+    stats.inc_value.assert_called_once_with("pipeline/store_count")
+
+  def test_stats_control_exception_remains_observable(self) -> None:
+    """R102: only ordinary StatsCollector failures are intentionally hidden."""
+    stats = MagicMock()
+    original_error = KeyboardInterrupt("stats interrupted")
+    stats.inc_value.side_effect = original_error
+    monitor = ScrapyStatsMonitor(stats)
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      monitor.on_store("k")
+
+    assert exc_info.value is original_error

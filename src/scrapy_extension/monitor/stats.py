@@ -57,9 +57,15 @@ def _stats_safe(hook: Callable[_P, None]) -> Callable[_P, None]:
     try:
       hook(*args, **kwargs)
     except Exception:
-      logger.debug(
-        "ScrapyStatsMonitor.%s raised; ignored", hook.__name__, exc_info=True
-      )
+      try:
+        logger.debug(
+          "ScrapyStatsMonitor.%s raised; ignored", hook.__name__, exc_info=True
+        )
+      except BaseException:
+        # The StatsCollector's ordinary failure is already intentionally
+        # suppressed. A logger handler interruption is diagnostic-only and
+        # must not make the monitor observable to the data path.
+        pass
 
   return _wrapper
 

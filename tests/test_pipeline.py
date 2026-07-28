@@ -9,7 +9,11 @@ from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.pipelines import ItemPipelineManager
 
 from scrapy_extension.backends.base import JSONSerializer, _validate_key_name
-from scrapy_extension.exceptions import BackendError, SerializationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  BackendError,
+  SerializationError,
+)
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
 
@@ -267,6 +271,56 @@ class TestBackendPipelineOpenSpider:
     # so process_item lazily retries storage on each item.
     assert pipeline._storage_supported is None
     assert "not reachable at spider open" in caplog.text
+
+  @pytest.mark.parametrize(
+    ("failure", "expected_supported"),
+    [
+      (NotImplementedError, False),
+      (BackendConnectionError("connection refused"), None),
+    ],
+  )
+  def test_open_expected_warning_handler_interruption_keeps_pipeline_live(
+    self,
+    mock_connection_manager,
+    mocker,
+    failure,
+    expected_supported,
+  ):
+    """R102: expected-open diagnostics cannot roll back a live pipeline."""
+    mock_connection_manager.get_storage_backend.side_effect = failure
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.warning",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+
+    pipeline.open_spider(spider)
+
+    assert pipeline._storage_supported is expected_supported
+    assert pipeline._opened is True
+    assert pipeline._opened_spider is spider
+    mock_connection_manager.close.assert_not_called()
+
+  def test_open_success_log_interruption_keeps_pipeline_live(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: publish precedes info diagnostics and must remain observable."""
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.info",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+
+    pipeline.open_spider(spider)
+
+    assert pipeline._storage_supported is True
+    assert pipeline._opened is True
+    assert pipeline._opened_spider is spider
+    mock_connection_manager.close.assert_not_called()
 
   def test_open_spider_programming_error_propagates(
     self, mock_connection_manager, mocker
@@ -599,6 +653,26 @@ class TestBackendPipelineProcessItem:
     # Storage was attempted.
     assert mock_storage.store.call_count == 1
 
+  def test_store_warning_handler_interruption_preserves_best_effort_result(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: a warning handler cannot turn an ordinary store failure fatal."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = True
+    mock_connection_manager.get_storage_backend().store.side_effect = RuntimeError(
+      "connection refused"
+    )
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.warning",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+    item = SampleItem(name="Test", value=1)
+
+    assert pipeline.process_item(item, spider) is item
+    spider.crawler.stats.inc_value.assert_called_with("pipeline/storage_errors")
+
   def test_process_item_propagates_deterministic_backend_validation_error(
     self, mock_connection_manager, mocker
   ):
@@ -685,6 +759,34 @@ class TestBackendPipelineProcessItem:
     pipeline._inc_stat(bare_spider, "pipeline/storage_errors")
     pipeline._inc_stat(bare_spider, "pipeline/storage_skipped")
 
+  def test_inc_stat_keeps_ordinary_failure_nonfatal_when_debug_interrupts(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: stats fallback diagnostics cannot replace an ordinary failure."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.crawler.stats.inc_value.side_effect = RuntimeError("stats unavailable")
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.debug",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+
+    pipeline._inc_stat(spider, "pipeline/storage_errors")
+
+  def test_inc_stat_propagates_direct_control_exception(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: only fallback diagnostics are isolated, not stats controls."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    original_error = KeyboardInterrupt("stats interrupted")
+    spider.crawler.stats.inc_value.side_effect = original_error
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      pipeline._inc_stat(spider, "pipeline/storage_errors")
+
+    assert exc_info.value is original_error
+
 
 class TestBackendPipelineMaxItemBytes:
   """D2: configurable per-item byte cap to prevent DoS via oversize payloads."""
@@ -743,6 +845,23 @@ class TestBackendPipelineMaxItemBytes:
     result = pipeline.process_item(item, mock_spider)
 
     assert result is item
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_success_debug_handler_interruption_keeps_persisted_result(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: post-store debug is diagnostic-only after a successful write."""
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = True
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.debug",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+    item = SampleItem(name="Test", value=123)
+
+    assert pipeline.process_item(item, spider) is item
     mock_connection_manager.get_storage_backend().store.assert_called_once()
 
   def test_default_max_item_bytes_is_one_mib(self, mock_connection_manager):
@@ -1205,6 +1324,99 @@ class TestBackendPipelineMonitorWiring:
     item = SampleItem(name="x", value=1)
 
     assert pipeline.process_item(item, spider) is item
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_monitor_failure_debug_interruption_keeps_best_effort_result(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: a logger handler cannot replace an ordinary monitor failure."""
+    monitor = mocker.Mock()
+    monitor.on_error.side_effect = RuntimeError("monitor boom")
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    mock_connection_manager.get_storage_backend().store.side_effect = RuntimeError(
+      "connection refused"
+    )
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.debug",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    spider = mocker.Mock()
+    spider.name = "s"
+    item = SampleItem(name="x", value=1)
+
+    assert pipeline.process_item(item, spider) is item
+    monitor.on_error.assert_called_once()
+
+  def test_on_store_failure_debug_interruption_keeps_persisted_result(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: on_store fallback logging cannot reverse a successful write."""
+    monitor = mocker.Mock()
+    monitor.on_store.side_effect = RuntimeError("monitor boom")
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.debug",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    spider = mocker.Mock()
+    spider.name = "s"
+    item = SampleItem(name="x", value=1)
+
+    assert pipeline.process_item(item, spider) is item
+    monitor.on_store.assert_called_once()
+
+  def test_scrapy_stats_monitor_debug_interruption_keeps_persisted_result(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: the concrete default monitor cannot make a store appear failed."""
+    from scrapy_extension.monitor import ScrapyStatsMonitor
+
+    stats = mocker.Mock()
+    stats.inc_value.side_effect = RuntimeError("stats unavailable")
+    monitor = ScrapyStatsMonitor(stats)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    mocker.patch(
+      "scrapy_extension.monitor.stats.logger.debug",
+      side_effect=KeyboardInterrupt("logger interrupted"),
+    )
+    spider = mocker.Mock()
+    spider.name = "s"
+    item = SampleItem(name="x", value=1)
+
+    assert pipeline.process_item(item, spider) is item
+    mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_monitor_control_exception_remains_observable(
+    self, mock_connection_manager, mocker
+  ):
+    """R102: direct monitor control exceptions are not telemetry fallback."""
+    monitor = mocker.Mock()
+    original_error = KeyboardInterrupt("monitor interrupted")
+    monitor.on_store.side_effect = original_error
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "s"
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      pipeline.process_item(SampleItem(name="x", value=1), spider)
+
+    assert exc_info.value is original_error
     mock_connection_manager.get_storage_backend().store.assert_called_once()
 
   def test_default_monitor_is_null_when_unset(self, mock_connection_manager):

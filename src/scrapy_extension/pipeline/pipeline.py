@@ -54,6 +54,17 @@ DEFAULT_PIPELINE_MAX_ITEM_BYTES = 1_048_576
 DEFAULT_MAX_STORAGE_ERRORS = 10
 
 
+def _emit_diagnostic(method: Any, message: str, *args: Any, **kwargs: Any) -> None:
+  """Emit non-semantic logging without letting a handler alter control flow."""
+  try:
+    method(message, *args, **kwargs)
+  except BaseException:
+    # A logger handler is observability infrastructure.  Its cancellation-style
+    # failures must not turn a successfully published pipeline or an otherwise
+    # best-effort storage outcome into a lifecycle failure.
+    pass
+
+
 class BackendPipeline:
   """Scrapy item pipeline using backend storage interface.
 
@@ -379,13 +390,15 @@ class BackendPipeline:
           self._storage_supported = True
         except NotImplementedError:
           self._storage_supported = False
-          logger.warning(
+          _emit_diagnostic(
+            logger.warning,
             "Backend %s does not support storage. "
             "Pipeline will be a no-op — items will not be persisted.",
             self.connection_manager.backend_type,
           )
         except BackendConnectionError as exc:
-          logger.warning(
+          _emit_diagnostic(
+            logger.warning,
             "Storage backend %s not reachable at spider open: %s. Pipeline "
             "will retry storage lazily on each item.",
             self.connection_manager.backend_type,
@@ -406,7 +419,7 @@ class BackendPipeline:
         raise
       self._opened = True
       self._opened_spider = spider
-      logger.info("Pipeline opened for spider %s", spider.name)
+      _emit_diagnostic(logger.info, "Pipeline opened for spider %s", spider.name)
 
   def close_spider(self, spider: Spider | None = None) -> None:
     """Called when a spider closes.
@@ -511,7 +524,11 @@ class BackendPipeline:
       try:
         self._monitor.on_error("store", e)
       except Exception:  # noqa: BLE001 - telemetry cannot mask serialization
-        logger.debug("monitor.on_error(store) raised; ignored", exc_info=True)
+        _emit_diagnostic(
+          logger.debug,
+          "monitor.on_error(store) raised; ignored",
+          exc_info=True,
+        )
       raise SerializationError(
         f"Failed to serialize item: {e}",
         data=item,
@@ -551,7 +568,8 @@ class BackendPipeline:
       # it, so preserve their original typed failure for Scrapy/operator policy.
       raise
     except Exception as e:
-      logger.warning(
+      _emit_diagnostic(
+        logger.warning,
         "Failed to store item %s: %s. Item will not be persisted.",
         key,
         e,
@@ -565,7 +583,11 @@ class BackendPipeline:
       try:
         self._monitor.on_error("store", e)
       except Exception:  # noqa: BLE001 - telemetry cannot mask storage
-        logger.debug("monitor.on_error(store) raised; ignored", exc_info=True)
+        _emit_diagnostic(
+          logger.debug,
+          "monitor.on_error(store) raised; ignored",
+          exc_info=True,
+        )
       # C2: opt-in loud-fail. Default (max_storage_errors=None) keeps the
       # best-effort swallow-and-stat behavior — zero compat break. When set,
       # track consecutive failures and re-raise once the count exceeds N so a
@@ -588,8 +610,12 @@ class BackendPipeline:
       try:
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - storage has already succeeded
-        logger.debug("monitor.on_store raised; ignored", exc_info=True)
-    logger.debug("Stored item: %s", key)
+        _emit_diagnostic(
+          logger.debug,
+          "monitor.on_store raised; ignored",
+          exc_info=True,
+        )
+    _emit_diagnostic(logger.debug, "Stored item: %s", key)
     return item
 
   @staticmethod
@@ -612,7 +638,12 @@ class BackendPipeline:
       try:
         stats.inc_value(stat_name)
       except Exception:  # noqa: BLE001 - stats cannot mask the pipeline result
-        logger.debug("stats.inc_value(%s) raised; ignored", stat_name, exc_info=True)
+        _emit_diagnostic(
+          logger.debug,
+          "stats.inc_value(%s) raised; ignored",
+          stat_name,
+          exc_info=True,
+        )
 
 
   def _generate_item_key(self, spider: Spider) -> str:
