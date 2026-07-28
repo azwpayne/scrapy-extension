@@ -158,3 +158,40 @@ def test_disconnect_waits_for_connect_before_retiring_generation(mocker) -> None
   assert disconnect_finished.is_set()
   assert backend._client is None
   candidate.close.assert_called_once()
+
+
+def test_disconnect_ignores_logger_control_error_after_ordinary_close_failure(
+  mocker,
+) -> None:
+  """A diagnostic handler cannot turn best-effort disconnect into failure."""
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  candidate = mocker.MagicMock()
+  candidate.close.side_effect = RuntimeError("close failed")
+  backend._client = candidate
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.logger.debug",
+    side_effect=KeyboardInterrupt("diagnostic interruption"),
+  )
+
+  backend.disconnect()
+
+  assert backend._client is None
+  assert backend._connection_snapshot is None
+  candidate.close.assert_called_once()
+
+
+def test_disconnect_propagates_direct_close_control_error_after_detach(mocker) -> None:
+  """Direct close control flow remains visible after the client is detached."""
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  candidate = mocker.MagicMock()
+  candidate.close.side_effect = KeyboardInterrupt("close interruption")
+  backend._client = candidate
+  logger = mocker.patch("scrapy_extension.backends.elasticsearch.logger.debug")
+
+  with pytest.raises(KeyboardInterrupt, match="close interruption"):
+    backend.disconnect()
+
+  assert backend._client is None
+  assert backend._connection_snapshot is None
+  candidate.close.assert_called_once()
+  logger.assert_not_called()

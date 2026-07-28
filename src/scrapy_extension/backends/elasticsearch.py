@@ -276,7 +276,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       try:
         candidate.close()
       except Exception:
-        logger.debug("Failed to close ElasticSearch client", exc_info=True)
+        # A logging handler is extension code and may itself raise a control
+        # exception. Normal disconnect is best-effort for ordinary close
+        # failures, so diagnostics must not turn that path into a failure.
+        # Deliberately do not catch BaseException from ``close``: once the
+        # generation has been detached, direct control-flow interruption
+        # remains observable to the caller.
+        try:
+          logger.debug("Failed to close ElasticSearch client", exc_info=True)
+        except BaseException:
+          pass
 
   def _discard_client(self) -> None:
     """Clear and best-effort close a failed or retired client."""
