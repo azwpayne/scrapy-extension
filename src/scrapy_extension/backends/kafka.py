@@ -1319,37 +1319,50 @@ class KafkaBackend(Backend, QueueBackend):
 
     temp_consumer: KafkaConsumer | None = None
     try:
-      auto_offset_reset = self.config.auto_offset_reset
-      temp_consumer = KafkaConsumer(
-        bootstrap_servers=self._bootstrap_servers(),
-        group_id=self.config.group_id,
-        auto_offset_reset=auto_offset_reset,
-        enable_auto_commit=False,
-        **self._build_client_security_config(),
-      )
-      partitions = temp_consumer.partitions_for_topic(topic_name)
-      if not partitions:
-        return 0
-      assignment = {TopicPartition(topic_name, partition) for partition in partitions}
-      temp_consumer.assign(list(assignment))
-      total = self._consumer_group_lag(
-        temp_consumer,
-        assignment,
-        queue_name=queue_name,
-        auto_offset_reset=auto_offset_reset,
-      )
-    except KafkaError as e:
-      msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
-      raise QueueError(
-        msg,
-        queue_name=queue_name,
-        operation="queue_len",
-      ) from e
-    finally:
+      try:
+        auto_offset_reset = self.config.auto_offset_reset
+        temp_consumer = KafkaConsumer(
+          bootstrap_servers=self._bootstrap_servers(),
+          group_id=self.config.group_id,
+          auto_offset_reset=auto_offset_reset,
+          enable_auto_commit=False,
+          **self._build_client_security_config(),
+        )
+        partitions = temp_consumer.partitions_for_topic(topic_name)
+        if not partitions:
+          total = 0
+        else:
+          assignment = {TopicPartition(topic_name, partition) for partition in partitions}
+          temp_consumer.assign(list(assignment))
+          total = self._consumer_group_lag(
+            temp_consumer,
+            assignment,
+            queue_name=queue_name,
+            auto_offset_reset=auto_offset_reset,
+          )
+      except KafkaError as e:
+        msg = f"Failed to get Kafka queue length for {queue_name}: {e}"
+        raise QueueError(
+          msg,
+          queue_name=queue_name,
+          operation="queue_len",
+        ) from e
+    except BaseException:
+      # A failed depth query is the primary outcome.  Closing its private
+      # consumer is leak prevention only, so a second control exception must
+      # not replace the causal QueueError (or another active primary failure).
       if temp_consumer is not None:
+        with contextlib.suppress(BaseException):
+          temp_consumer.close()
+      raise
+    else:
+      if temp_consumer is not None:
+        # On a successful probe there is no primary failure to preserve:
+        # retain the established contract that process-control close failures
+        # propagate, while ordinary SDK close failures remain best-effort.
         with contextlib.suppress(Exception):
           temp_consumer.close()
-    return total
+      return total
 
   def _consumer_group_lag(
     self,

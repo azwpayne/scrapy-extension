@@ -372,6 +372,43 @@ def test_queue_len_raises_on_temp_consumer_kafka_error(mocker) -> None:
   assert exc_info.value.operation == "queue_len"
 
 
+def test_queue_len_preserves_kafka_error_when_failed_probe_close_interrupts(mocker) -> None:
+  """A cleanup interrupt cannot replace the failed depth query's QueueError."""
+  backend = _backend()
+  backend._consumer = None
+  primary = KafkaError("end_offsets boom")
+  close_interrupt = KeyboardInterrupt("temporary consumer cleanup")
+  mock_temp = mocker.MagicMock()
+  mock_temp.partitions_for_topic.return_value = {0}
+  mock_temp.end_offsets.side_effect = primary
+  mock_temp.close.side_effect = close_interrupt
+  mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer", return_value=mock_temp)
+
+  with pytest.raises(QueueError) as raised:
+    backend.queue_len("q")
+
+  assert raised.value.__cause__ is primary
+  assert raised.value.operation == "queue_len"
+  mock_temp.close.assert_called_once_with()
+
+
+def test_queue_len_propagates_close_interrupt_after_successful_probe(mocker) -> None:
+  """A close interrupt remains observable when the probe itself succeeded."""
+  backend = _backend()
+  backend._consumer = None
+  close_interrupt = KeyboardInterrupt("temporary consumer cleanup")
+  mock_temp = mocker.MagicMock()
+  mock_temp.partitions_for_topic.return_value = None
+  mock_temp.close.side_effect = close_interrupt
+  mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer", return_value=mock_temp)
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    backend.queue_len("q")
+
+  assert raised.value is close_interrupt
+  mock_temp.close.assert_called_once_with()
+
+
 # ---------------------------------------------------------------------------
 # Niche edge cases (initiative #33 — completing kafka to 100%)
 # ---------------------------------------------------------------------------
