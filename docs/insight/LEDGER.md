@@ -13,3 +13,4 @@ Entries are keyed by `(file:line, root-class)` and use one of these states:
 | R36 | F4 set-monitor-race | backends/connectors.py:1340-1357 | monitor-set-monitor-race | DEFERRED | LOW |
 | R36 | F5 monitor-baseexception-propagation | backends/connectors.py:1359-1364 | monitor-baseexception-propagation | DEFERRED | LOW |
 | R37 | (none) | — | — | BLOCKED-push | No new scan: R35-F7 push still unresolved; classifier denied push retry (auto-mode [Irreversible Local Destruction]); R-round pipeline stalled until explicit user push authorization or proxy restored |
+| R38 | (none) | — | — | BLOCKED-push | Did not attempt push retry; preflight clean otherwise; awaiting explicit user push authorization (or restored origin proxy) to unblock the R-round pipeline |
