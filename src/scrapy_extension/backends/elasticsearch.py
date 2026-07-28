@@ -222,7 +222,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # generation.
         self._connection_snapshot = snapshot
         self._client = candidate
-        logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
+        # The generation is now live.  Success diagnostics are extension code,
+        # so a handler failure must not make ``connect`` roll back and close a
+        # healthy, published client.
+        try:
+          logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
+        except BaseException:
+          pass
       except BackendConnectionError:
         self._abort_failed_connect(candidate)
         raise
@@ -245,12 +251,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def _abort_failed_connect(self, candidate: Elasticsearch | None) -> None:
     """Detach and close only this failed connect candidate.
 
-    Most failures happen before publishing a client, but extension hooks such
-    as logging can fail after the candidate becomes visible.  Roll back only
-    if the currently published generation is this exact candidate; a future
-    generation must never be cleared by stale failure cleanup.  This helper is
-    deliberately separate from normal ``disconnect`` cleanup: a cleanup
-    ``BaseException`` must not mask the original connection failure.
+    Roll back only if the currently published generation is this exact
+    candidate; a future generation must never be cleared by stale failure
+    cleanup.  This helper is deliberately separate from normal ``disconnect``
+    cleanup: a cleanup ``BaseException`` must not mask the original connection
+    failure.
     """
     if candidate is None:
       return
