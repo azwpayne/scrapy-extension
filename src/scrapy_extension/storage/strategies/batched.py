@@ -38,27 +38,25 @@ if TYPE_CHECKING:
 DEFAULT_BATCH_THRESHOLD = 100
 
 #: R22-B: ceiling (seconds) for acquiring ``_flush_lock`` in :meth:`_flush`.
-#: Bounds the shutdown/public-flush path so a wedged backend (redis-py default
+#: Bounds the public-flush path so a wedged backend (redis-py default
 #: ``socket_timeout=None``, pymongo default ``socketTimeoutMS=None``) cannot hang
-#: ``close_spider`` forever: the age-flusher holds ``_flush_lock`` across the
-#: ``storage_backend.store()`` network-I/O loop, and the post-join ``flush()``
-#: used to re-block on it indefinitely. This bound only fires when a flush
+#: a synchronous caller forever: another flush may hold ``_flush_lock`` across
+#: its ``storage_backend.store()`` network-I/O loop. This bound only fires when a flush
 #: exceeds it (e.g. a large batch against a high-latency cross-region backend);
 #: healthy ``store()`` is milliseconds, so in normal operation the lock is free
 #: and the acquire returns instantly.
 _FLUSH_LOCK_TIMEOUT_S: float = 5.0
 
-#: R23-A: hard ceiling (seconds) for :meth:`close` to wait for the age-flusher
-#: to RELEASE ``_flush_lock`` before the final drain. Pre-R23 :meth:`close` did
+#: R23-A/R75: hard ceiling (seconds) for :meth:`close` to wait for *any*
+#: ``_flush_lock`` holder before the final drain. Pre-R23 :meth:`close` did
 #: a single fixed ``join(5.0)``; a slow-but-healthy cross-region flush (e.g.
 #: Mongo Atlas at ~150ms/store x threshold=100 = ~15s) left the flusher alive
 #: past that window, so the subsequent ``flush()`` lost the bounded
 #: ``_flush_lock`` race and SKIPPED, abandoning items still in ``_buffer``.
-#: Looping the join to this deadline lets a progressing flush complete (the
-#: flusher exits promptly once its in-flight ``store()`` returns, because
-#: ``_stop`` is set) so the final ``flush()`` acquires the now-free lock and
-#: drains the remainder. A genuinely-wedged backend is still bounded (R22-B's
-#: anti-hang guarantee preserved, at a 30s ceiling instead of the old 10s).
+#: R75 extends the deadline to threshold and explicit flushes too: close
+#: acquires the serialization lock directly, rather than taking public
+#: ``flush()``'s short anti-hang timeout. A genuinely-wedged backend remains
+#: bounded (at a 30s ceiling instead of the old 10s).
 _CLOSE_DRAIN_DEADLINE_S: float = 30.0
 
 logger = logging.getLogger(__name__)
@@ -220,35 +218,89 @@ class BatchedStorageStrategy(StorageStrategy):
   def close(self) -> None:
     """Flush remaining buffered items, then release resources.
 
-    Stops the age-based flusher (Risk 2) and joins it (bounded) before
-    draining, so ``BackendPipeline.close_spider`` does not tear down the
-    backend connection while the daemon flusher is mid-``store``.
+    Stops the age-based flusher (Risk 2) and waits, bounded, for every active
+    flush transaction before draining. This prevents
+    ``BackendPipeline.close_spider`` from tearing down the backend connection
+    while a daemon, threshold, or explicit flush is mid-``store``.
+
+    A control exception during the age-flusher join must not bypass the final
+    drain. Close records the first such exception, completes its bounded drain
+    attempt, then re-raises that original control exception.
     """
     with self._lock:
       self._closed = True
     self._stop.set()
+    primary_error: BaseException | None = None
+    deadline = time.monotonic() + _CLOSE_DRAIN_DEADLINE_S
     flusher = self._flusher
     if flusher is not None and flusher.is_alive():
-      # R23-A: wait for the age-flusher to RELEASE _flush_lock (it holds it
-      # across the slow storage_backend.store() loop) before the final
-      # self.flush() below. Pre-R23 a single fixed join(5.0) timed out for a
-      # slow-but-healthy cross-region flush, leaving the flusher alive; the
-      # subsequent flush() then lost the _flush_lock race and SKIPPED,
-      # abandoning items still in _buffer. Loop the join up to a hard deadline
-      # so a progressing flush completes (the flusher exits promptly once its
-      # in-flight store() returns, because _stop is set); a genuinely-wedged
-      # backend is bounded by the deadline (R22-B's anti-hang guarantee
-      # preserved, at a 30s ceiling instead of the old 10s).
-      deadline = time.monotonic() + _CLOSE_DRAIN_DEADLINE_S
+      # The join lets the daemon exit promptly after its active store returns.
+      # The direct lock acquisition below is still required: threshold/manual
+      # callers can hold _flush_lock without an age flusher.
       while flusher.is_alive() and time.monotonic() < deadline:
-        flusher.join(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+        try:
+          flusher.join(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+        except BaseException as error:
+          # Do not let KeyboardInterrupt/SystemExit skip the final drain. The
+          # lock phase below waits through the same shared deadline and drains
+          # if the current flush holder releases.
+          primary_error = error
+          break
       if flusher.is_alive():
+        try:
+          logger.warning(
+            "batched-storage-age-flush did not exit within %.1fs; "
+            "buffered items may be lost",
+            _CLOSE_DRAIN_DEADLINE_S,
+          )
+        except BaseException:
+          pass
+
+    # R75: public flush deliberately gives up after its short per-acquire
+    # timeout to keep synchronous callers responsive. Close has a stronger
+    # durability obligation: wait through the remaining shutdown deadline for
+    # *any* holder, then serialize the final snapshot/write/requeue operation.
+    # Retry an interrupted acquire until the deadline, retaining the first
+    # control exception for re-signal only after the drain attempt.
+    acquired = False
+    while not acquired:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        # A join can consume the final fraction of the deadline just as its
+        # holder releases the lock. Preserve one final drain opportunity
+        # without exceeding the bounded close contract.
+        try:
+          acquired = self._flush_lock.acquire(blocking=False)
+        except BaseException as error:
+          if primary_error is None:
+            primary_error = error
+        break
+      try:
+        acquired = self._flush_lock.acquire(timeout=remaining)
+      except BaseException as error:
+        if primary_error is None:
+          primary_error = error
+
+    if not acquired:
+      try:
         logger.warning(
-          "batched-storage-age-flush did not exit within %.1fs; "
+          "batched-storage close drain lock not acquired within %.1fs; "
           "buffered items may be lost",
           _CLOSE_DRAIN_DEADLINE_S,
         )
-    self.flush()
+      except BaseException:
+        pass
+    else:
+      try:
+        self._flush_serialized()
+      except BaseException as error:
+        if primary_error is None:
+          primary_error = error
+      finally:
+        self._flush_lock.release()
+
+    if primary_error is not None:
+      raise primary_error
 
   def _flush(self) -> None:
     """Drain the buffer to each entry's backend in insertion order.
@@ -270,15 +322,12 @@ class BatchedStorageStrategy(StorageStrategy):
 
     R22-B: the ``_flush_lock`` acquisition is *bounded* by
     ``_FLUSH_LOCK_TIMEOUT_S``. If the age-flusher (or any concurrent holder) is
-    wedged mid-``store()`` against an unresponsive backend, ``_flush`` skips
-    with a warning instead of blocking forever — so :meth:`close` and the
-    public :meth:`flush` cannot hang ``close_spider``. R23-A tightens the
-    close path further: :meth:`close` loops the age-flusher join to a hard
-    ``_CLOSE_DRAIN_DEADLINE_S`` so a slow-but-healthy flush completes and
-    releases ``_flush_lock`` before this final ``flush()`` runs — the skip
-    therefore only concedes items when the flusher is genuinely wedged past
-    that deadline, not merely slow. The public :meth:`flush` path (no join
-    loop) still skips on the per-acquire bound.
+    wedged mid-``store()`` against an unresponsive backend, the public
+    :meth:`flush` path skips with a warning instead of blocking forever. The
+    close path has a distinct, longer ``_CLOSE_DRAIN_DEADLINE_S`` because it
+    must drain any tail left by a slow-but-healthy transaction before releasing
+    backend resources; it serializes that final drain directly rather than
+    weakening public flush's anti-hang bound.
     """
     acquired = self._flush_lock.acquire(timeout=_FLUSH_LOCK_TIMEOUT_S)
     if not acquired:

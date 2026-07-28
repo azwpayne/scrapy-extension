@@ -123,6 +123,27 @@ class TestBatchedStorageStrategy:
     strat.close()
     assert backend.store.call_count == 1
 
+  def test_close_join_keyboardinterrupt_still_drains_then_reraises(self, mocker) -> None:
+    """R75: an interrupted age-worker join cannot skip the final drain."""
+    backend = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=100)
+    strat.store(backend, "k1", b"v1")
+
+    class _InterruptedFlusher:
+      def is_alive(self) -> bool:
+        return True
+
+      def join(self, timeout: float | None = None) -> None:
+        raise KeyboardInterrupt("interrupted join")
+
+    strat._flusher = _InterruptedFlusher()
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted join"):
+      strat.close()
+
+    backend.store.assert_called_once_with("k1", b"v1", ttl=None)
+    assert strat.pending == 0
+
   def test_close_waits_for_inflight_threshold_flush(self, mocker) -> None:
     backend = mocker.Mock()
     store_entered = threading.Event()
@@ -168,6 +189,68 @@ class TestBatchedStorageStrategy:
     assert not close_thread.is_alive()
     assert store_errors == []
     assert close_errors == []
+
+  def test_close_drains_tail_after_slow_threshold_flush_releases(
+    self, monkeypatch, mocker
+  ) -> None:
+    """R75: close waits for a non-flusher holder before its final drain.
+
+    The first threshold flush owns ``_flush_lock`` while writing ``k1``. A
+    concurrent store appends ``k2`` after that snapshot, then close begins.
+    Public ``flush()`` would give up at its short lock timeout and leave ``k2``
+    buffered; close must wait through its shutdown deadline and drain the tail
+    immediately after the holder releases.
+    """
+    monkeypatch.setattr(batched_module, "_FLUSH_LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(batched_module, "_CLOSE_DRAIN_DEADLINE_S", 1.0)
+
+    backend = mocker.Mock()
+    first_store_entered = threading.Event()
+    release_first_store = threading.Event()
+
+    def slow_first_store(key: str, *_args, **_kwargs) -> None:
+      if key == "k1":
+        first_store_entered.set()
+        assert release_first_store.wait(timeout=2.0), "first flush was not released"
+
+    backend.store.side_effect = slow_first_store
+    strat = BatchedStorageStrategy(threshold=1)
+    flush_thread = threading.Thread(
+      target=strat.store,
+      args=(backend, "k1", b"v1"),
+      daemon=True,
+    )
+    flush_thread.start()
+    assert first_store_entered.wait(timeout=2.0), "threshold flush did not start"
+
+    # The first flush detached k1, so k2 remains the close-only tail.
+    strat.store(backend, "k2", b"v2")
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def run_close() -> None:
+      try:
+        strat.close()
+      except BaseException as error:  # noqa: BLE001 - capture control failures
+        close_errors.append(error)
+      finally:
+        close_done.set()
+
+    close_thread = threading.Thread(target=run_close, daemon=True)
+    close_thread.start()
+    # Prove close is waiting for the general flush holder, not only a flusher.
+    time.sleep(0.15)
+    assert not close_done.is_set(), "close used public flush's short timeout"
+
+    release_first_store.set()
+    flush_thread.join(timeout=2.0)
+    assert not flush_thread.is_alive()
+    assert close_done.wait(timeout=2.0), "close did not drain after flush release"
+    close_thread.join(timeout=2.0)
+
+    assert close_errors == []
+    assert [call.args[0] for call in backend.store.call_args_list] == ["k1", "k2"]
+    assert strat.pending == 0
 
   def test_close_drains_buffer_when_flusher_completes_after_old_join_window(
     self, monkeypatch, mocker
