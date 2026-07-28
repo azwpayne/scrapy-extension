@@ -1487,6 +1487,9 @@ class BackendScheduler:
             # Each stale/already-disconnected tuple is independent: one failure
             # must not leave the other handler registered or block later cleanup.
             logger.exception("Failed to disconnect %s during shutdown", signal)
+          except BaseException as exc:
+            if primary_error is None:
+              primary_error = exc
       # Close the queue strategy FIRST so it can warn about / release any
       # in-process held state (e.g. DelayQueueStrategy's delayed items) while
       # the backend is still connected. Must precede connection_manager.close().
@@ -1495,6 +1498,9 @@ class BackendScheduler:
           self._queue.close()
         except Exception:
           logger.exception("Failed to close queue strategy during shutdown")
+        except BaseException as exc:
+          if primary_error is None:
+            primary_error = exc
       if (
         self._owns_dupefilter
         and self.dupefilter is not None
@@ -1505,13 +1511,11 @@ class BackendScheduler:
           self.dupefilter.close(reason)
         except Exception:
           logger.exception("Failed to close dupefilter during shutdown")
+        except BaseException as exc:
+          if primary_error is None:
+            primary_error = exc
         finally:
           self._dupefilter_open = False
-    except BaseException as exc:  # noqa: BLE001 — capture Ctrl+C/SystemExit
-      # A BaseException (Ctrl+C / SystemExit) escaped a teardown step whose
-      # ``except Exception`` guard does not cover it. Capture it; the finally
-      # still releases the manager, then we re-raise so the signal is not lost.
-      primary_error = exc
     finally:
       # R35-F7: state-reset tail moved here so it runs even if BaseException
       # aborts teardown mid-try. Idempotent: assigning None / False on

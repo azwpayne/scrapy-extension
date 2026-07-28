@@ -909,6 +909,51 @@ class TestStateResetsAfterBaseExceptionTeardown:
     assert scheduler._connected_signals is None
     assert scheduler._signals_connected is False
 
+  def test_signal_interrupt_still_closes_queue_and_owned_dupefilter(
+    self, mocker
+  ):
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    spider = mocker.MagicMock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.MagicMock()
+    scheduler.open(spider)
+    assert scheduler._queue is not None
+    queue_close = mocker.patch.object(scheduler._queue, "close")
+    first = KeyboardInterrupt()
+    assert scheduler._connected_signals is not None
+    connected_signals = scheduler._connected_signals
+    connected_signals.disconnect.side_effect = [first, None]
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      scheduler.close("test-done")
+
+    assert raised.value is first
+    assert connected_signals.disconnect.call_count == 2
+    queue_close.assert_called_once_with()
+    dupefilter.close.assert_called_once_with("test-done")
+    manager.close.assert_called_once_with()
+
+  def test_queue_interrupt_still_closes_owned_dupefilter(self, mocker):
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    spider = mocker.MagicMock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.MagicMock()
+    scheduler.open(spider)
+    assert scheduler._queue is not None
+    first = KeyboardInterrupt()
+    mocker.patch.object(scheduler._queue, "close", side_effect=first)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      scheduler.close("test-done")
+
+    assert raised.value is first
+    dupefilter.close.assert_called_once_with("test-done")
+    manager.close.assert_called_once_with()
+
   def test_state_resets_when_owned_dupefilter_close_raises_keyboardinterrupt(
     self, mocker
   ):
