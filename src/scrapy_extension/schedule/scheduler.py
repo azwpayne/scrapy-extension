@@ -1485,7 +1485,21 @@ class BackendScheduler:
     if self._lifecycle_state == _LIFECYCLE_CLOSED:
       return None
     self._lifecycle_state = _LIFECYCLE_CLOSED
-    logger.info("Scheduler closed: %s", reason)
+
+    # Shutdown diagnostics must never gain ownership of teardown. A custom
+    # logging handler can raise ``BaseException`` (for example when its output
+    # stream is interrupted); swallowing that diagnostic failure keeps the
+    # actual resource-close error, if any, as the observable outcome.
+    def _log_shutdown_exception(message: str, *args: object) -> None:
+      try:
+        logger.exception(message, *args)
+      except BaseException:
+        pass  # noqa: BLE001 — diagnostics must not abort teardown
+
+    try:
+      logger.info("Scheduler closed: %s", reason)
+    except BaseException:
+      pass  # noqa: BLE001 — diagnostics must not abort teardown
     # R26-G: teardown must be BaseException-safe. The three teardown steps
     # below (signal disconnect, queue.close, dupefilter.close) only catch
     # ``Exception``; a ``BaseException`` (Ctrl+C / SystemExit) escaping any of
@@ -1511,7 +1525,7 @@ class BackendScheduler:
           except Exception:
             # Each stale/already-disconnected tuple is independent: one failure
             # must not leave the other handler registered or block later cleanup.
-            logger.exception("Failed to disconnect %s during shutdown", signal)
+            _log_shutdown_exception("Failed to disconnect %s during shutdown", signal)
           except BaseException as exc:
             if primary_error is None:
               primary_error = exc
@@ -1522,7 +1536,7 @@ class BackendScheduler:
         try:
           self._queue.close()
         except Exception:
-          logger.exception("Failed to close queue strategy during shutdown")
+          _log_shutdown_exception("Failed to close queue strategy during shutdown")
         except BaseException as exc:
           if primary_error is None:
             primary_error = exc
@@ -1535,7 +1549,7 @@ class BackendScheduler:
         try:
           self.dupefilter.close(reason)
         except Exception:
-          logger.exception("Failed to close dupefilter during shutdown")
+          _log_shutdown_exception("Failed to close dupefilter during shutdown")
         except BaseException as exc:
           if primary_error is None:
             primary_error = exc
@@ -1565,12 +1579,9 @@ class BackendScheduler:
           if primary_error is None:
             primary_error = exc
           else:
-            try:
-              logger.exception(
-                "Failed to close connection manager during shutdown"
-              )
-            except BaseException:
-              pass  # noqa: BLE001 — never mask the primary error being re-raised
+            _log_shutdown_exception(
+              "Failed to close connection manager during shutdown"
+            )
     if primary_error is not None:
       raise primary_error
     return None

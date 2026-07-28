@@ -1041,6 +1041,71 @@ class TestStateResetsAfterBaseExceptionTeardown:
     assert scheduler_with_df._connected_signals is None
     assert scheduler_with_df._signals_connected is False
 
+
+class TestCloseDiagnosticsAreNonFatal:
+  """Shutdown logging is observational and cannot own resource teardown."""
+
+  def test_initial_closed_log_keyboardinterrupt_still_releases_every_resource(
+    self, mocker
+  ):
+    """The lifecycle ``info`` call runs after CLOSED is recorded, so a
+    control exception from a logging handler must not strand this terminal
+    scheduler before signals, queue, dupefilter, and manager are released.
+    """
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    spider = mocker.MagicMock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.MagicMock()
+    scheduler.open(spider)
+    assert scheduler._queue is not None
+    queue_close = mocker.patch.object(scheduler._queue, "close")
+    assert scheduler._connected_signals is not None
+    connected_signals = scheduler._connected_signals
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.logger.info",
+      side_effect=KeyboardInterrupt("interrupted logging handler"),
+    )
+
+    scheduler.close("test-done")
+
+    assert connected_signals.disconnect.call_count == 2
+    queue_close.assert_called_once_with()
+    dupefilter.close.assert_called_once_with("test-done")
+    manager.close.assert_called_once_with()
+
+  def test_exception_log_keyboardinterrupt_does_not_skip_later_cleanup(
+    self, mocker
+  ):
+    """A normal signal-disconnect failure is only diagnostic; even if its
+    exception logger is interrupted, the sibling handler and later teardown
+    phases still run.
+    """
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    spider = mocker.MagicMock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.MagicMock()
+    scheduler.open(spider)
+    assert scheduler._queue is not None
+    queue_close = mocker.patch.object(scheduler._queue, "close")
+    assert scheduler._connected_signals is not None
+    connected_signals = scheduler._connected_signals
+    connected_signals.disconnect.side_effect = [RuntimeError("stale"), None]
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.logger.exception",
+      side_effect=KeyboardInterrupt("interrupted exception logger"),
+    )
+
+    scheduler.close("test-done")
+
+    assert connected_signals.disconnect.call_count == 2
+    queue_close.assert_called_once_with()
+    dupefilter.close.assert_called_once_with("test-done")
+    manager.close.assert_called_once_with()
+
   def test_state_resets_when_reentrant_close_after_baseexception(
     self, mock_connection_manager, mocker
   ):
