@@ -224,23 +224,51 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._client = candidate
         logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
       except BackendConnectionError:
-        self._discard_candidate(candidate)
+        self._abort_failed_connect(candidate)
         raise
       except (ApiError, TransportError) as e:
-        self._discard_candidate(candidate)
+        self._abort_failed_connect(candidate)
         msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
         raise BackendConnectionError(msg, backend_type="elasticsearch") from e
       except Exception as e:
         # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
-        # must close the private candidate without publishing a false live state.
-        self._discard_candidate(candidate)
+        # must roll back a post-publication candidate as well as close it.
+        self._abort_failed_connect(candidate)
         msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
         raise BackendConnectionError(msg, backend_type="elasticsearch") from e
       except BaseException:
         # Ctrl-C / SystemExit during connect: still close the candidate, then
         # re-signal. Mirrors mongodb.connect() (BaseException arm).
-        self._discard_candidate(candidate)
+        self._abort_failed_connect(candidate)
         raise
+
+  def _abort_failed_connect(self, candidate: Elasticsearch | None) -> None:
+    """Detach and close only this failed connect candidate.
+
+    Most failures happen before publishing a client, but extension hooks such
+    as logging can fail after the candidate becomes visible.  Roll back only
+    if the currently published generation is this exact candidate; a future
+    generation must never be cleared by stale failure cleanup.  This helper is
+    deliberately separate from normal ``disconnect`` cleanup: a cleanup
+    ``BaseException`` must not mask the original connection failure.
+    """
+    if candidate is None:
+      return
+
+    if self._client is candidate:
+      self._client = None
+      self._connection_snapshot = None
+
+    try:
+      candidate.close()
+    except BaseException:
+      # Preserve the primary error from connect, including KeyboardInterrupt
+      # and SystemExit.  Logging is also isolated because user-installed
+      # handlers can raise control-flow exceptions.
+      try:
+        logger.debug("Failed to close ElasticSearch connect candidate", exc_info=True)
+      except BaseException:
+        pass
 
   def _discard_candidate(self, candidate: Elasticsearch | None) -> None:
     """Best-effort close for a client generation that was never published."""

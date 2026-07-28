@@ -45,6 +45,47 @@ def test_connect_discards_client_on_keyboard_interrupt(mocker) -> None:
   assert backend._client is None
 
 
+def test_post_publish_logger_failure_rolls_back_live_candidate(mocker) -> None:
+  """A failure after publication cannot leave a zombie connected client."""
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  candidate = mocker.MagicMock(ping=lambda: True)
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=candidate
+  )
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.logger.debug",
+    side_effect=RuntimeError("logger extension failed"),
+  )
+
+  with pytest.raises(BackendConnectionError, match="logger extension failed"):
+    backend.connect()
+
+  assert backend._client is None
+  assert backend._connection_snapshot is None
+  candidate.close.assert_called_once()
+
+
+def test_post_publish_control_failure_survives_candidate_close_system_exit(mocker) -> None:
+  """Failed-connect cleanup neither retains nor masks its own generation."""
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  candidate = mocker.MagicMock(ping=lambda: True)
+  candidate.close.side_effect = SystemExit("close should not mask primary")
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=candidate
+  )
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.logger.debug",
+    side_effect=KeyboardInterrupt("primary logging failure"),
+  )
+
+  with pytest.raises(KeyboardInterrupt, match="primary logging failure"):
+    backend.connect()
+
+  assert backend._client is None
+  assert backend._connection_snapshot is None
+  candidate.close.assert_called_once()
+
+
 def test_overlapping_connects_share_one_live_client_generation(mocker) -> None:
   """A second connect waits for and reuses the first candidate generation."""
   backend = ElasticSearchBackend(ElasticSearchSettings())
