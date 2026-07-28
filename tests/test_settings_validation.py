@@ -775,6 +775,21 @@ class TestRocketMQNamesrvFormat:
     """Valid ``host:port`` values stay accepted (incl. DNS, IPv4)."""
     assert RocketMQSettings(namesrv_address=addr).namesrv_address == addr
 
+  def test_namesrv_accepts_and_canonicalizes_cluster_endpoints(self) -> None:
+    settings = RocketMQSettings(
+      mode="cluster",  # type: ignore[arg-type]
+      namesrv_address=" one:8081 ; two:8082 ",
+    )
+    assert settings.namesrv_address == "one:8081;two:8082"
+
+  @pytest.mark.parametrize(
+    "addr", ["one:8081;", ";one:8081", "one:8081;;two:8082", "one:8081;two:abc"]
+  )
+  def test_namesrv_rejects_invalid_cluster_endpoint_member(self, addr: str) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      RocketMQSettings(namesrv_address=addr)
+    assert exc_info.value.setting_name == "namesrv_address"
+
 
 class TestRocketMQConfigEdges:
   """R27-RMQ-1/2: rocketmq config-edge guards (zero floor, blank name)."""

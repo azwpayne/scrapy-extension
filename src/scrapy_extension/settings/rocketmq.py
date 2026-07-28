@@ -14,7 +14,7 @@ from scrapy_extension.exceptions.base import ConfigurationError
 # host:port — host is any non-colon run of chars (DNS name, IPv4, IPv6-bracketed
 # forms are accepted by the client); port is digits only. Rejects bare host,
 # bare port, and values with a scheme prefix.
-_NAMESRV_PATTERN = re.compile(r"^[^:]+:\d+$")
+_NAMESRV_PATTERN = re.compile(r"[^:\s;]+:\d+")
 
 
 class RocketMQMode(str, Enum):
@@ -71,13 +71,21 @@ def validate_rocketmq_connection(
             setting_value=mode,
         )
 
-    if not isinstance(namesrv_address, str) or not _NAMESRV_PATTERN.match(
-        namesrv_address.strip()
-    ):
+    if not isinstance(namesrv_address, str):
         raise ConfigurationError(
-            "namesrv_address must match 'host:port' (e.g. 'localhost:8081').",
+            "namesrv_address must be a semicolon-separated 'host:port' list.",
             setting_name="namesrv_address",
         )
+    endpoints = [endpoint.strip() for endpoint in namesrv_address.split(";")]
+    if not endpoints or any(
+        not endpoint or not _NAMESRV_PATTERN.fullmatch(endpoint)
+        for endpoint in endpoints
+    ):
+        raise ConfigurationError(
+            "namesrv_address must be a semicolon-separated 'host:port' list.",
+            setting_name="namesrv_address",
+        )
+    namesrv_address = ";".join(endpoints)
     if not isinstance(tls_enabled, bool):
         raise ConfigurationError(
             "tls_enabled must be a boolean.",
@@ -201,7 +209,7 @@ class RocketMQSettings(BaseSettings):
             ConfigurationError: if ``namesrv_address`` does not match
                 ``host:port``.
         """
-        validate_rocketmq_connection(
+        _, self.namesrv_address, _, _, _ = validate_rocketmq_connection(
             self.mode,
             self.namesrv_address,
             self.access_key,
