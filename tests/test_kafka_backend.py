@@ -565,6 +565,28 @@ class TestKafkaBackendDisconnect:
     assert backend._consumer is None
     assert backend._admin_client is None
 
+  def test_disconnect_closes_all_clients_after_baseexception(self, mocker):
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    first = KeyboardInterrupt()
+    producer.close.side_effect = first
+    consumer.close.side_effect = SystemExit(2)
+    backend._producer = producer
+    backend._consumer = consumer
+    backend._admin_client = admin
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      backend.disconnect()
+
+    assert raised.value is first
+    for client in (producer, consumer, admin):
+      client.close.assert_called_once_with()
+    assert backend._producer is None
+    assert backend._consumer is None
+    assert backend._admin_client is None
+
 
 class TestKafkaBackendPing:
   """Tests for ping method."""

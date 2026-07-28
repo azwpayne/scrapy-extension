@@ -609,10 +609,23 @@ class KafkaBackend(Backend, QueueBackend):
       self._known_topics.clear()
       self._known_topic_policies.clear()
 
-    for client in (producer, consumer, admin_client):
+    self._close_detached_clients(producer, consumer, admin_client)
+
+  @staticmethod
+  def _close_detached_clients(*clients: Any) -> None:
+    """Close every detached client, retaining the first control exception."""
+    primary_error: BaseException | None = None
+    for client in clients:
       if client is not None:
-        with contextlib.suppress(Exception):
+        try:
           client.close()
+        except Exception:
+          pass
+        except BaseException as error:
+          if primary_error is None:
+            primary_error = error
+    if primary_error is not None:
+      raise primary_error
 
   def is_connected(self) -> bool:
     """Check if Kafka is connected.
