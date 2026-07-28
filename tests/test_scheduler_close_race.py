@@ -751,3 +751,219 @@ class TestCloseOnNeverOpenedScheduler:
 
     mock_connection_manager.close.assert_called_once_with()
     assert scheduler._spider is None
+
+
+class TestStateResetsAfterBaseExceptionTeardown:
+  """R35-F7: ``_close_locked`` state-reset tail must run even when a
+  ``BaseException`` (Ctrl+C / SystemExit) escapes teardown mid-``try``.
+
+  R26-G captures the ``connection_manager.close()`` release via a
+  ``finally`` block, but the state-reset tail (``_queue = None``,
+  ``_spider = None``, ``_connected_signals = None``,
+  ``_signals_connected = False``, ``_backpressure_paused = False``,
+  ``_backpressure_probe_due = False``) lives INSIDE the guarded ``try``
+  at lines 1510-1515 — so a ``BaseException`` landing during signal
+  disconnect, ``queue.close()``, or owned ``dupefilter.close()`` skips
+  the tail entirely. The ``finally`` at 1521 only handles manager
+  release; re-entry via ``close()`` short-circuits at 1464 because
+  ``_lifecycle_state`` is set to ``_LIFECYCLE_CLOSED`` before the
+  ``try``. Stale ``_queue``/``_spider``/``_connected_signals`` and a
+  dirty ``_signals_connected=True`` survive until GC, and any signal
+  handler not yet iterated in the disconnect loop remains registered.
+
+  Triggering surfaces (all realistic in production):
+
+  - per-handler ``signal.disconnect`` raising ``BaseException``
+    (custom signal_manager subclass);
+  - ``queue.close()`` raising ``BaseException`` via a custom
+    queue/strategy override;
+  - owned ``dupefilter.close()`` raising ``BaseException`` via a
+    custom filter override.
+
+  These tests pin the post-fix invariant: the state-reset tail runs
+  on every code path, idempotent, regardless of how teardown aborts.
+  """
+
+  def test_state_resets_when_strategy_close_raises_keyboardinterrupt(
+    self, mock_connection_manager, mocker
+  ):
+    """``KeyboardInterrupt`` from strategy.close() must not leave stale refs.
+
+    Pre-fix: state-reset tail lives in the guarded try; BaseException
+    capture at line 1516 skips it. Post-fix: tail in finally runs on
+    every path.
+    """
+    from scrapy_extension.queue.strategies.base import QueueStrategy
+
+    class _KeyboardInterruptingStrategy(QueueStrategy):
+      def push(self, queue_name, item, *, priority=0.0, delay=0.0, source="default"):  # noqa: ARG002
+        pass
+
+      def pop(self, queue_name, timeout=0.0):  # noqa: ARG002
+        return None
+
+      def queue_len(self, queue_name):  # noqa: ARG002
+        return 0
+
+      def clear(self, queue_name):  # noqa: ARG002
+        pass
+
+      def close(self) -> None:
+        raise KeyboardInterrupt("simulated Ctrl+C during strategy close")
+
+    scheduler, _ = _make_scheduler_with_queue(
+      mock_connection_manager,
+      mocker,
+      queue_strategy=_KeyboardInterruptingStrategy(mock_connection_manager),
+    )
+
+    # Pre-condition: open() populated state.
+    assert scheduler._queue is not None
+    assert scheduler._spider is not None
+    assert scheduler._signals_connected is True
+
+    # Primary signal is re-raised (R26-G).
+    with pytest.raises(KeyboardInterrupt):
+      scheduler.close("test-done")
+
+    # R26-G: connection_manager still released exactly once.
+    mock_connection_manager.close.assert_called_once_with()
+
+    # R35-F7: state-reset tail runs even when the BaseException aborts
+    # teardown. Pre-fix these assertions fail because the tail lives
+    # inside the guarded try.
+    assert scheduler._queue is None
+    assert scheduler._spider is None
+    assert scheduler._connected_signals is None
+    assert scheduler._signals_connected is False
+    assert scheduler._backpressure_paused is False
+    assert scheduler._backpressure_probe_due is False
+
+  def test_state_resets_when_signal_disconnect_raises_baseexception(
+    self, mock_connection_manager, mocker
+  ):
+    """A ``BaseException`` from ``signal_manager.disconnect`` must not leave
+    stale ``_connected_signals`` / ``_signals_connected`` / ``_queue`` /
+    ``_spider`` behind."""
+    scheduler, _ = _make_scheduler_with_queue(mock_connection_manager, mocker)
+
+    assert scheduler._connected_signals is not None
+    # The disconnect loop is the FIRST teardown step; BaseException here
+    # raises out of the try at line 1485 before queue/dupefilter close.
+    scheduler._connected_signals.disconnect.side_effect = KeyboardInterrupt(
+      "simulated Ctrl+C during signal disconnect"
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+      scheduler.close("test-done")
+
+    mock_connection_manager.close.assert_called_once_with()
+    assert scheduler._queue is None
+    assert scheduler._spider is None
+    assert scheduler._connected_signals is None
+    assert scheduler._signals_connected is False
+
+  def test_state_resets_when_owned_dupefilter_close_raises_keyboardinterrupt(
+    self, mocker
+  ):
+    """A ``BaseException`` from an OWNED dupefilter.close() must not leave
+    stale refs. This goes through ``from_crawler`` so the scheduler owns
+    the dupefilter (the trigger surface for the owned arm at line 1505).
+    """
+    manager = mocker.MagicMock(name="ConnectionManager")
+    scheduler = BackendScheduler(
+      connection_manager=manager,
+      queue_key="test:queue",
+    )
+    mocker.patch.object(
+      BackendScheduler,
+      "from_settings",
+      return_value=scheduler,
+    )
+    dupefilter = mocker.MagicMock(name="OwnedDupeFilter")
+    dupefilter.close.side_effect = KeyboardInterrupt(
+      "simulated Ctrl+C during owned dupefilter close"
+    )
+    dupefilter_cls = mocker.Mock(name="DupeFilterClass")
+    dupefilter_cls.from_crawler.return_value = dupefilter
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.load_object",
+      return_value=dupefilter_cls,
+    )
+    crawler = mocker.Mock()
+    crawler.settings.get.return_value = "example.OwnedDupeFilter"
+    crawler.stats = mocker.Mock()
+    scheduler_with_df = BackendScheduler.from_crawler(crawler)
+
+    # Wire a fake queue + spider + signals so the close path reaches the
+    # owned dupefilter arm. Mirrors what open() would have done.
+    fake_queue = mocker.MagicMock(name="BackendQueue")
+    fake_queue.close.return_value = None
+    scheduler_with_df._queue = fake_queue
+    fake_spider = mocker.MagicMock(name="Spider")
+    fake_spider.name = "test_spider"
+    fake_spider.crawler = mocker.MagicMock()
+    scheduler_with_df._spider = fake_spider
+    scheduler_with_df._connected_signals = mocker.MagicMock(name="SignalManager")
+    scheduler_with_df._signals_connected = True
+    scheduler_with_df._owns_dupefilter = True
+    scheduler_with_df._dupefilter_released = False
+
+    with pytest.raises(KeyboardInterrupt):
+      scheduler_with_df.close("test-done")
+
+    manager.close.assert_called_once_with()
+    assert scheduler_with_df._queue is None
+    assert scheduler_with_df._spider is None
+    assert scheduler_with_df._connected_signals is None
+    assert scheduler_with_df._signals_connected is False
+
+  def test_state_resets_when_reentrant_close_after_baseexception(
+    self, mock_connection_manager, mocker
+  ):
+    """A second ``close()`` after a BaseException teardown short-circuits
+    (no re-release), and the first ``close()`` must already have run the
+    state-reset tail. Re-entry cannot re-run idempotent assignments
+    (no-op on already-None), so this is a stability guard for the fix.
+    """
+    from scrapy_extension.queue.strategies.base import QueueStrategy
+
+    class _BoomStrategy(QueueStrategy):
+      def push(self, queue_name, item, *, priority=0.0, delay=0.0, source="default"):  # noqa: ARG002
+        pass
+
+      def pop(self, queue_name, timeout=0.0):  # noqa: ARG002
+        return None
+
+      def queue_len(self, queue_name):  # noqa: ARG002
+        return 0
+
+      def clear(self, queue_name):  # noqa: ARG002
+        pass
+
+      def close(self) -> None:
+        raise KeyboardInterrupt("simulated Ctrl+C")
+
+    scheduler, _ = _make_scheduler_with_queue(
+      mock_connection_manager,
+      mocker,
+      queue_strategy=_BoomStrategy(mock_connection_manager),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+      scheduler.close("first")
+
+    # First close released CM exactly once.
+    assert mock_connection_manager.close.call_count == 1
+    # State already reset.
+    assert scheduler._queue is None
+    assert scheduler._spider is None
+    assert scheduler._connected_signals is None
+    assert scheduler._signals_connected is False
+
+    # Second close is a no-op (lifecycle_state == CLOSED short-circuit).
+    scheduler.close("second")
+    assert mock_connection_manager.close.call_count == 1  # no double release
+    # State idempotently None.
+    assert scheduler._queue is None
+    assert scheduler._spider is None
