@@ -132,6 +132,64 @@ def test_persist_snapshot_skips_when_strategy_snapshot_raises() -> None:
   storage.store.assert_not_called()  # snapshot failed -> never reached store
 
 
+def test_close_releases_strategy_after_begin_close_baseexception() -> None:
+  """A control exception from begin_close cannot skip snapshot or close."""
+  strategy = MagicMock(name="Strategy")
+  first = KeyboardInterrupt()
+  strategy.begin_close.side_effect = first
+  strategy.snapshot.return_value = None
+  queue = BackendQueue(
+    connection_manager=_cm(), queue_name="q", queue_strategy=strategy
+  )
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    queue.close()
+
+  assert raised.value is first
+  strategy.snapshot.assert_called_once_with()
+  strategy.close.assert_called_once_with()
+  assert queue._close_complete is True
+
+
+def test_close_releases_strategy_after_snapshot_baseexception() -> None:
+  """A control exception during snapshot cannot skip destructive cleanup."""
+  strategy = MagicMock(name="Strategy")
+  first = KeyboardInterrupt()
+  strategy.snapshot.side_effect = first
+  queue = BackendQueue(
+    connection_manager=_cm(), queue_name="q", queue_strategy=strategy
+  )
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    queue.close()
+
+  assert raised.value is first
+  strategy.close.assert_called_once_with()
+  assert queue._close_complete is True
+
+
+def test_close_preserves_first_baseexception_across_all_phases() -> None:
+  """Every close phase runs even when each one raises a control exception."""
+  strategy = MagicMock(name="Strategy")
+  first = KeyboardInterrupt()
+  strategy.begin_close.side_effect = first
+  strategy.snapshot.side_effect = SystemExit(2)
+  strategy.close.side_effect = GeneratorExit()
+  queue = BackendQueue(
+    connection_manager=_cm(), queue_name="q", queue_strategy=strategy
+  )
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    queue.close()
+
+  assert raised.value is first
+  strategy.begin_close.assert_called_once_with()
+  strategy.snapshot.assert_called_once_with()
+  strategy.close.assert_called_once_with()
+  assert queue._close_complete is True
+  queue.close()
+
+
 def test_persist_snapshot_skips_when_storage_resolver_raises() -> None:
   """Lines 670-675: ``get_storage_backend()`` raising a non-``NotImplementedError``
   must not crash ``close`` — logged and skipped (distinct from the

@@ -1136,17 +1136,34 @@ class BackendQueue:
         return
       self._accepting_operations = False
 
+    primary_error: BaseException | None = None
     try:
       self._strategy.begin_close()
-      with self._operation_gate:
-        while self._active_operations > 0:
+    except BaseException as exc:
+      primary_error = exc
+    with self._operation_gate:
+      while self._active_operations > 0:
+        try:
           self._operation_gate.wait()
+        except BaseException as exc:
+          if primary_error is None:
+            primary_error = exc
+    try:
       self._persist_snapshot()
+    except BaseException as exc:
+      if primary_error is None:
+        primary_error = exc
+    try:
       self._strategy.close()
+    except BaseException as exc:
+      if primary_error is None:
+        primary_error = exc
     finally:
       with self._operation_gate:
         self._close_complete = True
         self._operation_gate.notify_all()
+    if primary_error is not None:
+      raise primary_error
 
   #: Storage-key prefix for strategy snapshots (initiative #3). Legacy key is
   #: ``<prefix><spider.name>:<queue_name>`` when a named spider is attached
