@@ -81,13 +81,18 @@ def _warn_per_process_scope(strategy: DedupeStrategy) -> None:
   if strategy in _warned:
     return
   _warned.add(strategy)
-  logger.warning(
-    "Dedup strategy %r is per-process — its state is not shared across "
-    "workers, so cross-worker duplicate requests will pass undetected. "
-    "For cross-worker dedup, use the default 'set' strategy (or a "
-    "MemoryMembershipFilter backed by a shared backend).",
-    strategy.value,
-  )
+  # This is an advisory after the warn-once state transition. A broken log
+  # handler must not prevent a valid filter from being constructed.
+  try:
+    logger.warning(
+      "Dedup strategy %r is per-process — its state is not shared across "
+      "workers, so cross-worker duplicate requests will pass undetected. "
+      "For cross-worker dedup, use the default 'set' strategy (or a "
+      "MemoryMembershipFilter backed by a shared backend).",
+      strategy.value,
+    )
+  except BaseException:
+    pass
 
 
 def build_membership_filter(

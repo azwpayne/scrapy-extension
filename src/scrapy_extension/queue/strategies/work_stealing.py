@@ -112,13 +112,18 @@ class WorkStealingQueueStrategy(QueueStrategy):
       # #31: a restart without a stable SCRAPY_QUEUE_WORKER_ID generates a NEW
       # id → new own-queue name → the previous own-queue's items are stranded
       # (queue_len reports 0, no cleanup). Warn so operators set a sticky id.
-      logger.warning(
-        "WorkStealingQueueStrategy auto-generated worker_id %r. A restart "
-        "without a stable SCRAPY_QUEUE_WORKER_ID strands the previous "
-        "own-queue's items. Set SCRAPY_QUEUE_WORKER_ID for production "
-        "multi-worker deployments.",
-        self._worker_id,
-      )
+      # The generated identity is already committed. This advisory cannot
+      # change constructor success or mask validation that follows.
+      try:
+        logger.warning(
+          "WorkStealingQueueStrategy auto-generated worker_id %r. A restart "
+          "without a stable SCRAPY_QUEUE_WORKER_ID strands the previous "
+          "own-queue's items. Set SCRAPY_QUEUE_WORKER_ID for production "
+          "multi-worker deployments.",
+          self._worker_id,
+        )
+      except BaseException:
+        pass
     if isinstance(peer_ids, (str, bytes)):
       raise ValueError("peer_ids must be an iterable of non-empty strings")
     normalized_peers: list[str] = []

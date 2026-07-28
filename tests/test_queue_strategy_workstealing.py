@@ -346,6 +346,48 @@ def test_default_worker_id_is_unique_per_instance():
   assert len(s1._worker_id) > 0
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("warning handler failed"),
+    KeyboardInterrupt("warning handler interrupted"),
+    SystemExit("warning handler exited"),
+  ],
+)
+def test_auto_worker_id_warning_failure_preserves_construction(
+  mocker, diagnostic_error: BaseException
+):
+  """The auto-ID advisory cannot turn a valid strategy into a failed startup."""
+  from scrapy_extension.queue.strategies import work_stealing as module
+
+  cm = MagicMock(name="ConnectionManager")
+  warning = mocker.patch.object(
+    module.logger, "warning", side_effect=diagnostic_error
+  )
+
+  strategy = WorkStealingQueueStrategy(cm)
+
+  assert strategy._worker_id
+  assert strategy._peer_ids == ()
+  warning.assert_called_once()
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("warning handler failed"), KeyboardInterrupt(), SystemExit()],
+)
+def test_auto_worker_id_warning_failure_does_not_suppress_peer_validation(
+  mocker, diagnostic_error: BaseException
+):
+  """Only the advisory is isolated; invalid peer configuration still fails."""
+  from scrapy_extension.queue.strategies import work_stealing as module
+
+  mocker.patch.object(module.logger, "warning", side_effect=diagnostic_error)
+
+  with pytest.raises(ValueError, match="peer_ids"):
+    WorkStealingQueueStrategy(MagicMock(), peer_ids=("",))
+
+
 # ---------------------------------------------------------------------------
 # queue_len, clear — own queue only
 # ---------------------------------------------------------------------------

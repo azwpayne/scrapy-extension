@@ -189,9 +189,14 @@ class BackendSpiderMixin(Spider):
           try:
             manager.close()
           except BaseException:
-            logger.exception(
-              "Failed to release ConnectionManager after signal wiring failure"
-            )
+            # Signal registration is the primary operation.  An arbitrary
+            # logging handler must not replace that registration failure.
+            try:
+              logger.exception(
+                "Failed to release ConnectionManager after signal wiring failure"
+              )
+            except BaseException:
+              pass
         raise
 
       return manager
@@ -438,7 +443,14 @@ class BackendSpiderMixin(Spider):
     try:
       self.close_backend()
     except Exception:
-      logger.exception("close_backend() failed during spider_closed signal")
+      # This is an advisory diagnostic: a broken logging handler must not
+      # interrupt Scrapy's remaining spider_closed subscribers.  Deliberately
+      # keep the outer ``except Exception`` so direct control-flow exceptions
+      # from close_backend still propagate.
+      try:
+        logger.exception("close_backend() failed during spider_closed signal")
+      except BaseException:
+        pass
 
   def _crawler_settings(self) -> Any | None:
     """Return ``crawler.settings`` if a crawler is attached, else None.

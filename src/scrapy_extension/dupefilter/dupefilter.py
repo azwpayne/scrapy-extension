@@ -801,11 +801,17 @@ class BackendDupeFilter:
         spider: The spider instance.
     """
     if self.debug:
-      logger.debug(
-        "Filtered duplicate request: %s",
-        request.url,
-        extra={"spider": spider},
-      )
+      try:
+        logger.debug(
+          "Filtered duplicate request: %s",
+          request.url,
+          extra={"spider": spider},
+        )
+      except BaseException:
+        # Scrapy calls this only after the duplicate decision has already
+        # been returned. A broken logging handler must not retroactively turn
+        # that completed decision into a false processing failure.
+        pass
 
   def request_seen(self, request: Request) -> bool:
     """Check a request through Scrapy's boolean duplicate-filter contract."""

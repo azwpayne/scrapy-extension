@@ -319,6 +319,46 @@ class TestSetupBackend:
     assert spider._connected_signals is None
     assert spider._signals_connected is False
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logger failed"),
+      KeyboardInterrupt(),
+      SystemExit(2),
+    ],
+  )
+  def test_setup_backend_preserves_signal_wiring_error_when_cleanup_logging_fails(
+    self, mocker, diagnostic_error
+  ):
+    """R130: cleanup diagnostics cannot replace the signal wiring failure."""
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    manager.close.side_effect = RuntimeError("manager close failed")
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+    log_exception = mocker.patch(
+      "scrapy_extension.spider.spider_mixin.logger.exception",
+      side_effect=diagnostic_error,
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    wiring_error = RuntimeError("signal wiring failed")
+    signal_manager.connect.side_effect = wiring_error
+    spider.crawler = mocker.MagicMock(signals=signal_manager)
+
+    with pytest.raises(RuntimeError) as captured:
+      spider.setup_backend()
+
+    assert captured.value is wiring_error
+    manager.close.assert_called_once_with()
+    log_exception.assert_called_once_with(
+      "Failed to release ConnectionManager after signal wiring failure"
+    )
+    assert spider._connection_manager is None
+
   def test_concurrent_setup_acquires_manager_once(self, mocker):
     """Concurrent setup calls pair with exactly one registry acquire."""
     import threading
@@ -1103,6 +1143,50 @@ class TestOnSpiderClosed:
 
     # Must NOT propagate; the failure is logged instead.
     assert "close_backend() failed" in caplog.text
+
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logger failed"),
+      KeyboardInterrupt(),
+      SystemExit(2),
+    ],
+  )
+  def test_close_failure_logging_cannot_break_spider_closed_signal_chain(
+    self, mocker, diagnostic_error
+  ):
+    """R130: an advisory logger must not abort remaining signal subscribers."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    mocker.patch.object(
+      spider, "close_backend", side_effect=RuntimeError("close failed")
+    )
+    mocker.patch(
+      "scrapy_extension.spider.spider_mixin.logger.exception",
+      side_effect=diagnostic_error,
+    )
+
+    # This method is called by Scrapy's signal dispatcher; no exception means
+    # later spider_closed subscribers get their chance to run.
+    spider._on_spider_closed(spider, reason="finished")
+
+  @pytest.mark.parametrize("control_error", [KeyboardInterrupt(), SystemExit(2)])
+  def test_close_backend_control_errors_remain_direct(self, mocker, control_error):
+    """R130: only diagnostics are isolated; close control flow still wins."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    mocker.patch.object(spider, "close_backend", side_effect=control_error)
+
+    with pytest.raises(type(control_error)) as captured:
+      spider._on_spider_closed(spider, reason="finished")
+
+    assert captured.value is control_error
 
   def test_ignores_other_spider_instances(self, mocker):
     """Test that _on_spider_closed ignores other spider instances."""

@@ -373,6 +373,48 @@ class TestPerProcessStrategyWarning:
     ]
     assert len(warnings) == 1
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning handler failed"),
+      KeyboardInterrupt("warning handler interrupted"),
+      SystemExit("warning handler exited"),
+    ],
+  )
+  def test_warning_failure_preserves_non_strict_construction(
+    self, mock_connection_manager, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """A per-process advisory cannot block a valid filter construction."""
+    warning = mocker.patch.object(
+      factory_module.logger, "warning", side_effect=diagnostic_error
+    )
+
+    result = build_membership_filter(
+      DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
+    )
+
+    assert isinstance(result, MemoryMembershipFilter)
+    assert DedupeStrategy.MEMORY in factory_module._warned
+    warning.assert_called_once()
+
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [RuntimeError("warning handler failed"), KeyboardInterrupt(), SystemExit()],
+  )
+  def test_warning_failure_does_not_suppress_filter_construction_error(
+    self, mock_connection_manager, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """Only the advisory is isolated; real constructor failures still escape."""
+    mocker.patch.object(factory_module.logger, "warning", side_effect=diagnostic_error)
+    mocker.patch.object(
+      factory_module,
+      "MemoryMembershipFilter",
+      side_effect=ValueError("invalid memory filter"),
+    )
+
+    with pytest.raises(ValueError, match="invalid memory filter"):
+      build_membership_filter(DedupeStrategy.MEMORY, mock_connection_manager)
+
 
 class TestStrictDedupFailLoud:
   """Risk 3: SCRAPY_DEDUP_STRICT fails loud on per-process strategies."""

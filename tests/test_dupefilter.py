@@ -466,6 +466,35 @@ class TestBackendDupeFilterLog:
     assert len(caplog.records) == 1
     assert caplog.records[0].spider is mock_spider
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logging unavailable"),
+      KeyboardInterrupt(),
+      SystemExit(),
+    ],
+  )
+  def test_log_failure_preserves_completed_duplicate_decision(
+    self, mock_connection_manager, mocker, diagnostic_error
+  ):
+    """Duplicate logging is advisory after the duplicate result is known."""
+    dupefilter = BackendDupeFilter(
+      connection_manager=mock_connection_manager,
+      debug=True,
+    )
+    mock_connection_manager.get_set_backend().add.return_value = False
+    request = Request(url="https://example.com")
+    spider = mock_connection_manager.get_queue_backend()
+
+    assert dupefilter.request_seen(request) is True
+    mocker.patch(
+      "scrapy_extension.dupefilter.dupefilter.logger.debug",
+      side_effect=diagnostic_error,
+    )
+
+    dupefilter.log(request, spider)
+    mock_connection_manager.get_set_backend().add.assert_called_once()
+
 
 class TestBackendDupeFilterRequestSeen:
   """Test BackendDupeFilter request_seen method."""
