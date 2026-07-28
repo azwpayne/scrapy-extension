@@ -574,7 +574,13 @@ class RabbitMQBackend(Backend, QueueBackend):
           except BaseException:
             pass
         raise
-      logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
+      # Publication is the connection linearization point.  A custom logging
+      # handler is pure telemetry and must not make a fully published session
+      # look like a failed connect to the caller.
+      try:
+        logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
+      except BaseException:
+        pass
 
   def _get_ssl_verify_mode(self, mode: str | None = None) -> ssl.VerifyMode:
     """Get SSL verification mode from config.

@@ -234,6 +234,40 @@ def test_publish_window_baseexception_after_publish_keeps_live_session(mocker) -
   assert backend._connection is candidate_connection
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logger handler failed"),
+    KeyboardInterrupt("logger interrupted"),
+    SystemExit("logger exited"),
+  ],
+)
+def test_post_publish_success_logger_failure_keeps_live_session(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """A success diagnostic cannot turn an already-published session into failure."""
+  backend = _backend()
+  candidate_connection, candidate_channel = _handles("candidate")
+  candidate = _RabbitMQCandidate(
+    connection=candidate_connection,
+    channel=candidate_channel,
+    snapshot=backend._capture_connection_snapshot(),
+  )
+  mocker.patch.object(backend, "_connect_standalone", return_value=candidate)
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.debug",
+    side_effect=diagnostic_error,
+  )
+
+  backend.connect()
+
+  assert backend._connection is candidate_connection
+  assert backend._channel is candidate_channel
+  assert backend.is_connected() is True
+  candidate_connection.close.assert_not_called()
+  candidate_channel.close.assert_not_called()
+
+
 def test_disconnect_fences_in_progress_candidate(mocker) -> None:
   backend = _backend()
   candidate_connection, candidate_channel = _handles("candidate")
