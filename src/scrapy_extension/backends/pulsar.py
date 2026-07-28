@@ -1138,5 +1138,12 @@ class _suppress_pulsar_errors:
     # operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    logger.debug("Suppressed pulsar cleanup error: %s", exc)
+    # Diagnostics are strictly secondary to the cleanup contract.  A custom
+    # logging handler can itself raise a control-flow exception; it must not
+    # turn an ordinary close error into that exception or stop later handles
+    # from being released.
+    try:
+      logger.debug("Suppressed pulsar cleanup error: %s", exc)
+    except BaseException:
+      pass
     return True

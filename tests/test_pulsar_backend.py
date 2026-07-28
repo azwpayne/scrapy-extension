@@ -421,6 +421,48 @@ class TestPulsarConnect:
     assert b._producers == {}
     assert b._client is None
 
+  def test_disconnect_ignores_diagnostic_control_error_after_close_error(
+    self, mocker
+  ) -> None:
+    """R96: logger failures must not stop suppressed-close sibling cleanup."""
+    b, client = _connected(mocker)
+    consumer_a = mocker.MagicMock(name="consumer_a")
+    consumer_b = mocker.MagicMock(name="consumer_b")
+    consumer_a.close.side_effect = RuntimeError("ordinary close failure")
+    b._consumers = {"topic_a": consumer_a, "topic_b": consumer_b}
+    mocker.patch(
+      "scrapy_extension.backends.pulsar.logger.debug",
+      side_effect=KeyboardInterrupt("diagnostic interrupted"),
+    )
+
+    b.disconnect()
+
+    for handle in (consumer_a, consumer_b, client):
+      handle.close.assert_called_once_with()
+
+  def test_stale_producer_close_keeps_connection_changed_queue_error(self, mocker) -> None:
+    """R96: a diagnostic interruption cannot replace stale-candidate QueueError."""
+    b, client = _connected(mocker)
+    producer = mocker.MagicMock(name="stale_producer")
+    producer.close.side_effect = RuntimeError("ordinary close failure")
+
+    def create_stale_producer(_topic: str):
+      with b._lifecycle_lock:
+        b._client = None
+        b._lifecycle_generation += 1
+      return producer
+
+    client.create_producer.side_effect = create_stale_producer
+    mocker.patch(
+      "scrapy_extension.backends.pulsar.logger.debug",
+      side_effect=KeyboardInterrupt("diagnostic interrupted"),
+    )
+
+    with pytest.raises(QueueError, match="connection changed"):
+      b._producer_for("topic")
+
+    producer.close.assert_called_once_with()
+
   def test_reconnect_during_disconnect_does_not_close_new_client(self, mocker) -> None:
     close_started = Event()
     release_close = Event()
