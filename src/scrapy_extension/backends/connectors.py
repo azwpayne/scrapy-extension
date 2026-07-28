@@ -16,7 +16,6 @@ registry to maintain.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import importlib
 import json
@@ -1234,8 +1233,13 @@ class ConnectionManager:
 
     # The final holder released while backend.connect() was in flight. Dispose
     # the successful handle instead of resurrecting an evicted manager.
-    with contextlib.suppress(Exception):
+    try:
       backend.disconnect()
+    except BaseException as exc:  # noqa: BLE001 - preserve the causal release error
+      # This teardown is best-effort.  In particular, a control-flow signal
+      # from a broken backend must not replace the typed error which explains
+      # why the successful connection was discarded.
+      logger.warning("Error disconnecting released backend: %s", exc)
     raise BackendConnectionError(
       "Connection completed after ConnectionManager release; backend discarded",
       backend_type=str(self.backend_type),

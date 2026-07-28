@@ -205,6 +205,59 @@ def test_attempt_connection_cleans_up_after_baseexception(mocker):
   assert manager._backend is None
 
 
+def test_attempt_connection_close_wins_preserves_discard_error(mocker):
+  """A close during connect keeps its causal terminal error despite cleanup.
+
+  ``backend.connect()`` runs without the manager state lock.  The final holder
+  can therefore retire the manager after the backend has connected but before
+  ``_attempt_connection()`` publishes it.  The newly successful handle must
+  be disconnected, but even a control-flow exception from that best-effort
+  cleanup must not replace the typed ``BackendConnectionError`` explaining
+  that close won the race.
+  """
+  import threading
+
+  manager = ConnectionManager(BackendType.REDIS)
+  connect_entered = threading.Event()
+  allow_connect_return = threading.Event()
+
+  def _connect() -> None:
+    connect_entered.set()
+    assert allow_connect_return.wait(timeout=5), "test did not release connect"
+
+  backend = mocker.MagicMock()
+  backend.connect.side_effect = _connect
+  cleanup_signal = KeyboardInterrupt("cleanup interruption")
+  backend.disconnect.side_effect = cleanup_signal
+  mocker.patch.object(manager, "_create_backend", return_value=backend)
+
+  outcome: list[BaseException] = []
+
+  def _attempt() -> None:
+    try:
+      manager._attempt_connection()
+    except BaseException as exc:  # noqa: BLE001 - capture the thread outcome
+      outcome.append(exc)
+
+  worker = threading.Thread(target=_attempt)
+  worker.start()
+  assert connect_entered.wait(timeout=5), "backend.connect() was not entered"
+
+  # ``close()`` takes the terminal-state lock while the backend is still in
+  # flight, so the worker deterministically sees a retired manager once it is
+  # allowed to return from ``connect()``.
+  manager.close()
+  allow_connect_return.set()
+  worker.join(timeout=5)
+
+  assert not worker.is_alive(), "connection attempt did not finish"
+  assert len(outcome) == 1
+  assert isinstance(outcome[0], BackendConnectionError)
+  assert "backend discarded" in str(outcome[0])
+  backend.disconnect.assert_called_once_with()
+  assert manager._backend is None
+
+
 def test_close_swallows_backend_disconnect_error_and_still_evicts(mocker):
   """R44-A1: close() must not propagate a backend-specific disconnect error.
 
