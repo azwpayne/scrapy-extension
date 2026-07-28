@@ -394,6 +394,39 @@ class TestSqsConnect:
     client.close.assert_called_once()
     assert b.is_connected() is False
 
+  def test_disconnect_swallows_close_error_when_diagnostic_interrupts(
+    self, mocker
+  ) -> None:
+    """A diagnostic for an ordinary close failure cannot break teardown."""
+    b, client = _connected(mocker)
+    client.close.side_effect = RuntimeError("close failed")
+    mocker.patch(
+      "scrapy_extension.backends.sqs.logger.debug",
+      side_effect=KeyboardInterrupt("diagnostic interrupted"),
+    )
+
+    b.disconnect()
+
+    client.close.assert_called_once_with()
+    assert b._generation is None
+    assert b._client is None
+
+  def test_disconnect_propagates_close_control_exception_after_detach(
+    self, mocker
+  ) -> None:
+    """A real close control exception remains observable after detaching."""
+    b, client = _connected(mocker)
+    interrupted = KeyboardInterrupt("close interrupted")
+    client.close.side_effect = interrupted
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.disconnect()
+
+    assert raised.value is interrupted
+    client.close.assert_called_once_with()
+    assert b._generation is None
+    assert b._client is None
+
   def test_disconnect_finishes_drain_after_baseexception(self, mocker) -> None:
     b, client = _connected(mocker)
     assert b._generation is not None

@@ -1248,5 +1248,11 @@ class _swallow:
     # (the operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    logger.debug("Suppressed SQS cleanup error: %s", exc)
+    # This diagnostic describes an error we have deliberately decided to
+    # suppress.  A failing logging handler must not turn that ordinary cleanup
+    # failure into a teardown failure (or mask the original close result).
+    try:
+      logger.debug("Suppressed SQS cleanup error: %s", exc)
+    except BaseException:
+      pass
     return True
