@@ -608,7 +608,7 @@ class BackendScheduler:
     self.queue_key = queue_key
     self.stats = stats
     self.dupefilter = dupefilter
-    self._owns_dupefilter: bool = False
+    self._owns_dupefilter: bool = dupefilter is not None
     self._dupefilter_open: bool = False
     self._dupefilter_released: bool = False
     self._queue_strategy = queue_strategy

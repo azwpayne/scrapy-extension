@@ -175,6 +175,52 @@ class TestOwnedDupeFilterLifecycle:
       scheduler.open(spider)
 
 
+class TestConstructorSuppliedDupeFilterLifecycle:
+  """R44-F1: a dupefilter passed to the public constructor is owned.
+
+  The constructor documents ``dupefilter`` as an optional scheduler dependency
+  and provides no caller-managed lifecycle switch. It must therefore receive
+  the same open/close lifecycle as a dupefilter created by ``from_crawler``.
+  This matters because ``BackendDupeFilter.open(spider)`` resolves ``{spider}``
+  key templates and applies clear-on-open before the first fingerprint check.
+  """
+
+  def test_constructor_supplied_dupefilter_is_opened_and_closed(
+    self, mock_connection_manager, mocker
+  ):
+    dupefilter = mocker.MagicMock(name="ConstructorDupeFilter")
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+      dupefilter=dupefilter,
+    )
+    spider = mocker.Mock(name="Spider")
+    spider.name = "constructor_spider"
+    spider.crawler = mocker.MagicMock()
+
+    scheduler.open(spider)
+    dupefilter.open.assert_called_once_with(spider)
+
+    scheduler.close("finished")
+    dupefilter.close.assert_called_once_with("finished")
+
+  def test_constructor_without_dupefilter_preserves_noop_lifecycle(
+    self, mock_connection_manager, mocker
+  ):
+    scheduler = BackendScheduler(
+      connection_manager=mock_connection_manager,
+      queue_key="test:queue",
+    )
+    spider = mocker.Mock(name="Spider")
+    spider.name = "no_dupefilter"
+    spider.crawler = mocker.MagicMock()
+
+    scheduler.open(spider)
+    scheduler.close("finished")
+
+    mock_connection_manager.close.assert_called_once_with()
+
+
 class TestOperationCloseRaces:
   """Operations retain the queue selected before a concurrent close."""
 

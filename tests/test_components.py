@@ -31,6 +31,12 @@ class RecordingDupeFilter:
     dupefilter.crawler = crawler
     return dupefilter
 
+  def open(self, spider):
+    del spider
+
+  def close(self, reason):
+    del reason
+
   def request_seen(self, request):
     self.seen_requests.append(request)
     return request.url in self.duplicates

@@ -55,6 +55,9 @@ import time
 import uuid
 
 import pytest
+from kafka.errors import NotLeaderForPartitionError
+
+from scrapy_extension.exceptions import QueueError
 
 pytestmark = [
   pytest.mark.integration,
@@ -83,6 +86,28 @@ def _drain(backend, queue: str, n: int, deadline_s: float = 15.0) -> list:  # ty
       received.append(item)
       backend.ack(queue)  # commit the offset (pop does NOT auto-ack, R12)
   return received
+
+
+def _push_after_leader_election(backend, queue: str, item: bytes) -> None:  # type: ignore[no-untyped-def]
+  """Push after a newly auto-created topic has elected its partition leader.
+
+  Kafka's CreateTopics response can arrive before metadata has converged on a
+  leader for every new partition. A ``NotLeaderForPartitionError`` is a known,
+  non-ambiguous retry signal in that narrow window; any other QueueError still
+  fails the test immediately.
+  """
+  deadline = time.monotonic() + 10.0
+  while True:
+    try:
+      backend.push(queue, item, priority=0.0)
+      return
+    except QueueError as exc:
+      if (
+        not isinstance(exc.__cause__, NotLeaderForPartitionError)
+        or time.monotonic() >= deadline
+      ):
+        raise
+      time.sleep(0.25)
 
 
 @pytest.fixture(scope="module")
@@ -130,7 +155,7 @@ def test_push_pop_round_trip_with_ack(kafka_backend, unique_prefix):
   n = 5
   sent = [f"item-{i:03d}".encode() for i in range(n)]
   for item in sent:
-    kafka_backend.push(queue, item, priority=0.0)
+    _push_after_leader_election(kafka_backend, queue, item)
 
   received = _drain(kafka_backend, queue, n)
 
@@ -143,7 +168,7 @@ def test_cold_start_depth_sees_existing_backlog(kafka_backend, unique_prefix):
   queue = f"{unique_prefix}-cold-depth"
   sent = [b"cold-0", b"cold-1", b"cold-2"]
   for item in sent:
-    kafka_backend.push(queue, item, priority=0.0)
+    _push_after_leader_election(kafka_backend, queue, item)
 
   assert kafka_backend.queue_len(queue) == len(sent)
 
