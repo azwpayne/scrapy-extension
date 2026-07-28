@@ -764,6 +764,70 @@ class TestAckNackFailureObservability:
     assert counts.get(f"scheduler/{operation}_error") == 1
     assert request.meta[BACKEND_ACK_TOKEN_META_KEY] == "tok"
 
+  @pytest.mark.parametrize("operation", ["ack", "nack"])
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+  )
+  def test_terminal_backend_error_survives_diagnostic_interruption(
+    self,
+    mocker: Any,
+    operation: str,
+    diagnostic_error: type[BaseException],
+  ) -> None:
+    """A logger failure cannot turn a retryable settlement miss into a crash."""
+    counts, stats = _stats_counter()
+    scheduler = BackendScheduler(
+      connection_manager=MagicMock(),
+      stats=stats,
+    )
+    queue = MagicMock(name="BackendQueue")
+    getattr(queue, operation).side_effect = BackendError("connection retired")
+    scheduler._queue = queue
+    mocker.patch(
+      "scrapy_extension.schedule.scheduler.logger.exception",
+      side_effect=diagnostic_error("diagnostic interrupted"),
+    )
+    request = Request(
+      "https://example.com/x",
+      meta={BACKEND_ACK_TOKEN_META_KEY: "tok"},
+    )
+
+    getattr(scheduler, f"_{operation}_request_token")(
+      request,
+      log_message=f"{operation} failed",
+    )
+
+    getattr(queue, operation).assert_called_once_with(token="tok")
+    assert counts.get(f"scheduler/{operation}_error") == 1
+    assert request.meta[BACKEND_ACK_TOKEN_META_KEY] == "tok"
+
+  @pytest.mark.parametrize("operation", ["ack", "nack"])
+  @pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+  def test_terminal_direct_queue_control_still_propagates(
+    self,
+    mocker: Any,
+    operation: str,
+    control_error: type[BaseException],
+  ) -> None:
+    """Only diagnostic failures are isolated; queue process control is direct."""
+    scheduler = BackendScheduler(connection_manager=MagicMock(), stats=MagicMock())
+    queue = MagicMock(name="BackendQueue")
+    getattr(queue, operation).side_effect = control_error("queue interrupted")
+    scheduler._queue = queue
+    log_exception = mocker.patch(
+      "scrapy_extension.schedule.scheduler.logger.exception",
+    )
+
+    with pytest.raises(control_error, match="queue interrupted"):
+      getattr(scheduler, f"_{operation}_token")(
+        "tok",
+        log_message=f"{operation} failed",
+      )
+
+    getattr(queue, operation).assert_called_once_with(token="tok")
+    log_exception.assert_not_called()
+
   def test_ack_success_does_not_increment_error_stat(self) -> None:
     """Guard: a successful ack bumps no error counter (no false-positive signal)."""
     manager = MagicMock(name="ConnectionManager")

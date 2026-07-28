@@ -1438,7 +1438,13 @@ class BackendScheduler:
     except BackendError:
       if self.stats:
         self.stats.inc_value("scheduler/ack_error")
-      logger.exception(log_message)
+      # The BackendError is the settlement outcome: retain the token so the
+      # broker can redeliver. A custom logging handler is only diagnostic and
+      # must not replace that documented ``False`` result.
+      try:
+        logger.exception(log_message)
+      except BaseException:
+        pass
       return False
     return True
 
@@ -1462,7 +1468,13 @@ class BackendScheduler:
     except BackendError:
       if self.stats:
         self.stats.inc_value("scheduler/nack_error")
-      logger.exception(log_message)
+      # Keep the failed settlement observable as ``False`` even when a
+      # diagnostic handler is interrupted. Exceptions from queue.nack itself
+      # still follow the direct queue-control contract above.
+      try:
+        logger.exception(log_message)
+      except BaseException:
+        pass
       return False
     return True
 
