@@ -259,6 +259,20 @@ class DynamoDBBackend(Backend, StorageBackend):
     except Exception as exc:
       logger.debug("Suppressed DynamoDB resource close error: %s", exc)
 
+  @classmethod
+  def _close_aborted_resource(cls, resource: Any) -> None:
+    """Close an unpublished candidate without masking its primary failure.
+
+    This helper is deliberately restricted to candidate-abort paths.  Normal
+    ``disconnect()`` keeps ``BaseException`` observable to its caller, while
+    an exception that already aborted candidate construction/publication must
+    remain the causal error even if SDK cleanup is interrupted.
+    """
+    try:
+      cls._close_resource(resource)
+    except BaseException as exc:
+      logger.debug("Suppressed aborted DynamoDB resource close error: %s", exc)
+
   def _build_candidate(
     self,
     snapshot: _DynamoDBConnectionSnapshot,
@@ -325,7 +339,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         snapshot=snapshot,
       )
     except BaseException:
-      self._close_resource(resource)
+      self._close_aborted_resource(resource)
       raise
 
   def _publish_generation_locked(
@@ -547,7 +561,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         # publish-step arm. Resource leak, not wedge: an unpublished candidate
         # never reaches instance state, so is_connected() stays truthful.
         if self._generation is not candidate:
-          self._close_resource(candidate.resource)
+          self._close_aborted_resource(candidate.resource)
         raise
       if not publish:
         self._close_resource(candidate.resource)

@@ -159,6 +159,44 @@ def test_connect_closes_candidate_on_baseexception_in_publish_window(
   assert backend.is_connected() is False
 
 
+def test_build_failure_keeps_primary_error_when_candidate_close_is_interrupted(
+  mocker,
+) -> None:
+  """An aborted build must not replace its SDK failure with Ctrl+C in close."""
+  backend = _backend()
+  resource, table = _resource(mocker)
+  failure = RuntimeError("load failed")
+  table.load.side_effect = failure
+  resource.meta.client.close.side_effect = KeyboardInterrupt
+  _patch_resource(mocker, return_value=resource)
+
+  with pytest.raises(BackendConnectionError) as raised:
+    backend.connect()
+
+  assert raised.value.__cause__ is failure
+  resource.meta.client.close.assert_called_once_with()
+  assert backend.is_connected() is False
+
+
+def test_publish_failure_keeps_primary_error_when_candidate_close_is_interrupted(
+  mocker,
+) -> None:
+  """A publish interrupt remains primary when the aborted close exits the VM."""
+  backend = _backend()
+  resource, _table = _resource(mocker)
+  resource.meta.client.close.side_effect = SystemExit
+  _patch_resource(mocker, return_value=resource)
+  mocker.patch.object(
+    backend, "_publish_generation_locked", side_effect=KeyboardInterrupt
+  )
+
+  with pytest.raises(KeyboardInterrupt):
+    backend.connect()
+
+  resource.meta.client.close.assert_called_once_with()
+  assert backend.is_connected() is False
+
+
 def test_concurrent_connect_is_single_flight_and_live_connect_is_idempotent(
   mocker,
 ) -> None:
