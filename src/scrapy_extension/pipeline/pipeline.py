@@ -268,9 +268,13 @@ class BackendPipeline:
       try:
         manager.close()
       except BaseException:
-        logger.exception(
-          "Failed to release ConnectionManager after pipeline factory failure"
-        )
+        try:
+          logger.exception(
+            "Failed to release ConnectionManager after pipeline factory failure"
+          )
+        except BaseException:
+          # Diagnostics must not replace the factory failure being unwound.
+          pass
       raise
 
   @classmethod
@@ -316,9 +320,13 @@ class BackendPipeline:
       try:
         pipeline._close_after_factory_failure()
       except BaseException:
-        logger.exception(
-          "Failed to close pipeline after crawler factory failure"
-        )
+        try:
+          logger.exception(
+            "Failed to close pipeline after crawler factory failure"
+          )
+        except BaseException:
+          # Diagnostics must not replace the crawler factory failure.
+          pass
       raise
 
   def _close_after_factory_failure(self) -> None:
@@ -390,7 +398,11 @@ class BackendPipeline:
         try:
           self._close_locked()
         except BaseException:
-          logger.exception("Pipeline cleanup failed during open rollback")
+          try:
+            logger.exception("Pipeline cleanup failed during open rollback")
+          except BaseException:
+            # Diagnostics must not replace the open failure being unwound.
+            pass
         raise
       self._opened = True
       self._opened_spider = spider

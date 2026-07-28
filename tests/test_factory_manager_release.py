@@ -95,6 +95,26 @@ def test_release_failure_does_not_mask_original_factory_error(mocker: Any) -> No
   manager.close.assert_called_once_with()
 
 
+def test_pipeline_factory_primary_control_error_survives_cleanup_log_failure(
+  mocker: Any,
+) -> None:
+  """R86: cleanup diagnostics cannot replace the factory control failure."""
+  manager, _ = _patch_manager(mocker)
+  original_error = KeyboardInterrupt("factory interrupted")
+  mocker.patch.object(BackendPipeline, "__init__", side_effect=original_error)
+  manager.close.side_effect = RuntimeError("release failed")
+  mocker.patch(
+    "scrapy_extension.pipeline.pipeline.logger.exception",
+    side_effect=SystemExit("logger interrupted"),
+  )
+
+  with pytest.raises(KeyboardInterrupt) as exc_info:
+    BackendPipeline.from_settings(_settings())
+
+  assert exc_info.value is original_error
+  manager.close.assert_called_once_with()
+
+
 def test_pipeline_from_crawler_failure_releases_acquired_manager(mocker: Any) -> None:
   manager, _ = _patch_manager(mocker)
   crawler = mocker.MagicMock(name="crawler")
@@ -107,6 +127,29 @@ def test_pipeline_from_crawler_failure_releases_acquired_manager(mocker: Any) ->
   )
 
   with pytest.raises(FactoryConstructionError) as exc_info:
+    BackendPipeline.from_crawler(crawler)
+
+  assert exc_info.value is original_error
+  manager.close.assert_called_once_with()
+
+
+def test_pipeline_crawler_primary_control_error_survives_cleanup_log_failure(
+  mocker: Any,
+) -> None:
+  """R86: crawler rollback retains its causal control failure."""
+  manager, _ = _patch_manager(mocker)
+  crawler = mocker.MagicMock(name="crawler")
+  crawler.settings = _settings()
+  crawler.stats = None
+  original_error = KeyboardInterrupt("crawler interrupted")
+  manager.set_monitor.side_effect = original_error
+  manager.close.side_effect = RuntimeError("release failed")
+  mocker.patch(
+    "scrapy_extension.pipeline.pipeline.logger.exception",
+    side_effect=SystemExit("logger interrupted"),
+  )
+
+  with pytest.raises(KeyboardInterrupt) as exc_info:
     BackendPipeline.from_crawler(crawler)
 
   assert exc_info.value is original_error

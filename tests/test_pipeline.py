@@ -282,6 +282,33 @@ class TestBackendPipelineOpenSpider:
     # And storage is NOT marked supported (the bug never confirmed it).
     assert pipeline._storage_supported is None
 
+  def test_open_rollback_preserves_primary_control_error_when_diagnostics_abort(
+    self, mock_connection_manager, mocker
+  ):
+    """R86: cleanup and its logger cannot mask the failed open's cause."""
+    strategy = mocker.MagicMock()
+    original_error = KeyboardInterrupt("open interrupted")
+    strategy.open.side_effect = original_error
+    mock_connection_manager.close.side_effect = RuntimeError("release failed")
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.exception",
+      side_effect=SystemExit("logger interrupted"),
+    )
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+    )
+    spider = mocker.Mock(name="spider")
+    spider.name = "test_spider"
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      pipeline.open_spider(spider)
+
+    assert exc_info.value is original_error
+    strategy.open.assert_called_once_with()
+    strategy.close.assert_called_once_with()
+    mock_connection_manager.close.assert_called_once_with()
+
   def test_open_spider_rejects_name_that_cannot_form_a_storage_key(
     self, mock_connection_manager, mocker
   ):
