@@ -21,7 +21,11 @@ import pytest
 from elasticsearch import TransportError
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 from scrapy_extension.settings import ElasticSearchMode, ElasticSearchSettings
 
 
@@ -49,7 +53,7 @@ def test_connect_cloud_mode_requires_cloud_id() -> None:
     )
   )
   backend.config.cloud_id = None  # bypass settings validation
-  with pytest.raises(BackendConnectionError, match="Cloud mode requires 'cloud_id'"):
+  with pytest.raises(ConfigurationError):
     backend.connect()
 
 

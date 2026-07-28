@@ -6,8 +6,11 @@ import base64
 import binascii
 import hashlib
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
+
+from pydantic import ValidationError
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -38,13 +41,38 @@ from scrapy_extension.backends.base import (
   _validate_ttl,
   secret_value,
 )
-from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+  StorageError,
+)
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
 
 if TYPE_CHECKING:
   from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _ElasticSearchConnectionSnapshot:
+  """Validated operational values fixed for one Elasticsearch client."""
+
+  mode: ElasticSearchMode
+  hosts: tuple[str, ...]
+  cloud_id: str | None
+  api_key: str | None
+  username: str | None
+  password: str | None
+  verify_certs: bool
+  ca_certs: str | None
+  request_timeout: float
+  max_retries: int
+  retry_on_timeout: bool
+  queue_index: str
+  set_index: str
+  storage_index: str
 
 
 def _b64encode(data: bytes) -> str:
@@ -68,24 +96,85 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     self.config = config
     self._client: Elasticsearch | None = None
+    self._connection_snapshot: _ElasticSearchConnectionSnapshot | None = None
 
-  def _build_kwargs(self) -> dict[str, Any]:
+  def _capture_connection_snapshot(self) -> _ElasticSearchConnectionSnapshot:
+    """Copy and revalidate every value used by one client generation.
+
+    Pydantic settings are mutable after construction.  Revalidating a copied
+    field map preserves the settings model's transport/auth/index invariants
+    before an SDK call, while the frozen result prevents later mutation from
+    retargeting a live client's capability operations.
+    """
+    try:
+      validated = type(self.config).model_validate(self.config.__dict__.copy())
+    except ConfigurationError:
+      raise
+    except ValidationError as exc:
+      errors = exc.errors()
+      location = errors[0].get("loc", ()) if errors else ()
+      setting_name = str(location[0]) if location else "elasticsearch"
+      raise ConfigurationError(
+        f"Invalid Elasticsearch setting '{setting_name}'.",
+        setting_name=setting_name,
+      ) from exc
+
+    return _ElasticSearchConnectionSnapshot(
+      mode=validated.mode,
+      hosts=tuple(validated.hosts),
+      cloud_id=validated.cloud_id,
+      api_key=(
+        cast(str, _redact(secret_value(validated.api_key)))
+        if validated.api_key is not None
+        else None
+      ),
+      username=validated.username,
+      password=(
+        cast(str, _redact(secret_value(validated.password)))
+        if validated.password is not None
+        else None
+      ),
+      verify_certs=validated.verify_certs,
+      ca_certs=validated.ca_certs,
+      request_timeout=validated.request_timeout,
+      max_retries=validated.max_retries,
+      retry_on_timeout=validated.retry_on_timeout,
+      queue_index=validated.queue_index,
+      set_index=validated.set_index,
+      storage_index=validated.storage_index,
+    )
+
+  def _active_snapshot(self) -> _ElasticSearchConnectionSnapshot:
+    """Return the immutable configuration belonging to the live client."""
+    snapshot = self._connection_snapshot
+    if snapshot is None:
+      # Preserve compatibility for integrations that supplied a test/dummy
+      # client through the formerly public private attribute.  A real
+      # ``connect`` always publishes the snapshot before the client.
+      snapshot = self._capture_connection_snapshot()
+      self._connection_snapshot = snapshot
+    return snapshot
+
+  def _build_kwargs(
+    self, snapshot: _ElasticSearchConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
     """Build common ElasticSearch client kwargs.
 
     Returns:
         Dictionary of client configuration options.
     """
+    snapshot = snapshot or self._connection_snapshot or self._capture_connection_snapshot()
     kwargs: dict[str, Any] = {
-      "request_timeout": self.config.request_timeout,
-      "max_retries": self.config.max_retries,
-      "retry_on_timeout": self.config.retry_on_timeout,
+      "request_timeout": snapshot.request_timeout,
+      "max_retries": snapshot.max_retries,
+      "retry_on_timeout": snapshot.retry_on_timeout,
     }
-    if self.config.api_key:
-      kwargs["api_key"] = _redact(secret_value(self.config.api_key))
-    elif self.config.username and self.config.password:
+    if snapshot.api_key is not None:
+      kwargs["api_key"] = snapshot.api_key
+    elif snapshot.username is not None and snapshot.password is not None:
       kwargs["basic_auth"] = (
-        self.config.username,
-        _redact(secret_value(self.config.password)),
+        snapshot.username,
+        snapshot.password,
       )
     return kwargs
 
@@ -95,39 +184,44 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Raises:
         BackendConnectionError: If the connection cannot be established.
     """
+    snapshot = self._capture_connection_snapshot()
     try:
-      kwargs = self._build_kwargs()
-      if self.config.mode == ElasticSearchMode.CLOUD:
-        if not self.config.cloud_id:
+      kwargs = self._build_kwargs(snapshot)
+      if snapshot.mode == ElasticSearchMode.CLOUD:
+        if not snapshot.cloud_id:
           msg = "Cloud mode requires 'cloud_id'"
           raise BackendConnectionError(msg, backend_type="elasticsearch")
-        kwargs["cloud_id"] = self.config.cloud_id
+        kwargs["cloud_id"] = snapshot.cloud_id
       else:
-        kwargs["hosts"] = self.config.hosts
-        kwargs["verify_certs"] = self.config.verify_certs
-        if self.config.ca_certs:
-          kwargs["ca_certs"] = self.config.ca_certs
-      self._client = Elasticsearch(**kwargs)
+        kwargs["hosts"] = snapshot.hosts
+        kwargs["verify_certs"] = snapshot.verify_certs
+        if snapshot.ca_certs:
+          kwargs["ca_certs"] = snapshot.ca_certs
+      candidate = Elasticsearch(**kwargs)
+      # Publish before ping so every failure path, including an unsuccessful
+      # health check, is owned by ``_discard_client()`` and closes the client.
+      self._connection_snapshot = snapshot
+      self._client = candidate
       if not self._client.ping():
         raise BackendConnectionError(
           "ElasticSearch health check returned false during connect",
           backend_type="elasticsearch",
         )
-      self._ensure_indices()
-      logger.debug("Connected to ElasticSearch in %s mode", self.config.mode.value)
+      self._ensure_indices(snapshot)
+      logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
     except BackendConnectionError:
       self._discard_client()
       raise
     except (ApiError, TransportError) as e:
       self._discard_client()
-      msg = f"Failed to connect to ElasticSearch ({self.config.mode.value}): {e}"
+      msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
       raise BackendConnectionError(msg, backend_type="elasticsearch") from e
     except Exception as e:
       # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
       # raised after self._client was assigned: discard the half-initialized
       # client so is_connected() cannot lie True. Mirrors mongodb/kafka connect().
       self._discard_client()
-      msg = f"Failed to connect to ElasticSearch ({self.config.mode.value}): {e}"
+      msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
       raise BackendConnectionError(msg, backend_type="elasticsearch") from e
     except BaseException:
       # Ctrl-C / SystemExit during connect: still discard the client, then
@@ -139,13 +233,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """Clear and best-effort close a failed or retired client."""
     client = self._client
     self._client = None
+    self._connection_snapshot = None
     if client is not None:
       try:
         client.close()
       except Exception:
         logger.debug("Failed to close ElasticSearch client", exc_info=True)
 
-  def _ensure_indices(self) -> None:
+  def _ensure_indices(
+    self, snapshot: _ElasticSearchConnectionSnapshot | None = None
+  ) -> None:
     """Create the queue/set/storage indices if absent.
 
     Uses try-create-and-ignore-``resource_already_exists`` rather than the
@@ -160,10 +257,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self._client is None:
       msg = "ElasticSearchBackend not connected: client is None"
       raise BackendConnectionError(msg, backend_type="elasticsearch")
+    snapshot = snapshot or self._connection_snapshot or self._capture_connection_snapshot()
     for name in (
-      self.config.queue_index,
-      self.config.set_index,
-      self.config.storage_index,
+      snapshot.queue_index,
+      snapshot.set_index,
+      snapshot.storage_index,
     ):
       try:
         self._client.indices.create(index=name)
@@ -257,7 +355,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # 4ms without — see bench_es_push_refresh.py); ES does not batch
       # ``wait_for`` across consecutive pushes, so each one pays the full
       # refresh-interval wait.
-      self.client.index(index=self.config.queue_index, document=doc)
+      self.client.index(index=self._active_snapshot().queue_index, document=doc)
     except (ApiError, TransportError) as e:
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
@@ -292,9 +390,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # (just flushes the indexing buffer to a segment) — far cheaper than
         # the per-push ``refresh="wait_for"`` it replaces (which blocked ~1s
         # per push). Amortized: N fast pushes + 1 refresh per read.
-        self.client.indices.refresh(index=self.config.queue_index)
+        self.client.indices.refresh(index=self._active_snapshot().queue_index)
         resp = self.client.search(
-          index=self.config.queue_index,
+          index=self._active_snapshot().queue_index,
           # ``.keyword`` subfield for exact match: the dynamic mapping makes
           # ``queue_name`` a ``text`` field (standard analyzer), so a name
           # with colons (e.g. ``inttest:<uuid>:queue``) gets tokenized and a
@@ -317,7 +415,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           # No ``refresh`` on delete — the NEXT pop's pre-search refresh
           # (above) flushes this delete, so the search won't re-find the doc.
           self.client.delete(
-            index=self.config.queue_index,
+            index=self._active_snapshot().queue_index,
             id=doc["_id"],
             if_seq_no=doc["_seq_no"],
             if_primary_term=doc["_primary_term"],
@@ -352,7 +450,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     try:
-      return self._count(self.config.queue_index, "queue_name", queue_name)
+      return self._count(self._active_snapshot().queue_index, "queue_name", queue_name)
     except (ApiError, TransportError) as e:
       raise QueueError(str(e), queue_name=queue_name, operation="queue_len") from e
 
@@ -368,7 +466,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(queue_name, "queue_name")
     try:
-      self._delete_by_term(self.config.queue_index, "queue_name", queue_name)
+      self._delete_by_term(
+        self._active_snapshot().queue_index, "queue_name", queue_name
+      )
     except (ApiError, TransportError) as e:
       msg = f"Failed to clear ElasticSearch queue {queue_name!r}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
@@ -413,7 +513,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # consistent); ``set_len`` refreshes in ``_count``. Same amortized
       # read-refresh rationale as push.
       self.client.index(
-        index=self.config.set_index,
+        index=self._active_snapshot().set_index,
         id=doc_id,
         document=doc,
         op_type="create",
@@ -451,7 +551,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return self._delete_by_id(self.config.set_index, self._set_doc_id(set_name, item))
+      return self._delete_by_id(
+        self._active_snapshot().set_index, self._set_doc_id(set_name, item)
+      )
     except (ApiError, TransportError) as e:
       raise BackendConnectionError(
         f"ElasticSearch set remove failed for {set_name!r}: {e}",
@@ -474,7 +576,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     _validate_key_name(set_name, "set_name")
     try:
       response = self.client.exists(
-        index=self.config.set_index, id=self._set_doc_id(set_name, item)
+        index=self._active_snapshot().set_index, id=self._set_doc_id(set_name, item)
       )
     except (ApiError, TransportError) as e:
       raise BackendConnectionError(
@@ -497,7 +599,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      return self._count(self.config.set_index, "set_name", set_name)
+      return self._count(self._active_snapshot().set_index, "set_name", set_name)
     except (ApiError, TransportError) as e:
       raise BackendConnectionError(
         f"ElasticSearch set length failed for {set_name!r}: {e}",
@@ -516,7 +618,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(set_name, "set_name")
     try:
-      self._delete_by_term(self.config.set_index, "set_name", set_name)
+      self._delete_by_term(
+        self._active_snapshot().set_index, "set_name", set_name
+      )
     except (ApiError, TransportError) as e:
       raise BackendConnectionError(
         f"ElasticSearch set clear failed for {set_name!r}: {e}",
@@ -545,7 +649,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
       ).isoformat()
     try:
-      self.client.index(index=self.config.storage_index, id=key, document=doc)
+      self.client.index(
+        index=self._active_snapshot().storage_index, id=key, document=doc
+      )
     except (ApiError, TransportError) as e:
       msg = f"Failed to store key {key!r} in ElasticSearch: {e}"
       raise StorageError(msg, operation="store", key=key) from e
@@ -633,7 +739,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return True
     try:
       self.client.delete(
-        index=self.config.storage_index,
+        index=self._active_snapshot().storage_index,
         id=key,
         if_seq_no=seq_no,
         if_primary_term=primary_term,
@@ -664,7 +770,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      resp = self.client.get(index=self.config.storage_index, id=key)
+      resp = self.client.get(index=self._active_snapshot().storage_index, id=key)
     except NotFoundError:
       return None
     except (ApiError, TransportError) as e:
@@ -690,7 +796,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      return self._delete_by_id(self.config.storage_index, key)
+      return self._delete_by_id(self._active_snapshot().storage_index, key)
     except (ApiError, TransportError) as e:
       msg = f"Failed to delete key {key!r} from ElasticSearch: {e}"
       raise StorageError(msg, operation="delete", key=key) from e
@@ -716,7 +822,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      resp = self.client.get(index=self.config.storage_index, id=key)
+      resp = self.client.get(index=self._active_snapshot().storage_index, id=key)
     except NotFoundError:
       return False
     except (ApiError, TransportError) as e:
@@ -741,7 +847,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     _validate_key_name(key, "key")
     try:
-      resp = self.client.get(index=self.config.storage_index, id=key)
+      resp = self.client.get(index=self._active_snapshot().storage_index, id=key)
     except NotFoundError:
       return None
     except (ApiError, TransportError) as e:
@@ -778,7 +884,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # scan_iter(match=prefix*) and dynamodb begins_with (#64).
     query = {"prefix": {"key.keyword": prefix}} if prefix else {"match_all": {}}
     try:
-      self._delete_by_query(self.config.storage_index, query)
+      self._delete_by_query(self._active_snapshot().storage_index, query)
     except (ApiError, TransportError) as e:
       msg = f"Failed to clear ElasticSearch storage: {e}"
       raise StorageError(msg, operation="clear_storage", key=None) from e

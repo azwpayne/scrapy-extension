@@ -20,6 +20,7 @@ def _mock_backend(mocker, **settings_kwargs):
   config = ElasticSearchSettings(**settings_kwargs)
   backend = ElasticSearchBackend(config)
   backend._client = mocker.MagicMock()
+  backend._connection_snapshot = backend._capture_connection_snapshot()
   return backend
 
 
@@ -157,6 +158,59 @@ class TestConnection:
         username="",
         password="",
       )
+
+  def test_connect_rejects_mutated_authenticated_cleartext_host(self, mocker):
+    """A post-construction downgrade must not send credentials over HTTP."""
+    config = ElasticSearchSettings(
+      hosts=["https://es.example:9200"], api_key="top-secret-es-key"
+    )
+    config.hosts = ["http://downgraded.example:9200"]
+    client_factory = mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch"
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchBackend(config).connect()
+
+    assert exc_info.value.setting_name == "hosts"
+    assert "top-secret-es-key" not in str(exc_info.value)
+    client_factory.assert_not_called()
+
+  def test_connect_rejects_mutated_capability_index_overlap(self, mocker):
+    """A later mutation cannot collapse destructive capability boundaries."""
+    config = ElasticSearchSettings()
+    config.storage_index = config.queue_index
+    client_factory = mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch"
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchBackend(config).connect()
+
+    assert exc_info.value.setting_name == "queue_index"
+    client_factory.assert_not_called()
+
+  def test_live_client_keeps_original_capability_indices_after_mutation(self, mocker):
+    """Live operations use the client generation's immutable index snapshot."""
+    client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=client
+    )
+    config = ElasticSearchSettings(
+      queue_index="queue-a", set_index="set-a", storage_index="storage-a"
+    )
+    backend = ElasticSearchBackend(config)
+    backend.connect()
+
+    config.queue_index = "attacker-index"
+    config.storage_index = "attacker-index"
+    backend.push("jobs", b"payload")
+    backend.store("key", b"payload")
+
+    assert [call.kwargs["index"] for call in client.index.call_args_list] == [
+      "queue-a",
+      "storage-a",
+    ]
 
   def test_standalone_empty_api_key_rejected(self):
     """R45: explicitly supplied blank credentials cannot become anonymous auth."""
