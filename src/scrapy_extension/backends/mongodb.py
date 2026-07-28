@@ -14,6 +14,7 @@ import logging
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -112,6 +113,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self._client_kwargs: dict[str, Any] | None = None
     # Cache read preference to avoid string manipulation on every call
     self._read_preference: str | None = self._compute_read_preference()
+    # A backend can be used directly as well as through ConnectionManager.
+    # Serialize publication/retirement of its client graph so concurrent direct
+    # callers cannot create two clients and lose one without closing it.
+    self._connection_lock = RLock()
 
   def connect(self) -> None:
     """Establish connection to MongoDB based on deployment mode.
@@ -123,6 +128,22 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         BackendConnectionError: If the connection cannot be established.
         ConfigurationError: If the configuration is invalid for the mode.
     """
+    with self._connection_lock:
+      # A published client graph is complete: the client has been pinged, its
+      # collections initialized, capability domains claimed, and indexes
+      # created. Re-running setup would allocate an unowned replacement client.
+      if self._client is not None:
+        return
+      self._refresh_connection_cache()
+      self._connect()
+
+  def _refresh_connection_cache(self) -> None:
+    """Rebuild configuration-derived caches for a fresh client generation."""
+    self._client_kwargs = None
+    self._read_preference = self._compute_read_preference()
+
+  def _connect(self) -> None:
+    """Connect one fresh client generation while ``_connection_lock`` is held."""
     mode = self.config.mode
     if mode not in (
       MongoDBMode.STANDALONE,
@@ -192,32 +213,33 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def _discard_client(self, *, suppress_process_control: bool = False) -> None:
     """Clear all handles and best-effort close the current client."""
-    client = self._client
-    self._client = None
-    self._db = None
-    self._queue_collection = None
-    self._set_collection = None
-    self._storage_collection = None
-    if client is not None:
-      try:
-        client.close()
-      except Exception:
+    with self._connection_lock:
+      client = self._client
+      self._client = None
+      self._db = None
+      self._queue_collection = None
+      self._set_collection = None
+      self._storage_collection = None
+      if client is not None:
         try:
-          logger.debug("Failed to close MongoDB client", exc_info=True)
+          client.close()
+        except Exception:
+          try:
+            logger.debug("Failed to close MongoDB client", exc_info=True)
+          except BaseException:
+            if not suppress_process_control:
+              raise
         except BaseException:
           if not suppress_process_control:
             raise
-      except BaseException:
-        if not suppress_process_control:
-          raise
-        try:
-          logger.debug(
-            "Process-control interruption while closing failed MongoDB client",
-            exc_info=True,
-          )
-        except BaseException:
-          # Failed-connect cleanup must never replace the original exception.
-          pass
+          try:
+            logger.debug(
+              "Process-control interruption while closing failed MongoDB client",
+              exc_info=True,
+            )
+          except BaseException:
+            # Failed-connect cleanup must never replace the original exception.
+            pass
 
   def _build_client_kwargs(self) -> dict[str, Any]:
     """Build common MongoDB client kwargs.

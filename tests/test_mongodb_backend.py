@@ -923,6 +923,91 @@ def test_mongodb_backend_reconnects_after_failed_connect(mocker):
   assert backend.is_connected() is True
 
 
+def test_mongodb_connect_single_flight_for_concurrent_direct_callers(mocker):
+  """One direct connection generation is published when callers overlap."""
+  from threading import Event, Thread
+
+  backend = MongoDBBackend(MongoDBSettings())
+  first_factory_entered = Event()
+  second_factory_entered = Event()
+  release_first_factory = Event()
+  second_started = Event()
+  clients = [mocker.MagicMock(), mocker.MagicMock()]
+  factory_calls = 0
+
+  def build_client(*_args, **_kwargs):
+    nonlocal factory_calls
+    factory_calls += 1
+    if factory_calls == 1:
+      first_factory_entered.set()
+      assert release_first_factory.wait(timeout=5)
+    else:
+      second_factory_entered.set()
+    return clients[factory_calls - 1]
+
+  client_factory = mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    side_effect=build_client,
+  )
+  errors: list[BaseException] = []
+
+  def connect_in_thread(*, signal_start: bool = False) -> None:
+    if signal_start:
+      second_started.set()
+    try:
+      backend.connect()
+    except BaseException as exc:  # pragma: no cover - assertion aid
+      errors.append(exc)
+
+  first = Thread(target=connect_in_thread)
+  first.start()
+  assert first_factory_entered.wait(timeout=5)
+
+  second = Thread(target=connect_in_thread, kwargs={"signal_start": True})
+  second.start()
+  assert second_started.wait(timeout=5)
+  assert not second_factory_entered.wait(timeout=0.2)
+
+  release_first_factory.set()
+  first.join(timeout=5)
+  second.join(timeout=5)
+
+  assert not first.is_alive()
+  assert not second.is_alive()
+  assert errors == []
+  assert client_factory.call_count == 1
+  assert backend._client is clients[0]
+  clients[1].close.assert_not_called()
+
+
+def test_mongodb_reconnect_refreshes_cached_config_after_disconnect(mocker):
+  """A new client generation uses configuration mutated after disconnect."""
+  config = MongoDBSettings(read_preference="primary", tls_enabled=False)
+  backend = MongoDBBackend(config)
+  first_client = mocker.MagicMock()
+  second_client = mocker.MagicMock()
+  client_factory = mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    side_effect=[first_client, second_client],
+  )
+
+  backend.connect()
+  config.tls_enabled = True
+  config.read_preference = "secondary"
+  backend.disconnect()
+  backend.connect()
+
+  assert client_factory.call_count == 2
+  first_kwargs = client_factory.call_args_list[0].kwargs
+  second_kwargs = client_factory.call_args_list[1].kwargs
+  assert "tls" not in first_kwargs
+  assert first_kwargs["readPreference"] == "primary"
+  assert second_kwargs["tls"] is True
+  assert second_kwargs["readPreference"] == "secondary"
+  first_client.close.assert_called_once()
+  assert backend._client is second_client
+
+
 def test_mongodb_backend_connect_generic_exception(mocker):
   """Test MongoDB backend raises BackendConnectionError on generic Exception."""
   config = MongoDBSettings()
