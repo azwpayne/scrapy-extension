@@ -500,6 +500,174 @@ def test_connect_replaces_existing_disconnected_backend(mocker):
   assert manager._backend is replacement
 
 
+def test_health_check_diagnostic_interrupt_does_not_block_reconnect(mocker):
+  """A logger handler cannot abort recovery after an ordinary probe failure."""
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 0})
+  stale = mocker.MagicMock(name="stale-backend")
+  stale.is_connected.side_effect = RuntimeError("probe failed")
+  replacement = mocker.MagicMock(name="replacement-backend")
+  monitor = mocker.MagicMock()
+  manager._backend = stale
+  manager.set_monitor(monitor)
+  mocker.patch.object(manager, "_create_backend", return_value=replacement)
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.debug",
+    side_effect=KeyboardInterrupt("diagnostic interruption"),
+  )
+
+  manager.connect()
+
+  stale.disconnect.assert_called_once_with()
+  replacement.connect.assert_called_once_with()
+  assert manager._backend is replacement
+  monitor.on_disconnect.assert_called_once_with("BackendType.REDIS", None)
+  monitor.on_connect.assert_called_once_with("BackendType.REDIS")
+
+
+def test_stale_disconnect_diagnostic_interrupt_does_not_block_reconnect(mocker):
+  """A logger handler cannot abort recovery after stale cleanup fails."""
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 0})
+  stale = mocker.MagicMock(name="stale-backend")
+  stale.is_connected.return_value = False
+  stale.disconnect.side_effect = RuntimeError("disconnect failed")
+  replacement = mocker.MagicMock(name="replacement-backend")
+  monitor = mocker.MagicMock()
+  manager._backend = stale
+  manager.set_monitor(monitor)
+  mocker.patch.object(manager, "_create_backend", return_value=replacement)
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.warning",
+    side_effect=SystemExit("diagnostic interruption"),
+  )
+
+  manager.connect()
+
+  stale.disconnect.assert_called_once_with()
+  replacement.connect.assert_called_once_with()
+  assert manager._backend is replacement
+  monitor.on_disconnect.assert_called_once_with("BackendType.REDIS", None)
+  monitor.on_connect.assert_called_once_with("BackendType.REDIS")
+
+
+def test_retry_diagnostic_interrupt_does_not_block_retry(mocker):
+  """A logger handler cannot replace a retryable backend failure."""
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 1, "retry_delay": 0},
+  )
+  monitor = mocker.MagicMock()
+  manager.set_monitor(monitor)
+  attempt = mocker.patch.object(
+    manager,
+    "_attempt_connection",
+    side_effect=[ConnectionError("first attempt failed"), None],
+  )
+  mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.warning",
+    side_effect=KeyboardInterrupt("diagnostic interruption"),
+  )
+
+  manager.connect()
+
+  assert attempt.call_count == 2
+  monitor.on_retry.assert_called_once_with("BackendType.REDIS", 1)
+  monitor.on_connect.assert_called_once_with("BackendType.REDIS")
+
+
+def test_connect_success_diagnostic_interrupt_still_dispatches_monitor(mocker):
+  """A success log handler cannot suppress the committed connect event."""
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 0})
+  monitor = mocker.MagicMock()
+  manager.set_monitor(monitor)
+  mocker.patch.object(manager, "_attempt_connection")
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.debug",
+    side_effect=KeyboardInterrupt("diagnostic interruption"),
+  )
+
+  manager.connect()
+
+  monitor.on_connect.assert_called_once_with("BackendType.REDIS")
+
+
+def test_close_success_diagnostic_interrupt_still_dispatches_monitor(mocker):
+  """A normal close log handler cannot skip the terminal monitor event."""
+  manager = ConnectionManager(BackendType.REDIS)
+  backend = mocker.MagicMock()
+  monitor = mocker.MagicMock()
+  manager._backend = backend
+  manager.set_monitor(monitor)
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.debug",
+    side_effect=KeyboardInterrupt("diagnostic interruption"),
+  )
+
+  manager.close()
+
+  backend.disconnect.assert_called_once_with()
+  monitor.on_disconnect.assert_called_once_with("BackendType.REDIS", None)
+
+
+def test_close_failure_diagnostic_interrupt_still_dispatches_monitor(mocker):
+  """A failed close log handler cannot skip the terminal monitor event."""
+  manager = ConnectionManager(BackendType.REDIS)
+  backend = mocker.MagicMock()
+  backend.disconnect.side_effect = RuntimeError("disconnect failed")
+  monitor = mocker.MagicMock()
+  manager._backend = backend
+  manager.set_monitor(monitor)
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.warning",
+    side_effect=SystemExit("diagnostic interruption"),
+  )
+
+  manager.close()
+
+  backend.disconnect.assert_called_once_with()
+  monitor.on_disconnect.assert_called_once_with("BackendType.REDIS", None)
+
+
+def test_monitor_failure_diagnostic_interrupt_stays_best_effort(mocker):
+  """A logger handler cannot turn an already-ignored monitor error fatal."""
+  manager = ConnectionManager(BackendType.REDIS)
+  monitor = mocker.MagicMock()
+  monitor.on_connect.side_effect = RuntimeError("monitor failed")
+  manager.set_monitor(monitor)
+  mocker.patch(
+    "scrapy_extension.backends.connectors.logger.debug",
+    side_effect=KeyboardInterrupt("diagnostic interruption"),
+  )
+
+  manager._notify_monitor("on_connect", "BackendType.REDIS")
+
+  monitor.on_connect.assert_called_once_with("BackendType.REDIS")
+
+
+def test_backend_and_monitor_control_exceptions_retain_their_semantics(mocker):
+  """Only logging handlers are insulated from control-flow exceptions."""
+  manager = ConnectionManager(BackendType.REDIS)
+  stale = mocker.MagicMock()
+  backend_interrupt = KeyboardInterrupt("backend interruption")
+  stale.is_connected.side_effect = backend_interrupt
+  manager._backend = stale
+
+  with pytest.raises(KeyboardInterrupt) as backend_raised:
+    manager.connect()
+
+  assert backend_raised.value is backend_interrupt
+
+  monitor = mocker.MagicMock()
+  monitor_interrupt = SystemExit("monitor interruption")
+  monitor.on_connect.side_effect = monitor_interrupt
+  manager.set_monitor(monitor)
+
+  with pytest.raises(SystemExit) as monitor_raised:
+    manager._notify_monitor("on_connect", "BackendType.REDIS")
+
+  assert monitor_raised.value is monitor_interrupt
+
+
 def test_reconnect_isolates_breaker_from_retired_backend_failures(mocker):
   """A late old-generation failure cannot trip the replacement generation."""
   from scrapy_extension.backends.base import Backend, QueueBackend
@@ -878,6 +1046,37 @@ def test_managers_registry_does_not_evict_actively_held_manager(mocker):
     # Release every holder so teardown is clean.
     for m in held_managers:
       m.close()
+    ConnectionManager.clear_registry()
+    mocker.stopall()
+
+
+def test_registry_over_cap_diagnostic_interrupt_does_not_block_acquire(mocker):
+  """A warning handler cannot abort an acquire after the cap state is marked."""
+  ConnectionManager.clear_registry()
+  cap = ConnectionManager.MAX_MANAGERS
+  held_managers: list[ConnectionManager] = []
+  try:
+    for i in range(cap):
+      held_managers.append(
+        ConnectionManager.get_manager(BackendType.REDIS, {"host": f"live-{i}"})
+      )
+    mocker.patch(
+      "scrapy_extension.backends.connectors.logger.warning",
+      side_effect=KeyboardInterrupt("diagnostic interruption"),
+    )
+
+    extra = ConnectionManager.get_manager(
+      BackendType.REDIS,
+      {"host": "extra-after-diagnostic-interruption"},
+    )
+    held_managers.append(extra)
+
+    assert ConnectionManager._over_cap_warned
+    assert len(ConnectionManager._managers) == cap + 1
+    assert extra in ConnectionManager._managers.values()
+  finally:
+    for manager in held_managers:
+      manager.close()
     ConnectionManager.clear_registry()
     mocker.stopall()
 

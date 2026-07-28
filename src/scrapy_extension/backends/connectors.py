@@ -25,7 +25,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
@@ -70,6 +70,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MonitorEvent = tuple[str, tuple[Any, ...]]
+
+
+def _log_diagnostic(
+  log_call: Callable[..., object],
+  message: str,
+  *args: object,
+  **kwargs: object,
+) -> None:
+  """Emit best-effort diagnostics without changing lifecycle control flow.
+
+  Backend operations and monitor callbacks retain their existing exception
+  semantics.  Only a logging handler is untrusted here: an application may
+  install a handler that raises a control-flow ``BaseException``, but that
+  diagnostic must not interrupt an already-selected recovery or teardown path.
+  """
+  try:
+    log_call(message, *args, **kwargs)
+  except BaseException:
+    pass
 
 _BUNDLED_BACKEND_TYPES: frozenset[str] = frozenset(
   backend_type.value for backend_type in BackendType
@@ -867,7 +886,8 @@ class ConnectionManager:
         # Warn once per process; do not force-evict a live manager.
         if not cls._over_cap_warned:
           cls._over_cap_warned = True
-          logger.warning(
+          _log_diagnostic(
+            logger.warning,
             "ConnectionManager registry at cap (%d) with all entries "
             "actively held; not force-evicting live managers. This "
             "indicates genuine unbounded backend coexistence — investigate "
@@ -1029,7 +1049,8 @@ class ConnectionManager:
         connected = backend.is_connected()
       except Exception:
         connected = False
-        logger.debug(
+        _log_diagnostic(
+          logger.debug,
           "Backend health check failed before reconnect",
           exc_info=True,
         )
@@ -1062,7 +1083,7 @@ class ConnectionManager:
       try:
         stale_backend.disconnect()
       except Exception as exc:
-        logger.warning("Error disconnecting stale backend: %s", exc)
+        _log_diagnostic(logger.warning, "Error disconnecting stale backend: %s", exc)
       monitor_events.append(
         ("on_disconnect", (str(self.backend_type), None))
       )
@@ -1088,7 +1109,8 @@ class ConnectionManager:
         # (KeyboardInterrupt, SystemExit)): raise`` here was unreachable dead code:
         # nothing caught by ``except Exception`` can be an instance of either.)
         last_exception = e
-        logger.warning(
+        _log_diagnostic(
+          logger.warning,
           "Connection attempt %d/%d failed: %s", attempt + 1, total_attempts, e
         )
         with self._lock:
@@ -1105,7 +1127,7 @@ class ConnectionManager:
           )
           time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
       else:
-        logger.debug("Connected to %s", self.backend_type)
+        _log_diagnostic(logger.debug, "Connected to %s", self.backend_type)
         # Preserve transaction order, then dispatch outside ``_connect_lock``.
         monitor_events.append(("on_connect", (str(self.backend_type),)))
         return
@@ -1329,12 +1351,12 @@ class ConnectionManager:
       # handle was already detached under ``_lock``, so no accessor can publish
       # it as live during disconnect.
       backend.disconnect()
-      logger.debug("Disconnected from %s", self.backend_type)
+      _log_diagnostic(logger.debug, "Disconnected from %s", self.backend_type)
     except Exception as e:
       # Broad catch — mirrors R25-A1's connect-path cleanup. Registry eviction
       # and state detachment are already complete, so teardown errors remain
       # observable without breaking the caller's close chain.
-      logger.warning("Error during disconnect: %s", e)
+      _log_diagnostic(logger.warning, "Error during disconnect: %s", e)
 
     # Lifecycle callbacks are user code. Dispatch after both registry and
     # manager locks are released so re-entry observes the terminal state and
@@ -1391,7 +1413,12 @@ class ConnectionManager:
     try:
       getattr(self._monitor, hook_name)(*args)
     except Exception:
-      logger.debug("Monitor.%s raised; ignored", hook_name, exc_info=True)
+      _log_diagnostic(
+        logger.debug,
+        "Monitor.%s raised; ignored",
+        hook_name,
+        exc_info=True,
+      )
 
   def _dispatch_monitor_events(self, events: list[_MonitorEvent]) -> None:
     """Dispatch ordered lifecycle events after manager locks are released."""
