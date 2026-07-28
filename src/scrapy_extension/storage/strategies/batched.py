@@ -367,7 +367,14 @@ class BatchedStorageStrategy(StorageStrategy):
       # check above is atomic with the assignment — concurrent stores can't
       # each pass the guard and each start a flusher.
       self._flusher = flusher
-      flusher.start()
+      try:
+        flusher.start()
+      except BaseException:
+        # A failed start never creates a usable worker. Roll back the
+        # provisional reference while the guard lock is held so a later store
+        # can safely retry with a fresh thread.
+        self._flusher = None
+        raise
 
   def _age_flush_loop(self) -> None:
     """Periodically flush when the oldest buffered item exceeds the age cap.

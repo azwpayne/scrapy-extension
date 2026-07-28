@@ -807,6 +807,27 @@ class TestBatchedStorageFlusherTOCTOU:
     finally:
       strat.close()
 
+  def test_start_failure_rolls_back_flusher_and_allows_retry(self, mocker) -> None:
+    """R49: a failed Thread.start() must not permanently disable age flushing."""
+    strat = BatchedStorageStrategy(threshold=100, max_buffer_age_s=1.0)
+    failed_thread = mocker.MagicMock()
+    failed_thread.start.side_effect = RuntimeError("thread start failed")
+
+    thread_constructor = mocker.patch(
+      "scrapy_extension.storage.strategies.batched.threading.Thread",
+      return_value=failed_thread,
+    )
+    try:
+      with pytest.raises(RuntimeError, match="thread start failed"):
+        strat._ensure_flusher()
+    finally:
+      mocker.stop(thread_constructor)
+
+    assert strat._flusher is None
+    strat._ensure_flusher()
+    assert strat._flusher is not None and strat._flusher.is_alive()
+    strat.close()
+
   def test_close_does_not_hang_when_age_flusher_wedges_on_flush_lock(
     self, mocker
   ) -> None:
