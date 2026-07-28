@@ -616,6 +616,11 @@ class BackendScheduler:
     self._spider: Spider | None = None
     self._signals_connected: bool = False
     self._connected_signals = None
+    # ``None`` retains compatibility with schedulers constructed by older
+    # callers/tests that set only ``_connected_signals``. Once this scheduler
+    # successfully registers a handler, the list becomes the authoritative
+    # ownership record, including during a partial-registration rollback.
+    self._connected_ack_signal_handlers: list[tuple[Any, Any]] | None = None
     self._manager_released: bool = False
     self._owns_connection_manager = owns_connection_manager
     # Backpressure gate config (round-4 BP-2). resume_at defaults to pause_at
@@ -1333,13 +1338,25 @@ class BackendScheduler:
     connected: list[tuple[Any, Any]] = []
     try:
       for handler, signal in signal_handlers:
-        sig.connect(handler, signal=signal)
+        # A third-party signal manager can register and then raise. Record
+        # ownership first so either outcome is disconnected during rollback
+        # (and retried by terminal cleanup if that rollback is interrupted).
         connected.append((handler, signal))
+        # Publish every attempted registration immediately. If registration
+        # or rollback is interrupted, ``open()`` can delegate retained
+        # handlers to ``_close_locked`` for another cleanup try.
+        self._connected_signals = sig
+        self._connected_ack_signal_handlers = connected
+        self._signals_connected = True
+        sig.connect(handler, signal=signal)
     except BaseException:
-      for handler, signal in reversed(connected):
+      for handler, signal in reversed(tuple(connected)):
         try:
           sig.disconnect(handler, signal=signal)
-        except Exception:
+        except BaseException:
+          # A failed rollback leaves this handler in ``connected`` so the
+          # terminal open-failure cleanup retries it. Never let rollback (or
+          # its logging) mask the original registration failure.
           try:
             logger.exception(
               "Failed to roll back %s after signal registration failure",
@@ -1347,9 +1364,13 @@ class BackendScheduler:
             )
           except BaseException:
             pass
+        else:
+          connected.remove((handler, signal))
+      if not connected:
+        self._connected_signals = None
+        self._connected_ack_signal_handlers = None
+        self._signals_connected = False
       raise
-    self._connected_signals = sig
-    self._signals_connected = True
 
   def _on_response_received(
     self,
@@ -1476,10 +1497,14 @@ class BackendScheduler:
     primary_error: BaseException | None = None
     try:
       if self._connected_signals is not None:
-        signal_handlers = (
-          (self._on_response_received, signals.response_received),
-          (self._on_spider_error, signals.spider_error),
-        )
+        signal_handlers = self._connected_ack_signal_handlers
+        if signal_handlers is None:
+          # Legacy/manual lifecycle state did not retain per-handler
+          # ownership. Preserve the historical full-pair cleanup behavior.
+          signal_handlers = [
+            (self._on_response_received, signals.response_received),
+            (self._on_spider_error, signals.spider_error),
+          ]
         for handler, signal in signal_handlers:
           try:
             self._connected_signals.disconnect(handler, signal=signal)
@@ -1524,6 +1549,7 @@ class BackendScheduler:
       self._queue = None
       self._spider = None
       self._connected_signals = None
+      self._connected_ack_signal_handlers = None
       self._signals_connected = False
       self._backpressure_paused = False
       self._backpressure_probe_due = False

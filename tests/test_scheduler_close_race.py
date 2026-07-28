@@ -34,7 +34,7 @@ close-race that the code doesn't have.
 
 from __future__ import annotations
 
-from unittest.mock import ANY
+from unittest.mock import ANY, call
 
 import pytest
 from scrapy.http import Request
@@ -162,10 +162,10 @@ class TestOwnedDupeFilterLifecycle:
     with pytest.raises(RuntimeError, match="second signal registration failed"):
       scheduler.open(spider)
 
-    signal_manager.disconnect.assert_called_once_with(
-      scheduler._on_response_received,
-      signal=ANY,
-    )
+    assert signal_manager.disconnect.call_args_list == [
+      call(scheduler._on_spider_error, signal=ANY),
+      call(scheduler._on_response_received, signal=ANY),
+    ]
     dupefilter.open.assert_called_once_with(spider)
     dupefilter.close.assert_called_once_with("open-failed")
     manager.close.assert_called_once_with()
@@ -173,6 +173,38 @@ class TestOwnedDupeFilterLifecycle:
 
     with pytest.raises(RuntimeError, match="closed"):
       scheduler.open(spider)
+
+  def test_signal_rollback_baseexception_retries_during_terminal_cleanup(
+    self, mocker
+  ):
+    """A rollback interrupt cannot orphan an already-connected handler."""
+    scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
+      mocker
+    )
+    registration_error = RuntimeError("second signal registration failed")
+    rollback_error = KeyboardInterrupt("rollback interrupted")
+    signal_manager = mocker.Mock(name="SignalManager")
+    signal_manager.connect.side_effect = [None, registration_error]
+    signal_manager.disconnect.side_effect = [rollback_error, None, None]
+    spider = mocker.Mock(name="Spider")
+    spider.name = "test_spider"
+    spider.crawler = mocker.Mock(signals=signal_manager)
+
+    with pytest.raises(RuntimeError) as raised:
+      scheduler.open(spider)
+
+    # The registration failure remains primary even though the first
+    # best-effort rollback was interrupted. ``open``'s terminal close retries
+    # the still-owned handler and releases every other resource.
+    assert raised.value is registration_error
+    assert signal_manager.disconnect.call_count == 3
+    dupefilter.close.assert_called_once_with("open-failed")
+    manager.close.assert_called_once_with()
+    assert scheduler._queue is None
+    assert scheduler._spider is None
+    assert scheduler._connected_signals is None
+    assert scheduler._connected_ack_signal_handlers is None
+    assert scheduler._signals_connected is False
 
 
 class TestConstructorSuppliedDupeFilterLifecycle:
