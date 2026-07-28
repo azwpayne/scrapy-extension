@@ -812,13 +812,16 @@ class SqsBackend(Backend, QueueBackend):
         return
       if not self._in_flight_overflow_warned:
         self._in_flight_overflow_warned = True
-        logger.warning(
-          "SQS in-flight ack-token set at cap (%d) — further unacked pops "
-          "will not be tracked in the diagnostic set. This indicates slow "
-          "acks or an ack leak; the broker still tracks receipt handles "
-          "so ack correctness is unaffected.",
-          _MAX_IN_FLIGHT,
-        )
+        try:
+          logger.warning(
+            "SQS in-flight ack-token set at cap (%d) — further unacked pops "
+            "will not be tracked in the diagnostic set. This indicates slow "
+            "acks or an ack leak; the broker still tracks receipt handles "
+            "so ack correctness is unaffected.",
+            _MAX_IN_FLIGHT,
+          )
+        except BaseException:  # noqa: BLE001 - preserve the successful pop
+          pass
 
   def _legacy_receipt_snapshot(
     self,

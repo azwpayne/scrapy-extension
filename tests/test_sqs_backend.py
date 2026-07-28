@@ -2069,10 +2069,19 @@ class TestSqsHalfCredentialGuard:
 class TestSqsInFlightCap:
   """R14-E MED: the diagnostic ``_in_flight`` set is capped at ``_MAX_IN_FLIGHT``."""
 
-  def test_pop_with_ack_caps_in_flight_set(self, mocker, caplog) -> None:
-    """When the set is saturated, the pop still succeeds but the set stops growing."""
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning handler failed"),
+      KeyboardInterrupt(),
+      SystemExit(),
+    ],
+  )
+  def test_pop_with_ack_preserves_success_when_cap_warning_fails(
+    self, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """A failed cap warning cannot discard a successfully received token."""
     import base64
-    import logging
 
     from scrapy_extension.backends.sqs import _MAX_IN_FLIGHT
 
@@ -2093,14 +2102,22 @@ class TestSqsInFlightCap:
     }
     assert not b._in_flight_overflow_warned
 
-    with caplog.at_level(logging.WARNING):
-      value, token = b.pop_with_ack("queue1")
+    warning = mocker.patch(
+      "scrapy_extension.backends.sqs.logger.warning", side_effect=diagnostic_error
+    )
+    value, token = b.pop_with_ack("queue1")
 
     # The pop succeeded — message returned, NOT dropped.
     assert value == body
-    assert isinstance(token, _SqsAckToken)
+    assert b._generation is not None
+    assert token == _SqsAckToken(
+      queue_url="https://sqs/test",
+      receipt_handle="rh-new",
+      generation_key=b._generation.key,
+      queue_epoch=0,
+    )
     # The set stayed at the cap (the new token was not added).
     assert len(b._in_flight) == _MAX_IN_FLIGHT
     # The one-shot warning fired.
     assert b._in_flight_overflow_warned is True
-    assert any("at cap" in r.message for r in caplog.records)
+    warning.assert_called_once()
