@@ -32,8 +32,10 @@ The unit suite is mock-based (no live backends needed). Pytest runs with `--disa
 
 Integration tests verify real-backend behavior the mocks cannot — atomicity,
 ack/nack delivery semantics, and contract correctness. They are
-**skip-by-default**, gated on environment variables — unset → the whole module
-skips; set → it runs against that service.
+**skip-by-default** behind two gates: set `SCRAPY_TEST_INTEGRATION=1` to admit
+the integration tier, then set the relevant backend variable to select its
+service. Without either gate the matching tests skip, so a zero-exit skipped
+run is not integration verification.
 
 | Backend | Env var | Example |
 |---|---|---|
@@ -44,10 +46,10 @@ skips; set → it runs against that service.
 | Kafka | `SCRAPY_TEST_KAFKA_BOOTSTRAP` | `localhost:9092` |
 | RocketMQ | `SCRAPY_TEST_ROCKETMQ_NAMESRV` | `localhost:8081` (gRPC proxy, broker started with `--enable-proxy`) |
 
-Run any subset by setting the relevant vars:
+Run any subset by setting the global gate and the relevant backend vars:
 
 ```bash
-SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 \
+SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 \
   uv run pytest tests/integration -m integration -q --force-enable-socket
 ```
 

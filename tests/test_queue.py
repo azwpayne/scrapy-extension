@@ -1179,7 +1179,7 @@ class TestBackendQueuePush:
 
   @pytest.mark.parametrize(
     "delay",
-    ["not-a-number", -1, float("nan"), float("inf"), float("-inf")],
+    [True, False, "not-a-number", -1, float("nan"), float("inf"), float("-inf")],
   )
   def test_push_rejects_invalid_delay_without_mutating_meta(
     self, mock_connection_manager, mocker, delay
@@ -1202,6 +1202,26 @@ class TestBackendQueuePush:
       assert math.isnan(request.meta["delay"])
     else:
       assert request.meta["delay"] == delay
+    assert request.meta["source"] == "feed-a"
+    strategy.push.assert_not_called()
+
+  @pytest.mark.parametrize("priority", [True, False])
+  def test_push_rejects_bool_priority_without_mutating_meta(
+    self, mock_connection_manager, mocker, priority
+  ):
+    """Bool is not a valid numeric priority despite ``bool`` subclassing ``int``."""
+    strategy = mocker.MagicMock()
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+      queue_strategy=strategy,
+    )
+    request = Request("https://example.com", meta={"delay": 5.0, "source": "feed-a"})
+
+    with pytest.raises(QueueError, match="priority"):
+      queue.push(request, priority=priority)
+
+    assert request.meta["delay"] == 5.0
     assert request.meta["source"] == "feed-a"
     strategy.push.assert_not_called()
 

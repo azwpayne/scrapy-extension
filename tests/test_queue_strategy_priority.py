@@ -195,6 +195,17 @@ def test_scrapy_integer_priorities_are_centered_and_monotonic():
   ]
 
 
+@pytest.mark.parametrize("priority", [True, False])
+def test_bool_priority_is_rejected_before_bucket_selection(priority):
+  """Direct strategy callers must not map bool to an integer priority bucket."""
+  s, qb = _strategy(levels=3)
+
+  with pytest.raises(ValueError, match="priority"):
+    s.push("q", b"item", priority=priority)
+
+  qb.push.assert_not_called()
+
+
 def test_derived_bucket_names_are_backend_portable_and_collision_resistant():
   """Strategy-created names must not introduce Kafka-invalid ``:`` separators."""
   from scrapy_extension.backends.base import _validate_key_name

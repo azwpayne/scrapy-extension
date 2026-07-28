@@ -369,10 +369,10 @@ def _strategy_settings(backend_type: str, strategy: str, *, concurrent: int = 16
 
 
 class TestStrategyMqAckBypassWarning:
-  """2026-07-10 (DEEP-INSIGHT-2026-07-10 §B): ``BackendQueue._pop_with_ack``
-  returns ``token=None`` for every non-passthrough strategy, silently dropping
-  MQ per-message ack (7 strategies x 5 MQ backends = 35 misconfig combos).
-  The scheduler emits a WARNING so operators notice. RED-first.
+  """Warn only when an ack-requiring strategy fails to override ``pop_with_ack``.
+
+  Built-in strategy overrides preserve MQ per-message tokens. The warning is a
+  diagnostic for custom or local-only strategies that would otherwise drop one.
   """
 
   def test_no_warn_when_delay_threads_ack_with_kafka(self, mocker, caplog) -> None:

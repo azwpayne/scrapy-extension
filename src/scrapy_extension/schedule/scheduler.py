@@ -681,11 +681,11 @@ class BackendScheduler:
     hypothetical 3rd-party single-slot backend. Read the opt-out via ``settings.get(..., False)`` — it is
     NOT a pydantic field.
 
-    **Strategy+MQ ack-bypass warning (2026-07-10, §B).** After the queue
-    strategy is resolved, if it is non-passthrough AND the backend
-    ``requires_ack=True``, a WARNING is logged: ``BackendQueue._pop_with_ack``
-    returns ``token=None`` for non-passthrough strategies, silently disabling
-    MQ per-message ack (35 misconfig combinations). See
+    **Strategy+MQ ack-bypass warning.** After the queue strategy is resolved,
+    the scheduler warns only if an ack-requiring backend is paired with a
+    strategy that does not override ``pop_with_ack``. Built-in strategies that
+    thread broker tokens through their override do not warn; the gate remains a
+    defensive diagnostic for custom or local-only strategies. See
     ``_warn_strategy_mq_ack_bypass``.
     """
     from scrapy_extension.queue.strategies.factory import (

@@ -18,9 +18,10 @@ matter most on this backend:
 Running
 -------
 Skipped by default. To run, point at a Redis you don't mind a few throwaway
-``inttest:*`` keys landing in::
+``inttest:*`` keys landing in and set the integration-tier gate::
 
-    SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 uv run pytest tests/integration -q
+    SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 \
+      uv run pytest tests/integration -q
 
 Each test uses a UUID-prefixed key namespace so concurrent runs and leftover
 data don't interfere.

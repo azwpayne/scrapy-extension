@@ -1593,11 +1593,12 @@ class ConnectionManager:
   def get_queue_backend(self) -> QueueBackend:
     """Get the queue backend interface.
 
-    When the circuit breaker is enabled, the returned backend's hot-path
-    ops (``push`` / ``pop`` / ``queue_len``) are wrapped under the breaker;
-    non-network methods (``clear_queue``, ``ack``, ``nack``,
-    ``is_connected``) forward unchanged. When disabled (default) the raw
-    backend is returned byte-identically.
+    When the circuit breaker is enabled, traffic operations (``push``,
+    ``_push_with_durability``, ``pop``, ``pop_with_ack``, ``ack``, and
+    ``nack``) are wrapped under the breaker. Administrative and lifecycle
+    methods (including ``queue_len``, ``clear_queue``, and ``is_connected``)
+    forward unchanged. When disabled (default) the raw backend is returned
+    byte-identically.
 
     Returns:
         The QueueBackend interface of the backend.

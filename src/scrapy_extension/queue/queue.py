@@ -325,6 +325,14 @@ class BackendQueue:
     """Execute an admitted push operation."""
     replacement_ack_token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
     raw_delay = request.meta.get("delay", 0.0)
+    if isinstance(raw_delay, bool):
+      error = QueueError(
+        f"Invalid queue delay {raw_delay!r}: expected a finite number >= 0",
+        queue_name=self.queue_name,
+        operation="push",
+      )
+      self._terminate_invalid_replacement(request, replacement_ack_token)
+      raise error
     try:
       delay = float(raw_delay or 0.0)
     except (TypeError, ValueError) as e:
@@ -338,6 +346,14 @@ class BackendQueue:
     if not math.isfinite(delay) or delay < 0:
       error = QueueError(
         f"Invalid queue delay {raw_delay!r}: expected a finite number >= 0",
+        queue_name=self.queue_name,
+        operation="push",
+      )
+      self._terminate_invalid_replacement(request, replacement_ack_token)
+      raise error
+    if isinstance(priority, bool):
+      error = QueueError(
+        f"Invalid queue priority {priority!r}: expected a finite number",
         queue_name=self.queue_name,
         operation="push",
       )

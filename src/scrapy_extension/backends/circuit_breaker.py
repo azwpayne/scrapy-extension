@@ -550,16 +550,17 @@ for _proxy_cls in (_QueueBackendProxy, _SetBackendProxy, _StorageBackendProxy):
 
 
 def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueBackend:
-  """Wrap ``backend``'s push/pop/pop_with_ack under ``breaker``.
+  """Wrap queue traffic operations under ``breaker``.
 
   ``queue_len`` is forwarded unchanged (NOT wrapped): it is an admin /
   observability probe, and a transient stats-query failure must not cascade
-  into a full traffic shutdown by tripping the breaker. Other attributes
-  (including ``clear_queue``, ``ack``, ``nack``, ``is_connected``) also forward
-  unchanged so an OPEN breaker does not block administrative / non-network
-  operations. ``pop_with_ack`` IS wrapped (2026-07-10) so MQ ack-pop failures
-  trip the breaker and the backend's per-message override is not shadowed by
-  the ABC default.
+  into a full traffic shutdown by tripping the breaker. Administrative and
+  lifecycle attributes (including ``clear_queue`` and ``is_connected``) forward
+  unchanged. ``push``, ``_push_with_durability``, ``pop``, ``pop_with_ack``,
+  ``ack``, and ``nack`` are wrapped: MQ implementations perform broker I/O for
+  all of them, so their failures must trip the breaker and fail fast while it is
+  OPEN. Atomic-pop backends inherit no-op ack/nack methods, for which wrapping
+  has no observable breaker effect.
   """
   return _QueueBackendProxy(backend, breaker)  # type: ignore[abstract]
 
