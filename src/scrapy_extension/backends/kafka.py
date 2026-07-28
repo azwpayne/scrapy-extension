@@ -351,7 +351,7 @@ class KafkaBackend(Backend, QueueBackend):
       # Detach it before beginning a fresh generation; otherwise a successful
       # retry would overwrite and leak that residual client.
       if self._producer is not None or self._admin_client is not None:
-        self._abort_partial_connect()
+        self._abort_partial_connect(suppress_process_control=True)
 
       if self.config.mode not in (
         KafkaMode.STANDALONE,
@@ -377,14 +377,14 @@ class KafkaBackend(Backend, QueueBackend):
           self._connect_confluent()
         logger.debug("Connected to Kafka in %s mode", self.config.mode.value)
       except KafkaError as e:
-        self._abort_partial_connect()
+        self._abort_partial_connect(suppress_process_control=True)
         msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
         raise BackendConnectionError(
           msg,
           backend_type="kafka",
         ) from e
       except Exception as e:
-        self._abort_partial_connect()
+        self._abort_partial_connect(suppress_process_control=True)
         # Unexpected errors (e.g., RuntimeError from mocking in tests)
         msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
         raise BackendConnectionError(
@@ -399,10 +399,10 @@ class KafkaBackend(Backend, QueueBackend):
         # bg thread) and leaving ``is_connected()`` lying True. Run the cleanup
         # before re-raising. Mirrors mongodb.py / elasticsearch.py / dynamodb /
         # redis ``except BaseException`` arms.
-        self._abort_partial_connect()
+        self._abort_partial_connect(suppress_process_control=True)
         raise
 
-  def _abort_partial_connect(self) -> None:
+  def _abort_partial_connect(self, *, suppress_process_control: bool = False) -> None:
     """Close+null any clients assigned before ``connect()`` failed.
 
     R-kacc: in each ``_connect_*`` path ``self._producer`` is assigned
@@ -420,21 +420,30 @@ class KafkaBackend(Backend, QueueBackend):
     so a second ``Ctrl+C`` raised by the blocking ``KafkaProducer.close()``
     escaped before ``self._producer = None`` ran, re-wedging the backend.
     Nulling first makes ``is_connected()`` truthful the instant the abort is
-    entered, regardless of what ``close()`` raises. Ordinary ``Exception``
-    failures from ``close()`` are swallowed (logged at debug); a
-    ``BaseException`` from ``close()`` still propagates, but state is already
-    detached so no wedge is possible.
+    entered, regardless of what ``close()`` raises. Both detached siblings are
+    always offered ``close()``, even if the first one raises a control-flow
+    exception. Ordinary ``Exception`` failures are logged at debug; direct
+    callers receive the first ``BaseException`` after all cleanup has been
+    attempted. ``connect()`` uses ``suppress_process_control=True`` so cleanup
+    cannot replace the original failed-connect cause or prevent a residual
+    generation from being retired before a retry.
     """
     producer = self._producer
     admin = self._admin_client
     self._producer = None
     self._admin_client = None
+    primary_error: BaseException | None = None
     for closer in (producer, admin):
       if closer is not None:
         try:
           closer.close()
         except Exception:
           logger.debug("Failed to abort partial Kafka client", exc_info=True)
+        except BaseException as error:
+          if primary_error is None:
+            primary_error = error
+    if primary_error is not None and not suppress_process_control:
+      raise primary_error
 
   def _build_common_config(self) -> dict[str, Any]:
     """Build common Kafka client configuration.

@@ -316,6 +316,74 @@ class TestKafkaBackendConnect:
     assert backend._producer is None
     assert backend._admin_client is None
 
+  def test_abort_partial_connect_closes_all_siblings_then_raises_first_control_error(
+    self, mocker
+  ):
+    """Direct cleanup preserves its first control error after full teardown."""
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    first_error = KeyboardInterrupt("producer close interrupted")
+    producer.close.side_effect = first_error
+    admin.close.side_effect = SystemExit("admin close interrupted")
+    backend._producer = producer
+    backend._admin_client = admin
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      backend._abort_partial_connect()
+
+    assert exc_info.value is first_error
+    producer.close.assert_called_once_with()
+    admin.close.assert_called_once_with()
+    assert backend._producer is None
+    assert backend._admin_client is None
+
+  def test_failed_connect_preserves_original_control_error_over_cleanup_error(
+    self, mocker
+  ):
+    """A candidate close interrupt must not replace construction's interrupt."""
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    connect_error = KeyboardInterrupt("admin construction interrupted")
+    producer.close.side_effect = SystemExit("producer close interrupted")
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", side_effect=connect_error
+    )
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+      backend.connect()
+
+    assert exc_info.value is connect_error
+    producer.close.assert_called_once_with()
+    assert backend._producer is None
+    assert backend._admin_client is None
+
+  def test_residual_cleanup_control_error_does_not_prevent_new_generation(
+    self, mocker
+  ):
+    """A stale client's close interrupt is best-effort before a fresh connect."""
+    backend = KafkaBackend(KafkaSettings())
+    residual_producer = mocker.MagicMock()
+    residual_producer.close.side_effect = KeyboardInterrupt("residual close")
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    backend._producer = residual_producer
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+    )
+    mocker.patch(
+      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+    )
+
+    backend.connect()
+
+    residual_producer.close.assert_called_once_with()
+    assert backend._producer is producer
+    assert backend._admin_client is admin
+
   def test_abort_partial_connect_nulls_admin_first_when_producer_close_succeeds(
     self, mocker
   ):
