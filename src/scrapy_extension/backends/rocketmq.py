@@ -150,6 +150,10 @@ class RocketMQBackend(Backend, QueueBackend):
     self.config = config
     self._producer: Any = None
     self._consumer: Any = None
+    # Producer and consumer form one client generation.  ``connect`` must not
+    # publish a second generation while the first is starting, and
+    # ``disconnect`` must not detach a half-started pair underneath it.
+    self._connection_lock = threading.RLock()
     self._consumer_generation = 0
     self._subscribed_topics: set[str] = set()
     # ``SimpleConsumer.await_duration`` is mutable global state on the client.
@@ -171,6 +175,21 @@ class RocketMQBackend(Backend, QueueBackend):
         is missing.
       ConfigurationError: If configuration is invalid.
     """
+    with self._connection_lock:
+      # A complete generation remains owned by this backend until an explicit
+      # disconnect.  Repeated (or overlapping) connects are therefore no-ops
+      # rather than silently leaking an earlier Producer/Consumer pair.
+      if self._producer is not None and self._consumer is not None:
+        return
+      # A failed/interrupted historical connect could leave one side assigned.
+      # Retire it before beginning a fresh generation; this preserves the
+      # failure cleanup contract while preventing a one-sided client leak.
+      if self._producer is not None or self._consumer is not None:
+        self._abort_partial_connect()
+      self._connect_unlocked()
+
+  def _connect_unlocked(self) -> None:
+    """Build one client generation while ``_connection_lock`` is held."""
     mode = self.config.mode
     namesrv_address = self.config.namesrv_address
     access_key = self.config.access_key
@@ -276,18 +295,21 @@ class RocketMQBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Close RocketMQ connections (shutdown producer + consumer)."""
-    # apache Producer/Consumer shutdown is best-effort — guard each so a
-    # failure in one doesn't skip the other.
-    producer = self._producer
-    consumer = self._consumer
-    self._producer = None
-    self._consumer = None
-    self._consumer_generation += 1
-    self._subscribed_topics.clear()
-    self._last_msg = None
-    self._last_delivery = None
-    self._shutdown_detached_clients((producer, "producer"), (consumer, "consumer"))
-    logger.debug("Disconnected from RocketMQ")
+    with self._connection_lock:
+      # apache Producer/Consumer shutdown is best-effort — guard each so a
+      # failure in one doesn't skip the other.
+      producer = self._producer
+      consumer = self._consumer
+      self._producer = None
+      self._consumer = None
+      self._consumer_generation += 1
+      self._subscribed_topics.clear()
+      self._last_msg = None
+      self._last_delivery = None
+      self._shutdown_detached_clients(
+        (producer, "producer"), (consumer, "consumer")
+      )
+      logger.debug("Disconnected from RocketMQ")
 
   @staticmethod
   def _shutdown_detached_clients(

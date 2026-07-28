@@ -206,6 +206,126 @@ def test_connect_standalone_mode(mocker) -> None:
   assert mock_config_cls.call_args.kwargs["endpoints"] == config.namesrv_address
 
 
+def test_repeated_connect_keeps_the_existing_client_generation(mocker) -> None:
+  """A complete live producer/consumer pair makes connect idempotent."""
+  backend = RocketMQBackend(RocketMQSettings())
+  mock_producer_cls, mock_consumer_cls, _, _, _ = _patch_rocketmq(mocker)
+
+  backend.connect()
+  producer = backend._producer
+  consumer = backend._consumer
+  backend.connect()
+
+  assert backend._producer is producer
+  assert backend._consumer is consumer
+  mock_producer_cls.assert_called_once()
+  mock_consumer_cls.assert_called_once()
+  producer.startup.assert_called_once_with()
+  consumer.startup.assert_called_once_with()
+
+
+def test_overlapping_connects_share_the_same_client_generation(mocker) -> None:
+  """A second direct connect waits for and reuses the first generation."""
+  backend = RocketMQBackend(RocketMQSettings())
+  mock_producer_cls, mock_consumer_cls, _, _, _ = _patch_rocketmq(mocker)
+  startup_started = threading.Event()
+  allow_startup = threading.Event()
+  errors: list[BaseException] = []
+
+  def block_producer_startup() -> None:
+    startup_started.set()
+    assert allow_startup.wait(timeout=2)
+
+  mock_producer_cls.return_value.startup.side_effect = block_producer_startup
+
+  def connect() -> None:
+    try:
+      backend.connect()
+    except BaseException as error:  # pragma: no cover - surfaced below
+      errors.append(error)
+
+  first = threading.Thread(target=connect)
+  second = threading.Thread(target=connect)
+  first.start()
+  assert startup_started.wait(timeout=1)
+  second.start()
+  assert mock_producer_cls.call_count == 1
+
+  allow_startup.set()
+  first.join(timeout=2)
+  second.join(timeout=2)
+
+  assert not first.is_alive()
+  assert not second.is_alive()
+  assert errors == []
+  mock_producer_cls.assert_called_once()
+  mock_consumer_cls.assert_called_once()
+
+
+def test_connect_retires_a_one_sided_residual_before_fresh_generation(mocker) -> None:
+  """An interrupted old generation cannot survive a later fresh connect."""
+  backend = RocketMQBackend(RocketMQSettings())
+  orphan_producer = MagicMock()
+  backend._producer = orphan_producer
+  mock_producer_cls, mock_consumer_cls, _, _, _ = _patch_rocketmq(mocker)
+
+  backend.connect()
+
+  orphan_producer.shutdown.assert_called_once_with()
+  assert backend._producer is mock_producer_cls.return_value
+  assert backend._consumer is mock_consumer_cls.return_value
+
+
+def test_disconnect_waits_for_the_full_connect_generation(mocker) -> None:
+  """Concurrent disconnect cannot detach the producer while connect starts it."""
+  backend = RocketMQBackend(RocketMQSettings())
+  mock_producer_cls, mock_consumer_cls, _, _, _ = _patch_rocketmq(mocker)
+  startup_started = threading.Event()
+  allow_startup = threading.Event()
+  disconnect_finished = threading.Event()
+  errors: list[BaseException] = []
+
+  def block_producer_startup() -> None:
+    startup_started.set()
+    assert allow_startup.wait(timeout=2)
+
+  mock_producer_cls.return_value.startup.side_effect = block_producer_startup
+
+  def connect() -> None:
+    try:
+      backend.connect()
+    except BaseException as error:  # pragma: no cover - surfaced below
+      errors.append(error)
+
+  def disconnect() -> None:
+    try:
+      backend.disconnect()
+    except BaseException as error:  # pragma: no cover - surfaced below
+      errors.append(error)
+    finally:
+      disconnect_finished.set()
+
+  connect_thread = threading.Thread(target=connect)
+  connect_thread.start()
+  assert startup_started.wait(timeout=1)
+
+  disconnect_thread = threading.Thread(target=disconnect)
+  disconnect_thread.start()
+  assert not disconnect_finished.wait(timeout=0.1)
+
+  allow_startup.set()
+  connect_thread.join(timeout=2)
+  disconnect_thread.join(timeout=2)
+
+  assert not connect_thread.is_alive()
+  assert not disconnect_thread.is_alive()
+  assert errors == []
+  mock_producer_cls.return_value.shutdown.assert_called_once_with()
+  mock_consumer_cls.return_value.shutdown.assert_called_once_with()
+  assert backend._producer is None
+  assert backend._consumer is None
+
+
 def test_connect_cluster_mode(mocker) -> None:
   """Cluster mode passes the configured proxy endpoints through."""
   config = RocketMQSettings(
