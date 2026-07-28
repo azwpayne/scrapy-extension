@@ -62,6 +62,32 @@ def test_repeated_connect_is_idempotent_and_keeps_one_client(mocker) -> None:
   second.close.assert_not_called()
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logger failed"),
+    KeyboardInterrupt("logger interrupted"),
+    SystemExit("logger exited"),
+  ],
+)
+def test_post_publish_logger_failure_preserves_live_generation(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  candidate = _client(mocker, "published")
+  mocker.patch("scrapy_extension.backends.redis.Redis", return_value=candidate)
+  mocker.patch(
+    "scrapy_extension.backends.redis.logger.debug", side_effect=diagnostic_error
+  )
+  backend = RedisBackend(RedisSettings())
+
+  backend.connect()
+
+  assert backend._generation is not None
+  assert backend.client is candidate
+  assert backend.is_connected() is True
+  candidate.close.assert_not_called()
+
+
 def test_lazy_operation_cannot_observe_candidate_before_ping_completes(
   mocker,
 ) -> None:

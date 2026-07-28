@@ -637,7 +637,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           # Raise outside the driver exception handler so sanitized startup
           # errors do not retain credentials/endpoints through __context__.
           raise startup_error
-        logger.debug("Connected to Redis in %s mode", snapshot.mode.value)
+        # Publication linearizes ownership of this generation. A third-party
+        # logging handler is only success telemetry and must not turn a live
+        # connection into a false failed connect (or surface a control signal).
+        try:
+          logger.debug("Connected to Redis in %s mode", snapshot.mode.value)
+        except BaseException:
+          pass
         return True
     finally:
       self._connect_local.depth = previous_depth
