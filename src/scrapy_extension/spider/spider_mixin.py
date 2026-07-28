@@ -653,7 +653,12 @@ class BackendSpiderMixin(Spider):
         try:
           component.close(*args)
         except Exception:
-          logger.exception("Failed to close backend %s", label)
+          # Diagnostics must not become a second teardown failure: custom
+          # logging handlers can raise process-control exceptions too.
+          try:
+            logger.exception("Failed to close backend %s", label)
+          except BaseException:  # noqa: BLE001 - teardown must continue
+            pass
         except BaseException as exc:  # noqa: BLE001 - preserve process control
           if primary_error is None:
             primary_error = exc
@@ -662,7 +667,12 @@ class BackendSpiderMixin(Spider):
         try:
           manager.close()
         except Exception:
-          logger.exception("Failed to close backend connection manager")
+          # Keep the manager release independent from diagnostic handlers for
+          # the same reason as component cleanup above.
+          try:
+            logger.exception("Failed to close backend connection manager")
+          except BaseException:  # noqa: BLE001 - teardown must continue
+            pass
         except BaseException as exc:  # noqa: BLE001 - do not mask component error
           if primary_error is None:
             primary_error = exc

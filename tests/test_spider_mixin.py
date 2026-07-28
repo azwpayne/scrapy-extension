@@ -1554,6 +1554,34 @@ class TestCloseBackend:
     manager.close.assert_called_once_with()
     assert caplog.text.count("Failed to disconnect backend lifecycle signal") == 2
 
+  def test_close_backend_isolates_diagnostic_control_errors(self, mocker):
+    """A logger failure after one close error cannot abort later teardown."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    spider = TestSpider()
+    scheduler = mocker.MagicMock()
+    queue = mocker.MagicMock()
+    dupefilter = mocker.MagicMock()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._scheduler = scheduler
+    spider._queue = queue
+    spider._dupefilter = dupefilter
+    spider._connection_manager = manager
+    scheduler.close.side_effect = RuntimeError("scheduler failed")
+    mocker.patch(
+      "scrapy_extension.spider.spider_mixin.logger.exception",
+      side_effect=KeyboardInterrupt(),
+    )
+
+    spider.close_backend()
+
+    scheduler.close.assert_called_once_with("spider-mixin-close")
+    queue.close.assert_called_once_with()
+    dupefilter.close.assert_called_once_with("spider-mixin-close")
+    manager.close.assert_called_once_with()
+
   def test_close_backend_releases_manager_after_component_baseexception(self, mocker):
     """R47: Ctrl-C in one close hook cannot leak the shared manager acquire."""
 
