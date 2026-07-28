@@ -9,6 +9,7 @@ from elasticsearch import ApiError, NotFoundError, RequestError, TransportError
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.settings.elasticsearch import (
   ElasticSearchMode,
   ElasticSearchSettings,
@@ -127,7 +128,7 @@ class TestConnection:
       )
 
   def test_cloud_mode_empty_api_key_fails_at_construction(self):
-    """R27-A: an empty-string ``api_key`` must fail CLOUD construction.
+    """R45: an empty-string ``api_key`` fails before client construction.
 
     R26-F used ``is not None``, so ``SecretStr("")`` — an env var set but
     unpopulated (e.g. ``SCRAPY_ELASTICSEARCH_API_KEY=""`` in CI drift) — passed
@@ -137,23 +138,19 @@ class TestConnection:
     false')`` R26-F exists to surface at config time. An empty value is the
     same operator error as an unset one and must fail at the same point.
     """
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError, match="auth"):
+    with pytest.raises(ConfigurationError, match="api_key"):
       ElasticSearchSettings(
         mode=ElasticSearchMode.CLOUD, cloud_id="test:abc", api_key=""
       )
 
   def test_cloud_mode_empty_basic_auth_fails_at_construction(self):
-    """R27-A: empty-string ``username``/``password`` must fail CLOUD construction.
+    """R45: blank basic-auth fields fail before client construction.
 
     Same root cause as the empty api_key case: ``is not None`` treats
     ``username=""`` / ``password=SecretStr("")`` as present, but
     ``_build_kwargs`` drops them via truthiness → anonymous client → 401.
     """
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError, match="auth"):
+    with pytest.raises(ConfigurationError, match="username"):
       ElasticSearchSettings(
         mode=ElasticSearchMode.CLOUD,
         cloud_id="test:abc",
@@ -161,21 +158,10 @@ class TestConnection:
         password="",
       )
 
-  def test_standalone_empty_api_key_http_not_blocked(self):
-    """R27-A: an empty ``api_key`` must not trip the cleartext-credentials guard.
-
-    ``_validate_no_cleartext_credentials`` also used ``is not None``, so
-    ``api_key=SecretStr("")`` + an ``http://`` host (the STANDALONE default)
-    raised "don't send credentials over cleartext" — a false positive, since
-    there are no real credentials to leak. The validator's own docstring
-    permits ``http://`` with no creds (no-auth local dev node). After the
-    truthiness fix, empty key = no credential = allowed. The real-key-over-http
-    guard is unchanged (``bool(SecretStr("real"))`` is still truthy).
-    """
-    # No exception: default http://localhost:9200 + empty api_key is a permitted
-    # no-auth dev config (the validator's docstring allows it).
-    settings = ElasticSearchSettings(mode=ElasticSearchMode.STANDALONE, api_key="")
-    assert settings.api_key.get_secret_value() == ""
+  def test_standalone_empty_api_key_rejected(self):
+    """R45: explicitly supplied blank credentials cannot become anonymous auth."""
+    with pytest.raises(ConfigurationError, match="api_key"):
+      ElasticSearchSettings(mode=ElasticSearchMode.STANDALONE, api_key="")
 
   def test_disconnect(self, mocker):
     mock_client = mocker.MagicMock(

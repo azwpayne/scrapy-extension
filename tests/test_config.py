@@ -549,8 +549,8 @@ class TestSec3ElasticsearchCleartextCredsGuard:
   with no creds is fine (e.g. a no-auth local dev node).
   """
 
-  def test_http_host_with_password_rejected(self):
-    """http:// host + password → ConfigurationError."""
+  def test_http_host_with_basic_auth_rejected(self):
+    """http:// host + complete basic auth → ConfigurationError."""
     from pydantic import SecretStr
 
     from scrapy_extension.exceptions import ConfigurationError
@@ -558,7 +558,7 @@ class TestSec3ElasticsearchCleartextCredsGuard:
 
     with pytest.raises(ConfigurationError) as exc_info:
       ElasticSearchSettings(
-        hosts=["http://es:9200"], password=SecretStr("s3cr3t")
+        hosts=["http://es:9200"], username="crawler", password=SecretStr("s3cr3t")
       )
     assert exc_info.value.setting_name == "hosts"
 
@@ -574,14 +574,14 @@ class TestSec3ElasticsearchCleartextCredsGuard:
         hosts=["http://es:9200"], api_key=SecretStr("key-123")
       )
 
-  def test_https_host_with_password_accepted(self):
-    """https:// host + password → accepted."""
+  def test_https_host_with_basic_auth_accepted(self):
+    """https:// host + complete basic auth → accepted."""
     from pydantic import SecretStr
 
     from scrapy_extension.settings import ElasticSearchSettings
 
     settings = ElasticSearchSettings(
-      hosts=["https://es:9200"], password=SecretStr("s3cr3t")
+      hosts=["https://es:9200"], username="crawler", password=SecretStr("s3cr3t")
     )
     assert settings.password.get_secret_value() == "s3cr3t"
 

@@ -7,6 +7,7 @@ ElasticSearch backend connections.
 from __future__ import annotations
 
 from enum import Enum
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,7 +15,7 @@ from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
 
-_VALID_ES_SCHEMES: tuple[str, ...] = ("http://", "https://")
+_VALID_ES_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
 
 class ElasticSearchMode(str, Enum):
@@ -134,13 +135,12 @@ class ElasticSearchSettings(BaseSettings):
 
   @model_validator(mode="after")
   def _validate_hosts_scheme(self) -> Self:
-    """SV4: every ``hosts`` entry must start with ``http://`` or ``https://``.
+    """Validate structurally safe standalone Elasticsearch endpoints.
 
-    SEC-3 (round 6) guards ``http://`` + credentials (cleartext leak); this
-    validator guards the scheme itself for the no-creds case. A bare
-    ``localhost:9200`` or ``es-cluster`` otherwise surfaces as an opaque
-    transport error inside the elasticsearch-py client (it does not infer a
-    default scheme). Empty strings are rejected.
+    A bare ``localhost:9200`` otherwise surfaces as an opaque transport error
+    inside elasticsearch-py. URL userinfo, query strings, and fragments can
+    carry secrets that would then reach driver errors or logs, so settings must
+    use the dedicated authentication fields instead.
 
     Raises:
         ConfigurationError: if any host entry lacks a valid scheme.
@@ -159,19 +159,100 @@ class ElasticSearchSettings(BaseSettings):
         setting_name="hosts",
         setting_value=self.hosts,
       )
-    bad = [
-      host
-      for host in self.hosts
-      if not host or not host.lower().startswith(_VALID_ES_SCHEMES)
-    ]
-    if bad:
+    for host in self.hosts:
+      if not isinstance(host, str) or not host:
+        raise ConfigurationError(
+          "each hosts entry must be a non-empty http:// or https:// endpoint.",
+          setting_name="hosts",
+          setting_value=self.hosts,
+        )
+      # Check raw input before urlsplit(), which deliberately normalizes some
+      # controls such as newlines. Do not include the host in an error because
+      # URL userinfo/query strings may contain credentials.
+      if any(char.isspace() or ord(char) < 32 for char in host):
+        raise ConfigurationError(
+          "hosts entries must not contain whitespace or control characters.",
+          setting_name="hosts",
+        )
+      try:
+        parsed = urlsplit(host)
+        # Accessing .port validates the numeric port, including out-of-range
+        # values, without imposing a port on deployments that use a proxy.
+        _ = parsed.port
+      except ValueError as exc:
+        raise ConfigurationError(
+          "each hosts entry must contain a valid network authority.",
+          setting_name="hosts",
+        ) from exc
+      if (
+        parsed.scheme.lower() not in _VALID_ES_SCHEMES
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+      ):
+        raise ConfigurationError(
+          "each hosts entry must be an http:// or https:// endpoint without "
+          "userinfo, query, or fragment.",
+          setting_name="hosts",
+        )
+    return self
+
+  @model_validator(mode="after")
+  def _validate_auth_completeness(self) -> Self:
+    """Reject blank, partial, or ambiguous authentication before client setup."""
+    api_key = self.api_key.get_secret_value() if self.api_key is not None else None
+    password = self.password.get_secret_value() if self.password is not None else None
+    if api_key is not None and not api_key.strip():
       raise ConfigurationError(
-        (
-          "each hosts entry must start with 'http://' or 'https://'. "
-          f"Got invalid entries={bad!r} (full hosts={self.hosts!r})."
-        ),
-        setting_name="hosts",
-        setting_value=self.hosts,
+        "api_key must not be blank when supplied.", setting_name="api_key"
+      )
+    if self.username is not None and not self.username.strip():
+      raise ConfigurationError(
+        "username must not be blank when supplied.", setting_name="username"
+      )
+    if password is not None and not password.strip():
+      raise ConfigurationError(
+        "password must not be blank when supplied.", setting_name="password"
+      )
+
+    has_api_key = api_key is not None
+    has_username = self.username is not None
+    has_password = password is not None
+    if has_api_key and (has_username or has_password):
+      raise ConfigurationError(
+        "api_key and basic-auth (username/password) are mutually exclusive; "
+        "remove one authentication method.",
+        setting_name="api_key",
+      )
+    if has_username != has_password:
+      missing = "password" if has_username else "username"
+      raise ConfigurationError(
+        f"basic authentication requires both username and password; set '{missing}'.",
+        setting_name=missing,
+      )
+    return self
+
+  @model_validator(mode="after")
+  def _validate_capability_indices(self) -> Self:
+    """Keep destructive queue, set, and storage operations physically isolated."""
+    indices = {
+      "queue_index": self.queue_index,
+      "set_index": self.set_index,
+      "storage_index": self.storage_index,
+    }
+    for name, value in indices.items():
+      if not value.strip():
+        raise ConfigurationError(
+          f"{name} must not be blank.", setting_name=name
+        )
+    if len(set(indices.values())) != len(indices):
+      raise ConfigurationError(
+        "queue_index, set_index, and storage_index must be pairwise distinct "
+        "so a capability clear cannot delete another capability's data.",
+        setting_name="queue_index",
       )
     return self
 
@@ -203,13 +284,8 @@ class ElasticSearchSettings(BaseSettings):
           f"Got cloud_id={self.cloud_id!r}."
         )
         raise ValueError(msg)
-      # R27-A: truthiness (not ``is not None``) so an empty-string secret —
-      # e.g. ``SCRAPY_ELASTICSEARCH_API_KEY=""`` (env var set but unpopulated)
-      # — is treated as absent, matching ``_build_kwargs`` (which uses
-      # ``if self.config.api_key:``). Pre-R27-A an empty secret passed this
-      # check but was dropped at build time → anonymous client → 401.
-      has_api_key = bool(self.api_key)
-      has_basic_auth = bool(self.username) and bool(self.password)
+      has_api_key = self.api_key is not None
+      has_basic_auth = self.username is not None and self.password is not None
       if not (has_api_key or has_basic_auth):
         msg = (
           "ElasticSearch CLOUD mode requires an auth method: set 'api_key' "
@@ -241,11 +317,7 @@ class ElasticSearchSettings(BaseSettings):
     if self.mode == ElasticSearchMode.CLOUD:
       return self
 
-    # R27-A: truthiness mirrors the CLOUD auth check above so an empty
-    # ``api_key``/``password`` is not treated as a credential present (which
-    # would false-positive the cleartext guard on a permitted no-auth http dev
-    # node — the validator's own docstring allows ``http://`` with no creds).
-    has_credential = bool(self.api_key) or bool(self.password)
+    has_credential = self.api_key is not None or self.password is not None
     if not has_credential:
       return self
     has_http_host = any(
@@ -263,42 +335,15 @@ class ElasticSearchSettings(BaseSettings):
     return self
 
   @model_validator(mode="after")
-  def _validate_auth_method_exclusivity(self) -> Self:
-    """SV3-5 (L-M): ``api_key`` and (``username``, ``password``) are mutually exclusive.
-
-    ``_build_kwargs`` prefers ``api_key`` when set and silently drops
-    ``basic_auth``. An operator who configures both believes basic_auth is
-    enforced while it never reaches the cluster — a silent auth-bypass
-    footgun. Fail-fast at config time; require the operator to pick one
-    method.
-
-    Verified safe: no existing repo fixture sets both (all ``api_key``
-    fixtures omit ``username``; all ``basic_auth`` fixtures omit ``api_key``).
-
-    Raises:
-        ConfigurationError: if ``api_key`` is set and either ``username`` or
-            ``password`` is also set.
-    """
-    # R28-A: truthiness (not ``is not None``) mirrors R27-A's two other ES
-    # validators so an empty-string secret (env var set but unpopulated) is
-    # treated as absent. Pre-R28-A an empty ``api_key`` + basic_auth was
-    # falsely rejected as "mutually exclusive" even though ``_build_kwargs``
-    # drops the empty key and uses basic_auth. Completes R27-A's stated
-    # "all three sites" intent (this is the third validator).
-    if not self.api_key:
-      return self
-    if bool(self.username) or bool(self.password):
+  def _validate_authenticated_tls(self) -> Self:
+    """Require certificate verification whenever standalone auth is enabled."""
+    if (
+      self.mode == ElasticSearchMode.STANDALONE
+      and not self.verify_certs
+      and (self.api_key is not None or self.username is not None)
+    ):
       raise ConfigurationError(
-        (
-          "api_key and basic-auth (username/password) are mutually "
-          "exclusive — when both are set, api_key is used and basic_auth "
-          "is silently dropped (auth-method ambiguity). Remove one "
-          "authentication method. "
-          f"Got api_key={'<set>' if self.api_key else None}, "
-          f"username={self.username!r}, password="
-          f"{'<set>' if self.password else None}."
-        ),
-        setting_name="api_key",
-        setting_value=self.api_key,
+        "verify_certs must be enabled for authenticated standalone connections.",
+        setting_name="verify_certs",
       )
     return self

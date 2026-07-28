@@ -825,13 +825,13 @@ class TestElasticSearchHostsScheme:
       ElasticSearchSettings(hosts=[""])  # type: ignore[arg-type]
 
   def test_hosts_rejects_any_bad_entry_in_mixed_list(self) -> None:
-    """One bad entry in a mixed list must reject (reports the bad entries)."""
+    """One bad entry in a mixed list must reject without echoing host input."""
     with pytest.raises(ConfigurationError) as exc_info:
       ElasticSearchSettings(
         hosts=["https://good:9200", "bad:9200"]  # type: ignore[arg-type]
       )
     assert exc_info.value.setting_name == "hosts"
-    assert "bad:9200" in str(exc_info.value)
+    assert "bad:9200" not in str(exc_info.value)
 
   @pytest.mark.parametrize(
     "hosts",
@@ -874,6 +874,57 @@ class TestElasticSearchHostsScheme:
       hosts=[],
     )
     assert s.cloud_id == "test:abc"
+
+  @pytest.mark.parametrize(
+    "host",
+    [
+      "https://user:secret@es.example:9200",
+      "https://es.example:9200?api_key=secret",
+      "https://es.example:9200#secret",
+      "https://es.example:9200\n",
+      "https:///missing-host",
+      "https://es.example:not-a-port",
+    ],
+  )
+  def test_hosts_reject_unsafe_or_malformed_authority(self, host: str) -> None:
+    """R45: host URLs cannot smuggle credentials or malformed authority.
+
+    The exception deliberately must not echo the input: a URL userinfo or query
+    can contain a credential, and settings errors are commonly logged.
+    """
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(hosts=[host])
+    assert exc_info.value.setting_name == "hosts"
+    assert "secret" not in str(exc_info.value)
+
+
+class TestElasticSearchCapabilityIsolation:
+  """R45: destructive capability operations need distinct ES indices."""
+
+  @pytest.mark.parametrize(
+    "kwargs",
+    [
+      {"queue_index": "shared", "set_index": "shared"},
+      {"queue_index": "shared", "storage_index": "shared"},
+      {"set_index": "shared", "storage_index": "shared"},
+    ],
+  )
+  def test_index_collisions_rejected(self, kwargs: dict[str, str]) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(**kwargs)
+    assert exc_info.value.setting_name == "queue_index"
+
+  @pytest.mark.parametrize("field", ["queue_index", "set_index", "storage_index"])
+  def test_blank_index_rejected(self, field: str) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(**{field: " \t "})
+    assert exc_info.value.setting_name == field
+
+  def test_distinct_indices_remain_valid(self) -> None:
+    settings = ElasticSearchSettings(
+      queue_index="jobs", set_index="seen", storage_index="items"
+    )
+    assert settings.storage_index == "items"
 
 
 class TestAwsRegionNameFormat:
@@ -1301,43 +1352,54 @@ class TestSV3ElasticsearchAuthExclusivity:
     assert s.username == "user"
     assert s.api_key is None
 
-  def test_empty_api_key_with_basic_auth_accepted(self) -> None:
-    """R28-A: an empty ``api_key`` must NOT trip the exclusivity guard.
-
-    R27-A fixed ``is not None``→truthiness in two of three ES validators but
-    missed ``_validate_auth_method_exclusivity``. With ``api_key=SecretStr("")``
-    (env-var set but unpopulated) + real basic_auth, the stale ``is not None``
-    check treated the empty key as set and raised "mutually exclusive" — yet
-    ``_build_kwargs`` drops the empty key (truthiness) and uses basic_auth, so
-    the config is valid. This completes R27-A's stated "all three sites" intent.
-    """
+  def test_empty_api_key_rejected(self) -> None:
+    """R45: an explicitly supplied blank API key is never anonymous auth."""
     from pydantic import SecretStr
 
-    s = ElasticSearchSettings(
-      hosts=["https://es:9200"],
-      api_key=SecretStr(""),
-      username="user",
-      password=SecretStr("p"),
-    )
-    # empty api_key is treated as absent → basic_auth is the active method,
-    # no false "mutually exclusive" rejection.
-    assert s.username == "user"
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(hosts=["https://es:9200"], api_key=SecretStr(""))
+    assert exc_info.value.setting_name == "api_key"
 
-  def test_real_api_key_with_empty_password_accepted(self) -> None:
-    """R28-A: a real ``api_key`` + empty ``password`` must NOT trip the guard.
+  @pytest.mark.parametrize(
+    ("kwargs", "setting_name"),
+    [
+      ({"username": "user"}, "password"),
+      ({"password": "p"}, "username"),
+      ({"username": " ", "password": "p"}, "username"),
+      ({"username": "user", "password": " "}, "password"),
+    ],
+  )
+  def test_partial_or_blank_basic_auth_rejected(
+    self, kwargs: dict[str, object], setting_name: str
+  ) -> None:
+    """R45: client kwargs must not silently discard incomplete basic auth."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(hosts=["https://es:9200"], **kwargs)
+    assert exc_info.value.setting_name == setting_name
 
-    Symmetric to the empty-api_key case: ``_build_kwargs`` uses the real api_key
-    and never reads the empty password, so the config is valid (api_key auth).
-    The stale ``password is not None`` check falsely raised "mutually exclusive".
-    """
+  @pytest.mark.parametrize(
+    "kwargs",
+    [
+      {"api_key": "key"},
+      {"username": "user", "password": "p"},
+    ],
+  )
+  def test_authenticated_unverified_tls_rejected(self, kwargs: dict[str, object]) -> None:
+    """R45: credentials must never be sent over unverified TLS."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(
+        hosts=["https://es:9200"], verify_certs=False, **kwargs
+      )
+    assert exc_info.value.setting_name == "verify_certs"
+
+  def test_anonymous_local_http_and_verified_https_auth_remain_valid(self) -> None:
+    """R45 retains the supported local-development and secure-auth paths."""
     from pydantic import SecretStr
 
-    s = ElasticSearchSettings(
-      hosts=["https://es:9200"],
-      api_key=SecretStr("real-key"),
-      password=SecretStr(""),
-    )
-    assert s.api_key is not None
+    assert ElasticSearchSettings(hosts=["http://localhost:9200"]).hosts
+    assert ElasticSearchSettings(
+      hosts=["https://es:9200"], username="user", password=SecretStr("p")
+    ).username == "user"
 
 
 class TestSV3SqsAwsCredsBothOrNeither:
