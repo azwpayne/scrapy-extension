@@ -268,6 +268,58 @@ def test_post_publish_success_logger_failure_keeps_live_session(
   candidate_channel.close.assert_not_called()
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logger handler failed"),
+    KeyboardInterrupt("logger interrupted"),
+    SystemExit("logger exited"),
+  ],
+)
+def test_qos_success_logger_failure_keeps_prepared_candidate_live(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """A QoS success diagnostic cannot abort its private prepared candidate."""
+  backend = RabbitMQBackend(RabbitMQSettings(prefetch_count=1))
+  candidate_connection, candidate_channel = _handles("candidate")
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=candidate_connection,
+  )
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.debug",
+    side_effect=diagnostic_error,
+  )
+
+  backend.connect()
+
+  candidate_channel.basic_qos.assert_called_once_with(prefetch_count=1, prefetch_size=0)
+  assert backend._connection is candidate_connection
+  assert backend._channel is candidate_channel
+  assert backend.is_connected() is True
+  candidate_connection.close.assert_not_called()
+  candidate_channel.close.assert_not_called()
+
+
+def test_qos_control_failure_still_aborts_private_candidate(mocker) -> None:
+  """Only QoS diagnostics are isolated; the QoS operation remains causal."""
+  backend = RabbitMQBackend(RabbitMQSettings(prefetch_count=1))
+  candidate_connection, candidate_channel = _handles("candidate")
+  candidate_channel.basic_qos.side_effect = KeyboardInterrupt("qos interrupted")
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=candidate_connection,
+  )
+
+  with pytest.raises(KeyboardInterrupt, match="qos interrupted"):
+    backend.connect()
+
+  assert backend._connection is None
+  assert backend._channel is None
+  candidate_connection.close.assert_called_once()
+  candidate_channel.close.assert_called_once()
+
+
 def test_disconnect_fences_in_progress_candidate(mocker) -> None:
   backend = _backend()
   candidate_connection, candidate_channel = _handles("candidate")

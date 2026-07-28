@@ -1618,6 +1618,49 @@ def test_rabbitmq_in_flight_set_bounded(mocker, caplog):
   assert any("at cap" in r.message for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("diagnostic failure"),
+    KeyboardInterrupt("diagnostic interruption"),
+    SystemExit("diagnostic exit"),
+  ],
+)
+def test_rabbitmq_in_flight_cap_warning_failure_preserves_claimed_delivery(
+  mocker, diagnostic_error
+):
+  """R117: post-pop diagnostics cannot discard an already-claimed delivery."""
+  from scrapy_extension.backends.rabbitmq import _MAX_IN_FLIGHT, _RabbitMQAckToken
+
+  backend = RabbitMQBackend(RabbitMQSettings())
+  mock_channel = mocker.MagicMock()
+  backend._activate_channel(mocker.MagicMock(), mock_channel)
+  backend._in_flight_tags = {
+    _RabbitMQAckToken(tag, backend._channel_generation, "other")
+    for tag in range(_MAX_IN_FLIGHT)
+  }
+  mock_channel.basic_get.return_value = (
+    mocker.MagicMock(delivery_tag=999_999),
+    mocker.MagicMock(),
+    b"body",
+  )
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  body, token = backend.pop_with_ack("q")
+
+  assert body == b"body"
+  assert token is not None
+  assert token.delivery_tag == 999_999
+  assert token.queue_name == "q"
+  assert len(backend._in_flight_tags) == _MAX_IN_FLIGHT
+  assert token not in backend._in_flight_tags
+  assert backend._pending_deliveries == {"q": 1}
+  assert backend._in_flight_overflow_warned is True
+
+
 def test_disconnect_clears_delivery_tag_state_and_in_flight_set():
   """R-mq-reconnect: ``disconnect()`` must clear ``_last_delivery_tag`` AND the
   ``_in_flight_tags`` set so a reconnect cannot (a) reuse a stale delivery tag

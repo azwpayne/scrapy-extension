@@ -845,11 +845,17 @@ class RabbitMQBackend(Backend, QueueBackend):
         prefetch_count=prefetch_count,
         prefetch_size=prefetch_size,
       )
-      logger.debug(
-        "Set QoS: prefetch_count=%d, prefetch_size=%d",
-        prefetch_count,
-        prefetch_size,
-      )
+      # QoS has already succeeded on the private candidate. A custom logging
+      # handler is pure telemetry, so it must not make this healthy candidate
+      # look like a failed prepare and trigger its abort cleanup.
+      try:
+        logger.debug(
+          "Set QoS: prefetch_count=%d, prefetch_size=%d",
+          prefetch_count,
+          prefetch_size,
+        )
+      except BaseException:
+        pass
 
   def disconnect(self) -> None:
     """Fence connect intents, detach the live generation, and close it."""
@@ -1136,13 +1142,19 @@ class RabbitMQBackend(Backend, QueueBackend):
         return
       if not self._in_flight_overflow_warned:
         self._in_flight_overflow_warned = True
-        logger.warning(
-          "RabbitMQ in-flight ack set at cap (%d) — further unacked pops "
-          "will not be tracked in the diagnostic set. This indicates slow "
-          "acks or an ack leak; the broker still tracks delivery tags so "
-          "ack correctness is unaffected.",
-          _MAX_IN_FLIGHT,
-        )
+        # The message and its broker-side acknowledgement state are already
+        # established. This is diagnostics only: a broken log handler must
+        # not turn a successfully claimed delivery into a failed pop.
+        try:
+          logger.warning(
+            "RabbitMQ in-flight ack set at cap (%d) — further unacked pops "
+            "will not be tracked in the diagnostic set. This indicates slow "
+            "acks or an ack leak; the broker still tracks delivery tags so "
+            "ack correctness is unaffected.",
+            _MAX_IN_FLIGHT,
+          )
+        except BaseException:
+          pass
 
   def _record_pending_delivery(self, queue_name: str) -> None:
     """Record one broker-unacked delivery while holding ``_delivery_lock``."""
