@@ -111,6 +111,20 @@ def test_ci_workflow_runs_for_pull_requests_before_merge() -> None:
   assert "push:" in workflow
 
 
+def test_ci_smoke_installs_and_imports_both_release_artifacts() -> None:
+  """R51: wheel and sdist must execute outside the source checkout."""
+  workflow = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+  ).read_text(encoding="utf-8")
+
+  assert 'for artifact in "${wheels[0]}" "${sdists[0]}"' in workflow
+  assert 'uv pip install --python "$venv/bin/python" "$artifact"' in workflow
+  assert '"$venv/bin/python" -I -c' in workflow
+  assert "uv build --clear" in workflow
+  smoke_block = workflow.split("- name: Smoke-test package artifacts", 1)[1]
+  assert "--no-deps" not in smoke_block.split("- name:", 1)[0]
+
+
 @pytest.mark.parametrize(
   "value",
   [

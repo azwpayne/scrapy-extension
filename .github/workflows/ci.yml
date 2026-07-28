@@ -55,7 +55,7 @@ jobs:
           tests/test_memory_filter.py::TestMemoryMembershipFilter::test_add_new_returns_true -q
       - name: Build package artifacts
         if: matrix.python-version == '3.10'
-        run: uv build --python ${{ matrix.python-version }}
+        run: uv build --clear --python ${{ matrix.python-version }}
       - name: Smoke-test package artifacts
         if: matrix.python-version == '3.10'
         shell: bash
@@ -65,9 +65,12 @@ jobs:
           sdists=(dist/*.tar.gz)
           test "${#wheels[@]}" -eq 1
           test "${#sdists[@]}" -eq 1
-          uv venv --python ${{ matrix.python-version }} .venv-package-smoke
-          uv pip install --python .venv-package-smoke/bin/python --no-deps "${wheels[0]}"
-          .venv-package-smoke/bin/python -c "import importlib.util; from importlib.metadata import version; assert importlib.util.find_spec('scrapy_extension'); assert version('scrapy-extension')"
+          for artifact in "${wheels[0]}" "${sdists[0]}"; do
+            venv=".venv-package-smoke-$(basename "$artifact" | tr -cd '[:alnum:]')"
+            uv venv --python ${{ matrix.python-version }} "$venv"
+            uv pip install --python "$venv/bin/python" "$artifact"
+            "$venv/bin/python" -I -c "import pathlib, scrapy_extension; from importlib.metadata import version; assert str(pathlib.Path(scrapy_extension.__file__).resolve()).startswith(str(pathlib.Path('$venv').resolve())); assert version('scrapy-extension')"
+          done
       - name: Unit tests with coverage (integration deselected)
         if: matrix.python-version == '3.10'
         run: >
