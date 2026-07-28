@@ -1742,16 +1742,14 @@ class BackendScheduler:
               completed_reservation,
               commit_volatile_reservation,
             )
-            if self.stats:
-              self.stats.inc_value("scheduler/dupefilter_volatile_marker")
+            self._record_enqueue_stat("scheduler/dupefilter_volatile_marker")
           else:
             self._rollback_atomic_reservation(
               completed_reservation,
               rollback_reservation,
               preserve_primary=False,
             )
-            if self.stats:
-              self.stats.inc_value("scheduler/dupefilter_volatile_unmarked")
+            self._record_enqueue_stat("scheduler/dupefilter_volatile_unmarked")
         else:
           self._commit_atomic_reservation(
             completed_reservation,
@@ -1761,8 +1759,7 @@ class BackendScheduler:
         # process-control signal interrupts finalization, the outer handler can
         # still discard bookkeeping without touching an ambiguous marker.
         reservation_intent = None
-      if self.stats:
-        self.stats.inc_value("scheduler/enqueued")
+      self._record_enqueue_stat("scheduler/enqueued")
     except SerializationError:
       if reservation is not None and rollback_reservation is not None:
         self._rollback_atomic_reservation(
@@ -1781,9 +1778,11 @@ class BackendScheduler:
         )
       elif dedup_reserved:
         self._rollback_dupefilter_reservation(request)
-      logger.exception("Failed to serialize request for enqueue")
-      if self.stats:
-        self.stats.inc_value("scheduler/serialization_errors")
+      self._record_enqueue_diagnostic(
+        "exception",
+        "Failed to serialize request for enqueue",
+        stat="scheduler/serialization_errors",
+      )
       return False
     except (QueueError, BackendError):
       if phase == "dedup":
@@ -1798,15 +1797,19 @@ class BackendScheduler:
           )
         # Dedup-backend outage: degrade to enqueue (don't lose the URL),
         # attribute to the dedup-error stat.
-        logger.exception("Failed to consult dupefilter; defaulting to enqueue")
-        if self.stats:
-          self.stats.inc_value("scheduler/dupefilter_error")
+        self._record_enqueue_diagnostic(
+          "exception",
+          "Failed to consult dupefilter; defaulting to enqueue",
+          stat="scheduler/dupefilter_error",
+        )
         try:
           queue.push(request, priority=priority)
-          if self.stats:
-            self.stats.inc_value("scheduler/enqueued")
+          self._record_enqueue_stat("scheduler/enqueued")
         except (QueueError, SerializationError, BackendError):
-          logger.exception("Failed to enqueue request after dedup outage")
+          self._record_enqueue_diagnostic(
+            "exception",
+            "Failed to enqueue request after dedup outage",
+          )
           return False
         return True
       # phase == "push": a plain queue-push failure (not a dedup outage).
@@ -1827,9 +1830,11 @@ class BackendScheduler:
         )
       elif dedup_reserved:
         self._rollback_dupefilter_reservation(request)
-      logger.exception("Failed to enqueue request")
-      if self.stats:
-        self.stats.inc_value("scheduler/queue_error")
+      self._record_enqueue_diagnostic(
+        "exception",
+        "Failed to enqueue request",
+        stat="scheduler/queue_error",
+      )
       return False
     except BaseException:
       # Process-control interruption after receipt handoff but before a
@@ -1887,28 +1892,25 @@ class BackendScheduler:
       rollback(reservation)
     except Exception:  # noqa: BLE001 - preserve the triggering queue failure
       if preserve_primary:
-        try:
-          logger.exception("Failed to roll back atomic dupefilter reservation")
-          if self.stats:
-            self.stats.inc_value("scheduler/dupefilter_rollback_error")
-        except BaseException:
-          pass
+        self._record_enqueue_diagnostic(
+          "exception",
+          "Failed to roll back atomic dupefilter reservation",
+          stat="scheduler/dupefilter_rollback_error",
+        )
       else:
-        logger.exception("Failed to roll back atomic dupefilter reservation")
-        if self.stats:
-          self.stats.inc_value("scheduler/dupefilter_rollback_error")
+        self._record_enqueue_diagnostic(
+          "exception",
+          "Failed to roll back atomic dupefilter reservation",
+          stat="scheduler/dupefilter_rollback_error",
+        )
     except BaseException:
       if not preserve_primary:
         raise
-      try:
-        logger.exception("Failed to roll back atomic dupefilter reservation")
-      except BaseException:
-        pass
-      try:
-        if self.stats:
-          self.stats.inc_value("scheduler/dupefilter_rollback_error")
-      except BaseException:
-        pass
+      self._record_enqueue_diagnostic(
+        "exception",
+        "Failed to roll back atomic dupefilter reservation",
+        stat="scheduler/dupefilter_rollback_error",
+      )
 
   def _commit_atomic_reservation(
     self,
@@ -1924,12 +1926,11 @@ class BackendScheduler:
     try:
       commit(reservation)
     except Exception:  # noqa: BLE001 - queue durability is authoritative
-      try:
-        logger.exception("Failed to finalize atomic dupefilter reservation")
-      except BaseException:
-        pass
-      if self.stats:
-        self.stats.inc_value("scheduler/dupefilter_commit_error")
+      self._record_enqueue_diagnostic(
+        "exception",
+        "Failed to finalize atomic dupefilter reservation",
+        stat="scheduler/dupefilter_commit_error",
+      )
 
   def _rollback_dupefilter_reservation(
     self,
@@ -1947,40 +1948,60 @@ class BackendScheduler:
     """
     forget = getattr(self.dupefilter, "forget", None)
     if not callable(forget):
-      logger.warning(
+      self._record_enqueue_diagnostic(
+        "warning",
         "Dupefilter %s cannot roll back a fingerprint after queue push failure",
         type(self.dupefilter).__name__,
+        stat="scheduler/dupefilter_rollback_error",
       )
-      if self.stats:
-        self.stats.inc_value("scheduler/dupefilter_rollback_error")
       return
 
     try:
       forget(request)
     except Exception:  # noqa: BLE001 - preserve the triggering queue failure
       if preserve_primary:
-        try:
-          logger.exception("Failed to roll back dupefilter reservation")
-          if self.stats:
-            self.stats.inc_value("scheduler/dupefilter_rollback_error")
-        except BaseException:
-          pass
+        self._record_enqueue_diagnostic(
+          "exception",
+          "Failed to roll back dupefilter reservation",
+          stat="scheduler/dupefilter_rollback_error",
+        )
       else:
-        logger.exception("Failed to roll back dupefilter reservation")
-        if self.stats:
-          self.stats.inc_value("scheduler/dupefilter_rollback_error")
+        self._record_enqueue_diagnostic(
+          "exception",
+          "Failed to roll back dupefilter reservation",
+          stat="scheduler/dupefilter_rollback_error",
+        )
     except BaseException:  # compensation must not hide process-control primary
       if not preserve_primary:
         raise
-      try:
-        logger.exception("Failed to roll back dupefilter reservation")
-      except BaseException:
-        pass
-      try:
-        if self.stats:
-          self.stats.inc_value("scheduler/dupefilter_rollback_error")
-      except BaseException:
-        pass
+      self._record_enqueue_diagnostic(
+        "exception",
+        "Failed to roll back dupefilter reservation",
+        stat="scheduler/dupefilter_rollback_error",
+      )
+
+  def _record_enqueue_stat(self, key: str) -> None:
+    """Record advisory enqueue telemetry without changing the scheduling result."""
+    try:
+      if self.stats:
+        self.stats.inc_value(key)
+    except BaseException:
+      pass
+
+  def _record_enqueue_diagnostic(
+    self,
+    level: str,
+    message: str,
+    *args: object,
+    stat: str | None = None,
+  ) -> None:
+    """Emit failure diagnostics without replacing a settled enqueue outcome."""
+    try:
+      getattr(logger, level)(message, *args)
+    except BaseException:
+      pass
+    if stat is not None:
+      self._record_enqueue_stat(stat)
 
   def next_request(self) -> Request | None:
     """Get the next request from the queue.

@@ -419,6 +419,22 @@ class _CommitFailingExplicitAtomicDupeFilter(_ExplicitAtomicDupeFilter):
     raise QueueError("commit bookkeeping unavailable")
 
 
+class _RollbackFailingExplicitAtomicDupeFilter(_ExplicitAtomicDupeFilter):
+  def rollback_reservation(self, reservation: object) -> None:
+    del reservation
+    raise RuntimeError("rollback bookkeeping unavailable")
+
+
+class _InterruptingRollbackExplicitAtomicDupeFilter(_ExplicitAtomicDupeFilter):
+  def __init__(self, signal: BaseException) -> None:
+    super().__init__()
+    self._signal = signal
+
+  def rollback_reservation(self, reservation: object) -> None:
+    del reservation
+    raise self._signal
+
+
 class TestBackpressureDefaultOff:
   """Test 1: pause_at=None → current behavior pinned (pop is called)."""
 
@@ -1672,6 +1688,178 @@ class TestEnqueueDedupReservation:
     assert scheduler.enqueue_request(Request("https://example.com/custom")) is False
     assert counts.get("scheduler/dupefilter_rollback_error") == 1
     assert counts.get("scheduler/queue_error") == 1
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("stats unavailable"),
+    KeyboardInterrupt("stats interrupted"),
+    SystemExit("stats exited"),
+  ],
+)
+def test_enqueue_success_survives_enqueued_stat_failure(
+  diagnostic_error: BaseException,
+) -> None:
+  """R126: a committed push remains successful when its success stat faults."""
+  stats = MagicMock(name="Stats")
+  stats.inc_value.side_effect = diagnostic_error
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    stats=stats,
+    dupefilter=None,
+  )
+  queue = _durable_queue_mock()
+  scheduler._queue = queue
+
+  assert scheduler.enqueue_request(Request("https://example.com/stat-success")) is True
+  queue.push.assert_called_once()
+
+
+@pytest.mark.parametrize("diagnostic", ["logger", "stats"])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("diagnostic unavailable"),
+    KeyboardInterrupt("diagnostic interrupted"),
+    SystemExit("diagnostic exited"),
+  ],
+)
+def test_enqueue_serialization_failure_survives_diagnostic_fault(
+  mocker: Any,
+  diagnostic: str,
+  diagnostic_error: BaseException,
+) -> None:
+  """R126: serialization remains a normal False result after telemetry faults."""
+  stats = MagicMock(name="Stats")
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    stats=stats,
+    dupefilter=None,
+  )
+  queue = _durable_queue_mock()
+  queue.push.side_effect = SerializationError("cannot serialize")
+  scheduler._queue = queue
+  if diagnostic == "logger":
+    mocker.patch.object(scheduler_module.logger, "exception", side_effect=diagnostic_error)
+  else:
+    stats.inc_value.side_effect = diagnostic_error
+
+  assert scheduler.enqueue_request(Request("https://example.com/stat-serialization")) is False
+  queue.push.assert_called_once()
+
+
+@pytest.mark.parametrize("fallback_succeeds", [True, False])
+@pytest.mark.parametrize("diagnostic", ["logger", "stats"])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("diagnostic unavailable"),
+    KeyboardInterrupt("diagnostic interrupted"),
+    SystemExit("diagnostic exited"),
+  ],
+)
+def test_dedup_outage_fallback_preserves_result_through_diagnostic_fault(
+  mocker: Any,
+  fallback_succeeds: bool,
+  diagnostic: str,
+  diagnostic_error: BaseException,
+) -> None:
+  """R126: the dedup fallback result is authoritative over advisory telemetry."""
+  stats = MagicMock(name="Stats")
+  dupefilter = MagicMock(spec=["request_seen", "log"])
+  dupefilter.request_seen.side_effect = QueueError("dedup backend unavailable")
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    stats=stats,
+    dupefilter=dupefilter,
+  )
+  queue = _durable_queue_mock()
+  if not fallback_succeeds:
+    queue.push.side_effect = QueueError("queue unavailable")
+  scheduler._queue = queue
+  if diagnostic == "logger":
+    mocker.patch.object(scheduler_module.logger, "exception", side_effect=diagnostic_error)
+  else:
+    stats.inc_value.side_effect = diagnostic_error
+
+  assert (
+    scheduler.enqueue_request(Request("https://example.com/dedup-fallback"))
+    is fallback_succeeds
+  )
+  queue.push.assert_called_once()
+
+
+@pytest.mark.parametrize("rollback_kind", ["atomic", "forget"])
+@pytest.mark.parametrize("diagnostic", ["logger", "stats"])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("diagnostic unavailable"),
+    KeyboardInterrupt("diagnostic interrupted"),
+    SystemExit("diagnostic exited"),
+  ],
+)
+def test_enqueue_ordinary_rollback_failure_survives_diagnostic_fault(
+  mocker: Any,
+  rollback_kind: str,
+  diagnostic: str,
+  diagnostic_error: BaseException,
+) -> None:
+  """R126: ordinary rollback/forget failures retain the queue False result."""
+  stats = MagicMock(name="Stats")
+  if rollback_kind == "atomic":
+    dupefilter: object = _RollbackFailingExplicitAtomicDupeFilter()
+  else:
+    dupefilter = MagicMock(spec=["request_seen", "forget", "log"])
+    dupefilter.request_seen.return_value = False
+    dupefilter.forget.side_effect = RuntimeError("forget unavailable")
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    stats=stats,
+    dupefilter=dupefilter,
+  )
+  queue = _durable_queue_mock()
+  queue.push.side_effect = QueueError("queue unavailable")
+  scheduler._queue = queue
+  if diagnostic == "logger":
+    mocker.patch.object(scheduler_module.logger, "exception", side_effect=diagnostic_error)
+  else:
+    stats.inc_value.side_effect = diagnostic_error
+
+  assert scheduler.enqueue_request(Request("https://example.com/rollback")) is False
+  queue.push.assert_called_once()
+
+
+@pytest.mark.parametrize("rollback_kind", ["atomic", "forget"])
+@pytest.mark.parametrize(
+  "signal",
+  [KeyboardInterrupt("rollback interrupted"), SystemExit("rollback exited")],
+)
+def test_enqueue_rollback_process_control_still_propagates(
+  rollback_kind: str,
+  signal: BaseException,
+) -> None:
+  """R126: advisory isolation does not swallow direct rollback/forget signals."""
+  if rollback_kind == "atomic":
+    dupefilter: object = _InterruptingRollbackExplicitAtomicDupeFilter(signal)
+  else:
+    dupefilter = MagicMock(spec=["request_seen", "forget", "log"])
+    dupefilter.request_seen.return_value = False
+    dupefilter.forget.side_effect = signal
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(name="ConnectionManager"),
+    stats=MagicMock(name="Stats"),
+    dupefilter=dupefilter,
+  )
+  queue = _durable_queue_mock()
+  queue.push.side_effect = QueueError("queue unavailable")
+  scheduler._queue = queue
+
+  with pytest.raises(type(signal)) as raised:
+    scheduler.enqueue_request(Request("https://example.com/rollback-signal"))
+  assert raised.value is signal
+  queue.push.assert_called_once()
 
 
 if __name__ == "__main__":
