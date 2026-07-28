@@ -1009,7 +1009,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         {"key": key, "expireAt": document["expireAt"]}
       )
     except PyMongoError as e:
-      logger.warning("Failed to reap expired MongoDB storage key %r: %s", key, e)
+      # The expired snapshot is already logically absent and the caught
+      # ordinary delete failure is best-effort.  Keep diagnostics from changing
+      # that result; direct control exceptions from ``delete_one`` are not
+      # caught by this PyMongoError arm.
+      try:
+        logger.warning("Failed to reap expired MongoDB storage key %r: %s", key, e)
+      except BaseException:
+        pass
     return True
 
   def retrieve(self, key: str) -> bytes | None:

@@ -1655,6 +1655,62 @@ def _storage_backend(mocker):
   return backend, mock_collection
 
 
+class TestMongoDBExpiredReapDiagnostics:
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning handler failed"),
+      KeyboardInterrupt("warning handler interrupted"),
+      SystemExit("warning handler exited"),
+    ],
+  )
+  def test_expired_reap_failure_keeps_absent_result_when_warning_fails(
+    self, mocker, diagnostic_error
+  ):
+    """A caught cleanup failure's warning cannot override logical expiry."""
+    from pymongo.errors import PyMongoError
+
+    backend, collection = _storage_backend(mocker)
+    expired_at = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
+    collection.find_one.return_value = {
+      "key": "expired-key",
+      "data": b"stale",
+      "expireAt": expired_at,
+    }
+    collection.delete_one.side_effect = PyMongoError("cleanup unavailable")
+    warning = mocker.patch(
+      "scrapy_extension.backends.mongodb.logger.warning",
+      side_effect=diagnostic_error,
+    )
+
+    assert backend.retrieve("expired-key") is None
+
+    collection.delete_one.assert_called_once_with(
+      {"key": "expired-key", "expireAt": expired_at}
+    )
+    warning.assert_called_once()
+
+  @pytest.mark.parametrize(
+    "control_error",
+    [KeyboardInterrupt("delete interrupted"), SystemExit("delete exited")],
+  )
+  def test_expired_reap_preserves_direct_delete_control_error(self, mocker, control_error):
+    """Only the caught PyMongo failure is best-effort; SDK controls propagate."""
+    backend, collection = _storage_backend(mocker)
+    expired_at = datetime.now(tz=timezone.utc) - timedelta(seconds=60)
+    collection.find_one.return_value = {
+      "key": "expired-key",
+      "data": b"stale",
+      "expireAt": expired_at,
+    }
+    collection.delete_one.side_effect = control_error
+
+    with pytest.raises(type(control_error)) as exc_info:
+      backend.retrieve("expired-key")
+
+    assert exc_info.value is control_error
+
+
 class TestMongoDBStorageErrorContract:
   def test_retrieve_connection_error_raises_storage_error(self, mocker):
     from pymongo.errors import AutoReconnect, PyMongoError

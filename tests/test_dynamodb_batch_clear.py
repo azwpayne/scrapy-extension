@@ -169,6 +169,33 @@ def test_clear_retries_only_unprocessed_items_with_full_jitter(mocker) -> None:
   ]
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("debug failed"), KeyboardInterrupt(), SystemExit()],
+)
+def test_retry_debug_failure_cannot_interrupt_the_next_batch_attempt(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  backend, table, client, _resource = _connected(mocker)
+  request = _delete_request("retry")
+  table.scan.return_value = {"Items": [{"pk": "retry"}]}
+  client.batch_write_item.side_effect = [
+    {"UnprocessedItems": {_TABLE_NAME: [request]}},
+    {"UnprocessedItems": {}},
+  ]
+  mocker.patch.object(
+    dynamodb_module,
+    "compute_full_jitter_backoff",
+    return_value=0.0,
+  )
+  mocker.patch.object(dynamodb_module.time, "sleep")
+  mocker.patch.object(dynamodb_module.logger, "debug", side_effect=diagnostic_error)
+
+  backend.clear_storage()
+
+  assert client.batch_write_item.call_count == 2
+
+
 def test_clear_exhausts_unprocessed_items_with_typed_partial_failure(
   mocker, caplog,
 ) -> None:
@@ -208,6 +235,38 @@ def test_clear_exhausts_unprocessed_items_with_typed_partial_failure(
     mocker.call(0.07),
   ]
   assert "stuck" not in caplog.text
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("warning failed"), KeyboardInterrupt(), SystemExit()],
+)
+def test_final_retry_warning_cannot_mask_the_typed_partial_failure(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  backend, table, client, _resource = _connected(mocker)
+  request = _delete_request("stuck")
+  table.scan.return_value = {"Items": [{"pk": "stuck"}]}
+  client.batch_write_item.return_value = {
+    "UnprocessedItems": {_TABLE_NAME: [request]}
+  }
+  mocker.patch.object(
+    dynamodb_module,
+    "compute_full_jitter_backoff",
+    return_value=0.0,
+  )
+  mocker.patch.object(dynamodb_module.time, "sleep")
+  mocker.patch.object(
+    dynamodb_module.logger,
+    "warning",
+    side_effect=diagnostic_error,
+  )
+
+  with pytest.raises(StorageError, match="partially complete") as exc_info:
+    backend.clear_storage()
+
+  assert exc_info.value.operation == "clear_storage"
+  assert client.batch_write_item.call_count == _MAX_ATTEMPTS
 
 
 @pytest.mark.parametrize(

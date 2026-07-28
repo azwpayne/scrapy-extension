@@ -795,11 +795,17 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # The value is still logically absent, but an unconditional delete could
       # remove a fresh concurrent replacement. ES normally returns both fields;
       # fail open on physical cleanup if a proxy/client omitted either one.
-      logger.warning(
-        "Skipping unsafe reap of expired ES storage key %r: response omitted "
-        "_seq_no/_primary_term",
-        key,
-      )
+      # Expiry has already made this value logically absent.  The missing
+      # metadata only disables the physical best-effort cleanup, so a logging
+      # handler must not turn the determined absent result into a failure.
+      try:
+        logger.warning(
+          "Skipping unsafe reap of expired ES storage key %r: response omitted "
+          "_seq_no/_primary_term",
+          key,
+        )
+      except BaseException:
+        pass
       return True
     try:
       self.client.delete(
@@ -811,7 +817,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except (ConflictError, NotFoundError):
       pass
     except (ApiError, TransportError) as e:
-      logger.warning("Failed to reap expired ES storage key %r: %s", key, e)
+      # Only the already-caught ordinary cleanup error is best-effort.  A
+      # direct control exception from ``delete`` still propagates normally.
+      try:
+        logger.warning("Failed to reap expired ES storage key %r: %s", key, e)
+      except BaseException:
+        pass
     return True
 
   def retrieve(self, key: str) -> bytes | None:

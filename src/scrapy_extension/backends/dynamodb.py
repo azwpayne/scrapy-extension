@@ -496,11 +496,14 @@ class DynamoDBBackend(Backend, StorageBackend):
       if not pending:
         return
       if attempt == _DDB_BATCH_MAX_ATTEMPTS - 1:
-        logger.warning(
-          "DynamoDB clear exhausted %d attempts with %d request(s) still unprocessed",
-          _DDB_BATCH_MAX_ATTEMPTS,
-          len(pending),
-        )
+        try:
+          logger.warning(
+            "DynamoDB clear exhausted %d attempts with %d request(s) still unprocessed",
+            _DDB_BATCH_MAX_ATTEMPTS,
+            len(pending),
+          )
+        except BaseException:
+          pass
         raise StorageError(
           "DynamoDB clear is partially complete: "
           f"{len(pending)} delete request(s) remained unprocessed after "
@@ -509,11 +512,14 @@ class DynamoDBBackend(Backend, StorageBackend):
           key=None,
         )
       delay = compute_full_jitter_backoff(attempt, _DDB_BATCH_BACKOFF_BASE_SECONDS)
-      logger.debug(
-        "Retrying %d unprocessed DynamoDB clear request(s) after %.3fs",
-        len(pending),
-        delay,
-      )
+      try:
+        logger.debug(
+          "Retrying %d unprocessed DynamoDB clear request(s) after %.3fs",
+          len(pending),
+          delay,
+        )
+      except BaseException:
+        pass
       time.sleep(delay)
 
   def connect(self) -> None:

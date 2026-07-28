@@ -554,6 +554,83 @@ class TestStorage:
     b._client.delete.assert_not_called()
 
   @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning handler failed"),
+      KeyboardInterrupt("warning handler interrupted"),
+      SystemExit("warning handler exited"),
+    ],
+  )
+  def test_expired_reap_missing_version_keeps_absent_result_when_warning_fails(
+    self, mocker, diagnostic_error
+  ):
+    """A metadata-cleanup warning cannot revive an already expired value."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
+    warning = mocker.patch(
+      "scrapy_extension.backends.elasticsearch.logger.warning",
+      side_effect=diagnostic_error,
+    )
+
+    assert b.retrieve("k") is None
+
+    b._client.delete.assert_not_called()
+    warning.assert_called_once()
+
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning handler failed"),
+      KeyboardInterrupt("warning handler interrupted"),
+      SystemExit("warning handler exited"),
+    ],
+  )
+  def test_expired_reap_delete_failure_keeps_absent_result_when_warning_fails(
+    self, mocker, diagnostic_error
+  ):
+    """A caught reaping failure's warning cannot override logical expiry."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {
+      "_source": {"data": "ZGF0YQ==", "expireAt": past},
+      "_seq_no": 4,
+      "_primary_term": 2,
+    }
+    b._client.delete.side_effect = TransportError("cleanup unavailable")
+    warning = mocker.patch(
+      "scrapy_extension.backends.elasticsearch.logger.warning",
+      side_effect=diagnostic_error,
+    )
+
+    assert b.retrieve("k") is None
+
+    b._client.delete.assert_called_once_with(
+      index="scrapy_storage", id="k", if_seq_no=4, if_primary_term=2
+    )
+    warning.assert_called_once()
+
+  @pytest.mark.parametrize(
+    "control_error",
+    [KeyboardInterrupt("delete interrupted"), SystemExit("delete exited")],
+  )
+  def test_expired_reap_preserves_direct_delete_control_error(self, mocker, control_error):
+    """Only diagnostic controls are isolated; SDK controls remain observable."""
+    b = _mock_backend(mocker)
+    past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
+    b._client.get.return_value = {
+      "_source": {"data": "ZGF0YQ==", "expireAt": past},
+      "_seq_no": 4,
+      "_primary_term": 2,
+    }
+    b._client.delete.side_effect = control_error
+
+    with pytest.raises(type(control_error)) as exc_info:
+      b.retrieve("k")
+
+    assert exc_info.value is control_error
+
+  @pytest.mark.parametrize(
     "source",
     [
       {},
