@@ -36,12 +36,33 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 
 from scrapy_extension.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
+
+
+def _log_diagnostic(
+  log_call: Callable[..., object],
+  message: str,
+  *args: object,
+  **kwargs: object,
+) -> None:
+  """Emit a best-effort registry diagnostic without changing discovery flow.
+
+  Entry-point enumeration and ordinary plugin failures are explicitly
+  recoverable: bundled backends must remain usable even if an application's
+  logging handler raises a control-flow exception while reporting that skip.
+  This boundary is deliberately limited to logging.  A plugin's own
+  ``BaseException`` still propagates from discovery unchanged.
+  """
+  try:
+    log_call(message, *args, **kwargs)
+  except BaseException:
+    pass
 
 #: Entry-point group 3rd-party packages use to register a backend.
 _ENTRY_POINT_GROUP: Final[str] = "scrapy_extension.backends"
@@ -203,7 +224,8 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
       importlib.metadata.entry_points(group=_ENTRY_POINT_GROUP)
     )
   except Exception:  # noqa: BLE001 - registry discovery must never crash callers
-    logger.warning(
+    _log_diagnostic(
+      logger.warning,
       "Failed to enumerate entry-points for group %r; skipping 3rd-party "
       "backend discovery.",
       _ENTRY_POINT_GROUP,
@@ -218,7 +240,8 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
     try:
       descriptor = _load_plugin_descriptor(ep)
     except Exception as exc:  # noqa: BLE001 - graceful-skip: never propagate
-      logger.warning(
+      _log_diagnostic(
+        logger.warning,
         "Skipping 3rd-party backend entry-point %r (group %r): %s: %s; "
         "bundled backends remain available.",
         ep.name,
@@ -231,7 +254,8 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
     name = descriptor.backend_type
     source = getattr(ep, "value", "<unknown>")
     if name in conflicted_names:
-      logger.error(
+      _log_diagnostic(
+        logger.error,
         "Skipping additional 3rd-party backend entry-point %r from %r: "
         "the backend name is already conflicted.",
         name,
@@ -242,7 +266,8 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
       previous_source = discovered_sources.pop(name)
       discovered.pop(name)
       conflicted_names.add(name)
-      logger.error(
+      _log_diagnostic(
+        logger.error,
         "Skipping duplicate 3rd-party backend name %r: entry-points %r and "
         "%r both claim it; neither plugin is registered.",
         name,
@@ -363,7 +388,8 @@ def get_registry() -> dict[str, BackendDescriptor]:
         # Bundled-wins precedence: the bundled descriptor stays; the
         # 3rd-party shadow is dropped. Log so operators notice without making
         # registry availability depend on their Python warning filters.
-        logger.warning(
+        _log_diagnostic(
+          logger.warning,
           "3rd-party backend entry-point %r shadows bundled backend; "
           "bundled wins. Rename the plugin backend_type to avoid the conflict.",
           name,

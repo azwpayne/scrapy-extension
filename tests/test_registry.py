@@ -683,6 +683,11 @@ def _register_generic_exception() -> BackendDescriptor:
   raise RuntimeError("plugin blew up at registration")
 
 
+def _interrupting_plugin() -> BackendDescriptor:
+  """A real plugin control exception must retain its normal semantics."""
+  raise KeyboardInterrupt("plugin control interruption")
+
+
 class TestPluginDiscoveryErrors:
   """R14-G: broken 3rd-party plugins must LOG+SKIP, never crash discovery.
 
@@ -809,3 +814,165 @@ class TestPluginDiscoveryErrors:
 
     # Must not raise; returns empty (no 3rd-party plugins discoverable).
     assert _discover_entry_points() == {}
+
+
+class TestRegistryDiagnosticInterruptions:
+  """R101: registry skip diagnostics cannot make discovery unavailable."""
+
+  def test_enumeration_failure_diagnostic_interrupt_keeps_bundled_registry(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """A logger control exception cannot replace an ordinary enumeration error."""
+    import importlib.metadata as importlib_metadata
+
+    from scrapy_extension.backends import registry as registry_mod
+
+    def _enumeration_failure(group: str | None = None) -> Any:
+      raise OSError("corrupted dist-info")
+
+    def _diagnostic_interrupt(*args: object, **kwargs: object) -> None:
+      raise KeyboardInterrupt("logger interruption")
+
+    monkeypatch.setattr(importlib_metadata, "entry_points", _enumeration_failure)
+    monkeypatch.setattr(registry_mod.logger, "warning", _diagnostic_interrupt)
+    _reset_registry_cache()
+
+    registry = get_registry()
+
+    assert registry["redis"].backend_cls_path == (
+      "scrapy_extension.backends.redis.RedisBackend"
+    )
+
+  def test_broken_plugin_diagnostic_interrupt_keeps_peer_plugin(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """A broken-plugin warning cannot prevent later valid registrations."""
+    from scrapy_extension.backends import registry as registry_mod
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    def _diagnostic_interrupt(*args: object, **kwargs: object) -> None:
+      raise SystemExit("logger interruption")
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="broken",
+          value="tests.test_registry._broken_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="goodplugin",
+          value="tests.test_registry._register_good_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+      ],
+    )
+    monkeypatch.setattr(registry_mod.logger, "warning", _diagnostic_interrupt)
+    _reset_registry_cache()
+
+    registry = get_registry()
+
+    assert "redis" in registry
+    assert "broken" not in registry
+    assert "goodplugin" in registry
+
+  def test_duplicate_diagnostic_interrupt_keeps_other_plugins(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """A duplicate-name error cannot stop discovery of independent plugins."""
+    from scrapy_extension.backends import registry as registry_mod
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    def _diagnostic_interrupt(*args: object, **kwargs: object) -> None:
+      raise KeyboardInterrupt("logger interruption")
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="duplicate",
+          value="tests.test_registry._register_duplicate_first",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="duplicate",
+          value="tests.test_registry._register_duplicate_second",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="duplicate",
+          value="tests.test_registry._register_duplicate_first",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="goodplugin",
+          value="tests.test_registry._register_good_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+      ],
+    )
+    monkeypatch.setattr(registry_mod.logger, "error", _diagnostic_interrupt)
+    _reset_registry_cache()
+
+    registry = get_registry()
+
+    assert "redis" in registry
+    assert "duplicate" not in registry
+    assert "goodplugin" in registry
+
+  def test_bundled_wins_diagnostic_interrupt_keeps_registry_usable(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """A shadow warning cannot turn a published bundled descriptor into failure."""
+    from scrapy_extension.backends import registry as registry_mod
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    def _diagnostic_interrupt(*args: object, **kwargs: object) -> None:
+      raise SystemExit("logger interruption")
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="redis",
+          value="tests.test_registry._register_shadow_redis",
+          group=_ENTRY_POINT_GROUP,
+        ),
+        _FakeEntryPoint(
+          name="goodplugin",
+          value="tests.test_registry._register_good_plugin",
+          group=_ENTRY_POINT_GROUP,
+        ),
+      ],
+    )
+    monkeypatch.setattr(registry_mod.logger, "warning", _diagnostic_interrupt)
+    _reset_registry_cache()
+
+    registry = get_registry()
+
+    assert registry["redis"].backend_cls_path == (
+      "scrapy_extension.backends.redis.RedisBackend"
+    )
+    assert "goodplugin" in registry
+
+  def test_plugin_control_exception_still_propagates(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """Only diagnostics are insulated; plugin control flow remains observable."""
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="interrupting",
+          value="tests.test_registry._interrupting_plugin",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    with pytest.raises(KeyboardInterrupt, match="plugin control interruption"):
+      get_registry()
