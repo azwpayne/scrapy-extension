@@ -565,7 +565,14 @@ class RabbitMQBackend(Backend, QueueBackend):
         # so ``is_connected()`` stays truthful. Mirrors the R16-A kafka/rocketmq
         # connect() abort contract.
         if candidate is not None and self._connection is not candidate.connection:
-          self._close_handles(candidate.channel, candidate.connection)
+          # The candidate-construction/publish failure is the causal error.
+          # Cleanup remains best effort here only: _close_handles deliberately
+          # re-raises BaseException for direct retirement callers, but a close
+          # failure must not replace the original aborted-connect signal.
+          try:
+            self._close_handles(candidate.channel, candidate.connection)
+          except BaseException:
+            pass
         raise
       logger.debug("Connected to RabbitMQ in %s mode", snapshot.mode.value)
 

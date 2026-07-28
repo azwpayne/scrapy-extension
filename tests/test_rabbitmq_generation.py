@@ -170,6 +170,28 @@ def test_connect_closes_candidate_on_baseexception_in_publish_window(mocker) -> 
   assert backend.is_connected() is False
 
 
+def test_publish_window_cleanup_cannot_mask_primary_baseexception(mocker) -> None:
+  """Candidate cleanup attempts every handle without replacing connect's error."""
+  backend = _backend()
+  candidate_connection, candidate_channel = _handles("candidate")
+  candidate = _RabbitMQCandidate(
+    connection=candidate_connection,
+    channel=candidate_channel,
+    snapshot=backend._capture_connection_snapshot(),
+  )
+  primary = KeyboardInterrupt()
+  candidate_channel.close.side_effect = SystemExit
+  mocker.patch.object(backend, "_connect_standalone", return_value=candidate)
+  mocker.patch.object(backend, "_publish_handles_locked", side_effect=primary)
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    backend.connect()
+
+  assert raised.value is primary
+  candidate_channel.close.assert_called_once()
+  candidate_connection.close.assert_called_once()
+
+
 def test_publish_window_baseexception_after_publish_keeps_live_session(mocker) -> None:
   """R18-C: a Ctrl+C AFTER publish completes must not close the now-live candidate.
 
