@@ -96,3 +96,54 @@ def test_unset_ack_opt_out_defaults_to_false(mocker: MockerFixture) -> None:
 
   with pytest.raises(ConfigurationError):
     BackendScheduler._enforce_ack_concurrency_gate(settings, "sqs")
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logger unavailable"),
+    KeyboardInterrupt("logger interrupted"),
+    SystemExit("logger exited"),
+  ],
+)
+def test_ack_bypass_warning_interruption_preserves_valid_configuration(
+  mocker: MockerFixture,
+  diagnostic_error: BaseException,
+) -> None:
+  """A pure compatibility warning cannot abort scheduler construction."""
+  manager = mocker.Mock(name="ConnectionManager")
+  mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+  mocker.patch(
+    "scrapy_extension.schedule.scheduler.logger.warning",
+    side_effect=diagnostic_error,
+  )
+  settings = ScrapySettings(
+    {
+      "SCRAPY_BACKEND_TYPE": "kafka",
+      "SCRAPY_QUEUE_STRATEGY": "ring_buffer",
+    }
+  )
+
+  scheduler = BackendScheduler.from_settings(settings)
+
+  assert scheduler._queue_strategy is not None
+  manager.close.assert_not_called()
+  scheduler.close("test-finished")
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_ack_bypass_descriptor_control_interruption_still_propagates(
+  mocker: MockerFixture,
+  control_error: type[BaseException],
+) -> None:
+  """Only the logger is advisory; descriptor resolution remains direct control."""
+  mocker.patch(
+    "scrapy_extension.backends.connectors._load_object",
+    side_effect=control_error("descriptor interrupted"),
+  )
+  warning = mocker.patch("scrapy_extension.schedule.scheduler.logger.warning")
+
+  with pytest.raises(control_error, match="descriptor interrupted"):
+    BackendScheduler._warn_strategy_mq_ack_bypass(object(), "kafka")
+
+  warning.assert_not_called()

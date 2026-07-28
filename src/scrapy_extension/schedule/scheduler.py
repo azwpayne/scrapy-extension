@@ -1173,16 +1173,22 @@ class BackendScheduler:
     bt_name = (
       backend_type.value if isinstance(backend_type, BackendType) else backend_type
     )
-    logger.warning(
-      "Queue strategy %s paired with MQ backend %r (requires_ack=True) does "
-      "not override pop_with_ack. A backend-delegating strategy would lose "
-      "per-message ack correlation; a local strategy bypasses broker "
-      "durability. Use a backend-threading strategy "
-      "(passthrough/delay/throttle/priority/time_wheel/work_stealing), or "
-      "accept the local-storage tradeoff deliberately.",
-      type(queue_strategy).__name__,
-      bt_name,
-    )
+    # This is advisory after all descriptor and strategy controls have run.
+    # A custom logging handler must not make an otherwise valid configuration
+    # fail, including when it raises a process-control BaseException.
+    try:
+      logger.warning(
+        "Queue strategy %s paired with MQ backend %r (requires_ack=True) does "
+        "not override pop_with_ack. A backend-delegating strategy would lose "
+        "per-message ack correlation; a local strategy bypasses broker "
+        "durability. Use a backend-threading strategy "
+        "(passthrough/delay/throttle/priority/time_wheel/work_stealing), or "
+        "accept the local-storage tradeoff deliberately.",
+        type(queue_strategy).__name__,
+        bt_name,
+      )
+    except BaseException:
+      pass
 
   @classmethod
   def from_crawler(cls, crawler: Crawler) -> BackendScheduler:
@@ -1339,12 +1345,17 @@ class BackendScheduler:
       return
     crawler = getattr(spider, "crawler", None)
     if crawler is None:
-      logger.warning(
-        "spider has no 'crawler' attribute — ack/nack signals not wired. "
-        "Kafka/RabbitMQ messages will re-deliver on consumer restart "
-        "(at-least-once) but won't be acked in-session. "
-        "Ensure the spider is created via CrawlerProcess/CrawlerRunner."
-      )
+      # The no-crawler fallback is deliberately graceful. Its warning must
+      # remain observational so an interrupted logger cannot abort open().
+      try:
+        logger.warning(
+          "spider has no 'crawler' attribute — ack/nack signals not wired. "
+          "Kafka/RabbitMQ messages will re-deliver on consumer restart "
+          "(at-least-once) but won't be acked in-session. "
+          "Ensure the spider is created via CrawlerProcess/CrawlerRunner."
+        )
+      except BaseException:
+        pass
       return
     sig = crawler.signals
     signal_handlers = (
@@ -2060,12 +2071,18 @@ class BackendScheduler:
         if self.stats:
           self.stats.inc_value("scheduler/dequeued")
     except SerializationError:
-      logger.exception("Failed to deserialize queued request")
+      try:
+        logger.exception("Failed to deserialize queued request")
+      except BaseException:
+        pass
       if self.stats:
         self.stats.inc_value("scheduler/deserialization_errors")
       return None
     except (QueueError, BackendConnectionError, CircuitBreakerOpenError):
-      logger.exception("Failed to get next request")
+      try:
+        logger.exception("Failed to get next request")
+      except BaseException:
+        pass
       return None
     else:
       return request
@@ -2084,9 +2101,12 @@ class BackendScheduler:
       BackendConnectionError,
       CircuitBreakerOpenError,
     ):
-      logger.warning(
-        "Queue length lookup is unavailable; assuming pending requests exist"
-      )
+      try:
+        logger.warning(
+          "Queue length lookup is unavailable; assuming pending requests exist"
+        )
+      except BaseException:
+        pass
       return True
 
   def __len__(self) -> int:

@@ -687,6 +687,85 @@ def test_has_pending_requests_stays_conservative_during_transient_outage(
   assert scheduler.has_pending_requests() is True
 
 
+@pytest.mark.parametrize(
+  "queue_error, diagnostic_error",
+  [
+    (SerializationError("invalid queued payload"), RuntimeError("logger failed")),
+    (QueueError("queue unavailable"), KeyboardInterrupt("logger interrupted")),
+    (
+      BackendConnectionError("reconnect exhausted"),
+      SystemExit("logger terminated"),
+    ),
+  ],
+)
+def test_next_request_preserves_empty_poll_when_failure_logger_interrupts(
+  mocker: Any,
+  queue_error: Exception,
+  diagnostic_error: BaseException,
+) -> None:
+  """A failed diagnostic must not replace the documented empty-poll fallback."""
+  scheduler = BackendScheduler(connection_manager=MagicMock())
+  queue = _durable_queue_mock()
+  queue.pop.side_effect = queue_error
+  scheduler._queue = queue
+  mocker.patch(
+    "scrapy_extension.schedule.scheduler.logger.exception",
+    side_effect=diagnostic_error,
+  )
+
+  assert scheduler.next_request() is None
+  queue.pop.assert_called_once_with(timeout=0)
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_next_request_keeps_queue_process_control_observable(
+  mocker: Any,
+  control_error: type[BaseException],
+) -> None:
+  """Diagnostic isolation must not catch process control from ``queue.pop``."""
+  scheduler = BackendScheduler(connection_manager=MagicMock())
+  queue = _durable_queue_mock()
+  queue.pop.side_effect = control_error("queue interrupted")
+  scheduler._queue = queue
+  diagnostic = mocker.patch(
+    "scrapy_extension.schedule.scheduler.logger.exception",
+  )
+
+  with pytest.raises(control_error, match="queue interrupted"):
+    scheduler.next_request()
+
+  diagnostic.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  "transient_error, diagnostic_error",
+  [
+    (NotImplementedError("length unavailable"), RuntimeError("logger failed")),
+    (QueueError("queue unavailable"), KeyboardInterrupt("logger interrupted")),
+    (
+      BackendConnectionError("reconnect exhausted"),
+      SystemExit("logger terminated"),
+    ),
+  ],
+)
+def test_has_pending_requests_preserves_conservative_fallback_when_logger_interrupts(
+  mocker: Any,
+  transient_error: Exception,
+  diagnostic_error: BaseException,
+) -> None:
+  """A failed liveness warning must not let Scrapy incorrectly declare idle."""
+  scheduler = BackendScheduler(connection_manager=MagicMock())
+  queue = _durable_queue_mock()
+  queue.__len__.side_effect = transient_error
+  scheduler._queue = queue
+  mocker.patch(
+    "scrapy_extension.schedule.scheduler.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  assert scheduler.has_pending_requests() is True
+
+
 class TestBackpressureStatsNoneAndFallthrough:
   """G8-G10: close stat-None + armed-but-below-threshold branches.
 

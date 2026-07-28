@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from pytest_mock import MockerFixture
 from scrapy import Spider
 
 from scrapy_extension.exceptions import ConfigurationError
@@ -107,6 +108,77 @@ class _FakeSpider(Spider):
     # Bypass Scrapy's Spider.__init__ (needs crawler context). Set just what
     # the scheduler reads (spider.name + spider.crawler.stats for monitor).
     self.crawler = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logger unavailable"),
+    KeyboardInterrupt("logger interrupted"),
+    SystemExit("logger exited"),
+  ],
+)
+def test_missing_crawler_warning_interruption_preserves_open_scheduler(
+  mocker: MockerFixture, diagnostic_error: BaseException
+) -> None:
+  """A no-crawler advisory must not turn the supported fallback into failure."""
+  manager = mocker.Mock(name="ConnectionManager")
+  scheduler = BackendScheduler(connection_manager=manager, queue_key="test:queue")
+  mocker.patch(
+    "scrapy_extension.schedule.scheduler.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  assert scheduler.open(_FakeSpider()) is None
+
+  assert scheduler._queue is not None
+  assert scheduler._signals_connected is False
+  scheduler.close("test-finished")
+
+
+class _CrawlerLookupInterruptedSpider:
+  name = "crawler-control"
+
+  @property
+  def crawler(self) -> None:
+    raise KeyboardInterrupt("crawler lookup interrupted")
+
+
+def test_crawler_control_interruption_still_propagates(
+  mocker: MockerFixture,
+) -> None:
+  """Crawler lookup is control flow, not part of the advisory warning."""
+  scheduler = BackendScheduler(
+    connection_manager=mocker.Mock(name="ConnectionManager"),
+    queue_key="test:queue",
+  )
+  warning = mocker.patch("scrapy_extension.schedule.scheduler.logger.warning")
+
+  with pytest.raises(KeyboardInterrupt, match="crawler lookup interrupted"):
+    scheduler.open(_CrawlerLookupInterruptedSpider())
+
+  warning.assert_not_called()
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_signal_registration_control_interruption_still_propagates(
+  mocker: MockerFixture,
+  control_error: type[BaseException],
+) -> None:
+  """Signal registration is operational control, not advisory telemetry."""
+  manager = mocker.Mock(name="ConnectionManager")
+  scheduler = BackendScheduler(connection_manager=manager, queue_key="test:queue")
+  spider = _FakeSpider()
+  signal_manager = mocker.Mock(name="SignalManager")
+  signal_manager.connect.side_effect = control_error("signal interrupted")
+  spider.crawler = mocker.Mock(signals=signal_manager, stats=None)
+  warning = mocker.patch("scrapy_extension.schedule.scheduler.logger.warning")
+
+  with pytest.raises(control_error, match="signal interrupted"):
+    scheduler.open(spider)
+
+  signal_manager.connect.assert_called_once()
+  warning.assert_not_called()
 
 
 def _open_scheduler(scheduler: BackendScheduler) -> BackendQueue:
