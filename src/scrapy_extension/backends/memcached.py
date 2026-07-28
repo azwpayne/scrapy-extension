@@ -146,8 +146,7 @@ class MemcachedBackend(Backend, StorageBackend):
         candidate.stats()
       except Exception:
         if candidate is not None:
-          with _swallow():
-            candidate.close()
+          _close_failed_candidate(candidate)
         raise BackendConnectionError(
           "Failed to connect to Memcached.", backend_type="memcached"
         ) from None
@@ -161,8 +160,7 @@ class MemcachedBackend(Backend, StorageBackend):
         # is_connected() stays truthful — bounded to a single FD per occurrence.
         # Mirror the R16-A kafka/rocketmq/dynamodb connect() BaseException arms.
         if candidate is not None:
-          with _swallow():
-            candidate.close()
+          _close_failed_candidate(candidate)
         raise
       with self._operation_lock:
         with self._lifecycle_lock:
@@ -405,3 +403,16 @@ class _swallow:
       return False
     logger.debug("Suppressed memcached cleanup error: %s", exc)
     return True
+
+
+def _close_failed_candidate(candidate: Any) -> None:
+  """Best-effort cleanup for a private connect candidate.
+
+  The caller is already handling the causal probe exception.  Unlike
+  ``_swallow``, this must not run diagnostics that can replace that exception;
+  close-time control signals are therefore intentionally suppressed here.
+  """
+  try:
+    candidate.close()
+  except BaseException:
+    pass

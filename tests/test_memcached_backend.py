@@ -283,6 +283,22 @@ class TestMemcachedConnect:
     assert b.is_connected() is False
     client.close.assert_called_once()
 
+  def test_connect_stats_failure_preserves_backend_error_when_close_interrupts(
+    self, mocker
+  ) -> None:
+    backend = _make_backend()
+    client = mocker.MagicMock()
+    client.stats.side_effect = RuntimeError("stats probe failed")
+    client.close.side_effect = KeyboardInterrupt
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+
+    with pytest.raises(BackendConnectionError) as raised:
+      backend.connect()
+
+    assert raised.value.__cause__ is None
+    client.close.assert_called_once()
+    assert backend.is_connected() is False
+
   def test_connect_stats_baseexception_closes_candidate(self, mocker) -> None:
     """R17-C: a Ctrl+C during the stats() probe must close the candidate socket.
 
@@ -297,12 +313,31 @@ class TestMemcachedConnect:
     """
     b = _make_backend()
     client = mocker.MagicMock()
-    client.stats.side_effect = KeyboardInterrupt
+    primary = KeyboardInterrupt()
+    client.stats.side_effect = primary
     mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt) as raised:
       b.connect()
+    assert raised.value is primary
     assert b.is_connected() is False
     client.close.assert_called_once()
+
+  def test_connect_stats_control_signal_survives_close_control_signal(
+    self, mocker
+  ) -> None:
+    backend = _make_backend()
+    client = mocker.MagicMock()
+    primary = KeyboardInterrupt()
+    client.stats.side_effect = primary
+    client.close.side_effect = SystemExit
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      backend.connect()
+
+    assert raised.value is primary
+    client.close.assert_called_once()
+    assert backend.is_connected() is False
 
   def test_disconnect_closes_client(self, mocker) -> None:
     b, client = _connected(mocker)
