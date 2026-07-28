@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
@@ -97,6 +98,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self.config = config
     self._client: Elasticsearch | None = None
     self._connection_snapshot: _ElasticSearchConnectionSnapshot | None = None
+    # A client generation is published only after its health check and index
+    # setup complete.  Serializing connect/disconnect prevents a second caller
+    # from replacing (or closing) an in-flight candidate.
+    self._lifecycle_lock = threading.RLock()
 
   def _capture_connection_snapshot(self) -> _ElasticSearchConnectionSnapshot:
     """Copy and revalidate every value used by one client generation.
@@ -184,64 +189,79 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Raises:
         BackendConnectionError: If the connection cannot be established.
     """
-    snapshot = self._capture_connection_snapshot()
-    try:
-      kwargs = self._build_kwargs(snapshot)
-      if snapshot.mode == ElasticSearchMode.CLOUD:
-        if not snapshot.cloud_id:
-          msg = "Cloud mode requires 'cloud_id'"
-          raise BackendConnectionError(msg, backend_type="elasticsearch")
-        kwargs["cloud_id"] = snapshot.cloud_id
-      else:
-        kwargs["hosts"] = snapshot.hosts
-        kwargs["verify_certs"] = snapshot.verify_certs
-        if snapshot.ca_certs:
-          kwargs["ca_certs"] = snapshot.ca_certs
-      candidate = Elasticsearch(**kwargs)
-      # Publish before ping so every failure path, including an unsuccessful
-      # health check, is owned by ``_discard_client()`` and closes the client.
-      self._connection_snapshot = snapshot
-      self._client = candidate
-      if not self._client.ping():
-        raise BackendConnectionError(
-          "ElasticSearch health check returned false during connect",
-          backend_type="elasticsearch",
-        )
-      self._ensure_indices(snapshot)
-      logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
-    except BackendConnectionError:
-      self._discard_client()
-      raise
-    except (ApiError, TransportError) as e:
-      self._discard_client()
-      msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
-      raise BackendConnectionError(msg, backend_type="elasticsearch") from e
-    except Exception as e:
-      # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
-      # raised after self._client was assigned: discard the half-initialized
-      # client so is_connected() cannot lie True. Mirrors mongodb/kafka connect().
-      self._discard_client()
-      msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
-      raise BackendConnectionError(msg, backend_type="elasticsearch") from e
-    except BaseException:
-      # Ctrl-C / SystemExit during connect: still discard the client, then
-      # re-signal. Mirrors mongodb.connect() (BaseException arm).
-      self._discard_client()
-      raise
+    with self._lifecycle_lock:
+      # The live generation's snapshot is deliberately fixed until callers
+      # explicitly disconnect.  Repeated connects are therefore no-ops rather
+      # than a competing replacement generation.
+      if self._client is not None:
+        return
+
+      snapshot = self._capture_connection_snapshot()
+      candidate: Elasticsearch | None = None
+      try:
+        kwargs = self._build_kwargs(snapshot)
+        if snapshot.mode == ElasticSearchMode.CLOUD:
+          if not snapshot.cloud_id:
+            msg = "Cloud mode requires 'cloud_id'"
+            raise BackendConnectionError(msg, backend_type="elasticsearch")
+          kwargs["cloud_id"] = snapshot.cloud_id
+        else:
+          kwargs["hosts"] = snapshot.hosts
+          kwargs["verify_certs"] = snapshot.verify_certs
+          if snapshot.ca_certs:
+            kwargs["ca_certs"] = snapshot.ca_certs
+        candidate = Elasticsearch(**kwargs)
+        if not candidate.ping():
+          raise BackendConnectionError(
+            "ElasticSearch health check returned false during connect",
+            backend_type="elasticsearch",
+          )
+        self._ensure_indices(snapshot, client=candidate)
+        # Only a fully initialized candidate becomes observable to other
+        # callers.  A failed candidate is never allowed to disturb a live
+        # generation.
+        self._connection_snapshot = snapshot
+        self._client = candidate
+        logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
+      except BackendConnectionError:
+        self._discard_candidate(candidate)
+        raise
+      except (ApiError, TransportError) as e:
+        self._discard_candidate(candidate)
+        msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
+        raise BackendConnectionError(msg, backend_type="elasticsearch") from e
+      except Exception as e:
+        # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
+        # must close the private candidate without publishing a false live state.
+        self._discard_candidate(candidate)
+        msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
+        raise BackendConnectionError(msg, backend_type="elasticsearch") from e
+      except BaseException:
+        # Ctrl-C / SystemExit during connect: still close the candidate, then
+        # re-signal. Mirrors mongodb.connect() (BaseException arm).
+        self._discard_candidate(candidate)
+        raise
+
+  def _discard_candidate(self, candidate: Elasticsearch | None) -> None:
+    """Best-effort close for a client generation that was never published."""
+    if candidate is not None:
+      try:
+        candidate.close()
+      except Exception:
+        logger.debug("Failed to close ElasticSearch client", exc_info=True)
 
   def _discard_client(self) -> None:
     """Clear and best-effort close a failed or retired client."""
     client = self._client
     self._client = None
     self._connection_snapshot = None
-    if client is not None:
-      try:
-        client.close()
-      except Exception:
-        logger.debug("Failed to close ElasticSearch client", exc_info=True)
+    self._discard_candidate(client)
 
   def _ensure_indices(
-    self, snapshot: _ElasticSearchConnectionSnapshot | None = None
+    self,
+    snapshot: _ElasticSearchConnectionSnapshot | None = None,
+    *,
+    client: Elasticsearch | None = None,
   ) -> None:
     """Create the queue/set/storage indices if absent.
 
@@ -254,7 +274,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     (HTTP 400) when the index is already there, which is the idempotent
     success path; any other 400 (invalid name, mapping error) is re-raised.
     """
-    if self._client is None:
+    active_client = client if client is not None else self._client
+    if active_client is None:
       msg = "ElasticSearchBackend not connected: client is None"
       raise BackendConnectionError(msg, backend_type="elasticsearch")
     snapshot = snapshot or self._connection_snapshot or self._capture_connection_snapshot()
@@ -264,7 +285,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       snapshot.storage_index,
     ):
       try:
-        self._client.indices.create(index=name)
+        active_client.indices.create(index=name)
       except RequestError as e:
         # HTTP 400 resource_already_exists_exception = idempotent success
         # (index created by a prior connect or a peer worker). Anything else
@@ -274,7 +295,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def disconnect(self) -> None:
     """Close ElasticSearch connection."""
-    self._discard_client()
+    with self._lifecycle_lock:
+      self._discard_client()
 
   def is_connected(self) -> bool:
     """Check if ElasticSearch is connected.
