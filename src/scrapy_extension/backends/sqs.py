@@ -455,6 +455,7 @@ class SqsBackend(Backend, QueueBackend):
 
   def disconnect(self) -> None:
     """Detach, drain, and close the current SQS client generation."""
+    primary_error: BaseException | None = None
     with self._connect_lock:
       with self._generation_condition:
         generation = self._generation
@@ -466,7 +467,11 @@ class SqsBackend(Backend, QueueBackend):
         self._queue_lifecycles = {}
         self._queue_lifecycles_lock = threading.Lock()
         while generation is not None and generation.active_leases:
-          self._generation_condition.wait()
+          try:
+            self._generation_condition.wait()
+          except BaseException as error:
+            if primary_error is None:
+              primary_error = error
       with self._in_flight_lock:
         self._in_flight.clear()
         self._last_receipt = None
@@ -476,8 +481,14 @@ class SqsBackend(Backend, QueueBackend):
         generation.queue_urls.clear()
         generation.queue_resolution_locks.clear()
         generation.queue_lifecycles.clear()
-        with _swallow():
-          generation.client.close()
+        try:
+          with _swallow():
+            generation.client.close()
+        except BaseException as error:
+          if primary_error is None:
+            primary_error = error
+    if primary_error is not None:
+      raise primary_error
 
   @contextmanager
   def _lease_generation(

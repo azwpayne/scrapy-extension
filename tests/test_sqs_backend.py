@@ -337,6 +337,32 @@ class TestSqsConnect:
     client.close.assert_called_once()
     assert b.is_connected() is False
 
+  def test_disconnect_finishes_drain_after_baseexception(self, mocker) -> None:
+    b, client = _connected(mocker)
+    assert b._generation is not None
+    generation = b._generation
+    generation.active_leases = 1
+    first = KeyboardInterrupt()
+    waits = 0
+
+    def wait() -> None:
+      nonlocal waits
+      waits += 1
+      if waits == 1:
+        raise first
+      generation.active_leases = 0
+
+    mocker.patch.object(b._generation_condition, "wait", side_effect=wait)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.disconnect()
+
+    assert raised.value is first
+    assert waits == 2
+    client.close.assert_called_once_with()
+    assert b._generation is None
+    assert b._client is None
+
   def test_repeated_connect_is_idempotent_and_keeps_generation_cache(
     self, mocker
   ) -> None:
