@@ -111,7 +111,11 @@ class MemoryMembershipFilter(MembershipFilter):
           "Memory filter saturation monitor hook raised; ignored",
           exc_info=True,
         )
-      except Exception:  # noqa: BLE001 - diagnostics are best effort too
+      except BaseException:  # noqa: BLE001 - diagnostics are best effort too
+        # The monitor exception is the authored control boundary: only this
+        # fallback diagnostic is advisory.  A broken logging handler must not
+        # replace the already-successful insertion, including when it raises a
+        # process-control signal.
         return
 
   @property
@@ -138,15 +142,22 @@ class MemoryMembershipFilter(MembershipFilter):
     if _evicted_warned:
       return
     _evicted_warned = True
-    logger.warning(
-      "MemoryMembershipFilter reached its maxsize cap (%s) and is now "
-      "evicting least-recently-used fingerprints. Evicted entries are "
-      "forgotten, so their URLs may be re-crawled (dedup false-negative). "
-      "Raise maxsize, pass maxsize=None for unbounded growth (OOM risk), "
-      "or switch to the backend-backed 'set' strategy for exact cross-"
-      "process dedup.",
-      f"{self._maxsize:,}" if self._maxsize is not None else "None",
-    )
+    try:
+      logger.warning(
+        "MemoryMembershipFilter reached its maxsize cap (%s) and is now "
+        "evicting least-recently-used fingerprints. Evicted entries are "
+        "forgotten, so their URLs may be re-crawled (dedup false-negative). "
+        "Raise maxsize, pass maxsize=None for unbounded growth (OOM risk), "
+        "or switch to the backend-backed 'set' strategy for exact cross-"
+        "process dedup.",
+        f"{self._maxsize:,}" if self._maxsize is not None else "None",
+      )
+    except BaseException:
+      # LRU eviction is already linearized before this advisory warning. A
+      # custom handler may raise RuntimeError or a process-control signal, but
+      # it cannot make the incoming fingerprint disappear from the bounded
+      # filter.
+      pass
 
   def add(self, item: bytes) -> bool:
     """Record an item; True if new, False if already present.

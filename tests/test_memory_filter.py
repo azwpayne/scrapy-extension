@@ -104,6 +104,36 @@ class TestMemoryMembershipFilter:
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1  # warn-once, not per-eviction
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("warning unavailable"),
+      KeyboardInterrupt(),
+      SystemExit(),
+    ],
+  )
+  def test_eviction_warning_failure_preserves_replacement(
+    self,
+    diagnostic_error: BaseException,
+    monkeypatch: pytest.MonkeyPatch,
+  ) -> None:
+    """A warning handler cannot undo an already-linearized LRU replacement."""
+    import scrapy_extension.dupefilter.filters.memory_filter as mod
+
+    def raise_diagnostic(*args: object, **kwargs: object) -> None:
+      del args, kwargs
+      raise diagnostic_error
+
+    monkeypatch.setattr(mod, "_evicted_warned", False)
+    monkeypatch.setattr(mod.logger, "warning", raise_diagnostic)
+    flt = MemoryMembershipFilter(maxsize=1)
+    assert flt.add(b"old") is True
+
+    assert flt.add(b"replacement") is True
+    assert len(flt) == 1
+    assert b"old" not in flt
+    assert b"replacement" in flt
+
   def test_maxsize_evicts_oldest(self) -> None:
     """Inserting past maxsize evicts the least-recently-used item."""
     flt = MemoryMembershipFilter(maxsize=3)

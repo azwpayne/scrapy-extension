@@ -313,7 +313,11 @@ class BackendDupeFilter:
       except Exception:  # noqa: BLE001 - telemetry must not alter dedup state
         try:
           logger.debug("Dupefilter monitor hook raised; ignored", exc_info=True)
-        except Exception:  # noqa: BLE001 - diagnostics are best effort too
+        except BaseException:
+          # The duplicate-filter decision and any reservation were already
+          # linearized before monitor delivery. A broken logging handler must
+          # not turn an advisory monitor failure into a false request failure
+          # (including process-control exceptions raised *by the handler*).
           _diagnostic_failed = True
     except BaseException as exc:
       primary = exc
@@ -433,7 +437,10 @@ class BackendDupeFilter:
         "up. Duplicate-filter decisions are unaffected.",
         self._monitor_event_limit,
       )
-    except Exception:  # noqa: BLE001 - diagnostics cannot reject a decision
+    except BaseException:
+      # This warning is emitted after the queue decision has been linearized.
+      # Logging handlers are outside the dedup control plane, including when
+      # they raise KeyboardInterrupt/SystemExit themselves.
       return
 
   @classmethod
@@ -1202,11 +1209,16 @@ class BackendDupeFilter:
       should_warn_overflow,
     )
     if should_warn_marker_overflow:
-      logger.warning(
-        "Volatile queue dedup shadow reached the %d-entry bound; evicting "
-        "the oldest marker may admit safe at-least-once replay",
-        self._volatile_fingerprint_limit,
-      )
+      try:
+        logger.warning(
+          "Volatile queue dedup shadow reached the %d-entry bound; evicting "
+          "the oldest marker may admit safe at-least-once replay",
+          self._volatile_fingerprint_limit,
+        )
+      except BaseException:
+        # The new marker was already published and the bounded eviction has
+        # already happened. Keep that committed outcome observable to callers.
+        pass
 
   def rollback_reservation(self, reservation: object) -> None:
     """Discard one uncommitted intent; no membership mutation has occurred."""
@@ -1337,11 +1349,16 @@ class BackendDupeFilter:
           warn_overflow = True
       self._retry_allowances[fingerprint] = None
     if warn_overflow:
-      logger.warning(
-        "Dedup retry allowances reached the %d-entry bound; evicting the "
-        "oldest failed-push allowance",
-        self._retry_allowance_limit,
-      )
+      try:
+        logger.warning(
+          "Dedup retry allowances reached the %d-entry bound; evicting the "
+          "oldest failed-push allowance",
+          self._retry_allowance_limit,
+        )
+      except BaseException:
+        # Allowance insertion/eviction is the linearized recovery outcome;
+        # its warning must remain advisory.
+        pass
 
   def _consume_retry_allowance(self, fingerprint: bytes) -> bool:
     """Atomically consume at most one allowance for ``fingerprint``."""
@@ -1380,14 +1397,18 @@ class BackendDupeFilter:
     global _filter_full_warned
     if not _filter_full_warned:
       _filter_full_warned = True
-      logger.warning(
-        "Dedup membership filter is full (filter_full); degrading — overflow "
-        "requests will be treated as not-seen and may re-fetch. Increase the "
-        "filter capacity or switch to an exact dedup strategy "
-        "(SCRAPY_DEDUP_STRATEGY=set). This filter_full warning fires once per "
-        "process; subsequent overflows are counted via the "
-        "dupefilter/filter_full stat only."
-      )
+      try:
+        logger.warning(
+          "Dedup membership filter is full (filter_full); degrading — overflow "
+          "requests will be treated as not-seen and may re-fetch. Increase the "
+          "filter capacity or switch to an exact dedup strategy "
+          "(SCRAPY_DEDUP_STRATEGY=set). This filter_full warning fires once per "
+          "process; subsequent overflows are counted via the "
+          "dupefilter/filter_full stat only."
+        )
+      except BaseException:
+        # The caller must still receive the deliberately degraded miss.
+        pass
     # Count the degradation via the monitor contract — ScrapyStatsMonitor
     # increments ``dupefilter/filter_full``; NullMonitor is a no-op. Replaces
     # an earlier reach into ``self._monitor._stats`` (private attribute).
@@ -1423,13 +1444,18 @@ class BackendDupeFilter:
     global _backend_error_warned
     if not _backend_error_warned:
       _backend_error_warned = True
-      logger.warning(
-        "Dedup backend transiently unavailable (%s); degrading — requests "
-        "will be treated as not-seen and may re-fetch until the backend "
-        "recovers. This warning fires once per process; subsequent "
-        "transient backend errors are counted via the errors/dedup stat only.",
-        type(exc).__name__,
-      )
+      try:
+        logger.warning(
+          "Dedup backend transiently unavailable (%s); degrading — requests "
+          "will be treated as not-seen and may re-fetch until the backend "
+          "recovers. This warning fires once per process; subsequent "
+          "transient backend errors are counted via the errors/dedup stat only.",
+          type(exc).__name__,
+        )
+      except BaseException:
+        # The transient backend contract is a graceful miss, regardless of
+        # whether a logging handler can report it.
+        pass
     monitor_events.append(("on_error", ("dedup", exc)))
     if include_miss:
       monitor_events.append(("on_dedup_miss", (fingerprint,)))

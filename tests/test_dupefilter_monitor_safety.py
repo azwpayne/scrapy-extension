@@ -423,13 +423,23 @@ def test_standalone_memory_monitor_failure_does_not_reject_insert() -> None:
   assert b"new" in membership
 
 
-def test_dupefilter_diagnostic_failure_does_not_reject_reservation(
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging unavailable"),
+    KeyboardInterrupt(),
+    SystemExit(),
+  ],
+)
+def test_monitor_diagnostic_failure_does_not_reject_reservation(
   mock_connection_manager: Any,
   mocker: MockerFixture,
+  diagnostic_error: BaseException,
 ) -> None:
+  """A logger failure after a normal monitor failure remains advisory."""
   mocker.patch(
     "scrapy_extension.dupefilter.dupefilter.logger.debug",
-    side_effect=RuntimeError("logging unavailable"),
+    side_effect=diagnostic_error,
   )
   dupefilter = BackendDupeFilter(
     connection_manager=mock_connection_manager,
@@ -442,12 +452,165 @@ def test_dupefilter_diagnostic_failure_does_not_reject_reservation(
   assert dupefilter.consume_reservation(request) is True
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging unavailable"),
+    KeyboardInterrupt(),
+    SystemExit(),
+  ],
+)
+@pytest.mark.parametrize("degraded_path", ["filter_full", "backend_error"])
+def test_graceful_miss_warning_failure_preserves_degraded_decision(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+  diagnostic_error: BaseException,
+  degraded_path: str,
+) -> None:
+  """Warn-once reporting cannot replace either intentional graceful miss."""
+  from scrapy_extension.dupefilter import dupefilter as dupefilter_module
+
+  membership = mocker.MagicMock(spec=MembershipFilter)
+  if degraded_path == "filter_full":
+    mocker.patch.object(dupefilter_module, "_filter_full_warned", False)
+    membership.add.side_effect = FilterFull("capacity exhausted")
+  else:
+    mocker.patch.object(dupefilter_module, "_backend_error_warned", False)
+    membership.add.side_effect = BackendConnectionError(
+      "backend unavailable", backend_type="redis"
+    )
+  mocker.patch(
+    "scrapy_extension.dupefilter.dupefilter.logger.warning",
+    side_effect=diagnostic_error,
+  )
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=membership,
+  )
+  request = Request(f"https://example.test/graceful-miss/{degraded_path}")
+
+  assert dupefilter.request_seen(request) is False
+  assert dupefilter.consume_reservation(request) is False
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging unavailable"),
+    KeyboardInterrupt(),
+    SystemExit(),
+  ],
+)
+def test_volatile_marker_overflow_warning_preserves_published_marker(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+  diagnostic_error: BaseException,
+) -> None:
+  """A post-publication volatile-shadow warning cannot undo the new marker."""
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=MemoryMembershipFilter(maxsize=None),
+  )
+  dupefilter._volatile_fingerprint_limit = 1
+  first_request = Request("https://example.test/volatile-warning/first")
+  second_request = Request("https://example.test/volatile-warning/second")
+  first = dupefilter.request_seen_with_reservation(first_request)
+  assert first.reservation is not None
+  dupefilter.commit_volatile_reservation(first.reservation)
+  mocker.patch(
+    "scrapy_extension.dupefilter.dupefilter.logger.warning",
+    side_effect=diagnostic_error,
+  )
+  second = dupefilter.request_seen_with_reservation(second_request)
+  assert second.reservation is not None
+
+  dupefilter.commit_volatile_reservation(second.reservation)
+
+  assert len(dupefilter._volatile_fingerprints) == 1
+  assert dupefilter.request_seen_with_reservation(second_request.replace()).seen
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging unavailable"),
+    KeyboardInterrupt(),
+    SystemExit(),
+  ],
+)
+def test_retry_allowance_overflow_warning_preserves_new_allowance(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+  diagnostic_error: BaseException,
+) -> None:
+  """Recovery allowance replacement is committed before its warning runs."""
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=BloomMembershipFilter(capacity=1_000, error_rate=0.01),
+  )
+  dupefilter._retry_allowance_limit = 1
+  first_request = Request("https://example.test/retry-warning/first")
+  second_request = Request("https://example.test/retry-warning/second")
+  assert dupefilter.request_seen(first_request) is False
+  dupefilter.forget(first_request)
+  mocker.patch(
+    "scrapy_extension.dupefilter.dupefilter.logger.warning",
+    side_effect=diagnostic_error,
+  )
+  assert dupefilter.request_seen(second_request) is False
+
+  dupefilter.forget(second_request)
+
+  assert len(dupefilter._retry_allowances) == 1
+  assert dupefilter.request_seen(second_request) is False
+  assert dupefilter.request_seen(second_request) is True
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging unavailable"),
+    KeyboardInterrupt(),
+    SystemExit(),
+  ],
+)
+def test_monitor_backlog_warning_preserves_reservation(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+  diagnostic_error: BaseException,
+) -> None:
+  """Backlog-drop reporting is outside the already-linearized miss result."""
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=MemoryMembershipFilter(maxsize=None),
+  )
+  dupefilter._monitor_event_limit = 0
+  mocker.patch(
+    "scrapy_extension.dupefilter.dupefilter.logger.warning",
+    side_effect=diagnostic_error,
+  )
+  request = Request("https://example.test/monitor-backlog-warning")
+
+  assert dupefilter.request_seen(request) is False
+  assert dupefilter.consume_reservation(request) is True
+  assert dupefilter._monitor_overflow_warned is True
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("logging unavailable"),
+    KeyboardInterrupt(),
+    SystemExit(),
+  ],
+)
 def test_standalone_memory_diagnostic_failure_does_not_reject_insert(
   mocker: MockerFixture,
+  diagnostic_error: BaseException,
 ) -> None:
   mocker.patch(
     "scrapy_extension.dupefilter.filters.memory_filter.logger.debug",
-    side_effect=RuntimeError("logging unavailable"),
+    side_effect=diagnostic_error,
   )
   membership = MemoryMembershipFilter(maxsize=1)
   membership.set_monitor(_SelectiveRaisingMonitor("on_filter_saturation"))
