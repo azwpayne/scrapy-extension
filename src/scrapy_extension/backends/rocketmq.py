@@ -257,8 +257,6 @@ class RocketMQBackend(Backend, QueueBackend):
         raise BackendConnectionError(msg, backend_type="rocketmq")
       self._consumer.startup()
       self._consumer_generation += 1
-
-      logger.debug("Connected to RocketMQ proxy at %s", namesrv_address)
     except BackendConnectionError:
       self._abort_partial_connect()
       raise
@@ -276,6 +274,15 @@ class RocketMQBackend(Backend, QueueBackend):
       # ``except BaseException`` arms.
       self._abort_partial_connect()
       raise
+
+    # A complete producer/consumer pair is live once the generation advances.
+    # Diagnostics after that publication are strictly observational: an
+    # extension logger is allowed to fail (including with a control exception)
+    # without treating the published clients as an aborted private candidate.
+    try:
+      logger.debug("Connected to RocketMQ proxy at %s", namesrv_address)
+    except BaseException:
+      pass
 
   def _abort_partial_connect(self) -> None:
     """Detach and best-effort stop clients created by a failed connect."""

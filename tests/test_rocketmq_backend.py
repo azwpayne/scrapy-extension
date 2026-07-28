@@ -206,6 +206,37 @@ def test_connect_standalone_mode(mocker) -> None:
   assert mock_config_cls.call_args.kwargs["endpoints"] == config.namesrv_address
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger extension failed"), KeyboardInterrupt(), SystemExit()],
+)
+def test_connect_post_publish_logger_failure_keeps_live_generation(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """Published clients survive ordinary and control diagnostic failures."""
+  backend = RocketMQBackend(RocketMQSettings())
+  mock_producer_cls, mock_consumer_cls, *_ = _patch_rocketmq(mocker)
+  producer = mock_producer_cls.return_value
+  consumer = mock_consumer_cls.return_value
+  debug_log = mocker.patch(
+    "scrapy_extension.backends.rocketmq.logger.debug",
+    side_effect=diagnostic_error,
+  )
+
+  backend.connect()
+
+  assert backend._producer is producer
+  assert backend._consumer is consumer
+  assert backend._consumer_generation == 1
+  producer.shutdown.assert_not_called()
+  consumer.shutdown.assert_not_called()
+
+  debug_log.side_effect = None
+  backend.disconnect()
+  producer.shutdown.assert_called_once_with()
+  consumer.shutdown.assert_called_once_with()
+
+
 def test_repeated_connect_keeps_the_existing_client_generation(mocker) -> None:
   """A complete live producer/consumer pair makes connect idempotent."""
   backend = RocketMQBackend(RocketMQSettings())
