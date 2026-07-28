@@ -388,6 +388,28 @@ class TestBackendPipelineCloseSpider:
 
     mock_connection_manager.close.assert_called_once_with()
 
+  def test_close_spider_releases_resources_when_close_log_interrupts(
+    self, mock_connection_manager, mocker
+  ):
+    """A logging handler interruption cannot skip terminal teardown."""
+    strategy = mocker.MagicMock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+    )
+    spider = mocker.Mock()
+    spider.name = "test_spider"
+    mocker.patch(
+      "scrapy_extension.pipeline.pipeline.logger.info",
+      side_effect=KeyboardInterrupt,
+    )
+
+    pipeline.close_spider(spider)
+
+    strategy.close.assert_called_once_with()
+    mock_connection_manager.close.assert_called_once_with()
+    assert pipeline._closed is True
+
   def test_close_spider_releases_connection_on_flush_failure(
     self, mock_connection_manager, mocker
   ):

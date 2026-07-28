@@ -422,7 +422,13 @@ class BackendPipeline:
       if self._closed:
         return
       spider = self._resolve_spider(spider)
-      logger.info("Pipeline closed for spider %s", spider.name)
+      try:
+        logger.info("Pipeline closed for spider %s", spider.name)
+      except BaseException:
+        # This is diagnostic-only and runs before _close_locked() establishes
+        # the resource-release invariant.  A logging handler must therefore
+        # not be able to skip strategy draining or manager teardown.
+        pass
       self._close_locked()
 
   def _close_locked(self) -> None:
