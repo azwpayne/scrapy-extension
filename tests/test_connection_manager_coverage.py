@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from types import TracebackType
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -560,6 +561,43 @@ def test_clear_registry_resets_each_configured_breaker(monkeypatch):
   monkeypatch.setattr(breaker, "reset", lambda: resets.append(1))
   ConnectionManager.clear_registry()
   assert len(resets) == 1, "clear_registry did not reset the configured breaker"
+
+
+def test_clear_registry_continues_after_backend_baseexceptions():
+  """A control exception from one victim cannot strand later managers."""
+  first = ConnectionManager.get_manager("redis", {"k": "first-interrupt"})
+  second = ConnectionManager.get_manager("redis", {"k": "second-interrupt"})
+  first_backend = MagicMock(name="first-backend")
+  second_backend = MagicMock(name="second-backend")
+  first_backend.disconnect.side_effect = KeyboardInterrupt()
+  second_backend.disconnect.side_effect = SystemExit(2)
+  first._backend = first_backend
+  second._backend = second_backend
+
+  ConnectionManager.clear_registry()
+
+  first_backend.disconnect.assert_called_once_with()
+  second_backend.disconnect.assert_called_once_with()
+  assert first._retired is True and first._backend is None
+  assert second._retired is True and second._backend is None
+  assert ConnectionManager._managers == {}
+
+
+def test_lru_eviction_survives_backend_baseexception(monkeypatch):
+  """A failed orphan teardown must not invalidate the new manager acquire."""
+  monkeypatch.setattr(ConnectionManager, "MAX_MANAGERS", 1)
+  victim = ConnectionManager.get_manager("redis", {"k": "evict-interrupt"})
+  backend = MagicMock(name="victim-backend")
+  backend.disconnect.side_effect = KeyboardInterrupt()
+  victim._backend = backend
+  with ConnectionManager._registry_lock:
+    victim._users = 0
+
+  replacement = ConnectionManager.get_manager("redis", {"k": "replacement"})
+
+  backend.disconnect.assert_called_once_with()
+  assert victim._retired is True and victim._backend is None
+  assert replacement in ConnectionManager._managers.values()
 
 
 def test_get_breaker_dcl_inner_recheck_under_lock(monkeypatch):

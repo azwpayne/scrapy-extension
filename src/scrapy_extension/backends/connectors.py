@@ -878,10 +878,15 @@ class ConnectionManager:
     """
     with manager._lock:
       manager._retired = True
-      if manager._backend is not None:
-        with contextlib.suppress(Exception):
-          manager._backend.disconnect()
-        manager._backend = None
+      backend = manager._backend
+      manager._backend = None
+    if backend is not None:
+      try:
+        backend.disconnect()
+      except BaseException:
+        # Forced registry teardown is best-effort: one broken victim must not
+        # strand later victims or invalidate a newly returned manager acquire.
+        pass
 
   @staticmethod
   def _registry_key(
