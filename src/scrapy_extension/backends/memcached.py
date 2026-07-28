@@ -409,7 +409,13 @@ class _swallow:
     # (the operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    logger.debug("Suppressed memcached cleanup error: %s", exc)
+    # Cleanup has already failed with a regular exception, so this diagnostic
+    # must not turn a best-effort disconnect (or stale private-candidate
+    # release) into a control-flow interruption when a logging handler fails.
+    try:
+      logger.debug("Suppressed memcached cleanup error: %s", exc)
+    except BaseException:
+      pass
     return True
 
 

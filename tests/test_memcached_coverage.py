@@ -59,6 +59,52 @@ class TestMemcachedErrorPaths:
     client.close.side_effect = RuntimeError("close failed")
     b.disconnect()  # _swallow catches; must not raise
 
+  def test_disconnect_ignores_diagnostic_interrupt_after_close_error(
+    self, mocker
+  ) -> None:
+    """R105: normal best-effort disconnect survives failed diagnostics."""
+    b, client = _connected(mocker)
+    client.close.side_effect = RuntimeError("close failed")
+    mocker.patch.object(memcached_mod.logger, "debug", side_effect=KeyboardInterrupt)
+
+    b.disconnect()
+
+    client.close.assert_called_once()
+    assert b.is_connected() is False
+
+  def test_disconnect_propagates_direct_close_control_exception(self, mocker) -> None:
+    """R105: an actual close control exception remains observable."""
+    b, client = _connected(mocker)
+    primary = KeyboardInterrupt()
+    client.close.side_effect = primary
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+      b.disconnect()
+
+    assert raised.value is primary
+    assert b.is_connected() is False
+
+  def test_stale_candidate_ignores_diagnostic_interrupt_after_close_error(
+    self, mocker
+  ) -> None:
+    """R105: stale private-candidate cleanup stays best effort."""
+    b = MemcachedBackend(MemcachedSettings())
+    client = mocker.MagicMock()
+    client.close.side_effect = RuntimeError("close failed")
+
+    def stale_probe() -> dict[str, str]:
+      b.disconnect()
+      return {}
+
+    client.stats.side_effect = stale_probe
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    mocker.patch.object(memcached_mod.logger, "debug", side_effect=KeyboardInterrupt)
+
+    b.connect()
+
+    client.close.assert_called_once()
+    assert b.is_connected() is False
+
   def test_swallow_does_not_suppress_base_exception(self) -> None:
     """R-swallow: _swallow must NOT suppress BaseException (Ctrl+C / SystemExit).
 
