@@ -313,6 +313,40 @@ def test_connect_mirrored_queues_warns_ha_policy_not_applied(mocker, caplog) -> 
   assert backend._channel is None  # candidate remains private until connect publishes
 
 
+def test_connect_mirrored_queues_closes_candidate_when_warning_is_interrupted(
+  mocker,
+) -> None:
+  """An interrupted HA-policy warning cannot leak its private candidate."""
+  mock_conn = MagicMock(name="connection")
+  mock_channel = MagicMock(name="channel")
+  mock_conn.channel.return_value = mock_channel
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=mock_conn,
+  )
+  mocker.patch.object(
+    RabbitMQBackend, "_build_common_parameters", return_value=MagicMock(name="params")
+  )
+  mocker.patch.object(RabbitMQBackend, "_apply_qos")
+  backend = _backend()
+  backend.config.ha_mode = "all"
+  primary = KeyboardInterrupt()
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.warning", side_effect=primary
+  )
+  mock_channel.close.side_effect = SystemExit("channel cleanup")
+  mock_conn.close.side_effect = GeneratorExit("connection cleanup")
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    backend._connect_mirrored_queues()
+
+  assert raised.value is primary
+  mock_channel.close.assert_called_once()
+  mock_conn.close.assert_called_once()
+  assert backend._channel is None
+  assert backend._connection is None
+
+
 def test_connect_mirrored_queues_no_warning_when_ha_mode_unset(mocker, caplog) -> None:
   """Early-return branch: when ``ha_mode`` is unset (default), the HA block
   is skipped cleanly after ``_connect_cluster`` — no warning emitted."""

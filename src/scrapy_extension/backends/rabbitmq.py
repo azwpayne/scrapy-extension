@@ -754,16 +754,27 @@ class RabbitMQBackend(Backend, QueueBackend):
       snapshot = self._capture_connection_snapshot()
     candidate = self._connect_cluster(snapshot)
     if snapshot.ha_mode:
-      logger.warning(
-        "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
-        "ha-sync-mode=%s) is configured but NOT applied via AMQP by this "
-        "client — set it out-of-band via `rabbitmqctl set_policy` or the "
-        "management API. Classic mirroring is deprecated in modern RabbitMQ; "
-        "consider quorum queues for HA.",
-        snapshot.ha_mode,
-        snapshot.ha_params,
-        snapshot.ha_sync_mode,
-      )
+      try:
+        logger.warning(
+          "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
+          "ha-sync-mode=%s) is configured but NOT applied via AMQP by this "
+          "client — set it out-of-band via `rabbitmqctl set_policy` or the "
+          "management API. Classic mirroring is deprecated in modern RabbitMQ; "
+          "consider quorum queues for HA.",
+          snapshot.ha_mode,
+          snapshot.ha_params,
+          snapshot.ha_sync_mode,
+        )
+      except BaseException:
+        # The cluster helper returns a private candidate.  A control signal in
+        # the advisory warning occurs before the caller can publish it, so it
+        # must be retired here.  Cleanup is deliberately best effort: do not
+        # replace the warning's causal signal with a close-time control error.
+        try:
+          self._close_handles(candidate.channel, candidate.connection)
+        except BaseException:
+          pass
+        raise
     return candidate
 
   def _setup_qos(self) -> None:
