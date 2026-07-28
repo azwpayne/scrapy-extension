@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel
 from scrapy.settings import Settings as ScrapySettings
 
 from scrapy_extension.backends import connectors
@@ -10,6 +11,21 @@ from scrapy_extension.backends.connectors import resolve_backend_config
 from scrapy_extension.backends.registry import BackendDescriptor
 
 pytestmark = pytest.mark.unit
+
+
+class _PluginRetrySettings(BaseModel):
+  """Plugin model whose public retry names must not be stolen by the manager."""
+
+  endpoint: str
+  retry_attempts: int
+  retry_delay: float
+
+
+class _PluginRetryBackend:
+  """Minimal module-level plugin backend used through descriptor resolution."""
+
+  def __init__(self, settings: _PluginRetrySettings) -> None:
+    self.settings = settings
 
 
 def _resolve_queue(settings: ScrapySettings) -> tuple[str, dict[str, object]]:
@@ -126,6 +142,46 @@ def test_plugin_backend_skips_bundled_flat_setting_extraction(
 
   assert backend_type == "third_party"
   assert backend_settings == {}
+
+
+def test_plugin_retry_fields_remain_backend_owned_and_manager_aliases_win(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Plugin retry fields survive adaptation; explicit aliases drive the manager."""
+  descriptor = BackendDescriptor(
+    backend_type="plugin_retry",
+    backend_cls_path="tests.test_backend_config_adapter._PluginRetryBackend",
+    settings_cls_path="tests.test_backend_config_adapter._PluginRetrySettings",
+    capabilities=frozenset({"queue"}),
+  )
+  monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+  settings = ScrapySettings(
+    {
+      "SCRAPY_BACKEND_TYPE": "plugin_retry",
+      "SCRAPY_BACKEND_SETTINGS": {
+        "endpoint": "plugin://broker",
+        "retry_attempts": 7,
+        "retry_delay": 9.5,
+        "manager_retry_attempts": 2,
+        "manager_retry_delay": 0.25,
+      },
+    }
+  )
+
+  backend_type, backend_settings = _resolve_queue(settings)
+
+  assert backend_type == "plugin_retry"
+  assert backend_settings["retry_attempts"] == 7
+  assert backend_settings["retry_delay"] == 9.5
+  manager = connectors.ConnectionManager(backend_type, backend_settings)
+  backend = manager._create_backend()
+  assert isinstance(backend, _PluginRetryBackend)
+  assert backend.settings.model_dump() == {
+    "endpoint": "plugin://broker",
+    "retry_attempts": 7,
+    "retry_delay": 9.5,
+  }
+  assert manager._retry_policy() == (2, 0.25)
 
 
 def test_non_pydantic_settings_class_safely_skips_flat_extraction(

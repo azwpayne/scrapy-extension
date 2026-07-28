@@ -297,11 +297,19 @@ def _adapt_backend_settings(
 ) -> dict[str, Any]:
   """Validate and merge flat/nested settings for a bundled backend model."""
   if backend_type not in _BUNDLED_BACKEND_TYPES:
+    # Plugins deliberately skip bundled flat-setting extraction and nested-key
+    # validation.  Their declared model fields still matter to the manager:
+    # a plugin may legitimately own ``retry_attempts`` or ``retry_delay``.
+    # Resolve the descriptor only for that collision information so those
+    # public values stay with the plugin while ``manager_retry_*`` continues
+    # to configure ConnectionManager independently.
+    descriptor = get_descriptor(backend_type)
+    settings_cls = _load_object(descriptor.settings_cls_path)
     return _merge_connection_manager_settings(
       settings,
       {},
       nested_settings,
-      frozenset(),
+      _model_field_names(settings_cls),
     )
 
   descriptor = get_descriptor(backend_type)
@@ -407,10 +415,14 @@ def _merge_connection_manager_settings(
       if public_name in backend_field_names:
         # This is a backend-specific field with a colliding name. Keep it for
         # the backend and ensure the outer manager uses its independent global
-        # value (or the documented default).
+        # value (or the documented default). A per-manager alias is the local
+        # override when no global Scrapy retry value was supplied.
         manager_settings.setdefault(
           internal_name,
-          _CONNECTION_MANAGER_DEFAULTS[public_name],
+          merged_nested_settings.get(
+            _CONNECTION_MANAGER_DIRECT_KEYS[public_name],
+            _CONNECTION_MANAGER_DEFAULTS[public_name],
+          ),
         )
       else:
         manager_settings[internal_name] = merged_nested_settings.pop(public_name)
