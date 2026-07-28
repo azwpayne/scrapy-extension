@@ -554,6 +554,25 @@ class TestPulsarPop:
     assert b.pop("queue1") is None
     assert b._last_msg is None
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [RuntimeError("logger extension failed"), KeyboardInterrupt(), SystemExit()],
+  )
+  def test_empty_timeout_logger_failure_preserves_empty_result(
+    self, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """R118: timeout diagnostics cannot turn an empty poll into a failure."""
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = pulsar.Timeout("timed out")
+    b, _ = _connected(mocker, subscribe=consumer)
+    mocker.patch(
+      "scrapy_extension.backends.pulsar.logger.debug",
+      side_effect=diagnostic_error,
+    )
+
+    assert b.pop("queue1") is None
+    assert b._last_msg is None
+
   def test_pop_wraps_non_timeout_receive_failure(self, mocker) -> None:
     consumer = mocker.MagicMock()
     failure = RuntimeError("broker disconnected")

@@ -1184,6 +1184,38 @@ class TestKafkaBackendEnsureTopicExists:
 class TestKafkaBackendPush:
   """Tests for push method."""
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("diagnostic failed"),
+      KeyboardInterrupt("diagnostic interrupted"),
+      SystemExit("diagnostic exited"),
+    ],
+  )
+  def test_first_push_survives_topic_ready_diagnostic_failure(
+    self, mocker, diagnostic_error
+  ):
+    """A committed topic cache makes the first push independent of logging."""
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    future = mocker.MagicMock()
+    producer.send.return_value = future
+    backend._producer = producer
+    admin = mocker.MagicMock()
+    admin.create_topics.return_value.topic_errors = [("scrapy-first", 0, None)]
+    backend._admin_client = admin
+    mocker.patch(
+      "scrapy_extension.backends.kafka.logger.debug", side_effect=diagnostic_error
+    )
+
+    backend.push("first", b"item")
+
+    assert "scrapy-first" in backend._known_topics
+    producer.send.assert_called_once_with(
+      "scrapy-first", value=b"item", partition=0
+    )
+    future.get.assert_called_once_with(timeout=10)
+
   def test_push_success(self, mocker):
     """Test successful push to queue."""
     config = KafkaSettings()

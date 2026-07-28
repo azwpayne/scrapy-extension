@@ -826,7 +826,14 @@ class PulsarBackend(Backend, QueueBackend):
       return (consumer.receive(timeout_millis=timeout_ms), consumer)
     except pulsar.Timeout as e:
       # No message within the timeout window is the normal "empty" case.
-      logger.debug("Pulsar receive returned no message for %s: %s", queue_name, e)
+      # A logging handler is optional diagnostics, so it must not turn a
+      # broker-confirmed empty poll into an operational failure.
+      try:
+        logger.debug(
+          "Pulsar receive returned no message for %s: %s", queue_name, e
+        )
+      except BaseException:
+        pass
       return (None, consumer)
     except Exception as e:
       # Broker disconnects, authorization failures, and invalid consumer state

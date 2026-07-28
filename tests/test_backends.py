@@ -432,6 +432,32 @@ class TestRedisBackend:
     result = backend.pop("test_queue")
     assert result is None
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logger handler failed"),
+      KeyboardInterrupt("logger handler interrupted"),
+      SystemExit("logger handler exited"),
+    ],
+  )
+  def test_queue_pop_orphan_recovery_ignores_diagnostic_failure(
+    self, redis_settings, mock_redis, mocker, diagnostic_error
+  ):
+    """A post-transaction diagnostic cannot turn stale-member recovery into a failure."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_script = mocker.MagicMock()
+    mock_script.return_value = [2, None]
+    mock_redis.register_script.return_value = mock_script
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    mocker.patch(
+      "scrapy_extension.backends.redis.logger.debug", side_effect=diagnostic_error
+    )
+    backend = RedisBackend(redis_settings)
+
+    assert backend.pop("test_queue") is None
+    mock_script.assert_called_once()
+
   def test_queue_pop_corruption_raises_queueerror(
     self, redis_settings, mock_redis, mocker
   ):
