@@ -20,7 +20,8 @@ Running
 Skipped by default. Point at a MongoDB you don't mind a few throwaway
 ``inttest:*`` logical keys landing in::
 
-    SCRAPY_TEST_MONGODB_URI=mongodb://localhost:27017 uv run pytest tests/integration -q
+    SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_MONGODB_URI=mongodb://localhost:27017 \
+      uv run pytest tests/integration -q --force-enable-socket
 
 Optional ``SCRAPY_TEST_MONGODB_DB`` overrides the database (default
 ``scrapy_extension``). Each test uses a UUID-prefixed logical-name namespace

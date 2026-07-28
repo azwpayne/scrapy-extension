@@ -195,9 +195,11 @@ def test_scrapy_integer_priorities_are_centered_and_monotonic():
   ]
 
 
-@pytest.mark.parametrize("priority", [True, False])
-def test_bool_priority_is_rejected_before_bucket_selection(priority):
-  """Direct strategy callers must not map bool to an integer priority bucket."""
+@pytest.mark.parametrize(
+  "priority", [True, False, "5", float("nan"), float("inf"), float("-inf")]
+)
+def test_invalid_priority_is_rejected_before_bucket_selection(priority):
+  """Direct strategy callers must not map invalid values to a priority bucket."""
   s, qb = _strategy(levels=3)
 
   with pytest.raises(ValueError, match="priority"):

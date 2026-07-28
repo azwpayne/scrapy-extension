@@ -716,7 +716,7 @@ exist; this is the canonical procedure until it lands):
    docs, and examples are present; confirm `.omc`, local `*.db`, ignored scratch
    plans, credentials, and editor state are absent. Render the wheel `METADATA`
    description and verify every non-anchor README link is an absolute web URL.
-7. **Verify gates:** `uv run ruff check`, `uv run pytest -m "not integration"`, and `uv run pytest --cov=scrapy_extension --cov-report=term-missing` (fails below 95%). For live backends, set the relevant `SCRAPY_TEST_*` variables and pass `--force-enable-socket`.
+7. **Verify gates:** `uv run ruff check`, `uv run pytest -m "not integration"`, and `uv run pytest --cov=scrapy_extension --cov-report=term-missing` (fails below 95%). For live backends, set `SCRAPY_TEST_INTEGRATION=1`, the relevant `SCRAPY_TEST_*` variables, and pass `--force-enable-socket`.
 8. **Verify install:** in a fresh venv, `pip install scrapy-extension==X.Y.Z` and
    import the package + one backend; confirm `__version__` matches.
 

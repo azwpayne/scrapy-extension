@@ -981,7 +981,7 @@ uv run pytest --cov=scrapy_extension --cov-report=term-missing
 uv run poe test
 ```
 
-Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage with `fail_under = 95`), pytest-ruff (lint), pytest-socket (unit tests run with sockets disabled by default), and more. Live integration tests require explicit backend env vars plus `--force-enable-socket`.
+Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage with `fail_under = 95`), pytest-ruff (lint), pytest-socket (unit tests run with sockets disabled by default), and more. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and `--force-enable-socket`.
 
 ## License
 

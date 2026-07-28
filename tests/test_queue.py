@@ -1179,7 +1179,16 @@ class TestBackendQueuePush:
 
   @pytest.mark.parametrize(
     "delay",
-    [True, False, "not-a-number", -1, float("nan"), float("inf"), float("-inf")],
+    [
+      True,
+      False,
+      "not-a-number",
+      -1,
+      10**400,
+      float("nan"),
+      float("inf"),
+      float("-inf"),
+    ],
   )
   def test_push_rejects_invalid_delay_without_mutating_meta(
     self, mock_connection_manager, mocker, delay
@@ -1205,11 +1214,13 @@ class TestBackendQueuePush:
     assert request.meta["source"] == "feed-a"
     strategy.push.assert_not_called()
 
-  @pytest.mark.parametrize("priority", [True, False])
-  def test_push_rejects_bool_priority_without_mutating_meta(
+  @pytest.mark.parametrize(
+    "priority", [True, False, "5", float("nan"), float("inf"), float("-inf")]
+  )
+  def test_push_rejects_invalid_priority_without_mutating_meta(
     self, mock_connection_manager, mocker, priority
   ):
-    """Bool is not a valid numeric priority despite ``bool`` subclassing ``int``."""
+    """Only finite, non-boolean numeric priorities may reach a strategy."""
     strategy = mocker.MagicMock()
     queue = BackendQueue(
       connection_manager=mock_connection_manager,
@@ -1224,6 +1235,35 @@ class TestBackendQueuePush:
     assert request.meta["delay"] == 5.0
     assert request.meta["source"] == "feed-a"
     strategy.push.assert_not_called()
+
+  @pytest.mark.parametrize(
+    ("meta", "match"),
+    [
+      ({"delay": True}, "delay"),
+      ({"delay": 10**400}, "delay"),
+      ({}, "priority"),
+    ],
+  )
+  def test_invalid_routing_value_terminates_replacement_delivery(
+    self, mock_connection_manager, meta, match
+  ):
+    """Deterministic routing poison must settle an inherited MQ delivery."""
+    request = Request(
+      "https://example.com",
+      meta={"_backend_ack_token": "old-token", **meta},
+    )
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+
+    with pytest.raises(QueueError, match=match):
+      queue.push(request, priority=True if match == "priority" else 0.0)
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
 
   def test_push_failure_preserves_routing_meta_for_retry(
     self, mock_connection_manager, mocker

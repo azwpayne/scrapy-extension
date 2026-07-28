@@ -29,8 +29,8 @@ Running
 Skipped by default. Point at a RabbitMQ you don't mind ``inttest:*`` queues
 landing in::
 
-    SCRAPY_TEST_RABBITMQ_URL=amqp://localhost:5672/ \
-      uv run pytest tests/integration -q
+    SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_RABBITMQ_URL=amqp://localhost:5672/ \
+      uv run pytest tests/integration -q --force-enable-socket
 
 Each test uses a UUID-prefixed queue name so concurrent runs and leftover
 queues don't interfere. The helper defaults to ``guest`` only for loopback;

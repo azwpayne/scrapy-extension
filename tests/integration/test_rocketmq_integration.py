@@ -38,7 +38,8 @@ with ``--enable-proxy``, which serves gRPC on 8081). The apache
 ``rocketmq-python-client`` 5.1.1 client speaks gRPC to the proxy, NOT the
 legacy remoting port (10911)::
 
-    SCRAPY_TEST_ROCKETMQ_NAMESRV=localhost:8081 uv run pytest tests/integration -q
+    SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_ROCKETMQ_NAMESRV=localhost:8081 \
+      uv run pytest tests/integration -q --force-enable-socket
 
 Each test uses a UUID-suffixed topic so concurrent runs and leftover data
 can't interfere. Consumer/producer groups are unique per module run.

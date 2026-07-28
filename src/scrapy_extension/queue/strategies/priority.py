@@ -108,7 +108,15 @@ class PriorityQueueStrategy(QueueStrategy):
         Level index in ``[0, levels-1]``.
     """
     center = self._levels // 2
-    if isinstance(priority, bool):
+    try:
+      valid_priority = (
+        not isinstance(priority, bool)
+        and isinstance(priority, (int, float))
+        and math.isfinite(priority)
+      )
+    except OverflowError:
+      valid_priority = False
+    if not valid_priority:
       raise ValueError(f"priority must be finite and non-boolean, got {priority!r}")
     if isinstance(priority, int):
       level = center - priority

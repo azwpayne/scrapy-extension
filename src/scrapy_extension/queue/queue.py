@@ -335,7 +335,7 @@ class BackendQueue:
       raise error
     try:
       delay = float(raw_delay or 0.0)
-    except (TypeError, ValueError) as e:
+    except (OverflowError, TypeError, ValueError) as e:
       error = QueueError(
         f"Invalid queue delay {raw_delay!r}: expected a finite number >= 0",
         queue_name=self.queue_name,
@@ -351,7 +351,15 @@ class BackendQueue:
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise error
-    if isinstance(priority, bool):
+    try:
+      valid_priority = (
+        not isinstance(priority, bool)
+        and isinstance(priority, (int, float))
+        and math.isfinite(priority)
+      )
+    except OverflowError:
+      valid_priority = False
+    if not valid_priority:
       error = QueueError(
         f"Invalid queue priority {priority!r}: expected a finite number",
         queue_name=self.queue_name,

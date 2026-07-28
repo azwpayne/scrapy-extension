@@ -23,10 +23,11 @@ Running
 Skipped by default. Set all three to run against live brokers you don't
 mind a few throwaway ``inttest:*`` keys landing in::
 
-    SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0
-    SCRAPY_TEST_MONGODB_URI=mongodb://localhost:27017
-    SCRAPY_TEST_ES_HOSTS=http://localhost:9200
-    uv run pytest tests/integration/test_multi_backend_e2e.py -q
+    SCRAPY_TEST_INTEGRATION=1 \
+    SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 \
+    SCRAPY_TEST_MONGODB_URI=mongodb://localhost:27017 \
+    SCRAPY_TEST_ES_HOSTS=http://localhost:9200 \
+      uv run pytest tests/integration/test_multi_backend_e2e.py -q --force-enable-socket
 
 Env var names mirror the per-backend integration suites
 (``test_redis_integration.py`` / ``test_mongodb_integration.py`` /
