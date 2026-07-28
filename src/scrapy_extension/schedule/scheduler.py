@@ -1447,8 +1447,7 @@ class BackendScheduler:
     try:
       queue.ack(token=token)
     except BackendError:
-      if self.stats:
-        self.stats.inc_value("scheduler/ack_error")
+      self._record_stat("scheduler/ack_error")
       # The BackendError is the settlement outcome: retain the token so the
       # broker can redeliver. A custom logging handler is only diagnostic and
       # must not replace that documented ``False`` result.
@@ -1477,8 +1476,7 @@ class BackendScheduler:
     try:
       queue.nack(token=token)
     except BackendError:
-      if self.stats:
-        self.stats.inc_value("scheduler/nack_error")
+      self._record_stat("scheduler/nack_error")
       # Keep the failed settlement observable as ``False`` even when a
       # diagnostic handler is interrupted. Exceptions from queue.nack itself
       # still follow the direct queue-control contract above.
@@ -1753,14 +1751,14 @@ class BackendScheduler:
               completed_reservation,
               commit_volatile_reservation,
             )
-            self._record_enqueue_stat("scheduler/dupefilter_volatile_marker")
+            self._record_stat("scheduler/dupefilter_volatile_marker")
           else:
             self._rollback_atomic_reservation(
               completed_reservation,
               rollback_reservation,
               preserve_primary=False,
             )
-            self._record_enqueue_stat("scheduler/dupefilter_volatile_unmarked")
+            self._record_stat("scheduler/dupefilter_volatile_unmarked")
         else:
           self._commit_atomic_reservation(
             completed_reservation,
@@ -1770,7 +1768,7 @@ class BackendScheduler:
         # process-control signal interrupts finalization, the outer handler can
         # still discard bookkeeping without touching an ambiguous marker.
         reservation_intent = None
-      self._record_enqueue_stat("scheduler/enqueued")
+      self._record_stat("scheduler/enqueued")
     except SerializationError:
       if reservation is not None and rollback_reservation is not None:
         self._rollback_atomic_reservation(
@@ -1815,7 +1813,7 @@ class BackendScheduler:
         )
         try:
           queue.push(request, priority=priority)
-          self._record_enqueue_stat("scheduler/enqueued")
+          self._record_stat("scheduler/enqueued")
         except (QueueError, SerializationError, BackendError):
           self._record_enqueue_diagnostic(
             "exception",
@@ -1991,8 +1989,15 @@ class BackendScheduler:
         stat="scheduler/dupefilter_rollback_error",
       )
 
-  def _record_enqueue_stat(self, key: str) -> None:
-    """Record advisory enqueue telemetry without changing the scheduling result."""
+  def _record_stat(self, key: str) -> None:
+    """Record advisory scheduler telemetry without changing the result.
+
+    Stats collection is intentionally not a scheduling or settlement control.
+    A collector may fail with an ordinary exception or a process-control
+    ``BaseException``; after a scheduler outcome is established, neither may
+    rewrite it. Direct queue and process-control calls stay outside this
+    helper and retain their normal propagation contract.
+    """
     try:
       if self.stats:
         self.stats.inc_value(key)
@@ -2012,7 +2017,7 @@ class BackendScheduler:
     except BaseException:
       pass
     if stat is not None:
-      self._record_enqueue_stat(stat)
+      self._record_stat(stat)
 
   def next_request(self) -> Request | None:
     """Get the next request from the queue.
@@ -2051,15 +2056,13 @@ class BackendScheduler:
           if not self._backpressure_paused and depth >= self._pause_at:
             self._backpressure_paused = True
             self._backpressure_probe_due = True
-            if self.stats:
-              self.stats.inc_value("scheduler/backpressure_pause")
+            self._record_stat("scheduler/backpressure_pause")
             return None
           if self._backpressure_paused:
             if depth <= resume_at:
               self._backpressure_paused = False
               self._backpressure_probe_due = False
-              if self.stats:
-                self.stats.inc_value("scheduler/backpressure_resume")
+              self._record_stat("scheduler/backpressure_resume")
             elif self._backpressure_probe_due:
               self._backpressure_probe_due = False
             else:
@@ -2068,15 +2071,13 @@ class BackendScheduler:
       request = queue.pop(timeout=0)
       if request:
         self._wrap_download_failure(request)
-        if self.stats:
-          self.stats.inc_value("scheduler/dequeued")
+        self._record_stat("scheduler/dequeued")
     except SerializationError:
       try:
         logger.exception("Failed to deserialize queued request")
       except BaseException:
         pass
-      if self.stats:
-        self.stats.inc_value("scheduler/deserialization_errors")
+      self._record_stat("scheduler/deserialization_errors")
       return None
     except (QueueError, BackendConnectionError, CircuitBreakerOpenError):
       try:

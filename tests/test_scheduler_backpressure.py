@@ -737,6 +737,94 @@ def test_next_request_keeps_queue_process_control_observable(
   diagnostic.assert_not_called()
 
 
+@pytest.mark.parametrize("operation", ["ack", "nack"])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("stats unavailable"),
+    KeyboardInterrupt("stats interrupted"),
+    SystemExit("stats exited"),
+  ],
+)
+def test_failed_settlement_survives_stats_failure(
+  operation: str,
+  diagnostic_error: BaseException,
+) -> None:
+  """R131: a failed ack/nack remains a False settlement after stats faults."""
+  stats = MagicMock(name="Stats")
+  stats.inc_value.side_effect = diagnostic_error
+  scheduler = BackendScheduler(connection_manager=MagicMock(), stats=stats)
+  queue = _durable_queue_mock()
+  getattr(queue, operation).side_effect = QueueError(f"{operation} unavailable")
+  scheduler._queue = queue
+
+  settle = getattr(scheduler, f"_{operation}_token")
+  assert settle("token", log_message=f"failed {operation}") is False
+  getattr(queue, operation).assert_called_once_with(token="token")
+
+
+@pytest.mark.parametrize("branch", ["pause", "resume", "dequeue"])
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("stats unavailable"),
+    KeyboardInterrupt("stats interrupted"),
+    SystemExit("stats exited"),
+  ],
+)
+def test_established_poll_outcome_survives_stats_failure(
+  branch: str,
+  diagnostic_error: BaseException,
+) -> None:
+  """R131: statistics cannot rewrite pause, resume, or dequeue decisions."""
+  stats = MagicMock(name="Stats")
+  stats.inc_value.side_effect = diagnostic_error
+  request = Request("https://example.com/telemetry")
+  scheduler = BackendScheduler(
+    connection_manager=MagicMock(),
+    stats=stats,
+    backpressure_pause_at=10 if branch != "dequeue" else None,
+    backpressure_resume_at=5 if branch != "dequeue" else None,
+  )
+  if branch == "pause":
+    queue = _LenControllableQueue(depth=10, pop_value=request)
+    expected = None
+  elif branch == "resume":
+    queue = _LenControllableQueue(depth=5, pop_value=request)
+    scheduler._backpressure_paused = True
+    expected = request
+  else:
+    queue = _LenControllableQueue(depth=0, pop_value=request)
+    expected = request
+  scheduler._queue = queue  # type: ignore[assignment]
+
+  assert scheduler.next_request() is expected
+  assert scheduler._backpressure_paused is (branch == "pause")
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("stats unavailable"),
+    KeyboardInterrupt("stats interrupted"),
+    SystemExit("stats exited"),
+  ],
+)
+def test_deserialization_fallback_survives_stats_failure(
+  diagnostic_error: BaseException,
+) -> None:
+  """R131: deserialization's documented empty poll outlives stats failure."""
+  stats = MagicMock(name="Stats")
+  stats.inc_value.side_effect = diagnostic_error
+  scheduler = BackendScheduler(connection_manager=MagicMock(), stats=stats)
+  queue = _durable_queue_mock()
+  queue.pop.side_effect = SerializationError("bad queued payload")
+  scheduler._queue = queue
+
+  assert scheduler.next_request() is None
+  queue.pop.assert_called_once_with(timeout=0)
+
+
 @pytest.mark.parametrize(
   "transient_error, diagnostic_error",
   [

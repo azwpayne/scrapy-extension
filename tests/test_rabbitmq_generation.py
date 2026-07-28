@@ -302,6 +302,40 @@ def test_plaintext_warning_failure_keeps_standalone_connect_live(
   candidate_channel.close.assert_not_called()
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("warning handler failed"),
+    KeyboardInterrupt("warning interrupted"),
+    SystemExit("warning exited"),
+  ],
+)
+def test_mirrored_ha_warning_failure_still_publishes_candidate(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """HA-policy advisory failure cannot prevent a valid candidate publishing."""
+  backend = RabbitMQBackend(
+    RabbitMQSettings(mode=RabbitMQMode.MIRRORED_QUEUES, ha_mode="all")
+  )
+  candidate_connection, candidate_channel = _handles("candidate")
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection",
+    return_value=candidate_connection,
+  )
+  mocker.patch(
+    "scrapy_extension.backends.rabbitmq.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  backend.connect()
+
+  assert backend._connection is candidate_connection
+  assert backend._channel is candidate_channel
+  assert backend.is_connected() is True
+  candidate_connection.close.assert_not_called()
+  candidate_channel.close.assert_not_called()
+
+
 @pytest.mark.parametrize("has_extra_nodes", [False, True])
 @pytest.mark.parametrize(
   "diagnostic_error",

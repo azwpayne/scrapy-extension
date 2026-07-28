@@ -233,8 +233,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           try:
             logger.debug("Failed to close MongoDB client", exc_info=True)
           except BaseException:
-            if not suppress_process_control:
-              raise
+            # A close failure is already best-effort here.  Its diagnostic
+            # must not turn ordinary disconnect into a process-control
+            # failure; direct control exceptions from ``client.close`` are
+            # handled by the separate arm below.
+            pass
         except BaseException:
           if not suppress_process_control:
             raise

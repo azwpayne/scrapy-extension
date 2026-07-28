@@ -313,10 +313,23 @@ def test_connect_mirrored_queues_warns_ha_policy_not_applied(mocker, caplog) -> 
   assert backend._channel is None  # candidate remains private until connect publishes
 
 
-def test_connect_mirrored_queues_closes_candidate_when_warning_is_interrupted(
-  mocker,
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [
+    RuntimeError("warning handler failed"),
+    KeyboardInterrupt("warning interrupted"),
+    SystemExit("warning exited"),
+  ],
+)
+def test_connect_mirrored_queues_warning_failure_keeps_private_candidate(
+  mocker, diagnostic_error: BaseException
 ) -> None:
-  """An interrupted HA-policy warning cannot leak its private candidate."""
+  """HA-policy telemetry cannot retire a valid private candidate.
+
+  ``connect()`` owns the candidate's eventual publish/retire decision.  The
+  mirrored helper must therefore return the same valid candidate even when a
+  custom warning handler fails with an ordinary or control-flow exception.
+  """
   mock_conn = MagicMock(name="connection")
   mock_channel = MagicMock(name="channel")
   mock_conn.channel.return_value = mock_channel
@@ -330,19 +343,16 @@ def test_connect_mirrored_queues_closes_candidate_when_warning_is_interrupted(
   mocker.patch.object(RabbitMQBackend, "_apply_qos")
   backend = _backend()
   backend.config.ha_mode = "all"
-  primary = KeyboardInterrupt()
   mocker.patch(
-    "scrapy_extension.backends.rabbitmq.logger.warning", side_effect=primary
+    "scrapy_extension.backends.rabbitmq.logger.warning", side_effect=diagnostic_error
   )
-  mock_channel.close.side_effect = SystemExit("channel cleanup")
-  mock_conn.close.side_effect = GeneratorExit("connection cleanup")
 
-  with pytest.raises(KeyboardInterrupt) as raised:
-    backend._connect_mirrored_queues()
+  candidate = backend._connect_mirrored_queues()
 
-  assert raised.value is primary
-  mock_channel.close.assert_called_once()
-  mock_conn.close.assert_called_once()
+  assert candidate.connection is mock_conn
+  assert candidate.channel is mock_channel
+  mock_channel.close.assert_not_called()
+  mock_conn.close.assert_not_called()
   assert backend._channel is None
   assert backend._connection is None
 

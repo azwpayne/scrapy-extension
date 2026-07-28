@@ -529,6 +529,60 @@ def test_mongodb_backend_disconnect(mocker):
   mock_instance.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+  "diagnostic_failure",
+  [
+    RuntimeError("diagnostic failed"),
+    KeyboardInterrupt("diagnostic interrupted"),
+    SystemExit("diagnostic exited"),
+  ],
+)
+def test_mongodb_disconnect_preserves_best_effort_close_when_diagnostic_fails(
+  mocker, diagnostic_failure
+):
+  """Ordinary close failures stay best-effort even when their log fails."""
+  backend = MongoDBBackend(MongoDBSettings())
+  client = mocker.MagicMock()
+  client.close.side_effect = RuntimeError("close failed")
+  backend._client = client
+  backend._db = mocker.MagicMock()
+  backend._queue_collection = mocker.MagicMock()
+  backend._set_collection = mocker.MagicMock()
+  backend._storage_collection = mocker.MagicMock()
+  log = mocker.patch(
+    "scrapy_extension.backends.mongodb.logger.debug",
+    side_effect=diagnostic_failure,
+  )
+
+  backend.disconnect()
+
+  client.close.assert_called_once_with()
+  log.assert_called_once_with("Failed to close MongoDB client", exc_info=True)
+  assert backend._client is None
+  assert backend._db is None
+  assert backend._queue_collection is None
+  assert backend._set_collection is None
+  assert backend._storage_collection is None
+
+
+def test_mongodb_disconnect_propagates_direct_close_process_control(mocker):
+  """Normal disconnect retains direct process-control errors from close."""
+  backend = MongoDBBackend(MongoDBSettings())
+  client = mocker.MagicMock()
+  interruption = KeyboardInterrupt("close interrupted")
+  client.close.side_effect = interruption
+  backend._client = client
+  log = mocker.patch("scrapy_extension.backends.mongodb.logger.debug")
+
+  with pytest.raises(KeyboardInterrupt) as exc_info:
+    backend.disconnect()
+
+  assert exc_info.value is interruption
+  client.close.assert_called_once_with()
+  log.assert_not_called()
+  assert backend._client is None
+
+
 def test_mongodb_backend_push_pop(mocker):
   """Test MongoDB backend push and pop operations."""
   from scrapy_extension.backends.mongodb import MongoDBBackend

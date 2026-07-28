@@ -785,15 +785,12 @@ class RabbitMQBackend(Backend, QueueBackend):
           snapshot.ha_sync_mode,
         )
       except BaseException:
-        # The cluster helper returns a private candidate.  A control signal in
-        # the advisory warning occurs before the caller can publish it, so it
-        # must be retired here.  Cleanup is deliberately best effort: do not
-        # replace the warning's causal signal with a close-time control error.
-        try:
-          self._close_handles(candidate.channel, candidate.connection)
-        except BaseException:
-          pass
-        raise
+        # The policy warning is pure telemetry.  The cluster helper has
+        # already returned a valid private candidate, which the caller will
+        # publish or retire under its normal lifecycle fence; a logging
+        # handler must not close that candidate or turn connect() into a
+        # false failure.
+        pass
     return candidate
 
   def _setup_qos(self) -> None:
