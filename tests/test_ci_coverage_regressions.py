@@ -6,7 +6,7 @@ import sys
 from datetime import date, time, timedelta
 from decimal import Decimal
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -99,6 +99,16 @@ def _run_immediate(awaitable: Any) -> Any:
       awaitable.send(None)
     except StopIteration as completed:
       return completed.value
+
+
+def test_ci_workflow_runs_for_pull_requests_before_merge() -> None:
+  """R48: CI must validate a change before it reaches the main branch."""
+  workflow = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+  ).read_text(encoding="utf-8")
+
+  assert "pull_request:" in workflow
+  assert "push:" in workflow
 
 
 @pytest.mark.parametrize(
