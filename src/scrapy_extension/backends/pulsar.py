@@ -406,6 +406,10 @@ class PulsarBackend(Backend, QueueBackend):
     # assignment otherwise, raising ``UnboundLocalError`` that masks the original
     # interrupt. Mirror rabbitmq ``_open_prepared_channel`` (hoist before try).
     client: Any = None
+    # ``None`` means construction failed before publication.  Once set, this
+    # lets failure cleanup distinguish our published generation from one that
+    # a concurrent disconnect/reconnect has already retired and replaced.
+    published_generation: int | None = None
     try:
       kwargs: dict[str, Any] = {}
       # Keep the package's public compatibility names, but translate them to
@@ -435,6 +439,7 @@ class PulsarBackend(Backend, QueueBackend):
           return
         client = pulsar.Client(snapshot.service_url, **kwargs)
         self._lifecycle_generation += 1
+        published_generation = self._lifecycle_generation
         self._client = client
         self._connection_snapshot = snapshot
       logger.debug(
@@ -445,25 +450,79 @@ class PulsarBackend(Backend, QueueBackend):
     except ConfigurationError:
       raise
     except Exception:
+      self._abort_failed_connect(client, published_generation)
       raise BackendConnectionError(
         "Failed to connect to Pulsar.", backend_type="pulsar"
       ) from None
     except BaseException:
-      # R18-B: a Ctrl+C/SystemExit after ``pulsar.Client(...)`` returns (the C++
-      # binding starts its background IO/service threads in the constructor) but
-      # before the client is published to ``self._client`` must close the
-      # un-published client — otherwise ``disconnect()`` cannot reach it and the
-      # C++ bg threads + lazy broker FD leak to interpreter shutdown. Identity
-      # guard: ``self._client is client`` means it WAS published and disconnect()
-      # owns it, so don't double-close. Resource leak, not wedge: the client is
-      # never published on this path, so ``is_connected()`` stays truthful. The
-      # ``from None`` redaction above is untouched (deliberate secret-redaction).
-      # Mirror the R16-A/R17 connect() BaseException contract — pulsar was the
-      # last connect()-capable backend without this arm.
-      if client is not None and self._client is not client:
-        with _suppress_pulsar_errors():
-          client.close()
+      # R18-B/R72: a Ctrl+C/SystemExit after ``pulsar.Client(...)`` returns (the
+      # C++ binding starts background IO/service threads in its constructor), or
+      # after publication from a user-installed logging handler, must not leak a
+      # client generation.  Cleanup never masks the original control signal.
+      self._abort_failed_connect(client, published_generation)
       raise
+
+  def _abort_failed_connect(
+    self, client: Any, published_generation: int | None
+  ) -> None:
+    """Detach and best-effort close only this failed connect generation.
+
+    A normal connection failure commonly happens before publication.  Less
+    obvious extension points (notably logging handlers) can fail after the
+    client, snapshot, and generation have become visible.  In that case detach
+    only when both the client object and generation still match: a concurrent
+    disconnect/reconnect may already own and have replaced the old client.
+    Cleanup intentionally swallows *all* exceptions, including control-flow
+    exceptions from driver ``close()``, because this helper runs while another
+    connection failure is already propagating.
+    """
+    if client is None:
+      return
+
+    handles: list[Any] = []
+    if published_generation is None:
+      # Construction completed but publication did not.  No public teardown
+      # could have claimed this private candidate, so this connect owns it.
+      handles.append(client)
+    else:
+      with self._lifecycle_lock:
+        if (
+          self._client is client
+          and self._lifecycle_generation == published_generation
+        ):
+          consumers = {
+            id(consumer): consumer for consumer in self._consumers.values()
+          }
+          if self._consumer is not None:
+            consumers.setdefault(id(self._consumer), self._consumer)
+          producers = {
+            id(producer): producer for producer in self._producers.values()
+          }
+          self._consumers.clear()
+          self._consumer = None
+          self._subscribed_topic = None
+          self._producers.clear()
+          self._client = None
+          self._connection_snapshot = None
+          self._last_msg = None
+          self._last_delivery = None
+          with self._in_flight_lock:
+            self._in_flight.clear()
+          # Invalidate in-flight producer/consumer creations that observed
+          # this client before the post-publication failure was noticed.
+          self._lifecycle_generation += 1
+          handles = [*consumers.values(), *producers.values(), client]
+
+    for handle in handles:
+      try:
+        handle.close()
+      except BaseException:
+        # A driver close or logging integration must never replace the
+        # connection failure currently being handled.
+        try:
+          logger.debug("Failed to close Pulsar connect candidate", exc_info=True)
+        except BaseException:
+          pass
 
   def disconnect(self) -> None:
     """Close the Pulsar client and release producers/consumers."""
