@@ -789,6 +789,28 @@ def test_disconnect_best_effort_on_shutdown_failure(mocker) -> None:
   assert backend._producer is None
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("debug failed"), KeyboardInterrupt(), SystemExit(1)],
+)
+def test_disconnect_preserves_completed_state_when_debug_is_interrupted(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """Post-disconnect diagnostics cannot turn a completed close into failure."""
+  backend, producer, consumer, _ = _make_connected_backend(mocker)
+  mocker.patch(
+    "scrapy_extension.backends.rocketmq.logger.debug",
+    side_effect=diagnostic_error,
+  )
+
+  backend.disconnect()
+
+  producer.shutdown.assert_called_once_with()
+  consumer.shutdown.assert_called_once_with()
+  assert backend._producer is None
+  assert backend._consumer is None
+
+
 def test_disconnect_continues_when_shutdown_warning_is_interrupted(mocker) -> None:
   """A cleanup warning must not stop sibling shutdown."""
   backend, producer, consumer, _ = _make_connected_backend(mocker)
@@ -1532,6 +1554,25 @@ def test_queue_len_warns_once_risk1(caplog) -> None:
   warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
   assert len(warnings) == 1
   assert "unsupported" in warnings[0].message
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("warning failed"), KeyboardInterrupt(), SystemExit(1)],
+)
+def test_queue_len_preserves_unsupported_contract_when_warning_is_interrupted(
+  mocker, diagnostic_error: BaseException
+) -> None:
+  """The pure warning cannot replace RocketMQ's required capability signal."""
+  _reset_queue_len_warned()
+  backend = RocketMQBackend(RocketMQSettings())
+  mocker.patch(
+    "scrapy_extension.backends.rocketmq.logger.warning",
+    side_effect=diagnostic_error,
+  )
+
+  with pytest.raises(NotImplementedError, match="broker-side depth RPC"):
+    backend.queue_len("test_queue")
 
 
 def test_unsupported_depth_keeps_scheduler_conservative() -> None:

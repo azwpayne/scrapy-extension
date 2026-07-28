@@ -454,6 +454,35 @@ def test_restore_snapshot_skips_oversized_blob(monkeypatch: pytest.MonkeyPatch) 
   strategy.restore.assert_not_called()
 
 
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("diagnostic boom"), KeyboardInterrupt(), SystemExit(2)],
+)
+def test_restore_snapshot_over_cap_diagnostic_failure_starts_clean(
+  monkeypatch: pytest.MonkeyPatch, diagnostic_error: BaseException
+) -> None:
+  """A failed over-cap warning cannot turn the clean-start fallback into failure."""
+  import scrapy_extension.queue.queue as queue_mod
+
+  monkeypatch.setattr(queue_mod, "_MAX_SNAPSHOT_BYTES", 8)
+  monkeypatch.setattr(
+    queue_mod.logger,
+    "warning",
+    MagicMock(side_effect=diagnostic_error),
+  )
+  strategy = _delay()
+  strategy.restore = MagicMock()  # type: ignore[method-assign]
+  oversized = b"x" * (queue_mod._MAX_SNAPSHOT_BYTES + 1)
+
+  BackendQueue(
+    connection_manager=_cm(storage=_storage(retrieve_return=oversized)),
+    queue_name="q",
+    queue_strategy=strategy,
+  )
+
+  strategy.restore.assert_not_called()
+
+
 def test_persist_snapshot_warns_when_over_cap(
   monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -488,3 +517,39 @@ def test_persist_snapshot_warns_when_over_cap(
   ), [r.message for r in caplog.records]
   # Persist still happened (operator gets a chance to act before restart).
   storage.store.assert_called_once()
+
+
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("diagnostic boom"), KeyboardInterrupt(), SystemExit(2)],
+)
+def test_persist_snapshot_over_cap_diagnostic_failure_keeps_checkpoint(
+  monkeypatch: pytest.MonkeyPatch, diagnostic_error: BaseException
+) -> None:
+  """A failed over-cap warning cannot skip the completed snapshot checkpoint."""
+  import scrapy_extension.queue.queue as queue_mod
+
+  monkeypatch.setattr(queue_mod, "_MAX_SNAPSHOT_BYTES", 8)
+  monkeypatch.setattr(
+    queue_mod.logger,
+    "warning",
+    MagicMock(side_effect=diagnostic_error),
+  )
+  strategy = _delay()
+  strategy.snapshot = MagicMock(  # type: ignore[method-assign]
+    return_value=b"x" * (queue_mod._MAX_SNAPSHOT_BYTES + 1)
+  )
+  strategy.close = MagicMock()  # type: ignore[method-assign]
+  storage = _storage()
+  queue = BackendQueue(
+    connection_manager=_cm(storage=storage),
+    queue_name="q",
+    queue_strategy=strategy,
+    monitor=MagicMock(),
+  )
+
+  queue.close()
+
+  storage.store.assert_called_once_with(queue._snapshot_key(), strategy.snapshot.return_value)
+  strategy.close.assert_called_once_with()
+  assert queue._close_complete is True

@@ -1255,14 +1255,20 @@ class BackendQueue:
     # cap or shrink the held heap (e.g. lower queue_delay_max_held) before the
     # restart, in which case the snapshot restores cleanly.
     if state is not None and len(state) > _MAX_SNAPSHOT_BYTES:
-      logger.warning(
-        "Strategy snapshot for queue %r is %d bytes (restore cap %d); it will "
-        "be DROPPED on restart. Reduce the held heap (e.g. queue_delay_max_held) "
-        "or raise the cap before the next restart to preserve it.",
-        self.queue_name,
-        len(state),
-        _MAX_SNAPSHOT_BYTES,
-      )
+      # This is a pure operator diagnostic after the snapshot is complete.
+      # A custom logging handler may raise even a control-flow BaseException;
+      # that must not prevent the checkpoint from reaching storage.
+      try:
+        logger.warning(
+          "Strategy snapshot for queue %r is %d bytes (restore cap %d); it will "
+          "be DROPPED on restart. Reduce the held heap (e.g. queue_delay_max_held) "
+          "or raise the cap before the next restart to preserve it.",
+          self.queue_name,
+          len(state),
+          _MAX_SNAPSHOT_BYTES,
+        )
+      except BaseException:
+        pass
     try:
       if state is None:
         storage.delete(snapshot_key)
@@ -1317,13 +1323,19 @@ class BackendQueue:
     # R25-B: bound the snapshot blob before the bytes(state) copy + json.loads
     # materialization so a corrupt/malicious value cannot OOM-kill startup.
     if len(state) > _MAX_SNAPSHOT_BYTES:
-      logger.warning(
-        "Strategy snapshot for queue %r is %d bytes (cap %d); starting clean "
-        "to avoid OOM during restore.",
-        self.queue_name,
-        len(state),
-        _MAX_SNAPSHOT_BYTES,
-      )
+      # This warning only explains an already-completed safety decision. A
+      # logging handler failure must not turn the clean-start fallback into a
+      # failed queue construction.
+      try:
+        logger.warning(
+          "Strategy snapshot for queue %r is %d bytes (cap %d); starting clean "
+          "to avoid OOM during restore.",
+          self.queue_name,
+          len(state),
+          _MAX_SNAPSHOT_BYTES,
+        )
+      except BaseException:
+        pass
       return
     try:
       self._strategy.restore(bytes(state))

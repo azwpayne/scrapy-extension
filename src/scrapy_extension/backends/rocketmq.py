@@ -316,7 +316,13 @@ class RocketMQBackend(Backend, QueueBackend):
       self._shutdown_detached_clients(
         (producer, "producer"), (consumer, "consumer")
       )
-      logger.debug("Disconnected from RocketMQ")
+      # This diagnostic follows the completed disconnect state transition. A
+      # misbehaving logging handler must not report the completed operation as
+      # failed or resurrect an already-detached client generation.
+      try:
+        logger.debug("Disconnected from RocketMQ")
+      except BaseException:
+        pass
 
   @staticmethod
   def _shutdown_detached_clients(
@@ -752,12 +758,17 @@ class RocketMQBackend(Backend, QueueBackend):
     _validate_key_name(queue_name, "queue_name")
     if not _queue_len_warned:
       _queue_len_warned = True
-      logger.warning(
-        "RocketMQ queue_len() is unsupported (deferred-ack model has no "
-        "broker-side depth RPC). Pending detection will stay conservative; "
-        "monitor via pop-rate / consumer-liveness instead. This warning "
-        "fires once per process."
-      )
+      # The warning only describes the already-established capability
+      # contract. It cannot replace the required NotImplementedError.
+      try:
+        logger.warning(
+          "RocketMQ queue_len() is unsupported (deferred-ack model has no "
+          "broker-side depth RPC). Pending detection will stay conservative; "
+          "monitor via pop-rate / consumer-liveness instead. This warning "
+          "fires once per process."
+        )
+      except BaseException:
+        pass
     raise NotImplementedError(
       "RocketMQ queue depth is unsupported: no broker-side depth RPC"
     )
