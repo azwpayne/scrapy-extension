@@ -586,7 +586,10 @@ class BackendQueue:
     try:
       self._monitor.on_pop(self.queue_name)
     except Exception:  # noqa: BLE001 - atomic backends already removed the item
-      logger.debug("monitor.on_pop raised; ignored", exc_info=True)
+      try:
+        logger.debug("monitor.on_pop raised; ignored", exc_info=True)
+      except BaseException:
+        pass
     # U2 operability: record this pop into the rolling window, then emit the
     # derived rate on the same sampling cadence as the depth probe below —
     # keeps the hot path O(1) amortized and avoids per-pop stat RPCs. A
@@ -598,7 +601,10 @@ class BackendQueue:
       try:
         self._emit_pop_rate()
       except Exception:  # noqa: BLE001
-        logger.debug("monitor.on_pop_rate raised; ignored", exc_info=True)
+        try:
+          logger.debug("monitor.on_pop_rate raised; ignored", exc_info=True)
+        except BaseException:
+          pass
     # Sample depth after each pop — this is the backpressure signal (architect's
     # #1 operability gap). Cheaper than a periodic timer and aligns the sample
     # with an event that already touched the backend. U4: routed through
@@ -608,7 +614,10 @@ class BackendQueue:
     try:
       self._monitor.on_queue_depth(self.queue_name, self._probe_depth())
     except Exception:  # noqa: BLE001
-      logger.debug("monitor.on_queue_depth raised; ignored", exc_info=True)
+      try:
+        logger.debug("monitor.on_queue_depth raised; ignored", exc_info=True)
+      except BaseException:
+        pass
 
     if data is None:
       if ack_token is not None:
@@ -1224,7 +1233,13 @@ class BackendQueue:
     try:
       state = self._strategy.snapshot()
     except Exception:  # noqa: BLE001 — snapshot must not crash close
-      logger.exception("strategy.snapshot() raised; skipping persist")
+      # This only reports an already-selected best-effort fallback.  A custom
+      # handler may raise even a control-flow BaseException; it must not turn
+      # the promised non-fatal snapshot failure into a failed close.
+      try:
+        logger.exception("strategy.snapshot() raised; skipping persist")
+      except BaseException:
+        pass
       return
     get_storage = getattr(self.connection_manager, "get_storage_backend", None)
     if get_storage is None:
@@ -1232,19 +1247,27 @@ class BackendQueue:
     try:
       storage = get_storage()
     except NotImplementedError:
-      logger.info(
-        "Queue backend is not storage-capable; cannot persist strategy "
-        "snapshot for queue %r — in-process held state (e.g. delayed items) "
-        "will not survive restart. Pair with a storage-capable backend "
-        "(Redis/MongoDB/ElasticSearch) to enable snapshot/restore.",
-        self.queue_name,
-      )
+      # This is an informational fallback after the backend capability was
+      # determined.  Diagnostics cannot make close fail.
+      try:
+        logger.info(
+          "Queue backend is not storage-capable; cannot persist strategy "
+          "snapshot for queue %r — in-process held state (e.g. delayed items) "
+          "will not survive restart. Pair with a storage-capable backend "
+          "(Redis/MongoDB/ElasticSearch) to enable snapshot/restore.",
+          self.queue_name,
+        )
+      except BaseException:
+        pass
       return
     except Exception:  # noqa: BLE001 — resolver must not crash close
-      logger.exception(
-        "Failed to resolve storage backend for queue %r; skipping snapshot persist.",
-        self.queue_name,
-      )
+      try:
+        logger.exception(
+          "Failed to resolve storage backend for queue %r; skipping snapshot persist.",
+          self.queue_name,
+        )
+      except BaseException:
+        pass
       return
     snapshot_key = self._snapshot_key()
     # R26-A: warn at persist time when the snapshot exceeds the restore cap, so
@@ -1275,10 +1298,13 @@ class BackendQueue:
       else:
         storage.store(snapshot_key, state)
     except Exception:  # noqa: BLE001 — store must not crash close
-      logger.exception(
-        "Failed to update strategy snapshot for queue %r; continuing.",
-        self.queue_name,
-      )
+      try:
+        logger.exception(
+          "Failed to update strategy snapshot for queue %r; continuing.",
+          self.queue_name,
+        )
+      except BaseException:
+        pass
 
   def _restore_snapshot(self) -> None:
     """Restore the strategy's in-process state on startup (initiative #3).
@@ -1302,19 +1328,25 @@ class BackendQueue:
     except NotImplementedError:
       return  # storage-incapable backend — no prior snapshot to restore
     except Exception:  # noqa: BLE001 — resolver must not crash startup
-      logger.exception(
-        "Failed to resolve storage backend for queue %r; starting clean.",
-        self.queue_name,
-      )
+      try:
+        logger.exception(
+          "Failed to resolve storage backend for queue %r; starting clean.",
+          self.queue_name,
+        )
+      except BaseException:
+        pass
       return
     snapshot_key = self._snapshot_key()
     try:
       state = storage.retrieve(snapshot_key)
     except Exception:  # noqa: BLE001 — retrieve must not crash startup
-      logger.exception(
-        "Failed to retrieve strategy snapshot for queue %r; starting clean.",
-        self.queue_name,
-      )
+      try:
+        logger.exception(
+          "Failed to retrieve strategy snapshot for queue %r; starting clean.",
+          self.queue_name,
+        )
+      except BaseException:
+        pass
       return
     # Only restore real bytes — None (no prior snapshot) or any non-bytes
     # value (unexpected type / mock) is a no-op, never passed to restore().
@@ -1340,7 +1372,10 @@ class BackendQueue:
     try:
       self._strategy.restore(bytes(state))
     except Exception:  # noqa: BLE001 — restore must not crash startup (docstring)
-      logger.exception(
-        "strategy.restore() raised for queue %r; starting clean.",
-        self.queue_name,
-      )
+      try:
+        logger.exception(
+          "strategy.restore() raised for queue %r; starting clean.",
+          self.queue_name,
+        )
+      except BaseException:
+        pass

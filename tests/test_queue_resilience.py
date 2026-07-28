@@ -220,6 +220,152 @@ def test_persist_snapshot_skips_when_store_raises() -> None:
   bq.close()  # must not raise
 
 
+@pytest.mark.parametrize(
+  ("fallback_site", "diagnostic_method"),
+  [
+    pytest.param("snapshot", "exception", id="persist-snapshot"),
+    pytest.param("storage-incapable", "info", id="persist-not-implemented"),
+    pytest.param("persist-resolver", "exception", id="persist-resolver"),
+    pytest.param("store", "exception", id="persist-store"),
+    pytest.param("restore-resolver", "exception", id="restore-resolver"),
+    pytest.param("retrieve", "exception", id="restore-retrieve"),
+    pytest.param("restore", "exception", id="strategy-restore"),
+  ],
+)
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("diagnostic boom"), KeyboardInterrupt(), SystemExit(2)],
+)
+def test_snapshot_fallback_diagnostic_failure_preserves_best_effort_contract(
+  monkeypatch: pytest.MonkeyPatch,
+  fallback_site: str,
+  diagnostic_method: str,
+  diagnostic_error: BaseException,
+) -> None:
+  """A failing fallback diagnostic never replaces the completed degradation.
+
+  The underlying operation deliberately raises an ordinary ``Exception`` so
+  the snapshot contract selects its documented best-effort outcome.  Logging
+  that outcome is pure telemetry: even a handler's ``RuntimeError``,
+  ``KeyboardInterrupt``, or ``SystemExit`` must leave close/startup on that
+  selected path.  This does not weaken direct control-flow exceptions from the
+  snapshot, resolver, storage, or strategy operations themselves.
+  """
+  import scrapy_extension.queue.queue as queue_mod
+
+  diagnostic = MagicMock(side_effect=diagnostic_error)
+  monkeypatch.setattr(queue_mod.logger, diagnostic_method, diagnostic)
+  strategy = _delay()
+  storage = _storage()
+  cm = _cm(storage=storage)
+
+  if fallback_site == "snapshot":
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    strategy.snapshot = MagicMock(side_effect=RuntimeError("snapshot boom"))  # type: ignore[method-assign]
+    queue.close()
+    storage.store.assert_not_called()
+    assert queue._close_complete is True
+  elif fallback_site == "storage-incapable":
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    cm.get_storage_backend.side_effect = NotImplementedError("queue-only backend")
+    queue.close()
+    storage.store.assert_not_called()
+    assert queue._close_complete is True
+  elif fallback_site == "persist-resolver":
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    cm.get_storage_backend.side_effect = RuntimeError("resolver boom")
+    queue.close()
+    storage.store.assert_not_called()
+    assert queue._close_complete is True
+  elif fallback_site == "store":
+    strategy.push("q", b"held", delay=10.0)
+    storage.store.side_effect = RuntimeError("store boom")
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    # Construction restores before close; retain the queued held state after
+    # that no-op restore so persist reaches the failing store.
+    queue.close()
+    storage.store.assert_called_once()
+    assert queue._close_complete is True
+  elif fallback_site == "restore-resolver":
+    cm.get_storage_backend.side_effect = RuntimeError("resolver boom")
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    assert queue._close_complete is False
+  elif fallback_site == "retrieve":
+    storage.retrieve.side_effect = RuntimeError("retrieve boom")
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    assert queue._close_complete is False
+  else:
+    assert fallback_site == "restore"
+    storage.retrieve.return_value = b"incompatible snapshot"
+    strategy.restore = MagicMock(side_effect=RuntimeError("restore boom"))  # type: ignore[method-assign]
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    strategy.restore.assert_called_once_with(b"incompatible snapshot")
+    assert queue._close_complete is False
+
+  diagnostic.assert_called_once()
+
+
+@pytest.mark.parametrize(
+  "failure_site",
+  [
+    "snapshot",
+    "persist-resolver",
+    "store",
+    "restore-resolver",
+    "retrieve",
+    "restore",
+  ],
+)
+def test_snapshot_operations_preserve_direct_control_flow_exceptions(
+  failure_site: str,
+) -> None:
+  """Control exceptions from operations are not misclassified as diagnostics."""
+  control_error = KeyboardInterrupt()
+  strategy = _delay()
+  storage = _storage()
+  cm = _cm(storage=storage)
+
+  if failure_site == "snapshot":
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    strategy.snapshot = MagicMock(side_effect=control_error)  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt) as raised:
+      queue.close()
+    assert raised.value is control_error
+    assert queue._close_complete is True
+  elif failure_site == "persist-resolver":
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    cm.get_storage_backend.side_effect = control_error
+    with pytest.raises(KeyboardInterrupt) as raised:
+      queue.close()
+    assert raised.value is control_error
+    assert queue._close_complete is True
+  elif failure_site == "store":
+    strategy.push("q", b"held", delay=10.0)
+    storage.store.side_effect = control_error
+    queue = BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    with pytest.raises(KeyboardInterrupt) as raised:
+      queue.close()
+    assert raised.value is control_error
+    assert queue._close_complete is True
+  elif failure_site == "restore-resolver":
+    cm.get_storage_backend.side_effect = control_error
+    with pytest.raises(KeyboardInterrupt) as raised:
+      BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    assert raised.value is control_error
+  elif failure_site == "retrieve":
+    storage.retrieve.side_effect = control_error
+    with pytest.raises(KeyboardInterrupt) as raised:
+      BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    assert raised.value is control_error
+  else:
+    assert failure_site == "restore"
+    storage.retrieve.return_value = b"incompatible snapshot"
+    strategy.restore = MagicMock(side_effect=control_error)  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt) as raised:
+      BackendQueue(connection_manager=cm, queue_name="q", queue_strategy=strategy)
+    assert raised.value is control_error
+
+
 # ---------------------------------------------------------------------------
 # _restore_snapshot resilience (init path)
 # ---------------------------------------------------------------------------
@@ -398,6 +544,82 @@ def test_pop_survives_monitor_failure_after_atomic_pop() -> None:
 
   assert restored is not None
   assert restored.url == request.url
+
+
+@pytest.mark.parametrize(
+  "monitor_method",
+  ["on_pop", "on_pop_rate", "on_queue_depth"],
+)
+@pytest.mark.parametrize(
+  "diagnostic_error",
+  [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
+)
+@pytest.mark.parametrize("is_empty", [False, True], ids=["request", "empty"])
+def test_pop_monitor_fallback_debug_failure_preserves_determined_result(
+  mocker: MockerFixture,
+  monitor_method: str,
+  diagnostic_error: BaseException,
+  is_empty: bool,
+) -> None:
+  """Post-pop fallback diagnostics cannot replace a request or empty result."""
+  qb = MagicMock(name="QueueBackend")
+  qb.queue_len.return_value = 0
+  monitor = MagicMock()
+  getattr(monitor, monitor_method).side_effect = RuntimeError("monitor boom")
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb),
+    queue_name="q",
+    monitor=monitor,
+    depth_sample_every=1,
+  )
+  request = Request("https://example.com")
+  qb.pop.return_value = (
+    None if is_empty else bq._serializer.serialize(bq._request_to_dict(request))
+  )
+  logger_debug = mocker.patch(
+    "scrapy_extension.queue.queue.logger.debug", side_effect=diagnostic_error
+  )
+
+  popped = bq.pop()
+
+  getattr(monitor, monitor_method).assert_called_once()
+  logger_debug.assert_called_once()
+  if is_empty:
+    assert popped is None
+  else:
+    assert popped is not None
+    assert popped.url == request.url
+
+
+@pytest.mark.parametrize(
+  "monitor_method",
+  ["on_pop", "on_pop_rate", "on_queue_depth"],
+)
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt(), SystemExit()])
+def test_pop_propagates_direct_monitor_control_exception(
+  mocker: MockerFixture,
+  monitor_method: str,
+  control_error: BaseException,
+) -> None:
+  """Control exceptions from monitors remain observable, unlike log failures."""
+  qb = MagicMock(name="QueueBackend")
+  qb.pop.return_value = None
+  qb.queue_len.return_value = 0
+  monitor = MagicMock()
+  getattr(monitor, monitor_method).side_effect = control_error
+  bq = BackendQueue(
+    connection_manager=_cm(queue_backend=qb),
+    queue_name="q",
+    monitor=monitor,
+    depth_sample_every=1,
+  )
+  logger_debug = mocker.patch("scrapy_extension.queue.queue.logger.debug")
+
+  with pytest.raises(type(control_error)) as raised:
+    bq.pop()
+
+  assert raised.value is control_error
+  logger_debug.assert_not_called()
 
 
 def test_error_monitor_failure_does_not_mask_serialization_error() -> None:
