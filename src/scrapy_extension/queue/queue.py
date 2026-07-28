@@ -78,6 +78,11 @@ _REQUEST_CLASSES: dict[str, type[Request]] = {
 }
 
 
+def _invalid_routing_value_description(value: object) -> str:
+  """Describe invalid input without invoking an arbitrary or unbounded ``repr``."""
+  return f"<{type(value).__name__}>"
+
+
 class BackendQueue:
   """Scrapy queue implementation using backend queue interface.
 
@@ -325,9 +330,10 @@ class BackendQueue:
     """Execute an admitted push operation."""
     replacement_ack_token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
     raw_delay = request.meta.get("delay", 0.0)
-    if isinstance(raw_delay, bool):
+    if isinstance(raw_delay, bool) or not isinstance(raw_delay, (int, float)):
       error = QueueError(
-        f"Invalid queue delay {raw_delay!r}: expected a finite number >= 0",
+        "Invalid queue delay "
+        f"{_invalid_routing_value_description(raw_delay)}: expected a finite number >= 0",
         queue_name=self.queue_name,
         operation="push",
       )
@@ -337,7 +343,8 @@ class BackendQueue:
       delay = float(raw_delay or 0.0)
     except (OverflowError, TypeError, ValueError) as e:
       error = QueueError(
-        f"Invalid queue delay {raw_delay!r}: expected a finite number >= 0",
+        "Invalid queue delay "
+        f"{_invalid_routing_value_description(raw_delay)}: expected a finite number >= 0",
         queue_name=self.queue_name,
         operation="push",
       )
@@ -345,7 +352,8 @@ class BackendQueue:
       raise error from e
     if not math.isfinite(delay) or delay < 0:
       error = QueueError(
-        f"Invalid queue delay {raw_delay!r}: expected a finite number >= 0",
+        "Invalid queue delay "
+        f"{_invalid_routing_value_description(raw_delay)}: expected a finite number >= 0",
         queue_name=self.queue_name,
         operation="push",
       )
@@ -361,7 +369,8 @@ class BackendQueue:
       valid_priority = False
     if not valid_priority:
       error = QueueError(
-        f"Invalid queue priority {priority!r}: expected a finite number",
+        "Invalid queue priority "
+        f"{_invalid_routing_value_description(priority)}: expected a finite number",
         queue_name=self.queue_name,
         operation="push",
       )

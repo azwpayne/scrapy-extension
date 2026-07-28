@@ -1182,6 +1182,10 @@ class TestBackendQueuePush:
     [
       True,
       False,
+      None,
+      "",
+      [],
+      {},
       "not-a-number",
       -1,
       10**400,
@@ -1259,6 +1263,32 @@ class TestBackendQueuePush:
 
     with pytest.raises(QueueError, match=match):
       queue.push(request, priority=True if match == "priority" else 0.0)
+
+    mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
+      "test_queue", token="old-token"
+    )
+    assert "_backend_ack_token" not in request.meta
+
+  @pytest.mark.parametrize("routing_field", ["delay", "priority"])
+  def test_huge_routing_value_terminates_replacement_delivery(
+    self, mock_connection_manager, routing_field
+  ):
+    """Error rendering must not leak CPython's huge-integer repr failure."""
+    huge_value = 10**5000
+    meta = {"_backend_ack_token": "old-token"}
+    if routing_field == "delay":
+      meta["delay"] = huge_value
+      priority = 0.0
+    else:
+      priority = huge_value
+    request = Request("https://example.com", meta=meta)
+    queue = BackendQueue(
+      connection_manager=mock_connection_manager,
+      queue_name="test_queue",
+    )
+
+    with pytest.raises(QueueError, match=routing_field):
+      queue.push(request, priority=priority)
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
       "test_queue", token="old-token"
