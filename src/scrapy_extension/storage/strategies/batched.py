@@ -345,12 +345,18 @@ class BatchedStorageStrategy(StorageStrategy):
     """
     acquired = self._flush_lock.acquire(timeout=_FLUSH_LOCK_TIMEOUT_S)
     if not acquired:
-      logger.warning(
-        "batched-storage flush lock not acquired within %.1fs; skipping "
-        "(a flush is in flight against an unresponsive backend — in-flight "
-        "items may be lost)",
-        _FLUSH_LOCK_TIMEOUT_S,
-      )
+      # The bounded-acquire result is already the public outcome. Logging this
+      # best-effort diagnostic must not turn a responsive skip into a failed
+      # flush when a custom logging handler raises, including control errors.
+      try:
+        logger.warning(
+          "batched-storage flush lock not acquired within %.1fs; skipping "
+          "(a flush is in flight against an unresponsive backend — in-flight "
+          "items may be lost)",
+          _FLUSH_LOCK_TIMEOUT_S,
+        )
+      except BaseException:
+        pass
       return
     try:
       self._flush_serialized()

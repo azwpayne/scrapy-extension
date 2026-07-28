@@ -108,6 +108,34 @@ class TestBatchedStorageStrategy:
     assert backend.store.call_count == 2
     assert strat.pending == 0
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logging failed"),
+      KeyboardInterrupt("logging interrupted"),
+      SystemExit("logging exited"),
+    ],
+  )
+  def test_flush_lock_timeout_diagnostic_cannot_raise(
+    self, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """R120: a lock-timeout warning cannot change the skip-and-return result."""
+    strat = BatchedStorageStrategy()
+    strat._flush_lock = mocker.Mock()
+    strat._flush_lock.acquire.return_value = False
+    warning = mocker.patch.object(
+      batched_module.logger,
+      "warning",
+      side_effect=diagnostic_error,
+    )
+
+    strat.flush()
+
+    strat._flush_lock.acquire.assert_called_once_with(
+      timeout=batched_module._FLUSH_LOCK_TIMEOUT_S
+    )
+    warning.assert_called_once()
+
   def test_close_flushes_remaining(self, mocker) -> None:
     backend = mocker.Mock()
     strat = BatchedStorageStrategy(threshold=100)
