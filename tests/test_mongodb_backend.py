@@ -51,6 +51,63 @@ def test_mongodb_backend_connect(mocker):
   assert backend.is_connected()
 
 
+@pytest.mark.parametrize(
+  "diagnostic_failure",
+  [
+    RuntimeError("diagnostic failed"),
+    KeyboardInterrupt("diagnostic interrupted"),
+    SystemExit("diagnostic exited"),
+  ],
+  ids=["runtime-error", "keyboard-interrupt", "system-exit"],
+)
+@pytest.mark.parametrize(
+  ("settings_kwargs", "mode"),
+  [
+    ({}, MongoDBMode.STANDALONE),
+    ({"mode": MongoDBMode.REPLICA_SET, "replica_set_name": "rs0"}, MongoDBMode.REPLICA_SET),
+    ({"mode": MongoDBMode.SHARDED_CLUSTER}, MongoDBMode.SHARDED_CLUSTER),
+    (
+      {
+        "mode": MongoDBMode.ATLAS,
+        "uri": "mongodb+srv://cluster.example.mongodb.net",
+      },
+      MongoDBMode.ATLAS,
+    ),
+  ],
+  ids=["standalone", "replica-set", "sharded-cluster", "atlas"],
+)
+def test_mongodb_connect_keeps_published_generation_when_success_log_fails(
+  mocker,
+  diagnostic_failure,
+  settings_kwargs,
+  mode,
+):
+  """A post-publication success diagnostic cannot roll back MongoDB state."""
+  backend = MongoDBBackend(MongoDBSettings(**settings_kwargs))
+  client = mocker.MagicMock()
+  mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    return_value=client,
+  )
+  log = mocker.patch(
+    "scrapy_extension.backends.mongodb.logger.debug",
+    side_effect=diagnostic_failure,
+  )
+
+  backend.connect()
+
+  assert backend._client is client
+  assert backend._db is not None
+  assert backend._queue_collection is not None
+  assert backend._set_collection is not None
+  assert backend._storage_collection is not None
+  client.close.assert_not_called()
+  log.assert_called_once_with(
+    "Connected to MongoDB in %s mode",
+    mode.value,
+  )
+
+
 def test_mongodb_connect_rejects_mutated_unacknowledged_w_before_sdk_io(mocker):
   config = MongoDBSettings(username="crawler", password="do-not-leak")
   backend = MongoDBBackend(config)

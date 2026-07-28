@@ -185,7 +185,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._connect_sharded_cluster(database, collection_names, marker_options)
       else:
         self._connect_atlas(database, collection_names, marker_options)
-      logger.debug("Connected to MongoDB in %s mode", mode.value)
     except ConnectionFailure as e:
       self._discard_client(suppress_process_control=True)
       msg = f"Failed to connect to MongoDB ({mode.value}): {e}"
@@ -210,6 +209,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except BaseException:
       self._discard_client(suppress_process_control=True)
       raise
+
+    # The complete client graph is now published.  Success diagnostics must
+    # not turn that completed generation into a failed connection attempt.
+    try:
+      logger.debug("Connected to MongoDB in %s mode", mode.value)
+    except BaseException:
+      pass
 
   def _discard_client(self, *, suppress_process_control: bool = False) -> None:
     """Clear all handles and best-effort close the current client."""
