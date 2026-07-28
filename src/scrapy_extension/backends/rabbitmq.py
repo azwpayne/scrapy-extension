@@ -11,7 +11,6 @@ Note: RabbitMQ does not support SetBackend or StorageBackend operations.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import ssl
 import threading
@@ -248,12 +247,24 @@ class RabbitMQBackend(Backend, QueueBackend):
     keep_connection: pika.BlockingConnection | None = None,
   ) -> None:
     """Best-effort close a detached or losing connection generation."""
+    primary_error: BaseException | None = None
     if channel is not None and channel is not keep_channel:
-      with contextlib.suppress(Exception):
+      try:
         channel.close()
+      except Exception:
+        pass
+      except BaseException as exc:
+        primary_error = exc
     if connection is not None and connection is not keep_connection:
-      with contextlib.suppress(Exception):
+      try:
         connection.close()
+      except Exception:
+        pass
+      except BaseException as exc:
+        if primary_error is None:
+          primary_error = exc
+    if primary_error is not None:
+      raise primary_error
 
   def _publish_handles_locked(
     self,
@@ -687,11 +698,11 @@ class RabbitMQBackend(Backend, QueueBackend):
       # built by the caller before re-raising — otherwise the BlockingConnection
       # (background heartbeat/I/O thread + TCP FD) leaks. Mirror the R16-A
       # kafka/rocketmq connect() abort contract.
-      if channel is not None:
-        with contextlib.suppress(Exception):
-          channel.close()
-      with contextlib.suppress(Exception):
-        connection.close()
+      try:
+        self._close_handles(channel, connection)
+      except BaseException:
+        # Cleanup must not replace the channel-open/prepare primary.
+        pass
       raise
 
   def _activate_channel(

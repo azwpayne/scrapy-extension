@@ -854,6 +854,43 @@ def test_rabbitmq_backend_disconnect_connection_amqp_error(mocker):
   backend.disconnect()
 
 
+def test_close_handles_closes_connection_after_channel_keyboard_interrupt(mocker):
+  """R53: a process-control error cannot leak the detached connection."""
+  channel = mocker.MagicMock()
+  connection = mocker.MagicMock()
+  channel.close.side_effect = KeyboardInterrupt()
+
+  with pytest.raises(KeyboardInterrupt):
+    RabbitMQBackend._close_handles(channel, connection)
+
+  connection.close.assert_called_once_with()
+
+
+def test_close_handles_reraises_connection_keyboard_interrupt(mocker):
+  channel = mocker.MagicMock()
+  connection = mocker.MagicMock()
+  connection.close.side_effect = KeyboardInterrupt()
+
+  with pytest.raises(KeyboardInterrupt):
+    RabbitMQBackend._close_handles(channel, connection)
+
+  channel.close.assert_called_once_with()
+
+
+def test_close_handles_preserves_first_baseexception_while_closing_all(mocker):
+  channel = mocker.MagicMock()
+  connection = mocker.MagicMock()
+  first = KeyboardInterrupt()
+  channel.close.side_effect = first
+  connection.close.side_effect = SystemExit(2)
+
+  with pytest.raises(KeyboardInterrupt) as raised:
+    RabbitMQBackend._close_handles(channel, connection)
+
+  assert raised.value is first
+  connection.close.assert_called_once_with()
+
+
 def test_rabbitmq_backend_ensure_queue_exists_no_channel():
   """Test _ensure_queue_exists raises QueueError when channel is None (lines 311-317)."""
   config = RabbitMQSettings()
