@@ -464,11 +464,18 @@ class SqsBackend(Backend, QueueBackend):
         raise BackendConnectionError(
           f"Failed to create SQS client: {error}", backend_type="sqs"
         ) from error
-      logger.debug(
-        "Connected to SQS (%s, %s)",
-        snapshot.mode.value,
-        snapshot.region_name,
-      )
+      # Publication is the linearization point.  A success diagnostic runs
+      # strictly after that point, so even a control-flow failure from a
+      # logging extension must not make ``connect`` report failure or discard
+      # the now-authoritative generation.
+      try:
+        logger.debug(
+          "Connected to SQS (%s, %s)",
+          snapshot.mode.value,
+          snapshot.region_name,
+        )
+      except BaseException:
+        pass
 
   def disconnect(self) -> None:
     """Detach, drain, and close the current SQS client generation."""

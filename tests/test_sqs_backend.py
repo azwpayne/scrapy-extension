@@ -282,6 +282,35 @@ class TestSqsConnect:
     assert b._generation.client is client
     client.close.assert_not_called()
 
+  @pytest.mark.parametrize(
+    "diagnostic_error",
+    [
+      RuntimeError("logger extension failed"),
+      KeyboardInterrupt("logger interrupted"),
+      SystemExit("logger exited"),
+    ],
+    ids=["runtime-error", "keyboard-interrupt", "system-exit"],
+  )
+  def test_postpublish_logger_failure_keeps_live_generation(
+    self, mocker, diagnostic_error: BaseException
+  ) -> None:
+    """Success diagnostics cannot turn a published generation into a failure."""
+    b = _make_backend()
+    client = mocker.MagicMock(name="live-client")
+    _patch_client(mocker, return_value=client)
+    mocker.patch(
+      "scrapy_extension.backends.sqs.logger.debug",
+      side_effect=diagnostic_error,
+    )
+
+    b.connect()
+
+    assert b._generation is not None
+    assert b._generation.client is client
+    assert b._client is client
+    assert b.is_connected() is True
+    client.close.assert_not_called()
+
   def test_private_session_construction_failure_is_retryable(
     self, mocker
   ) -> None:
