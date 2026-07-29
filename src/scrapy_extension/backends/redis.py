@@ -415,6 +415,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       "ssl_ca_certs": snapshot.ssl_cafile,
       "ssl_certfile": snapshot.ssl_certfile,
       "ssl_keyfile": snapshot.ssl_keyfile,
+      "ssl_cert_reqs": "required",
       "ssl_check_hostname": snapshot.ssl_check_hostname,
     }
 

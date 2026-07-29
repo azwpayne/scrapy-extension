@@ -510,6 +510,8 @@ def test_master_slave_warning_has_static_safe_attribution(mocker) -> None:
       RedisSettings(
         mode=RedisMode.MASTER_SLAVE,
         password=_SECRET,
+        ssl_enabled=True,
+        ssl_cafile="/tls/ca.pem",
       )
     )
     backend.connect()

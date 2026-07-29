@@ -332,9 +332,11 @@ speculative work.
 - [ ] **SEC-02B2B3 — authenticated Kafka transport.** Require password-based
   SASL to use `SASL_SSL` with hostname verification, reject ignored TLS
   material, and require client certificate/key pairs.
-- [ ] **SEC-02C-R — authenticated Redis transport.** Require remote password
-  authentication, including Sentinel and Cluster data paths, to use verified
-  TLS while preserving explicit loopback development configurations.
+- [x] **SEC-02C-R — authenticated Redis transport.** Require every remote or
+  discovery-capable Redis authentication path (including username-only,
+  Sentinel, Cluster, and the deprecated compatibility mode) to use explicit
+  CA-backed certificate and hostname verification. Preserve only the direct,
+  literal-loopback standalone plaintext development configuration (Round 39B).
 - [ ] **SEC-02C-E — authenticated Elasticsearch transport.** Require HTTPS and
   certificate verification whenever API-key or basic authentication is used.
 - [x] **SEC-02C-M — authenticated MongoDB transport.** Revalidate effective

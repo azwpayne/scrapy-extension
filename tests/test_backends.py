@@ -571,6 +571,8 @@ class TestRedisBackendModes:
       sentinels=["sentinel1:26379", "sentinel2:26379"],
       sentinel_master_name="mymaster",
       password="secret",
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
     )
 
     mock_sentinel = mocker.Mock()
@@ -632,6 +634,8 @@ class TestRedisBackendModes:
       mode=RedisMode.CLUSTER,
       cluster_startup_nodes=["node1:7000", "node2:7000", "node3:7000"],
       password="secret",
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
     )
 
     mocker.patch(
@@ -689,6 +693,8 @@ class TestRedisBackendModes:
       sentinel_password="sentinel_pass",
       password="redis_pass",
       db=0,
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
     )
 
     mock_sentinel = mocker.Mock()
@@ -714,6 +720,8 @@ class TestRedisBackendModes:
       sentinel_master_name="mymaster",
       sentinel_username="sentinel_user",
       sentinel_password="sentinel_pass",
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
     )
 
     mock_sentinel = mocker.Mock()
@@ -795,6 +803,8 @@ class TestRedisSentinelClusterWiring:
       sentinels=["sentinel-a:26379", "sentinel-b:26380", "sentinel-c:26381"],
       sentinel_master_name="mymaster",
       password="secret",
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
     )
 
     captured_sentinel = {}
@@ -926,6 +936,8 @@ class TestRedisSentinelClusterWiring:
       mode=RedisMode.CLUSTER,
       cluster_startup_nodes=["node-a:7000", "node-b:7001", "node-c:7002"],
       password="secret",
+      ssl_enabled=True,
+      ssl_cafile="/tls/ca.pem",
     )
 
     captured: dict[str, object] = {}
@@ -2373,6 +2385,8 @@ def test_sentinel_ping_failure_wrapped_as_connection_error(mocker):
     sentinels=["sentinel-a:26379"],
     sentinel_master_name="mymaster",
     password="secret",
+    ssl_enabled=True,
+    ssl_cafile="/tls/ca.pem",
   )
 
   mock_sentinel = mocker.Mock()
@@ -2399,6 +2413,8 @@ def test_cluster_ping_failure_wrapped_as_connection_error(mocker):
     mode=RedisMode.CLUSTER,
     cluster_startup_nodes=["node-a:7000"],
     password="secret",
+    ssl_enabled=True,
+    ssl_cafile="/tls/ca.pem",
   )
 
   mock_cluster = mocker.Mock()

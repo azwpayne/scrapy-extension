@@ -99,6 +99,21 @@ def normalize_redis_host(host: object, *, setting_name: str = "host") -> str:
   return candidate
 
 
+def is_redis_loopback_host(host: object) -> bool:
+  """Return whether a normalized Redis host is an exact local endpoint.
+
+  A ``*.localhost`` suffix remains a DNS name controlled by the active name
+  resolution policy.  Only the exact ``localhost`` spelling (with an optional
+  harmless trailing dot) and literal loopback IP addresses qualify for the
+  plaintext local-development exception.
+  """
+  normalized = normalize_redis_host(host).lower().rstrip(".")
+  if normalized == "localhost":
+    return True
+  parsed = _parsed_ip(normalized)
+  return parsed is not None and parsed.is_loopback
+
+
 def normalize_redis_port(
   port: object,
   *,
@@ -206,6 +221,59 @@ def validate_redis_tls(
     raise ConfigurationError(
       "Redis TLS client authentication requires both certificate and key files.",
       setting_name=missing_name,
+    )
+
+
+def validate_redis_transport_security(
+  *,
+  mode: RedisMode,
+  host: str,
+  username: str | None,
+  password: SecretStr | None,
+  sentinel_username: str | None,
+  sentinel_password: SecretStr | None,
+  ssl_enabled: bool,
+  ssl_cafile: str | None,
+  ssl_certfile: str | None,
+  ssl_keyfile: str | None,
+  ssl_check_hostname: bool,
+) -> None:
+  """Require verified TLS before a non-local topology authenticates.
+
+  Sentinel and Cluster have discovery paths, so even loopback seed addresses
+  cannot prove that every eventual authenticated connection stays local.  The
+  explicit plaintext exception is deliberately limited to standalone.
+  """
+  validate_redis_tls(
+    ssl_enabled,
+    ssl_cafile,
+    ssl_certfile,
+    ssl_keyfile,
+  )
+  has_authentication = any(
+    value is not None
+    for value in (username, password, sentinel_username, sentinel_password)
+  )
+  is_direct_loopback = (
+    mode is RedisMode.STANDALONE and is_redis_loopback_host(host)
+  )
+  if not has_authentication or is_direct_loopback:
+    return
+  if not ssl_enabled:
+    raise ConfigurationError(
+      (
+        "Redis authentication outside a direct literal-loopback standalone "
+        "connection requires ssl_enabled=True."
+      ),
+      setting_name="ssl_enabled",
+    )
+  if not ssl_check_hostname:
+    raise ConfigurationError(
+      (
+        "Redis authentication outside a direct literal-loopback standalone "
+        "connection requires ssl_check_hostname=True."
+      ),
+      setting_name="ssl_check_hostname",
     )
 
 
@@ -604,29 +672,19 @@ class RedisSettings(BaseSettings):
     return self
 
   @model_validator(mode="after")
-  def _validate_ssl_enabled_requires_cafile(self) -> RedisSettings:
-    """SV3-3 (M): ``ssl_enabled=True`` → require ``ssl_cafile``.
-
-    Without an explicit CA bundle, ``redis-py`` falls back to OpenSSL's
-    default verification path — which on minimal containers may be empty or
-    missing system roots, causing either an opaque ``SSL`` error at connect
-    or (worse, when ``ssl_check_hostname=False`` is also set) a silent MITM
-    risk. Fail-fast at config time: operators with self-signed certs must
-    provide their own CA file; there is no implicit opt-out.
-
-    Verified safe to raise: no existing repo fixture constructs
-    ``RedisSettings(ssl_enabled=True)`` without ``ssl_cafile`` in a way that
-    is intended to be valid (the lone ``ssl_enabled=True`` fixture in
-    ``tests/test_backend_modes.py`` sets both).
-
-    Raises:
-        ConfigurationError: if ``ssl_enabled`` is True and ``ssl_cafile`` is
-            unset/empty.
-    """
-    validate_redis_tls(
-      self.ssl_enabled,
-      self.ssl_cafile,
-      self.ssl_certfile,
-      self.ssl_keyfile,
+  def _validate_transport_security(self) -> RedisSettings:
+    """Validate TLS material and the authenticated transport boundary."""
+    validate_redis_transport_security(
+      mode=self.mode,
+      host=self.host,
+      username=self.username,
+      password=self.password,
+      sentinel_username=self.sentinel_username,
+      sentinel_password=self.sentinel_password,
+      ssl_enabled=self.ssl_enabled,
+      ssl_cafile=self.ssl_cafile,
+      ssl_certfile=self.ssl_certfile,
+      ssl_keyfile=self.ssl_keyfile,
+      ssl_check_hostname=self.ssl_check_hostname,
     )
     return self
