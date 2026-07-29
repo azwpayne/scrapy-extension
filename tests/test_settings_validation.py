@@ -80,7 +80,7 @@ class TestKafkaLiterals:
 
   @pytest.mark.parametrize(
     "value",
-    ["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"],
+    ["PLAINTEXT", "SSL", "SASL_SSL"],
   )
   def test_security_protocol_accepts_valid(self, value: str) -> None:
     """All four documented kafka-python security protocols stay valid."""
@@ -1103,15 +1103,16 @@ class TestSV3KafkaSaslRequiresSaslProtocol:
         sasl_password="p",  # type: ignore[arg-type]
       )
 
-  def test_sasl_with_sasl_plaintext_accepted(self) -> None:
-    """SASL fields + ``SASL_PLAINTEXT`` → valid."""
-    s = KafkaSettings(
-      security_protocol="SASL_PLAINTEXT",  # type: ignore[arg-type]
-      sasl_mechanism="PLAIN",
-      sasl_username="user",
-      sasl_password="secret",  # type: ignore[arg-type]
-    )
-    assert s.security_protocol == "SASL_PLAINTEXT"
+  def test_sasl_plaintext_rejected(self) -> None:
+    """Password SASL must not be configured without TLS."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      KafkaSettings(
+        security_protocol="SASL_PLAINTEXT",  # type: ignore[arg-type]
+        sasl_mechanism="PLAIN",
+        sasl_username="user",
+        sasl_password="secret",  # type: ignore[arg-type]
+      )
+    assert exc_info.value.setting_name == "security_protocol"
 
   def test_sasl_with_sasl_ssl_accepted(self) -> None:
     """SASL fields + ``SASL_SSL`` → valid (the canonical secured path)."""

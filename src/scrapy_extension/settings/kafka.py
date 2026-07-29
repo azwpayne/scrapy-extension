@@ -30,7 +30,7 @@ class KafkaMode(str, Enum):
 
 
 _KAFKA_SECURITY_PROTOCOLS = frozenset(
-  {"PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"}
+  {"PLAINTEXT", "SSL", "SASL_SSL"}
 )
 _PASSWORD_SASL_MECHANISMS = frozenset(
   {"PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"}
@@ -79,6 +79,11 @@ def validate_kafka_authentication(
       setting_name="security_protocol",
     )
   protocol = str(security_protocol)
+  if protocol == "SASL_PLAINTEXT":
+    raise ConfigurationError(
+      "SASL credentials require SASL_SSL; SASL_PLAINTEXT transmits them without TLS.",
+      setting_name="security_protocol",
+    )
   sasl_fields_set = (
     sasl_username is not None
     or sasl_password is not None
@@ -90,7 +95,7 @@ def validate_kafka_authentication(
       (
         "SASL credentials (sasl_username / sasl_password / sasl_mechanism) "
         "require a 'SASL_'-prefixed security_protocol "
-        "('SASL_PLAINTEXT' or 'SASL_SSL'); kafka-python silently ignores "
+        "('SASL_SSL'); kafka-python silently ignores "
         "the SASL fields otherwise (auth never attempted). "
         f"Got security_protocol={protocol!r}."
       ),
