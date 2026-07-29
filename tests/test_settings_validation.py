@@ -684,7 +684,7 @@ class TestMongoDBUriScheme:
     [
       "mongodb://localhost:27017",
       "mongodb+srv://cluster0.example.mongodb.net",
-      "mongodb://user:pass@host:27017/?replicaSet=rs0",
+      "mongodb://host:27017/?replicaSet=rs0",
     ],
   )
   def test_uri_accepts_valid_schemes(self, uri: str) -> None:

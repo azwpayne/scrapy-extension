@@ -289,8 +289,9 @@ class TestMongoDBBackendModes:
 
     settings = MongoDBSettings(
       mode=MongoDBMode.ATLAS,
-      uri="mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/mydb"
-      "?retryWrites=true&w=majority",
+      uri="mongodb+srv://cluster0.xxxxx.mongodb.net/mydb?retryWrites=true&w=majority",
+      username="user",
+      password="pass",  # type: ignore[arg-type]
     )
 
     mock_client_class = mocker.patch(

@@ -181,7 +181,7 @@ def test_mongodb_atlas_cluster_name_does_not_replace_srv_uri() -> None:
     (
       MongoDBMode.REPLICA_SET,
       "mongodb://alice:super-secret@mongo.internal/database",
-      "replica_set_name",
+      "uri",
     ),
   ],
 )
