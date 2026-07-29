@@ -100,6 +100,7 @@ _MonitorHook = Literal[
 ]
 _PendingMonitorEvent = tuple[_MonitorHook, tuple[object, ...]]
 _MonitorEvent = tuple[_MonitorHook, tuple[object, ...], object]
+_ContinuationDiagnostic = Literal["filter_full", "backend_error"]
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -297,6 +298,7 @@ class BackendDupeFilter:
     hook_name, args, origin_request = event
     event_token = _MonitorFenceToken(get_ident(), "event_token")
     primary: BaseException | None = None
+    monitor_failed = False
     try:
       with self._lifecycle_lock:
         request_id = id(origin_request)
@@ -314,14 +316,7 @@ class BackendDupeFilter:
         hook: Callable[..., None] = getattr(self._monitor, hook_name)
         hook(*args)
       except Exception:  # noqa: BLE001 - telemetry must not alter dedup state
-        try:
-          logger.debug("Dupefilter monitor hook raised; ignored")
-        except BaseException:
-          # The duplicate-filter decision and any reservation were already
-          # linearized before monitor delivery. A broken logging handler must
-          # not turn an advisory monitor failure into a false request failure
-          # (including process-control exceptions raised *by the handler*).
-          _diagnostic_failed = True
+        monitor_failed = True
     except BaseException as exc:
       primary = exc
     try:
@@ -358,6 +353,16 @@ class BackendDupeFilter:
         _diagnostic_failed = True
     if primary is not None:
       raise primary
+    if monitor_failed:
+      # The monitor's caught exception has now unwound. A custom logging
+      # handler therefore cannot inspect it through ``sys.exc_info()``.
+      try:
+        logger.debug("Dupefilter monitor hook raised; ignored")
+      except BaseException:
+        # The duplicate-filter decision and any reservation were already
+        # linearized before monitor delivery. A broken logging handler must
+        # not turn an advisory monitor failure into a false request failure.
+        pass
 
   def _monitor_origin_ref(self, origin_request: object) -> ReferenceType[object]:
     """Create a weak origin reference that removes an abandoned fence entry."""
@@ -418,6 +423,34 @@ class BackendDupeFilter:
       self._warn_monitor_overflow()
     if drain_token is not None:
       self._drain_monitor_events(drain_token)
+
+  @staticmethod
+  def _emit_continuation_diagnostics(
+    diagnostics: list[_ContinuationDiagnostic],
+  ) -> None:
+    """Emit fixed degradation warnings after their failure suites unwind."""
+    for diagnostic in diagnostics:
+      try:
+        if diagnostic == "filter_full":
+          logger.warning(
+            "Dedup membership filter is full (filter_full); degrading — overflow "
+            "requests will be treated as not-seen and may re-fetch. Increase the "
+            "filter capacity or switch to an exact dedup strategy "
+            "(SCRAPY_DEDUP_STRATEGY=set). This filter_full warning fires once per "
+            "process; subsequent overflows are counted via the "
+            "dupefilter/filter_full stat only."
+          )
+        else:
+          logger.warning(
+            "Dedup backend transiently unavailable; degrading — requests will be "
+            "treated as not-seen and may re-fetch until the backend recovers. This "
+            "warning fires once per process; subsequent transient backend errors "
+            "are counted via the errors/dedup stat only."
+          )
+      except BaseException:
+        # The graceful-miss outcome was already selected before reporting it.
+        # A logging handler cannot turn the advisory warning into a crawl error.
+        pass
 
   def _drain_monitor_events(self, token: _MonitorFenceToken) -> None:
     """Drain the event-enqueue-ordered FIFO as its sole consumer."""
@@ -866,6 +899,7 @@ class BackendDupeFilter:
   ) -> DedupDecision:
     """Linearize one decision and dispatch its telemetry outside locks."""
     pending_monitor_events: list[_PendingMonitorEvent] = []
+    pending_diagnostics: list[_ContinuationDiagnostic] = []
     drain_token: _MonitorFenceToken | None = None
     should_warn_overflow = False
     reservation: _DedupReservation | None = None
@@ -916,6 +950,7 @@ class BackendDupeFilter:
               fingerprint,
               encoded_fingerprint,
               pending_monitor_events,
+              pending_diagnostics,
             )
             if seen:
               assert reservation is not None  # nosec B101 - published above
@@ -927,6 +962,7 @@ class BackendDupeFilter:
               fingerprint,
               encoded_fingerprint,
               pending_monitor_events,
+              pending_diagnostics,
             )
             if reservation_state is not None:
               self._pending_reservations.add(request)
@@ -945,6 +981,7 @@ class BackendDupeFilter:
             )
             compensated_under_lock = True
           raise
+      self._emit_continuation_diagnostics(pending_diagnostics)
       self._dispatch_queued_monitor_events(
         drain_token,
         should_warn_overflow,
@@ -970,6 +1007,7 @@ class BackendDupeFilter:
     fingerprint: str,
     encoded_fingerprint: bytes,
     monitor_events: list[_PendingMonitorEvent],
+    diagnostics: list[_ContinuationDiagnostic],
   ) -> tuple[bool, Literal["added", "allowance"] | None]:
     """Check if a request has been seen before.
 
@@ -1020,7 +1058,7 @@ class BackendDupeFilter:
       # full). ``FilterFull`` is caught by TYPE (not by string-matching the
       # message), so the cuckoo layer is free to reword its message without
       # silently disabling this guard.
-      self._handle_filter_full(fingerprint, monitor_events)
+      self._handle_filter_full(fingerprint, monitor_events, diagnostics)
       return False, None
     except (BackendConnectionError, CircuitBreakerOpenError) as exc:
       # Transient-backend-error graceful degradation (Risk 4).
@@ -1038,7 +1076,7 @@ class BackendDupeFilter:
       # strictly better than crawl death. Distinct from the NotImplementedError
       # arm (unsupported backend, still raises RuntimeError) and the FilterFull
       # arm (filter at capacity).
-      self._handle_backend_error(fingerprint, exc, monitor_events)
+      self._handle_backend_error(fingerprint, exc, monitor_events, diagnostics)
       return False, None
 
     # add() returns True when the item was newly added; a duplicate maps to False.
@@ -1077,6 +1115,7 @@ class BackendDupeFilter:
     fingerprint: str,
     encoded_fingerprint: bytes,
     monitor_events: list[_PendingMonitorEvent],
+    diagnostics: list[_ContinuationDiagnostic],
   ) -> bool:
     """Read dedup state without publishing a pre-queue marker.
 
@@ -1100,6 +1139,7 @@ class BackendDupeFilter:
         fingerprint,
         exc,
         monitor_events,
+        diagnostics,
         include_miss=False,
       )
       return False
@@ -1120,6 +1160,7 @@ class BackendDupeFilter:
     if not isinstance(reservation, _DedupReservation):
       raise TypeError("invalid duplicate-filter reservation receipt")
     pending_monitor_events: list[_PendingMonitorEvent] = []
+    pending_diagnostics: list[_ContinuationDiagnostic] = []
     drain_token: _MonitorFenceToken | None = None
     should_warn_overflow = False
     with self._lifecycle_lock:
@@ -1139,12 +1180,14 @@ class BackendDupeFilter:
         self._handle_filter_full(
           reservation.fingerprint_text,
           pending_monitor_events,
+          pending_diagnostics,
         )
       except (BackendConnectionError, CircuitBreakerOpenError) as exc:
         self._handle_backend_error(
           reservation.fingerprint_text,
           exc,
           pending_monitor_events,
+          pending_diagnostics,
         )
       else:
         saturation_event: _PendingMonitorEvent | None = None
@@ -1174,6 +1217,7 @@ class BackendDupeFilter:
         reservation.request,
         pending_monitor_events,
       )
+    self._emit_continuation_diagnostics(pending_diagnostics)
     self._dispatch_queued_monitor_events(
       drain_token,
       should_warn_overflow,
@@ -1337,9 +1381,14 @@ class BackendDupeFilter:
         raise RuntimeError("dupefilter is closing or closed")
       self._pending_reservations.discard(request)
       fingerprint = self.request_fingerprint(request).encode()
+      retry_allowance_needed = False
       try:
         self._filter.remove(fingerprint)
       except NotImplementedError:
+        retry_allowance_needed = True
+      if retry_allowance_needed:
+        # ``NotImplementedError`` is no longer active when the helper emits
+        # its bounded-overflow warning.
         self._grant_retry_allowance(fingerprint)
 
   def _grant_retry_allowance(self, fingerprint: bytes) -> None:
@@ -1358,9 +1407,8 @@ class BackendDupeFilter:
     if warn_overflow:
       try:
         logger.warning(
-          "Dedup retry allowances reached the %d-entry bound; evicting the "
-          "oldest failed-push allowance",
-          self._retry_allowance_limit,
+          "Dedup retry allowances reached the configured bound; evicting the "
+          "oldest failed-push allowance."
         )
       except BaseException:
         # Allowance insertion/eviction is the linearized recovery outcome;
@@ -1390,6 +1438,7 @@ class BackendDupeFilter:
     self,
     fingerprint: str,
     monitor_events: list[_PendingMonitorEvent],
+    diagnostics: list[_ContinuationDiagnostic],
   ) -> None:
     """Degrade gracefully when the membership filter reports it is full.
 
@@ -1404,18 +1453,7 @@ class BackendDupeFilter:
     global _filter_full_warned
     if not _filter_full_warned:
       _filter_full_warned = True
-      try:
-        logger.warning(
-          "Dedup membership filter is full (filter_full); degrading — overflow "
-          "requests will be treated as not-seen and may re-fetch. Increase the "
-          "filter capacity or switch to an exact dedup strategy "
-          "(SCRAPY_DEDUP_STRATEGY=set). This filter_full warning fires once per "
-          "process; subsequent overflows are counted via the "
-          "dupefilter/filter_full stat only."
-        )
-      except BaseException:
-        # The caller must still receive the deliberately degraded miss.
-        pass
+      diagnostics.append("filter_full")
     # Count the degradation via the monitor contract — ScrapyStatsMonitor
     # increments ``dupefilter/filter_full``; NullMonitor is a no-op. Replaces
     # an earlier reach into ``self._monitor._stats`` (private attribute).
@@ -1429,6 +1467,7 @@ class BackendDupeFilter:
     fingerprint: str,
     exc: BaseException,
     monitor_events: list[_PendingMonitorEvent],
+    diagnostics: list[_ContinuationDiagnostic],
     *,
     include_miss: bool = True,
   ) -> None:
@@ -1451,18 +1490,7 @@ class BackendDupeFilter:
     global _backend_error_warned
     if not _backend_error_warned:
       _backend_error_warned = True
-      try:
-        logger.warning(
-          "Dedup backend transiently unavailable (%s); degrading — requests "
-          "will be treated as not-seen and may re-fetch until the backend "
-          "recovers. This warning fires once per process; subsequent "
-          "transient backend errors are counted via the errors/dedup stat only.",
-          type(exc).__name__,
-        )
-      except BaseException:
-        # The transient backend contract is a graceful miss, regardless of
-        # whether a logging handler can report it.
-        pass
+      diagnostics.append("backend_error")
     if type(exc) is CircuitBreakerOpenError:
       reported_error: BaseException = CircuitBreakerOpenError(
         _DEDUP_CIRCUIT_BREAKER_NAME

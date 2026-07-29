@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from weakref import ref
 
@@ -22,6 +25,51 @@ from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFi
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 from scrapy_extension.exceptions import BackendConnectionError
 from scrapy_extension.monitor.base import Monitor
+
+
+class _ExceptionContextProbeHandler(logging.Handler):
+  """Capture the interpreter state exposed to a custom logging handler."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.records: list[logging.LogRecord] = []
+    self.active_errors: list[BaseException | None] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.active_errors.append(sys.exc_info()[1])
+
+
+@contextmanager
+def _capture_diagnostics(
+  logger_name: str,
+  *,
+  level: int,
+) -> Iterator[_ExceptionContextProbeHandler]:
+  """Attach a handler while preserving the logger's previous level."""
+  source_logger = logging.getLogger(logger_name)
+  previous_level = source_logger.level
+  handler = _ExceptionContextProbeHandler()
+  source_logger.addHandler(handler)
+  source_logger.setLevel(level)
+  try:
+    yield handler
+  finally:
+    source_logger.removeHandler(handler)
+    source_logger.setLevel(previous_level)
+
+
+def _assert_handler_records_are_redacted(
+  handler: _ExceptionContextProbeHandler,
+  marker: str,
+) -> None:
+  """Assert fixed continuation diagnostics did not expose a caught failure."""
+  assert handler.records
+  assert handler.active_errors == [None] * len(handler.records)
+  assert all(marker not in record.getMessage() for record in handler.records)
+  assert all(not record.args for record in handler.records)
+  assert all(record.exc_info is None for record in handler.records)
+  assert all(record.exc_text is None for record in handler.records)
 
 
 class _SelectiveRaisingMonitor(Monitor):
@@ -499,6 +547,25 @@ def test_standalone_memory_monitor_failure_does_not_reject_insert() -> None:
   assert b"new" in membership
 
 
+def test_standalone_memory_monitor_fallback_handler_has_no_active_exception(
+  mocker: MockerFixture,
+) -> None:
+  """A saturation fallback logs after the monitor exception has unwound."""
+  marker = "round47-memory-monitor-private-marker"
+  monitor = mocker.Mock()
+  monitor.on_filter_saturation.side_effect = RuntimeError(marker)
+  membership = MemoryMembershipFilter(maxsize=1)
+  membership.set_monitor(monitor)
+
+  with _capture_diagnostics(
+    "scrapy_extension.dupefilter.filters.memory_filter",
+    level=logging.DEBUG,
+  ) as handler:
+    assert membership.add(b"new") is True
+
+  _assert_handler_records_are_redacted(handler, marker)
+
+
 @pytest.mark.parametrize(
   "diagnostic_error",
   [
@@ -526,6 +593,29 @@ def test_monitor_diagnostic_failure_does_not_reject_reservation(
 
   assert dupefilter.request_seen(request) is False
   assert dupefilter.consume_reservation(request) is True
+
+
+def test_monitor_fallback_handler_has_no_active_exception(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+) -> None:
+  """Deferred monitor delivery exits its exception handler before logging."""
+  marker = "round47-dupefilter-monitor-private-marker"
+  monitor = mocker.Mock()
+  monitor.on_dedup_miss.side_effect = RuntimeError(marker)
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=MemoryMembershipFilter(maxsize=10),
+    monitor=monitor,
+  )
+
+  with _capture_diagnostics(
+    "scrapy_extension.dupefilter.dupefilter",
+    level=logging.DEBUG,
+  ) as handler:
+    assert dupefilter.request_seen(Request("https://example.test/monitor")) is False
+
+  _assert_handler_records_are_redacted(handler, marker)
 
 
 @pytest.mark.parametrize(
@@ -567,6 +657,67 @@ def test_graceful_miss_warning_failure_preserves_degraded_decision(
 
   assert dupefilter.request_seen(request) is False
   assert dupefilter.consume_reservation(request) is False
+
+
+@pytest.mark.parametrize("degraded_path", ["filter_full", "backend_error"])
+def test_graceful_miss_warning_handler_has_no_active_exception(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+  degraded_path: str,
+) -> None:
+  """Warn-once degradation logs only after the filter failure is released."""
+  from scrapy_extension.dupefilter import dupefilter as dupefilter_module
+
+  marker = f"round47-dupefilter-{degraded_path}-private-marker"
+  membership = mocker.MagicMock(spec=MembershipFilter)
+  if degraded_path == "filter_full":
+    mocker.patch.object(dupefilter_module, "_filter_full_warned", False)
+    membership.add.side_effect = FilterFull(marker)
+  else:
+    mocker.patch.object(dupefilter_module, "_backend_error_warned", False)
+    membership.add.side_effect = BackendConnectionError(marker, backend_type=marker)
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=membership,
+  )
+
+  with _capture_diagnostics(
+    "scrapy_extension.dupefilter.dupefilter",
+    level=logging.WARNING,
+  ) as handler:
+    assert dupefilter.request_seen(Request("https://example.test/degraded")) is False
+
+  _assert_handler_records_are_redacted(handler, marker)
+
+
+def test_retry_allowance_warning_handler_has_no_active_exception(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+) -> None:
+  """A helper invoked by ``forget`` logs after its caught fallback unwinds."""
+  marker = "round47-dupefilter-allowance-private-marker"
+  membership = mocker.MagicMock(spec=MembershipFilter)
+  membership.add.return_value = True
+  membership.saturation = None
+  membership.remove.side_effect = NotImplementedError(marker)
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=membership,
+  )
+  dupefilter._retry_allowance_limit = 1
+  first = Request("https://example.test/allowance/first")
+  second = Request("https://example.test/allowance/second")
+
+  assert dupefilter.request_seen(first) is False
+  dupefilter.forget(first)
+  assert dupefilter.request_seen(second) is False
+  with _capture_diagnostics(
+    "scrapy_extension.dupefilter.dupefilter",
+    level=logging.WARNING,
+  ) as handler:
+    dupefilter.forget(second)
+
+  _assert_handler_records_are_redacted(handler, marker)
 
 
 @pytest.mark.parametrize(

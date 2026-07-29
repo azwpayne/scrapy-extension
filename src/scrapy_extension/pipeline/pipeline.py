@@ -460,6 +460,7 @@ class BackendPipeline:
         if spider is self._opened_spider:
           return
         raise RuntimeError("pipeline is already open for a different spider")
+      open_diagnostic: str | None = None
       try:
         _validate_key_name(spider.name, "spider.name")
         self.storage_strategy.open()
@@ -468,20 +469,9 @@ class BackendPipeline:
           self._storage_supported = True
         except NotImplementedError:
           self._storage_supported = False
-          _emit_diagnostic(
-            logger.warning,
-            "Backend %s does not support storage. "
-            "Pipeline will be a no-op — items will not be persisted.",
-            self.connection_manager.backend_type,
-          )
-        except BackendConnectionError as exc:
-          _emit_diagnostic(
-            logger.warning,
-            "Storage backend %s not reachable at spider open: %s. Pipeline "
-            "will retry storage lazily on each item.",
-            self.connection_manager.backend_type,
-            exc,
-          )
+          open_diagnostic = "unsupported_storage"
+        except BackendConnectionError:
+          open_diagnostic = "unreachable_storage"
       except BaseException:
         # An open failure is terminal: no Scrapy close callback is guaranteed
         # after component startup aborts, so roll back both child resources and
@@ -495,6 +485,22 @@ class BackendPipeline:
             # Diagnostics must not replace the open failure being unwound.
             pass
         raise
+      if open_diagnostic == "unsupported_storage":
+        # The expected capability exception has fully unwound. A custom handler
+        # must not recover it through ``sys.exc_info()``.
+        _emit_diagnostic(
+          logger.warning,
+          "Configured backend does not support storage; pipeline will not "
+          "persist items.",
+        )
+      elif open_diagnostic == "unreachable_storage":
+        # Keep this operational continuation static and outside its catch
+        # suite; backend types and driver messages may be sensitive.
+        _emit_diagnostic(
+          logger.warning,
+          "Storage backend not reachable at spider open; pipeline will retry "
+          "storage lazily on each item.",
+        )
       self._opened = True
       self._opened_spider = spider
       _emit_diagnostic(logger.info, "Pipeline opened for spider %s", spider.name)
@@ -629,6 +635,7 @@ class BackendPipeline:
         serializer="json",
       )
 
+    storage_failed = False
     try:
       self._store_item(key, data)
     except StorageBackpressureError:
@@ -649,6 +656,12 @@ class BackendPipeline:
       # it, so preserve their original typed failure for Scrapy/operator policy.
       raise
     except Exception:
+      # Do not invoke logging, stats, or a custom monitor from this suite: a
+      # handler can otherwise observe the raw backend failure via
+      # ``sys.exc_info()`` even when the record itself is static.
+      storage_failed = True
+
+    if storage_failed:
       reported_error = StorageError(
         _PIPELINE_STORAGE_FAILURE_MESSAGE,
         operation="store",
@@ -663,12 +676,15 @@ class BackendPipeline:
       # dupefilter — so a ScrapyStatsMonitor increments the documented
       # ``errors/store`` counter for synchronous store failures (the most common
       # storage failure mode), not just serialization + batched-flush failures.
+      monitor_failed = False
       try:
         self._monitor.on_error("store", reported_error)
       except Exception:  # noqa: BLE001 - telemetry cannot mask storage
+        monitor_failed = True
+      if monitor_failed:
         _emit_diagnostic(
           logger.debug,
-          "monitor.on_error(store) raised; ignored",
+          "Pipeline store monitor callback raised; ignored.",
         )
       # C2: opt-in loud-fail. Default (max_storage_errors=None) keeps the
       # best-effort swallow-and-stat behavior — zero compat break. When set,
@@ -685,10 +701,16 @@ class BackendPipeline:
     # their later durable backend write succeeds.
     self._consecutive_storage_errors = 0
     if not self.storage_strategy.emits_store_events:
+      monitor_failed = False
       try:
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - storage has already succeeded
-        _emit_diagnostic(logger.debug, "monitor.on_store raised; ignored")
+        monitor_failed = True
+      if monitor_failed:
+        _emit_diagnostic(
+          logger.debug,
+          "Pipeline store-success monitor callback raised; ignored.",
+        )
     _emit_diagnostic(logger.debug, "Stored item: %s", key)
     return item
 
@@ -709,10 +731,16 @@ class BackendPipeline:
     crawler = getattr(spider, "crawler", None)
     stats = getattr(crawler, "stats", None) if crawler is not None else None
     if stats is not None:
+      stats_failed = False
       try:
         stats.inc_value(stat_name)
       except Exception:  # noqa: BLE001 - stats cannot mask the pipeline result
-        _emit_diagnostic(logger.debug, "stats.inc_value raised; ignored")
+        stats_failed = True
+      if stats_failed:
+        _emit_diagnostic(
+          logger.debug,
+          "Pipeline stats collector callback raised; ignored.",
+        )
 
 
   def _generate_item_key(self, spider: Spider) -> str:

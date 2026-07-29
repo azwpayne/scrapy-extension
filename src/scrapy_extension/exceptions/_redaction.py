@@ -280,15 +280,17 @@ def serialization_error_boundary(
       del caught_error
       del raw_args
 
+      monitor_failed = False
       if monitor is not None and monitor_operation is not None:
         try:
           monitor.on_error(monitor_operation, event_error)
         except Exception:  # noqa: BLE001 - telemetry cannot mask serialization
-          if logger is not None:
-            try:
-              logger.debug("monitor.on_error(%s) raised; ignored", monitor_operation)
-            except BaseException:
-              pass
+          monitor_failed = True
+      if monitor_failed and logger is not None:
+        try:
+          logger.debug("Serialization monitor callback raised; ignored.")
+        except BaseException:
+          pass
       del monitor
       del event_error
       raise sanitized_error

@@ -103,9 +103,12 @@ class MemoryMembershipFilter(MembershipFilter):
     """Publish saturation without letting telemetry reject an insertion."""
     if self._monitor is None:
       return
+    monitor_failed = False
     try:
       self._monitor.on_filter_saturation(used, capacity)
     except Exception:  # noqa: BLE001 - telemetry must not alter filter state
+      monitor_failed = True
+    if monitor_failed:
       try:
         logger.debug("Memory filter saturation monitor hook raised; ignored")
       except BaseException:  # noqa: BLE001 - diagnostics are best effort too

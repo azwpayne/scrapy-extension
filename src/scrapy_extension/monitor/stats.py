@@ -54,9 +54,12 @@ def _stats_safe(hook: Callable[_P, None]) -> Callable[_P, None]:
 
   @functools.wraps(hook)
   def _wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
+    hook_failed = False
     try:
       hook(*args, **kwargs)
     except Exception:
+      hook_failed = True
+    if hook_failed:
       try:
         logger.debug("ScrapyStatsMonitor hook raised; ignored")
       except BaseException:

@@ -1,8 +1,11 @@
 """Tests for BackendPipeline component."""
 
 import logging
+import sys
 import traceback
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
@@ -80,6 +83,51 @@ class SampleItem(Item):
 
   name = Field()
   value = Field()
+
+
+class _ExceptionContextProbeHandler(logging.Handler):
+  """Capture the exception state visible to an application log handler."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.records: list[logging.LogRecord] = []
+    self.active_errors: list[BaseException | None] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.active_errors.append(sys.exc_info()[1])
+
+
+@contextmanager
+def _capture_diagnostics(
+  logger_name: str,
+  *,
+  level: int,
+) -> Iterator[_ExceptionContextProbeHandler]:
+  """Attach one handler without changing the logger's prior configuration."""
+  source_logger = logging.getLogger(logger_name)
+  previous_level = source_logger.level
+  handler = _ExceptionContextProbeHandler()
+  source_logger.addHandler(handler)
+  source_logger.setLevel(level)
+  try:
+    yield handler
+  finally:
+    source_logger.removeHandler(handler)
+    source_logger.setLevel(previous_level)
+
+
+def _assert_handler_records_are_redacted(
+  handler: _ExceptionContextProbeHandler,
+  marker: str,
+) -> None:
+  """Assert a continuation diagnostic exposed no caught failure to a handler."""
+  assert handler.records
+  assert handler.active_errors == [None] * len(handler.records)
+  assert all(marker not in record.getMessage() for record in handler.records)
+  assert all(not record.args for record in handler.records)
+  assert all(record.exc_info is None for record in handler.records)
+  assert all(record.exc_text is None for record in handler.records)
 
 
 class TestBackendPipelineInit:
@@ -329,6 +377,41 @@ class TestBackendPipelineOpenSpider:
     # so process_item lazily retries storage on each item.
     assert pipeline._storage_supported is None
     assert "not reachable at spider open" in caplog.text
+
+  @pytest.mark.parametrize(
+    ("failure_kind", "expected_supported"),
+    [
+      ("unsupported", False),
+      ("unreachable", None),
+    ],
+  )
+  def test_open_fallback_diagnostic_leaves_no_active_exception_for_handler(
+    self,
+    mock_connection_manager,
+    mocker,
+    failure_kind: str,
+    expected_supported: bool | None,
+  ):
+    """A caught startup blip must be gone before a warning handler runs."""
+    marker = "round47-pipeline-open-private-marker"
+    failure: BaseException = (
+      NotImplementedError(marker)
+      if failure_kind == "unsupported"
+      else BackendConnectionError(marker, backend_type=marker)
+    )
+    mock_connection_manager.get_storage_backend.side_effect = failure
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.name = "safe-spider"
+
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.WARNING,
+    ) as handler:
+      pipeline.open_spider(spider)
+
+    assert pipeline._storage_supported is expected_supported
+    _assert_handler_records_are_redacted(handler, marker)
 
   @pytest.mark.parametrize(
     ("failure", "expected_supported"),
@@ -1515,6 +1598,81 @@ class TestBackendPipelineMonitorWiring:
     assert all(marker not in record.getMessage() for record in caplog.records)
     assert all(record.exc_info is None for record in caplog.records)
 
+  def test_storage_fallback_diagnostics_leave_no_active_exception_for_handler(
+    self, mock_connection_manager, mocker
+  ):
+    """Store, monitor, and stats fallbacks run after their caught failures."""
+    marker = "round47-pipeline-store-private-marker"
+    monitor = mocker.Mock()
+    monitor.on_error.side_effect = RuntimeError(marker)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    mock_connection_manager.get_storage_backend().store.side_effect = RuntimeError(
+      marker
+    )
+    spider = mocker.Mock()
+    spider.name = "safe-spider"
+    item = SampleItem(name="safe", value=1)
+
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.DEBUG,
+    ) as handler:
+      assert pipeline.process_item(item, spider) is item
+
+    monitor.on_error.assert_called_once()
+    _assert_handler_records_are_redacted(handler, marker)
+
+  def test_stats_fallback_diagnostic_leaves_no_active_exception_for_handler(
+    self, mock_connection_manager, mocker
+  ):
+    """A custom handler cannot inspect a swallowed stats-collector failure."""
+    marker = "round47-pipeline-stats-private-marker"
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    spider = mocker.Mock()
+    spider.crawler.stats.inc_value.side_effect = RuntimeError(marker)
+
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.DEBUG,
+    ) as handler:
+      pipeline._inc_stat(spider, "pipeline/storage_errors")
+
+    _assert_handler_records_are_redacted(handler, marker)
+
+  def test_serialization_monitor_fallback_handler_has_no_active_exception(
+    self, mock_connection_manager, mocker
+  ):
+    """Monitor-fallback logging in the terminal boundary is also isolated."""
+    marker = "round47-pipeline-serialization-monitor-private-marker"
+    monitor = mocker.Mock()
+    monitor.on_error.side_effect = RuntimeError(marker)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "safe-spider"
+
+    def fail_serialization(_item: object) -> bytes:
+      raise RuntimeError(marker)
+
+    pipeline._serialize_item = fail_serialization
+
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.DEBUG,
+    ) as handler:
+      with pytest.raises(SerializationError):
+        pipeline.process_item(SampleItem(name="safe", value=1), spider)
+
+    monitor.on_error.assert_called_once()
+    _assert_handler_records_are_redacted(handler, marker)
+
   def test_on_store_failure_does_not_fail_already_persisted_item(
     self, mock_connection_manager, mocker
   ):
@@ -1532,6 +1690,44 @@ class TestBackendPipelineMonitorWiring:
 
     assert pipeline.process_item(item, spider) is item
     mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_store_success_monitor_fallback_handler_has_no_active_exception(
+    self, mock_connection_manager, mocker
+  ):
+    """A successful-store monitor fallback also logs after its catch ends."""
+    marker = "round47-pipeline-store-success-monitor-private-marker"
+    monitor = mocker.Mock()
+    monitor.on_store.side_effect = RuntimeError(marker)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "safe-spider"
+
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.DEBUG,
+    ) as handler:
+      assert pipeline.process_item(SampleItem(name="safe", value=1), spider)
+
+    observations = [
+      (record, active_error)
+      for record, active_error in zip(
+        handler.records,
+        handler.active_errors,
+        strict=True,
+      )
+      if record.getMessage() == "Pipeline store-success monitor callback raised; ignored."
+    ]
+    assert len(observations) == 1
+    record, active_error = observations[0]
+    assert active_error is None
+    assert marker not in record.getMessage()
+    assert not record.args
+    assert record.exc_info is None
+    assert record.exc_text is None
 
   def test_monitor_failure_debug_interruption_keeps_best_effort_result(
     self, mock_connection_manager, mocker
@@ -1604,6 +1800,32 @@ class TestBackendPipelineMonitorWiring:
 
     assert pipeline.process_item(item, spider) is item
     mock_connection_manager.get_storage_backend().store.assert_called_once()
+
+  def test_scrapy_stats_monitor_fallback_handler_has_no_active_exception(
+    self, mock_connection_manager, mocker
+  ):
+    """The concrete stats monitor exits its catch before logging a fallback."""
+    from scrapy_extension.monitor import ScrapyStatsMonitor
+
+    marker = "round47-pipeline-monitor-stats-private-marker"
+    stats = mocker.Mock()
+    stats.inc_value.side_effect = RuntimeError(marker)
+    monitor = ScrapyStatsMonitor(stats)
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "safe-spider"
+
+    with _capture_diagnostics(
+      "scrapy_extension.monitor.stats",
+      level=logging.DEBUG,
+    ) as handler:
+      assert pipeline.process_item(SampleItem(name="safe", value=1), spider)
+
+    _assert_handler_records_are_redacted(handler, marker)
 
   def test_monitor_control_exception_remains_observable(
     self, mock_connection_manager, mocker
