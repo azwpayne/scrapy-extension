@@ -14,6 +14,7 @@ from uuid import UUID
 from weakref import ref
 
 import pytest
+import yaml
 from pydantic import SecretStr, ValidationError
 from scrapy import Request
 from scrapy.settings import Settings
@@ -109,6 +110,27 @@ def test_ci_workflow_runs_for_pull_requests_before_merge() -> None:
 
   assert "pull_request:" in workflow
   assert "push:" in workflow
+
+
+def test_integration_ci_and_compose_share_supported_elasticsearch_contract() -> None:
+  """R49: cold CI startup budget and ES fixture version stay synchronized."""
+  repository_root = Path(__file__).resolve().parents[1]
+  workflow = yaml.safe_load(
+    (repository_root / ".github" / "workflows" / "ci.yml").read_text(
+      encoding="utf-8"
+    )
+  )
+  compose = yaml.safe_load(
+    (repository_root / "tests" / "integration" / "docker-compose.yml").read_text(
+      encoding="utf-8"
+    )
+  )
+
+  integration_job = workflow["jobs"]["integration-tests"]
+  expected_image = "docker.elastic.co/elasticsearch/elasticsearch:9.4.1"
+  assert integration_job["timeout-minutes"] == 30
+  assert integration_job["services"]["elasticsearch"]["image"] == expected_image
+  assert compose["services"]["elasticsearch"]["image"] == expected_image
 
 
 def test_ci_smoke_installs_and_imports_both_release_artifacts() -> None:

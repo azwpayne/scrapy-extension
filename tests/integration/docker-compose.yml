@@ -53,11 +53,11 @@ services:
       start_period: 10s
 
   elasticsearch:
-    # Single-node ES 8 with security disabled — integration-test fixture only.
+    # Single-node ES 9 with security disabled — integration-test fixture only.
     # Heavy image (~1.5GB); if CI bandwidth matters, consider a smaller
     # ES-compatible (e.g. OpenSearch) but the package's ElasticSearchBackend
     # uses the official elasticsearch-py client which expects ES APIs.
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.1
     container_name: scrapy-ext-es
     ports:
       - "9200:9200"

@@ -175,11 +175,11 @@ jobs:
   # the stock GitHub runner. See #44.
   integration-tests:
     runs-on: ubuntu-latest
-    # Bound the whole job. A hung broker-client op (no per-op timeout) used to
-    # bleed to GitHub Actions' 360-min default — every run since the #44 series
-    # landed as cancelled-at-6h. 15 min is generous (broker bring-up ~2 min +
-    # the integration suite under per-test --timeout below).
-    timeout-minutes: 15
+    # Bound the whole job, including GitHub's service-image initialization. A
+    # hung broker-client op (no per-op timeout) used to bleed to Actions'
+    # 360-min default; 30 min leaves cold image pulls enough headroom while
+    # retaining a hard cap for the live suite's per-test timeout below.
+    timeout-minutes: 30
     services:
       redis:
         image: redis:7
