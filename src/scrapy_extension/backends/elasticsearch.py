@@ -51,6 +51,9 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
+  set_operation_error_boundary,
+  storage_operation_error_boundary,
 )
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
 
@@ -77,6 +80,74 @@ _ELASTICSEARCH_CONNECT_SETTING_NAMES: frozenset[str] = frozenset(
     "verify_certs",
   }
 )
+_ELASTICSEARCH_OPERATION_SETTING_NAMES: frozenset[str] = frozenset({"operation"})
+_ELASTICSEARCH_QUEUE_PUSH_ERROR = "ElasticSearch queue push failed."
+_ELASTICSEARCH_QUEUE_POP_ERROR = "ElasticSearch queue pop failed."
+_ELASTICSEARCH_QUEUE_LENGTH_ERROR = "ElasticSearch queue length read failed."
+_ELASTICSEARCH_QUEUE_CLEAR_ERROR = "ElasticSearch queue clear failed."
+_ELASTICSEARCH_SET_ADD_ERROR = "ElasticSearch set add failed."
+_ELASTICSEARCH_SET_REMOVE_ERROR = "ElasticSearch set remove failed."
+_ELASTICSEARCH_SET_CONTAINS_ERROR = "ElasticSearch set membership check failed."
+_ELASTICSEARCH_SET_LENGTH_ERROR = "ElasticSearch set length read failed."
+_ELASTICSEARCH_SET_CLEAR_ERROR = "ElasticSearch set clear failed."
+_ELASTICSEARCH_SET_REQUEST_ERROR = "ElasticSearch set request was rejected."
+_ELASTICSEARCH_STORAGE_STORE_ERROR = "ElasticSearch storage store failed."
+_ELASTICSEARCH_STORAGE_RETRIEVE_ERROR = "ElasticSearch storage retrieve failed."
+_ELASTICSEARCH_STORAGE_DELETE_ERROR = "ElasticSearch storage delete failed."
+_ELASTICSEARCH_STORAGE_EXISTS_ERROR = "ElasticSearch storage existence check failed."
+_ELASTICSEARCH_STORAGE_TTL_ERROR = "ElasticSearch storage TTL read failed."
+_ELASTICSEARCH_STORAGE_CLEAR_ERROR = "ElasticSearch storage clear failed."
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct ElasticSearch queue name before terminal handling."""
+  _validate_key_name(queue_name, "queue_name")
+
+
+def _validate_set_name_argument(
+  _backend: object,
+  set_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct ElasticSearch set name before terminal handling."""
+  _validate_key_name(set_name, "set_name")
+
+
+def _validate_storage_key_argument(
+  _backend: object,
+  key: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct ElasticSearch storage key before terminal handling."""
+  _validate_key_name(key, "key")
+
+
+def _validate_store_arguments(
+  _backend: object,
+  key: str,
+  data: bytes,
+  ttl: int | None = None,
+) -> None:
+  """Validate storage write arguments before implementation frames exist."""
+  del data
+  _validate_key_name(key, "key")
+  _validate_ttl(ttl)
+
+
+def _validate_storage_prefix_argument(
+  _backend: object,
+  prefix: str | None = None,
+) -> None:
+  """Validate an optional ElasticSearch storage prefix outside the boundary."""
+  if prefix is not None:
+    _validate_key_name(prefix, "prefix")
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +514,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   # ---- Queue ----
 
+  @queue_operation_error_boundary(
+    "push",
+    _ELASTICSEARCH_QUEUE_PUSH_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to priority queue.
 
@@ -474,6 +551,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except (ApiError, TransportError) as e:
       raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
+  @queue_operation_error_boundary(
+    "pop",
+    _ELASTICSEARCH_QUEUE_POP_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
@@ -550,6 +633,24 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         raise QueueError(str(e), queue_name=queue_name, operation="pop") from e
     return None
 
+  @queue_operation_error_boundary(
+    "pop",
+    _ELASTICSEARCH_QUEUE_POP_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, None]:
+    """Pop atomically without retaining the inherited base operation frame."""
+    return (self.pop(queue_name, timeout), None)
+
+  @queue_operation_error_boundary(
+    "queue_len",
+    _ELASTICSEARCH_QUEUE_LENGTH_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
 
@@ -569,6 +670,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except (ApiError, TransportError) as e:
       raise QueueError(str(e), queue_name=queue_name, operation="queue_len") from e
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    _ELASTICSEARCH_QUEUE_CLEAR_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
 
@@ -602,6 +709,18 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     return f"{set_name}:{hashlib.sha256(item).hexdigest()}"
 
+  @configuration_error_boundary(
+    _ELASTICSEARCH_SET_REQUEST_ERROR,
+    _ELASTICSEARCH_OPERATION_SETTING_NAMES,
+    fallback_setting_name="operation",
+    pass_through_exception_types=(BackendConnectionError,),
+    catch_unexpected=False,
+  )
+  @set_operation_error_boundary(
+    _ELASTICSEARCH_SET_ADD_ERROR,
+    "elasticsearch",
+    validator=_validate_set_name_argument,
+  )
   def add(self, set_name: str, item: bytes) -> bool:
     """Add item to set.
 
@@ -638,19 +757,40 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except RequestError as e:
       if "version_conflict" in str(e).lower():
         return False
-      raise
+      raise ConfigurationError(
+        _ELASTICSEARCH_SET_REQUEST_ERROR,
+        setting_name="operation",
+      ) from e
+    except ApiError as e:
+      raise ConfigurationError(
+        _ELASTICSEARCH_SET_REQUEST_ERROR,
+        setting_name="operation",
+      ) from e
     except TransportError as e:
       # R-dupe-1 (option b): wrap transient TransportError so BackendDupeFilter's
       # graceful-degradation arm catches it (degrade to not-seen) instead of
       # crashing the crawl. ConflictError + version-conflict RequestError (the
-      # "already existed" signals) stay first. Non-conflict RequestError still
-      # re-raises (contract error, not transient). Supersedes R31-A1.
+      # "already existed" signals) stay first; other API rejections are a
+      # non-transient ConfigurationError rather than a retryable connection
+      # failure. Supersedes R31-A1.
       raise BackendConnectionError(
         f"ElasticSearch set add failed for {set_name!r}: {e}",
         backend_type="elasticsearch",
       ) from e
     return True
 
+  @configuration_error_boundary(
+    _ELASTICSEARCH_SET_REQUEST_ERROR,
+    _ELASTICSEARCH_OPERATION_SETTING_NAMES,
+    fallback_setting_name="operation",
+    pass_through_exception_types=(BackendConnectionError,),
+    catch_unexpected=False,
+  )
+  @set_operation_error_boundary(
+    _ELASTICSEARCH_SET_REMOVE_ERROR,
+    "elasticsearch",
+    validator=_validate_set_name_argument,
+  )
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.
 
@@ -669,12 +809,29 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return self._delete_by_id(
         self._active_snapshot().set_index, self._set_doc_id(set_name, item)
       )
-    except (ApiError, TransportError) as e:
+    except TransportError as e:
       raise BackendConnectionError(
         f"ElasticSearch set remove failed for {set_name!r}: {e}",
         backend_type="elasticsearch",
       ) from e
+    except ApiError as e:
+      raise ConfigurationError(
+        _ELASTICSEARCH_SET_REQUEST_ERROR,
+        setting_name="operation",
+      ) from e
 
+  @configuration_error_boundary(
+    _ELASTICSEARCH_SET_REQUEST_ERROR,
+    _ELASTICSEARCH_OPERATION_SETTING_NAMES,
+    fallback_setting_name="operation",
+    pass_through_exception_types=(BackendConnectionError,),
+    catch_unexpected=False,
+  )
+  @set_operation_error_boundary(
+    _ELASTICSEARCH_SET_CONTAINS_ERROR,
+    "elasticsearch",
+    validator=_validate_set_name_argument,
+  )
   def contains(self, set_name: str, item: bytes) -> bool:
     """Check if item is in set.
 
@@ -693,13 +850,30 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       response = self.client.exists(
         index=self._active_snapshot().set_index, id=self._set_doc_id(set_name, item)
       )
-    except (ApiError, TransportError) as e:
+    except TransportError as e:
       raise BackendConnectionError(
         f"ElasticSearch set contains failed for {set_name!r}: {e}",
         backend_type="elasticsearch",
       ) from e
+    except ApiError as e:
+      raise ConfigurationError(
+        _ELASTICSEARCH_SET_REQUEST_ERROR,
+        setting_name="operation",
+      ) from e
     return bool(response)
 
+  @configuration_error_boundary(
+    _ELASTICSEARCH_SET_REQUEST_ERROR,
+    _ELASTICSEARCH_OPERATION_SETTING_NAMES,
+    fallback_setting_name="operation",
+    pass_through_exception_types=(BackendConnectionError,),
+    catch_unexpected=False,
+  )
+  @set_operation_error_boundary(
+    _ELASTICSEARCH_SET_LENGTH_ERROR,
+    "elasticsearch",
+    validator=_validate_set_name_argument,
+  )
   def set_len(self, set_name: str) -> int:
     """Get set size.
 
@@ -715,12 +889,29 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     _validate_key_name(set_name, "set_name")
     try:
       return self._count(self._active_snapshot().set_index, "set_name", set_name)
-    except (ApiError, TransportError) as e:
+    except TransportError as e:
       raise BackendConnectionError(
         f"ElasticSearch set length failed for {set_name!r}: {e}",
         backend_type="elasticsearch",
       ) from e
+    except ApiError as e:
+      raise ConfigurationError(
+        _ELASTICSEARCH_SET_REQUEST_ERROR,
+        setting_name="operation",
+      ) from e
 
+  @configuration_error_boundary(
+    _ELASTICSEARCH_SET_REQUEST_ERROR,
+    _ELASTICSEARCH_OPERATION_SETTING_NAMES,
+    fallback_setting_name="operation",
+    pass_through_exception_types=(BackendConnectionError,),
+    catch_unexpected=False,
+  )
+  @set_operation_error_boundary(
+    _ELASTICSEARCH_SET_CLEAR_ERROR,
+    "elasticsearch",
+    validator=_validate_set_name_argument,
+  )
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
 
@@ -736,14 +927,25 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self._delete_by_term(
         self._active_snapshot().set_index, "set_name", set_name
       )
-    except (ApiError, TransportError) as e:
+    except TransportError as e:
       raise BackendConnectionError(
         f"ElasticSearch set clear failed for {set_name!r}: {e}",
         backend_type="elasticsearch",
       ) from e
+    except ApiError as e:
+      raise ConfigurationError(
+        _ELASTICSEARCH_SET_REQUEST_ERROR,
+        setting_name="operation",
+      ) from e
 
   # ---- Storage ----
 
+  @storage_operation_error_boundary(
+    "store",
+    _ELASTICSEARCH_STORAGE_STORE_ERROR,
+    "elasticsearch",
+    validator=_validate_store_arguments,
+  )
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
     """Store data with key.
 
@@ -851,9 +1053,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # handler must not turn the determined absent result into a failure.
       try:
         logger.warning(
-          "Skipping unsafe reap of expired ES storage key %r: response omitted "
-          "_seq_no/_primary_term",
-          key,
+          "Skipping unsafe reap of expired ES storage document: response omitted "
+          "_seq_no/_primary_term"
         )
       except BaseException:
         pass
@@ -876,6 +1077,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         pass
     return True
 
+  @storage_operation_error_boundary(
+    "retrieve",
+    _ELASTICSEARCH_STORAGE_RETRIEVE_ERROR,
+    "elasticsearch",
+    validator=_validate_storage_key_argument,
+  )
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
 
@@ -907,6 +1114,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return None
     return self._storage_data(source, key)
 
+  @storage_operation_error_boundary(
+    "delete",
+    _ELASTICSEARCH_STORAGE_DELETE_ERROR,
+    "elasticsearch",
+    validator=_validate_storage_key_argument,
+  )
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
@@ -927,6 +1140,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to delete key {key!r} from ElasticSearch: {e}"
       raise StorageError(msg, operation="delete", key=key) from e
 
+  @storage_operation_error_boundary(
+    "exists",
+    _ELASTICSEARCH_STORAGE_EXISTS_ERROR,
+    "elasticsearch",
+    validator=_validate_storage_key_argument,
+  )
   def exists(self, key: str) -> bool:
     """Check if a key exists and is not expired.
 
@@ -958,6 +1177,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return False
     return True
 
+  @storage_operation_error_boundary(
+    "ttl",
+    _ELASTICSEARCH_STORAGE_TTL_ERROR,
+    "elasticsearch",
+    validator=_validate_storage_key_argument,
+  )
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
 
@@ -988,6 +1213,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     remaining = (expiry - datetime.now(tz=timezone.utc)).total_seconds()
     return max(0, int(remaining))
 
+  @storage_operation_error_boundary(
+    "clear_storage",
+    _ELASTICSEARCH_STORAGE_CLEAR_ERROR,
+    "elasticsearch",
+    validator=_validate_storage_prefix_argument,
+  )
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
 

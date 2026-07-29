@@ -477,7 +477,8 @@ class TestQueue:
     with pytest.raises(BackendConnectionError) as exc_info:
       b.set_len("s")
     assert exc_info.value.backend_type == "elasticsearch"
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert str(exc_info.value) == "ElasticSearch set length read failed."
+    assert exc_info.value.__cause__ is None
 
   def test_clear_queue(self, mocker):
     b = _mock_backend(mocker)
@@ -493,9 +494,10 @@ class TestQueue:
     with pytest.raises(QueueError) as exc_info:
       b.clear_queue("q")
 
-    assert exc_info.value.queue_name == "q"
+    assert str(exc_info.value) == "ElasticSearch queue clear failed."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "clear_queue"
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert exc_info.value.__cause__ is None
 
 
 class TestSetCore:
@@ -522,9 +524,11 @@ class TestSetCore:
     b._client.delete.side_effect = _make_not_found_error()
     assert b.remove("s", b"item") is False
 
-  @pytest.mark.parametrize("error_type", [ApiError, TransportError])
-  def test_remove_wraps_backend_error(self, mocker, error_type):
-    from scrapy_extension.exceptions import BackendConnectionError
+  @pytest.mark.parametrize(
+    ("error_type", "expected_type"),
+    ((ApiError, ConfigurationError), (TransportError, BackendConnectionError)),
+  )
+  def test_remove_normalizes_backend_error(self, mocker, error_type, expected_type):
 
     b = _mock_backend(mocker)
     error = (
@@ -533,9 +537,15 @@ class TestSetCore:
       else error_type("delete failed")
     )
     b._client.delete.side_effect = error
-    with pytest.raises(BackendConnectionError) as exc_info:
+    with pytest.raises(expected_type) as exc_info:
       b.remove("s", b"item")
-    assert exc_info.value.__cause__ is error
+    assert exc_info.value.__cause__ is None
+    if expected_type is BackendConnectionError:
+      assert str(exc_info.value) == "ElasticSearch set remove failed."
+      assert exc_info.value.backend_type == "elasticsearch"
+    else:
+      assert str(exc_info.value) == "ElasticSearch set request was rejected."
+      assert exc_info.value.setting_name == "operation"
 
   def test_contains(self, mocker):
     b = _mock_backend(mocker)
@@ -550,7 +560,9 @@ class TestSetCore:
     b._client.exists.side_effect = error
     with pytest.raises(BackendConnectionError) as exc_info:
       b.contains("s", b"item")
-    assert exc_info.value.__cause__ is error
+    assert str(exc_info.value) == "ElasticSearch set membership check failed."
+    assert exc_info.value.backend_type == "elasticsearch"
+    assert exc_info.value.__cause__ is None
 
   def test_set_len(self, mocker):
     b = _mock_backend(mocker)
@@ -572,7 +584,8 @@ class TestSetCore:
       b.clear_set("s")
 
     assert exc_info.value.backend_type == "elasticsearch"
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert str(exc_info.value) == "ElasticSearch set clear failed."
+    assert exc_info.value.__cause__ is None
 
 
 class TestStorage:
@@ -737,8 +750,9 @@ class TestStorage:
     with pytest.raises(StorageError) as exc_info:
       b.retrieve("k")
 
+    assert str(exc_info.value) == "ElasticSearch storage retrieve failed."
     assert exc_info.value.operation == "retrieve"
-    assert exc_info.value.key == "k"
+    assert exc_info.value.key is None
 
   def test_delete(self, mocker):
     b = _mock_backend(mocker)
@@ -820,8 +834,9 @@ class TestStorage:
     with pytest.raises(StorageError) as exc_info:
       b.ttl("k")
 
+    assert str(exc_info.value) == "ElasticSearch storage TTL read failed."
     assert exc_info.value.operation == "ttl"
-    assert exc_info.value.key == "k"
+    assert exc_info.value.key is None
 
   def test_ttl_not_found(self, mocker):
     """R48: a missing key returns None, not -1 (distinguish absent from expired).
@@ -843,9 +858,10 @@ class TestStorage:
     with pytest.raises(StorageError) as exc_info:
       b.ttl("k")
 
+    assert str(exc_info.value) == "ElasticSearch storage TTL read failed."
     assert exc_info.value.operation == "ttl"
-    assert exc_info.value.key == "k"
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
   def test_clear_storage(self, mocker):
     b = _mock_backend(mocker)
@@ -877,9 +893,10 @@ class TestStorage:
     with pytest.raises(StorageError) as exc_info:
       b.clear_storage("items:")
 
+    assert str(exc_info.value) == "ElasticSearch storage clear failed."
     assert exc_info.value.operation == "clear_storage"
     assert exc_info.value.key is None
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert exc_info.value.__cause__ is None
 
   def test_store_wraps_transport_error_as_storage_error(self, mocker):
     """#30: ES storage ops must join the StorageError family (Mongo/Memcached/
@@ -899,10 +916,10 @@ class TestStorage:
     b._client.index.side_effect = TransportError("connection refused")
     with pytest.raises(StorageError) as ei:
       b.store("k", b"data")
+    assert str(ei.value) == "ElasticSearch storage store failed."
     assert ei.value.operation == "store"
-    assert ei.value.key == "k"
-    # The original TransportError is chained (not swallowed).
-    assert isinstance(ei.value.__cause__, TransportError)
+    assert ei.value.key is None
+    assert ei.value.__cause__ is None
 
   def test_store_wraps_api_error_as_storage_error(self, mocker):
     from scrapy_extension.exceptions import StorageError
@@ -914,9 +931,10 @@ class TestStorage:
     with pytest.raises(StorageError) as exc_info:
       b.store("k", b"data")
 
+    assert str(exc_info.value) == "ElasticSearch storage store failed."
     assert exc_info.value.operation == "store"
-    assert exc_info.value.key == "k"
-    assert exc_info.value.__cause__ is error
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
   def test_retrieve_wraps_transport_error_as_storage_error(self, mocker):
     from elasticsearch import TransportError
@@ -927,8 +945,10 @@ class TestStorage:
     b._client.get.side_effect = TransportError("timeout")
     with pytest.raises(StorageError) as ei:
       b.retrieve("k")
+    assert str(ei.value) == "ElasticSearch storage retrieve failed."
     assert ei.value.operation == "retrieve"
-    assert isinstance(ei.value.__cause__, TransportError)
+    assert ei.value.key is None
+    assert ei.value.__cause__ is None
 
   def test_delete_wraps_transport_error_as_storage_error(self, mocker):
     from elasticsearch import TransportError
@@ -939,9 +959,10 @@ class TestStorage:
     b._client.delete.side_effect = TransportError("timeout")
     with pytest.raises(StorageError) as ei:
       b.delete("k")
+    assert str(ei.value) == "ElasticSearch storage delete failed."
     assert ei.value.operation == "delete"
-    assert ei.value.key == "k"
-    assert isinstance(ei.value.__cause__, TransportError)
+    assert ei.value.key is None
+    assert ei.value.__cause__ is None
 
 
 class TestValidation:
@@ -957,8 +978,11 @@ class TestSet:
     b = _mock_backend(mocker)
     err = RequestError("400", mocker.MagicMock(), {"error": "mapper_parsing_exception"})
     b._client.index.side_effect = err
-    with pytest.raises(RequestError):
+    with pytest.raises(ConfigurationError) as exc_info:
       b.add("s", b"item")
+    assert str(exc_info.value) == "ElasticSearch set request was rejected."
+    assert exc_info.value.setting_name == "operation"
+    assert exc_info.value.__cause__ is None
 
   def test_add_new(self, mocker):
     b = _mock_backend(mocker)
@@ -1015,8 +1039,8 @@ class TestSet:
   def test_add_transport_error_wrapped(self, mocker):
     """R-dupe-1 (option b): TransportError during set add is wrapped as
     BackendConnectionError so BackendDupeFilter's graceful-degradation arm
-    catches it (degrade to not-seen) instead of crashing the crawl. The raw
-    TransportError is chained (``from e``) for diagnosis.
+    catches it (degrade to not-seen) instead of crashing the crawl. The public
+    terminal error intentionally drops the raw TransportError graph.
 
     Supersedes R31-A1's "must propagate raw" — but preserves R31-A1's core
     concern: add does NOT return False on error. Previously the broad
@@ -1037,7 +1061,8 @@ class TestSet:
     with pytest.raises(BackendConnectionError) as exc_info:
       b.add("s", b"item")
     assert exc_info.value.backend_type == "elasticsearch"
-    assert isinstance(exc_info.value.__cause__, TransportError)  # raw error chained
+    assert str(exc_info.value) == "ElasticSearch set add failed."
+    assert exc_info.value.__cause__ is None
 
 
 class TestPing:

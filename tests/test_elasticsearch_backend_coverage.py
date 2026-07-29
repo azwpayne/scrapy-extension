@@ -248,8 +248,10 @@ class TestPop:
     backend.connect()
     with pytest.raises(QueueError) as exc_info:
       backend.pop("q")
-    assert exc_info.value.queue_name == "q"
+    assert str(exc_info.value) == "ElasticSearch queue pop failed."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "pop"
+    assert exc_info.value.__cause__ is None
 
   def test_pop_api_error_wrapped_as_queue_error(self, mocker):
     """R19-A: a non-NotFound, non-Conflict ApiError subclass (auth/server/query
@@ -280,8 +282,10 @@ class TestPop:
     backend.connect()
     with pytest.raises(QueueError) as exc_info:
       backend.pop("q")
-    assert exc_info.value.queue_name == "q"
+    assert str(exc_info.value) == "ElasticSearch queue pop failed."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "pop"
+    assert exc_info.value.__cause__ is None
 
 
 class TestAdd:
@@ -290,8 +294,8 @@ class TestAdd:
   def test_add_transport_error(self, mocker):
     """R-dupe-1 (option b): a transient TransportError during set add is wrapped
     as BackendConnectionError so BackendDupeFilter's graceful-degradation arm
-    catches it (degrade to not-seen) instead of crashing the crawl. The raw
-    TransportError is chained (``from e``) for diagnosis. Supersedes R31-A1's
+    catches it (degrade to not-seen) instead of crashing the crawl. The public
+    terminal error drops the raw TransportError graph. Supersedes R31-A1's
     "must propagate" — but preserves R31-A1's core concern: add does NOT return
     False on error (no silent mis-treatment as duplicate); it raises a typed,
     catchable exception. The dupefilter degradation arm exists now and the
@@ -315,7 +319,8 @@ class TestAdd:
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.add("s", b"item")
     assert exc_info.value.backend_type == "elasticsearch"
-    assert isinstance(exc_info.value.__cause__, TransportError)  # raw error chained
+    assert str(exc_info.value) == "ElasticSearch set add failed."
+    assert exc_info.value.__cause__ is None
 
 
 class TestContains:
@@ -343,9 +348,13 @@ class TestContains:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(BackendConnectionError, match="Exists failed") as exc_info:
+    with pytest.raises(
+      BackendConnectionError,
+      match="ElasticSearch set membership check failed.",
+    ) as exc_info:
       backend.contains("s", b"item")
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert exc_info.value.backend_type == "elasticsearch"
+    assert exc_info.value.__cause__ is None
 
 
 class TestRetrieve:
@@ -362,9 +371,9 @@ class TestRetrieve:
 
     2026-07-11 (#30): retrieve now wraps TransportError as ``StorageError``
     (joining Mongo/Memcached/DynamoDB). R32-A1's *propagate, don't swallow*
-    intent is preserved — StorageError propagates (with the TransportError
-    chained as ``__cause__``); only the type changed. ``except BackendError``
-    now catches ES storage failures uniformly.
+    intent is preserved — a static StorageError propagates, while its terminal
+    boundary drops the TransportError graph. ``except BackendError`` now catches
+    ES storage failures uniformly.
     """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
@@ -381,9 +390,14 @@ class TestRetrieve:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(StorageError, match="Get failed") as ei:
+    with pytest.raises(
+      StorageError,
+      match="ElasticSearch storage retrieve failed.",
+    ) as ei:
       backend.retrieve("k")
-    assert isinstance(ei.value.__cause__, TransportError)
+    assert ei.value.operation == "retrieve"
+    assert ei.value.key is None
+    assert ei.value.__cause__ is None
 
 
 class TestExists:
@@ -400,9 +414,9 @@ class TestExists:
     R-esttl (2026-07-12): exists now uses ``get`` (not the cheap ``exists``
     HEAD) so it can lazy-reap expired docs. The TransportError is wrapped as
     ``StorageError`` (joining retrieve/delete/ttl). R33-A1's *propagate, don't
-    swallow* intent is preserved — StorageError propagates with the raw
-    TransportError chained as ``__cause__``; only the type + mock target
-    changed (exists→get).
+    swallow* intent is preserved — a static StorageError propagates and its
+    terminal boundary drops the raw TransportError graph; only the type + mock
+    target changed (exists→get).
     """
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
@@ -419,9 +433,14 @@ class TestExists:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(StorageError, match="Exists failed") as ei:
+    with pytest.raises(
+      StorageError,
+      match="ElasticSearch storage existence check failed.",
+    ) as ei:
       backend.exists("k")
-    assert isinstance(ei.value.__cause__, TransportError)
+    assert ei.value.operation == "exists"
+    assert ei.value.key is None
+    assert ei.value.__cause__ is None
 
 
 class TestTTL:
@@ -449,11 +468,14 @@ class TestTTL:
 
     backend = ElasticSearchBackend(ElasticSearchSettings())
     backend.connect()
-    with pytest.raises(StorageError, match="Get failed") as exc_info:
+    with pytest.raises(
+      StorageError,
+      match="ElasticSearch storage TTL read failed.",
+    ) as exc_info:
       backend.ttl("k")
     assert exc_info.value.operation == "ttl"
-    assert exc_info.value.key == "k"
-    assert isinstance(exc_info.value.__cause__, TransportError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
 
 class TestDeleteById:
@@ -532,5 +554,7 @@ class TestPush:
     backend.connect()
     with pytest.raises(QueueError) as exc_info:
       backend.push("q", b"data")
-    assert exc_info.value.queue_name == "q"
+    assert str(exc_info.value) == "ElasticSearch queue push failed."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "push"
+    assert exc_info.value.__cause__ is None
