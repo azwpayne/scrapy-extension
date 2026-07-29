@@ -128,7 +128,7 @@ def parse_rabbitmq_node(node: str, default_port: int) -> tuple[str, int]:
 
 def _is_loopback_host(host: str) -> bool:
   normalized = normalize_rabbitmq_host(host).lower().rstrip(".")
-  if normalized == "localhost" or normalized.endswith(".localhost"):
+  if normalized == "localhost":
     return True
   try:
     return ip_address(normalized).is_loopback

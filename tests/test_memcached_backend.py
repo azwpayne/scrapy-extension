@@ -174,6 +174,28 @@ class TestMemcachedConnect:
     assert exc_info.value.setting_name == "allow_remote_plaintext"
     client.assert_not_called()
 
+  def test_lookalike_localhost_requires_explicit_remote_plaintext_opt_in(
+    self,
+  ) -> None:
+    """A suffix hostname is DNS-controlled and not a local Memcached boundary."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedSettings(host="attacker.localhost")
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+
+  def test_connect_revalidates_mutated_lookalike_localhost_before_sdk_io(
+    self, mocker
+  ) -> None:
+    settings = MemcachedSettings()
+    settings.host = "attacker.localhost"
+    client = mocker.patch.object(memcached_mod, "MemcachedClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      MemcachedBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+    client.assert_not_called()
+
   def test_connect_revalidates_mutated_port_before_sdk_io(self, mocker) -> None:
     settings = MemcachedSettings()
     settings.port = 0

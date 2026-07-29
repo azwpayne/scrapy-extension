@@ -55,7 +55,7 @@ def normalize_memcached_host(host: object) -> str:
 def is_memcached_loopback(host: str) -> bool:
   """Return whether ``host`` is confined to the local machine."""
   normalized = normalize_memcached_host(host).lower().rstrip(".")
-  if normalized == "localhost" or normalized.endswith(".localhost"):
+  if normalized == "localhost":
     return True
   try:
     return ip_address(normalized).is_loopback

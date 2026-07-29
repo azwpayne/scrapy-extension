@@ -320,13 +320,15 @@ speculative work.
 - [x] **SEC-02B1 — RocketMQ and Redis control-plane transport.** Propagate
   authenticated RocketMQ TLS and apply Redis TLS, CA, mTLS, hostname, timeout,
   and credential policy to both Sentinel discovery and discovered masters.
-- [x] **SEC-02B2A — RabbitMQ broker transport.** Limit plaintext to all-loopback
-  endpoint sets, forbid `amqps://` downgrade, require certificate/hostname
-  verification, and bind TLS SNI to each actual cluster node.
+- [x] **SEC-02B2A — RabbitMQ broker transport.** Limit plaintext to exact
+  literal-loopback endpoint sets (not DNS suffix lookalikes), forbid `amqps://`
+  downgrade, require certificate/hostname verification, and bind TLS SNI to
+  each actual cluster node.
 - [x] **SEC-02B2B1 — authenticated Pulsar transport.** Require both certificate
   and hostname verification whenever a token is configured.
 - [x] **SEC-02B2B2 — Memcached transport boundary.** Define and enforce an
-  explicit trusted-network boundary for remote Memcached.
+  explicit trusted-network boundary for remote Memcached, with a literal-only
+  loopback classifier for the local plaintext exception.
 - [ ] **SEC-02B2B3 — authenticated Kafka transport.** Require password-based
   SASL to use `SASL_SSL` with hostname verification, reject ignored TLS
   material, and require client certificate/key pairs.

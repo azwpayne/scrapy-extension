@@ -31,6 +31,33 @@ def test_remote_plaintext_connection_is_rejected() -> None:
   assert exc_info.value.setting_name == "ssl_enabled"
 
 
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {"host": "attacker.localhost"},
+    {
+      "mode": RabbitMQMode.CLUSTER,
+      "host": "localhost",
+      "cluster_nodes": ["attacker.localhost:5672"],
+    },
+  ],
+)
+def test_lookalike_localhost_is_remote_for_plaintext_transport(settings_kwargs) -> None:
+  """Only exact localhost and literal loopback IPs receive the dev exception."""
+  secret = "lookalike-rabbitmq-secret"
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    RabbitMQSettings(
+      username="crawler",
+      password=secret,
+      **settings_kwargs,
+    )
+
+  assert exc_info.value.setting_name == "ssl_enabled"
+  assert secret not in str(exc_info.value)
+  assert secret not in repr(exc_info.value)
+
+
 def test_remote_cluster_node_requires_tls_even_with_loopback_primary() -> None:
   with pytest.raises(ConfigurationError) as exc_info:
     RabbitMQSettings(
@@ -203,6 +230,42 @@ def test_connect_revalidates_mutated_transport_before_sdk_io(mocker) -> None:
     RabbitMQBackend(settings).connect()
 
   assert exc_info.value.setting_name == "ssl_enabled"
+  blocking_connection.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("mode", "cluster_nodes"),
+  [
+    (RabbitMQMode.STANDALONE, []),
+    (RabbitMQMode.CLUSTER, ["localhost:5672"]),
+  ],
+)
+def test_connect_rejects_mutated_lookalike_localhost_before_sdk_io(
+  mocker, mode: RabbitMQMode, cluster_nodes: list[str]
+) -> None:
+  """Runtime mutation cannot reclassify a remote host as plaintext-safe."""
+  secret = "runtime-lookalike-rabbitmq-secret"
+  settings = RabbitMQSettings(
+    mode=mode,
+    host="localhost",
+    cluster_nodes=cluster_nodes,
+    username="crawler",
+    password=secret,
+  )
+  if mode is RabbitMQMode.CLUSTER:
+    settings.cluster_nodes = ["attacker.localhost:5672"]
+  else:
+    settings.host = "attacker.localhost"
+  blocking_connection = mocker.patch(
+    "scrapy_extension.backends.rabbitmq.pika.BlockingConnection"
+  )
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    RabbitMQBackend(settings).connect()
+
+  assert exc_info.value.setting_name == "ssl_enabled"
+  assert secret not in str(exc_info.value)
+  assert secret not in repr(exc_info.value)
   blocking_connection.assert_not_called()
 
 
