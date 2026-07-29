@@ -415,6 +415,7 @@ class KafkaBackend(Backend, QueueBackend):
           setting_value=mode,
         )
       snapshot = self._capture_connection_snapshot()
+      startup_error: BackendConnectionError | None = None
       try:
         if snapshot.mode == KafkaMode.STANDALONE:
           self._connect_standalone(snapshot)
@@ -426,21 +427,19 @@ class KafkaBackend(Backend, QueueBackend):
         self._log_success_diagnostic(
           "Connected to Kafka in %s mode", snapshot.mode.value
         )
-      except KafkaError as e:
+      except KafkaError:
         self._abort_partial_connect(suppress_process_control=True)
-        msg = f"Failed to connect to Kafka ({snapshot.mode.value}): {e}"
-        raise BackendConnectionError(
-          msg,
+        startup_error = BackendConnectionError(
+          f"Failed to connect to Kafka ({snapshot.mode.value}).",
           backend_type="kafka",
-        ) from e
-      except Exception as e:
+        )
+      except Exception:
         self._abort_partial_connect(suppress_process_control=True)
-        # Unexpected errors (e.g., RuntimeError from mocking in tests)
-        msg = f"Failed to connect to Kafka ({snapshot.mode.value}): {e}"
-        raise BackendConnectionError(
-          msg,
+        # Unexpected driver/plugin errors are not safe public diagnostics.
+        startup_error = BackendConnectionError(
+          f"Failed to connect to Kafka ({snapshot.mode.value}).",
           backend_type="kafka",
-        ) from e
+        )
       except BaseException:
         # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
         # arms above cannot catch them — without this arm a Ctrl+C raised in the
@@ -451,6 +450,11 @@ class KafkaBackend(Backend, QueueBackend):
         # redis ``except BaseException`` arms.
         self._abort_partial_connect(suppress_process_control=True)
         raise
+
+      if startup_error is not None:
+        # Raise outside the driver exception handler so endpoint/credential
+        # text cannot survive through ``__cause__`` or ``__context__``.
+        raise startup_error
 
   def _abort_partial_connect(self, *, suppress_process_control: bool = False) -> None:
     """Close+null any clients assigned before ``connect()`` failed.
@@ -495,7 +499,7 @@ class KafkaBackend(Backend, QueueBackend):
           # interrupt teardown of the remaining detached sibling or replace
           # that causal failure.
           try:
-            logger.debug("Failed to abort partial Kafka client", exc_info=True)
+            logger.debug("Failed to abort partial Kafka client")
           except BaseException:
             pass
         except BaseException as error:
@@ -507,22 +511,30 @@ class KafkaBackend(Backend, QueueBackend):
   def _capture_connection_snapshot(self) -> _KafkaConnectionSnapshot:
     """Copy and revalidate every setting consumed by one client generation."""
     raw_values = self.config.__dict__.copy()
+    validated: KafkaSettings | None = None
+    settings_error: ConfigurationError | None = None
     try:
       validated = KafkaSettings.model_validate(raw_values, strict=True)
     except ConfigurationError as exc:
       setting_name = exc.setting_name or "kafka"
-      raise ConfigurationError(
+      settings_error = ConfigurationError(
         f"Invalid Kafka setting '{setting_name}'.",
         setting_name=setting_name,
-      ) from None
+      )
     except ValidationError as exc:
       errors = exc.errors()
       location = errors[0].get("loc", ()) if errors else ()
       setting_name = str(location[0]) if location else "kafka"
-      raise ConfigurationError(
+      settings_error = ConfigurationError(
         f"Invalid Kafka setting '{setting_name}'.",
         setting_name=setting_name,
-      ) from None
+      )
+
+    if settings_error is not None:
+      # Raise outside the validator exception handler so raw mutated settings
+      # cannot survive through ``__cause__`` or ``__context__``.
+      raise settings_error
+    assert validated is not None
 
     if validated.enable_auto_commit is not False:
       raise ConfigurationError(
@@ -802,7 +814,7 @@ class KafkaBackend(Backend, QueueBackend):
         try:
           client.close()
         except Exception:
-          logger.debug("Ignoring Kafka client-close failure", exc_info=True)
+          logger.debug("Ignoring Kafka client-close failure")
         except BaseException as error:
           if primary_error is None:
             primary_error = error

@@ -1112,7 +1112,6 @@ class ConnectionManager:
         _log_diagnostic(
           logger.debug,
           "Backend health check failed before reconnect",
-          exc_info=True,
         )
 
       with self._lock:
@@ -1142,8 +1141,8 @@ class ConnectionManager:
     if stale_backend is not None:
       try:
         stale_backend.disconnect()
-      except Exception as exc:
-        _log_diagnostic(logger.warning, "Error disconnecting stale backend: %s", exc)
+      except Exception:
+        _log_diagnostic(logger.warning, "Error disconnecting stale backend")
       monitor_events.append(
         ("on_disconnect", (str(self.backend_type), None))
       )
@@ -1151,7 +1150,7 @@ class ConnectionManager:
     retry_attempts, retry_delay = self._retry_policy()
     total_attempts = retry_attempts + 1
 
-    last_exception: Exception | None = None
+    failed_attempt = False
     for attempt in range(total_attempts):
       try:
         self._attempt_connection()
@@ -1160,7 +1159,7 @@ class ConnectionManager:
         # network backoff. Preserve their actionable exception and avoid
         # constructing/sleeping through the remaining retry attempts.
         raise
-      except Exception as e:
+      except Exception:
         # Intentional broad catch: any backend connection error should trigger retry.
         # Backend-specific exceptions (RedisError, PyMongoError, KafkaError, AMQPError)
         # all inherit from Exception. KeyboardInterrupt/SystemExit inherit from
@@ -1168,10 +1167,10 @@ class ConnectionManager:
         # — they propagate out of the retry loop naturally. (A prior ``isinstance(e,
         # (KeyboardInterrupt, SystemExit)): raise`` here was unreachable dead code:
         # nothing caught by ``except Exception`` can be an instance of either.)
-        last_exception = e
+        failed_attempt = True
         _log_diagnostic(
           logger.warning,
-          "Connection attempt %d/%d failed: %s", attempt + 1, total_attempts, e
+          "Connection attempt %d/%d failed", attempt + 1, total_attempts
         )
         with self._lock:
           retired = self._retired
@@ -1192,15 +1191,12 @@ class ConnectionManager:
         monitor_events.append(("on_connect", (str(self.backend_type),)))
         return
 
-    if last_exception is not None:
+    if failed_attempt:
       attempt_word = "attempt" if total_attempts == 1 else "attempts"
-      msg = (
-        f"Failed to connect after {total_attempts} {attempt_word}: {last_exception}"
-      )
       raise BackendConnectionError(
-        msg,
+        f"Failed to connect after {total_attempts} {attempt_word}.",
         backend_type=str(self.backend_type),
-      ) from last_exception
+      )
 
   def _retry_policy(self) -> tuple[int, float]:
     """Normalize and validate generic connection retry controls.
@@ -1329,12 +1325,12 @@ class ConnectionManager:
     # the successful handle instead of resurrecting an evicted manager.
     try:
       backend.disconnect()
-    except BaseException as exc:  # noqa: BLE001 - preserve the causal release error
+    except BaseException:  # noqa: BLE001 - teardown remains best-effort
       # This teardown is best-effort.  In particular, a control-flow signal
       # from a broken backend must not replace the typed error which explains
       # why the successful connection was discarded.
       try:
-        logger.warning("Error disconnecting released backend: %s", exc)
+        logger.warning("Error disconnecting released backend")
       except BaseException:
         # Diagnostics are also best-effort: a custom logging handler can raise
         # a control-flow signal, but close winning the publication race remains
@@ -1412,11 +1408,11 @@ class ConnectionManager:
       # it as live during disconnect.
       backend.disconnect()
       _log_diagnostic(logger.debug, "Disconnected from %s", self.backend_type)
-    except Exception as e:
+    except Exception:
       # Broad catch — mirrors R25-A1's connect-path cleanup. Registry eviction
       # and state detachment are already complete, so teardown errors remain
       # observable without breaking the caller's close chain.
-      _log_diagnostic(logger.warning, "Error during disconnect: %s", e)
+      _log_diagnostic(logger.warning, "Error during disconnect")
 
     # Lifecycle callbacks are user code. Dispatch after both registry and
     # manager locks are released so re-entry observes the terminal state and
@@ -1477,7 +1473,6 @@ class ConnectionManager:
         logger.debug,
         "Monitor.%s raised; ignored",
         hook_name,
-        exc_info=True,
       )
 
   def _dispatch_monitor_events(self, events: list[_MonitorEvent]) -> None:

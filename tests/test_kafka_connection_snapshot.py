@@ -98,6 +98,8 @@ def test_connect_rejects_runtime_tls_hostname_downgrade_before_sdk_io(
   assert exc_info.value.setting_name == "ssl_check_hostname"
   assert "runtime-kafka-secret" not in str(exc_info.value)
   assert "runtime-kafka-secret" not in repr(exc_info.value)
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   producer.assert_not_called()
   admin.assert_not_called()
 

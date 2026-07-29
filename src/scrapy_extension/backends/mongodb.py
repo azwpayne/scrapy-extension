@@ -378,6 +378,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       journal=snapshot.journal,
       w_timeout_ms=snapshot.w_timeout_ms,
     )
+    startup_error: BackendConnectionError | None = None
     try:
       if snapshot.mode == MongoDBMode.STANDALONE:
         self._connect_standalone(snapshot, marker_options)
@@ -387,30 +388,38 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._connect_sharded_cluster(snapshot, marker_options)
       else:
         self._connect_atlas(snapshot, marker_options)
-    except ConnectionFailure as e:
+    except ConnectionFailure:
       self._discard_client(suppress_process_control=True)
-      msg = f"Failed to connect to MongoDB ({snapshot.mode.value}): {e}"
-      raise BackendConnectionError(
-        msg,
+      startup_error = BackendConnectionError(
+        f"Failed to connect to MongoDB ({snapshot.mode.value}).",
         backend_type="mongodb",
-      ) from e
+      )
     except BackendConnectionError:
       self._discard_client(suppress_process_control=True)
-      raise
+      # Marker/setup helpers may retain a driver cause. The public startup
+      # boundary must not re-expose that exception graph.
+      startup_error = BackendConnectionError(
+        f"Failed to connect to MongoDB ({snapshot.mode.value}).",
+        backend_type="mongodb",
+      )
     except ConfigurationError:
       self._discard_client(suppress_process_control=True)
       raise
-    except Exception as e:
+    except Exception:
       self._discard_client(suppress_process_control=True)
-      # Unexpected errors (e.g., RuntimeError from mocking in tests)
-      msg = f"Failed to connect to MongoDB ({snapshot.mode.value}): {e}"
-      raise BackendConnectionError(
-        msg,
+      # Unexpected driver/plugin errors are not safe public diagnostics.
+      startup_error = BackendConnectionError(
+        f"Failed to connect to MongoDB ({snapshot.mode.value}).",
         backend_type="mongodb",
-      ) from e
+      )
     except BaseException:
       self._discard_client(suppress_process_control=True)
       raise
+
+    if startup_error is not None:
+      # Raise outside the driver exception handler so endpoint/credential text
+      # cannot survive through ``__cause__`` or ``__context__``.
+      raise startup_error
 
     # The complete client graph is now published.  Success diagnostics must
     # not turn that completed generation into a failed connection attempt.
@@ -433,7 +442,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           client.close()
         except Exception:
           try:
-            logger.debug("Failed to close MongoDB client", exc_info=True)
+            logger.debug("Failed to close MongoDB client")
           except BaseException:
             # A close failure is already best-effort here.  Its diagnostic
             # must not turn ordinary disconnect into a process-control
@@ -444,10 +453,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           if not suppress_process_control:
             raise
           try:
-            logger.debug(
-              "Process-control interruption while closing failed MongoDB client",
-              exc_info=True,
-            )
+            logger.debug("Process-control interruption while closing failed MongoDB client")
           except BaseException:
             # Failed-connect cleanup must never replace the original exception.
             pass
@@ -1229,13 +1235,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self._storage_collection.delete_one(
         {"key": key, "expireAt": document["expireAt"]}
       )
-    except PyMongoError as e:
+    except PyMongoError:
       # The expired snapshot is already logically absent and the caught
       # ordinary delete failure is best-effort.  Keep diagnostics from changing
       # that result; direct control exceptions from ``delete_one`` are not
       # caught by this PyMongoError arm.
       try:
-        logger.warning("Failed to reap expired MongoDB storage key %r: %s", key, e)
+        logger.warning("Failed to reap expired MongoDB storage key")
       except BaseException:
         pass
     return True

@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from types import ModuleType
 from typing import cast
@@ -705,7 +706,8 @@ def test_connect_failure_keeps_primary_when_abort_logging_is_interrupted(mocker)
   with pytest.raises(BackendConnectionError) as raised:
     backend.connect()
 
-  assert raised.value.__cause__ is startup_error
+  assert raised.value.__cause__ is None
+  assert raised.value.__context__ is None
   mock_consumer_cls.return_value.shutdown.assert_called_once_with()
   mock_producer_cls.return_value.shutdown.assert_called_once_with()
   assert backend._producer is None
@@ -717,8 +719,8 @@ def test_connect_consumer_startup_baseexception_cleans_both_clients(mocker) -> N
 
   A ``KeyboardInterrupt`` / ``SystemExit`` raised by ``consumer.startup()``
   (after the producer is assigned and started) is NOT an ``Exception``
-  subclass, so the ``except BackendConnectionError`` / ``except Exception``
-  arms cannot catch it. Without an ``except BaseException`` arm both clients
+  subclass, so the ``except Exception`` arm cannot catch it. Without an
+  ``except BaseException`` arm both clients
   leak and the backend wedges. Mirrors the kafka BaseException arm and the
   mongodb/es ``except BaseException`` cleanup pattern.
   """
@@ -749,15 +751,41 @@ def test_connect_unexpected_exception(mocker) -> None:
     _,
     _,
   ) = _patch_rocketmq(mocker)
+  marker = "rocketmq-driver-secret"
   mock_producer_cls.return_value.startup.side_effect = RuntimeError(
-    "do-not-leak"
+    f"driver dump included {marker}"
   )
   backend = RocketMQBackend(RocketMQSettings())
 
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
   assert "Failed to connect to RocketMQ" in str(exc_info.value)
-  assert "do-not-leak" not in str(exc_info.value)
+  assert marker not in str(exc_info.value)
+  assert marker not in repr(exc_info.value.__dict__)
+  assert marker not in "".join(traceback.format_exception(exc_info.value))
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
+
+
+def test_connect_backend_error_does_not_retain_driver_diagnostics(mocker) -> None:
+  mock_producer_cls, _, _, _, _ = _patch_rocketmq(mocker)
+  marker = "rocketmq-backend-secret"
+  mock_producer_cls.return_value.startup.side_effect = BackendConnectionError(
+    f"custom client diagnostic included {marker}", backend_type="custom"
+  )
+  backend = RocketMQBackend(RocketMQSettings())
+
+  with pytest.raises(BackendConnectionError) as exc_info:
+    backend.connect()
+
+  assert marker not in str(exc_info.value)
+  assert marker not in repr(exc_info.value.__dict__)
+  assert marker not in "".join(traceback.format_exception(exc_info.value))
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
+  mock_producer_cls.return_value.shutdown.assert_called_once()
+  assert backend._producer is None
+  assert backend._consumer is None
 
 
 # ---------------------------------------------------------------------------

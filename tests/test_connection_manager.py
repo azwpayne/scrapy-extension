@@ -1205,12 +1205,9 @@ def test_owner_connect_failure_signals_all_peer_waiters(mocker):
     f"finally block. results={results}"
   )
 
-  # Every worker must have received a BackendConnectionError (re-raised by
-  # the owner path) — never a silent success and never a different exception
-  # type. ``connect()``'s retry loop wraps the raw ``connect_error`` as
-  # "Failed to connect after N attempts: ...", so we assert TYPE equality +
-  # chain identity (the original ``connect_error`` is preserved in ``__cause__``
-  # or the wrapped message) rather than instance identity.
+  # Every worker must receive one typed, sanitized retry-exhaustion error —
+  # never a silent success, a different exception type, or the owner's raw
+  # backend diagnostic in an exception chain.
   assert len(errors) == 4, (
     f"expected 4 errors (one per worker), got {len(errors)}; results={results}"
   )
@@ -1218,18 +1215,9 @@ def test_owner_connect_failure_signals_all_peer_waiters(mocker):
     assert isinstance(exc, BackendConnectionError), (
       f"peer received a non-BackendConnectionError: got {exc!r}"
     )
-    # The owner's raw connect_error must be visible somewhere in the chain
-    # (it is the __cause__ of the wrapped retry-loop exception, or the
-    # exception message itself).
-    chain_text = ""
-    cur: BaseException | None = exc
-    while cur is not None:
-      chain_text += f"{cur}\n"
-      cur = cur.__cause__
-    assert "simulated owner connect failure" in chain_text, (
-      f"owner's original error not preserved in peer's exception chain: "
-      f"{chain_text}"
-    )
+    assert "simulated owner connect failure" not in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
 
   # The event must be set (the finally ran) — otherwise a later waiter would
   # hang on the next ``get_queue_backend()`` call.

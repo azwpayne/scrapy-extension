@@ -207,14 +207,20 @@ class RocketMQBackend(Backend, QueueBackend):
       )
     )
 
+    missing_dependency = False
     try:
       from rocketmq import ClientConfiguration, Credentials, Producer, SimpleConsumer
     except ImportError as e:
       if not _is_missing_optional_dependency(e, "rocketmq"):
         raise
-      msg = f"rocketmq-python-client not installed: {e}"
-      raise BackendConnectionError(msg, backend_type="rocketmq") from e
+      missing_dependency = True
+    if missing_dependency:
+      raise BackendConnectionError(
+        "rocketmq-python-client not installed.", backend_type="rocketmq"
+      )
 
+    startup_error: BackendConnectionError | None = None
+    invariant_error: BackendConnectionError | None = None
     try:
       # Credentials: empty Credentials() for no-auth (the broker fixture runs
       # with auth disabled); Credentials(ak, sk) when both are provided.
@@ -239,31 +245,35 @@ class RocketMQBackend(Backend, QueueBackend):
 
       self._producer = Producer(config_obj, tls_enable=tls_enabled)
       if self._producer is None:
-        msg = "RocketMQBackend producer initialization returned None"
-        raise BackendConnectionError(msg, backend_type="rocketmq")
-      self._producer.startup()
+        invariant_error = BackendConnectionError(
+          "RocketMQBackend producer initialization returned None",
+          backend_type="rocketmq",
+        )
+      else:
+        self._producer.startup()
 
-      # The client defaults await_duration to 20 seconds, so initialize it to
-      # zero; each receive replaces it with the requested duration clamped to
-      # RocketMQ Proxy's five-second server floor.
-      self._consumer = SimpleConsumer(
-        config_obj,
-        consumer_group,
-        await_duration=0,
-        tls_enable=tls_enabled,
+        # The client defaults await_duration to 20 seconds, so initialize it to
+        # zero; each receive replaces it with the requested duration clamped to
+        # RocketMQ Proxy's five-second server floor.
+        self._consumer = SimpleConsumer(
+          config_obj,
+          consumer_group,
+          await_duration=0,
+          tls_enable=tls_enabled,
+        )
+        if self._consumer is None:
+          invariant_error = BackendConnectionError(
+            "RocketMQBackend consumer initialization returned None",
+            backend_type="rocketmq",
+          )
+        else:
+          self._consumer.startup()
+          self._consumer_generation += 1
+    except Exception:
+      self._abort_partial_connect()
+      startup_error = BackendConnectionError(
+        "Failed to connect to RocketMQ.", backend_type="rocketmq"
       )
-      if self._consumer is None:
-        msg = "RocketMQBackend consumer initialization returned None"
-        raise BackendConnectionError(msg, backend_type="rocketmq")
-      self._consumer.startup()
-      self._consumer_generation += 1
-    except BackendConnectionError:
-      self._abort_partial_connect()
-      raise
-    except Exception as e:
-      self._abort_partial_connect()
-      msg = "Failed to connect to RocketMQ."
-      raise BackendConnectionError(msg, backend_type="rocketmq") from e
     except BaseException:
       # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
       # arms above cannot catch them — without this arm a Ctrl+C raised after
@@ -275,12 +285,23 @@ class RocketMQBackend(Backend, QueueBackend):
       self._abort_partial_connect()
       raise
 
+    if invariant_error is not None:
+      # These local contract violations use fixed text, so preserve their
+      # existing public diagnostics while still raising outside any handler.
+      self._abort_partial_connect()
+      startup_error = invariant_error
+
+    if startup_error is not None:
+      # Raise outside the driver exception handler so endpoint/credential text
+      # cannot survive through ``__cause__`` or ``__context__``.
+      raise startup_error
+
     # A complete producer/consumer pair is live once the generation advances.
     # Diagnostics after that publication are strictly observational: an
     # extension logger is allowed to fail (including with a control exception)
     # without treating the published clients as an aborted private candidate.
     try:
-      logger.debug("Connected to RocketMQ proxy at %s", namesrv_address)
+      logger.debug("Connected to RocketMQ proxy")
     except BaseException:
       pass
 
@@ -331,7 +352,7 @@ class RocketMQBackend(Backend, QueueBackend):
   ) -> None:
     """Shut down every detached client, retaining the first control exception."""
     primary_error: BaseException | None = None
-    for closer, label in clients:
+    for closer, _label in clients:
       if closer is not None:
         try:
           closer.shutdown()
@@ -342,11 +363,9 @@ class RocketMQBackend(Backend, QueueBackend):
           # failed-connect error that caused this abort.
           try:
             if suppress_control_errors:
-              logger.debug("Failed to abort partial RocketMQ client", exc_info=True)
+              logger.debug("Failed to abort partial RocketMQ client")
             else:
-              logger.warning(
-                "RocketMQ %s shutdown raised; ignoring", label, exc_info=True
-              )
+              logger.warning("RocketMQ client shutdown raised; ignoring")
           except BaseException:
             pass
         except BaseException as error:

@@ -1,3 +1,4 @@
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -890,7 +891,7 @@ def test_mongodb_disconnect_preserves_best_effort_close_when_diagnostic_fails(
   backend.disconnect()
 
   client.close.assert_called_once_with()
-  log.assert_called_once_with("Failed to close MongoDB client", exc_info=True)
+  log.assert_called_once_with("Failed to close MongoDB client")
   assert backend._client is None
   assert backend._db is None
   assert backend._queue_collection is None
@@ -1327,7 +1328,10 @@ def test_mongodb_backend_connect_connection_failure(mocker):
   backend = MongoDBBackend(config)
 
   mock_instance = mocker.MagicMock()
-  mock_instance.admin.command.side_effect = ConnectionFailure("network error")
+  marker = "mongodb-driver-secret"
+  mock_instance.admin.command.side_effect = ConnectionFailure(
+    f"network error included {marker}"
+  )
   mocker.patch(
     "scrapy_extension.backends.mongodb.MongoClient", return_value=mock_instance
   )
@@ -1335,6 +1339,11 @@ def test_mongodb_backend_connect_connection_failure(mocker):
   with pytest.raises(BackendConnectionError) as exc_info:
     backend.connect()
   assert exc_info.value.backend_type == "mongodb"
+  assert marker not in str(exc_info.value)
+  assert marker not in repr(exc_info.value.__dict__)
+  assert marker not in "".join(traceback.format_exception(exc_info.value))
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   assert backend._client is None
   assert backend._db is None
   assert backend._queue_collection is None

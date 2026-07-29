@@ -134,6 +134,7 @@ class MemcachedBackend(Backend, StorageBackend):
         generation = self._lifecycle_generation
       snapshot = self._capture_connection_snapshot()
       candidate: Any = None
+      startup_error: BackendConnectionError | None = None
       try:
         # pymemcache defaults ``default_noreply=True``. In that mode set,
         # delete, and flush can return success after only writing the command
@@ -147,9 +148,9 @@ class MemcachedBackend(Backend, StorageBackend):
       except Exception:
         if candidate is not None:
           _close_failed_candidate(candidate)
-        raise BackendConnectionError(
+        startup_error = BackendConnectionError(
           "Failed to connect to Memcached.", backend_type="memcached"
-        ) from None
+        )
       except BaseException:
         # R17-C: a Ctrl+C/SystemExit during the stats() probe (the first command
         # to open the TCP socket — pymemcache is lazy) must still close the
@@ -162,6 +163,10 @@ class MemcachedBackend(Backend, StorageBackend):
         if candidate is not None:
           _close_failed_candidate(candidate)
         raise
+      if startup_error is not None:
+        # Raise outside the driver exception handler so endpoint/credential
+        # text cannot survive through ``__cause__`` or ``__context__``.
+        raise startup_error
       with self._operation_lock:
         with self._lifecycle_lock:
           # A concurrent disconnect fences this private probe by advancing the
@@ -413,7 +418,7 @@ class _swallow:
     # must not turn a best-effort disconnect (or stale private-candidate
     # release) into a control-flow interruption when a logging handler fails.
     try:
-      logger.debug("Suppressed memcached cleanup error: %s", exc)
+      logger.debug("Suppressed memcached cleanup error")
     except BaseException:
       pass
     return True

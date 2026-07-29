@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -99,7 +100,8 @@ def test_candidate_is_private_until_ready_and_failure_closes_it(mocker) -> None:
   resource, table = _resource(mocker)
   entered = threading.Event()
   release = threading.Event()
-  failure = RuntimeError("load failed")
+  marker = "dynamodb-driver-secret"
+  failure = RuntimeError(f"load failed with {marker}")
 
   def blocked_load() -> None:
     entered.set()
@@ -123,7 +125,11 @@ def test_candidate_is_private_until_ready_and_failure_closes_it(mocker) -> None:
   assert table_while_preparing is None
   assert len(errors) == 1
   assert isinstance(errors[0], BackendConnectionError)
-  assert errors[0].__cause__ is failure
+  assert errors[0].__cause__ is None
+  assert errors[0].__context__ is None
+  assert marker not in str(errors[0])
+  assert marker not in repr(errors[0].__dict__)
+  assert marker not in "".join(traceback.format_exception(errors[0]))
   resource.meta.client.close.assert_called_once_with()
 
 
@@ -173,7 +179,8 @@ def test_build_failure_keeps_primary_error_when_candidate_close_is_interrupted(
   with pytest.raises(BackendConnectionError) as raised:
     backend.connect()
 
-  assert raised.value.__cause__ is failure
+  assert raised.value.__cause__ is None
+  assert raised.value.__context__ is None
   resource.meta.client.close.assert_called_once_with()
   assert backend.is_connected() is False
 
@@ -193,11 +200,10 @@ def test_build_failure_keeps_primary_error_when_aborted_close_diagnostic_interru
   with pytest.raises(BackendConnectionError) as raised:
     backend.connect()
 
-  assert raised.value.__cause__ is failure
+  assert raised.value.__cause__ is None
+  assert raised.value.__context__ is None
   resource.meta.client.close.assert_called_once_with()
-  debug.assert_called_once_with(
-    "Suppressed aborted DynamoDB resource close error: %s", mocker.ANY
-  )
+  debug.assert_called_once_with("Suppressed aborted DynamoDB resource close error")
   assert backend.is_connected() is False
 
 
@@ -267,7 +273,7 @@ def test_disconnect_suppresses_ordinary_close_diagnostic_interrupt(
   backend.disconnect()
 
   resource.meta.client.close.assert_called_once_with()
-  debug.assert_called_once_with("Suppressed DynamoDB resource close error: %s", mocker.ANY)
+  debug.assert_called_once_with("Suppressed DynamoDB resource close error")
   assert backend._generation is None
   assert backend._resource is None
   assert backend._table is None
@@ -586,7 +592,8 @@ def test_existing_transitional_table_is_private_until_waiter_succeeds(
   assert connected_while_waiting is False
   assert len(errors) == 1
   assert isinstance(errors[0], BackendConnectionError)
-  assert errors[0].__cause__ is failure
+  assert errors[0].__cause__ is None
+  assert errors[0].__context__ is None
   resource.meta.client.close.assert_called_once_with()
 
 

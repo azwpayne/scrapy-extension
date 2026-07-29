@@ -252,14 +252,14 @@ class RabbitMQBackend(Backend, QueueBackend):
       try:
         channel.close()
       except Exception:
-        logger.debug("Ignoring RabbitMQ channel-close failure", exc_info=True)
+        logger.debug("Ignoring RabbitMQ channel-close failure")
       except BaseException as exc:
         primary_error = exc
     if connection is not None and connection is not keep_connection:
       try:
         connection.close()
       except Exception:
-        logger.debug("Ignoring RabbitMQ connection-close failure", exc_info=True)
+        logger.debug("Ignoring RabbitMQ connection-close failure")
       except BaseException as exc:
         if primary_error is None:
           primary_error = exc
@@ -506,6 +506,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._ssl_warning_emitted = True
       candidate: _RabbitMQCandidate | None = None
       published = False
+      startup_error: BackendConnectionError | None = None
       try:
         if snapshot.mode == RabbitMQMode.STANDALONE:
           candidate = self._connect_standalone(snapshot)
@@ -519,11 +520,15 @@ class RabbitMQBackend(Backend, QueueBackend):
         with self._delivery_lock:
           if request_epoch != self._lifecycle_epoch:
             return
-        msg = f"Failed to connect to RabbitMQ ({snapshot.mode.value})"
-        raise BackendConnectionError(
-          msg,
+        startup_error = BackendConnectionError(
+          f"Failed to connect to RabbitMQ ({snapshot.mode.value})",
           backend_type="rabbitmq",
-        ) from None
+        )
+
+      if startup_error is not None:
+        # Raise outside the driver exception handler so endpoint/credential
+        # text cannot survive through ``__cause__`` or ``__context__``.
+        raise startup_error
 
       try:
         with self._retirement_lock:

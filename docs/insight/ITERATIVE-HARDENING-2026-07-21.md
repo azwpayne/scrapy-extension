@@ -374,10 +374,10 @@ speculative work.
   construct a generation from values that were never jointly validated. Begin
   with Memcached endpoint plus destructive-remote policy and carry the same
   invariant through SQS, DynamoDB, RabbitMQ, Pulsar, and RocketMQ.
-- [ ] **CONN-SEC-01 — static connection-manager diagnostics.** Do not interpolate
+- [x] **CONN-SEC-01 — static connection-manager diagnostics.** Do not interpolate
   arbitrary backend exception text or attach raw tracebacks to public manager
-  errors and ordinary logs; preserve the original exception as the cause while
-  emitting only static, non-secret-bearing context.
+  errors and ordinary logs. Raise the static public error outside its handler,
+  so neither `__cause__` nor `__context__` retains a raw driver diagnostic.
 - [x] **TRANSPORT-01 — Pulsar TLS SDK contract.** Use the keyword names accepted
   by the locked Pulsar client, propagate hostname validation, and prove the TLS
   branch with a real-signature smoke test.

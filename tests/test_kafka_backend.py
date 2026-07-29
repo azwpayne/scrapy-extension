@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from threading import Event, Thread
 
 import pytest
@@ -268,15 +269,21 @@ class TestKafkaBackendConnect:
     """Test connect raises BackendConnectionError on generic Exception."""
     config = KafkaSettings()
     backend = KafkaBackend(config)
+    marker = "kafka-driver-secret"
 
     mocker.patch(
       "scrapy_extension.backends.kafka.KafkaProducer",
-      side_effect=RuntimeError("Unexpected error"),
+      side_effect=RuntimeError(f"Unexpected error included {marker}"),
     )
 
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
     assert "Failed to connect to Kafka" in str(exc_info.value)
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.__dict__)
+    assert marker not in "".join(traceback.format_exception(exc_info.value))
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_connect_admin_client_failure_nulls_producer_no_wedge(self, mocker):
     """R-kacc: admin-client failure AFTER producer assigned must not wedge.

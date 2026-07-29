@@ -366,3 +366,4 @@ def test_startup_error_traceback_does_not_echo_driver_secrets(mocker) -> None:
   assert "rabbit-secret" not in str(exc_info.value)
   assert "rabbit-secret" not in rendered
   assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None

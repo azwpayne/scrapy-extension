@@ -256,13 +256,13 @@ class DynamoDBBackend(Backend, StorageBackend):
       return
     try:
       resource.meta.client.close()
-    except Exception as exc:
+    except Exception:
       # Closing a retired resource is best-effort. A logging handler is also
       # diagnostic-only here, so it cannot turn an ordinary close failure into
       # a lifecycle control failure. Do not cover ``close()`` itself: direct
       # KeyboardInterrupt/SystemExit remains observable to the caller.
       try:
-        logger.debug("Suppressed DynamoDB resource close error: %s", exc)
+        logger.debug("Suppressed DynamoDB resource close error")
       except BaseException:
         pass
 
@@ -277,12 +277,12 @@ class DynamoDBBackend(Backend, StorageBackend):
     """
     try:
       cls._close_resource(resource)
-    except BaseException as exc:
+    except BaseException:
       # This diagnostic runs after construction/publication has already failed.
       # A user logging handler can itself raise a control exception, which must
       # not replace that causal failure while the candidate remains private.
       try:
-        logger.debug("Suppressed aborted DynamoDB resource close error: %s", exc)
+        logger.debug("Suppressed aborted DynamoDB resource close error")
       except BaseException:
         pass
 
@@ -542,21 +542,29 @@ class DynamoDBBackend(Backend, StorageBackend):
         if self._generation is not None:
           return
       snapshot, resource_kwargs = self._capture_connection_snapshot()
+      candidate: _DynamoDBGeneration | None = None
+      startup_error: BackendConnectionError | None = None
       try:
         candidate = self._build_candidate(
           snapshot, resource_kwargs, request_epoch
         )
       except _DynamoDBConnectCancelled:
         return
-      except Exception as exc:
+      except Exception:
         # Teardown intentionally cancels an in-progress connection attempt.
         # A late SDK failure from that stale attempt is not a new live error.
         with self._operation_lock:
           if request_epoch != self._lifecycle_epoch:
             return
-        raise BackendConnectionError(
+        startup_error = BackendConnectionError(
           "Failed to connect to DynamoDB.", backend_type="dynamodb"
-        ) from exc
+        )
+
+      if startup_error is not None:
+        # Raise outside the SDK exception handler so endpoint/credential text
+        # cannot survive through ``__cause__`` or ``__context__``.
+        raise startup_error
+      assert candidate is not None
 
       try:
         with self._operation_lock:
@@ -1024,7 +1032,7 @@ class _swallow:
     # suppressed even if a diagnostic logging handler raises a control error;
     # direct BaseException from delete_item returned above remains observable.
     try:
-      logger.debug("Suppressed dynamodb cleanup error: %s", exc)
+      logger.debug("Suppressed dynamodb cleanup error")
     except BaseException:
       pass
     return True

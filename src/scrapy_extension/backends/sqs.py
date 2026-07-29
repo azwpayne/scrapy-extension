@@ -428,6 +428,7 @@ class SqsBackend(Backend, QueueBackend):
       snapshot, kwargs = self._capture_connection_snapshot()
       candidate: Any | None = None
       generation: _SqsClientGeneration | None = None
+      startup_error: BackendConnectionError | None = None
       try:
         # The module-level boto3.client() alias shares boto3's process-wide
         # default Session, which is not safe for concurrent client creation.
@@ -461,9 +462,13 @@ class SqsBackend(Backend, QueueBackend):
             pass
         if not isinstance(error, Exception):
           raise
-        raise BackendConnectionError(
-          f"Failed to create SQS client: {error}", backend_type="sqs"
-        ) from error
+        startup_error = BackendConnectionError(
+          "Failed to create SQS client.", backend_type="sqs"
+        )
+      if startup_error is not None:
+        # Raise outside the driver exception handler so endpoint/credential
+        # text cannot survive through ``__cause__`` or ``__context__``.
+        raise startup_error
       # Publication is the linearization point.  A success diagnostic runs
       # strictly after that point, so even a control-flow failure from a
       # logging extension must not make ``connect`` report failure or discard
@@ -1262,7 +1267,7 @@ class _swallow:
     # suppress.  A failing logging handler must not turn that ordinary cleanup
     # failure into a teardown failure (or mask the original close result).
     try:
-      logger.debug("Suppressed SQS cleanup error: %s", exc)
+      logger.debug("Suppressed SQS cleanup error")
     except BaseException:
       pass
     return True

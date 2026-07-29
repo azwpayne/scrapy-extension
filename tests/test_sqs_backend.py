@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import binascii
 import threading
+import traceback
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
@@ -191,7 +192,8 @@ class TestSqsConnect:
     self, mocker
   ) -> None:
     b = _make_backend()
-    failure = RuntimeError("private client construction failed")
+    marker = "sqs-driver-secret"
+    failure = RuntimeError(f"private client construction included {marker}")
     failed_session = mocker.MagicMock(name="failed-session")
     failed_session.client.side_effect = failure
     recovered_session = mocker.MagicMock(name="recovered-session")
@@ -211,7 +213,11 @@ class TestSqsConnect:
     with pytest.raises(BackendConnectionError) as exc_info:
       b.connect()
 
-    assert exc_info.value.__cause__ is failure
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.__dict__)
+    assert marker not in "".join(traceback.format_exception(exc_info.value))
     session_factory.assert_called_once_with()
     failed_session.client.assert_called_once()
     default_client.assert_not_called()
@@ -333,7 +339,8 @@ class TestSqsConnect:
     with pytest.raises(BackendConnectionError) as exc_info:
       b.connect()
 
-    assert exc_info.value.__cause__ is failure
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert b._generation is None
 
     b.connect()

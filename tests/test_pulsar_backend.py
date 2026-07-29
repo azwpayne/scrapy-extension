@@ -316,6 +316,7 @@ class TestPulsarConnect:
     assert secret not in str(exc_info.value)
     assert secret not in rendered
     assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_connect_is_idempotent_while_connected(self, mocker) -> None:
     consumer = mocker.MagicMock(name="consumer")

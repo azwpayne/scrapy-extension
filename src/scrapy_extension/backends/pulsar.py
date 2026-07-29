@@ -410,6 +410,7 @@ class PulsarBackend(Backend, QueueBackend):
     # lets failure cleanup distinguish our published generation from one that
     # a concurrent disconnect/reconnect has already retired and replaced.
     published_generation: int | None = None
+    startup_error: BackendConnectionError | None = None
     try:
       kwargs: dict[str, Any] = {}
       # Keep the package's public compatibility names, but translate them to
@@ -457,9 +458,9 @@ class PulsarBackend(Backend, QueueBackend):
       raise
     except Exception:
       self._abort_failed_connect(client, published_generation)
-      raise BackendConnectionError(
+      startup_error = BackendConnectionError(
         "Failed to connect to Pulsar.", backend_type="pulsar"
-      ) from None
+      )
     except BaseException:
       # R18-B/R106: a Ctrl+C/SystemExit after ``pulsar.Client(...)`` returns
       # (the C++ binding starts background IO/service threads in its
@@ -468,6 +469,11 @@ class PulsarBackend(Backend, QueueBackend):
       # enter this abort path. Cleanup never masks the original control signal.
       self._abort_failed_connect(client, published_generation)
       raise
+
+    if startup_error is not None:
+      # Raise outside the driver exception handler so endpoint/credential text
+      # cannot survive through ``__cause__`` or ``__context__``.
+      raise startup_error
 
   def _abort_failed_connect(
     self, client: Any, published_generation: int | None
@@ -528,7 +534,7 @@ class PulsarBackend(Backend, QueueBackend):
         # A driver close or logging integration must never replace the
         # connection failure currently being handled.
         try:
-          logger.debug("Failed to close Pulsar connect candidate", exc_info=True)
+          logger.debug("Failed to close Pulsar connect candidate")
         except BaseException:
           pass
 
@@ -1164,7 +1170,7 @@ class _suppress_pulsar_errors:
     # turn an ordinary close error into that exception or stop later handles
     # from being released.
     try:
-      logger.debug("Suppressed pulsar cleanup error: %s", exc)
+      logger.debug("Suppressed pulsar cleanup error")
     except BaseException:
       pass
     return True

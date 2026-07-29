@@ -198,6 +198,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
       snapshot = self._capture_connection_snapshot()
       candidate: Elasticsearch | None = None
+      startup_error: BackendConnectionError | None = None
       try:
         kwargs = self._build_kwargs(snapshot)
         if snapshot.mode == ElasticSearchMode.CLOUD:
@@ -229,24 +230,30 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           logger.debug("Connected to ElasticSearch in %s mode", snapshot.mode.value)
         except BaseException:
           pass
-      except BackendConnectionError:
+      except (BackendConnectionError, ApiError, TransportError):
         self._abort_failed_connect(candidate)
-        raise
-      except (ApiError, TransportError) as e:
-        self._abort_failed_connect(candidate)
-        msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
-        raise BackendConnectionError(msg, backend_type="elasticsearch") from e
-      except Exception as e:
+        startup_error = BackendConnectionError(
+          f"Failed to connect to ElasticSearch ({snapshot.mode.value}).",
+          backend_type="elasticsearch",
+        )
+      except Exception:
         # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
         # must roll back a post-publication candidate as well as close it.
         self._abort_failed_connect(candidate)
-        msg = f"Failed to connect to ElasticSearch ({snapshot.mode.value}): {e}"
-        raise BackendConnectionError(msg, backend_type="elasticsearch") from e
+        startup_error = BackendConnectionError(
+          f"Failed to connect to ElasticSearch ({snapshot.mode.value}).",
+          backend_type="elasticsearch",
+        )
       except BaseException:
         # Ctrl-C / SystemExit during connect: still close the candidate, then
         # re-signal. Mirrors mongodb.connect() (BaseException arm).
         self._abort_failed_connect(candidate)
         raise
+
+      if startup_error is not None:
+        # Raise outside the driver exception handler so endpoint/credential
+        # text cannot survive through ``__cause__`` or ``__context__``.
+        raise startup_error
 
   def _abort_failed_connect(self, candidate: Elasticsearch | None) -> None:
     """Detach and close only this failed connect candidate.
@@ -271,7 +278,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # and SystemExit.  Logging is also isolated because user-installed
       # handlers can raise control-flow exceptions.
       try:
-        logger.debug("Failed to close ElasticSearch connect candidate", exc_info=True)
+        logger.debug("Failed to close ElasticSearch connect candidate")
       except BaseException:
         pass
 
@@ -288,7 +295,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # generation has been detached, direct control-flow interruption
         # remains observable to the caller.
         try:
-          logger.debug("Failed to close ElasticSearch client", exc_info=True)
+          logger.debug("Failed to close ElasticSearch client")
         except BaseException:
           pass
 
@@ -816,11 +823,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
     except (ConflictError, NotFoundError):
       pass
-    except (ApiError, TransportError) as e:
+    except (ApiError, TransportError):
       # Only the already-caught ordinary cleanup error is best-effort.  A
       # direct control exception from ``delete`` still propagates normally.
       try:
-        logger.warning("Failed to reap expired ES storage key %r: %s", key, e)
+        logger.warning("Failed to reap expired ES storage key")
       except BaseException:
         pass
     return True

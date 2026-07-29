@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -9,7 +10,7 @@ from elasticsearch import ApiError, NotFoundError, RequestError, TransportError
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.settings.elasticsearch import (
   ElasticSearchMode,
   ElasticSearchSettings,
@@ -77,6 +78,40 @@ class TestConnection:
     backend.connect()
 
     assert backend.is_connected()
+
+  def test_connect_startup_error_does_not_retain_driver_diagnostics(self, mocker):
+    marker = "elasticsearch-driver-secret"
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      side_effect=RuntimeError(f"transport dump included {marker}"),
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      ElasticSearchBackend(ElasticSearchSettings()).connect()
+
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.__dict__)
+    assert marker not in "".join(traceback.format_exception(exc_info.value))
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+  def test_connect_backend_error_does_not_retain_driver_diagnostics(self, mocker):
+    marker = "elasticsearch-backend-secret"
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      side_effect=BackendConnectionError(
+        f"custom transport diagnostic included {marker}", backend_type="custom"
+      ),
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      ElasticSearchBackend(ElasticSearchSettings()).connect()
+
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.__dict__)
+    assert marker not in "".join(traceback.format_exception(exc_info.value))
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_connect_cloud(self, mocker):
     mock_client = mocker.MagicMock(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from unittest.mock import MagicMock
 
 import pytest
@@ -304,6 +305,32 @@ class TestConnectionManagerRetryLogic:
 
     assert "Failed to connect after 4 attempts" in str(exc_info.value)
     assert mock_create_backend.call_count == 4
+
+  def test_connect_retry_does_not_retain_driver_diagnostics(self, mocker, caplog):
+    marker = "manager-driver-secret"
+    mock_create_backend = mocker.patch.object(
+      ConnectionManager,
+      "_create_backend",
+      side_effect=RuntimeError(f"driver dump included {marker}"),
+    )
+    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    manager = ConnectionManager(
+      BackendType.REDIS, {"retry_attempts": 1, "retry_delay": 0}
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      manager.connect()
+
+    error = exc_info.value
+    assert mock_create_backend.call_count == 2
+    assert marker not in str(error)
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    for record in caplog.records:
+      assert marker not in record.getMessage()
+      assert marker not in repr(record.args)
 
   def test_connect_retry_success_on_first_attempt(self, mocker):
     """Test connect succeeds on first attempt without retries."""
