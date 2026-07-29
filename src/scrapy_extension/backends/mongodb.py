@@ -52,6 +52,9 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
+  set_operation_error_boundary,
+  storage_operation_error_boundary,
 )
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
@@ -110,6 +113,71 @@ _MONGODB_CONNECT_SETTING_NAMES: frozenset[str] = frozenset(
 _MONGODB_SAFE_CONNECT_MESSAGES: frozenset[str] = frozenset(
   {"Unsupported MongoDB mode."}
 )
+_MONGODB_QUEUE_PUSH_ERROR = "MongoDB queue push failed."
+_MONGODB_QUEUE_POP_ERROR = "MongoDB queue pop failed."
+_MONGODB_QUEUE_LENGTH_ERROR = "MongoDB queue length read failed."
+_MONGODB_QUEUE_CLEAR_ERROR = "MongoDB queue clear failed."
+_MONGODB_SET_ADD_ERROR = "MongoDB set add failed."
+_MONGODB_SET_REMOVE_ERROR = "MongoDB set remove failed."
+_MONGODB_SET_CONTAINS_ERROR = "MongoDB set membership check failed."
+_MONGODB_SET_LENGTH_ERROR = "MongoDB set length read failed."
+_MONGODB_SET_CLEAR_ERROR = "MongoDB set clear failed."
+_MONGODB_STORAGE_STORE_ERROR = "MongoDB storage store failed."
+_MONGODB_STORAGE_RETRIEVE_ERROR = "MongoDB storage retrieve failed."
+_MONGODB_STORAGE_DELETE_ERROR = "MongoDB storage delete failed."
+_MONGODB_STORAGE_EXISTS_ERROR = "MongoDB storage existence check failed."
+_MONGODB_STORAGE_TTL_ERROR = "MongoDB storage TTL read failed."
+_MONGODB_STORAGE_CLEAR_ERROR = "MongoDB storage clear failed."
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct MongoDB queue name outside its terminal boundary."""
+  _validate_key_name(queue_name, "queue_name")
+
+
+def _validate_set_name_argument(
+  _backend: object,
+  set_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct MongoDB set name outside its terminal boundary."""
+  _validate_key_name(set_name, "set_name")
+
+
+def _validate_storage_key_argument(
+  _backend: object,
+  key: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct MongoDB storage key outside its terminal boundary."""
+  _validate_key_name(key, "key")
+
+
+def _validate_store_arguments(
+  _backend: object,
+  key: str,
+  _data: bytes,
+  ttl: int | None = None,
+) -> None:
+  """Validate storage write arguments before a terminal error boundary."""
+  _validate_key_name(key, "key")
+  _validate_ttl(ttl)
+
+
+def _validate_storage_prefix_argument(
+  _backend: object,
+  prefix: str | None = None,
+) -> None:
+  """Validate a non-empty clear prefix before backend implementation frames."""
+  if prefix is not None:
+    _validate_key_name(prefix, "prefix")
 
 
 @dataclass(frozen=True)
@@ -942,6 +1010,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise BackendConnectionError(msg, backend_type="mongodb")
 
   # QueueBackend implementation
+  @queue_operation_error_boundary(
+    "push",
+    _MONGODB_QUEUE_PUSH_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to priority queue.
 
@@ -971,6 +1045,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to push to queue {queue_name}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="push") from e
 
+  @queue_operation_error_boundary(
+    "pop",
+    _MONGODB_QUEUE_POP_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
@@ -1004,6 +1084,24 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return cast(bytes, result["item"])
     return None
 
+  @queue_operation_error_boundary(
+    "pop",
+    _MONGODB_QUEUE_POP_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, None]:
+    """Pop atomically without retaining the base-class operation frame."""
+    return (self.pop(queue_name, timeout), None)
+
+  @queue_operation_error_boundary(
+    "queue_len",
+    _MONGODB_QUEUE_LENGTH_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
 
@@ -1033,6 +1131,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       msg = f"Failed to get queue length for {queue_name}: {e}"
       raise QueueError(msg, queue_name=queue_name, operation="queue_len") from e
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    _MONGODB_QUEUE_CLEAR_ERROR,
+    validator=_validate_queue_name_argument,
+    handled_exception_types=(QueueError, BackendConnectionError),
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
 
@@ -1055,6 +1159,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
   # SetBackend implementation
+  @set_operation_error_boundary(
+    _MONGODB_SET_ADD_ERROR,
+    "mongodb",
+    validator=_validate_set_name_argument,
+  )
   def add(self, set_name: str, item: bytes) -> bool:
     """Add item to set.
 
@@ -1094,6 +1203,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     else:
       return True
 
+  @set_operation_error_boundary(
+    _MONGODB_SET_REMOVE_ERROR,
+    "mongodb",
+    validator=_validate_set_name_argument,
+  )
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.
 
@@ -1126,6 +1240,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       ) from e
     return result.deleted_count > 0
 
+  @set_operation_error_boundary(
+    _MONGODB_SET_CONTAINS_ERROR,
+    "mongodb",
+    validator=_validate_set_name_argument,
+  )
   def contains(self, set_name: str, item: bytes) -> bool:
     """Check if item is in set.
 
@@ -1158,6 +1277,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       ) from e
     return result is not None
 
+  @set_operation_error_boundary(
+    _MONGODB_SET_LENGTH_ERROR,
+    "mongodb",
+    validator=_validate_set_name_argument,
+  )
   def set_len(self, set_name: str) -> int:
     """Get set size.
 
@@ -1184,6 +1308,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         backend_type="mongodb",
       ) from e
 
+  @set_operation_error_boundary(
+    _MONGODB_SET_CLEAR_ERROR,
+    "mongodb",
+    validator=_validate_set_name_argument,
+  )
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
 
@@ -1213,6 +1342,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       ) from e
 
   # StorageBackend implementation
+  @storage_operation_error_boundary(
+    "store",
+    _MONGODB_STORAGE_STORE_ERROR,
+    "mongodb",
+    validator=_validate_store_arguments,
+  )
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
     """Store data with key.
 
@@ -1292,6 +1427,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         pass
     return True
 
+  @storage_operation_error_boundary(
+    "retrieve",
+    _MONGODB_STORAGE_RETRIEVE_ERROR,
+    "mongodb",
+    validator=_validate_storage_key_argument,
+  )
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve current data by key.
 
@@ -1322,6 +1463,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return cast(bytes, result.get("data"))
     return None
 
+  @storage_operation_error_boundary(
+    "delete",
+    _MONGODB_STORAGE_DELETE_ERROR,
+    "mongodb",
+    validator=_validate_storage_key_argument,
+  )
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
@@ -1347,6 +1494,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise StorageError(msg, operation="delete", key=key) from e
     return result.deleted_count > 0
 
+  @storage_operation_error_boundary(
+    "exists",
+    _MONGODB_STORAGE_EXISTS_ERROR,
+    "mongodb",
+    validator=_validate_storage_key_argument,
+  )
   def exists(self, key: str) -> bool:
     """Check if key exists and has not expired.
 
@@ -1376,6 +1529,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       raise StorageError(msg, operation="exists", key=key) from e
     return result is not None
 
+  @storage_operation_error_boundary(
+    "ttl",
+    _MONGODB_STORAGE_TTL_ERROR,
+    "mongodb",
+    validator=_validate_storage_key_argument,
+  )
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
 
@@ -1409,6 +1568,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       return None
     return max(0, int(remaining))
 
+  @storage_operation_error_boundary(
+    "clear_storage",
+    _MONGODB_STORAGE_CLEAR_ERROR,
+    "mongodb",
+    validator=_validate_storage_prefix_argument,
+  )
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
 

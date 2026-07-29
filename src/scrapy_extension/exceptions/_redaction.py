@@ -94,15 +94,18 @@ def queue_operation_error_boundary(
   *,
   safe_messages: Collection[str] = (),
   validator: Callable[..., None] | None = None,
+  handled_exception_types: tuple[type[Exception], ...] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
   """Make one public queue operation publish a redacted ``QueueError``.
 
   ``validator`` deliberately runs before the protected call so established
   ``ValueError`` input contracts remain visible to callers.  Once I/O begins,
   every regular exception is reconstructed after all implementation frames
-  have unwound.  The replacement has a fixed operation, no logical queue
-  identifier, and no exception chain.  ``BaseException`` control flow remains
-  untouched.
+  have unwound.  ``handled_exception_types`` may narrow that behavior for a
+  backend whose known driver failures have already been normalized to package
+  exceptions; unlisted exceptions then retain their established behavior.
+  The replacement has a fixed operation, no logical queue identifier, and no
+  exception chain.  ``BaseException`` control flow remains untouched.
   """
 
   def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -114,6 +117,13 @@ def queue_operation_error_boundary(
       try:
         return function(*args, **kwargs)
       except Exception as error:  # noqa: BLE001 - terminal public boundary
+        if (
+          handled_exception_types is not None
+          and type(error) not in handled_exception_types
+        ):
+          del args
+          del kwargs
+          raise
         caught_error = error
       except BaseException:
         del args
@@ -137,6 +147,119 @@ def queue_operation_error_boundary(
       del caught_error
       del raw_args
       del replacement_message
+      raise sanitized_error
+
+    return wrapped
+
+  return decorate
+
+
+def set_operation_error_boundary(
+  message: str,
+  backend_type: str,
+  *,
+  validator: Callable[..., None] | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+  """Rebuild a known direct set connection failure without private state.
+
+  Direct set implementations normalize expected client failures to the exact
+  :class:`BackendConnectionError` class so callers can make their documented
+  graceful-degradation decision.  Its original traceback can still retain a
+  logical set name, payload, client object, or mutable settings graph.  This
+  boundary publishes a new fixed error only after those implementation frames
+  have unwound.  It deliberately leaves subclasses and unknown exceptions
+  alone: a bundled operation must not silently redefine plugin/custom error
+  contracts just because it is protected by this terminal boundary.
+  """
+
+  def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+      if validator is not None:
+        validator(*args, **kwargs)
+      caught_connection_error = False
+      try:
+        return function(*args, **kwargs)
+      except BackendConnectionError as error:
+        if type(error) is not BackendConnectionError:
+          del args
+          del kwargs
+          raise
+        caught_connection_error = True
+      except BaseException:
+        del args
+        del kwargs
+        raise
+
+      assert caught_connection_error
+      sanitized_error = BackendConnectionError(message, backend_type=backend_type)
+      del args
+      del kwargs
+      del caught_connection_error
+      raise sanitized_error
+
+    return wrapped
+
+  return decorate
+
+
+def storage_operation_error_boundary(
+  operation: str,
+  message: str,
+  backend_type: str,
+  *,
+  validator: Callable[..., None] | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+  """Publish a terminal direct-storage error without key or backend graphs.
+
+  The wrapped backend may expose either the exact ``StorageError`` operational
+  contract or the exact ``BackendConnectionError`` not-connected contract.
+  Both are reconstructed from static caller-selected metadata.  Storage
+  failures retain their fixed operation but never the logical key; connection
+  failures retain a trusted bundled backend type.  Input validation runs
+  outside the protected call.  Custom exception subclasses and unknown
+  implementation failures are intentionally not converted.
+  """
+
+  def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+      if validator is not None:
+        validator(*args, **kwargs)
+      caught_storage_error = False
+      caught_connection_error = False
+      try:
+        return function(*args, **kwargs)
+      except StorageError as error:
+        if type(error) is not StorageError:
+          del args
+          del kwargs
+          raise
+        caught_storage_error = True
+      except BackendConnectionError as error:
+        if type(error) is not BackendConnectionError:
+          del args
+          del kwargs
+          raise
+        caught_connection_error = True
+      except BaseException:
+        del args
+        del kwargs
+        raise
+
+      if caught_storage_error:
+        sanitized_error: BackendError = StorageError(
+          message,
+          operation=operation,
+          key=None,
+        )
+      else:
+        assert caught_connection_error
+        sanitized_error = BackendConnectionError(message, backend_type=backend_type)
+      del args
+      del kwargs
+      del caught_storage_error
+      del caught_connection_error
       raise sanitized_error
 
     return wrapped
