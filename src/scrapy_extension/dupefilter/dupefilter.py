@@ -319,6 +319,7 @@ class BackendDupeFilter:
         monitor_failed = True
     except BaseException as exc:
       primary = exc
+    cleanup_error: BaseException | None = None
     try:
       with self._lifecycle_lock:
         active = self._active_monitor_requests.get(id(origin_request))
@@ -326,7 +327,10 @@ class BackendDupeFilter:
           active[1].discard(event_token)
           if not active[1]:
             del self._active_monitor_requests[id(origin_request)]
-    except BaseException as cleanup_error:
+    except BaseException as exc:
+      cleanup_error = exc
+
+    if cleanup_error is not None:
       # A custom mapping or asynchronous interruption may fail the normal
       # ``get`` path. Try direct indexing once so an origin Request that never
       # retries is not retained indefinitely; never remove another live token.
@@ -337,20 +341,15 @@ class BackendDupeFilter:
           if not active[1]:
             del self._active_monitor_requests[id(origin_request)]
       except BaseException:
-        _fallback_cleanup_failed = True
+        pass
       if primary is None:
         raise cleanup_error
       try:
         logger.debug(
-          "Failed to clear monitor observer fence while preserving signal",
-          exc_info=(
-            type(cleanup_error),
-            cleanup_error,
-            cleanup_error.__traceback__,
-          ),
+          "Failed to clear monitor observer fence while preserving signal"
         )
       except BaseException:
-        _diagnostic_failed = True
+        pass
     if primary is not None:
       raise primary
     if monitor_failed:
@@ -1326,10 +1325,10 @@ class BackendDupeFilter:
           if owner_reservation is not None and owner_reservation.owner is owner:
             self._discard_reservation(owner_reservation)
     except BaseException:
-      try:
-        logger.debug("Failed to compensate interrupted duplicate-filter decision")
-      except BaseException:
-        return
+      # This best-effort cleanup commonly runs while an outer primary error is
+      # active. Logging here would expose that raw exception to custom Handler
+      # implementations through ``sys.exc_info()`` without improving recovery.
+      return
 
   def _discard_reservation(self, reservation: _DedupReservation) -> None:
     """Forget one receipt without mutating membership state."""

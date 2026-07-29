@@ -618,6 +618,88 @@ def test_monitor_fallback_handler_has_no_active_exception(
   _assert_handler_records_are_redacted(handler, marker)
 
 
+def test_monitor_fence_cleanup_diagnostic_releases_raw_error_context(
+  mock_connection_manager: Any,
+) -> None:
+  """A preserved primary signal cannot expose a failed fence cleanup."""
+  cleanup_marker = "round50-dupefilter-fence-cleanup-marker"
+  primary = _MonitorStop("round50-dupefilter-fence-primary-marker")
+
+  class _CleanupFailingRegistry(dict[int, tuple[object, set[Any]]]):
+    def __init__(self) -> None:
+      super().__init__()
+      self._get_calls = 0
+
+    def get(self, key: int, default: Any = None) -> Any:
+      self._get_calls += 1
+      if self._get_calls == 2:
+        raise RuntimeError(cleanup_marker)
+      return super().get(key, default)
+
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=MemoryMembershipFilter(maxsize=10),
+  )
+  request = Request("https://example.test/fence-cleanup-context")
+  registry = _CleanupFailingRegistry()
+  dupefilter._active_monitor_requests = registry  # type: ignore[assignment]
+  dupefilter._monitor = _OneShotProcessControlMonitor(primary)
+
+  with _capture_diagnostics(
+    "scrapy_extension.dupefilter.dupefilter",
+    level=logging.DEBUG,
+  ) as handler:
+    with pytest.raises(_MonitorStop) as raised:
+      dupefilter._emit_monitor(("on_dedup_miss", ("fingerprint",), request))
+
+  assert raised.value is primary
+  assert id(request) not in registry
+  _assert_handler_records_are_redacted(handler, cleanup_marker)
+  assert all(str(primary) not in record.getMessage() for record in handler.records)
+  assert all(str(primary) not in repr(record.args) for record in handler.records)
+
+
+def test_interrupted_decision_compensation_is_silent_with_active_primary(
+  mock_connection_manager: Any,
+) -> None:
+  """Best-effort compensation must not leak an active caller exception."""
+  cleanup_marker = "round50-dupefilter-compensation-cleanup-marker"
+  primary = _MonitorStop("round50-dupefilter-compensation-primary-marker")
+
+  class _FailingReservationRegistry(dict[int, object]):
+    def get(self, key: int, default: Any = None) -> Any:
+      del key, default
+      raise RuntimeError(cleanup_marker)
+
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=MemoryMembershipFilter(maxsize=10),
+  )
+  decision = dupefilter.request_seen_with_reservation(
+    Request("https://example.test/interrupted-compensation")
+  )
+  assert decision.reservation is not None
+  dupefilter._active_reservations = _FailingReservationRegistry()  # type: ignore[assignment]
+
+  with _capture_diagnostics(
+    "scrapy_extension.dupefilter.dupefilter",
+    level=logging.DEBUG,
+  ) as handler:
+    with pytest.raises(_MonitorStop) as raised:
+      try:
+        raise primary
+      except _MonitorStop:
+        dupefilter._compensate_interrupted_decision(
+          decision.reservation,
+          decision.reservation.owner,
+        )
+        raise
+
+  assert raised.value is primary
+  assert handler.records == []
+  assert handler.active_errors == []
+
+
 @pytest.mark.parametrize(
   "diagnostic_error",
   [
