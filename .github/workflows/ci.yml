@@ -15,6 +15,10 @@ jobs:
   # integration-tests job below.
   unit-tests:
     runs-on: ubuntu-latest
+    # Bound each matrix lane so a stalled dependency or test cannot consume
+    # GitHub Actions' multi-hour default timeout.  The normal suite completes
+    # in minutes; 20 minutes leaves headroom for a cold runner.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
