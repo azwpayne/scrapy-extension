@@ -190,30 +190,39 @@ class BatchedStorageStrategy(StorageStrategy):
 
   def _emit_buffer_depth(self, depth: int) -> None:
     """Publish the buffer gauge without allowing telemetry into the data path."""
+    monitor_failed = False
     try:
       self._monitor.on_buffer_depth(depth)
     except Exception:  # noqa: BLE001 - monitor must never crash storage
+      monitor_failed = True
+
+    if monitor_failed:
+      # Invoke the fallback only after the monitor exception suite has ended.
+      # A custom logging handler is extension code and must not inherit the
+      # monitor's raw failure through ``sys.exc_info()``.
       try:
         logger.debug("on_buffer_depth hook raised")
       except BaseException:
-        # This is only fallback diagnostics after an ordinary monitor failure.
-        # It must not interrupt a synchronous store or the age-flush daemon.
-        # A direct control exception from the monitor still bypasses the outer
-        # ``except Exception`` and remains observable to its caller.
+        # This is only fallback diagnostics after an ordinary monitor failure;
+        # it must not interrupt a synchronous store or the age-flush daemon.
         pass
 
   def _emit_error(self, operation: str, error: Exception) -> None:
     """Publish an error without allowing telemetry to stop retry processing."""
+    monitor_failed = False
     try:
       self._monitor.on_error(operation, error)
     except Exception:  # noqa: BLE001 - monitor must never crash storage
+      monitor_failed = True
+
+    if monitor_failed:
+      # The monitor's ordinary failure is no longer active here, so a logging
+      # handler cannot inspect it through ``sys.exc_info()``.
       try:
         logger.debug("on_error hook raised")
       except BaseException:
-        # This is a fallback diagnostic after an ordinary monitor failure.
-        # It must not terminate the age-flush retry daemon and strand its
-        # re-enqueued batch. A direct control exception from the monitor is
-        # still intentionally not caught by the outer ``except Exception``.
+        # This fallback must not terminate the age-flush retry daemon and
+        # strand its re-enqueued batch.
         pass
 
   def store(
@@ -442,16 +451,11 @@ class BatchedStorageStrategy(StorageStrategy):
       # one admission slot under the same lock that protects the buffer so a
       # concurrent caller can use it without violating the total cap.
       self._release_persisted_entry()
+      store_monitor_failed = False
       try:
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - persistence already succeeded
-        try:
-          logger.debug("on_store hook raised")
-        except BaseException:
-          # A diagnostic handler cannot be allowed to interrupt the remaining
-          # snapshot after the monitor's ordinary failure was intentionally
-          # ignored.
-          pass
+        store_monitor_failed = True
       except BaseException:
         # This item is already durable, but its remaining snapshot tail has
         # not yet been attempted.  Preserve precisely that tail before
@@ -461,6 +465,17 @@ class BatchedStorageStrategy(StorageStrategy):
         if i + 1 < len(batch):
           self._requeue_tail(batch[i + 1 :])
         raise
+      if store_monitor_failed:
+        # The ordinary monitor failure has unwound before diagnostics run;
+        # logging handlers therefore cannot recover it through
+        # ``sys.exc_info()``.
+        try:
+          logger.debug("on_store hook raised")
+        except BaseException:
+          # A diagnostic handler cannot be allowed to interrupt the remaining
+          # snapshot after the monitor's ordinary failure was intentionally
+          # ignored.
+          pass
     if batch:
       with self._lock:
         remaining_depth = self._pending_locked()

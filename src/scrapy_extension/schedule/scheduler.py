@@ -59,6 +59,7 @@ _LIFECYCLE_NEW = "new"
 _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
 _MISSING_STATIC_ATTRIBUTE = object()
+_EnqueueDiagnostic = tuple[str, str, str | None]
 
 
 def _static_declaration_rank(component: object, name: str) -> int | None:
@@ -1444,13 +1445,16 @@ class BackendScheduler:
     queue = self._queue
     if queue is None:
       return False
+    settlement_failed = False
     try:
       queue.ack(token=token)
     except BackendError:
+      settlement_failed = True
+    if settlement_failed:
+      # The BackendError has left its ``except`` suite before either stats or
+      # logging runs. Both collaborators are extension code and must not be
+      # able to inspect the queue error through ``sys.exc_info()``.
       self._record_stat("scheduler/ack_error")
-      # The BackendError is the settlement outcome: retain the token so the
-      # broker can redeliver. A custom logging handler is only diagnostic and
-      # must not replace that documented ``False`` result.
       try:
         logger.error(log_message)
       except BaseException:
@@ -1473,13 +1477,16 @@ class BackendScheduler:
     queue = self._queue
     if queue is None:
       return False
+    settlement_failed = False
     try:
       queue.nack(token=token)
     except BackendError:
+      settlement_failed = True
+    if settlement_failed:
+      # The BackendError has left its ``except`` suite before either stats or
+      # logging runs. Both collaborators are extension code and must not be
+      # able to inspect the queue error through ``sys.exc_info()``.
       self._record_stat("scheduler/nack_error")
-      # Keep the failed settlement observable as ``False`` even when a
-      # diagnostic handler is interrupted. Exceptions from queue.nack itself
-      # still follow the direct queue-control contract above.
       try:
         logger.error(log_message)
       except BaseException:
@@ -1557,41 +1564,53 @@ class BackendScheduler:
             (self._on_spider_error, signals.spider_error),
           ]
         for handler, signal in signal_handlers:
+          disconnect_failed = False
           try:
             self._connected_signals.disconnect(handler, signal=signal)
           except Exception:
             # Each stale/already-disconnected tuple is independent: one failure
             # must not leave the other handler registered or block later cleanup.
-            _log_shutdown_exception("Failed to disconnect signal during shutdown")
+            disconnect_failed = True
           except BaseException as exc:
             if primary_error is None:
               primary_error = exc
+          if disconnect_failed:
+            # The ordinary disconnect failure has unwound before the logging
+            # handler runs, so it cannot expose its traceback through
+            # ``sys.exc_info()``.
+            _log_shutdown_exception("Failed to disconnect signal during shutdown")
       # Close the queue strategy FIRST so it can warn about / release any
       # in-process held state (e.g. DelayQueueStrategy's delayed items) while
       # the backend is still connected. Must precede connection_manager.close().
       if self._queue is not None:
+        queue_close_failed = False
         try:
           self._queue.close()
         except Exception:
-          _log_shutdown_exception("Failed to close queue strategy during shutdown")
+          queue_close_failed = True
         except BaseException as exc:
           if primary_error is None:
             primary_error = exc
+        if queue_close_failed:
+          _log_shutdown_exception("Failed to close queue strategy during shutdown")
       if (
         self._owns_dupefilter
         and self.dupefilter is not None
         and not self._dupefilter_released
       ):
         self._dupefilter_released = True
+        dupefilter_close_failed = False
         try:
           self.dupefilter.close(reason)
         except Exception:
-          _log_shutdown_exception("Failed to close dupefilter during shutdown")
+          dupefilter_close_failed = True
         except BaseException as exc:
           if primary_error is None:
             primary_error = exc
         finally:
           self._dupefilter_open = False
+        if dupefilter_close_failed:
+          _log_shutdown_exception("Failed to close dupefilter during shutdown")
     finally:
       # R35-F7: state-reset tail moved here so it runs even if BaseException
       # aborts teardown mid-try. Idempotent: assigning None / False on
@@ -1610,15 +1629,16 @@ class BackendScheduler:
         # caller) delivers duplicate close notifications — and even if a
         # BaseException aborted teardown above.
         self._manager_released = True
+        manager_close_secondary_failure = False
         try:
           self.connection_manager.close()
         except BaseException as exc:  # noqa: BLE001 — release must not mask primary
           if primary_error is None:
             primary_error = exc
           else:
-            _log_shutdown_exception(
-              "Failed to close connection manager during shutdown"
-            )
+            manager_close_secondary_failure = True
+        if manager_close_secondary_failure:
+          _log_shutdown_exception("Failed to close connection manager during shutdown")
     if primary_error is not None:
       raise primary_error
     return None
@@ -1663,6 +1683,9 @@ class BackendScheduler:
     commit_volatile_reservation: Callable[[object], None] | None = None
     rollback_reservation: Callable[[object], None] | None = None
     rollback_reservation_intent: Callable[[object], None] | None = None
+    deferred_diagnostics: list[_EnqueueDiagnostic] = []
+    ordinary_outcome: bool | None = None
+    retry_after_dupefilter_failure = False
     try:
       # Dedup check is INSIDE the try (round-2 C6 fix) so a dedup-backend
       # outage degrades to default-enqueue instead of crashing the spider.
@@ -1775,6 +1798,7 @@ class BackendScheduler:
           reservation,
           rollback_reservation,
           preserve_primary=False,
+          deferred_diagnostics=deferred_diagnostics,
         )
       elif (
         reservation_intent is not None
@@ -1784,15 +1808,21 @@ class BackendScheduler:
           reservation_intent,
           rollback_reservation_intent,
           preserve_primary=False,
+          deferred_diagnostics=deferred_diagnostics,
         )
       elif dedup_reserved:
-        self._rollback_dupefilter_reservation(request)
-      self._record_enqueue_diagnostic(
-        "exception",
-        "Failed to serialize request for enqueue",
-        stat="scheduler/serialization_errors",
+        self._rollback_dupefilter_reservation(
+          request,
+          deferred_diagnostics=deferred_diagnostics,
+        )
+      deferred_diagnostics.append(
+        (
+          "error",
+          "Failed to serialize request for enqueue",
+          "scheduler/serialization_errors",
+        )
       )
-      return False
+      ordinary_outcome = False
     except (QueueError, BackendError):
       if phase == "dedup":
         if (
@@ -1803,48 +1833,48 @@ class BackendScheduler:
             reservation_intent,
             rollback_reservation_intent,
             preserve_primary=False,
+            deferred_diagnostics=deferred_diagnostics,
           )
         # Dedup-backend outage: degrade to enqueue (don't lose the URL),
-        # attribute to the dedup-error stat.
-        self._record_enqueue_diagnostic(
-          "exception",
-          "Failed to consult dupefilter; defaulting to enqueue",
-          stat="scheduler/dupefilter_error",
-        )
-        try:
-          queue.push(request, priority=priority)
-          self._record_stat("scheduler/enqueued")
-        except (QueueError, SerializationError, BackendError):
-          self._record_enqueue_diagnostic(
-            "exception",
-            "Failed to enqueue request after dedup outage",
+        # attribute to the dedup-error stat. The fallback push itself moves
+        # below the handler so its diagnostic code cannot inherit this raw
+        # dupefilter failure through ``sys.exc_info()``.
+        deferred_diagnostics.append(
+          (
+            "error",
+            "Failed to consult dupefilter; defaulting to enqueue",
+            "scheduler/dupefilter_error",
           )
-          return False
-        return True
-      # phase == "push": a plain queue-push failure (not a dedup outage).
-      if reservation is not None and rollback_reservation is not None:
-        self._rollback_atomic_reservation(
-          reservation,
-          rollback_reservation,
-          preserve_primary=False,
         )
-      elif (
-        reservation_intent is not None
-        and rollback_reservation_intent is not None
-      ):
-        self._rollback_atomic_reservation(
-          reservation_intent,
-          rollback_reservation_intent,
-          preserve_primary=False,
+        retry_after_dupefilter_failure = True
+      else:
+        # phase == "push": a plain queue-push failure (not a dedup outage).
+        if reservation is not None and rollback_reservation is not None:
+          self._rollback_atomic_reservation(
+            reservation,
+            rollback_reservation,
+            preserve_primary=False,
+            deferred_diagnostics=deferred_diagnostics,
+          )
+        elif (
+          reservation_intent is not None
+          and rollback_reservation_intent is not None
+        ):
+          self._rollback_atomic_reservation(
+            reservation_intent,
+            rollback_reservation_intent,
+            preserve_primary=False,
+            deferred_diagnostics=deferred_diagnostics,
+          )
+        elif dedup_reserved:
+          self._rollback_dupefilter_reservation(
+            request,
+            deferred_diagnostics=deferred_diagnostics,
+          )
+        deferred_diagnostics.append(
+          ("error", "Failed to enqueue request", "scheduler/queue_error")
         )
-      elif dedup_reserved:
-        self._rollback_dupefilter_reservation(request)
-      self._record_enqueue_diagnostic(
-        "exception",
-        "Failed to enqueue request",
-        stat="scheduler/queue_error",
-      )
-      return False
+        ordinary_outcome = False
     except BaseException:
       # Process-control interruption after receipt handoff but before a
       # confirmed push follows the package's at-least-once policy: compensate
@@ -1864,9 +1894,14 @@ class BackendScheduler:
             reservation,
             rollback_reservation,
             preserve_primary=True,
+            deferred_diagnostics=deferred_diagnostics,
           )
         elif dedup_reserved:
-          self._rollback_dupefilter_reservation(request, preserve_primary=True)
+          self._rollback_dupefilter_reservation(
+            request,
+            preserve_primary=True,
+            deferred_diagnostics=deferred_diagnostics,
+          )
       except BaseException:
         # This outer guard also covers an asynchronous signal before the
         # cleanup callee establishes its own try-region. Retry the silent
@@ -1879,13 +1914,31 @@ class BackendScheduler:
             rollback_reservation_intent(reservation_intent)
           except BaseException:
             pass
-        try:
-          logger.error("Failed to compensate enqueue interruption while preserving signal")
-        except BaseException:
-          pass
       raise
-    else:
+
+    if retry_after_dupefilter_failure:
+      # All of the dupefilter failure handling above has unwound. Preserve the
+      # historical diagnostic-before-fallback ordering without exposing the
+      # raw failure to logger or stats extensions.
+      self._flush_enqueue_diagnostics(deferred_diagnostics)
+      fallback_push_failed = False
+      try:
+        queue.push(request, priority=priority)
+      except (QueueError, SerializationError, BackendError):
+        fallback_push_failed = True
+      if fallback_push_failed:
+        self._record_enqueue_diagnostic(
+          "error",
+          "Failed to enqueue request after dedup outage",
+        )
+        return False
+      self._record_stat("scheduler/enqueued")
       return True
+
+    self._flush_enqueue_diagnostics(deferred_diagnostics)
+    if ordinary_outcome is not None:
+      return ordinary_outcome
+    return True
 
   def _rollback_atomic_reservation(
     self,
@@ -1893,28 +1946,23 @@ class BackendScheduler:
     rollback: Callable[[object], None],
     *,
     preserve_primary: bool,
+    deferred_diagnostics: list[_EnqueueDiagnostic] | None = None,
   ) -> None:
     """Roll back one receipt with explicit process-control precedence."""
+    rollback_failed = False
+    control_rollback_failed = False
     try:
       rollback(reservation)
     except Exception:  # noqa: BLE001 - preserve the triggering queue failure
-      if preserve_primary:
-        self._record_enqueue_diagnostic(
-          "exception",
-          "Failed to roll back atomic dupefilter reservation",
-          stat="scheduler/dupefilter_rollback_error",
-        )
-      else:
-        self._record_enqueue_diagnostic(
-          "exception",
-          "Failed to roll back atomic dupefilter reservation",
-          stat="scheduler/dupefilter_rollback_error",
-        )
+      rollback_failed = True
     except BaseException:
       if not preserve_primary:
         raise
-      self._record_enqueue_diagnostic(
-        "exception",
+      control_rollback_failed = True
+    if rollback_failed or control_rollback_failed:
+      self._record_or_defer_enqueue_diagnostic(
+        deferred_diagnostics,
+        "error",
         "Failed to roll back atomic dupefilter reservation",
         stat="scheduler/dupefilter_rollback_error",
       )
@@ -1923,6 +1971,8 @@ class BackendScheduler:
     self,
     reservation: object,
     commit: Callable[[object], None],
+    *,
+    deferred_diagnostics: list[_EnqueueDiagnostic] | None = None,
   ) -> None:
     """Finalize receipt bookkeeping after the queue commit boundary.
 
@@ -1930,11 +1980,15 @@ class BackendScheduler:
     Process-control signals still propagate, with caller state already cleared
     so the outer handler cannot roll back the committed marker.
     """
+    commit_failed = False
     try:
       commit(reservation)
     except Exception:  # noqa: BLE001 - queue durability is authoritative
-      self._record_enqueue_diagnostic(
-        "exception",
+      commit_failed = True
+    if commit_failed:
+      self._record_or_defer_enqueue_diagnostic(
+        deferred_diagnostics,
+        "error",
         "Failed to finalize atomic dupefilter reservation",
         stat="scheduler/dupefilter_commit_error",
       )
@@ -1944,6 +1998,7 @@ class BackendScheduler:
     request: Request,
     *,
     preserve_primary: bool = False,
+    deferred_diagnostics: list[_EnqueueDiagnostic] | None = None,
   ) -> None:
     """Best-effort compensation for request_seen followed by a failed push.
 
@@ -1955,36 +2010,53 @@ class BackendScheduler:
     """
     forget = getattr(self.dupefilter, "forget", None)
     if not callable(forget):
-      self._record_enqueue_diagnostic(
+      self._record_or_defer_enqueue_diagnostic(
+        deferred_diagnostics,
         "warning",
         "Dupefilter cannot roll back a fingerprint after queue push failure",
         stat="scheduler/dupefilter_rollback_error",
       )
       return
 
+    rollback_failed = False
+    control_rollback_failed = False
     try:
       forget(request)
     except Exception:  # noqa: BLE001 - preserve the triggering queue failure
-      if preserve_primary:
-        self._record_enqueue_diagnostic(
-          "exception",
-          "Failed to roll back dupefilter reservation",
-          stat="scheduler/dupefilter_rollback_error",
-        )
-      else:
-        self._record_enqueue_diagnostic(
-          "exception",
-          "Failed to roll back dupefilter reservation",
-          stat="scheduler/dupefilter_rollback_error",
-        )
+      rollback_failed = True
     except BaseException:  # compensation must not hide process-control primary
       if not preserve_primary:
         raise
-      self._record_enqueue_diagnostic(
-        "exception",
+      control_rollback_failed = True
+    if rollback_failed or control_rollback_failed:
+      self._record_or_defer_enqueue_diagnostic(
+        deferred_diagnostics,
+        "error",
         "Failed to roll back dupefilter reservation",
         stat="scheduler/dupefilter_rollback_error",
       )
+
+  def _record_or_defer_enqueue_diagnostic(
+    self,
+    deferred_diagnostics: list[_EnqueueDiagnostic] | None,
+    level: str,
+    message: str,
+    *,
+    stat: str | None = None,
+  ) -> None:
+    """Record a fixed continuation diagnostic now or after an outer catch."""
+    if deferred_diagnostics is None:
+      self._record_enqueue_diagnostic(level, message, stat=stat)
+      return
+    deferred_diagnostics.append((level, message, stat))
+
+  def _flush_enqueue_diagnostics(
+    self,
+    deferred_diagnostics: list[_EnqueueDiagnostic],
+  ) -> None:
+    """Dispatch diagnostics after the enclosing operational error unwinds."""
+    for level, message, stat in deferred_diagnostics:
+      self._record_enqueue_diagnostic(level, message, stat=stat)
 
   def _record_stat(self, key: str) -> None:
     """Record advisory scheduler telemetry without changing the result.
@@ -2024,6 +2096,7 @@ class BackendScheduler:
         The next request, or None if the queue is empty or paused under the
         backpressure gate.
     """
+    fallback_diagnostic: tuple[str, str | None] | None = None
     try:
       queue = self._queue
       if queue is None:
@@ -2071,20 +2144,26 @@ class BackendScheduler:
         self._wrap_download_failure(request)
         self._record_stat("scheduler/dequeued")
     except SerializationError:
-      try:
-        logger.error("Failed to deserialize queued request")
-      except BaseException:
-        pass
-      self._record_stat("scheduler/deserialization_errors")
-      return None
+      fallback_diagnostic = (
+        "Failed to deserialize queued request",
+        "scheduler/deserialization_errors",
+      )
     except (QueueError, BackendConnectionError, CircuitBreakerOpenError):
+      fallback_diagnostic = ("Failed to get next request", None)
+
+    if fallback_diagnostic is not None:
+      # The queue error has left its exception suite before telemetry runs, so
+      # neither a logging handler nor stats collector can access its raw
+      # traceback through ``sys.exc_info()``.
+      message, stat = fallback_diagnostic
       try:
-        logger.error("Failed to get next request")
+        logger.error(message)
       except BaseException:
         pass
+      if stat is not None:
+        self._record_stat(stat)
       return None
-    else:
-      return request
+    return request
 
   def has_pending_requests(self) -> bool:
     """Check if there are pending requests.
@@ -2100,13 +2179,17 @@ class BackendScheduler:
       BackendConnectionError,
       CircuitBreakerOpenError,
     ):
-      try:
-        logger.warning(
-          "Queue length lookup is unavailable; assuming pending requests exist"
-        )
-      except BaseException:
-        pass
-      return True
+      pass
+
+    # The length failure has unwound before the diagnostic handler is invoked,
+    # preventing it from recovering backend details through ``sys.exc_info()``.
+    try:
+      logger.warning(
+        "Queue length lookup is unavailable; assuming pending requests exist"
+      )
+    except BaseException:
+      pass
+    return True
 
   def __len__(self) -> int:
     """Get the number of pending requests.

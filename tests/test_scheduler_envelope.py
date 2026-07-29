@@ -17,6 +17,8 @@ Round-2 hardening (C6 HIGH + C8 HIGH):
 
 from __future__ import annotations
 
+import logging
+import sys
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -25,6 +27,7 @@ from scrapy import Request, Spider
 
 from scrapy_extension.exceptions import BackendError, QueueError, SerializationError
 from scrapy_extension.queue.queue import BACKEND_ACK_TOKEN_META_KEY, BackendQueue
+from scrapy_extension.schedule import scheduler as scheduler_module
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -52,6 +55,19 @@ class _FakeSpider(Spider):
     # Bypass Scrapy's Spider.__init__ (which needs a crawler context for
     # type-checking only). We set just what the scheduler reads.
     self.crawler = None  # type: ignore[assignment]
+
+
+class _ExceptionContextHandler(logging.Handler):
+  """Capture the interpreter exception state visible to a log handler."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.records: list[logging.LogRecord] = []
+    self.active_exceptions: list[tuple[object, object, object]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.active_exceptions.append(sys.exc_info())
 
 
 class TestEnqueueEnvelopeDedupeFailure:
@@ -85,6 +101,7 @@ class TestEnqueueEnvelopeDedupeFailure:
     queue.push.assert_called_once()
     # Stat incremented so the outage is observable.
     assert counts.get("scheduler/dupefilter_error") == 1
+    assert counts.get("scheduler/enqueued") == 1
 
   def test_request_seen_backend_error_also_handled(self) -> None:
     """E1: any BackendError (parent of QueueError) is also caught."""
@@ -874,3 +891,71 @@ class TestAckNackFailureObservability:
     queue.ack.assert_called_once_with(token="tok")
     queue.nack.assert_not_called()
     assert "_backend_ack_token" not in request.meta
+
+
+class TestSchedulerExceptionContextIsolation:
+  """Continuation telemetry must run after its operational error unwinds."""
+
+  def test_handler_and_stats_cannot_observe_caught_backend_failures(self) -> None:
+    marker = "round47-scheduler-private-marker"
+    handler = _ExceptionContextHandler()
+    stats_exception_states: list[tuple[object, object, object]] = []
+
+    class _Stats:
+      def inc_value(self, *_args: object, **_kwargs: object) -> None:
+        stats_exception_states.append(sys.exc_info())
+
+    stats = _Stats()
+    scheduler_module.logger.addHandler(handler)
+    try:
+      dupefilter = MagicMock(name="DupeFilter")
+      dupefilter.request_seen.side_effect = QueueError(marker)
+      scheduler = BackendScheduler(
+        connection_manager=MagicMock(name="ConnectionManager"),
+        stats=stats,
+        dupefilter=dupefilter,
+      )
+      queue = MagicMock(name="BackendQueue")
+      scheduler._queue = queue
+
+      assert scheduler.enqueue_request(Request("https://example.invalid/a")) is True
+
+      queue.ack.side_effect = QueueError(marker)
+      assert scheduler._ack_token(
+        "ack-token",
+        log_message="Failed to acknowledge queued request",
+      ) is False
+
+      queue.nack.side_effect = QueueError(marker)
+      assert scheduler._nack_token(
+        "nack-token",
+        log_message="Failed to negatively acknowledge queued request",
+      ) is False
+
+      next_scheduler = BackendScheduler(
+        connection_manager=MagicMock(name="ConnectionManager"),
+        stats=stats,
+      )
+      next_queue = MagicMock(name="BackendQueue")
+      next_queue.pop.side_effect = QueueError(marker)
+      next_scheduler._queue = next_queue
+      assert next_scheduler.next_request() is None
+
+      close_scheduler = BackendScheduler(
+        connection_manager=MagicMock(name="ConnectionManager"),
+      )
+      close_queue = MagicMock(name="BackendQueue")
+      close_queue.close.side_effect = RuntimeError(marker)
+      close_scheduler._queue = close_queue
+      close_scheduler.close("test")
+    finally:
+      scheduler_module.logger.removeHandler(handler)
+
+    assert handler.active_exceptions
+    assert all(state == (None, None, None) for state in handler.active_exceptions)
+    assert all(state == (None, None, None) for state in stats_exception_states)
+    for record in handler.records:
+      assert marker not in record.getMessage()
+      assert marker not in repr(record.args)
+      assert record.exc_info is None
+      assert record.exc_text is None

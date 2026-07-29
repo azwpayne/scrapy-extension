@@ -1,6 +1,8 @@
 """Tests for BackendSpiderMixin."""
 
+import logging
 import os
+import sys
 import threading
 from unittest.mock import Mock
 
@@ -10,6 +12,7 @@ from scrapy import Spider, signals
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.spider import spider_mixin as spider_mixin_module
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 
 # Redis password fixture - use env var to avoid S105 warnings
@@ -35,6 +38,19 @@ class _ObservedLock:
 
   def __exit__(self, *_exc_info):
     self._lock.release()
+
+
+class _ExceptionContextHandler(logging.Handler):
+  """Capture the interpreter exception state visible to a log handler."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.records: list[logging.LogRecord] = []
+    self.active_exceptions: list[tuple[object, object, object]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.active_exceptions.append(sys.exc_info())
 
 
 class TestBackendSpiderMixinInit:
@@ -1637,6 +1653,52 @@ class TestCloseBackend:
     dupefilter.close.assert_called_once_with("spider-mixin-close")
     manager.close.assert_called_once_with()
     assert caplog.text.count("Failed to disconnect backend lifecycle signal") == 2
+
+  def test_continuation_logs_hide_active_teardown_errors_from_handlers(self, mocker):
+    """R47: teardown and signal fallbacks log after their error suites end."""
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+
+    marker = "round47-spider-private-marker"
+    handler = _ExceptionContextHandler()
+    spider = TestSpider()
+    signal_manager = mocker.MagicMock()
+    queue = mocker.MagicMock()
+    dupefilter = mocker.MagicMock()
+    scheduler = mocker.MagicMock()
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    spider._connected_signals = signal_manager
+    spider._signals_connected = True
+    spider._queue = queue
+    spider._dupefilter = dupefilter
+    spider._scheduler = scheduler
+    spider._connection_manager = manager
+    signal_manager.disconnect.side_effect = RuntimeError(marker)
+    queue.close.side_effect = RuntimeError(marker)
+    dupefilter.close.side_effect = RuntimeError(marker)
+    scheduler.close.side_effect = RuntimeError(marker)
+    manager.close.side_effect = RuntimeError(marker)
+
+    spider_mixin_module.logger.addHandler(handler)
+    try:
+      spider.close_backend()
+
+      signal_spider = TestSpider()
+      signal_spider.close_backend = mocker.MagicMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError(marker)
+      )
+      signal_spider._on_spider_closed(signal_spider, reason="finished")
+    finally:
+      spider_mixin_module.logger.removeHandler(handler)
+
+    assert handler.active_exceptions
+    assert all(state == (None, None, None) for state in handler.active_exceptions)
+    for record in handler.records:
+      assert marker not in record.getMessage()
+      assert marker not in repr(record.args)
+      assert record.exc_info is None
+      assert record.exc_text is None
 
   def test_close_backend_isolates_diagnostic_control_errors(self, mocker):
     """A logger failure after one close error cannot abort later teardown."""

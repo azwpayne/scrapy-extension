@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
@@ -20,6 +21,19 @@ from scrapy_extension.storage.strategies import (
   create_storage_strategy,
 )
 from scrapy_extension.storage.strategies import batched as batched_module
+
+
+class _ExceptionContextHandler(logging.Handler):
+  """Capture the interpreter exception state visible to a log handler."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.records: list[logging.LogRecord] = []
+    self.active_exceptions: list[tuple[object, object, object]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.active_exceptions.append(sys.exc_info())
 
 
 class TestPassthroughStorageStrategy:
@@ -1115,6 +1129,38 @@ class TestBatchedStorageRisk2:
     # The item was buffered before telemetry ran, so a caller that handles the
     # control signal can retry the persistence lifecycle without losing it.
     assert strat.pending == 1
+
+  def test_monitor_fallback_handlers_see_no_active_exception(self, mocker) -> None:
+    """R47: ignored monitor errors must unwind before fallback logging."""
+    marker = "round47-batched-private-marker"
+    handler = _ExceptionContextHandler()
+    monitor = mocker.Mock()
+    strat = BatchedStorageStrategy(threshold=1, monitor=monitor)
+    backend = mocker.Mock()
+    previous_level = batched_module.logger.level
+    batched_module.logger.setLevel(logging.DEBUG)
+    batched_module.logger.addHandler(handler)
+    try:
+      monitor.on_buffer_depth.side_effect = RuntimeError(marker)
+      strat._emit_buffer_depth(1)
+
+      monitor.on_error.side_effect = RuntimeError(marker)
+      strat._emit_error("store", RuntimeError(marker))
+
+      monitor.on_buffer_depth.side_effect = None
+      monitor.on_store.side_effect = RuntimeError(marker)
+      strat.store(backend, "key", b"value")
+    finally:
+      batched_module.logger.removeHandler(handler)
+      batched_module.logger.setLevel(previous_level)
+
+    assert handler.active_exceptions
+    assert all(state == (None, None, None) for state in handler.active_exceptions)
+    for record in handler.records:
+      assert marker not in record.getMessage()
+      assert marker not in repr(record.args)
+      assert record.exc_info is None
+      assert record.exc_text is None
 
   def test_max_buffer_age_s_none_starts_no_flusher(self, mocker) -> None:
     """Disabled (None) → no background flusher thread (byte-identical to old)."""

@@ -397,20 +397,24 @@ class BackendSpiderMixin(Spider):
     )
     primary_error: BaseException | None = None
     for handler, signal in targets:
+      disconnect_failed = False
       try:
         signal_manager.disconnect(handler, signal)
       except Exception:
+        disconnect_failed = True
+      except BaseException as exc:  # noqa: BLE001 - finish sibling cleanup
+        # This is the primary lifecycle-control failure.  Keep cleaning up
+        # sibling handlers, then re-raise it below without invoking telemetry
+        # while its exception context is active.
+        if primary_error is None:
+          primary_error = exc
+      if disconnect_failed:
+        # The ordinary signal-manager error has left its ``except`` suite.
+        # A custom logging handler cannot recover it through ``sys.exc_info``.
         try:
           logger.error("Failed to disconnect backend lifecycle signal")
         except BaseException:
           pass
-      except BaseException as exc:  # noqa: BLE001 - finish sibling cleanup
-        try:
-          logger.exception("Failed to disconnect backend lifecycle signal")
-        except BaseException:
-          pass
-        if primary_error is None:
-          primary_error = exc
     if primary_error is not None:
       raise primary_error
 
@@ -440,13 +444,17 @@ class BackendSpiderMixin(Spider):
     """
     if spider is not self:
       return
+    close_failed = False
     try:
       self.close_backend()
     except Exception:
+      close_failed = True
+    if close_failed:
       # This is an advisory diagnostic: a broken logging handler must not
-      # interrupt Scrapy's remaining spider_closed subscribers.  Deliberately
-      # keep the outer ``except Exception`` so direct control-flow exceptions
-      # from close_backend still propagate.
+      # interrupt Scrapy's remaining spider_closed subscribers.  The caught
+      # close failure has unwound before logger code runs, so the handler
+      # cannot inspect it through ``sys.exc_info()``. Direct control-flow
+      # exceptions from close_backend still propagate.
       try:
         logger.error("close_backend() failed during spider_closed signal")
       except BaseException:
@@ -662,32 +670,39 @@ class BackendSpiderMixin(Spider):
       ):
         if component is None:
           continue
+        component_close_failed = False
         try:
           component.close(*args)
         except Exception:
-          # Diagnostics must not become a second teardown failure: custom
-          # logging handlers can raise process-control exceptions too.
+          component_close_failed = True
+        except BaseException as exc:  # noqa: BLE001 - preserve process control
+          if primary_error is None:
+            primary_error = exc
+        if component_close_failed:
+          # The component's ordinary close error is no longer active, so a
+          # custom logger cannot observe it through ``sys.exc_info()``.
           try:
             logger.error("Failed to close backend component")
           except BaseException:  # noqa: BLE001 - teardown must continue
             pass
-        except BaseException as exc:  # noqa: BLE001 - preserve process control
-          if primary_error is None:
-            primary_error = exc
 
       if manager is not None:
+        manager_close_failed = False
         try:
           manager.close()
         except Exception:
+          manager_close_failed = True
+        except BaseException as exc:  # noqa: BLE001 - do not mask component error
+          if primary_error is None:
+            primary_error = exc
+        if manager_close_failed:
           # Keep the manager release independent from diagnostic handlers for
-          # the same reason as component cleanup above.
+          # the same reason as component cleanup above. Its ordinary error has
+          # already left the handler before this log call.
           try:
             logger.error("Failed to close backend connection manager")
           except BaseException:  # noqa: BLE001 - teardown must continue
             pass
-        except BaseException as exc:  # noqa: BLE001 - do not mask component error
-          if primary_error is None:
-            primary_error = exc
       if primary_error is not None:
         raise primary_error
 
