@@ -24,6 +24,7 @@ import math
 import os
 import threading
 import time
+from abc import ABC
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -35,13 +36,14 @@ from enum import Enum
 from json import JSONEncoder
 from pathlib import PurePath
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import Any, ClassVar, cast
 from uuid import UUID
 
 from pydantic import BaseModel, SecretBytes, SecretStr, ValidationError
 
 from scrapy_extension.backends._retry import compute_full_jitter_backoff
 from scrapy_extension.backends.base import (
+  Backend,
   BackendType,
   QueueBackend,
   SetBackend,
@@ -63,9 +65,6 @@ from scrapy_extension.exceptions import (
   QueueError,
 )
 from scrapy_extension.monitor.base import Monitor, NullMonitor
-
-if TYPE_CHECKING:
-  from scrapy_extension.backends.base import Backend
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +133,40 @@ def _model_field_names(settings_cls: Any) -> frozenset[str]:
   if not isinstance(fields, Mapping):
     return frozenset()
   return frozenset(name for name in fields if isinstance(name, str))
+
+
+_CAPABILITY_INTERFACES: dict[str, type[ABC]] = {
+  "queue": QueueBackend,
+  "set": SetBackend,
+  "storage": StorageBackend,
+}
+
+
+def _validate_backend_contract(
+  backend: object, descriptor: BackendDescriptor
+) -> Backend:
+  """Verify a selected backend fulfils its advertised runtime contract.
+
+  Registry discovery intentionally stores dotted paths only, so a plugin can
+  remain lazy until it is selected.  This is the corresponding first-use
+  boundary: after construction, its lifecycle and every declared capability
+  must be backed by the project's ABCs.  A descriptor is configuration, not
+  an assertion to trust blindly.
+  """
+  missing: list[str] = []
+  if not isinstance(backend, Backend):
+    missing.append("Backend")
+  for capability in sorted(descriptor.capabilities):
+    interface = _CAPABILITY_INTERFACES[capability]
+    if not isinstance(backend, interface):
+      missing.append(interface.__name__)
+  if missing:
+    msg = (
+      f"Backend {descriptor.backend_type!r} does not implement its declared "
+      f"contract: missing {', '.join(missing)}."
+    )
+    raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
+  return cast("Backend", backend)
 
 
 # ---------------------------------------------------------------------------
@@ -987,8 +1020,21 @@ class ConnectionManager:
       if isinstance(self.backend_type, BackendType)
       else self.backend_type
     )
-    backend_cls = _load_object(descriptor.backend_cls_path)
-    settings_cls = _load_object(descriptor.settings_cls_path)
+    try:
+      backend_cls = _load_object(descriptor.backend_cls_path)
+      settings_cls = _load_object(descriptor.settings_cls_path)
+    except (AttributeError, ValueError, TypeError) as exc:
+      msg = (
+        f"Backend {descriptor.backend_type!r} has an invalid plugin class "
+        f"path: {exc}"
+      )
+      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE") from exc
+    if not callable(backend_cls) or not callable(settings_cls):
+      msg = (
+        f"Backend {descriptor.backend_type!r} must provide callable backend "
+        "and settings classes."
+      )
+      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
     backend_field_names = _model_field_names(settings_cls)
     manager_only_names = _CONNECTION_MANAGER_SETTING_NAMES - backend_field_names
     backend_settings = {
@@ -997,9 +1043,23 @@ class ConnectionManager:
       if name not in _CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS
       and name not in manager_only_names
     }
-    # Both loaded objects are dynamically-discovered plugin classes (typed as
-    # ``Any``); cast narrows to the concrete ``Backend`` instance we construct.
-    return cast("Backend", backend_cls(settings_cls(**backend_settings)))
+    try:
+      backend = backend_cls(settings_cls(**backend_settings))
+    except TypeError as exc:
+      # A plugin's constructor contract is static configuration.  Retrying it
+      # as though it were a transient network failure only delays a useful
+      # error and can leave operators with a misleading BackendConnectionError.
+      msg = (
+        f"Backend {descriptor.backend_type!r} could not be constructed: {exc}"
+      )
+      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE") from exc
+    # Bundled descriptors and implementations ship together and are covered by
+    # their backend contract suite.  Third-party descriptors are executable
+    # metadata from another distribution, so enforce the runtime contract at
+    # this lazy first-use boundary before any connection attempt can start.
+    if descriptor.backend_type not in _BUNDLED_BACKEND_TYPES:
+      return _validate_backend_contract(backend, descriptor)
+    return cast("Backend", backend)
 
   def connect(self) -> None:
     """Establish connection with retry logic.

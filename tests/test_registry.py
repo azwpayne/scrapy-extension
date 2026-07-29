@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scrapy_extension.backends.base import Backend, QueueBackend
 from scrapy_extension.backends.registry import (
   BackendDescriptor,
   _reset_registry_cache,
@@ -50,6 +51,14 @@ def _register_kwarg() -> BackendDescriptor:
 
 def _register_good_plugin() -> BackendDescriptor:
   return _make_descriptor("goodplugin", capabilities=frozenset({"queue"}))
+
+
+def _register_overclaimed_plugin() -> BackendDescriptor:
+  return _make_descriptor(
+    "overclaimed",
+    capabilities=frozenset({"queue"}),
+    backend_cls_path="tests.test_registry._LifecycleOnlyBackend",
+  )
 
 
 def _register_mismatched_plugin() -> BackendDescriptor:
@@ -189,7 +198,7 @@ def _patch_entry_points(monkeypatch: pytest.MonkeyPatch, eps: list[_FakeEntryPoi
 # ---------------------------------------------------------------------------
 
 
-class _StubBackend:
+class _StubBackend(Backend, QueueBackend):
   """Minimal backend stub the descriptor points at.
 
   Constructed as ``_StubBackend(_StubSettings(**settings))`` — so the
@@ -200,12 +209,65 @@ class _StubBackend:
   def __init__(self, settings: _StubSettings) -> None:
     self.settings = settings
 
+  @property
+  def backend_type(self) -> str:
+    return "mybackend"
+
+  def connect(self) -> None:
+    pass
+
+  def disconnect(self) -> None:
+    pass
+
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    del queue_name, item, priority
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    del queue_name, timeout
+    return None
+
+  def queue_len(self, queue_name: str) -> int:
+    del queue_name
+    return 0
+
+  def clear_queue(self, queue_name: str) -> None:
+    del queue_name
+
 
 class _StubSettings:
   """Settings stub matching ``_StubBackend``'s constructor contract."""
 
   def __init__(self, **kwargs: Any) -> None:
     self.kwargs = kwargs
+
+
+class _LifecycleOnlyBackend(Backend):
+  """Valid lifecycle backend deliberately missing its declared queue ABC."""
+
+  def __init__(self, settings: _StubSettings) -> None:
+    self.settings = settings
+
+  @property
+  def backend_type(self) -> str:
+    return "overclaimed"
+
+  def connect(self) -> None:
+    pass
+
+  def disconnect(self) -> None:
+    pass
+
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +351,29 @@ class TestThirdPartyDiscovered:
 
 class TestDescriptorBoundary:
   """Malformed or ambiguous plugins never enter or abort the registry."""
+
+  def test_selected_plugin_overclaim_fails_before_connection_retry(self, monkeypatch):
+    """Runtime interface validation happens on first use, not discovery."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+    from scrapy_extension.exceptions import ConfigurationError
+
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name="overclaimed",
+          value="tests.test_registry._register_overclaimed_plugin",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    manager = ConnectionManager("overclaimed", {"retry_attempts": 3})
+    with pytest.raises(ConfigurationError, match="QueueBackend"):
+      manager.connect()
+    assert manager._backend is None
 
   def test_broken_plugin_isolated_when_user_warnings_are_errors(self, monkeypatch):
     from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from scrapy.settings import Settings as ScrapySettings
 
 from scrapy_extension.backends import connectors
+from scrapy_extension.backends.base import Backend, QueueBackend
 from scrapy_extension.backends.connectors import resolve_backend_config
 from scrapy_extension.backends.registry import BackendDescriptor
 
@@ -21,11 +22,41 @@ class _PluginRetrySettings(BaseModel):
   retry_delay: float
 
 
-class _PluginRetryBackend:
+class _PluginRetryBackend(Backend, QueueBackend):
   """Minimal module-level plugin backend used through descriptor resolution."""
 
   def __init__(self, settings: _PluginRetrySettings) -> None:
     self.settings = settings
+
+  @property
+  def backend_type(self) -> str:
+    return "plugin_retry"
+
+  def connect(self) -> None:
+    pass
+
+  def disconnect(self) -> None:
+    pass
+
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    del queue_name, item, priority
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    del queue_name, timeout
+    return None
+
+  def queue_len(self, queue_name: str) -> int:
+    del queue_name
+    return 0
+
+  def clear_queue(self, queue_name: str) -> None:
+    del queue_name
 
 
 def _resolve_queue(settings: ScrapySettings) -> tuple[str, dict[str, object]]:

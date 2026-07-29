@@ -200,19 +200,21 @@ class MySettings(BaseModel):
 
 ```python
 from scrapy_extension.backends.base import (
+    Backend,
     QueueBackend,
     SetBackend,
     StorageBackend,
 )
+from mybackend_plugin.settings import MySettings
 
 
-class MyBackend(QueueBackend, SetBackend, StorageBackend):
+class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """In-process backend for demonstration — no external service required."""
 
     backend_type = "mybackend"
 
-    def __init__(self, settings: dict | None = None) -> None:
-        self._settings = settings or {}
+    def __init__(self, settings: MySettings) -> None:
+        self._settings = settings
         self._queue: list[tuple[str, bytes]] = []   # (priority, item)
         self._seen: set[str] = set()
         self._store: dict[str, bytes] = {}
