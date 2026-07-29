@@ -19,12 +19,12 @@ logic per mode:
 - STANDALONE (``_connect_standalone``): ``MongoClient(config.uri, **kwargs)`` —
   single-host, no ``replicaSet`` kwarg, no URI query suffix.
 - REPLICA_SET (``_connect_replica_set``): when ``replica_set_members`` set,
-  URI is ``mongodb://<members>/<db>?replicaSet=<name>`` and ``replicaSet`` is
-  ALSO injected as a kwarg when ``replica_set_name`` is set. Without members
-  it falls back to ``config.uri``.
+  URI is authority-only ``mongodb://<members>/`` and ``replicaSet`` is passed
+  only as a kwarg when ``replica_set_name`` is set. Without members it falls
+  back to ``config.uri``.
 - SHARDED_CLUSTER (``_connect_sharded_cluster``): when ``mongos_routers`` set,
-  URI is ``mongodb://<routers>/<db>`` (multiple hosts). Without routers it
-  falls back to ``config.uri``.
+  URI is authority-only ``mongodb://<routers>/`` (multiple hosts). Without
+  routers it falls back to ``config.uri``.
 - ATLAS (``_connect_atlas``): forces ``tls=True`` in kwargs regardless of
   ``tls_enabled`` config; URI comes from ``config.uri`` unchanged.
 """
@@ -85,16 +85,14 @@ class TestStandaloneModeConstructor:
 
 
 class TestReplicaSetModeConstructor:
-  """REPLICA_SET: ``replicaSet=`` in URI and/or ``replicaSet`` kwarg."""
+  """REPLICA_SET: authority-only seed URI plus ``replicaSet`` kwarg."""
 
-  def test_replica_set_builds_members_uri_with_replicaset_query(self, mocker):
+  def test_replica_set_builds_authority_only_members_uri(self, mocker):
     """REPLICA_SET + ``replica_set_members`` → URI is
-    ``mongodb://<members>/<db>?replicaSet=<name>`` AND ``replicaSet`` kwarg
-    is set.
+    ``mongodb://<members>/`` and ``replicaSet`` is a separate kwarg.
 
-    Pins ``_connect_replica_set`` (mongodb.py:257-279): members → URI is
-    rebuilt; ``replica_set_name`` (when set) appears BOTH as the
-    ``?replicaSet=`` query suffix AND as the ``replicaSet=<name>`` kwarg.
+    The database and replica-set name must never be interpolated into the
+    generated URI, because both are independently passed to PyMongo.
     """
     config = MongoDBSettings(
       mode=MongoDBMode.REPLICA_SET,
@@ -111,9 +109,9 @@ class TestReplicaSetModeConstructor:
     call_args, call_kwargs = MongoClient.call_args
     uri = call_args[0]
     # Multi-host URI rebuilt from members, NOT the default localhost URI.
-    assert uri.startswith("mongodb://rs-host1:27017,rs-host2:27017,rs-host3:27017/")
-    assert "?replicaSet=rs0" in uri
-    # The replicaSet kwarg is ALSO injected (separate from the URI suffix).
+    assert uri == "mongodb://rs-host1:27017,rs-host2:27017,rs-host3:27017/"
+    assert "?" not in uri
+    # The replicaSet kwarg is the only topology declaration in this path.
     assert call_kwargs.get("replicaSet") == "rs0"
 
   def test_replica_set_without_members_falls_back_to_config_uri(self, mocker):
@@ -146,7 +144,7 @@ class TestShardedClusterModeConstructor:
 
   def test_sharded_cluster_builds_multi_host_uri_from_mongos_routers(self, mocker):
     """SHARDED_CLUSTER + ``mongos_routers`` → URI is
-    ``mongodb://<router1>,<router2>/<db>``.
+    ``mongodb://<router1>,<router2>/``.
 
     Pins ``_connect_sharded_cluster`` (mongodb.py:281-298): multiple mongos
     routers become a multi-host URI. This is the load-bearing difference
@@ -169,7 +167,7 @@ class TestShardedClusterModeConstructor:
     # Both routers appear as comma-separated hosts.
     assert "mongos-a:27017" in uri
     assert "mongos-b:27017" in uri
-    assert uri.startswith("mongodb://mongos-a:27017,mongos-b:27017/shard_db")
+    assert uri == "mongodb://mongos-a:27017,mongos-b:27017/"
     # Sharded cluster does NOT inject the replicaSet kwarg.
     _args, call_kwargs = MongoClient.call_args
     assert "replicaSet" not in call_kwargs
@@ -256,7 +254,7 @@ class TestModesDiverge:
           replica_set_name="rs0",
           replica_set_members=["r1:27017", "r2:27017"],
         ),
-        None,  # don't pin exact URI; assert it's multi-host + has suffix
+        None,  # multi-host authority-only seed URI
         False,
         "rs0",
       ),
@@ -309,7 +307,7 @@ class TestModesDiverge:
   ("mode", "expected_in_uri"),
   [
     (MongoDBMode.STANDALONE, ("mongodb://h:27017",)),
-    (MongoDBMode.REPLICA_SET, ("replicaSet=rs0",)),
+    (MongoDBMode.REPLICA_SET, ("mongodb://rs1:27017,rs2:27017/",)),
     (MongoDBMode.SHARDED_CLUSTER, ("mongos1:27017", "mongos2:27017")),
     (MongoDBMode.ATLAS, ("mongodb+srv://",)),
   ],
@@ -318,7 +316,7 @@ def test_mode_specific_uri_signature(mode: MongoDBMode, expected_in_uri: tuple[s
   """Parametrized smoke: each mode's captured URI contains mode-specific tokens.
 
   This is a compact regression check on the URI shape itself — standalone is
-  a plain single-host URI, replica_set carries the ``?replicaSet=`` suffix,
+  a plain single-host URI, replica_set has an authority-only seed URI,
   sharded_cluster has multiple mongos hosts, atlas uses ``mongodb+srv://``.
   """
   if mode is MongoDBMode.STANDALONE:

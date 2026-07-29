@@ -123,6 +123,339 @@ def test_mongodb_connect_rejects_mutated_unacknowledged_w_before_sdk_io(mocker):
 
 
 @pytest.mark.parametrize(
+  ("uri", "secret"),
+  [
+    (
+      "mongodb://crawler:runtime-uri-secret@db.example.test:27017",
+      "runtime-uri-secret",
+    ),
+    (
+      "mongodb://db.example.test:27017/?tls=true;tlsAllowInvalidHostnames=true",
+      "runtime-uri-secret",
+    ),
+    (
+      "mongodb://db.example.test:27017/?authMechanismProperties=AWS_SESSION_TOKEN:runtime-uri-secret",
+      "runtime-uri-secret",
+    ),
+    (
+      "mongodb://db.example.test:27017/#?tlsAllowInvalidHostnames=true",
+      "runtime-uri-secret",
+    ),
+    (
+      "mongodb://db.example.test:27017/#?authMechanismProperties=AWS_SESSION_TOKEN:runtime-fragment-secret",
+      "runtime-fragment-secret",
+    ),
+  ],
+)
+def test_mongodb_connect_rejects_mutated_uri_security_policy_before_sdk_io(
+  mocker, uri, secret
+):
+  """Runtime mutation cannot bypass the typed credential/TLS URI boundary."""
+  config = MongoDBSettings()
+  config.uri = uri
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "uri"
+  assert secret not in str(exc_info.value)
+  assert secret not in repr(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("uri", "secret"),
+  [
+    ("mongodb://db.example.test:not-a-port", "runtime-authority-secret"),
+    ("mongodb://db.example.test:65536", "runtime-authority-secret"),
+    ("mongodb://,db.example.test:27017", "runtime-authority-secret"),
+    ("mongodb+srv://cluster.example.test:27017", "runtime-authority-secret"),
+  ],
+)
+def test_mongodb_connect_rejects_mutated_malformed_authority_before_sdk_io(
+  mocker, uri, secret
+):
+  """Mutable URI authorities cannot defer validation to PyMongo."""
+  config = MongoDBSettings()
+  config.uri = uri
+  config.password = secret
+  config.username = "crawler"
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "uri"
+  assert secret not in str(exc_info.value)
+  assert secret not in repr(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("field", "value", "expected_name"),
+  [
+    ("username", "crawler", "password"),
+    ("password", "runtime-password-secret", "username"),
+  ],
+)
+def test_mongodb_connect_rejects_mutated_partial_credentials_before_sdk_io(
+  mocker, field, value, expected_name
+):
+  """A mutable one-sided pair must fail rather than connect anonymously."""
+  config = MongoDBSettings()
+  setattr(config, field, value)
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == expected_name
+  assert "runtime-password-secret" not in str(exc_info.value)
+  client.assert_not_called()
+
+
+def test_mongodb_connect_rejects_mutated_remote_plaintext_auth_before_sdk_io(mocker):
+  """A valid local object cannot mutate into remote cleartext authentication."""
+  config = MongoDBSettings()
+  config.uri = "mongodb://db.example.test:27017"
+  config.username = "crawler"
+  config.password = "runtime-transport-secret"
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert "runtime-transport-secret" not in str(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  "uri",
+  [
+    "mongodb://attacker.localhost:27017",
+    "mongodb://localhost:27017/?replicaSet=rs0",
+    "mongodb://localhost:27017/?directConnection=false",
+    "mongodb://localhost:27017/?loadBalanced=true",
+    "mongodb://127.0.0.1:27017,localhost:27018",
+  ],
+)
+def test_mongodb_connect_rejects_mutated_non_direct_loopback_plaintext_auth(
+  mocker, uri
+):
+  """Runtime mutation cannot turn local cleartext auth into remote discovery."""
+  secret = "runtime-topology-secret"
+  config = MongoDBSettings()
+  config.uri = uri
+  config.username = "crawler"
+  config.password = secret
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert secret not in str(exc_info.value)
+  assert secret not in repr(exc_info.value)
+  client.assert_not_called()
+
+
+def test_mongodb_local_plaintext_auth_pins_driver_to_direct_connection(mocker):
+  """The narrow local compatibility exception cannot follow replica members."""
+  config = MongoDBSettings(username="crawler", password="local-direct-secret")
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  backend.connect()
+
+  assert client.call_args.kwargs["directConnection"] is True
+
+
+def test_mongodb_connect_rejects_mutated_blank_auth_source_before_sdk_io(mocker):
+  """A mutable blank auth source must not reach the driver as a bad database."""
+  config = MongoDBSettings(username="crawler", password="runtime-auth-secret")
+  config.auth_source = " "
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "auth_source"
+  assert "runtime-auth-secret" not in str(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {
+      "mode": MongoDBMode.ATLAS,
+      "uri": "mongodb+srv://cluster.example.mongodb.net",
+    },
+    {"mode": MongoDBMode.SHARDED_CLUSTER},
+  ],
+)
+def test_mongodb_connect_rejects_mutated_invalid_tls_before_sdk_io(
+  mocker, settings_kwargs
+):
+  """Production TLS policy is rechecked after mutable settings changes."""
+  config = MongoDBSettings(**settings_kwargs)
+  config.tls_allow_invalid_certificates = True
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == "tls_allow_invalid_certificates"
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("settings_kwargs", "field", "value", "expected_name"),
+  [
+    (
+      {"mode": MongoDBMode.REPLICA_SET, "replica_set_name": "rs0"},
+      "replica_set_members",
+      ["alice:runtime-seed-secret@db.example.test:27017"],
+      "replica_set_members",
+    ),
+    (
+      {"mode": MongoDBMode.SHARDED_CLUSTER},
+      "mongos_routers",
+      ["db.example.test:27017/?tlsInsecure=true&token=runtime-seed-secret"],
+      "mongos_routers",
+    ),
+  ],
+)
+def test_mongodb_connect_rejects_mutated_seed_uri_syntax_before_sdk_io(
+  mocker, settings_kwargs, field, value, expected_name
+):
+  """Mutable seed lists cannot inject credentials or TLS policy into a URI."""
+  config = MongoDBSettings(**settings_kwargs)
+  setattr(config, field, value)
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == expected_name
+  assert "runtime-seed-secret" not in str(exc_info.value)
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("settings_kwargs", "expected_uri", "expected_replica_set"),
+  [
+    (
+      {
+        "mode": MongoDBMode.REPLICA_SET,
+        "database": "crawl?tlsInsecure=true",
+        "replica_set_name": "rs0&tlsInsecure=true",
+        "replica_set_members": ["rs1:27017", "rs2:27017"],
+      },
+      "mongodb://rs1:27017,rs2:27017/",
+      "rs0&tlsInsecure=true",
+    ),
+    (
+      {
+        "mode": MongoDBMode.SHARDED_CLUSTER,
+        "database": "crawl?tlsInsecure=true",
+        "mongos_routers": ["mongos1:27017", "mongos2:27017"],
+      },
+      "mongodb://mongos1:27017,mongos2:27017/",
+      None,
+    ),
+  ],
+)
+def test_mongodb_generated_seed_uri_never_interpolates_database_or_topology(
+  mocker, settings_kwargs, expected_uri, expected_replica_set
+):
+  """Database/topology values stay out of generated URI path/query syntax."""
+  config = MongoDBSettings(**settings_kwargs)
+  backend = MongoDBBackend(config)
+  client_instance = mocker.MagicMock()
+  client = mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient", return_value=client_instance
+  )
+
+  backend.connect()
+
+  assert client.call_args.args == (expected_uri,)
+  assert "?" not in expected_uri
+  assert client.call_args.kwargs.get("replicaSet") == expected_replica_set
+  client_instance.__getitem__.assert_called_once_with("crawl?tlsInsecure=true")
+
+
+def test_mongodb_connect_uses_snapshot_after_mutable_config_changes(mocker):
+  """The driver receives the validated values even if config changes mid-connect."""
+  config = MongoDBSettings(
+    uri="mongodb://db.example.test:27017",
+    username="crawler",
+    password="snapshot-secret",
+    tls_enabled=True,
+  )
+  backend = MongoDBBackend(config)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  capture = backend._capture_connection_snapshot
+
+  def mutate_after_capture():
+    snapshot = capture()
+    config.uri = "mongodb://attacker.example.test:27017"
+    config.tls_enabled = False
+    config.username = "attacker"
+    config.password = "attacker-secret"
+    return snapshot
+
+  mocker.patch.object(
+    backend, "_capture_connection_snapshot", side_effect=mutate_after_capture
+  )
+
+  backend.connect()
+
+  assert client.call_args.args == ("mongodb://db.example.test:27017",)
+  assert client.call_args.kwargs["tls"] is True
+  assert client.call_args.kwargs["username"] == "crawler"
+  assert client.call_args.kwargs["password"] == "snapshot-secret"
+
+
+@pytest.mark.parametrize(
+  ("mutations", "setting_name"),
+  [
+    ({"min_pool_size": True}, "min_pool_size"),
+    ({"min_pool_size": 11, "max_pool_size": 10}, "min_pool_size"),
+    ({"journal": "true"}, "journal"),
+    ({"tls_ca_file": " "}, "tls_ca_file"),
+    ({"read_preference": None}, "read_preference"),
+    ({"read_preference": "unsupported"}, "read_preference"),
+  ],
+)
+def test_mongodb_connect_revalidates_mutated_snapshot_options_before_sdk_io(
+  mocker, mutations, setting_name
+):
+  """Every option consumed by the snapshot is type/policy checked at connect."""
+  config = MongoDBSettings()
+  backend = MongoDBBackend(config)
+  for field, value in mutations.items():
+    setattr(config, field, value)
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    backend.connect()
+
+  assert exc_info.value.setting_name == setting_name
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
   ("field", "peer_field"),
   [
     ("queue_collection", "set_collection"),
@@ -1244,6 +1577,34 @@ def test_mongodb_backend_build_client_kwargs_auth(mocker):
   assert kwargs.get("password") == "secret"
   assert kwargs.get("authSource") == "admin"
   assert kwargs.get("authMechanism") == "SCRAM-SHA-256"
+
+
+@pytest.mark.parametrize(
+  ("mechanism", "settings_kwargs", "expected_username"),
+  [
+    ("GSSAPI", {"username": "crawler@EXAMPLE.TEST"}, "crawler@EXAMPLE.TEST"),
+    ("MONGODB-X509", {}, None),
+    ("MONGODB-AWS", {}, None),
+  ],
+)
+def test_mongodb_backend_build_client_kwargs_external_auth(
+  mechanism, settings_kwargs, expected_username, mocker
+):
+  """External mechanisms use the driver-supported credential shape/source."""
+  config = MongoDBSettings(auth_mechanism=mechanism, **settings_kwargs)
+  backend = MongoDBBackend(config)
+
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+  backend.connect()
+
+  kwargs = backend._build_client_kwargs()
+  assert kwargs.get("authMechanism") == mechanism
+  assert kwargs.get("authSource") == "$external"
+  if expected_username is None:
+    assert "username" not in kwargs
+  else:
+    assert kwargs["username"] == expected_username
+  assert "password" not in kwargs
 
 
 def test_mongodb_backend_build_client_kwargs_read_preference(mocker):

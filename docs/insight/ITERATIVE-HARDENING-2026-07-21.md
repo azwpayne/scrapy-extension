@@ -335,9 +335,11 @@ speculative work.
   TLS while preserving explicit loopback development configurations.
 - [ ] **SEC-02C-E — authenticated Elasticsearch transport.** Require HTTPS and
   certificate verification whenever API-key or basic authentication is used.
-- [ ] **SEC-02C-M — authenticated MongoDB transport.** Evaluate actual URI
-  endpoints and forbid invalid-certificate TLS for remote authenticated nodes,
-  including standalone mode.
+- [x] **SEC-02C-M — authenticated MongoDB transport.** Revalidate effective
+  URI/seed endpoints (including authority and fragment parsing), forbid
+  invalid-certificate TLS for remote nodes, require TLS for authenticated
+  replica/sharded discovery, and preserve only a pinned direct-connection,
+  single literal-loopback plaintext compatibility path (Round 38).
 - [x] **SEC-03A — AWS validated connection snapshots.** Revalidate SQS/DynamoDB
   endpoint and credential fields at connect time and use one captured set of
   connection values, so construction-time mutation and validation/use races
@@ -358,8 +360,8 @@ speculative work.
   immutable endpoint/policy snapshot, publish only after a successful probe,
   make connect idempotent, and sanitize startup failures.
 - [ ] **SEC-03B2B3 — remaining validated connection snapshots.** Apply copied,
-  revalidated connection snapshots and sanitized URL/URI failures to Kafka,
-  MongoDB, and Elasticsearch.
+  revalidated connection snapshots and sanitized URL/URI failures to Kafka and
+  Elasticsearch.
 - [ ] **SEC-03C — atomic mutable-configuration snapshots.** Copy the selected
   settings model's field mapping once before revalidation and SDK use, then
   freeze nested endpoint collections, so concurrent field mutation cannot

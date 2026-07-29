@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -51,7 +52,16 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
 from scrapy_extension.settings.mongodb import (
+  is_mongodb_direct_loopback_uri,
+  uses_mongodb_external_auth,
+  validate_mongodb_auth_source,
+  validate_mongodb_authentication,
   validate_mongodb_collection_domains,
+  validate_mongodb_database,
+  validate_mongodb_replica_set_name,
+  validate_mongodb_seed_endpoints,
+  validate_mongodb_transport_security,
+  validate_mongodb_uri,
   validate_mongodb_write_concern,
 )
 
@@ -65,6 +75,40 @@ logger = logging.getLogger(__name__)
 
 _CAPABILITY_DOMAIN_MARKER_ID = "scrapy-extension:capability-domain:v1"
 _CAPABILITY_DOMAIN_MARKER_FIELD = "scrapy_extension_capability_domain"
+
+
+@dataclass(frozen=True)
+class _MongoDBConnectionSnapshot:
+  """One fully validated, repr-safe set of values for a connect attempt."""
+
+  mode: MongoDBMode
+  uri: str
+  database: str
+  collection_names: tuple[str, str, str]
+  replica_set_name: str | None
+  replica_set_members: tuple[str, ...]
+  mongos_routers: tuple[str, ...]
+  min_pool_size: int
+  max_pool_size: int
+  max_idle_time_ms: int
+  wait_queue_timeout_ms: int
+  server_selection_timeout_ms: int
+  heartbeat_frequency_ms: int
+  w: int | str
+  journal: bool
+  w_timeout_ms: int | None
+  tls_enabled: bool
+  tls_ca_file: str | None
+  tls_cert_file: str | None
+  tls_key_file: str | None
+  tls_allow_invalid_certificates: bool
+  username: str | None
+  password: str | None
+  auth_source: str
+  auth_mechanism: str | None
+  authenticated: bool
+  force_direct_connection: bool
+  read_preference: str
 
 
 class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
@@ -140,54 +184,212 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def _refresh_connection_cache(self) -> None:
     """Rebuild configuration-derived caches for a fresh client generation."""
     self._client_kwargs = None
-    self._read_preference = self._compute_read_preference()
+    self._read_preference = None
 
-  def _connect(self) -> None:
-    """Connect one fresh client generation while ``_connection_lock`` is held."""
+  @staticmethod
+  def _validated_snapshot_int(
+    value: object, setting_name: str, minimum: int
+  ) -> int:
+    """Validate a mutable integer option before it reaches PyMongo."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+      raise ConfigurationError(
+        f"MongoDB {setting_name} must be an integer >= {minimum}.",
+        setting_name=setting_name,
+      )
+    return value
+
+  @staticmethod
+  def _validated_snapshot_optional_string(
+    value: object, setting_name: str
+  ) -> str | None:
+    """Validate an optional path-like client option from mutable settings."""
+    if value is None:
+      return None
+    if type(value) is not str or not value.strip():
+      raise ConfigurationError(
+        f"MongoDB {setting_name} must be a non-empty string when set.",
+        setting_name=setting_name,
+      )
+    return value
+
+  def _validated_read_preference(self, value: object) -> str:
+    """Normalize a mutable read-preference value to PyMongo's spelling."""
+    if type(value) is not str:
+      raise ConfigurationError(
+        "MongoDB read_preference must be a supported string.",
+        setting_name="read_preference",
+      )
+    normalized = value.lower().replace("_", "")
+    result = self._READ_PREF_MAP.get(normalized)
+    if result is None:
+      raise ConfigurationError(
+        "MongoDB read_preference is unsupported.",
+        setting_name="read_preference",
+      )
+    return result
+
+  def _capture_connection_snapshot(self) -> _MongoDBConnectionSnapshot:
+    """Capture and validate every value consumed by one client generation.
+
+    ``MongoDBSettings`` remains mutable for compatibility. A single immutable
+    snapshot closes the interval where a configuration could otherwise pass a
+    security check and then be changed before ``MongoClient`` consumes it.
+    """
     mode = self.config.mode
-    if mode not in (
-      MongoDBMode.STANDALONE,
-      MongoDBMode.REPLICA_SET,
-      MongoDBMode.SHARDED_CLUSTER,
-      MongoDBMode.ATLAS,
-    ):
+    if not isinstance(mode, MongoDBMode):
       try:
         mode_text = str(mode)
       except (TypeError, ValueError):
-        mode_text = getattr(mode, "value", repr(mode))
-      msg = f"Unsupported MongoDB mode: {mode_text}"
+        mode_value = getattr(mode, "value", None)
+        try:
+          mode_text = str(mode_value)
+        except (TypeError, ValueError):
+          mode_text = type(mode).__name__
       raise ConfigurationError(
-        msg,
-        setting_name="mode",
-        setting_value=mode,
+        f"Unsupported MongoDB mode: {mode_text}", setting_name="mode"
       )
-    # Settings models remain mutable after construction. Recheck before any
-    # client construction so a live mutation cannot merge capability domains
-    # or downgrade public writes to an unacknowledged socket handoff.
+
+    uri = validate_mongodb_uri(self.config.uri)
+    database = validate_mongodb_database(self.config.database)
     collection_names = validate_mongodb_collection_domains(
       self.config.queue_collection,
       self.config.set_collection,
       self.config.storage_collection,
     )
-    database = self.config.database
-    _, w_timeout_ms = self._validated_write_concern()
-    marker_options = self._marker_collection_options(
-      mode,
-      journal=self.config.journal,
+    replica_set_name = validate_mongodb_replica_set_name(
+      self.config.replica_set_name
+    )
+    replica_set_members = validate_mongodb_seed_endpoints(
+      self.config.replica_set_members, "replica_set_members"
+    )
+    mongos_routers = validate_mongodb_seed_endpoints(
+      self.config.mongos_routers, "mongos_routers"
+    )
+
+    min_pool_size = self._validated_snapshot_int(
+      self.config.min_pool_size, "min_pool_size", 0
+    )
+    max_pool_size = self._validated_snapshot_int(
+      self.config.max_pool_size, "max_pool_size", 1
+    )
+    if min_pool_size > max_pool_size:
+      raise ConfigurationError(
+        "MongoDB min_pool_size must be <= max_pool_size.",
+        setting_name="min_pool_size",
+      )
+    max_idle_time_ms = self._validated_snapshot_int(
+      self.config.max_idle_time_ms, "max_idle_time_ms", 0
+    )
+    wait_queue_timeout_ms = self._validated_snapshot_int(
+      self.config.wait_queue_timeout_ms, "wait_queue_timeout_ms", 0
+    )
+    server_selection_timeout_ms = self._validated_snapshot_int(
+      self.config.server_selection_timeout_ms, "server_selection_timeout_ms", 0
+    )
+    heartbeat_frequency_ms = self._validated_snapshot_int(
+      self.config.heartbeat_frequency_ms, "heartbeat_frequency_ms", 0
+    )
+    w, w_timeout_ms = validate_mongodb_write_concern(
+      self.config.w, self.config.w_timeout_ms
+    )
+    journal = self.config.journal
+    if type(journal) is not bool:
+      raise ConfigurationError(
+        "MongoDB journal must be a boolean.", setting_name="journal"
+      )
+
+    tls_enabled = self.config.tls_enabled
+    tls_allow_invalid_certificates = self.config.tls_allow_invalid_certificates
+    tls_ca_file = self._validated_snapshot_optional_string(
+      self.config.tls_ca_file, "tls_ca_file"
+    )
+    tls_cert_file = self._validated_snapshot_optional_string(
+      self.config.tls_cert_file, "tls_cert_file"
+    )
+    tls_key_file = self._validated_snapshot_optional_string(
+      self.config.tls_key_file, "tls_key_file"
+    )
+
+    username = self.config.username
+    password = secret_value(self.config.password)
+    auth_source = validate_mongodb_auth_source(self.config.auth_source)
+    auth_mechanism = self.config.auth_mechanism
+    authenticated = validate_mongodb_authentication(
+      username,
+      password,
+      auth_mechanism,
+      auth_source,
+    )
+    validate_mongodb_transport_security(
+      mode=mode,
+      uri=uri,
+      replica_set_members=replica_set_members,
+      mongos_routers=mongos_routers,
+      tls_enabled=tls_enabled,
+      tls_allow_invalid_certificates=tls_allow_invalid_certificates,
+      username=username,
+      password=password,
+      auth_mechanism=auth_mechanism,
+      auth_source=auth_source,
+    )
+
+    return _MongoDBConnectionSnapshot(
+      mode=mode,
+      uri=uri,
+      database=database,
+      collection_names=collection_names,
+      replica_set_name=replica_set_name,
+      replica_set_members=replica_set_members,
+      mongos_routers=mongos_routers,
+      min_pool_size=min_pool_size,
+      max_pool_size=max_pool_size,
+      max_idle_time_ms=max_idle_time_ms,
+      wait_queue_timeout_ms=wait_queue_timeout_ms,
+      server_selection_timeout_ms=server_selection_timeout_ms,
+      heartbeat_frequency_ms=heartbeat_frequency_ms,
+      w=w,
+      journal=journal,
       w_timeout_ms=w_timeout_ms,
+      tls_enabled=tls_enabled,
+      tls_ca_file=tls_ca_file,
+      tls_cert_file=tls_cert_file,
+      tls_key_file=tls_key_file,
+      tls_allow_invalid_certificates=tls_allow_invalid_certificates,
+      username=username,
+      password=cast(str | None, _redact(password)),
+      auth_source=auth_source,
+      auth_mechanism=cast(str | None, auth_mechanism),
+      authenticated=authenticated,
+      force_direct_connection=(
+        authenticated
+        and not tls_enabled
+        and mode is MongoDBMode.STANDALONE
+        and is_mongodb_direct_loopback_uri(uri)
+      ),
+      read_preference=self._validated_read_preference(self.config.read_preference),
+    )
+
+  def _connect(self) -> None:
+    """Connect one fresh client generation while ``_connection_lock`` is held."""
+    snapshot = self._capture_connection_snapshot()
+    self._read_preference = snapshot.read_preference
+    marker_options = self._marker_collection_options(
+      snapshot.mode,
+      journal=snapshot.journal,
+      w_timeout_ms=snapshot.w_timeout_ms,
     )
     try:
-      if mode == MongoDBMode.STANDALONE:
-        self._connect_standalone(database, collection_names, marker_options)
-      elif mode == MongoDBMode.REPLICA_SET:
-        self._connect_replica_set(database, collection_names, marker_options)
-      elif mode == MongoDBMode.SHARDED_CLUSTER:
-        self._connect_sharded_cluster(database, collection_names, marker_options)
+      if snapshot.mode == MongoDBMode.STANDALONE:
+        self._connect_standalone(snapshot, marker_options)
+      elif snapshot.mode == MongoDBMode.REPLICA_SET:
+        self._connect_replica_set(snapshot, marker_options)
+      elif snapshot.mode == MongoDBMode.SHARDED_CLUSTER:
+        self._connect_sharded_cluster(snapshot, marker_options)
       else:
-        self._connect_atlas(database, collection_names, marker_options)
+        self._connect_atlas(snapshot, marker_options)
     except ConnectionFailure as e:
       self._discard_client(suppress_process_control=True)
-      msg = f"Failed to connect to MongoDB ({mode.value}): {e}"
+      msg = f"Failed to connect to MongoDB ({snapshot.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="mongodb",
@@ -201,7 +403,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except Exception as e:
       self._discard_client(suppress_process_control=True)
       # Unexpected errors (e.g., RuntimeError from mocking in tests)
-      msg = f"Failed to connect to MongoDB ({mode.value}): {e}"
+      msg = f"Failed to connect to MongoDB ({snapshot.mode.value}): {e}"
       raise BackendConnectionError(
         msg,
         backend_type="mongodb",
@@ -213,7 +415,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # The complete client graph is now published.  Success diagnostics must
     # not turn that completed generation into a failed connection attempt.
     try:
-      logger.debug("Connected to MongoDB in %s mode", mode.value)
+      logger.debug("Connected to MongoDB in %s mode", snapshot.mode.value)
     except BaseException:
       pass
 
@@ -250,47 +452,53 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # Failed-connect cleanup must never replace the original exception.
             pass
 
-  def _build_client_kwargs(self) -> dict[str, Any]:
+  def _build_client_kwargs(
+    self, snapshot: _MongoDBConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
     """Build common MongoDB client kwargs.
 
     Returns:
         Dictionary of client configuration options.
     """
-    self._validated_write_concern()
-    # Return cached kwargs if available
-    if self._client_kwargs is not None:
+    if snapshot is None and self._client_kwargs is not None:
       return self._client_kwargs.copy()
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
+    self._read_preference = snapshot.read_preference
 
     kwargs: dict[str, Any] = {
-      "minPoolSize": self.config.min_pool_size,
-      "maxPoolSize": self.config.max_pool_size,
-      "maxIdleTimeMS": self.config.max_idle_time_ms,
-      "waitQueueTimeoutMS": self.config.wait_queue_timeout_ms,
-      "serverSelectionTimeoutMS": self.config.server_selection_timeout_ms,
-      "heartbeatFrequencyMS": self.config.heartbeat_frequency_ms,
+      "minPoolSize": snapshot.min_pool_size,
+      "maxPoolSize": snapshot.max_pool_size,
+      "maxIdleTimeMS": snapshot.max_idle_time_ms,
+      "waitQueueTimeoutMS": snapshot.wait_queue_timeout_ms,
+      "serverSelectionTimeoutMS": snapshot.server_selection_timeout_ms,
+      "heartbeatFrequencyMS": snapshot.heartbeat_frequency_ms,
     }
 
-    kwargs.update(self._write_concern_kwargs())
-    kwargs.update(self._tls_kwargs())
-    kwargs.update(self._auth_kwargs())
+    kwargs.update(self._write_concern_kwargs(snapshot))
+    kwargs.update(self._tls_kwargs(snapshot))
+    kwargs.update(self._auth_kwargs(snapshot))
+    if snapshot.force_direct_connection:
+      # The cleartext loopback exception is safe only when the driver cannot
+      # discover and follow a replica topology to remote endpoints.
+      kwargs["directConnection"] = True
 
     # Add read preference
-    read_pref = self._get_read_preference()
-    if read_pref:
-      kwargs["readPreference"] = read_pref
+    kwargs["readPreference"] = snapshot.read_preference
 
     # Cache for future use
     self._client_kwargs = kwargs.copy()
     return kwargs
 
-  def _write_concern_kwargs(self) -> dict[str, Any]:
-    """Build write-concern kwargs from config (w / journal / wtimeoutMS)."""
-    w, w_timeout_ms = self._validated_write_concern()
-    kwargs: dict[str, Any] = {"w": w}
-    if self.config.journal is not None:
-      kwargs["journal"] = self.config.journal
-    if w_timeout_ms is not None:
-      kwargs["wtimeoutMS"] = w_timeout_ms
+  def _write_concern_kwargs(
+    self, snapshot: _MongoDBConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
+    """Build write-concern kwargs from one validated connection snapshot."""
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
+    kwargs: dict[str, Any] = {"w": snapshot.w, "journal": snapshot.journal}
+    if snapshot.w_timeout_ms is not None:
+      kwargs["wtimeoutMS"] = snapshot.w_timeout_ms
     return kwargs
 
   def _validated_write_concern(self) -> tuple[int | str, int | None]:
@@ -300,32 +508,44 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self.config.w_timeout_ms,
     )
 
-  def _tls_kwargs(self) -> dict[str, Any]:
-    """Build TLS/SSL kwargs from config (empty when tls disabled)."""
+  def _tls_kwargs(
+    self, snapshot: _MongoDBConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
+    """Build TLS kwargs from one validated connection snapshot."""
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
     kwargs: dict[str, Any] = {}
-    if not self.config.tls_enabled:
+    if not (snapshot.tls_enabled or snapshot.mode is MongoDBMode.ATLAS):
       return kwargs
     kwargs["tls"] = True
-    if self.config.tls_ca_file:
-      kwargs["tlsCAFile"] = self.config.tls_ca_file
-    if self.config.tls_cert_file:
-      kwargs["tlsCertificateKeyFile"] = self.config.tls_cert_file
-    if self.config.tls_key_file and not self.config.tls_cert_file:
-      kwargs["tlsCertificateKeyFile"] = self.config.tls_key_file
-    kwargs["tlsAllowInvalidCertificates"] = self.config.tls_allow_invalid_certificates
+    if snapshot.tls_ca_file:
+      kwargs["tlsCAFile"] = snapshot.tls_ca_file
+    if snapshot.tls_cert_file:
+      kwargs["tlsCertificateKeyFile"] = snapshot.tls_cert_file
+    if snapshot.tls_key_file and not snapshot.tls_cert_file:
+      kwargs["tlsCertificateKeyFile"] = snapshot.tls_key_file
+    kwargs["tlsAllowInvalidCertificates"] = snapshot.tls_allow_invalid_certificates
     return kwargs
 
-  def _auth_kwargs(self) -> dict[str, Any]:
-    """Build authentication kwargs from config (empty when no credentials)."""
+  def _auth_kwargs(
+    self, snapshot: _MongoDBConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
+    """Build authentication kwargs from one validated connection snapshot."""
+    if snapshot is None:
+      snapshot = self._capture_connection_snapshot()
     kwargs: dict[str, Any] = {}
-    if not (self.config.username and self.config.password):
+    if not snapshot.authenticated:
       return kwargs
-    kwargs["username"] = self.config.username
-    kwargs["password"] = _redact(secret_value(self.config.password))
-    if self.config.auth_source:
-      kwargs["authSource"] = self.config.auth_source
-    if self.config.auth_mechanism:
-      kwargs["authMechanism"] = self.config.auth_mechanism
+    if snapshot.username is not None:
+      kwargs["username"] = snapshot.username
+    if snapshot.password is not None:
+      kwargs["password"] = snapshot.password
+    if snapshot.auth_mechanism:
+      kwargs["authMechanism"] = snapshot.auth_mechanism
+    if uses_mongodb_external_auth(snapshot.auth_mechanism):
+      kwargs["authSource"] = "$external"
+    else:
+      kwargs["authSource"] = snapshot.auth_source
     return kwargs
 
   def _compute_read_preference(self) -> str | None:
@@ -334,11 +554,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     Returns:
         Read preference string or None for default.
     """
-    read_pref = getattr(self.config, "read_preference", None)
-    if read_pref is None:
+    read_preference = getattr(self.config, "read_preference", None)
+    if read_preference is None:
       return None
-    normalized = read_pref.lower().replace("_", "")
-    return self._READ_PREF_MAP.get(normalized)
+    return self._validated_read_preference(read_preference)
 
   def _get_read_preference(self) -> str | None:
     """Get cached read preference string for MongoDB.
@@ -504,87 +723,86 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def _connect_standalone(
     self,
-    database: str,
-    collection_names: tuple[str, str, str],
+    snapshot: _MongoDBConnectionSnapshot,
     marker_options: Mapping[str, Any],
   ) -> None:
     """Connect to standalone MongoDB instance."""
-    kwargs = self._build_client_kwargs()
-    self._client = MongoClient(self.config.uri, **kwargs)
+    kwargs = self._build_client_kwargs(snapshot)
+    self._client = MongoClient(snapshot.uri, **kwargs)
     self._client.admin.command("ping")
-    self._initialize_collections(database, collection_names, marker_options)
+    self._initialize_collections(
+      snapshot.database, snapshot.collection_names, marker_options
+    )
 
   def _connect_replica_set(
     self,
-    database: str,
-    collection_names: tuple[str, str, str],
+    snapshot: _MongoDBConnectionSnapshot,
     marker_options: Mapping[str, Any],
   ) -> None:
     """Connect to MongoDB replica set.
 
     Uses replica_set_name if provided, otherwise uses URI.
     """
-    kwargs = self._build_client_kwargs()
+    kwargs = self._build_client_kwargs(snapshot)
 
-    # Build connection URI for replica set
-    if self.config.replica_set_members:
-      # Build connection string with replica set members
-      members = ",".join(self.config.replica_set_members)
-      uri = f"mongodb://{members}/{database}"
-      if self.config.replica_set_name:
-        uri += f"?replicaSet={self.config.replica_set_name}"
+    # The seed list has already been parsed as host[:port] values. Keep the
+    # generated URI authority-only: database selection and replica topology
+    # are explicit client operations/kwargs, never string interpolation.
+    if snapshot.replica_set_members:
+      uri = f"mongodb://{','.join(snapshot.replica_set_members)}/"
     else:
-      uri = self.config.uri
+      uri = snapshot.uri
 
-    if self.config.replica_set_name:
-      kwargs["replicaSet"] = self.config.replica_set_name
+    if snapshot.replica_set_name:
+      kwargs["replicaSet"] = snapshot.replica_set_name
 
     self._client = MongoClient(uri, **kwargs)
     self._client.admin.command("ping")
-    self._initialize_collections(database, collection_names, marker_options)
+    self._initialize_collections(
+      snapshot.database, snapshot.collection_names, marker_options
+    )
 
   def _connect_sharded_cluster(
     self,
-    database: str,
-    collection_names: tuple[str, str, str],
+    snapshot: _MongoDBConnectionSnapshot,
     marker_options: Mapping[str, Any],
   ) -> None:
     """Connect to MongoDB sharded cluster.
 
     Connects via mongos routers.
     """
-    kwargs = self._build_client_kwargs()
+    kwargs = self._build_client_kwargs(snapshot)
 
-    if self.config.mongos_routers:
-      # Use mongos routers as connection points
-      routers = ",".join(self.config.mongos_routers)
-      uri = f"mongodb://{routers}/{database}"
+    if snapshot.mongos_routers:
+      # Use validated mongos routers as connection points without a path/query.
+      routers = ",".join(snapshot.mongos_routers)
+      uri = f"mongodb://{routers}/"
       self._client = MongoClient(uri, **kwargs)
     else:
       # Fall back to provided URI
-      self._client = MongoClient(self.config.uri, **kwargs)
+      self._client = MongoClient(snapshot.uri, **kwargs)
 
     self._client.admin.command("ping")
-    self._initialize_collections(database, collection_names, marker_options)
+    self._initialize_collections(
+      snapshot.database, snapshot.collection_names, marker_options
+    )
 
   def _connect_atlas(
     self,
-    database: str,
-    collection_names: tuple[str, str, str],
+    snapshot: _MongoDBConnectionSnapshot,
     marker_options: Mapping[str, Any],
   ) -> None:
     """Connect to MongoDB Atlas.
 
     Uses standard Atlas connection string with TLS enabled.
     """
-    kwargs = self._build_client_kwargs()
+    kwargs = self._build_client_kwargs(snapshot)
 
-    # Atlas always requires TLS
-    kwargs["tls"] = True
-
-    self._client = MongoClient(self.config.uri, **kwargs)
+    self._client = MongoClient(snapshot.uri, **kwargs)
     self._client.admin.command("ping")
-    self._initialize_collections(database, collection_names, marker_options)
+    self._initialize_collections(
+      snapshot.database, snapshot.collection_names, marker_options
+    )
 
   def _create_indexes(self) -> None:
     """Create necessary indexes for collections.

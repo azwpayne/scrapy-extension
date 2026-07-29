@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import ClassVar, Literal, cast
-from urllib.parse import urlsplit
+from ipaddress import ip_address
+from typing import Literal, cast
+from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -154,6 +155,542 @@ class MongoDBMode(str, Enum):
   REPLICA_SET = "replica_set"
   SHARDED_CLUSTER = "sharded_cluster"
   ATLAS = "atlas"
+
+
+_INSECURE_TLS_URI_OPTIONS: frozenset[str] = frozenset(
+  {
+    "tlsallowinvalidcertificates",
+    "tlsallowinvalidhostnames",
+    "tlsdisableocspendpointcheck",
+    "tlsinsecure",
+  }
+)
+_EXTERNAL_AUTH_MECHANISMS: frozenset[str] = frozenset(
+  {"GSSAPI", "MONGODB-AWS", "MONGODB-X509"}
+)
+_PASSWORD_AUTH_MECHANISMS: frozenset[str] = frozenset(
+  {"SCRAM-SHA-1", "SCRAM-SHA-256", "MONGODB-CR", "PLAIN"}
+)
+_SUPPORTED_AUTH_MECHANISMS: frozenset[str] = frozenset(
+  {
+    *_PASSWORD_AUTH_MECHANISMS,
+    *_EXTERNAL_AUTH_MECHANISMS,
+  }
+)
+_PRODUCTION_MONGO_MODES: frozenset[MongoDBMode] = frozenset(
+  {MongoDBMode.ATLAS, MongoDBMode.SHARDED_CLUSTER, MongoDBMode.REPLICA_SET}
+)
+_LOCAL_PLAINTEXT_BLOCKED_TOPOLOGY_OPTIONS: frozenset[str] = frozenset(
+  {
+    "replicaset",
+    "loadbalanced",
+    "srvmaxhosts",
+    "srvservicename",
+  }
+)
+
+
+def validate_mongodb_uri(value: object) -> str:
+  """Require a safe MongoDB URI before it reaches the driver.
+
+  MongoDB connection strings are later given verbatim to PyMongo.  Validate
+  their authority and policy-bearing options here rather than allowing a
+  malformed or security-downgrading value to surface during client creation.
+  """
+  if type(value) is not str or not value or not value.lower().startswith(
+    _VALID_MONGO_SCHEMES
+  ):
+    raise ConfigurationError(
+      "uri must start with 'mongodb://' or 'mongodb+srv://'.",
+      setting_name="uri",
+    )
+  # MongoDB URIs do not support fragments.  ``urlsplit`` discards one before
+  # the query policy is inspected, while PyMongo parses the full connection
+  # string and can still consume options after it.
+  if "#" in value:
+    raise ConfigurationError(
+      "MongoDB URI must not contain fragments.", setting_name="uri"
+    )
+  try:
+    parsed = urlsplit(value)
+  except ValueError:
+    raise ConfigurationError(
+      "MongoDB URI is malformed.", setting_name="uri"
+    ) from None
+  if not parsed.netloc:
+    raise ConfigurationError(
+      "MongoDB URI must include at least one server endpoint.",
+      setting_name="uri",
+    )
+  if parsed.username is not None or parsed.password is not None:
+    raise ConfigurationError(
+      "MongoDB URI must not contain userinfo; configure username/password settings instead.",
+      setting_name="uri",
+    )
+  _validate_mongodb_uri_authority(parsed.scheme, parsed.netloc)
+  # PyMongo accepts both '&' and ';' separators. Keeping blank values avoids
+  # a policy bypass such as ``?tlsInsecure=``.
+  option_names = {
+    name for name, _value in _mongodb_uri_option_pairs(parsed.query)
+  }
+  if option_names & _INSECURE_TLS_URI_OPTIONS:
+    raise ConfigurationError(
+      "MongoDB URI must not disable TLS certificate or hostname verification.",
+      setting_name="uri",
+    )
+  if any(name.startswith(("auth", "tls", "ssl")) for name in option_names):
+    raise ConfigurationError(
+      (
+        "MongoDB URI must not contain authentication, credential, or TLS "
+        "query options; configure dedicated settings instead."
+      ),
+      setting_name="uri",
+    )
+  return value
+
+
+def validate_mongodb_database(value: object) -> str:
+  """Require a concrete database name before indexing a client with it."""
+  if type(value) is not str or not value.strip():
+    raise ConfigurationError(
+      "MongoDB 'database' name must be a non-empty string.",
+      setting_name="database",
+    )
+  return value
+
+
+def validate_mongodb_auth_source(value: object) -> str:
+  """Require a concrete authentication source before calling PyMongo."""
+  if type(value) is not str or not value.strip():
+    raise ConfigurationError(
+      "MongoDB 'auth_source' must be a non-empty string.",
+      setting_name="auth_source",
+    )
+  return value
+
+
+def validate_mongodb_replica_set_name(value: object) -> str | None:
+  """Require a concrete optional replica-set name for the driver kwarg."""
+  if value is None:
+    return None
+  if type(value) is not str or not value.strip():
+    raise ConfigurationError(
+      "MongoDB 'replica_set_name' must be a non-empty string when set.",
+      setting_name="replica_set_name",
+    )
+  return value
+
+
+def _invalid_mongodb_seed_endpoint(setting_name: str) -> None:
+  """Raise a static error without echoing possibly credential-bearing input."""
+  raise ConfigurationError(
+    "MongoDB seed endpoints must be host, host:port, or '[IPv6]:port' values.",
+    setting_name=setting_name,
+  )
+
+
+def _normalize_mongodb_seed_host(host: str, setting_name: str) -> str:
+  """Return a canonical IP or conservative DNS hostname for a seed endpoint."""
+  if (
+    not host
+    or not host.isascii()
+    or any(char.isspace() or char in "/@?#\\%" for char in host)
+  ):
+    _invalid_mongodb_seed_endpoint(setting_name)
+  try:
+    return str(ip_address(host))
+  except ValueError:
+    pass
+
+  hostname = host[:-1] if host.endswith(".") else host
+  labels = hostname.split(".")
+  if (
+    not hostname
+    or len(hostname) > 253
+    or any(
+      not label
+      or len(label) > 63
+      or label[0] == "-"
+      or label[-1] == "-"
+      or any(not (char.isascii() and (char.isalnum() or char == "-")) for char in label)
+      for label in labels
+    )
+  ):
+    _invalid_mongodb_seed_endpoint(setting_name)
+  return host.lower()
+
+
+def _parse_mongodb_seed_port(port_text: str, setting_name: str) -> int:
+  """Parse the optional seed port without accepting URI syntax."""
+  if not port_text or not port_text.isascii() or not port_text.isdecimal():
+    _invalid_mongodb_seed_endpoint(setting_name)
+  port = int(port_text)
+  if not 1 <= port <= 65535:
+    _invalid_mongodb_seed_endpoint(setting_name)
+  return port
+
+
+def _parse_mongodb_seed_endpoint(
+  value: object, setting_name: str
+) -> tuple[str, str]:
+  """Parse one safe MongoDB seed and return ``(uri_seed, host)``.
+
+  Seed lists are interpolated into a generated MongoDB URI. They therefore
+  accept only host syntax, never URL authority/path/query syntax.
+  """
+  if type(value) is not str or not value or value != value.strip():
+    _invalid_mongodb_seed_endpoint(setting_name)
+  text = cast(str, value)
+  if "," in text or any(char.isspace() or char in "/@?#\\%" for char in text):
+    _invalid_mongodb_seed_endpoint(setting_name)
+
+  port: int | None = None
+  if text.startswith("["):
+    closing = text.find("]")
+    if closing <= 1:
+      _invalid_mongodb_seed_endpoint(setting_name)
+    host = text[1:closing]
+    remainder = text[closing + 1 :]
+    if remainder:
+      if not remainder.startswith(":"):
+        _invalid_mongodb_seed_endpoint(setting_name)
+      port = _parse_mongodb_seed_port(remainder[1:], setting_name)
+    try:
+      address = ip_address(host)
+    except ValueError:
+      _invalid_mongodb_seed_endpoint(setting_name)
+    if address.version != 6:
+      _invalid_mongodb_seed_endpoint(setting_name)
+    normalized_host = str(address)
+    uri_seed = f"[{normalized_host}]"
+  else:
+    try:
+      address = ip_address(text)
+    except ValueError:
+      if text.count(":") > 1:
+        _invalid_mongodb_seed_endpoint(setting_name)
+      if ":" in text:
+        host, port_text = text.rsplit(":", 1)
+        port = _parse_mongodb_seed_port(port_text, setting_name)
+      else:
+        host = text
+      normalized_host = _normalize_mongodb_seed_host(host, setting_name)
+      uri_seed = normalized_host
+    else:
+      normalized_host = str(address)
+      uri_seed = (
+        f"[{normalized_host}]" if address.version == 6 else normalized_host
+      )
+  if port is not None:
+    uri_seed = f"{uri_seed}:{port}"
+  return uri_seed, normalized_host
+
+
+def validate_mongodb_seed_endpoints(
+  value: object, setting_name: str
+) -> tuple[str, ...]:
+  """Validate and normalize a list of URI-safe replica/mongos seeds."""
+  if not isinstance(value, (list, tuple)):
+    raise ConfigurationError(
+      "MongoDB seed endpoints must be a list or tuple of endpoint strings.",
+      setting_name=setting_name,
+    )
+  return tuple(
+    _parse_mongodb_seed_endpoint(endpoint, setting_name)[0] for endpoint in value
+  )
+
+
+def _invalid_mongodb_uri_authority() -> None:
+  """Raise a static URI error without reflecting an untrusted authority."""
+  raise ConfigurationError(
+    "MongoDB URI must contain valid server endpoint authorities.",
+    setting_name="uri",
+  )
+
+
+def _validate_mongodb_uri_authority(scheme: str, authority: str) -> None:
+  """Validate URI hosts with the strict generated-seed authority grammar."""
+  if scheme.lower() == "mongodb":
+    endpoints = authority.split(",")
+    if not endpoints:
+      _invalid_mongodb_uri_authority()
+    for endpoint in endpoints:
+      try:
+        _parse_mongodb_seed_endpoint(endpoint, "uri")
+      except ConfigurationError:
+        _invalid_mongodb_uri_authority()
+    return
+
+  # ``mongodb+srv`` delegates host discovery to one DNS hostname.  It has no
+  # seed list, port, bracketed IP literal, or userinfo form.
+  if (
+    not authority
+    or "," in authority
+    or any(char in authority for char in ":[]")
+  ):
+    _invalid_mongodb_uri_authority()
+  try:
+    normalized_host = _normalize_mongodb_seed_host(authority, "uri")
+    ip_address(normalized_host)
+  except ConfigurationError:
+    _invalid_mongodb_uri_authority()
+  except ValueError:
+    return
+  _invalid_mongodb_uri_authority()
+
+
+def _mongodb_uri_option_pairs(query: str) -> tuple[tuple[str, str], ...]:
+  """Return lower-cased Mongo URI option names using both PyMongo separators."""
+  return tuple(
+    (name.lower(), option_value)
+    for name, option_value in parse_qsl(
+      query.replace(";", "&"), keep_blank_values=True
+    )
+  )
+
+
+def _mongodb_password_text(value: object) -> str | None:
+  if value is None:
+    return None
+  if isinstance(value, SecretStr):
+    return value.get_secret_value()
+  if type(value) is str:
+    return value
+  raise ConfigurationError(
+    "MongoDB 'password' must be a string or SecretStr.",
+    setting_name="password",
+  )
+
+
+def uses_mongodb_external_auth(mechanism: object) -> bool:
+  """Return whether a mechanism uses an external/ambient identity."""
+  return type(mechanism) is str and mechanism in _EXTERNAL_AUTH_MECHANISMS
+
+
+def validate_mongodb_authentication(
+  username: object,
+  password: object,
+  auth_mechanism: object,
+  auth_source: object = "admin",
+) -> bool:
+  """Validate mechanism-specific authentication before driver construction."""
+  if username is not None and (
+    type(username) is not str or not username.strip()
+  ):
+    raise ConfigurationError(
+      "MongoDB 'username' must be non-empty.",
+      setting_name="username",
+    )
+  password_text = _mongodb_password_text(password)
+  if password_text is not None and not password_text.strip():
+    raise ConfigurationError(
+      "MongoDB 'password' must be non-empty.",
+      setting_name="password",
+    )
+  if auth_mechanism is not None and (
+    type(auth_mechanism) is not str
+    or auth_mechanism not in _SUPPORTED_AUTH_MECHANISMS
+  ):
+    raise ConfigurationError(
+      "MongoDB auth_mechanism is unsupported.",
+      setting_name="auth_mechanism",
+    )
+  normalized_auth_source = validate_mongodb_auth_source(auth_source)
+  username_set = username is not None
+  password_set = password_text is not None
+
+  if auth_mechanism == "GSSAPI":
+    if not username_set:
+      raise ConfigurationError(
+        "MongoDB GSSAPI authentication requires a username.",
+        setting_name="username",
+      )
+    if normalized_auth_source not in {"admin", "$external"}:
+      raise ConfigurationError(
+        "MongoDB external authentication requires auth_source='$external'.",
+        setting_name="auth_source",
+      )
+    return True
+
+  if auth_mechanism == "MONGODB-X509":
+    if password_set:
+      raise ConfigurationError(
+        "MongoDB MONGODB-X509 authentication does not support a password.",
+        setting_name="password",
+      )
+    if normalized_auth_source not in {"admin", "$external"}:
+      raise ConfigurationError(
+        "MongoDB external authentication requires auth_source='$external'.",
+        setting_name="auth_source",
+      )
+    return True
+
+  if auth_mechanism == "MONGODB-AWS":
+    if username_set != password_set:
+      raise ConfigurationError(
+        "MongoDB MONGODB-AWS username and password must be configured together.",
+        setting_name="username" if not username_set else "password",
+      )
+    if normalized_auth_source not in {"admin", "$external"}:
+      raise ConfigurationError(
+        "MongoDB external authentication requires auth_source='$external'.",
+        setting_name="auth_source",
+      )
+    return True
+
+  if username_set != password_set:
+    raise ConfigurationError(
+      "MongoDB username and password must be configured together.",
+      setting_name="username" if not username_set else "password",
+    )
+  if auth_mechanism in _PASSWORD_AUTH_MECHANISMS and not username_set:
+    raise ConfigurationError(
+      "MongoDB password authentication requires username and password.",
+      setting_name="username",
+    )
+  return username_set
+
+
+def _mongodb_endpoint_is_loopback(endpoint: object) -> bool:
+  """Classify a single host[:port] conservatively; unknown means remote."""
+  try:
+    _uri_seed, host = _parse_mongodb_seed_endpoint(
+      endpoint, "replica_set_members"
+    )
+  except ConfigurationError:
+    return False
+  normalized = host.lower().rstrip(".")
+  if normalized == "localhost":
+    return True
+  try:
+    return ip_address(normalized).is_loopback
+  except ValueError:
+    return False
+
+
+def is_mongodb_direct_loopback_uri(uri: str) -> bool:
+  """Return whether a URI can safely use the local plaintext compatibility path.
+
+  A single loopback seed alone is not sufficient: PyMongo can discover a
+  replica topology from that seed and subsequently authenticate to non-local
+  members.  The backend pins direct mode for this narrow path, so reject
+  topology-bearing URI options that would conflict with it.
+  """
+  if "#" in uri:
+    return False
+  try:
+    parsed = urlsplit(uri)
+  except ValueError:
+    return False
+  if parsed.scheme.lower() != "mongodb":
+    return False
+  endpoints = parsed.netloc.split(",")
+  if len(endpoints) != 1 or not _mongodb_endpoint_is_loopback(endpoints[0]):
+    return False
+  for name, option_value in _mongodb_uri_option_pairs(parsed.query):
+    if name in _LOCAL_PLAINTEXT_BLOCKED_TOPOLOGY_OPTIONS:
+      return False
+    if name == "directconnection" and option_value.strip().lower() != "true":
+      return False
+  return True
+
+
+def _mongodb_endpoints_are_loopback(
+  mode: MongoDBMode,
+  uri: str,
+  replica_set_members: object,
+  mongos_routers: object,
+) -> bool:
+  """Return true only when every effective endpoint is known loopback."""
+  if mode is MongoDBMode.REPLICA_SET and replica_set_members:
+    endpoints = replica_set_members
+  elif mode is MongoDBMode.SHARDED_CLUSTER and mongos_routers:
+    endpoints = mongos_routers
+  else:
+    parsed = urlsplit(uri)
+    if parsed.scheme.lower() == "mongodb+srv":
+      return False
+    endpoints = parsed.netloc.split(",")
+  return isinstance(endpoints, (list, tuple)) and bool(endpoints) and all(
+    _mongodb_endpoint_is_loopback(endpoint) for endpoint in endpoints
+  )
+
+
+def validate_mongodb_transport_security(
+  *,
+  mode: MongoDBMode,
+  uri: str,
+  replica_set_members: object,
+  mongos_routers: object,
+  tls_enabled: object,
+  tls_allow_invalid_certificates: object,
+  username: object,
+  password: object,
+  auth_mechanism: object,
+  auth_source: object = "admin",
+) -> None:
+  """Require verified TLS for remote authenticated MongoDB connections."""
+  if not isinstance(mode, MongoDBMode):
+    raise ConfigurationError(
+      "MongoDB mode is unsupported.", setting_name="mode"
+    )
+  normalized_uri = validate_mongodb_uri(uri)
+  normalized_replica_set_members = validate_mongodb_seed_endpoints(
+    replica_set_members, "replica_set_members"
+  )
+  normalized_mongos_routers = validate_mongodb_seed_endpoints(
+    mongos_routers, "mongos_routers"
+  )
+  if not isinstance(tls_enabled, bool):
+    raise ConfigurationError(
+      "MongoDB tls_enabled must be a boolean.", setting_name="tls_enabled"
+    )
+  if not isinstance(tls_allow_invalid_certificates, bool):
+    raise ConfigurationError(
+      "MongoDB tls_allow_invalid_certificates must be a boolean.",
+      setting_name="tls_allow_invalid_certificates",
+    )
+  loopback_only = _mongodb_endpoints_are_loopback(
+    mode,
+    normalized_uri,
+    normalized_replica_set_members,
+    normalized_mongos_routers,
+  )
+  if tls_allow_invalid_certificates and (
+    mode in _PRODUCTION_MONGO_MODES or not loopback_only
+  ):
+    raise ConfigurationError(
+      "tls_allow_invalid_certificates=True is not permitted for remote or production-tier MongoDB connections.",
+      setting_name="tls_allow_invalid_certificates",
+      setting_value=True,
+    )
+  derived_seed_uri = (
+    mode is MongoDBMode.REPLICA_SET and bool(normalized_replica_set_members)
+  ) or (mode is MongoDBMode.SHARDED_CLUSTER and bool(normalized_mongos_routers))
+  uri_scheme = urlsplit(normalized_uri).scheme.lower()
+  effective_tls = (
+    tls_enabled
+    or mode is MongoDBMode.ATLAS
+    or (not derived_seed_uri and uri_scheme == "mongodb+srv")
+  )
+  local_standalone_plaintext = (
+    mode is MongoDBMode.STANDALONE
+    and is_mongodb_direct_loopback_uri(normalized_uri)
+  )
+  if (
+    validate_mongodb_authentication(
+      username, password, auth_mechanism, auth_source
+    )
+    and not effective_tls
+    and not local_standalone_plaintext
+  ):
+    raise ConfigurationError(
+      (
+        "Authenticated MongoDB connections require verified TLS unless they "
+        "are direct standalone loopback development connections."
+      ),
+      setting_name="tls_enabled",
+    )
 
 
 class MongoDBSettings(BaseSettings):
@@ -339,14 +876,6 @@ class MongoDBSettings(BaseSettings):
     description="Heartbeat frequency in milliseconds",
   )
 
-  # Production-tier modes where disabling cert validation is virtually always
-  # a misconfiguration / dev shortcut that must not ship. STANDALONE stays
-  # permissive (local dev with a self-signed mongod). ClassVar so pydantic
-  # does not treat it as a setting field.
-  _PRODUCTION_MODES: ClassVar[frozenset[MongoDBMode]] = frozenset(
-    {MongoDBMode.ATLAS, MongoDBMode.SHARDED_CLUSTER, MongoDBMode.REPLICA_SET}
-  )
-
   @field_validator("w", mode="before")
   @classmethod
   def _normalize_write_concern(cls, value: object) -> int | str:
@@ -370,33 +899,14 @@ class MongoDBSettings(BaseSettings):
   @field_validator("database", mode="after")
   @classmethod
   def _reject_blank_database(cls, value: str) -> str:
-    """R29-C: reject empty/whitespace ``database`` — pymongo raises InvalidName
-    at ``_initialize_collections`` otherwise (no Field constraint on the field).
-    """
-    if not value or not value.strip():
-      raise ConfigurationError(
-        "MongoDB 'database' name must be non-empty.",
-        setting_name="database",
-        setting_value=value,
-      )
-    return value
+    """Keep construction and connection-time database checks identical."""
+    return validate_mongodb_database(value)
 
   @field_validator("auth_source", mode="after")
   @classmethod
   def _reject_blank_auth_source(cls, value: str) -> str:
-    """R31-A: reject empty/whitespace ``auth_source`` — the backend's
-    ``_auth_kwargs`` uses bare truthiness (``if self.config.auth_source:``), so a
-    whitespace value is truthy and passed verbatim as ``authSource='   '`` to
-    MongoClient → opaque authentication failure. R29's whitespace sweep missed
-    this field. Mirrors R29-C ``database``.
-    """
-    if not value or not value.strip():
-      raise ConfigurationError(
-        "MongoDB 'auth_source' must be non-empty.",
-        setting_name="auth_source",
-        setting_value=value,
-      )
-    return value
+    """Keep construction and connection-time auth-source checks identical."""
+    return validate_mongodb_auth_source(value)
 
   @field_validator("username", mode="after")
   @classmethod
@@ -430,20 +940,23 @@ class MongoDBSettings(BaseSettings):
       )
     return value
 
-  @field_validator("replica_set_members", "mongos_routers", mode="after")
+  @field_validator("replica_set_members", mode="after")
   @classmethod
-  def _reject_blank_member_elements(cls, value: list[str]) -> list[str]:
-    """R29-B: reject empty/whitespace elements in replica_set_members /
-    mongos_routers — they build a malformed ``mongodb://`` URI and surface as
-    an opaque InvalidURI at connect.
-    """
-    if any((not element) or (not element.strip()) for element in value):
-      raise ConfigurationError(
-        "MongoDB replica_set_members/mongos_routers entries must be non-empty.",
-        setting_name="replica_set_members",
-        setting_value=value,
-      )
-    return value
+  def _validate_replica_set_members(cls, value: list[str]) -> list[str]:
+    """Allow only URI-safe replica-set seed endpoints."""
+    return list(validate_mongodb_seed_endpoints(value, "replica_set_members"))
+
+  @field_validator("mongos_routers", mode="after")
+  @classmethod
+  def _validate_mongos_routers(cls, value: list[str]) -> list[str]:
+    """Allow only URI-safe mongos seed endpoints."""
+    return list(validate_mongodb_seed_endpoints(value, "mongos_routers"))
+
+  @field_validator("replica_set_name", mode="after")
+  @classmethod
+  def _validate_replica_set_name(cls, value: str | None) -> str | None:
+    """Validate the optional driver ``replicaSet`` kwarg at construction."""
+    return validate_mongodb_replica_set_name(value)
 
   @model_validator(mode="after")
   def _validate_collection_domains(self) -> Self:
@@ -456,39 +969,20 @@ class MongoDBSettings(BaseSettings):
     return self
 
   @model_validator(mode="after")
-  def _validate_tls_insecure_not_in_production_mode(self) -> Self:
-    """SEC-2: forbid ``tls_allow_invalid_certificates=True`` in production modes.
-
-    Disabling certificate validation strips TLS of its MITM protection. In
-    multi-host, production-tier deployments (ATLAS / SHARDED_CLUSTER /
-    REPLICA_SET) this is virtually always a misconfiguration or a developer
-    shortcut that must not ship — fail-fast at construction rather than
-    silently degrading the connection's security posture. STANDALONE remains
-    permissive for local dev (e.g. a self-signed local mongod).
-
-    Mirrors the Redis ``ssl_check_hostname`` guidance and the RabbitMQ
-    guest-guard pattern (raise, not warn — deterministic + the project's
-    ``error::UserWarning`` filter makes warn-by-default risky).
-
-    Raises:
-        ConfigurationError: if ``tls_allow_invalid_certificates`` is True and
-            ``mode`` is one of the production-tier modes.
-    """
-    if (
-      self.tls_allow_invalid_certificates
-      and self.mode in self._PRODUCTION_MODES
-    ):
-      raise ConfigurationError(
-        (
-          "tls_allow_invalid_certificates=True disables certificate "
-          "validation; not permitted in production-tier MongoDB modes "
-          f"(mode={self.mode.value!r}). Either set "
-          "tls_allow_invalid_certificates=False or use STANDALONE for local "
-          "dev with a self-signed certificate."
-        ),
-        setting_name="tls_allow_invalid_certificates",
-        setting_value=True,
-      )
+  def _validate_authentication_and_transport_security(self) -> Self:
+    """Require coherent authentication and verified remote transport."""
+    validate_mongodb_transport_security(
+      mode=self.mode,
+      uri=self.uri,
+      replica_set_members=self.replica_set_members,
+      mongos_routers=self.mongos_routers,
+      tls_enabled=self.tls_enabled,
+      tls_allow_invalid_certificates=self.tls_allow_invalid_certificates,
+      username=self.username,
+      password=self.password,
+      auth_mechanism=self.auth_mechanism,
+      auth_source=self.auth_source,
+    )
     return self
 
   @field_validator("uri")
@@ -505,17 +999,7 @@ class MongoDBSettings(BaseSettings):
     Raises:
         ConfigurationError: if ``uri`` does not start with a valid scheme.
     """
-    if not v or not v.lower().startswith(_VALID_MONGO_SCHEMES):
-      raise ConfigurationError(
-        "uri must start with 'mongodb://' or 'mongodb+srv://'.",
-        setting_name="uri",
-      )
-    if urlsplit(v).username is not None:
-      raise ConfigurationError(
-        "MongoDB URI must not contain userinfo; configure username/password settings instead.",
-        setting_name="uri",
-      )
-    return v
+    return validate_mongodb_uri(v)
 
   @model_validator(mode="after")
   def _validate_mode_requirements(self) -> Self:

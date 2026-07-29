@@ -101,7 +101,10 @@ SCRAPY_REDIS_DB = 0
 
 # --- MongoDB Atlas (Cloud) ---
 # SCRAPY_MONGO_MODE = "atlas"
-# SCRAPY_MONGO_URI = "mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/scrapy?retryWrites=true&w=majority"
+# SCRAPY_MONGO_URI = "mongodb+srv://cluster0.xxxxx.mongodb.net"
+# SCRAPY_MONGO_DATABASE = "scrapy"
+# SCRAPY_MONGO_USERNAME = "user"
+# SCRAPY_MONGO_PASSWORD = "set-via-secret-manager"
 
 # =============================================================================
 # Kafka Configuration (Uncomment to use)

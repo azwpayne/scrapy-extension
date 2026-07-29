@@ -187,7 +187,7 @@ SCRAPY_MONGO_MONGOS_ROUTERS = ["mongos1:27017", "mongos2:27017"]
 
 # Atlas requires an explicit SRV URI
 SCRAPY_MONGO_MODE = "atlas"
-SCRAPY_MONGO_URI = "mongodb+srv://cluster.example.net/scrapy"
+SCRAPY_MONGO_URI = "mongodb+srv://cluster.example.net"
 ```
 
 Prefer `SCRAPY_MONGO_USERNAME` and `SCRAPY_MONGO_PASSWORD` over embedding

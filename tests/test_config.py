@@ -757,3 +757,382 @@ def test_mongodb_uri_userinfo_is_rejected_without_secret_leakage():
 
   assert exc_info.value.setting_name == "uri"
   assert "super-secret" not in str(exc_info.value)
+
+
+def test_mongodb_malformed_uri_is_normalized_to_configuration_error():
+  """Malformed authorities must not leak raw parser exceptions or credentials."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri="mongodb://alice:malformed-uri-secret@[")
+
+  assert exc_info.value.setting_name == "uri"
+  assert "malformed-uri-secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("uri", ["mongodb://", "mongodb+srv://"])
+def test_mongodb_uri_requires_an_endpoint(uri):
+  """A syntactically valid scheme without an authority cannot reach PyMongo."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri=uri)
+
+  assert exc_info.value.setting_name == "uri"
+
+
+@pytest.mark.parametrize(
+  "uri",
+  [
+    "mongodb://db.example.test:not-a-port",
+    "mongodb://db.example.test:65536",
+    "mongodb://,db.example.test:27017",
+    "mongodb://db.example.test:27017,,other.example.test:27017",
+    "mongodb://db.example.test:27017,",
+    "mongodb+srv://cluster.example.test:27017",
+    "mongodb+srv://first.example.test,second.example.test",
+    "mongodb+srv://[::1]",
+    "mongodb+srv://192.0.2.1",
+  ],
+)
+def test_mongodb_uri_rejects_malformed_authorities_before_driver_io(uri):
+  """Every URI authority is parsed before PyMongo sees a connection string."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri=uri)
+
+  assert exc_info.value.setting_name == "uri"
+
+
+@pytest.mark.parametrize(
+  "query",
+  [
+    "tlsAllowInvalidCertificates=true",
+    "tls=true;tlsAllowInvalidHostnames=true",
+    "tls=true&tlsDisableOCSPEndpointCheck=true",
+    "tlsInsecure=true",
+  ],
+)
+def test_mongodb_uri_tls_policy_options_are_rejected(query):
+  """Both PyMongo URI separators must not bypass TLS verification policy."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri=f"mongodb://db.example.test:27017/?{query}")
+
+  assert exc_info.value.setting_name == "uri"
+
+
+@pytest.mark.parametrize(
+  "query",
+  [
+    "authMechanismProperties=AWS_SESSION_TOKEN:uri-secret",
+    "tlsCertificateKeyFilePassword=uri-secret",
+  ],
+)
+def test_mongodb_uri_credential_options_do_not_leak(query):
+  """Credential query values are rejected without becoming error text."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri=f"mongodb://db.example.test:27017/?{query}")
+
+  assert exc_info.value.setting_name == "uri"
+  assert "uri-secret" not in str(exc_info.value)
+  assert "uri-secret" not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+  "uri",
+  [
+    "mongodb://db.example.test:27017/#?tlsAllowInvalidHostnames=true",
+    "mongodb://db.example.test:27017/#?authMechanismProperties=AWS_SESSION_TOKEN:fragment-secret",
+  ],
+)
+def test_mongodb_uri_fragment_policy_bypass_is_rejected_without_leakage(uri):
+  """Fragments must not hide options from stdlib parsing but not PyMongo."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(
+      uri=uri,
+      username="crawler",
+      password="fragment-secret",
+      tls_enabled=True,
+    )
+
+  assert exc_info.value.setting_name == "uri"
+  assert "fragment-secret" not in str(exc_info.value)
+  assert "fragment-secret" not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+  ("setting_name", "value"),
+  [
+    ("replica_set_members", ["alice:seed-secret@db.example.test:27017"]),
+    ("replica_set_members", ["db.example.test:27017/?tlsInsecure=true"]),
+    ("mongos_routers", ["db.example.test:27017#seed-secret"]),
+    ("mongos_routers", ["mongodb://db.example.test:27017"]),
+  ],
+)
+def test_mongodb_seed_endpoints_reject_uri_injection_without_leakage(
+  setting_name, value
+):
+  """Generated replica/mongos URIs accept host syntax only, never URI pieces."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(**{setting_name: value})
+
+  assert exc_info.value.setting_name == setting_name
+  assert "seed-secret" not in str(exc_info.value)
+
+
+def test_mongodb_seed_endpoints_normalize_bracketed_and_bare_ipv6():
+  """IPv6 remains supported while the generated authority stays unambiguous."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  settings = MongoDBSettings(
+    replica_set_members=["[::1]:27017", "2001:db8::7"]
+  )
+
+  assert settings.replica_set_members == ["[::1]:27017", "[2001:db8::7]"]
+
+
+@pytest.mark.parametrize(
+  "value",
+  [
+    object(),
+    ["-bad-host:27017"],
+    ["db.example.test:0"],
+    ["[127.0.0.1]:27017"],
+    ["[not-an-ip]:27017"],
+    ["[::1]suffix"],
+    ["one:two:three"],
+  ],
+)
+def test_mongodb_seed_endpoint_parser_fails_closed_for_invalid_authorities(value):
+  """Every malformed generated-URI authority is rejected before concatenation."""
+  from scrapy_extension.settings.mongodb import validate_mongodb_seed_endpoints
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    validate_mongodb_seed_endpoints(value, "replica_set_members")
+
+  assert exc_info.value.setting_name == "replica_set_members"
+
+
+@pytest.mark.parametrize(
+  ("settings_kwargs", "missing_name"),
+  [
+    ({"username": "crawler"}, "password"),
+    ({"password": "partial-secret"}, "username"),
+  ],
+)
+def test_mongodb_partial_credentials_are_rejected(settings_kwargs, missing_name):
+  """One-sided credentials must never become an anonymous MongoDB connection."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(**settings_kwargs)
+
+  assert exc_info.value.setting_name == missing_name
+  assert "partial-secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {
+      "uri": "mongodb://db.example.test:27017",
+      "username": "crawler",
+      "password": "transport-secret",
+    },
+    {
+      "mode": "replica_set",
+      "replica_set_name": "rs0",
+      "replica_set_members": ["db.example.test:27017"],
+      "username": "crawler",
+      "password": "transport-secret",
+    },
+    {
+      "mode": "sharded_cluster",
+      "mongos_routers": ["db.example.test:27017"],
+      "username": "crawler",
+      "password": "transport-secret",
+    },
+  ],
+)
+def test_mongodb_remote_authenticated_connections_require_tls(settings_kwargs):
+  """URI, replica member, and mongos router endpoints all control TLS policy."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(**settings_kwargs)
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert "transport-secret" not in str(exc_info.value)
+
+
+def test_mongodb_loopback_authenticated_connection_allows_local_plaintext():
+  """The explicitly direct local development compatibility path remains available."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  settings = MongoDBSettings(
+    uri="mongodb://127.0.0.1:27017",
+    username="crawler",
+    password="local-secret",
+  )
+
+  assert settings.tls_enabled is False
+
+
+def test_mongodb_lookalike_localhost_requires_tls_for_authenticated_connections():
+  """Only exact localhost and literal loopback IPs receive the dev exception."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(
+      uri="mongodb://attacker.localhost:27017",
+      username="crawler",
+      password="lookalike-localhost-secret",
+    )
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert "lookalike-localhost-secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+  "uri",
+  [
+    "mongodb://localhost:27017/?replicaSet=rs0",
+    "mongodb://localhost:27017/?directConnection=false",
+    "mongodb://localhost:27017/?loadBalanced=true",
+    "mongodb://127.0.0.1:27017,localhost:27018",
+  ],
+)
+def test_mongodb_topology_bearing_loopback_uri_requires_tls_for_auth(uri):
+  """The local plaintext exception cannot discover a remote topology."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(
+      uri=uri,
+      username="crawler",
+      password="topology-uri-secret",
+    )
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert "topology-uri-secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+  "settings_kwargs",
+  [
+    {
+      "mode": "replica_set",
+      "replica_set_name": "rs0",
+      "replica_set_members": ["127.0.0.1:27017"],
+      "username": "crawler",
+      "password": "topology-secret",
+    },
+    {
+      "mode": "sharded_cluster",
+      "mongos_routers": ["127.0.0.1:27017"],
+      "username": "crawler",
+      "password": "topology-secret",
+    },
+  ],
+)
+def test_mongodb_authenticated_cluster_topologies_require_tls(settings_kwargs):
+  """Loopback seeds can discover remote members, so cluster auth needs TLS."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(**settings_kwargs)
+
+  assert exc_info.value.setting_name == "tls_enabled"
+  assert "topology-secret" not in str(exc_info.value)
+
+
+def test_mongodb_authenticated_srv_uri_uses_implicit_verified_tls():
+  """PyMongo's ``mongodb+srv`` transport is TLS-enabled even without a flag."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  settings = MongoDBSettings(
+    uri="mongodb+srv://cluster.example.mongodb.net",
+    username="crawler",
+    password="srv-secret",
+  )
+
+  assert settings.tls_enabled is False
+
+
+def test_mongodb_remote_invalid_certificate_setting_is_rejected():
+  """Self-signed certificate exemptions are constrained to loopback dev only."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(
+      uri="mongodb://db.example.test:27017",
+      tls_enabled=True,
+      tls_allow_invalid_certificates=True,
+    )
+
+  assert exc_info.value.setting_name == "tls_allow_invalid_certificates"
+
+
+@pytest.mark.parametrize(
+  ("username", "password", "auth_mechanism", "setting_name"),
+  [
+    (" ", None, None, "username"),
+    (None, " ", None, "password"),
+    (None, object(), None, "password"),
+    (None, None, "not-a-mongodb-mechanism", "auth_mechanism"),
+  ],
+)
+def test_mongodb_runtime_authentication_validation_rejects_invalid_mutations(
+  username, password, auth_mechanism, setting_name
+):
+  """Runtime settings mutation retains the same typed authentication boundary."""
+  from scrapy_extension.settings.mongodb import validate_mongodb_authentication
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    validate_mongodb_authentication(username, password, auth_mechanism)
+
+  assert exc_info.value.setting_name == setting_name
+
+
+@pytest.mark.parametrize("endpoint", [None, " ", "[", ":"])
+def test_mongodb_loopback_classifier_fails_closed_for_malformed_endpoints(endpoint):
+  """Unparseable endpoints never receive the local plaintext exception."""
+  from scrapy_extension.settings.mongodb import _mongodb_endpoint_is_loopback
+
+  assert _mongodb_endpoint_is_loopback(endpoint) is False
+
+
+@pytest.mark.parametrize(
+  ("tls_enabled", "tls_allow_invalid_certificates", "setting_name"),
+  [("true", False, "tls_enabled"), (False, "false", "tls_allow_invalid_certificates")],
+)
+def test_mongodb_transport_validation_rejects_runtime_nonboolean_tls_flags(
+  tls_enabled, tls_allow_invalid_certificates, setting_name
+):
+  """Mutable TLS flags must not fall through Python truthiness semantics."""
+  from scrapy_extension.settings import MongoDBMode
+  from scrapy_extension.settings.mongodb import validate_mongodb_transport_security
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    validate_mongodb_transport_security(
+      mode=MongoDBMode.STANDALONE,
+      uri="mongodb://localhost:27017",
+      replica_set_members=[],
+      mongos_routers=[],
+      tls_enabled=tls_enabled,
+      tls_allow_invalid_certificates=tls_allow_invalid_certificates,
+      username=None,
+      password=None,
+      auth_mechanism=None,
+    )
+
+  assert exc_info.value.setting_name == setting_name

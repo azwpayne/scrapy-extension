@@ -246,19 +246,77 @@ class TestMongoDBLiterals:
 
   @pytest.mark.parametrize(
     "value",
+    ["SCRAM-SHA-1", "SCRAM-SHA-256", "MONGODB-CR", "PLAIN"],
+  )
+  def test_password_auth_mechanism_requires_complete_credentials(
+    self, value: str
+  ) -> None:
+    """Password mechanisms cannot be silently omitted by the backend."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(auth_mechanism=value)  # type: ignore[arg-type]
+    assert exc_info.value.setting_name == "username"
+
+  @pytest.mark.parametrize(
+    "value",
+    ["SCRAM-SHA-1", "SCRAM-SHA-256", "MONGODB-CR", "PLAIN"],
+  )
+  def test_password_auth_mechanism_accepts_complete_credentials(
+    self, value: str
+  ) -> None:
+    """Documented password mechanisms remain valid with a credential pair."""
+    settings = MongoDBSettings(
+      auth_mechanism=value,  # type: ignore[arg-type]
+      username="crawler",
+      password="not-a-real-secret",
+    )
+    assert settings.auth_mechanism == value
+
+  @pytest.mark.parametrize("value", ["MONGODB-X509", "MONGODB-AWS"])
+  def test_external_auth_mechanism_accepts_ambient_identity(self, value: str) -> None:
+    """X.509 and AWS retain their driver-supported ambient identity path."""
+    assert MongoDBSettings(auth_mechanism=value).auth_mechanism == value
+
+  def test_gssapi_requires_and_accepts_a_username(self) -> None:
+    """PyMongo requires a principal even when Kerberos supplies its ticket."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(auth_mechanism="GSSAPI")
+    assert exc_info.value.setting_name == "username"
+
+    settings = MongoDBSettings(
+      auth_mechanism="GSSAPI", username="crawler@EXAMPLE.TEST"
+    )
+    assert settings.auth_mechanism == "GSSAPI"
+
+  @pytest.mark.parametrize(
+    ("auth_mechanism", "settings_kwargs", "setting_name"),
     [
-      "SCRAM-SHA-1",
-      "SCRAM-SHA-256",
-      "MONGODB-CR",
-      "PLAIN",
-      "GSSAPI",
-      "MONGODB-X509",
-      "MONGODB-AWS",
+      ("MONGODB-X509", {"password": "x509-secret"}, "password"),
+      ("MONGODB-AWS", {"username": "aws-key"}, "password"),
+      ("MONGODB-AWS", {"password": "aws-secret"}, "username"),
     ],
   )
-  def test_auth_mechanism_accepts_valid(self, value: str) -> None:
-    """All documented pymongo auth mechanisms stay valid."""
-    assert MongoDBSettings(auth_mechanism=value).auth_mechanism == value
+  def test_external_auth_mechanism_rejects_invalid_credential_shape(
+    self,
+    auth_mechanism: str,
+    settings_kwargs: dict[str, str],
+    setting_name: str,
+  ) -> None:
+    """Mechanism-specific shapes fail before PyMongo's opaque constructor."""
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(auth_mechanism=auth_mechanism, **settings_kwargs)
+    assert exc_info.value.setting_name == setting_name
+
+  @pytest.mark.parametrize("auth_mechanism", ["GSSAPI", "MONGODB-X509", "MONGODB-AWS"])
+  def test_external_auth_mechanism_rejects_nonexternal_source(
+    self, auth_mechanism: str
+  ) -> None:
+    """External mechanisms must not pass an unsupported auth source to PyMongo."""
+    settings_kwargs: dict[str, str] = {"auth_source": "other"}
+    if auth_mechanism == "GSSAPI":
+      settings_kwargs["username"] = "crawler@EXAMPLE.TEST"
+    with pytest.raises(ConfigurationError) as exc_info:
+      MongoDBSettings(auth_mechanism=auth_mechanism, **settings_kwargs)
+    assert exc_info.value.setting_name == "auth_source"
 
 
 class TestMongoDBWriteConcern:
