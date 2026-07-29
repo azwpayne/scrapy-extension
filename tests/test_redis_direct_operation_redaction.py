@@ -197,6 +197,14 @@ def test_redis_direct_set_and_storage_validators_run_before_io(mocker: Any) -> N
   client.set.assert_not_called()
 
 
+def test_redis_storage_boundary_accepts_public_keyword_data(mocker: Any) -> None:
+  backend, client = _connected_backend(mocker)
+
+  backend.store("keyword", data=b"payload")
+
+  client.set.assert_called_once()
+
+
 def test_redis_direct_set_and_storage_boundaries_preserve_base_exception_identity(
   mocker: Any,
 ) -> None:

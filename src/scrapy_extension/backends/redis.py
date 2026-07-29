@@ -226,12 +226,13 @@ def _validate_set_name_argument(
 def _validate_store_arguments(
   _backend: object,
   key: str,
-  _data: bytes,
+  data: bytes,
   ttl: int | None = None,
   *_args: Any,
   **_kwargs: Any,
 ) -> None:
   """Validate Redis storage write inputs outside the terminal boundary."""
+  del data
   _validate_key_name(key, "key")
   _validate_ttl(ttl)
 

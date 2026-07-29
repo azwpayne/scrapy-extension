@@ -376,3 +376,11 @@ def test_mongodb_boundaries_validate_inputs_before_backend_work(mocker: Any) -> 
   set_collection.insert_one.assert_not_called()
   storage_collection.replace_one.assert_not_called()
   storage_collection.delete_many.assert_not_called()
+
+
+def test_mongodb_storage_boundary_accepts_public_keyword_data(mocker: Any) -> None:
+  backend, _queue_collection, _set_collection, storage_collection = _backend(mocker)
+
+  backend.store("keyword", data=b"payload")
+
+  storage_collection.replace_one.assert_called_once()

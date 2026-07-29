@@ -163,10 +163,11 @@ def _validate_storage_key_argument(
 def _validate_store_arguments(
   _backend: object,
   key: str,
-  _data: bytes,
+  data: bytes,
   ttl: int | None = None,
 ) -> None:
   """Validate storage write arguments before a terminal error boundary."""
+  del data
   _validate_key_name(key, "key")
   _validate_ttl(ttl)
 
