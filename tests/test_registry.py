@@ -348,6 +348,12 @@ class TestThirdPartyDiscovered:
     assert isinstance(instance, _StubBackend)
     assert instance.settings.kwargs == {"host": "local"}
 
+    # The first-use plugin boundary accepts a backend that actually fulfils
+    # both its lifecycle and declared QueueBackend contracts.
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    assert isinstance(ConnectionManager("mybackend")._create_backend(), _StubBackend)
+
 
 class TestDescriptorBoundary:
   """Malformed or ambiguous plugins never enter or abort the registry."""
