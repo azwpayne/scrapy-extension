@@ -1072,13 +1072,17 @@ def test_direct_connect_dispatches_retry_monitor_outside_terminal_error(mocker):
 
 
 def test_direct_connect_preserves_base_exception_retry_monitor_dispatch(mocker):
-  """Control-flow failures still dispatch already-buffered retry events once."""
+  """Buffered retry callbacks run after a control-flow failure has unwound."""
+  import sys
+
   manager = ConnectionManager(
     BackendType.REDIS,
     {"retry_attempts": 1, "retry_delay": 0},
   )
   monitor_events: list[tuple[str, int]] = []
-  interrupt = KeyboardInterrupt("direct connect interrupted")
+  observed_exception_states: list[tuple[object, object, object]] = []
+  marker = "direct-connect-monitor-control-flow-marker"
+  interrupt = KeyboardInterrupt(marker)
 
   class _Monitor:
     def on_connect(self, backend_type: str) -> None:
@@ -1089,6 +1093,7 @@ def test_direct_connect_preserves_base_exception_retry_monitor_dispatch(mocker):
 
     def on_retry(self, backend_type: str, attempt: int) -> None:
       monitor_events.append((backend_type, attempt))
+      observed_exception_states.append(sys.exc_info())
 
   manager.set_monitor(_Monitor())  # type: ignore[arg-type]
   mocker.patch.object(
@@ -1102,6 +1107,43 @@ def test_direct_connect_preserves_base_exception_retry_monitor_dispatch(mocker):
     manager.connect()
 
   assert exc_info.value is interrupt
+  assert monitor_events == [("BackendType.REDIS", 1)]
+  assert observed_exception_states == [(None, None, None)]
+
+
+def test_direct_connect_base_exception_monitor_callback_keeps_precedence(mocker):
+  """A callback's control-flow signal still wins over a pending backend one."""
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 1, "retry_delay": 0},
+  )
+  monitor_events: list[tuple[str, int]] = []
+  backend_interrupt = KeyboardInterrupt("backend interrupted")
+  monitor_interrupt = SystemExit("monitor interrupted")
+
+  class _Monitor:
+    def on_connect(self, backend_type: str) -> None:
+      del backend_type
+
+    def on_disconnect(self, backend_type: str, reason: object) -> None:
+      del backend_type, reason
+
+    def on_retry(self, backend_type: str, attempt: int) -> None:
+      monitor_events.append((backend_type, attempt))
+      raise monitor_interrupt
+
+  manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+  mocker.patch.object(
+    manager,
+    "_attempt_connection",
+    side_effect=[RuntimeError("retryable failure"), backend_interrupt],
+  )
+  mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+  with pytest.raises(SystemExit) as exc_info:
+    manager.connect()
+
+  assert exc_info.value is monitor_interrupt
   assert monitor_events == [("BackendType.REDIS", 1)]
 
 

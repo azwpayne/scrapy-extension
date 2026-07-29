@@ -1767,32 +1767,24 @@ class ConnectionManager:
         raise _rebuild_connect_attempt_error(lazy_terminal_error)
       return
 
-    terminal_error: Exception | None = None
-    monitor_dispatch_started = False
+    terminal_error: BaseException | None = None
     try:
-      try:
-        with self._connect_lock:
-          self._connect_with_retries(monitor_events)
-      except Exception as error:
-        # End the exception handler before invoking user-extensible monitor
-        # callbacks. Otherwise their ``sys.exc_info()`` exposes the manager's
-        # raw failure traceback and settings while the terminal boundary has
-        # not yet rebuilt the public error.
-        terminal_error = error
+      with self._connect_lock:
+        self._connect_with_retries(monitor_events)
+    except BaseException as error:
+      # Capture every terminal result, including control-flow exceptions, so
+      # the handler ends before user-extensible monitor callbacks run. A
+      # ``finally`` would expose the raw primary through ``sys.exc_info()``
+      # to a callback dispatched for an earlier retry event.
+      terminal_error = error
 
-      # Set this before dispatch so a monitor's BaseException is never
-      # dispatched twice by the fallback below. Ordinary monitor failures are
-      # still handled by ``_notify_monitor`` as best-effort diagnostics.
-      monitor_dispatch_started = True
-      self._dispatch_monitor_events(monitor_events)
-      if terminal_error is not None:
-        raise terminal_error
-    finally:
-      if not monitor_dispatch_started:
-        # Keep direct calls' existing BaseException behavior: a control-flow
-        # exception bypasses the ordinary-error capture but still dispatches
-        # events already buffered by the serialized retry transaction.
-        self._dispatch_monitor_events(monitor_events)
+    # Keep the direct-call contract: buffered events still dispatch after a
+    # control-flow failure, and a callback's own BaseException takes
+    # precedence because it exits before the pending terminal result is
+    # re-raised below.
+    self._dispatch_monitor_events(monitor_events)
+    if terminal_error is not None:
+      raise terminal_error
 
   def _complete_lazy_connection_attempt(
     self,
