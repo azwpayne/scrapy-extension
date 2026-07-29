@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import ClassVar, Literal, cast
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -507,6 +508,11 @@ class MongoDBSettings(BaseSettings):
     if not v or not v.lower().startswith(_VALID_MONGO_SCHEMES):
       raise ConfigurationError(
         "uri must start with 'mongodb://' or 'mongodb+srv://'.",
+        setting_name="uri",
+      )
+    if urlsplit(v).username is not None:
+      raise ConfigurationError(
+        "MongoDB URI must not contain userinfo; configure username/password settings instead.",
         setting_name="uri",
       )
     return v

@@ -747,3 +747,13 @@ class TestR14COperabilitySettings:
     monkeypatch.setenv("SCRAPY_MONITOR_POP_RATE_WINDOW_S", "30.0")
     settings = Settings()
     assert settings.monitor_pop_rate_window_s == 30.0
+
+
+def test_mongodb_uri_userinfo_is_rejected_without_secret_leakage():
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri="mongodb://alice:super-secret@db.example.test:27017")
+
+  assert exc_info.value.setting_name == "uri"
+  assert "super-secret" not in str(exc_info.value)
