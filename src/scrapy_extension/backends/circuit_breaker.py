@@ -69,11 +69,16 @@ _QUEUE_METHOD_OPERATIONS = {
   "pop_with_ack": "pop",
   "ack": "ack",
   "nack": "nack",
+  "queue_len": "queue_len",
+  "clear_queue": "clear_queue",
 }
 _STORAGE_METHOD_OPERATIONS = {
   "store": "store",
   "retrieve": "retrieve",
   "delete": "delete",
+  "exists": "exists",
+  "ttl": "ttl",
+  "clear_storage": "clear_storage",
 }
 
 
@@ -413,11 +418,12 @@ class CircuitBreaker:
 #
 # A proxy wraps the backend's *hot-path* (network-touching) methods under a
 # shared breaker while transparently forwarding every other attribute to the
-# underlying backend. Non-network methods (``is_connected``, ``backend_type``,
-# ``clear_queue``/``clear_set``/``clear_storage`` which are administrative)
-# deliberately bypass the breaker so that an OPEN breaker does not, e.g., block
-# an ``is_connected()`` health probe or a shutdown-time ``clear_*``. Note
-# ``ack``/``nack`` are NOT administrative on MQ backends (R34-C) and are in
+# underlying backend. Administrative I/O methods (``queue_len`` / ``clear_*`` /
+# storage probes) deliberately bypass the breaker so an OPEN breaker does not,
+# e.g., block an observability query or shutdown cleanup; they still terminally
+# reconstruct package ``BackendError`` instances. Lifecycle methods such as
+# ``is_connected`` remain raw forwards. Note ``ack``/``nack`` are NOT
+# administrative on MQ backends (R34-C) and are in
 # ``_QueueBackendProxy._HOT_PATH``; see its docstring.
 #
 # The proxies subclass the interface ABCs purely so ``isinstance(proxy,
@@ -439,7 +445,8 @@ class _BackendProxyBase:
   attribute (which shadows the class-level ABC stub):
 
   - hot-path methods → ``breaker.call``-wrapped bound method
-  - every other interface method → the backend's own bound method, unchanged
+  - protected administrative I/O methods → non-counting error-safe wrapper
+  - lifecycle/other interface methods → backend's own bound method, unchanged
 
   Non-method attributes (``backend_type``, ``_backend`` internals) keep
   resolving via ``__getattr__`` → the wrapped backend, since they aren't on
@@ -449,8 +456,14 @@ class _BackendProxyBase:
   # Subclasses override: names wrapped under the breaker.
   _HOT_PATH: tuple[str, ...] = ()
   # Subclasses override: every other method the interface ABC declares, so we
-  # bind them as plain forwarded instance attributes and bypass the ABC stub.
+  # bind them as forwarded instance attributes and bypass the ABC stub.
   _FORWARDED: tuple[str, ...] = ()
+  # A strict subset of ``_FORWARDED`` whose methods perform backend I/O but
+  # intentionally do not affect breaker state.  These need the same terminal
+  # BackendError reconstruction as hot-path operations, without routing
+  # through ``breaker.call``.  Lifecycle methods stay raw forwards so their
+  # established exception behavior remains unchanged.
+  _PROTECTED_FORWARDED: tuple[str, ...] = ()
 
   def __init__(self, backend: Any, breaker: CircuitBreaker) -> None:
     # Use object.__setattr__ to avoid recursing through our own __setattr__.
@@ -471,6 +484,8 @@ class _BackendProxyBase:
         forwarded = getattr(backend, method_name)
       except AttributeError:
         continue
+      if method_name in self._PROTECTED_FORWARDED:
+        forwarded = _wrap_forwarded_bound(backend, method_name, forwarded)
       object.__setattr__(self, method_name, forwarded)
 
   def __getattr__(self, name: str) -> Any:
@@ -585,6 +600,114 @@ def _wrap_bound(
   return _ProtectedBoundOperation(breaker, backend, method_name, func)
 
 
+class _ProtectedForwardedOperation:
+  """Forward a non-counting I/O operation without exposing backend state.
+
+  Administrative probes and clear operations must continue to bypass a
+  circuit breaker: their failures should not trip or reset traffic admission.
+  They can still raise package ``BackendError`` instances, whose traceback can
+  retain a bound backend, endpoint, queue name, or storage key.  This wrapper
+  only reconstructs those package errors after the backend frames unwind;
+  unknown plugin exceptions deliberately retain their raw compatibility
+  contract.
+  """
+
+  __slots__ = (
+    "__name__",
+    "_backend_ref",
+    "_method_name",
+    "_snapshot_ref",
+  )
+
+  def __init__(
+    self,
+    backend: Any,
+    method_name: str,
+    func: Callable[..., Any],
+  ) -> None:
+    self._backend_ref = weakref.ref(backend)
+    self._method_name = method_name
+    self.__name__ = getattr(func, "__name__", method_name)
+    snapshot_ref: Callable[[], Callable[..., Any] | None] | None
+    try:
+      if getattr(func, "__self__", None) is not None:
+        snapshot_ref = weakref.WeakMethod(func)
+      else:
+        snapshot_ref = weakref.ref(func)
+    except TypeError:
+      # Plugin callables need not support weak references.  The owning proxy
+      # already retains its backend, so resolve such a callable afresh only at
+      # call time rather than retaining it in an escaped traceback frame.
+      snapshot_ref = None
+    self._snapshot_ref = snapshot_ref
+
+  def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    backend = self._backend_ref()
+    method = self._snapshot_ref() if self._snapshot_ref is not None else None
+    if method is None and backend is not None:
+      method = getattr(backend, self._method_name)
+    if method is None:
+      unavailable = BackendError("Backend operation is unavailable.")
+      del args
+      del kwargs
+      del backend
+      del method
+      del self
+      raise unavailable
+
+    caught_error: BackendError | None = None
+    try:
+      return method(*args, **kwargs)
+    except BackendError as error:
+      caught_error = error
+    except BaseException:
+      # Unknown plugin errors and process-control exceptions retain their
+      # historical raw behavior.  Do not count this administrative call or
+      # alter the breaker state.
+      del args
+      del kwargs
+      del backend
+      del method
+      del self
+      raise
+
+    assert caught_error is not None
+    queue_operation = _QUEUE_METHOD_OPERATIONS.get(self._method_name)
+    storage_operation = _STORAGE_METHOD_OPERATIONS.get(self._method_name)
+    safe_queue_operations = (queue_operation,) if queue_operation is not None else ()
+    safe_storage_operations = (
+      (storage_operation,) if storage_operation is not None else ()
+    )
+    sanitized_error = sanitize_backend_error(
+      caught_error,
+      message="Backend operation failed.",
+      safe_queue_operations=safe_queue_operations,
+      safe_storage_operations=safe_storage_operations,
+      fallback_queue_operation=queue_operation,
+      fallback_storage_operation=storage_operation,
+    )
+    del args
+    del kwargs
+    del backend
+    del method
+    del caught_error
+    del queue_operation
+    del storage_operation
+    del safe_queue_operations
+    del safe_storage_operations
+    del self
+    raise sanitized_error
+
+
+def _wrap_forwarded_bound(
+  backend: Any,
+  method_name: str,
+  func: Callable[..., Any],
+) -> Callable[..., Any]:
+  """Return a non-counting protected wrapper for one forwarded I/O operation."""
+  return _ProtectedForwardedOperation(backend, method_name, func)
+
+
 class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
   """Wrap a :class:`QueueBackend`'s hot-path ops under a breaker.
 
@@ -593,8 +716,8 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
   A transient failure in the length query (e.g. a momentary ``CLUSTER DOWN``
   during a stats scrape) must not cascade into a full traffic shutdown by
   tripping the breaker. Traffic-bearing ops (``push``/``pop``/
-  ``pop_with_ack``) are wrapped; ``queue_len`` is forwarded unchanged so its
-  failures never reach the breaker.
+  ``pop_with_ack``) are breaker-wrapped; ``queue_len`` uses a non-counting
+  protected forward, so its package errors cannot expose backend state.
 
   ``pop_with_ack`` (2026-07-10 fix) must be in the hot path so that (a) a
   broker degradation on the MQ ack-pop path trips the breaker, and (b) the
@@ -629,6 +752,7 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
     "is_connected",
     "ping",
   )
+  _PROTECTED_FORWARDED = ("queue_len", "clear_queue")
 
 
 class _SetBackendProxy(_BackendProxyBase, SetBackend):
@@ -636,6 +760,7 @@ class _SetBackendProxy(_BackendProxyBase, SetBackend):
 
   _HOT_PATH = ("add", "contains", "remove")
   _FORWARDED = ("set_len", "clear_set", "connect", "disconnect", "is_connected", "ping")
+  _PROTECTED_FORWARDED = ("set_len", "clear_set")
 
 
 class _StorageBackendProxy(_BackendProxyBase, StorageBackend):
@@ -643,6 +768,7 @@ class _StorageBackendProxy(_BackendProxyBase, StorageBackend):
 
   _HOT_PATH = ("store", "retrieve", "delete")
   _FORWARDED = ("exists", "ttl", "clear_storage", "connect", "disconnect", "is_connected", "ping")
+  _PROTECTED_FORWARDED = ("exists", "ttl", "clear_storage")
 
 
 # The proxies are pure forwarders: hot-path methods are installed on each
@@ -666,15 +792,15 @@ for _proxy_cls in (_QueueBackendProxy, _SetBackendProxy, _StorageBackendProxy):
 def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueBackend:
   """Wrap queue traffic operations under ``breaker``.
 
-  ``queue_len`` is forwarded unchanged (NOT wrapped): it is an admin /
+  ``queue_len`` is a non-counting protected forward: it is an admin /
   observability probe, and a transient stats-query failure must not cascade
-  into a full traffic shutdown by tripping the breaker. Administrative and
-  lifecycle attributes (including ``clear_queue`` and ``is_connected``) forward
-  unchanged. ``push``, ``_push_with_durability``, ``pop``, ``pop_with_ack``,
-  ``ack``, and ``nack`` are wrapped: MQ implementations perform broker I/O for
-  all of them, so their failures must trip the breaker and fail fast while it is
-  OPEN. Atomic-pop backends inherit no-op ack/nack methods, for which wrapping
-  has no observable breaker effect.
+  into a full traffic shutdown by tripping the breaker. ``clear_queue`` uses
+  the same package-error privacy boundary; lifecycle attributes (including
+  ``is_connected``) forward unchanged. ``push``, ``_push_with_durability``,
+  ``pop``, ``pop_with_ack``, ``ack``, and ``nack`` are breaker-wrapped: MQ
+  implementations perform broker I/O for all of them, so their failures must
+  trip the breaker and fail fast while it is OPEN. Atomic-pop backends inherit
+  no-op ack/nack methods, for which wrapping has no observable breaker effect.
   """
   return _QueueBackendProxy(backend, breaker)  # type: ignore[abstract]
 

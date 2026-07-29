@@ -812,8 +812,47 @@ class TestQueueBackendProxy:
     # breaker (clear_queue is administrative; is_connected is a health probe).
     wrapped.clear_queue("q")
     assert backend.clear_calls == 1
+    assert breaker.state is BreakerState.OPEN
     # is_connected forwards to the wrapped backend.
     assert wrapped.is_connected() is True
+
+  def test_admin_runtime_error_stays_raw_without_affecting_breaker(self):
+    """Unknown plugin exceptions remain a raw non-counting admin contract."""
+    backend = _FakeQueueBackend()
+    expected_error = RuntimeError("plugin queue-length failure")
+
+    def _queue_len_fails(*_args: Any, **_kwargs: Any) -> int:
+      raise expected_error
+
+    backend.queue_len = _queue_len_fails  # type: ignore[method-assign]
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    wrapped = wrap_queue_backend(backend, breaker)
+
+    with pytest.raises(RuntimeError) as exc_info:
+      wrapped.queue_len("q")
+
+    assert exc_info.value is expected_error
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+
+  def test_lifecycle_runtime_error_stays_raw_forward(self):
+    """Only I/O admin forwards are protected; lifecycle methods stay raw."""
+    backend = _FakeQueueBackend()
+    expected_error = RuntimeError("plugin connect failure")
+
+    def _connect_fails() -> None:
+      raise expected_error
+
+    backend.connect = _connect_fails  # type: ignore[method-assign]
+    breaker = CircuitBreaker("q", failure_threshold=1)
+    wrapped = wrap_queue_backend(backend, breaker)
+
+    with pytest.raises(RuntimeError) as exc_info:
+      wrapped.connect()
+
+    assert exc_info.value is expected_error
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
 
   def test_ack_failure_trips_breaker_and_fail_fast_when_open(self):
     """R34-C: ack() is a real network op on the 5 MQ backends (kafka
@@ -1032,8 +1071,9 @@ class TestQueueLenNotHotPath:
     """queue_len is an observability probe — failures must not trip the breaker.
 
     Pre-fix (queue_len in _HOT_PATH): N consecutive queue_len failures trip the
-    breaker → RED. Post-fix (queue_len removed from _HOT_PATH): queue_len is
-    forwarded unwrapped, so failures never reach the breaker → GREEN.
+    breaker → RED. Post-fix (queue_len removed from _HOT_PATH): queue_len uses
+    a non-counting protected forward, so failures never reach the breaker →
+    GREEN.
     """
     backend = _FakeQueueBackend()
     # queue_len always fails; push/pop succeed.
