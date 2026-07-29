@@ -244,7 +244,7 @@ class TestDynamoDBStorageOps:
       b.retrieve("key1")
 
     assert exc_info.value.operation == "retrieve"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
 
   @pytest.mark.parametrize(
     ("method_name", "operation"),
@@ -263,7 +263,7 @@ class TestDynamoDBStorageOps:
       getattr(b, method_name)("key1")
 
     assert exc_info.value.operation == operation
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
     table.delete_item.assert_not_called()
 
   def test_retrieve_missing_returns_none(self, mocker) -> None:
@@ -392,11 +392,13 @@ class TestDynamoDBStorageOps:
     b, table = _connected(mocker)
     table.delete_item.return_value = response
 
-    with pytest.raises(StorageError, match="malformed") as exc_info:
+    with pytest.raises(
+      StorageError, match="^DynamoDB storage delete failed\\.$"
+    ) as exc_info:
       b.delete("key1")
 
     assert exc_info.value.operation == "delete"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
     assert exc_info.value.__cause__ is None
 
   def test_delete_malformed_response_does_not_copy_payload_to_public_fields(
@@ -415,7 +417,7 @@ class TestDynamoDBStorageOps:
     assert marker not in str(error)
     assert marker not in repr(vars(error))
     assert error.operation == "delete"
-    assert error.key == "key1"
+    assert error.key is None
     assert error.__cause__ is None
 
   def test_delete_rejects_non_string_partition_key_with_spoofed_equality(
@@ -428,7 +430,7 @@ class TestDynamoDBStorageOps:
     b, table = _connected(mocker)
     table.delete_item.return_value = {"Attributes": {"pk": _EqualKey()}}
 
-    with pytest.raises(StorageError, match="malformed"):
+    with pytest.raises(StorageError, match="^DynamoDB storage delete failed\\.$"):
       b.delete("key1")
 
   def test_exists_true_for_current(self, mocker) -> None:
@@ -718,9 +720,9 @@ class TestDynamoDBStorageErrorContract:
     with pytest.raises(StorageError) as exc_info:
       b.delete("key1")
     assert exc_info.value.operation == "delete"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
 
-  def test_delete_sdk_failure_preserves_cause_without_copying_message(
+  def test_delete_sdk_failure_rebuilds_without_copying_error_graph(
     self, mocker
   ) -> None:
     marker = "operator-secret-in-sdk-diagnostic"
@@ -735,8 +737,8 @@ class TestDynamoDBStorageErrorContract:
     assert marker not in str(error)
     assert marker not in repr(vars(error))
     assert error.operation == "delete"
-    assert error.key == "key1"
-    assert error.__cause__ is failure
+    assert error.key is None
+    assert error.__cause__ is None
 
   @pytest.mark.parametrize(
     ("operation", "table_method", "invoke"),
@@ -747,7 +749,7 @@ class TestDynamoDBStorageErrorContract:
       ("ttl", "get_item", lambda backend: backend.ttl("key1")),
     ],
   )
-  def test_operation_sdk_failure_preserves_cause_without_copying_message(
+  def test_operation_sdk_failure_rebuilds_without_copying_error_graph(
     self, mocker, operation: str, table_method: str, invoke
   ) -> None:
     marker = "operator-secret-in-sdk-diagnostic"
@@ -762,10 +764,10 @@ class TestDynamoDBStorageErrorContract:
     assert marker not in str(error)
     assert marker not in repr(vars(error))
     assert error.operation == operation
-    assert error.key == "key1"
-    assert error.__cause__ is failure
+    assert error.key is None
+    assert error.__cause__ is None
 
-  def test_store_resource_not_found_preserves_cause_without_copying_message(
+  def test_store_resource_not_found_rebuilds_without_copying_error_graph(
     self, mocker
   ) -> None:
     marker = "operator-secret-in-sdk-diagnostic"
@@ -778,12 +780,12 @@ class TestDynamoDBStorageErrorContract:
       b.store("key1", b"value")
 
     error = exc_info.value
-    assert "table not found" in str(error)
+    assert str(error) == "DynamoDB storage store failed."
     assert marker not in str(error)
     assert marker not in repr(vars(error))
     assert error.operation == "store"
-    assert error.key == "key1"
-    assert error.__cause__ is failure
+    assert error.key is None
+    assert error.__cause__ is None
 
   def test_store_provisioned_throughput_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -827,8 +829,8 @@ class TestDynamoDBStorageErrorContract:
       b.delete("key1")
 
     assert exc_info.value.operation == "delete"
-    assert exc_info.value.key == "key1"
-    assert exc_info.value.__cause__ is error
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
   def test_retrieve_resource_not_found_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)
@@ -839,8 +841,8 @@ class TestDynamoDBStorageErrorContract:
       b.retrieve("key1")
 
     assert exc_info.value.operation == "retrieve"
-    assert exc_info.value.key == "key1"
-    assert exc_info.value.__cause__ is error
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
   def test_storage_error_is_backend_error_subclass(self, mocker) -> None:
     from scrapy_extension.exceptions.base import BackendError

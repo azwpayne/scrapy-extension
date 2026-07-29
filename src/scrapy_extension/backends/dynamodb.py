@@ -50,6 +50,7 @@ from scrapy_extension.exceptions import BackendConnectionError, ConfigurationErr
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  storage_operation_error_boundary,
 )
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings
@@ -71,6 +72,12 @@ _DYNAMODB_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
 _DYNAMODB_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
   {"Failed to connect to DynamoDB."}
 )
+_DYNAMODB_STORAGE_STORE_ERROR = "DynamoDB storage store failed."
+_DYNAMODB_STORAGE_RETRIEVE_ERROR = "DynamoDB storage retrieve failed."
+_DYNAMODB_STORAGE_DELETE_ERROR = "DynamoDB storage delete failed."
+_DYNAMODB_STORAGE_EXISTS_ERROR = "DynamoDB storage existence check failed."
+_DYNAMODB_STORAGE_TTL_ERROR = "DynamoDB storage TTL read failed."
+_DYNAMODB_STORAGE_CLEAR_ERROR = "DynamoDB storage clear failed."
 
 # DynamoDB ClientError codes used while establishing the table. A
 # ResourceNotFoundException means the TABLE is missing, never that an item is
@@ -120,6 +127,37 @@ def _validate_partition_key(key: str) -> None:
       "DynamoDB partition key exceeds 2,048 UTF-8 bytes "
       f"({key_size} bytes)."
     )
+
+
+def _validate_dynamodb_storage_key_argument(
+  _backend: object,
+  key: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate one direct DynamoDB key before a terminal error boundary."""
+  _validate_partition_key(key)
+
+
+def _validate_dynamodb_store_arguments(
+  _backend: object,
+  key: str,
+  data: bytes,
+  ttl: int | None = None,
+) -> None:
+  """Validate direct DynamoDB store inputs before implementation frames."""
+  del data
+  _validate_partition_key(key)
+  _validate_ttl(ttl)
+
+
+def _validate_dynamodb_storage_prefix_argument(
+  _backend: object,
+  prefix: str | None = None,
+) -> None:
+  """Validate an optional direct DynamoDB clear prefix before backend work."""
+  if prefix is not None:
+    _validate_key_name(prefix, "prefix")
 
 
 def _number_size_upper_bound(value: int) -> int:
@@ -749,6 +787,12 @@ class DynamoDBBackend(Backend, StorageBackend):
     return True
 
   # StorageBackend implementation
+  @storage_operation_error_boundary(
+    "store",
+    _DYNAMODB_STORAGE_STORE_ERROR,
+    "dynamodb",
+    validator=_validate_dynamodb_store_arguments,
+  )
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
     """Store ``data`` under ``key`` with optional TTL.
 
@@ -784,6 +828,12 @@ class DynamoDBBackend(Backend, StorageBackend):
           msg = f"Failed to store key {key!r} in DynamoDB"
         raise StorageError(msg, operation="store", key=key) from e
 
+  @storage_operation_error_boundary(
+    "retrieve",
+    _DYNAMODB_STORAGE_RETRIEVE_ERROR,
+    "dynamodb",
+    validator=_validate_dynamodb_storage_key_argument,
+  )
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key (None if missing or expired).
 
@@ -825,6 +875,12 @@ class DynamoDBBackend(Backend, StorageBackend):
       msg = "DynamoDB item has a missing or non-binary value attribute"
       raise StorageError(msg, operation="retrieve", key=key)
 
+  @storage_operation_error_boundary(
+    "delete",
+    _DYNAMODB_STORAGE_DELETE_ERROR,
+    "dynamodb",
+    validator=_validate_dynamodb_storage_key_argument,
+  )
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
@@ -852,6 +908,12 @@ class DynamoDBBackend(Backend, StorageBackend):
         raise StorageError(msg, operation="delete", key=key) from e
       return self._response_deleted(resp, key)
 
+  @storage_operation_error_boundary(
+    "exists",
+    _DYNAMODB_STORAGE_EXISTS_ERROR,
+    "dynamodb",
+    validator=_validate_dynamodb_storage_key_argument,
+  )
   def exists(self, key: str) -> bool:
     """Check if a key exists and is not expired.
 
@@ -880,6 +942,12 @@ class DynamoDBBackend(Backend, StorageBackend):
       expiry = self._validated_expiry(item, "exists", key)
       return not self._lazy_reap_if_expired(table, expiry, key)
 
+  @storage_operation_error_boundary(
+    "ttl",
+    _DYNAMODB_STORAGE_TTL_ERROR,
+    "dynamodb",
+    validator=_validate_dynamodb_storage_key_argument,
+  )
   def ttl(self, key: str) -> int | None:
     """Return remaining TTL seconds if the item has expire_at, else None.
 
@@ -918,6 +986,12 @@ class DynamoDBBackend(Backend, StorageBackend):
         return None
       return max(0, int(expiry[1] - time.time()))
 
+  @storage_operation_error_boundary(
+    "clear_storage",
+    _DYNAMODB_STORAGE_CLEAR_ERROR,
+    "dynamodb",
+    validator=_validate_dynamodb_storage_prefix_argument,
+  )
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear observed keys via bounded batch deletes, optionally by prefix.
 
