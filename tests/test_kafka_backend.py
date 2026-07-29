@@ -708,7 +708,7 @@ class TestKafkaBackendConfluentMode:
       mode=KafkaMode.CONFLUENT,
       confluent_api_key="api_key_123",
       confluent_api_secret="api_secret_456",
-      confluent_bootstrap_servers="pulsar://abc.xyz.confluent.cloud:9092",
+      confluent_bootstrap_servers="abc.xyz.confluent.cloud:9092",
     )
     backend = KafkaBackend(config)
 

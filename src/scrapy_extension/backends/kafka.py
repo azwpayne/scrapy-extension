@@ -62,6 +62,9 @@ from scrapy_extension.exceptions._redaction import (
   configuration_error_boundary,
 )
 from scrapy_extension.settings import KafkaMode, KafkaSettings
+from scrapy_extension.settings._broker_endpoints import (
+  KAFKA_BROKER_ENDPOINTS_ERROR,
+)
 from scrapy_extension.settings.kafka import (
     validate_kafka_authentication,
     validate_kafka_delivery_policy,
@@ -96,6 +99,7 @@ _KAFKA_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
 )
 _KAFKA_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
   {
+    KAFKA_BROKER_ENDPOINTS_ERROR,
     "Unsupported Kafka mode.",
     (
       "KafkaBackend requires enable_auto_commit=False because queue "

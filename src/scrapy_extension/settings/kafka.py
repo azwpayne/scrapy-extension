@@ -13,6 +13,9 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._broker_endpoints import (
+  normalize_kafka_broker_endpoints,
+)
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 
@@ -436,6 +439,31 @@ class KafkaSettings(RedactedBaseSettings):
     ge=1,
     description="Minimum in-sync replicas for producer acks",
   )
+
+  @field_validator("bootstrap_servers", mode="after")
+  @classmethod
+  def _normalize_bootstrap_servers(cls, value: str) -> str:
+    """Keep Kafka bootstrap syntax valid before the client reaches DNS."""
+    return normalize_kafka_broker_endpoints(value, "bootstrap_servers")
+
+  @field_validator("cluster_brokers", mode="after")
+  @classmethod
+  def _normalize_cluster_brokers(cls, value: list[str]) -> list[str]:
+    """Validate each optional cluster member with the Kafka endpoint grammar."""
+    return [
+      normalize_kafka_broker_endpoints(endpoint, "cluster_brokers")
+      for endpoint in value
+    ]
+
+  @field_validator("confluent_bootstrap_servers", mode="after")
+  @classmethod
+  def _normalize_confluent_bootstrap_servers(cls, value: str | None) -> str | None:
+    """Preserve an empty optional override as the documented fallback signal."""
+    if value is None:
+      return None
+    if not value.strip(" "):
+      return ""
+    return normalize_kafka_broker_endpoints(value, "confluent_bootstrap_servers")
 
   @field_validator("acks", mode="before")
   @classmethod

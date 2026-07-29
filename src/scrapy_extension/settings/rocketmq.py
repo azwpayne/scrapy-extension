@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from enum import Enum
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -10,12 +9,10 @@ from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._broker_endpoints import (
+    normalize_rocketmq_namesrv_endpoints,
+)
 from scrapy_extension.settings._redacted import RedactedBaseSettings
-
-# host:port — host is any non-colon run of chars (DNS name, IPv4, IPv6-bracketed
-# forms are accepted by the client); port is digits only. Rejects bare host,
-# bare port, and values with a scheme prefix.
-_NAMESRV_PATTERN = re.compile(r"[^:\s;]+:\d+")
 
 
 class RocketMQMode(str, Enum):
@@ -67,21 +64,7 @@ def validate_rocketmq_connection(
             setting_name="mode",
         )
 
-    if not isinstance(namesrv_address, str):
-        raise ConfigurationError(
-            "namesrv_address must be a semicolon-separated 'host:port' list.",
-            setting_name="namesrv_address",
-        )
-    endpoints = [endpoint.strip() for endpoint in namesrv_address.split(";")]
-    if not endpoints or any(
-        not endpoint or not _NAMESRV_PATTERN.fullmatch(endpoint)
-        for endpoint in endpoints
-    ):
-        raise ConfigurationError(
-            "namesrv_address must be a semicolon-separated 'host:port' list.",
-            setting_name="namesrv_address",
-        )
-    namesrv_address = ";".join(endpoints)
+    namesrv_address = normalize_rocketmq_namesrv_endpoints(namesrv_address)
     if not isinstance(tls_enabled, bool):
         raise ConfigurationError(
             "tls_enabled must be a boolean.",

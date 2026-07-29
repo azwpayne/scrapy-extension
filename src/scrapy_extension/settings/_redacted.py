@@ -13,6 +13,10 @@ from pydantic_settings import BaseSettings, SettingsError
 from scrapy_extension.exceptions._redaction import sanitize_configuration_error
 from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._aws import _AWS_SAFE_CONFIGURATION_MESSAGES
+from scrapy_extension.settings._broker_endpoints import (
+  KAFKA_BROKER_ENDPOINTS_ERROR,
+  ROCKETMQ_NAMESRV_ENDPOINTS_ERROR,
+)
 
 _SAFE_SETTINGS_ERROR_NAMES: frozenset[str] = frozenset(
   {
@@ -29,6 +33,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     "Kafka CONFLUENT mode requires 'confluent_api_key and confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
     "Kafka CONFLUENT mode requires 'confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
     "Kafka TLS connections require ssl_check_hostname=True.",
+    KAFKA_BROKER_ENDPOINTS_ERROR,
     "min_pool_size must be <= max_pool_size — an inverted pair makes the connection pool unable to satisfy any checkout (deadlock under load).",
     "MongoDB ATLAS mode requires an explicit 'mongodb+srv://' uri. atlas_cluster_name cannot replace uri because the backend uses uri verbatim and a complete Atlas SRV hostname cannot be derived from a cluster display name.",
     "MongoDB REPLICA_SET mode requires 'replica_set_name' to be set, or a uri that already carries a '?replicaSet=...' query.",
@@ -36,6 +41,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     "Redis SENTINEL mode requires 'sentinel_master_name' to be set. No endpoint or credential values are included in this error.",
     "Redis SENTINEL mode requires 'sentinels' to be set. No endpoint or credential values are included in this error.",
     "Redis SENTINEL mode requires 'sentinels and sentinel_master_name' to be set. No endpoint or credential values are included in this error.",
+    ROCKETMQ_NAMESRV_ENDPOINTS_ERROR,
     "SASL credentials (sasl_username / sasl_password / sasl_mechanism) require a 'SASL_'-prefixed security_protocol ('SASL_SSL'); kafka-python silently ignores the SASL fields otherwise (auth never attempted).",
     "ssl_enabled=True requires 'ssl_cafile' to be set (path to a CA certificate bundle).",
     "username must not be blank when supplied.",

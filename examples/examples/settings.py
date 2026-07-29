@@ -185,11 +185,11 @@ SCRAPY_REDIS_DB = 0
 # Note: RocketMQ only supports Queue operations (no Set/Storage for dedup/storage)
 
 # SCRAPY_BACKEND_TYPE = "rocketmq"
-# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:9876"
+# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "localhost:8081"
 
 # --- RocketMQ Cluster ---
 # SCRAPY_ROCKETMQ_MODE = "cluster"
-# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "namesrv1:9876,namesrv2:9876"
+# SCRAPY_ROCKETMQ_NAMESRV_ADDRESS = "10.0.0.11:8081;10.0.0.12:8081"
 
 # --- Alibaba Cloud RocketMQ ---
 # SCRAPY_ROCKETMQ_MODE = "cloud"
@@ -199,5 +199,4 @@ SCRAPY_REDIS_DB = 0
 
 # --- RocketMQ Consumer/Producer Settings ---
 # SCRAPY_ROCKETMQ_CONSUMER_GROUP = "scrapy-extension-consumer"
-# SCRAPY_ROCKETMQ_PRODUCER_GROUP = "scrapy-extension-producer"
 # SCRAPY_ROCKETMQ_SEND_TIMEOUT = 3000

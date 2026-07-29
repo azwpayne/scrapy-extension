@@ -856,9 +856,9 @@ class TestRocketMQNamesrvFormat:
   def test_namesrv_accepts_and_canonicalizes_cluster_endpoints(self) -> None:
     settings = RocketMQSettings(
       mode="cluster",  # type: ignore[arg-type]
-      namesrv_address=" one:8081 ; two:8082 ",
+      namesrv_address=" 192.0.2.10:8081 ; 192.0.2.11:8082 ",
     )
-    assert settings.namesrv_address == "one:8081;two:8082"
+    assert settings.namesrv_address == "192.0.2.10:8081;192.0.2.11:8082"
 
   @pytest.mark.parametrize(
     "addr", ["one:8081;", ";one:8081", "one:8081;;two:8082", "one:8081;two:abc"]

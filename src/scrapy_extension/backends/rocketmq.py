@@ -51,7 +51,12 @@ from scrapy_extension.exceptions._redaction import (
   import_error_traceback_boundary,
 )
 from scrapy_extension.settings import RocketMQSettings
-from scrapy_extension.settings.rocketmq import validate_rocketmq_connection
+from scrapy_extension.settings._broker_endpoints import (
+  ROCKETMQ_NAMESRV_ENDPOINTS_ERROR,
+)
+from scrapy_extension.settings.rocketmq import (
+  validate_rocketmq_connection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,7 @@ _ROCKETMQ_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
 )
 _ROCKETMQ_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
   {
+    ROCKETMQ_NAMESRV_ENDPOINTS_ERROR,
     "Unsupported RocketMQ mode.",
     "Cloud mode requires access_key and secret_key.",
   }
