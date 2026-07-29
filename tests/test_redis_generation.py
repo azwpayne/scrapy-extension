@@ -965,7 +965,9 @@ def test_blocking_pop_never_crosses_or_resurrects_generation(mocker) -> None:
   assert len(pop_errors) == 1
   assert isinstance(pop_errors[0], QueueError)
   assert pop_errors[0].operation == "pop"
-  assert pop_errors[0].queue_name == "jobs"
+  assert pop_errors[0].queue_name is None
+  assert pop_errors[0].__cause__ is None
+  assert pop_errors[0].__context__ is None
   assert disconnect_errors == []
   constructor.assert_called_once()
   second_script.assert_not_called()

@@ -17,7 +17,7 @@ from redis.cluster import (
   RedisCluster as SdkRedisCluster,
 )
 from redis.connection import Connection
-from redis.exceptions import AuthenticationError, ClusterError, MovedError
+from redis.exceptions import AuthenticationError, MovedError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
 from redis.sentinel import (
@@ -470,7 +470,8 @@ def test_real_sdk_script_transport_does_not_replay_after_lost_response(
     with pytest.raises(QueueError) as exc_info:
       call()
 
-    assert isinstance(exc_info.value.__cause__, RedisTimeoutError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert _CommittedThenResponseLostConnection.retry_counts == [0]
     assert len(_CommittedThenResponseLostConnection.commands) == 1
     command = _CommittedThenResponseLostConnection.commands[0][0]
@@ -524,7 +525,8 @@ def test_real_cluster_script_transport_does_not_replay_after_lost_response(
     with pytest.raises(QueueError) as exc_info:
       backend.push("queue", b"payload")
 
-    assert isinstance(exc_info.value.__cause__, RedisTimeoutError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert cluster.retry.get_retries() == 0
     assert _CommittedThenResponseLostConnection.retry_counts == [0]
     assert len(_CommittedThenResponseLostConnection.commands) == 1
@@ -587,7 +589,8 @@ def test_real_cluster_max_redirects_bounds_consecutive_moved_follow_ups(
   finally:
     backend.disconnect()
 
-  assert isinstance(exc_info.value.__cause__, ClusterError)
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   assert all(
     command[0] in {"EVALSHA", "EVAL"}
     for command in _AlwaysMovedConnection.commands
@@ -636,7 +639,8 @@ def test_real_sentinel_master_transport_does_not_replay_lost_response(
     with pytest.raises(QueueError) as exc_info:
       backend.pop("queue")
 
-    assert isinstance(exc_info.value.__cause__, RedisTimeoutError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert _CommittedThenResponseLostSentinelConnection.retry_counts == [0]
     assert len(_CommittedThenResponseLostSentinelConnection.commands) == 1
     command = _CommittedThenResponseLostSentinelConnection.commands[0][0]

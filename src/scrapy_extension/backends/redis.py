@@ -64,6 +64,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
 )
 from scrapy_extension.settings import RedisMode
 from scrapy_extension.settings.redis import (
@@ -88,6 +89,18 @@ _REDIS_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
   | {
     "Cannot connect to Redis re-entrantly while building a candidate.",
     "Cannot connect to Redis re-entrantly during disconnect.",
+  }
+)
+_REDIS_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Redis queue push failed.",
+    "Redis queue pop failed.",
+    "Redis disconnected while waiting to pop from a queue.",
+    "Malformed Redis pop response.",
+    "Redis pop payload has an invalid type.",
+    "Redis pop reported structural corruption.",
+    "Redis queue length read failed.",
+    "Redis queue clear failed.",
   }
 )
 
@@ -141,6 +154,28 @@ def _normalize_pop_timeout(timeout: float) -> float:
   if not math.isfinite(normalized) or normalized < 0:
     raise ValueError(f"timeout must be a finite non-negative number, got {timeout!r}")
   return normalized
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate one public Redis queue name before I/O can begin."""
+  _validate_key_name(queue_name, "queue_name")
+
+
+def _validate_pop_arguments(
+  _backend: object,
+  queue_name: str,
+  timeout: float = 0.0,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Preserve queue-name and finite timeout validation outside redaction."""
+  _validate_key_name(queue_name, "queue_name")
+  _normalize_pop_timeout(timeout)
 
 
 def _new_no_replay_retry() -> Retry:
@@ -970,6 +1005,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     resolved_namespace = self.config.namespace if namespace is None else namespace
     return f"{resolved_namespace}:storage:{key}"
 
+  @queue_operation_error_boundary(
+    "push",
+    "Redis queue push failed.",
+    safe_messages=_REDIS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to priority queue.
 
@@ -1009,6 +1050,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           operation="push",
         ) from e
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Redis queue pop failed.",
+    safe_messages=_REDIS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_pop_arguments,
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
@@ -1084,6 +1131,25 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             operation="pop",
           )
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Redis queue pop failed.",
+    safe_messages=_REDIS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_pop_arguments,
+  )
+  def pop_with_ack(
+    self, queue_name: str, timeout: float = 0.0
+  ) -> tuple[bytes | None, None]:
+    """Pop atomically without retaining the base-class operation frame.
+
+    Redis consumes a message in the pop transaction, so there is no deferred
+    acknowledgement token.  This explicit override is intentionally not the
+    inherited ``QueueBackend.pop_with_ack`` implementation: a terminal
+    ``QueueError`` raised through that base frame could retain the backend,
+    queue name, and payload arguments in its traceback.
+    """
+    return (self.pop(queue_name, timeout), None)
+
   def _atomic_pop_once(
     self,
     queue_name: str,
@@ -1151,6 +1217,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       operation="pop",
     )
 
+  @queue_operation_error_boundary(
+    "queue_len",
+    "Redis queue length read failed.",
+    safe_messages=_REDIS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
 
@@ -1181,6 +1253,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           operation="queue_len",
         ) from e
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    "Redis queue clear failed.",
+    safe_messages=_REDIS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Clear all items from queue.
 

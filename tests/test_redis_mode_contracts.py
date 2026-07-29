@@ -732,7 +732,12 @@ def test_cluster_sdk_exception_obeys_every_operation_contract(
   with pytest.raises(error_type) as exc_info:
     _invoke_operation(backend, client, mocker, operation, failure)
 
-  assert exc_info.value.__cause__ is failure
+  if type(exc_info.value) is QueueError:
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.queue_name is None
+  else:
+    assert exc_info.value.__cause__ is failure
   assert getattr(exc_info.value, field_name) == field_value
   assert _SECRET not in str(exc_info.value)
 
@@ -787,7 +792,12 @@ def test_pool_child_deadlock_obeys_every_operation_contract(
   with pytest.raises(error_type) as exc_info:
     _invoke_operation(backend, client, mocker, operation, failure)
 
-  assert exc_info.value.__cause__ is failure
+  if type(exc_info.value) is QueueError:
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.queue_name is None
+  else:
+    assert exc_info.value.__cause__ is failure
   assert getattr(exc_info.value, field_name) == field_value
 
 
