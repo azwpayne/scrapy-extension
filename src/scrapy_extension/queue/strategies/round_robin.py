@@ -177,13 +177,15 @@ class RoundRobinQueueStrategy(QueueStrategy):
     """
     if not state:
       return
+    corrupt_snapshot = False
     try:
       data = json.loads(state.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError):
+      corrupt_snapshot = True
+    if corrupt_snapshot:
       try:
         logger.warning(
-          "RoundRobinQueueStrategy restore: corrupt snapshot (%s); starting clean.",
-          e,
+          "RoundRobinQueueStrategy restore: corrupt snapshot; starting clean."
         )
       except BaseException:
         pass
@@ -233,25 +235,20 @@ class RoundRobinQueueStrategy(QueueStrategy):
         continue
       if source in recovered:
         try:
-          logger.warning(
-            "RoundRobinQueueStrategy restore: skipping duplicate source %r.",
-            source,
-          )
+          logger.warning("RoundRobinQueueStrategy restore: skipping duplicate source.")
         except BaseException:
           pass
         continue
       items: deque[bytes] = deque()
       for raw_item in raw_items:
+        malformed_item = False
         try:
           items.append(base64.b64decode(raw_item, validate=True))
-        except (binascii.Error, TypeError, ValueError) as e:
+        except (binascii.Error, TypeError, ValueError):
+          malformed_item = True
+        if malformed_item:
           try:
-            logger.warning(
-              "RoundRobinQueueStrategy restore: skipping malformed item for "
-              "source %r (%s).",
-              source,
-              e,
-            )
+            logger.warning("RoundRobinQueueStrategy restore: skipping malformed item.")
           except BaseException:
             pass
       if items:

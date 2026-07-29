@@ -272,13 +272,15 @@ class RingBufferQueueStrategy(QueueStrategy):
     """
     if not state:
       return
+    corrupt_snapshot = False
     try:
       data = json.loads(state.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError):
+      corrupt_snapshot = True
+    if corrupt_snapshot:
       try:
         logger.warning(
-          "RingBufferQueueStrategy restore: corrupt snapshot (%s); starting clean.",
-          e,
+          "RingBufferQueueStrategy restore: corrupt snapshot; starting clean."
         )
       except BaseException:
         pass
@@ -306,13 +308,14 @@ class RingBufferQueueStrategy(QueueStrategy):
       return
     decoded: list[bytes] = []
     for entry in raw_items:
+      malformed_item = False
       try:
         decoded.append(base64.b64decode(entry, validate=True))
-      except (binascii.Error, TypeError, ValueError) as e:
+      except (binascii.Error, TypeError, ValueError):
+        malformed_item = True
+      if malformed_item:
         try:
-          logger.warning(
-            "RingBufferQueueStrategy restore: skipping malformed item (%s).", e
-          )
+          logger.warning("RingBufferQueueStrategy restore: skipping malformed item.")
         except BaseException:
           pass
         continue

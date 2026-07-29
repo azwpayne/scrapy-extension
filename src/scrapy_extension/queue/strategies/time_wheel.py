@@ -529,13 +529,15 @@ class TimeWheelQueueStrategy(QueueStrategy):
     """
     if not state:
       return
+    corrupt_snapshot = False
     try:
       data = json.loads(state.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError):
+      corrupt_snapshot = True
+    if corrupt_snapshot:
       try:
         logger.warning(
-          "TimeWheelQueueStrategy restore: corrupt snapshot (%s); starting clean.",
-          e,
+          "TimeWheelQueueStrategy restore: corrupt snapshot; starting clean."
         )
       except BaseException:
         pass
@@ -568,6 +570,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
       now = self._clock_now()
       downtime = 0.0
       if version == 2:
+        invalid_v2_clock_metadata = False
         try:
           snapshot_wall_time = float(data["snapshot_wall_time"])
           current_wall_time = float(self._wall_clock())
@@ -576,12 +579,13 @@ class TimeWheelQueueStrategy(QueueStrategy):
           ):
             raise ValueError("wall clock is not finite")
           downtime = max(0.0, current_wall_time - snapshot_wall_time)
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError):
+          invalid_v2_clock_metadata = True
+        if invalid_v2_clock_metadata:
           try:
             logger.warning(
-              "TimeWheelQueueStrategy restore: invalid v2 clock metadata (%s); "
-              "starting clean.",
-              e,
+              "TimeWheelQueueStrategy restore: invalid v2 clock metadata; "
+              "starting clean."
             )
           except BaseException:
             pass
@@ -609,17 +613,19 @@ class TimeWheelQueueStrategy(QueueStrategy):
       for entry in slots_flat:
         entry_order = input_order
         input_order += 1
+        malformed_wheel_entry = False
         try:
           item = base64.b64decode(entry["item_b64"], validate=True)
           priority = float(entry["priority"])
           if not math.isfinite(priority):
             raise ValueError("priority is not finite")
           ready_at, original_deadline = restored_timing(entry)
-        except (KeyError, TypeError, ValueError, binascii.Error) as e:
+        except (KeyError, TypeError, ValueError, binascii.Error):
+          malformed_wheel_entry = True
+        if malformed_wheel_entry:
           try:
             logger.warning(
-              "TimeWheelQueueStrategy restore: skipping malformed wheel entry (%s).",
-              e,
+              "TimeWheelQueueStrategy restore: skipping malformed wheel entry."
             )
           except BaseException:
             pass
@@ -628,17 +634,19 @@ class TimeWheelQueueStrategy(QueueStrategy):
       for entry in overflow_entries:
         entry_order = input_order
         input_order += 1
+        malformed_overflow_entry = False
         try:
           ready_at, original_deadline = restored_timing(entry)
           item = base64.b64decode(entry["item_b64"], validate=True)
           priority = float(entry["priority"])
           if not math.isfinite(priority):
             raise ValueError("priority is not finite")
-        except (KeyError, TypeError, ValueError, binascii.Error) as e:
+        except (KeyError, TypeError, ValueError, binascii.Error):
+          malformed_overflow_entry = True
+        if malformed_overflow_entry:
           try:
             logger.warning(
-              "TimeWheelQueueStrategy restore: skipping malformed overflow entry (%s).",
-              e,
+              "TimeWheelQueueStrategy restore: skipping malformed overflow entry."
             )
           except BaseException:
             pass

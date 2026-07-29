@@ -202,9 +202,12 @@ class DelayQueueStrategy(QueueStrategy):
     # in-process delay heap grows unbounded (held-delay state is lost on
     # crash). No-op under NullMonitor; BLE001-guarded so a misbehaving
     # monitor cannot crash the push path.
+    delay_depth_hook_failed = False
     try:
       self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 — monitor must never crash push
+      delay_depth_hook_failed = True
+    if delay_depth_hook_failed:
       try:
         logger.debug("on_delay_depth hook raised")
       except BaseException:
@@ -262,9 +265,12 @@ class DelayQueueStrategy(QueueStrategy):
           (ready_at, next(self._seq), item, normalized_priority),
         )
         held = len(self._holding)
+      delay_depth_hook_failed = False
       try:
         self._monitor.on_delay_depth(held)
       except Exception:  # noqa: BLE001 — monitor must never crash push
+        delay_depth_hook_failed = True
+      if delay_depth_hook_failed:
         try:
           logger.debug("on_delay_depth hook raised")
         except BaseException:
@@ -417,9 +423,12 @@ class DelayQueueStrategy(QueueStrategy):
     # R25-D: emit on drain so queue/delay_depth can fall — pre-fix the gauge was
     # push-only and pegged at peak, unable to reflect a drained heap (so an
     # operator's max-held alert could never clear).
+    delay_depth_hook_failed = False
     try:
       self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 - monitor must not break the drain path
+      delay_depth_hook_failed = True
+    if delay_depth_hook_failed:
       try:
         logger.debug("on_delay_depth hook raised")
       except BaseException:
@@ -457,9 +466,12 @@ class DelayQueueStrategy(QueueStrategy):
       self._connection_manager.get_queue_backend().clear_queue(queue_name)
       self._holding.clear()
     # R25-D: emit 0 so the gauge clears on an explicit flush (was push-only).
+    delay_depth_hook_failed = False
     try:
       self._monitor.on_delay_depth(0)
     except Exception:  # noqa: BLE001 - monitor must not break clear()
+      delay_depth_hook_failed = True
+    if delay_depth_hook_failed:
       try:
         logger.debug("on_delay_depth hook raised")
       except BaseException:
@@ -540,13 +552,14 @@ class DelayQueueStrategy(QueueStrategy):
     """
     if not state:
       return
+    corrupt_snapshot = False
     try:
       data = json.loads(state.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError):
+      corrupt_snapshot = True
+    if corrupt_snapshot:
       try:
-        logger.warning(
-          "DelayQueueStrategy restore: corrupt snapshot (%s); starting clean.", e
-        )
+        logger.warning("DelayQueueStrategy restore: corrupt snapshot; starting clean.")
       except BaseException:
         pass
       return
@@ -556,12 +569,7 @@ class DelayQueueStrategy(QueueStrategy):
       or data.get("version") not in (1, 2)
     ):
       try:
-        logger.warning(
-          "DelayQueueStrategy restore: unknown snapshot format "
-          "(strategy=%r, version=%r); starting clean.",
-          data.get("strategy") if isinstance(data, dict) else None,
-          data.get("version") if isinstance(data, dict) else None,
-        )
+        logger.warning("DelayQueueStrategy restore: unknown snapshot format; starting clean.")
       except BaseException:
         pass
       return
@@ -575,19 +583,22 @@ class DelayQueueStrategy(QueueStrategy):
         pass
       return
     version = int(data["version"])
+    invalid_clock_metadata = False
     try:
       now = _require_finite(self._clock(), "clock value")
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError):
+      invalid_clock_metadata = True
+    if invalid_clock_metadata:
       try:
         logger.warning(
-          "DelayQueueStrategy restore: invalid clock metadata (%s); starting clean.",
-          e,
+          "DelayQueueStrategy restore: invalid clock metadata; starting clean."
         )
       except BaseException:
         pass
       return
     downtime = 0.0
     if version == 2:
+      invalid_v2_clock_metadata = False
       try:
         snapshot_wall_time = float(data["snapshot_wall_time"])
         current_wall_time = float(self._wall_clock())
@@ -596,11 +607,12 @@ class DelayQueueStrategy(QueueStrategy):
         ):
           raise ValueError("wall clock is not finite")
         downtime = max(0.0, current_wall_time - snapshot_wall_time)
-      except (KeyError, TypeError, ValueError) as e:
+      except (KeyError, TypeError, ValueError):
+        invalid_v2_clock_metadata = True
+      if invalid_v2_clock_metadata:
         try:
           logger.warning(
-            "DelayQueueStrategy restore: invalid v2 clock metadata (%s); starting clean.",
-            e,
+            "DelayQueueStrategy restore: invalid v2 clock metadata; starting clean."
           )
         except BaseException:
           pass
@@ -610,6 +622,7 @@ class DelayQueueStrategy(QueueStrategy):
     for input_order, entry in enumerate(items):
       if not isinstance(entry, dict):
         continue
+      malformed_entry = False
       try:
         if version == 2:
           remaining = float(entry["remaining"])
@@ -627,9 +640,11 @@ class DelayQueueStrategy(QueueStrategy):
         item = base64.b64decode(entry["item_b64"], validate=True)
         priority = float(entry["priority"])
         _require_finite(priority, "priority")
-      except (KeyError, TypeError, ValueError, binascii.Error) as e:
+      except (KeyError, TypeError, ValueError, binascii.Error):
+        malformed_entry = True
+      if malformed_entry:
         try:
-          logger.warning("DelayQueueStrategy restore: skipping malformed entry (%s).", e)
+          logger.warning("DelayQueueStrategy restore: skipping malformed entry.")
         except BaseException:
           pass
         continue

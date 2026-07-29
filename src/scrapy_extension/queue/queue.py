@@ -489,6 +489,7 @@ class BackendQueue:
     # without silently losing its delay or source semantics.
     request.meta.pop("delay", None)
     request.meta.pop("source", None)
+    replacement_ack_failed = False
     if replacement_ack_token is not None:
       # This push already owns an operation lease. Use the admitted primitive
       # directly so a concurrent close cannot reject the terminal ack between
@@ -503,20 +504,23 @@ class BackendQueue:
         # and return success for the durable replacement. A later redelivery
         # carrying its own token is durably handed off again before that token
         # is acked; this can replay work but cannot lose the source delivery.
-        self._inc_stat("scheduler/ack_error")
-        # The replacement commit is already visible. A broken logging handler
-        # must not reclassify that committed enqueue as a failed push.
-        try:
-          logger.error(
-            "Failed to acknowledge source delivery after replacement committed"
-          )
-        except BaseException:
-          pass
+        replacement_ack_failed = True
       else:
         request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+    if replacement_ack_failed:
+      self._inc_stat("scheduler/ack_error")
+      # The replacement commit is already visible. A broken logging handler
+      # must not reclassify that committed enqueue as a failed push.
+      try:
+        logger.error("Failed to acknowledge source delivery after replacement committed")
+      except BaseException:
+        pass
+    push_monitor_failed = False
     try:
       self._monitor.on_push(self.queue_name, priority)
     except Exception:  # noqa: BLE001 - enqueue has already committed
+      push_monitor_failed = True
+    if push_monitor_failed:
       # Keep the monitor's ordinary failure swallowed even when its fallback
       # diagnostic handler raises a control-flow exception.
       try:
@@ -593,9 +597,12 @@ class BackendQueue:
     # the consumer-liveness signal (pop attempts per second), independent of
     # whether an item was returned. A worker popping an empty queue is itself
     # operability signal.
+    pop_monitor_failed = False
     try:
       self._monitor.on_pop(self.queue_name)
     except Exception:  # noqa: BLE001 - atomic backends already removed the item
+      pop_monitor_failed = True
+    if pop_monitor_failed:
       try:
         logger.debug("monitor.on_pop raised; ignored")
       except BaseException:
@@ -608,9 +615,12 @@ class BackendQueue:
     self._pop_rate_counter += 1
     if self._pop_rate_counter >= self.depth_sample_every:
       self._pop_rate_counter = 0
+      pop_rate_monitor_failed = False
       try:
         self._emit_pop_rate()
       except Exception:  # noqa: BLE001
+        pop_rate_monitor_failed = True
+      if pop_rate_monitor_failed:
         try:
           logger.debug("monitor.on_pop_rate raised; ignored")
         except BaseException:
@@ -621,9 +631,12 @@ class BackendQueue:
     # ``_probe_depth`` so the real ``queue_len`` RPC only fires once per
     # ``depth_sample_every`` pops; cached value fills the gaps. Guarded so a
     # depth-sampling failure can never break a successful pop.
+    depth_monitor_failed = False
     try:
       self._monitor.on_queue_depth(self.queue_name, self._probe_depth())
     except Exception:  # noqa: BLE001
+      depth_monitor_failed = True
+    if depth_monitor_failed:
       try:
         logger.debug("monitor.on_queue_depth raised; ignored")
       except BaseException:
@@ -735,6 +748,7 @@ class BackendQueue:
     body = request_dict.get("body")
     if body is None:
       return
+    legacy_bytes: bytes | None = None
     try:
       request_dict["body"] = base64.b64decode(body, validate=True)
     except (binascii.Error, ValueError):
@@ -746,21 +760,21 @@ class BackendQueue:
         try:
           legacy_bytes = body.encode("utf-8")
         except UnicodeEncodeError:
-          legacy_bytes = None
-      else:
-        legacy_bytes = None
+          pass
       if legacy_bytes is not None:
-        warnings.warn(
-          "legacy non-base64 queue body; will be unsupported after the "
-          "next major. Re-queue the request with a current package version "
-          "to migrate it.",
-          DeprecationWarning,
-          stacklevel=2,
-        )
-        request_dict["body"] = legacy_bytes
-        return
-      msg = "Invalid base64 body in queued request: body is not valid base64"
-      raise SerializationError(msg, data=body, serializer="json")
+        pass
+      else:
+        msg = "Invalid base64 body in queued request: body is not valid base64"
+        raise SerializationError(msg, data=body, serializer="json")
+    if legacy_bytes is not None:
+      warnings.warn(
+        "legacy non-base64 queue body; will be unsupported after the "
+        "next major. Re-queue the request with a current package version "
+        "to migrate it.",
+        DeprecationWarning,
+        stacklevel=2,
+      )
+      request_dict["body"] = legacy_bytes
 
   @staticmethod
   def _validate_request_dict(request_dict: dict[str, Any]) -> None:
@@ -1100,14 +1114,17 @@ class BackendQueue:
     """
     crawler = getattr(self._spider, "crawler", None) if self._spider else None
     stats = getattr(crawler, "stats", None) if crawler is not None else None
+    stats_failed = False
     if stats is not None:
       try:
         stats.inc_value(stat_name)
       except Exception:  # noqa: BLE001 - stats cannot mask the queue result
-        try:
-          logger.debug("stats.inc_value raised; ignored")
-        except BaseException:
-          pass
+        stats_failed = True
+    if stats_failed:
+      try:
+        logger.debug("stats.inc_value raised; ignored")
+      except BaseException:
+        pass
 
   @staticmethod
   def _resolve_monitor(spider: Spider | None) -> Monitor:
@@ -1234,9 +1251,12 @@ class BackendQueue:
     ``get_storage_backend`` attribute (e.g. test stubs) also skip. Best-effort:
     any failure is logged, never crashes :meth:`close`.
     """
+    snapshot_failed = False
     try:
       state = self._strategy.snapshot()
     except Exception:  # noqa: BLE001 — snapshot must not crash close
+      snapshot_failed = True
+    if snapshot_failed:
       # This only reports an already-selected best-effort fallback.  A custom
       # handler may raise even a control-flow BaseException; it must not turn
       # the promised non-fatal snapshot failure into a failed close.
@@ -1248,23 +1268,28 @@ class BackendQueue:
     get_storage = getattr(self.connection_manager, "get_storage_backend", None)
     if get_storage is None:
       return  # connection manager exposes no storage interface
+    storage_unsupported = False
+    storage_resolution_failed = False
     try:
       storage = get_storage()
     except NotImplementedError:
+      storage_unsupported = True
+    except Exception:  # noqa: BLE001 — resolver must not crash close
+      storage_resolution_failed = True
+    if storage_unsupported:
       # This is an informational fallback after the backend capability was
       # determined.  Diagnostics cannot make close fail.
       try:
         logger.info(
           "Queue backend is not storage-capable; cannot persist strategy "
-          "snapshot for queue %r — in-process held state (e.g. delayed items) "
-          "will not survive restart. Pair with a storage-capable backend "
-          "(Redis/MongoDB/ElasticSearch) to enable snapshot/restore.",
-          self.queue_name,
+          "snapshot — in-process held state (e.g. delayed items) will not "
+          "survive restart. Pair with a storage-capable backend "
+          "(Redis/MongoDB/ElasticSearch) to enable snapshot/restore."
         )
       except BaseException:
         pass
       return
-    except Exception:  # noqa: BLE001 — resolver must not crash close
+    if storage_resolution_failed:
       try:
         logger.error("Failed to resolve storage backend; skipping snapshot persist")
       except BaseException:
@@ -1284,21 +1309,23 @@ class BackendQueue:
       # that must not prevent the checkpoint from reaching storage.
       try:
         logger.warning(
-          "Strategy snapshot for queue %r is %d bytes (restore cap %d); it will "
+          "Strategy snapshot is %d bytes (restore cap %d); it will "
           "be DROPPED on restart. Reduce the held heap (e.g. queue_delay_max_held) "
           "or raise the cap before the next restart to preserve it.",
-          self.queue_name,
           len(state),
           _MAX_SNAPSHOT_BYTES,
         )
       except BaseException:
         pass
+    snapshot_update_failed = False
     try:
       if state is None:
         storage.delete(snapshot_key)
       else:
         storage.store(snapshot_key, state)
     except Exception:  # noqa: BLE001 — store must not crash close
+      snapshot_update_failed = True
+    if snapshot_update_failed:
       try:
         logger.error("Failed to update strategy snapshot; continuing")
       except BaseException:
@@ -1321,20 +1348,26 @@ class BackendQueue:
     get_storage = getattr(self.connection_manager, "get_storage_backend", None)
     if get_storage is None:
       return  # connection manager exposes no storage interface
+    storage_resolution_failed = False
     try:
       storage = get_storage()
     except NotImplementedError:
       return  # storage-incapable backend — no prior snapshot to restore
     except Exception:  # noqa: BLE001 — resolver must not crash startup
+      storage_resolution_failed = True
+    if storage_resolution_failed:
       try:
         logger.error("Failed to resolve storage backend; starting clean")
       except BaseException:
         pass
       return
     snapshot_key = self._snapshot_key()
+    snapshot_retrieval_failed = False
     try:
       state = storage.retrieve(snapshot_key)
     except Exception:  # noqa: BLE001 — retrieve must not crash startup
+      snapshot_retrieval_failed = True
+    if snapshot_retrieval_failed:
       try:
         logger.error("Failed to retrieve strategy snapshot; starting clean")
       except BaseException:
@@ -1352,18 +1385,20 @@ class BackendQueue:
       # failed queue construction.
       try:
         logger.warning(
-          "Strategy snapshot for queue %r is %d bytes (cap %d); starting clean "
-          "to avoid OOM during restore.",
-          self.queue_name,
+          "Strategy snapshot is %d bytes (cap %d); starting clean to avoid "
+          "OOM during restore.",
           len(state),
           _MAX_SNAPSHOT_BYTES,
         )
       except BaseException:
         pass
       return
+    snapshot_restore_failed = False
     try:
       self._strategy.restore(bytes(state))
     except Exception:  # noqa: BLE001 — restore must not crash startup (docstring)
+      snapshot_restore_failed = True
+    if snapshot_restore_failed:
       try:
         logger.error("Strategy snapshot restore failed; starting clean")
       except BaseException:
