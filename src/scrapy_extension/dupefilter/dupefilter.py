@@ -71,6 +71,9 @@ _filter_full_warned: bool = False
 # for isolation.
 _backend_error_warned: bool = False
 
+_DEDUP_BACKEND_FAILURE_MESSAGE = "Dedup backend is unavailable."
+_DEDUP_CIRCUIT_BREAKER_NAME = "dedup"
+
 # Non-removable filters (notably Bloom) cannot compensate a successful add
 # after the scheduler's later queue push fails. Keep a bounded, one-shot retry
 # allowance per fingerprint instead. 1,024 limits failure-path memory while
@@ -1028,8 +1031,9 @@ class BackendDupeFilter:
       # engine and crashes the crawl — contradicting the codebase's documented
       # "a dead spider is worse than a duplicate fetch" philosophy. Mirror the
       # FilterFull arm: warn once per process, emit
-      # ``monitor.on_error("dedup", exc)`` so a wired collector increments
-      # ``errors/dedup``, and degrade to not-seen (allow the request through).
+      # ``monitor.on_error("dedup", safe_error)`` so a wired collector
+      # increments ``errors/dedup``, and degrade to not-seen (allow the request
+      # through).
       # The tradeoff is possible duplicate fetches during the outage window —
       # strictly better than crawl death. Distinct from the NotImplementedError
       # arm (unsupported backend, still raises RuntimeError) and the FilterFull
@@ -1436,11 +1440,11 @@ class BackendDupeFilter:
     Risk 4: a transient :class:`BackendConnectionError` or fail-fast
     :class:`CircuitBreakerOpenError` from the SetBackend must not crash the
     crawl. Mirror :meth:`_handle_filter_full`: warn once per process
-    (module-level ``_backend_error_warned``), emit
-    ``monitor.on_error("dedup", exc)`` so a wired stats collector increments
-    ``errors/dedup``, and emit a dedup-miss hook so observability stays
-    consistent with the not-seen outcome the caller returns. The tradeoff is
-    possible duplicate fetches until the backend recovers — strictly better
+    (module-level ``_backend_error_warned``), emit one static package error to
+    ``monitor.on_error("dedup", safe_error)`` so a wired stats collector
+    increments ``errors/dedup``, and emit a dedup-miss hook so observability
+    stays consistent with the not-seen outcome the caller returns. The tradeoff
+    is possible duplicate fetches until the backend recovers — strictly better
     than crawl death.
 
     Args:
@@ -1462,7 +1466,13 @@ class BackendDupeFilter:
         # The transient backend contract is a graceful miss, regardless of
         # whether a logging handler can report it.
         pass
-    monitor_events.append(("on_error", ("dedup", exc)))
+    if type(exc) is CircuitBreakerOpenError:
+      reported_error: BaseException = CircuitBreakerOpenError(
+        _DEDUP_CIRCUIT_BREAKER_NAME
+      )
+    else:
+      reported_error = BackendConnectionError(_DEDUP_BACKEND_FAILURE_MESSAGE)
+    monitor_events.append(("on_error", ("dedup", reported_error)))
     if include_miss:
       monitor_events.append(("on_dedup_miss", (fingerprint,)))
 

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
 import pytest
 
-from scrapy_extension.exceptions import ConfigurationError, StorageBackpressureError
+from scrapy_extension.exceptions import (
+  ConfigurationError,
+  StorageBackpressureError,
+  StorageError,
+)
 from scrapy_extension.storage.strategies import (
   BatchedStorageStrategy,
   PassthroughStorageStrategy,
@@ -1134,7 +1139,7 @@ class TestBatchedStorageRisk2:
     strat.close()  # stops the flusher cleanly
 
   def test_age_flush_failure_is_reported_to_monitor(self, mocker) -> None:
-    """Background failures need the same observable error boundary as stores."""
+    """Background failures publish one fresh, key-free monitor error."""
     from scrapy_extension.monitor.base import Monitor
 
     attempted = threading.Event()
@@ -1159,7 +1164,76 @@ class TestBatchedStorageRisk2:
     assert strat._flusher is not None
     strat._flusher.join(timeout=1.0)
 
-    monitor.on_error.assert_called_once_with("store", failure)
+    monitor.on_error.assert_called_once()
+    operation, reported_error = monitor.on_error.call_args.args
+    assert operation == "store"
+    assert type(reported_error) is StorageError
+    assert reported_error is not failure
+    assert str(reported_error) == "Batched storage flush failed."
+    assert reported_error.operation == "store"
+    assert reported_error.key is None
+    assert reported_error.__cause__ is None
+    assert reported_error.__context__ is None
+    assert reported_error.__traceback__ is None
+
+  def test_age_flush_monitor_error_is_redacted_after_raw_failure_unwinds(
+    self, monkeypatch, mocker
+  ) -> None:
+    """A monitor cannot recover a failed key/value/error graph from age flush."""
+    from scrapy_extension.monitor.base import Monitor
+
+    marker = "round45-batched-monitor-private-marker"
+    raw_failures: list[StorageError] = []
+    active_errors: list[BaseException | None] = []
+    backend = mocker.Mock()
+
+    def fail_store(*_args, **_kwargs):
+      private_frame_state = {"marker": marker}
+      try:
+        raise RuntimeError(marker)
+      except RuntimeError as cause:
+        failure = StorageError(marker, operation=marker, key=marker)
+        failure.private_state = private_frame_state
+        raw_failures.append(failure)
+        raise failure from cause
+
+    backend.store.side_effect = fail_store
+    monitor = mocker.Mock(spec=Monitor)
+
+    def capture_error(_operation, _error) -> None:
+      active_errors.append(sys.exc_info()[1])
+
+    monitor.on_error.side_effect = capture_error
+    strat = BatchedStorageStrategy(
+      threshold=1000,
+      max_buffer_age_s=0.1,
+      monitor=monitor,
+    )
+    with strat._lock:
+      strat._buffer.append((backend, marker, marker.encode(), None))
+      strat._oldest_ts = 0.0
+    stop = mocker.Mock()
+    stop.wait.side_effect = [False, True]
+    strat._stop = stop
+    monkeypatch.setattr(batched_module.time, "monotonic", mocker.Mock(return_value=1.0))
+
+    strat._age_flush_loop()
+
+    monitor.on_error.assert_called_once()
+    operation, reported_error = monitor.on_error.call_args.args
+    assert operation == "store"
+    assert type(reported_error) is StorageError
+    assert reported_error is not raw_failures[0]
+    assert str(reported_error) == "Batched storage flush failed."
+    assert reported_error.operation == "store"
+    assert reported_error.key is None
+    assert reported_error.__cause__ is None
+    assert reported_error.__context__ is None
+    assert reported_error.__traceback__ is None
+    assert marker not in repr(reported_error.args)
+    assert marker not in repr(reported_error.__dict__)
+    assert active_errors == [None]
+    assert strat.pending == 1
 
   def test_age_flush_warning_keyboardinterrupt_does_not_stop_retry_cycle(
     self, monkeypatch, mocker
@@ -1220,7 +1294,14 @@ class TestBatchedStorageRisk2:
 
     strat._age_flush_loop()
 
-    monitor.on_error.assert_called_once_with("store", failure)
+    monitor.on_error.assert_called_once()
+    operation, reported_error = monitor.on_error.call_args.args
+    assert operation == "store"
+    assert type(reported_error) is StorageError
+    assert reported_error is not failure
+    assert str(reported_error) == "Batched storage flush failed."
+    assert reported_error.operation == "store"
+    assert reported_error.key is None
     assert backend.store.call_count == 2
     assert strat.pending == 0
 

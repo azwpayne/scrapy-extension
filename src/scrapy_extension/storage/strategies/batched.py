@@ -27,7 +27,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-from scrapy_extension.exceptions import StorageBackpressureError
+from scrapy_extension.exceptions import StorageBackpressureError, StorageError
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies.base import StorageStrategy
 
@@ -59,6 +59,8 @@ _FLUSH_LOCK_TIMEOUT_S: float = 5.0
 #: ``flush()``'s short anti-hang timeout. A genuinely-wedged backend remains
 #: bounded (at a 30s ceiling instead of the old 10s).
 _CLOSE_DRAIN_DEADLINE_S: float = 30.0
+
+_BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE = "Batched storage flush failed."
 
 logger = logging.getLogger(__name__)
 
@@ -556,12 +558,23 @@ class BatchedStorageStrategy(StorageStrategy):
           and (time.monotonic() - self._oldest_ts) >= age
         )
       if need_flush:
+        reported_error: StorageError | None = None
         try:
           self._flush()
-        except Exception as exc:  # noqa: BLE001 — keep retry loop alive
-          # the loop alive so a transient outage doesn't disable the flusher
-          # and report a failure that has no synchronous pipeline caller.
-          self._emit_error("store", exc)
+        except Exception:  # noqa: BLE001 — keep retry loop alive
+          # Keep the loop alive so a transient outage doesn't disable the
+          # flusher, and report a static failure with no synchronous caller.
+          # ``_flush`` has already restored its retry tail; do not retain its
+          # raw backend graph in an extension-facing monitor event.
+          reported_error = StorageError(
+            _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,
+            operation="store",
+            key=None,
+          )
+        if reported_error is not None:
+          # Dispatch after the ``except`` has unwound so listener code cannot
+          # recover the raw backend error through the active exception state.
+          self._emit_error("store", reported_error)
           try:
             logger.warning(
               "age-based flush failed; will retry next cycle (loss window "

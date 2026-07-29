@@ -11,6 +11,7 @@ import pytest
 from pytest_mock import MockerFixture
 from scrapy.http import Request
 
+from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.dupefilter import (
   BackendDupeFilter,
   _MonitorFenceToken,
@@ -55,6 +56,18 @@ class _SelectiveRaisingMonitor(Monitor):
   def on_error(self, operation: str, error: BaseException) -> None:
     del operation, error
     self._raise_for("on_error")
+
+
+class _RecordingErrorMonitor(Monitor):
+  """Capture fail-open monitor errors and their active exception state."""
+
+  def __init__(self) -> None:
+    self.events: list[tuple[str, BaseException]] = []
+    self.active_errors: list[BaseException | None] = []
+
+  def on_error(self, operation: str, error: BaseException) -> None:
+    self.events.append((operation, error))
+    self.active_errors.append(sys.exc_info()[1])
 
 
 class _LifecycleLockProbeMonitor(Monitor):
@@ -376,6 +389,69 @@ def test_backend_error_monitor_failure_preserves_degraded_miss(
 
   assert dupefilter.request_seen(request) is False
   assert dupefilter.consume_reservation(request) is False
+
+
+@pytest.mark.parametrize(
+  ("source_kind", "expected_type", "expected_message"),
+  [
+    ("connection", BackendConnectionError, "Dedup backend is unavailable."),
+    ("circuit", CircuitBreakerOpenError, "Circuit breaker open for 'dedup'"),
+  ],
+)
+def test_fail_open_monitor_error_is_fresh_static_and_redacted(
+  mock_connection_manager: Any,
+  mocker: MockerFixture,
+  source_kind: str,
+  expected_type: type[BaseException],
+  expected_message: str,
+) -> None:
+  """Fail-open telemetry exposes neither the source graph nor an active error."""
+  marker = f"round45-dupefilter-{source_kind}-private-marker"
+  raw_failures: list[BaseException] = []
+  membership = mocker.MagicMock(spec=MembershipFilter)
+
+  def fail_add(_fingerprint: bytes) -> None:
+    private_frame_state = {"marker": marker}
+    try:
+      raise RuntimeError(marker)
+    except RuntimeError as cause:
+      if source_kind == "connection":
+        failure: BaseException = BackendConnectionError(marker, backend_type=marker)
+      else:
+        failure = CircuitBreakerOpenError(marker)
+      failure.private_state = private_frame_state
+      raw_failures.append(failure)
+      raise failure from cause
+
+  membership.add.side_effect = fail_add
+  monitor = _RecordingErrorMonitor()
+  dupefilter = BackendDupeFilter(
+    connection_manager=mock_connection_manager,
+    membership_filter=membership,
+    monitor=monitor,
+  )
+  request = Request(f"https://example.test/{marker}")
+
+  assert dupefilter.request_seen(request) is False
+  assert dupefilter.consume_reservation(request) is False
+  assert len(monitor.events) == 1
+  operation, reported_error = monitor.events[0]
+
+  assert operation == "dedup"
+  assert type(reported_error) is expected_type
+  assert reported_error is not raw_failures[0]
+  assert str(reported_error) == expected_message
+  assert reported_error.__cause__ is None
+  assert reported_error.__context__ is None
+  assert reported_error.__traceback__ is None
+  assert marker not in repr(reported_error.args)
+  assert marker not in repr(reported_error.__dict__)
+  assert monitor.active_errors == [None]
+  if type(reported_error) is BackendConnectionError:
+    assert reported_error.backend_type is None
+  else:
+    assert isinstance(reported_error, CircuitBreakerOpenError)
+    assert reported_error.name == "dedup"
 
 
 def test_saturation_monitor_failure_preserves_new_reservation(
