@@ -96,8 +96,9 @@ def test_push_durability_translation_uses_real_connection_manager() -> None:
 
   Builds a real ``ConnectionManager`` (not the fixture mirror), assigns a
   volatile backend, and asserts the production translation (connectors.py) both
-  returns a volatile receipt for ordinary pushes AND raises a ``QueueError``
-  carrying ``queue_name`` + ``operation="push"`` for a required-durable push.
+  returns a volatile receipt for ordinary pushes AND raises a terminal
+  ``QueueError`` carrying ``operation="push"`` (but no queue name) for a
+  required-durable push.
   Co-located with the fixture tests above so they cannot be mistaken for the
   production coverage.
   """
@@ -113,7 +114,7 @@ def test_push_durability_translation_uses_real_connection_manager() -> None:
       manager._push_queue_with_durability(
         "orders", b"payload", require_durable=True
       )
-    assert exc_info.value.queue_name == "orders"
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "push"
   finally:
     manager.close()

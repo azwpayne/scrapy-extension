@@ -1,15 +1,32 @@
 """Tests for connection manager."""
 
 import traceback
+from types import SimpleNamespace
 
 import pytest
 
-from scrapy_extension.backends.base import BackendType
+from scrapy_extension.backends.base import (
+  Backend,
+  BackendType,
+  QueueBackend,
+  _DurablePushRequired,
+  _QueuePushReceipt,
+)
+from scrapy_extension.backends.circuit_breaker import (
+  BreakerState,
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+)
 from scrapy_extension.backends.connectors import (
   ConnectionManager,
   _rebuild_connect_attempt_error,
 )
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  BackendError,
+  ConfigurationError,
+  QueueError,
+)
 
 
 def _assert_package_traceback_locals_are_redacted(
@@ -1918,3 +1935,263 @@ def test_backend_property_rejects_released_manager(mocker):
 
   backend.disconnect.assert_called_once_with()
   create_backend.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Round 43B — durable-push terminal error boundary
+# ---------------------------------------------------------------------------
+
+
+def _assert_durable_value_is_redacted(
+  value: object,
+  marker: str,
+  seen: set[int] | None = None,
+) -> None:
+  """Walk a bounded object graph without trusting custom ``repr`` methods."""
+  if seen is None:
+    seen = set()
+  value_id = id(value)
+  if value_id in seen:
+    return
+  seen.add(value_id)
+  if isinstance(value, str):
+    assert marker not in value
+    return
+  if isinstance(value, bytes):
+    assert marker.encode() not in value
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      _assert_durable_value_is_redacted(key, marker, seen)
+      _assert_durable_value_is_redacted(item, marker, seen)
+    return
+  if isinstance(value, (tuple, list, set, frozenset)):
+    for item in value:
+      _assert_durable_value_is_redacted(item, marker, seen)
+    return
+  try:
+    attributes = vars(value)
+  except TypeError:
+    return
+  _assert_durable_value_is_redacted(attributes, marker, seen)
+
+
+def _assert_durable_push_error_is_redacted(error: BaseException, marker: str) -> None:
+  """Assert every public durable-push error surface drops private markers."""
+  assert marker not in str(error)
+  assert marker not in repr(error.args)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  assert marker not in "".join(traceback.format_exception(error))
+
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+      for value in frame.f_locals.values():
+        _assert_durable_value_is_redacted(value, marker)
+    trace = trace.tb_next
+
+
+class _SensitiveDurableQueueBackend(Backend, QueueBackend):
+  """Queue backend that deliberately retains request/config state on failure."""
+
+  def __init__(self, marker: str, *, policy_rejection: bool) -> None:
+    self.config = SimpleNamespace(
+      endpoint_url=f"https://{marker}.example",
+      api_key=marker,
+    )
+    self.marker = marker
+    self.policy_rejection = policy_rejection
+    self.push_attempts = 0
+
+  @property
+  def backend_type(self) -> BackendType:
+    return BackendType.REDIS
+
+  def connect(self) -> None:
+    return None
+
+  def disconnect(self) -> None:
+    return None
+
+  def is_connected(self) -> bool:
+    return True
+
+  def ping(self) -> bool:
+    return True
+
+  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+    self._push_with_durability(queue_name, item, priority)
+
+  def _push_with_durability(
+    self,
+    queue_name: str,
+    item: bytes,
+    priority: float = 0.0,
+    *,
+    require_durable: bool = False,
+  ) -> _QueuePushReceipt:
+    self.push_attempts += 1
+    if self.policy_rejection:
+      raise _DurablePushRequired
+    try:
+      raise RuntimeError(self.marker)
+    except RuntimeError as error:
+      raise QueueError(
+        self.marker,
+        queue_name=queue_name,
+        operation="push",
+      ) from error
+
+  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+    del queue_name
+    del timeout
+    return None
+
+  def queue_len(self, queue_name: str) -> int:
+    del queue_name
+    return 0
+
+  def clear_queue(self, queue_name: str) -> None:
+    del queue_name
+
+
+def _durable_push_manager(
+  backend: QueueBackend,
+  marker: str,
+  breaker: CircuitBreaker | None = None,
+) -> ConnectionManager:
+  manager = ConnectionManager(BackendType.REDIS, {"api_key": marker})
+  manager._backend = backend  # type: ignore[assignment]
+  manager._breaker_configured = True
+  manager._breaker = breaker
+  return manager
+
+
+def test_durable_policy_error_is_terminally_redacted_without_tripping_breaker() -> None:
+  marker = "round43b-durable-policy-private-marker"
+  backend = _SensitiveDurableQueueBackend(marker, policy_rejection=True)
+  breaker = CircuitBreaker(
+    f"breaker-{marker}",
+    failure_threshold=1,
+    failure_exceptions=(BackendError,),
+  )
+  manager = _durable_push_manager(backend, marker, breaker)
+  try:
+    with pytest.raises(QueueError) as exc_info:
+      manager._push_queue_with_durability(
+        f"{marker}-queue",
+        f"{marker}-item".encode(),
+        require_durable=True,
+      )
+
+    error = exc_info.value
+    assert str(error) == "Selected queue backend generation is not worker-crash durable"
+    assert error.operation == "push"
+    assert error.queue_name is None
+    assert backend.push_attempts == 1
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+    _assert_durable_push_error_is_redacted(error, marker)
+  finally:
+    manager.close()
+
+
+def test_durable_backend_queue_error_is_terminally_redacted_without_breaker() -> None:
+  marker = "round43b-durable-backend-private-marker"
+  backend = _SensitiveDurableQueueBackend(marker, policy_rejection=False)
+  manager = _durable_push_manager(backend, marker)
+  try:
+    with pytest.raises(QueueError) as exc_info:
+      manager._push_queue_with_durability(
+        f"{marker}-queue",
+        f"{marker}-item".encode(),
+      )
+
+    error = exc_info.value
+    assert str(error) == "Queue backend push failed."
+    assert error.operation == "push"
+    assert error.queue_name is None
+    assert backend.push_attempts == 1
+    _assert_durable_push_error_is_redacted(error, marker)
+  finally:
+    manager.close()
+
+
+def test_durable_backend_queue_error_preserves_breaker_open_semantics() -> None:
+  marker = "round43b-durable-breaker-private-marker"
+  backend = _SensitiveDurableQueueBackend(marker, policy_rejection=False)
+  breaker = CircuitBreaker(
+    f"breaker-{marker}",
+    failure_threshold=1,
+    failure_exceptions=(BackendError,),
+  )
+  manager = _durable_push_manager(backend, marker, breaker)
+  try:
+    with pytest.raises(QueueError) as first_exc_info:
+      manager._push_queue_with_durability(
+        f"{marker}-queue",
+        f"{marker}-item".encode(),
+      )
+
+    first_error = first_exc_info.value
+    assert str(first_error) == "Backend operation failed."
+    assert first_error.operation == "push"
+    assert first_error.queue_name is None
+    assert breaker.state is BreakerState.OPEN
+    assert breaker.failure_count == 1
+    assert backend.push_attempts == 1
+    _assert_durable_push_error_is_redacted(first_error, marker)
+
+    with pytest.raises(CircuitBreakerOpenError) as open_exc_info:
+      manager._push_queue_with_durability(
+        f"{marker}-queue",
+        f"{marker}-item".encode(),
+      )
+
+    open_error = open_exc_info.value
+    assert open_error.name == "backend-operation"
+    assert breaker.state is BreakerState.OPEN
+    assert breaker.failure_count == 1
+    assert backend.push_attempts == 1
+    _assert_durable_push_error_is_redacted(open_error, marker)
+  finally:
+    manager.close()
+
+
+@pytest.mark.parametrize(
+  ("raised_error", "expected_type", "preserves_identity"),
+  (
+    (BackendConnectionError("private", backend_type="private"), BackendConnectionError, False),
+    (ConfigurationError("private", setting_name="api_key"), ConfigurationError, False),
+    (ImportError("private"), ImportError, False),
+    (ValueError("input contract"), ValueError, True),
+    (NotImplementedError("unsupported"), NotImplementedError, False),
+    (KeyboardInterrupt("control flow"), KeyboardInterrupt, True),
+  ),
+)
+def test_durable_push_preserves_non_queue_exception_contracts(
+  mocker,
+  raised_error: BaseException,
+  expected_type: type[BaseException],
+  preserves_identity: bool,
+) -> None:
+  """Only QueueError is rebuilt; established sibling contracts stay intact."""
+  manager = ConnectionManager(BackendType.REDIS, {"api_key": "private"})
+  mocker.patch.object(
+    manager,
+    "_get_backend_breaker_snapshot",
+    side_effect=raised_error,
+  )
+
+  with pytest.raises(expected_type) as exc_info:
+    manager._push_queue_with_durability("queue", b"item")
+
+  error = exc_info.value
+  if preserves_identity:
+    assert error is raised_error
+  else:
+    assert error is not raised_error

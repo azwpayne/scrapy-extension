@@ -53,7 +53,10 @@ from scrapy_extension.backends.base import (
   _DurablePushRequired,
   _QueuePushReceipt,
 )
-from scrapy_extension.backends.circuit_breaker import CircuitBreaker
+from scrapy_extension.backends.circuit_breaker import (
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+)
 from scrapy_extension.backends.registry import (
   BackendDescriptor,
   get_descriptor,
@@ -942,6 +945,81 @@ def _manager_terminal_error_boundary(
     return wrapped
 
   return decorate
+
+
+_SAFE_DURABLE_PUSH_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Selected queue backend generation is not worker-crash durable",
+    "Queue backend returned no valid worker-crash durability receipt",
+    "Backend operation failed.",
+  }
+)
+_DURABLE_PUSH_QUEUE_ERROR_MESSAGE = "Queue backend push failed."
+
+
+def _durable_push_queue_error_boundary(
+  function: Callable[_P, _T],
+) -> Callable[_P, _T]:
+  """Publish a terminal, queue-name-free error for durable queue pushes.
+
+  ``_push_queue_with_durability`` spans manager snapshots, an optional breaker
+  proxy, and backend methods. A ``QueueError`` from any of those layers can
+  retain the logical queue, serialized item, backend configuration, and a
+  driver cause. This outermost boundary rebuilds that public error after all
+  inner manager and backend frames have unwound. It also rebuilds the static
+  OPEN-breaker result for the same traceback reason. Other documented input,
+  capability, connection, import, and control-flow exceptions retain their
+  established contracts.
+  """
+
+  @wraps(function)
+  def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+    caught_error: QueueError | None = None
+    circuit_open_error = False
+    try:
+      return function(*args, **kwargs)
+    except QueueError as error:
+      caught_error = error
+    except CircuitBreakerOpenError:
+      # The breaker error is already a static operational result, but its
+      # traceback still crosses this manager method and retains queue/item/
+      # configuration locals. Rebuild it after those frames unwind.
+      circuit_open_error = True
+    except BaseException:
+      del args
+      del kwargs
+      raise
+
+    if circuit_open_error:
+      sanitized_open_error = CircuitBreakerOpenError("backend-operation")
+      del args
+      del kwargs
+      del caught_error
+      del circuit_open_error
+      raise sanitized_open_error
+
+    assert caught_error is not None
+    message = _DURABLE_PUSH_QUEUE_ERROR_MESSAGE
+    raw_args: object = None
+    if type(caught_error) is QueueError:
+      raw_args = caught_error.args
+      if (
+        type(raw_args) is tuple
+        and len(raw_args) == 1
+        and type(raw_args[0]) is str
+        and raw_args[0] in _SAFE_DURABLE_PUSH_QUEUE_MESSAGES
+      ):
+        message = raw_args[0]
+    sanitized_error = QueueError(message, operation="push")
+    del args
+    del kwargs
+    del caught_error
+    del circuit_open_error
+    del raw_args
+    del message
+    raise sanitized_error
+
+  return wrapped
 
 
 def _rebuild_connect_attempt_error(error: BaseException) -> BaseException:
@@ -2474,6 +2552,7 @@ class ConnectionManager:
 
     return wrap_queue_backend(backend, breaker)
 
+  @_durable_push_queue_error_boundary
   @_manager_terminal_error_boundary()
   @configuration_error_boundary(
     "Connection manager configuration is invalid.",
@@ -2483,6 +2562,7 @@ class ConnectionManager:
     sanitize_exception_types=(ValidationError,),
     pass_through_exception_types=(
       BackendConnectionError,
+      CircuitBreakerOpenError,
       ImportError,
       QueueError,
     ),
