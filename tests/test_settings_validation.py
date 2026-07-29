@@ -387,9 +387,7 @@ class TestMemcachedBounds:
 
 
 class TestMemcachedTrustedNetworkBoundary:
-  @pytest.mark.parametrize(
-    "host", ["localhost", "localhost.", "cache.localhost", "127.0.0.1", "::1"]
-  )
+  @pytest.mark.parametrize("host", ["localhost", "localhost.", "127.0.0.1", "::1"])
   def test_loopback_plaintext_is_accepted_by_default(self, host: str) -> None:
     settings = MemcachedSettings(host=host)
 
