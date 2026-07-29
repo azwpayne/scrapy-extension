@@ -50,6 +50,7 @@ from scrapy_extension.exceptions._redaction import (
   configuration_error_boundary,
   import_error_traceback_boundary,
   not_implemented_error_boundary,
+  queue_operation_error_boundary,
 )
 from scrapy_extension.settings import RocketMQSettings
 from scrapy_extension.settings._broker_endpoints import (
@@ -77,6 +78,21 @@ _ROCKETMQ_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
     "RocketMQBackend producer initialization returned None",
     "RocketMQBackend consumer initialization returned None",
     "Failed to connect to RocketMQ.",
+  }
+)
+_ROCKETMQ_MAX_MESSAGE_SIZE_ERROR = (
+  "RocketMQ message exceeds configured max_message_size."
+)
+_ROCKETMQ_CLEAR_QUEUE_UNSUPPORTED_MESSAGE = (
+  "clear_queue is not supported by the RocketMQ client"
+)
+_ROCKETMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Not connected to RocketMQ",
+    "RocketMQBackend not connected: producer is None",
+    "RocketMQBackend not connected: consumer is None",
+    _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR,
+    _ROCKETMQ_CLEAR_QUEUE_UNSUPPORTED_MESSAGE,
   }
 )
 _ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE = (
@@ -510,6 +526,12 @@ class RocketMQBackend(Backend, QueueBackend):
       ) from e
     self._subscribed_topics.add(topic_name)
 
+  @queue_operation_error_boundary(
+    "push",
+    "Failed to push RocketMQ message.",
+    safe_messages=_ROCKETMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to queue.
 
@@ -530,10 +552,7 @@ class RocketMQBackend(Backend, QueueBackend):
     # gets a clear QueueError at push, not an opaque broker-side rejection. The
     # Field was previously dead config (declared, never read).
     if len(item) > self.config.max_message_size:
-      msg = (
-        f"item size {len(item)} exceeds RocketMQ max_message_size "
-        f"{self.config.max_message_size}"
-      )
+      msg = _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR
       raise QueueError(msg, queue_name=queue_name, operation="push")
 
     try:
@@ -612,6 +631,12 @@ class RocketMQBackend(Backend, QueueBackend):
     message, _consumer, _generation = self._receive_delivery(queue_name, timeout)
     return message
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop RocketMQ message.",
+    safe_messages=_ROCKETMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop item from queue WITHOUT acking (deferred-ack model).
 
@@ -639,6 +664,12 @@ class RocketMQBackend(Backend, QueueBackend):
     self._last_delivery = (consumer, generation, msg)
     return self._extract_body(msg)
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop RocketMQ message.",
+    safe_messages=_ROCKETMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
   ) -> tuple[bytes | None, Any | None]:
@@ -688,6 +719,11 @@ class RocketMQBackend(Backend, QueueBackend):
       return bytes(body)
     return str(body).encode()
 
+  @queue_operation_error_boundary(
+    "ack",
+    "Failed to ack RocketMQ message.",
+    safe_messages=_ROCKETMQ_SAFE_QUEUE_MESSAGES,
+  )
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message (deferred from :meth:`pop` / :meth:`pop_with_ack`).
 
@@ -755,6 +791,11 @@ class RocketMQBackend(Backend, QueueBackend):
         self._last_msg = None
         self._last_delivery = None
 
+  @queue_operation_error_boundary(
+    "nack",
+    "Failed to nack RocketMQ message.",
+    safe_messages=_ROCKETMQ_SAFE_QUEUE_MESSAGES,
+  )
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Shorten a popped message's lease to RocketMQ's 10-second floor.
 
@@ -860,6 +901,12 @@ class RocketMQBackend(Backend, QueueBackend):
         pass
     raise NotImplementedError(_ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE)
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    "Failed to clear RocketMQ queue.",
+    safe_messages=_ROCKETMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Report that RocketMQ broker-side queue purge is unsupported.
 
@@ -875,7 +922,7 @@ class RocketMQBackend(Backend, QueueBackend):
       raise QueueError(
         msg, queue_name=queue_name, operation="clear_queue"
       )
-    msg = "clear_queue is not supported by the RocketMQ client"
+    msg = _ROCKETMQ_CLEAR_QUEUE_UNSUPPORTED_MESSAGE
     raise QueueError(
       msg, queue_name=queue_name, operation="clear_queue"
     )

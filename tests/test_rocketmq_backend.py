@@ -1005,7 +1005,7 @@ def test_push_send_failure(mocker) -> None:
 
   with pytest.raises(QueueError) as exc_info:
     backend.push("my_queue", b"data")
-  assert "Failed to push to queue" in str(exc_info.value)
+  assert str(exc_info.value) == "Failed to push RocketMQ message."
 
 
 def test_push_unexpected_error(mocker) -> None:
@@ -1016,7 +1016,7 @@ def test_push_unexpected_error(mocker) -> None:
 
   with pytest.raises(QueueError) as exc_info:
     backend.push("my_queue", b"data")
-  assert "Failed to push to queue" in str(exc_info.value)
+  assert str(exc_info.value) == "Failed to push RocketMQ message."
 
 
 def test_push_rejects_item_above_max_message_size(mocker) -> None:
@@ -1030,6 +1030,7 @@ def test_push_rejects_item_above_max_message_size(mocker) -> None:
 
   with pytest.raises(QueueError, match="max_message_size") as exc_info:
     backend.push("my_queue", b"x" * 16)  # 16 > 8-byte cap
+  assert str(exc_info.value) == "RocketMQ message exceeds configured max_message_size."
   assert exc_info.value.operation == "push"
   mock_producer.send.assert_not_called()
 
@@ -1155,7 +1156,7 @@ def test_pop_receive_failure(mocker) -> None:
 
   with pytest.raises(QueueError) as exc_info:
     backend.pop("my_queue")
-  assert "Failed to pop from queue" in str(exc_info.value)
+  assert str(exc_info.value) == "Failed to pop RocketMQ message."
 
 
 def test_pop_unexpected_error(mocker) -> None:
@@ -1165,7 +1166,7 @@ def test_pop_unexpected_error(mocker) -> None:
 
   with pytest.raises(QueueError) as exc_info:
     backend.pop("my_queue")
-  assert "Failed to pop from queue" in str(exc_info.value)
+  assert str(exc_info.value) == "Failed to pop RocketMQ message."
 
 
 def test_pop_subscribes_to_topic_before_receive(mocker) -> None:
@@ -1573,7 +1574,7 @@ def test_ensure_subscribed_surfaces_subscribe_failure(mocker) -> None:
   with pytest.raises(QueueError) as exc_info:
     backend.pop("flaky_queue")
 
-  assert exc_info.value.queue_name == "flaky_queue"
+  assert exc_info.value.queue_name is None
   assert exc_info.value.operation == "pop"
   mock_consumer.receive.assert_not_called()
 
@@ -1592,7 +1593,9 @@ def test_ack_failure_raises_queue_error(mocker) -> None:
   assert exc_info.value.operation == "ack"
 
 
-@pytest.mark.parametrize("method", ["push", "pop", "queue_len", "clear_queue"])
+@pytest.mark.parametrize(
+  "method", ["push", "pop", "pop_with_ack", "queue_len", "clear_queue"]
+)
 def test_queue_methods_validate_names_before_driver_call(mocker, method) -> None:
   backend, producer, consumer, _ = _make_connected_backend(mocker)
   args = ("bad name!", b"x") if method == "push" else ("bad name!",)
@@ -1725,7 +1728,7 @@ def test_clear_queue_not_connected() -> None:
   with pytest.raises(QueueError) as exc_info:
     backend.clear_queue("test_queue")
   assert "Not connected" in str(exc_info.value)
-  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.queue_name is None
   assert exc_info.value.operation == "clear_queue"
 
 
@@ -1735,7 +1738,7 @@ def test_clear_queue_connected(mocker) -> None:
   with pytest.raises(QueueError) as exc_info:
     backend.clear_queue("test_queue")
   assert "not supported" in str(exc_info.value)
-  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.queue_name is None
   assert exc_info.value.operation == "clear_queue"
 
 
