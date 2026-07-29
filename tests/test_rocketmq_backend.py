@@ -1169,6 +1169,19 @@ def test_pop_unexpected_error(mocker) -> None:
   assert str(exc_info.value) == "Failed to pop RocketMQ message."
 
 
+def test_raw_pop_implementation_retains_driver_cause_for_integration_retry(mocker) -> None:
+  """Only live tests bypass the public redaction to identify a Proxy race."""
+  backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+  driver_error = RuntimeError("NullPointerException from receive startup")
+  mock_consumer.receive.side_effect = driver_error
+
+  with pytest.raises(QueueError) as exc_info:
+    backend.pop.__wrapped__(backend, "my_queue")
+
+  assert exc_info.value.__cause__ is driver_error
+  assert "NullPointerException" in str(exc_info.value.__cause__)
+
+
 def test_pop_subscribes_to_topic_before_receive(mocker) -> None:
   """pop subscribes the consumer to the queue's topic before receiving."""
   backend, _, mock_consumer, _ = _make_connected_backend(mocker)

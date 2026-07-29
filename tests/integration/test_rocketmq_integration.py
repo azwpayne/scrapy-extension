@@ -52,9 +52,11 @@ when ``SCRAPY_TEST_ROCKETMQ_NAMESRV`` is unset.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -88,7 +90,11 @@ def _drain(backend, queue: str, n: int, deadline_s: float = 15.0):  # type: igno
   deadline = time.time() + deadline_s
   while len(received) < n and time.time() < deadline:
     try:
-      body, token = backend.pop_with_ack(queue, timeout=1.0)
+      body, token = _pop_with_ack_preserving_proxy_error(
+        backend,
+        queue,
+        timeout=1.0,
+      )
     except QueueError as exc:
       # apache rocketmq 5.x proxy has two broker-side propagation races:
       # NPE in ReceiveMessageActivity (delivery race), and "no topic to
@@ -96,10 +102,10 @@ def _drain(backend, queue: str, n: int, deadline_s: float = 15.0):  # type: igno
       # as an empty receive for this iteration and let the poll loop retry
       # — the deadline bounds total effort. Other errors propagate. Track
       # NPE count so the caller can skip (not fail) when delivery is NPE-blocked.
-      msg = str(exc)
-      if "NullPointerException" not in msg and "no topic" not in msg.lower():
+      transient_state = _proxy_receive_transient_state(exc)
+      if transient_state is None:
         raise
-      if "NullPointerException" in msg:
+      if transient_state == "npe":
         npe_hits += 1
       continue
     if body is not None:
@@ -116,6 +122,40 @@ _BROKER_ADDR = os.environ.get("SCRAPY_TEST_ROCKETMQ_BROKER_ADDR", "scrapy-ext-ro
 _NAMESRV_ADDR = os.environ.get("SCRAPY_TEST_ROCKETMQ_INTERNAL_NAMESRV", "rocketmq-namesrv:9876")
 _ROCKETMQ_SDK_LOCAL_IP_CACHE_ATTRIBUTE = "_Misc__LOCAL_IP"
 _ROCKETMQ_SDK_LOOPBACK_ADDRESS = "127.0.0.1"
+_ROCKETMQ_PROXY_NPE_SIGNATURE = "NullPointerException"
+_ROCKETMQ_PROXY_NPE_CODE = "50001"
+_ROCKETMQ_PROXY_RECEIVE_ACTIVITY_SIGNATURE = "ReceiveMessageActivity.receiveMessage"
+_ROCKETMQ_PROXY_NO_TOPIC_SIGNATURE = "no topic to receive message"
+
+
+def _pop_with_ack_preserving_proxy_error(
+  backend, queue_name: str, timeout: float
+):  # type: ignore[no-untyped-def]
+  """Call the integration-only raw implementation to inspect a Proxy race.
+
+  Public ``pop_with_ack`` intentionally strips driver details at its error
+  boundary.  This live-broker suite needs to recognize only two documented,
+  deadline-bounded Apache Proxy startup races; keeping that detail inside the
+  test avoids weakening the production error contract.
+  """
+  return backend.pop_with_ack.__wrapped__(backend, queue_name, timeout)
+
+
+def _proxy_receive_transient_state(error: QueueError) -> str | None:
+  """Classify only the two known Apache Proxy receive-startup races."""
+  cause = error.__cause__
+  if cause is None:
+    return None
+  detail = str(cause)
+  if (
+    _ROCKETMQ_PROXY_NPE_CODE in detail
+    and _ROCKETMQ_PROXY_NPE_SIGNATURE in detail
+    and _ROCKETMQ_PROXY_RECEIVE_ACTIVITY_SIGNATURE in detail
+  ):
+    return "npe"
+  if _ROCKETMQ_PROXY_NO_TOPIC_SIGNATURE in detail.lower():
+    return "no-topic"
+  return None
 
 
 def _ensure_topic(backend, queue_name: str) -> None:  # type: ignore[no-untyped-def]
@@ -212,16 +252,38 @@ def test_sdk_loopback_identity_avoids_public_route_probe(
   _rocketmq_sdk_loopback_identity, mocker
 ):  # type: ignore[no-untyped-def]
   """The fixture must use the SDK cache without constructing a probe socket."""
-  socket_constructor = mocker.patch(
-    "rocketmq.v5.util.misc.socket.socket",
-    side_effect=AssertionError("RocketMQ metadata attempted a public route probe"),
+  probe_socket = mocker.Mock(
+    side_effect=AssertionError("RocketMQ metadata attempted a public route probe")
+  )
+  mocker.patch(
+    "rocketmq.v5.util.misc.socket",
+    SimpleNamespace(
+      AF_INET=socket.AF_INET,
+      SOCK_DGRAM=socket.SOCK_DGRAM,
+      socket=probe_socket,
+    ),
   )
 
   assert (
     _rocketmq_sdk_loopback_identity.get_local_ip()
     == _ROCKETMQ_SDK_LOOPBACK_ADDRESS
   )
-  socket_constructor.assert_not_called()
+  probe_socket.assert_not_called()
+
+
+def test_proxy_receive_classifier_retries_only_known_startup_npe() -> None:
+  """An unrelated SDK/Proxy NPE must not turn the live suite falsely green."""
+  known_error = QueueError("internal receive error")
+  known_error.__cause__ = RuntimeError(
+    "50001, null. NullPointerException. "
+    "org.apache.rocketmq.proxy.grpc.v2.consumer."
+    "ReceiveMessageActivity.receiveMessage(ReceiveMessageActivity.java:63)"
+  )
+  unrelated_error = QueueError("internal receive error")
+  unrelated_error.__cause__ = RuntimeError("NullPointerException in unrelated RPC")
+
+  assert _proxy_receive_transient_state(known_error) == "npe"
+  assert _proxy_receive_transient_state(unrelated_error) is None
 
 
 def test_push_pop_round_trip(rocketmq_backend, unique_prefix):
@@ -281,11 +343,17 @@ def test_pop_empty_returns_none(rocketmq_backend, unique_prefix):
   deadline = time.time() + 30.0
   while time.time() < deadline:
     try:
-      if rocketmq_backend.pop(queue, timeout=1.0) is None:
+      body, token = _pop_with_ack_preserving_proxy_error(
+        rocketmq_backend,
+        queue,
+        timeout=1.0,
+      )
+      if body is None:
         return  # route propagated + queue empty → success
+      if token is not None:
+        rocketmq_backend.ack(queue, token=token)
     except QueueError as exc:
-      msg = str(exc)
-      if "NullPointerException" not in msg and "no topic" not in msg.lower():
+      if _proxy_receive_transient_state(exc) is None:
         raise  # non-transient error → surface, don't mask
     # transient race (no-topic / NPE) OR a stray message → keep polling
   pytest.fail(

@@ -146,8 +146,8 @@ def test_integration_ci_and_compose_share_locked_elasticsearch_contract() -> Non
   assert compose["services"]["elasticsearch"]["image"] == expected_image
 
 
-def test_integration_ci_keeps_rocketmq_route_probe_socket_isolated() -> None:
-  """R51: live brokers use loopback without granting public route probes."""
+def test_integration_ci_keeps_external_socket_access_restricted() -> None:
+  """R52: live broker tests retain the loopback-only socket boundary."""
   repository_root = Path(__file__).resolve().parents[1]
   workflow = yaml.safe_load(
     (repository_root / ".github" / "workflows" / "ci.yml").read_text(

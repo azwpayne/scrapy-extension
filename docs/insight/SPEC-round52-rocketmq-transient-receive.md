@@ -32,8 +32,9 @@ desired policy.
 - Test only the live broker's known transient receive conditions through the
   decorated functions' original implementation (`__wrapped__`), where the
   test can inspect a local driver cause without publishing it.
-- Retry only the exact, known NPE and no-topic signatures until the existing
-  deadline; unrelated failures must remain test failures.
+- Retry only the exact `50001` NPE from
+  `ReceiveMessageActivity.receiveMessage` and the known no-topic signature
+  until the existing deadline; unrelated failures must remain test failures.
 - Keep the Round 51 SDK-cache pre-seed, but replace its process-global socket
   constructor mock with a mock of only the SDK module's socket reference so it
   cannot race background gRPC threads.
