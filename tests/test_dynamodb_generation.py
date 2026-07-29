@@ -238,7 +238,8 @@ def test_post_publish_diagnostic_failure_preserves_live_generation(
   mocker, diagnostic_error: BaseException
 ) -> None:
   """Success logging cannot undo a DynamoDB generation already made live."""
-  backend = _backend()
+  marker = "round41b-dynamodb-table-marker"
+  backend = _backend(table_name=marker)
   resource, table = _resource(mocker)
   _patch_resource(mocker, return_value=resource)
   debug = mocker.patch.object(
@@ -254,7 +255,8 @@ def test_post_publish_diagnostic_failure_preserves_live_generation(
   assert backend._table is table
   assert backend.is_connected() is True
   resource.meta.client.close.assert_not_called()
-  debug.assert_called_once_with("Connected to DynamoDB table %s", "scrapy-extension")
+  debug.assert_called_once_with("Connected to DynamoDB.")
+  assert marker not in repr(debug.call_args_list)
 
 
 def test_disconnect_suppresses_ordinary_close_diagnostic_interrupt(

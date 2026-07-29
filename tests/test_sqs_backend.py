@@ -943,13 +943,14 @@ class TestSqsPushPop:
     self, mocker
   ) -> None:
     """The poison-message cleanup diagnostic cannot replace the decode error."""
+    marker = "sqs-delete-diagnostic-marker"
     b, client = _connected(mocker)
     client.receive_message.return_value = {
       "Messages": [{"Body": "not-base64!", "ReceiptHandle": "rh"}]
     }
-    client.delete_message.side_effect = RuntimeError("delete failed")
+    client.delete_message.side_effect = RuntimeError(marker)
     diagnostic = mocker.patch(
-      "scrapy_extension.backends.sqs.logger.exception",
+      "scrapy_extension.backends.sqs.logger.warning",
       side_effect=KeyboardInterrupt("diagnostic interrupted"),
     )
 
@@ -961,9 +962,8 @@ class TestSqsPushPop:
     client.delete_message.assert_called_once_with(
       QueueUrl="https://sqs/test", ReceiptHandle="rh"
     )
-    diagnostic.assert_called_once_with(
-      "Failed to delete malformed SQS message from queue %r", "queue1"
-    )
+    diagnostic.assert_called_once_with("Failed to delete malformed SQS message.")
+    assert marker not in repr(diagnostic.call_args_list)
 
   def test_pop_malformed_body_propagates_direct_delete_interrupt(
     self, mocker
@@ -975,7 +975,7 @@ class TestSqsPushPop:
     }
     interrupt = KeyboardInterrupt("delete interrupted")
     client.delete_message.side_effect = interrupt
-    diagnostic = mocker.patch("scrapy_extension.backends.sqs.logger.exception")
+    diagnostic = mocker.patch("scrapy_extension.backends.sqs.logger.warning")
 
     with pytest.raises(KeyboardInterrupt) as raised:
       b.pop("queue1")

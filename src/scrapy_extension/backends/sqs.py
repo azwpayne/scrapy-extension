@@ -32,7 +32,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -58,17 +58,34 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
-from scrapy_extension.settings import SqsMode
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
+from scrapy_extension.settings import SqsMode, SqsSettings
 from scrapy_extension.settings._aws import (
+  _AWS_SAFE_CONFIGURATION_MESSAGES,
   validate_aws_credentials,
   validate_aws_endpoint,
   validate_aws_region_name,
 )
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import SqsSettings
-
 logger = logging.getLogger(__name__)
+
+_SQS_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  SqsSettings.model_fields
+)
+_SQS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Unsupported SQS mode.",
+    "queue_name_prefix must be a string.",
+    "visibility_timeout must be an integer between 1 and 43200.",
+  }
+  | _AWS_SAFE_CONFIGURATION_MESSAGES
+)
+_SQS_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {"Failed to create SQS client."}
+)
 
 # SQS caps WaitTimeSeconds at 20.
 _MAX_WAIT_SECONDS = 20
@@ -354,6 +371,12 @@ class SqsBackend(Backend, QueueBackend):
     self._last_receipt_epoch: int | None = None
     self._last_receipt_generation_key: object | None = None
 
+  @configuration_error_boundary(
+    "SQS configuration is invalid.",
+    _SQS_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_SQS_SAFE_CONFIGURATION_MESSAGES,
+  )
   def _capture_connection_snapshot(
     self,
   ) -> tuple[_SqsConnectionSnapshot, dict[str, Any]]:
@@ -367,9 +390,8 @@ class SqsBackend(Backend, QueueBackend):
     visibility_timeout = self.config.visibility_timeout
     if not isinstance(mode, SqsMode):
       raise ConfigurationError(
-        f"Unsupported SQS mode: {mode}",
+        "Unsupported SQS mode.",
         setting_name="mode",
-        setting_value=mode,
       )
     validate_aws_endpoint(
       endpoint_url,
@@ -415,6 +437,18 @@ class SqsBackend(Backend, QueueBackend):
       kwargs["aws_secret_access_key"] = _redact(secret)
     return snapshot, kwargs
 
+  @backend_connection_error_boundary(
+    "Failed to create SQS client.",
+    "sqs",
+    safe_messages=_SQS_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "SQS configuration is invalid.",
+    _SQS_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_SQS_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Publish one immutable SQS client generation, idempotently.
 
@@ -474,11 +508,7 @@ class SqsBackend(Backend, QueueBackend):
       # logging extension must not make ``connect`` report failure or discard
       # the now-authoritative generation.
       try:
-        logger.debug(
-          "Connected to SQS (%s, %s)",
-          snapshot.mode.value,
-          snapshot.region_name,
-        )
+        logger.debug("Connected to SQS in %s mode", snapshot.mode.value)
       except BaseException:
         pass
 
@@ -1000,10 +1030,7 @@ class SqsBackend(Backend, QueueBackend):
             # raise a control exception. The malformed body is the causal
             # failure here, so logging must not replace its QueueError.
             try:
-              logger.exception(
-                "Failed to delete malformed SQS message from queue %r",
-                queue_name,
-              )
+              logger.warning("Failed to delete malformed SQS message.")
             except BaseException:  # noqa: BLE001 - retain decode failure
               pass
           raise QueueError(

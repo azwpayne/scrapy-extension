@@ -16,7 +16,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -45,13 +45,30 @@ from scrapy_extension.exceptions import (
     ConfigurationError,
     QueueError,
 )
-from scrapy_extension.settings import RabbitMQMode
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
+from scrapy_extension.settings import RabbitMQMode, RabbitMQSettings
 from scrapy_extension.settings.rabbitmq import validate_rabbitmq_connection
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import RabbitMQSettings
-
 logger = logging.getLogger(__name__)
+
+_RABBITMQ_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  RabbitMQSettings.model_fields
+)
+_RABBITMQ_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Unsupported RabbitMQ mode.",
+    "RabbitMQ's guest user is restricted to loopback endpoints.",
+  }
+)
+_RABBITMQ_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {
+    f"Failed to connect to RabbitMQ ({mode.value})"
+    for mode in RabbitMQMode
+  }
+)
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
@@ -313,6 +330,12 @@ class RabbitMQBackend(Backend, QueueBackend):
     self._pending_deliveries.clear()
     return channel, connection
 
+  @configuration_error_boundary(
+    "RabbitMQ configuration is invalid.",
+    _RABBITMQ_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_RABBITMQ_SAFE_CONFIGURATION_MESSAGES,
+  )
   def _capture_connection_snapshot(self) -> _RabbitMQConnectionSnapshot:
     """Capture and revalidate every value consumed by one connect attempt."""
     mode = self.config.mode
@@ -321,14 +344,9 @@ class RabbitMQBackend(Backend, QueueBackend):
       RabbitMQMode.CLUSTER,
       RabbitMQMode.MIRRORED_QUEUES,
     ):
-      try:
-        mode_text = str(mode)
-      except (TypeError, ValueError):
-        mode_text = getattr(mode, "value", repr(mode))
       raise ConfigurationError(
-        f"Unsupported RabbitMQ mode: {mode_text}",
+        "Unsupported RabbitMQ mode.",
         setting_name="mode",
-        setting_value=mode,
       )
 
     host = self.config.host
@@ -462,6 +480,18 @@ class RabbitMQBackend(Backend, QueueBackend):
       ha_sync_mode=ha_sync_mode,
     )
 
+  @backend_connection_error_boundary(
+    "Failed to connect to RabbitMQ.",
+    "rabbitmq",
+    safe_messages=_RABBITMQ_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "RabbitMQ configuration is invalid.",
+    _RABBITMQ_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_RABBITMQ_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Establish connection to RabbitMQ based on deployment mode.
 
@@ -681,17 +711,19 @@ class RabbitMQBackend(Backend, QueueBackend):
       snapshot = self._capture_connection_snapshot()
     if snapshot.cluster_nodes:
       parameters = [self._build_common_parameters(snapshot=snapshot)]
-      all_hosts = [f"{snapshot.host}:{snapshot.port}"]
 
       for host, port in snapshot.cluster_nodes:
         parameters.append(
           self._build_common_parameters(host=host, port=port, snapshot=snapshot)
         )
-        all_hosts.append(f"{host}:{port}")
 
-      # Host-list rendering is diagnostics, not part of failover construction.
+      # Endpoint values are private configuration, but the bounded node count
+      # still distinguishes a clustered connect from the single-node path.
       try:
-        logger.debug("Connecting to RabbitMQ cluster with hosts: %s", all_hosts)
+        logger.debug(
+          "Connecting to RabbitMQ cluster with %d configured node(s).",
+          len(parameters),
+        )
       except BaseException:
         pass
       connection_parameters: pika.ConnectionParameters | list[pika.ConnectionParameters] = (
@@ -700,9 +732,7 @@ class RabbitMQBackend(Backend, QueueBackend):
     else:
       # This branch's endpoint diagnostic is likewise non-causal.
       try:
-        logger.debug(
-          "Connecting to RabbitMQ cluster at %s:%s", snapshot.host, snapshot.port
-        )
+        logger.debug("Connecting to RabbitMQ cluster.")
       except BaseException:
         pass
       connection_parameters = self._build_common_parameters(snapshot=snapshot)
@@ -780,14 +810,10 @@ class RabbitMQBackend(Backend, QueueBackend):
     if snapshot.ha_mode:
       try:
         logger.warning(
-          "RabbitMQ mirrored-queues HA policy (ha-mode=%s, ha-params=%s, "
-          "ha-sync-mode=%s) is configured but NOT applied via AMQP by this "
+          "RabbitMQ mirrored-queues HA policy is configured but NOT applied via AMQP by this "
           "client — set it out-of-band via `rabbitmqctl set_policy` or the "
           "management API. Classic mirroring is deprecated in modern RabbitMQ; "
-          "consider quorum queues for HA.",
-          snapshot.ha_mode,
-          snapshot.ha_params,
-          snapshot.ha_sync_mode,
+          "consider quorum queues for HA."
         )
       except BaseException:
         # The policy warning is pure telemetry.  The cluster helper has

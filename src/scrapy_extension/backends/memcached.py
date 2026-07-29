@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from threading import Lock
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -42,18 +42,26 @@ from scrapy_extension.backends.base import (
   _validate_ttl,
 )
 from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
 from scrapy_extension.exceptions.base import StorageError
-from scrapy_extension.settings import MemcachedMode
+from scrapy_extension.settings import MemcachedMode, MemcachedSettings
 from scrapy_extension.settings.memcached import (
   is_memcached_loopback,
   validate_memcached_connection,
   validate_memcached_flush_policy,
 )
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import MemcachedSettings
-
 logger = logging.getLogger(__name__)
+
+_MEMCACHED_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  MemcachedSettings.model_fields
+)
+_MEMCACHED_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {"Failed to connect to Memcached."}
+)
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,10 @@ class MemcachedBackend(Backend, StorageBackend):
     self._lifecycle_lock = Lock()
     self._lifecycle_generation = 0
 
+  @configuration_error_boundary(
+    "Memcached configuration is invalid.",
+    _MEMCACHED_CONFIGURATION_SETTING_NAMES,
+  )
   def _capture_connection_snapshot(self) -> _MemcachedConnectionSnapshot:
     """Capture and revalidate every value used by one connect attempt."""
     mode, host, port, allow_remote = validate_memcached_connection(
@@ -117,6 +129,16 @@ class MemcachedBackend(Backend, StorageBackend):
       allow_flush_all=allow_flush_all,
     )
 
+  @backend_connection_error_boundary(
+    "Failed to connect to Memcached.",
+    "memcached",
+    safe_messages=_MEMCACHED_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "Memcached configuration is invalid.",
+    _MEMCACHED_CONFIGURATION_SETTING_NAMES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Connect to Memcached and verify with a stats() call.
 
@@ -184,17 +206,13 @@ class MemcachedBackend(Backend, StorageBackend):
         # connect appear to fail or cause callers to roll back this generation.
         try:
           logger.warning(
-            "Remote Memcached plaintext was explicitly enabled for %s:%d; "
-            "use only an isolated trusted network.",
-            snapshot.host,
-            snapshot.port,
+            "Remote Memcached plaintext was explicitly enabled; use only an "
+            "isolated trusted network."
           )
         except BaseException:
           pass
       try:
-        logger.debug(
-          "Connected to Memcached at %s:%s", snapshot.host, snapshot.port
-        )
+        logger.debug("Connected to Memcached.")
       except BaseException:
         pass
 

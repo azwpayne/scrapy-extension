@@ -51,12 +51,15 @@ from scrapy_extension.backends.base import (
   Backend,
   BackendType,
   QueueBackend,
-  _get_mode_text,
 )
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
+)
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
 )
 from scrapy_extension.settings import KafkaMode, KafkaSettings
 from scrapy_extension.settings.kafka import (
@@ -87,6 +90,30 @@ def _validate_topic_name(name: str) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+_KAFKA_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  KafkaSettings.model_fields
+)
+_KAFKA_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Unsupported Kafka mode.",
+    (
+      "KafkaBackend requires enable_auto_commit=False because queue "
+      "delivery completion is controlled by QueueBackend.ack(); enabling "
+      "Kafka auto-commit can commit a request before Scrapy processes it."
+    ),
+    (
+      "KafkaBackend requires enable_auto_commit=False because queue "
+      "delivery completion is controlled by QueueBackend.ack()."
+    ),
+  }
+)
+_KAFKA_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {
+    f"Failed to connect to Kafka ({mode.value})."
+    for mode in KafkaMode
+  }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +281,12 @@ class KafkaBackend(Backend, QueueBackend):
   requires_ack = True
   supports_concurrent_ack = True
 
+  @configuration_error_boundary(
+    "Kafka configuration is invalid.",
+    _KAFKA_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_KAFKA_SAFE_CONFIGURATION_MESSAGES,
+  )
   def __init__(self, config: KafkaSettings) -> None:
     """Initialize Kafka backend.
 
@@ -382,6 +415,18 @@ class KafkaBackend(Backend, QueueBackend):
     except BaseException:
       pass
 
+  @backend_connection_error_boundary(
+    "Failed to connect to Kafka.",
+    "kafka",
+    safe_messages=_KAFKA_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "Kafka configuration is invalid.",
+    _KAFKA_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_KAFKA_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Establish connection to Kafka based on deployment mode.
 
@@ -410,9 +455,8 @@ class KafkaBackend(Backend, QueueBackend):
         KafkaMode.CONFLUENT,
       ):
         raise ConfigurationError(
-          f"Unsupported Kafka mode: {_get_mode_text(mode)}",
+          "Unsupported Kafka mode.",
           setting_name="mode",
-          setting_value=mode,
         )
       snapshot = self._capture_connection_snapshot()
       startup_error: BackendConnectionError | None = None
@@ -508,6 +552,12 @@ class KafkaBackend(Backend, QueueBackend):
     if primary_error is not None and not suppress_process_control:
       raise primary_error
 
+  @configuration_error_boundary(
+    "Kafka configuration is invalid.",
+    _KAFKA_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_KAFKA_SAFE_CONFIGURATION_MESSAGES,
+  )
   def _capture_connection_snapshot(self) -> _KafkaConnectionSnapshot:
     """Copy and revalidate every setting consumed by one client generation."""
     raw_values = self.config.__dict__.copy()

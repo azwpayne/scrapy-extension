@@ -113,3 +113,5 @@ def test_rocketmq_connect_preserves_dependency_internal_import_error(
   with pytest.raises(ImportError) as exc_info:
     RocketMQBackend(RocketMQSettings()).connect()
   assert exc_info.value is failure
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None

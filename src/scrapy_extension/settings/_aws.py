@@ -17,6 +17,44 @@ _AWS_REGION_PATTERN = re.compile(
   r"^[a-z][a-z0-9]+(?:-[a-z][a-z0-9]*)+-[0-9]+$"
 )
 
+# These are the exact diagnostics emitted by the validators in this module.
+# They contain only fixed field names and policy text, so terminal backend
+# boundaries may retain them without exposing endpoint or credential values.
+_AWS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {
+    (
+      "region_name must be a lowercase, hyphen-delimited AWS region "
+      "identifier ending in a numeric label (e.g. 'us-east-1', "
+      "'us-gov-west-1', 'eusc-de-east-1')."
+    ),
+    "aws_access_key_id must be a string when explicitly configured.",
+    "aws_access_key_id must be non-empty when explicitly configured.",
+    "aws_secret_access_key must be a string when explicitly configured.",
+    "aws_secret_access_key must be non-empty when explicitly configured.",
+    (
+      "aws_access_key_id is required when aws_secret_access_key is set; "
+      "set both or leave both unset to use the ambient credential chain."
+    ),
+    (
+      "aws_secret_access_key is required when aws_access_key_id is set; "
+      "set both or leave both unset to use the ambient credential chain."
+    ),
+    (
+      "endpoint_url is required in standalone mode to prevent an accidental "
+      "fallback to the real AWS endpoint chain."
+    ),
+    "endpoint_url must be a non-empty HTTP(S) URL.",
+    "endpoint_url must not contain surrounding whitespace or control characters.",
+    "endpoint_url is not a valid HTTP(S) URL.",
+    "endpoint_url must be an absolute HTTP(S) URL with a hostname.",
+    (
+      "endpoint_url must not contain URL userinfo; configure AWS credentials "
+      "through the dedicated credential fields."
+    ),
+    "An explicit endpoint_url in cloud mode must use HTTPS.",
+  }
+)
+
 
 def validate_aws_region_name(region_name: object) -> str:
   """Return one AWS-style region name or raise a typed config error."""

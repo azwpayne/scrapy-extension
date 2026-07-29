@@ -349,11 +349,12 @@ def test_cluster_host_diagnostic_failure_keeps_connect_live(
   mocker, has_extra_nodes: bool, diagnostic_error: BaseException
 ) -> None:
   """Both cluster-host diagnostic branches remain advisory during connect."""
+  marker = "rabbitmq-cluster-log-marker"
   backend = RabbitMQBackend(
     RabbitMQSettings(
       mode=RabbitMQMode.CLUSTER,
       ssl_enabled=True,
-      cluster_nodes=["node2:5672"],
+      cluster_nodes=[f"{marker}.example:5672"],
       username="user",
       password="pass",
     )
@@ -373,7 +374,7 @@ def test_cluster_host_diagnostic_failure_keeps_connect_live(
     assert backend._connection is candidate_connection
     assert backend._channel is candidate_channel
     assert backend.is_connected() is True
-    assert logger_debug.call_count == 2  # host-list + published-session diagnostics
+    assert logger_debug.call_count == 2  # cluster-count + published-session diagnostics
   else:
     # ``connect`` intentionally rejects empty cluster topology snapshots;
     # exercise the retained endpoint-only candidate branch directly.
@@ -381,9 +382,8 @@ def test_cluster_host_diagnostic_failure_keeps_connect_live(
     candidate = backend._connect_cluster(snapshot)
     assert candidate.connection is candidate_connection
     assert candidate.channel is candidate_channel
-    logger_debug.assert_called_once_with(
-      "Connecting to RabbitMQ cluster at %s:%s", "localhost", 5672
-    )
+    logger_debug.assert_called_once_with("Connecting to RabbitMQ cluster.")
+  assert marker not in repr(logger_debug.call_args_list)
   candidate_connection.close.assert_not_called()
   candidate_channel.close.assert_not_called()
 

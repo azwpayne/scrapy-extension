@@ -61,6 +61,10 @@ from scrapy_extension.exceptions import (
   QueueError,
   StorageError,
 )
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
 from scrapy_extension.settings import RedisMode
 from scrapy_extension.settings.redis import (
   RedisSettings,
@@ -69,6 +73,23 @@ from scrapy_extension.settings.redis import (
 )
 
 logger = logging.getLogger(__name__)
+
+_REDIS_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  RedisSettings.model_fields
+)
+_REDIS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {"Unsupported Redis mode."}
+)
+_REDIS_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {
+    f"Failed to connect to Redis ({mode.value})"
+    for mode in RedisMode
+  }
+  | {
+    "Cannot connect to Redis re-entrantly while building a candidate.",
+    "Cannot connect to Redis re-entrantly during disconnect.",
+  }
+)
 
 _REDIS_FIELD_ADAPTERS: dict[str, TypeAdapter[Any]] = {
   name: TypeAdapter(field.rebuild_annotation())
@@ -256,6 +277,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       for index, value in enumerate(values)
     )
 
+  @configuration_error_boundary(
+    "Redis configuration is invalid.",
+    _REDIS_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_REDIS_SAFE_CONFIGURATION_MESSAGES,
+  )
   def _capture_connection_plan(
     self,
   ) -> tuple[_RedisConnectionSnapshot, Any, Any]:
@@ -540,7 +567,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._raise_if_connect_cancelled(request_epoch)
       else:  # pragma: no cover - RedisSettings validation owns this branch
         raise ConfigurationError(
-          f"Unsupported Redis mode: {snapshot.mode}", setting_name="mode"
+          "Unsupported Redis mode.", setting_name="mode"
         )
 
       if client is None or not client.ping():
@@ -649,6 +676,18 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     finally:
       self._connect_local.depth = previous_depth
 
+  @backend_connection_error_boundary(
+    "Failed to connect to Redis.",
+    "redis",
+    safe_messages=_REDIS_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "Redis configuration is invalid.",
+    _REDIS_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_REDIS_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Privately build and atomically publish one Redis generation."""
     current_thread = threading.get_ident()

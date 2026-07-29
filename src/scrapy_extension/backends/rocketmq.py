@@ -30,7 +30,7 @@ import logging
 import math
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 from scrapy_extension.backends._redaction import _redact
@@ -45,12 +45,33 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+  import_error_traceback_boundary,
+)
+from scrapy_extension.settings import RocketMQSettings
 from scrapy_extension.settings.rocketmq import validate_rocketmq_connection
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import RocketMQSettings
-
 logger = logging.getLogger(__name__)
+
+_ROCKETMQ_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  RocketMQSettings.model_fields
+)
+_ROCKETMQ_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Unsupported RocketMQ mode.",
+    "Cloud mode requires access_key and secret_key.",
+  }
+)
+_ROCKETMQ_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {
+    "rocketmq-python-client not installed.",
+    "RocketMQBackend producer initialization returned None",
+    "RocketMQBackend consumer initialization returned None",
+    "Failed to connect to RocketMQ.",
+  }
+)
 
 # Module-level warn-once flag for the unsupported-depth signal (Risk 1).
 # RocketMQ's deferred-ack model has no broker-side depth RPC, so queue_len
@@ -167,6 +188,19 @@ class RocketMQBackend(Backend, QueueBackend):
     self._last_msg: Any = None
     self._last_delivery: tuple[Any, int, Any] | None = None
 
+  @import_error_traceback_boundary
+  @backend_connection_error_boundary(
+    "Failed to connect to RocketMQ.",
+    "rocketmq",
+    safe_messages=_ROCKETMQ_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "RocketMQ configuration is invalid.",
+    _ROCKETMQ_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_ROCKETMQ_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError, ImportError),
+  )
   def connect(self) -> None:
     """Establish connection to RocketMQ (gRPC proxy).
 
@@ -188,6 +222,19 @@ class RocketMQBackend(Backend, QueueBackend):
         self._abort_partial_connect()
       self._connect_unlocked()
 
+  @import_error_traceback_boundary
+  @backend_connection_error_boundary(
+    "Failed to connect to RocketMQ.",
+    "rocketmq",
+    safe_messages=_ROCKETMQ_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "RocketMQ configuration is invalid.",
+    _ROCKETMQ_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_ROCKETMQ_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError, ImportError),
+  )
   def _connect_unlocked(self) -> None:
     """Build one client generation while ``_connection_lock`` is held."""
     mode = self.config.mode
@@ -861,7 +908,9 @@ class RocketMQSetBackend(RocketMQBackend):
     Raises:
         ConfigurationError: Always.
     """
-    raise _unsupported_component_guard("set", "SCRAPY_SET_BACKEND_TYPE")
+    error = _unsupported_component_guard("set", "SCRAPY_SET_BACKEND_TYPE")
+    del config
+    raise error
 
 
 class RocketMQStorageBackend(RocketMQBackend):
@@ -876,4 +925,6 @@ class RocketMQStorageBackend(RocketMQBackend):
     Raises:
         ConfigurationError: Always.
     """
-    raise _unsupported_component_guard("storage", "SCRAPY_STORAGE_BACKEND_TYPE")
+    error = _unsupported_component_guard("storage", "SCRAPY_STORAGE_BACKEND_TYPE")
+    del config
+    raise error

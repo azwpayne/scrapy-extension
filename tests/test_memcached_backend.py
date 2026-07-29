@@ -91,6 +91,25 @@ class TestMemcachedConnect:
     client.stats.assert_called_once()
     assert b.is_connected() is True
 
+  def test_connect_diagnostics_hide_remote_endpoint(self, mocker) -> None:
+    marker = "memcached-endpoint-log-marker"
+    backend = _make_backend(
+      host=f"{marker}.example", allow_remote_plaintext=True
+    )
+    client = mocker.MagicMock(name="client")
+    mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+    logger_warning = mocker.patch.object(memcached_mod.logger, "warning")
+    logger_debug = mocker.patch.object(memcached_mod.logger, "debug")
+
+    backend.connect()
+
+    logger_warning.assert_called_once_with(
+      "Remote Memcached plaintext was explicitly enabled; use only an "
+      "isolated trusted network."
+    )
+    logger_debug.assert_called_once_with("Connected to Memcached.")
+    assert marker not in repr((logger_warning.call_args_list, logger_debug.call_args_list))
+
   def test_connect_keeps_remote_client_live_when_warning_interrupts(
     self, mocker
   ) -> None:

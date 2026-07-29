@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsError
 
 from scrapy_extension.exceptions._redaction import sanitize_configuration_error
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._aws import _AWS_SAFE_CONFIGURATION_MESSAGES
 
 _SAFE_SETTINGS_ERROR_NAMES: frozenset[str] = frozenset(
   {
@@ -21,12 +22,9 @@ _SAFE_SETTINGS_ERROR_NAMES: frozenset[str] = frozenset(
 )
 _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
   {
-    "An explicit endpoint_url in cloud mode must use HTTPS.",
     "api_key and basic-auth (username/password) are mutually exclusive; remove one authentication method.",
     "api_key must not be blank when supplied.",
     "Authenticated Pulsar connections require 'pulsar+ssl://' transport.",
-    "aws_access_key_id is required when aws_secret_access_key is set; set both or leave both unset to use the ambient credential chain.",
-    "aws_secret_access_key is required when aws_access_key_id is set; set both or leave both unset to use the ambient credential chain.",
     "Kafka CONFLUENT mode requires 'confluent_api_key' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
     "Kafka CONFLUENT mode requires 'confluent_api_key and confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
     "Kafka CONFLUENT mode requires 'confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
@@ -42,6 +40,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     "ssl_enabled=True requires 'ssl_cafile' to be set (path to a CA certificate bundle).",
     "username must not be blank when supplied.",
   }
+  | _AWS_SAFE_CONFIGURATION_MESSAGES
 )
 _TRUSTED_SETTINGS_CLASSES: frozenset[tuple[str, str]] = frozenset(
   {

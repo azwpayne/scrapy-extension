@@ -529,7 +529,10 @@ class TestModeConfigurationErrors:
     backend = KafkaBackend(settings)
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
-    assert "invalid_mode" in str(exc_info.value)
+    assert str(exc_info.value) == "Unsupported Kafka mode."
+    assert "invalid_mode" not in repr(exc_info.value)
+    assert exc_info.value.setting_name == "mode"
+    assert exc_info.value.setting_value is None
 
   def test_mongodb_unsupported_mode(self, mocker):
     """Test MongoDB backend with unsupported mode."""
@@ -560,4 +563,7 @@ class TestModeConfigurationErrors:
     backend = RabbitMQBackend(settings)
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
-    assert "invalid_mode" in str(exc_info.value)
+    assert str(exc_info.value) == "Unsupported RabbitMQ mode."
+    assert "invalid_mode" not in repr(exc_info.value)
+    assert exc_info.value.setting_name == "mode"
+    assert exc_info.value.setting_value is None

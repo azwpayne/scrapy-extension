@@ -306,9 +306,13 @@ def test_connect_mirrored_queues_warns_ha_policy_not_applied(mocker, caplog) -> 
   mocker.patch.object(RabbitMQBackend, "_apply_qos")  # succeeds -> no cleanup path
   backend = _backend()
   backend.config.ha_mode = "all"
+  marker = "rabbitmq-ha-log-marker"
+  backend.config.ha_params = marker
+  backend.config.ha_sync_mode = marker
   with caplog.at_level(logging.WARNING):
     candidate = backend._connect_mirrored_queues()
   assert any("NOT applied via AMQP" in r.message for r in caplog.records)
+  assert marker not in "\n".join(record.getMessage() for record in caplog.records)
   assert candidate.channel is mock_channel
   assert backend._channel is None  # candidate remains private until connect publishes
 

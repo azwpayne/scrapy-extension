@@ -101,6 +101,20 @@ class TestPulsarConnect:
     pulsar.Client.assert_called_once_with("pulsar://localhost:6650")
     assert b.is_connected() is True
 
+  def test_connect_diagnostic_hides_service_url(self, mocker) -> None:
+    marker = "pulsar-service-url-log-marker"
+    b = _make_backend(service_url=f"pulsar://{marker}.example:6650")
+    client = mocker.MagicMock()
+    mocker.patch.object(pulsar, "Client", return_value=client)
+    logger_debug = mocker.patch("scrapy_extension.backends.pulsar.logger.debug")
+
+    b.connect()
+
+    logger_debug.assert_called_once_with(
+      "Connected to Pulsar in %s mode", PulsarMode.STANDALONE.value
+    )
+    assert marker not in repr(logger_debug.call_args_list)
+
   def test_connect_failure_raises_connection_error(self, mocker) -> None:
     b = _make_backend()
     mocker.patch.object(pulsar, "Client", side_effect=RuntimeError("boom"))
@@ -554,6 +568,18 @@ class TestPulsarPop:
     b, _ = _connected(mocker, subscribe=consumer)
     assert b.pop("queue1") is None
     assert b._last_msg is None
+
+  def test_empty_timeout_diagnostic_hides_queue_and_driver_text(self, mocker) -> None:
+    marker = "pulsar-timeout-log-marker"
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = pulsar.Timeout(marker)
+    b, _ = _connected(mocker, subscribe=consumer)
+    logger_debug = mocker.patch("scrapy_extension.backends.pulsar.logger.debug")
+
+    assert b.pop(f"{marker}-queue") is None
+
+    logger_debug.assert_called_once_with("Pulsar receive returned no message.")
+    assert marker not in repr(logger_debug.call_args_list)
 
   @pytest.mark.parametrize(
     "diagnostic_error",

@@ -148,17 +148,59 @@ def configuration_error_boundary(
   return decorate
 
 
+def import_error_traceback_boundary(
+  function: Callable[_P, _T],
+) -> Callable[_P, _T]:
+  """Keep an import failure's public identity without retaining config frames.
+
+  Optional dependencies distinguish a genuinely missing package from an
+  internal ABI/import failure. The latter remains the original ``ImportError``
+  for compatibility, but its accumulated traceback can retain backend
+  configuration. Strip that graph only after the wrapped function has exited,
+  then re-raise from a wrapper whose arguments have been released.
+  """
+
+  @wraps(function)
+  def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+    caught_error: ImportError | None = None
+    try:
+      return function(*args, **kwargs)
+    except ImportError as error:
+      caught_error = error
+    except BaseException:
+      del args
+      del kwargs
+      raise
+    assert caught_error is not None
+    caught_error.__traceback__ = None
+    caught_error.__cause__ = None
+    caught_error.__context__ = None
+    caught_error.__suppress_context__ = True
+    sanitized_error = caught_error
+    del args
+    del kwargs
+    del caught_error
+    raise sanitized_error
+
+  return wrapped
+
+
 def backend_connection_error_boundary(
   message: str,
   backend_type: str,
+  *,
+  safe_messages: Collection[str] = (),
+  safe_message_predicate: Callable[[str], bool] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
   """Rebuild public startup failures without retaining connection inputs.
 
   A backend's direct ``connect`` method commonly retains mutable endpoint and
   credential snapshots in its stack while a driver failure propagates.  The
   public error must keep the operational exception family, but not that
-  traceback graph.  Non-connection exceptions keep their established
-  semantics after this wrapper drops its own argument references.
+  traceback graph. A caller may preserve an exact static message through a
+  literal allowlist or a fail-closed structural predicate; every other
+  message falls back to ``message``. Non-connection exceptions keep their
+  established semantics after this wrapper drops its own argument references.
   """
 
   def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -173,10 +215,33 @@ def backend_connection_error_boundary(
         del args
         del kwargs
         raise
-      sanitized_error = BackendConnectionError(message, backend_type=backend_type)
+      connection_message = message
+      raw_args: object = None
+      raw_message: object = None
+      predicate_matches = False
+      if type(caught_error) is BackendConnectionError:
+        raw_args = caught_error.args
+        if type(raw_args) is tuple and len(raw_args) == 1:
+          raw_message = raw_args[0]
+        if type(raw_message) is str and safe_message_predicate is not None:
+          try:
+            predicate_matches = safe_message_predicate(raw_message)
+          except Exception:  # noqa: BLE001 - diagnostic predicates fail closed
+            predicate_matches = False
+        if type(raw_message) is str and (
+          raw_message in safe_messages or predicate_matches
+        ):
+          connection_message = raw_message
+      sanitized_error = BackendConnectionError(
+        connection_message, backend_type=backend_type
+      )
       del args
       del kwargs
       del caught_error
+      del raw_args
+      del raw_message
+      del predicate_matches
+      del connection_message
       raise sanitized_error
 
     return wrapped

@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -47,13 +47,24 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
-from scrapy_extension.settings import PulsarMode
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
+from scrapy_extension.settings import PulsarMode, PulsarSettings
 from scrapy_extension.settings.pulsar import validate_pulsar_connection
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import PulsarSettings
-
 logger = logging.getLogger(__name__)
+
+_PULSAR_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  PulsarSettings.model_fields
+)
+_PULSAR_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {"Unsupported Pulsar mode."}
+)
+_PULSAR_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {"Failed to connect to Pulsar."}
+)
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
@@ -315,6 +326,12 @@ class PulsarBackend(Backend, QueueBackend):
     # R14-E: one-shot guard for the in-flight-set-overflow warning.
     self._in_flight_overflow_warned: bool = False
 
+  @configuration_error_boundary(
+    "Pulsar configuration is invalid.",
+    _PULSAR_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_PULSAR_SAFE_CONFIGURATION_MESSAGES,
+  )
   def _capture_connection_snapshot(self) -> _PulsarConnectionSnapshot:
     """Capture and revalidate every value used by one client generation."""
     mode = self.config.mode
@@ -329,14 +346,9 @@ class PulsarBackend(Backend, QueueBackend):
     tls_validate_hostname = self.config.tls_validate_hostname
 
     if mode not in (PulsarMode.STANDALONE, PulsarMode.CLUSTER):
-      try:
-        mode_text = str(mode)
-      except (TypeError, ValueError):
-        mode_text = getattr(mode, "value", repr(mode))
       raise ConfigurationError(
-        f"Unsupported Pulsar mode: {mode_text}",
+        "Unsupported Pulsar mode.",
         setting_name="mode",
-        setting_value=mode,
       )
     (
       normalized_url,
@@ -389,6 +401,18 @@ class PulsarBackend(Backend, QueueBackend):
       tls_validate_hostname=validate_hostname,
     )
 
+  @backend_connection_error_boundary(
+    "Failed to connect to Pulsar.",
+    "pulsar",
+    safe_messages=_PULSAR_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "Pulsar configuration is invalid.",
+    _PULSAR_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_PULSAR_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Connect to Pulsar by creating a client from ``service_url``.
 
@@ -447,11 +471,7 @@ class PulsarBackend(Backend, QueueBackend):
       # This message is only telemetry: a custom log handler must not turn a
       # completed connection into a failed one, nor abort its live client.
       try:
-        logger.debug(
-          "Connected to Pulsar at %s (%s)",
-          snapshot.service_url,
-          snapshot.mode.value,
-        )
+        logger.debug("Connected to Pulsar in %s mode", snapshot.mode.value)
       except BaseException:
         pass
     except ConfigurationError:
@@ -836,14 +856,12 @@ class PulsarBackend(Backend, QueueBackend):
       # timeout=0 -> a short poll; Pulsar needs a positive timeout_millis.
       timeout_ms = int(timeout * 1000) if timeout > 0 else 100
       return (consumer.receive(timeout_millis=timeout_ms), consumer)
-    except pulsar.Timeout as e:
+    except pulsar.Timeout:
       # No message within the timeout window is the normal "empty" case.
       # A logging handler is optional diagnostics, so it must not turn a
       # broker-confirmed empty poll into an operational failure.
       try:
-        logger.debug(
-          "Pulsar receive returned no message for %s: %s", queue_name, e
-        )
+        logger.debug("Pulsar receive returned no message.")
       except BaseException:
         pass
       return (None, consumer)

@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -47,18 +47,30 @@ from scrapy_extension.backends.base import (
   _validate_ttl,
 )
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
 from scrapy_extension.exceptions.base import StorageError
-from scrapy_extension.settings import DynamoDBMode
+from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings
 from scrapy_extension.settings._aws import (
+  _AWS_SAFE_CONFIGURATION_MESSAGES,
   validate_aws_credentials,
   validate_aws_endpoint,
   validate_aws_region_name,
 )
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import DynamoDBSettings
-
 logger = logging.getLogger(__name__)
+
+_DYNAMODB_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  DynamoDBSettings.model_fields
+)
+_DYNAMODB_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
+  {"Unsupported DynamoDB mode."} | _AWS_SAFE_CONFIGURATION_MESSAGES
+)
+_DYNAMODB_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {"Failed to connect to DynamoDB."}
+)
 
 # DynamoDB ClientError codes used while establishing the table. A
 # ResourceNotFoundException means the TABLE is missing, never that an item is
@@ -202,6 +214,12 @@ class DynamoDBBackend(Backend, StorageBackend):
       ):
         raise _DynamoDBConnectCancelled
 
+  @configuration_error_boundary(
+    "DynamoDB configuration is invalid.",
+    _DYNAMODB_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_DYNAMODB_SAFE_CONFIGURATION_MESSAGES,
+  )
   def _capture_connection_snapshot(
     self,
   ) -> tuple[_DynamoDBConnectionSnapshot, dict[str, Any]]:
@@ -212,9 +230,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     secret_key = self.config.aws_secret_access_key
     if not isinstance(mode, DynamoDBMode):
       raise ConfigurationError(
-        f"Unsupported DynamoDB mode: {mode}",
+        "Unsupported DynamoDB mode.",
         setting_name="mode",
-        setting_value=mode,
       )
     region_name = validate_aws_region_name(self.config.region_name)
     endpoint_url = validate_aws_endpoint(
@@ -522,6 +539,18 @@ class DynamoDBBackend(Backend, StorageBackend):
         pass
       time.sleep(delay)
 
+  @backend_connection_error_boundary(
+    "Failed to connect to DynamoDB.",
+    "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_CONNECTION_MESSAGES,
+  )
+  @configuration_error_boundary(
+    "DynamoDB configuration is invalid.",
+    _DYNAMODB_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_DYNAMODB_SAFE_CONFIGURATION_MESSAGES,
+    pass_through_exception_types=(BackendConnectionError,),
+  )
   def connect(self) -> None:
     """Privately prepare and atomically publish one table generation.
 
@@ -597,7 +626,7 @@ class DynamoDBBackend(Backend, StorageBackend):
       # diagnostic handler is outside that transaction: it must not make
       # connect() report a false failure or retire the now-live generation.
       try:
-        logger.debug("Connected to DynamoDB table %s", snapshot.table_name)
+        logger.debug("Connected to DynamoDB.")
       except BaseException:
         pass
 
