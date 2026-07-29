@@ -49,6 +49,11 @@ from scrapy_extension.settings.rabbitmq import (
   validate_rabbitmq_connection,
 )
 
+try:
+  import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+  import tomli as tomllib
+
 
 class _RegistryEnum(str, Enum):
   VALUE = "value"
@@ -112,8 +117,8 @@ def test_ci_workflow_runs_for_pull_requests_before_merge() -> None:
   assert "push:" in workflow
 
 
-def test_integration_ci_and_compose_share_supported_elasticsearch_contract() -> None:
-  """R49: cold CI startup budget and ES fixture version stay synchronized."""
+def test_integration_ci_and_compose_share_locked_elasticsearch_contract() -> None:
+  """R50: CI/Compose image versions derive from the exact locked client."""
   repository_root = Path(__file__).resolve().parents[1]
   workflow = yaml.safe_load(
     (repository_root / ".github" / "workflows" / "ci.yml").read_text(
@@ -125,9 +130,17 @@ def test_integration_ci_and_compose_share_supported_elasticsearch_contract() -> 
       encoding="utf-8"
     )
   )
+  lock = tomllib.loads((repository_root / "uv.lock").read_text(encoding="utf-8"))
+  elasticsearch_version = next(
+    package["version"]
+    for package in lock["package"]
+    if package["name"] == "elasticsearch"
+  )
 
   integration_job = workflow["jobs"]["integration-tests"]
-  expected_image = "docker.elastic.co/elasticsearch/elasticsearch:9.4.1"
+  expected_image = (
+    "docker.elastic.co/elasticsearch/elasticsearch:" f"{elasticsearch_version}"
+  )
   assert integration_job["timeout-minutes"] == 30
   assert integration_job["services"]["elasticsearch"]["image"] == expected_image
   assert compose["services"]["elasticsearch"]["image"] == expected_image
