@@ -329,9 +329,10 @@ speculative work.
 - [x] **SEC-02B2B2 — Memcached transport boundary.** Define and enforce an
   explicit trusted-network boundary for remote Memcached, with a literal-only
   loopback classifier for the local plaintext exception.
-- [ ] **SEC-02B2B3 — authenticated Kafka transport.** Require password-based
+- [x] **SEC-02B2B3 — authenticated Kafka transport.** Require password-based
   SASL to use `SASL_SSL` with hostname verification, reject ignored TLS
-  material, and require client certificate/key pairs.
+  material, require client certificate/key pairs, and pin all Kafka client
+  constructors to one verified connection snapshot (Round 39C).
 - [x] **SEC-02C-R — authenticated Redis transport.** Require every remote or
   discovery-capable Redis authentication path (including username-only,
   Sentinel, Cluster, and the deprecated compatibility mode) to use explicit
@@ -364,8 +365,9 @@ speculative work.
   immutable endpoint/policy snapshot, publish only after a successful probe,
   make connect idempotent, and sanitize startup failures.
 - [ ] **SEC-03B2B3 — remaining validated connection snapshots.** Apply copied,
-  revalidated connection snapshots and sanitized URL/URI failures to Kafka and
-  Elasticsearch.
+  revalidated connection snapshots and sanitized URL/URI failures to
+  Elasticsearch. Kafka's producer, admin, persistent consumer, and temporary
+  consumer paths are complete (Round 39C).
 - [ ] **SEC-03C — atomic mutable-configuration snapshots.** Copy the selected
   settings model's field mapping once before revalidation and SDK use, then
   freeze nested endpoint collections, so concurrent field mutation cannot

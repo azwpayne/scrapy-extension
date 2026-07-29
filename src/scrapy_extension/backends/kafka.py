@@ -17,7 +17,10 @@ import re
 import threading
 from collections import defaultdict
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, cast
+from dataclasses import dataclass
+from typing import Any, cast
+
+from pydantic import ValidationError
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -45,17 +48,17 @@ except ImportError as e:
 
 from scrapy_extension.backends._redaction import _RedactedStr
 from scrapy_extension.backends.base import (
-    Backend,
-    BackendType,
-    QueueBackend,
-    _get_mode_text,
+  Backend,
+  BackendType,
+  QueueBackend,
+  _get_mode_text,
 )
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
 )
-from scrapy_extension.settings import KafkaMode
+from scrapy_extension.settings import KafkaMode, KafkaSettings
 from scrapy_extension.settings.kafka import (
     validate_kafka_authentication,
     validate_kafka_delivery_policy,
@@ -83,10 +86,42 @@ def _validate_topic_name(name: str) -> None:
         )
 
 
-if TYPE_CHECKING:
-  from scrapy_extension.settings import KafkaSettings
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _KafkaConnectionSnapshot:
+  """Validated connection-used values fixed for one Kafka generation."""
+
+  mode: KafkaMode
+  bootstrap_servers: str
+  security_protocol: str
+  sasl_mechanism: str | None
+  sasl_username: str | None
+  sasl_password: _RedactedStr | None
+  confluent_api_key: _RedactedStr | None
+  confluent_api_secret: _RedactedStr | None
+  ssl_cafile: str | None
+  ssl_certfile: str | None
+  ssl_keyfile: str | None
+  ssl_check_hostname: bool
+  acks: int | str
+  retries: int
+  batch_size: int
+  linger_ms: int
+  compression_type: str | None
+  max_in_flight_requests_per_connection: int
+  request_timeout_ms: int
+  max_priority_partitions: int
+  num_partitions: int
+  replication_factor: int
+  retention_ms: int
+  min_insync_replicas: int
+  group_id: str
+  auto_offset_reset: str
+  auto_commit_interval_ms: int
+  max_poll_records: int
+  session_timeout_ms: int
 
 
 class _KafkaAckToken:
@@ -241,6 +276,8 @@ class KafkaBackend(Backend, QueueBackend):
     # teardown can block on SDK I/O, whereas delivery-token bookkeeping must
     # remain a short critical section for ack/rebalance callbacks.
     self._connection_lock = threading.RLock()
+    self._connection_snapshot: _KafkaConnectionSnapshot | None = None
+    self._connecting_snapshot: _KafkaConnectionSnapshot | None = None
     self._producer: KafkaProducer | None = None
     self._consumer: KafkaConsumer | None = None
     self._consumer_auto_offset_reset: str | None = None
@@ -367,34 +404,34 @@ class KafkaBackend(Backend, QueueBackend):
       if self._producer is not None or self._admin_client is not None:
         self._abort_partial_connect(suppress_process_control=True)
 
-      if self.config.mode not in (
+      mode = getattr(self.config, "mode", None)
+      if mode not in (
         KafkaMode.STANDALONE,
         KafkaMode.CLUSTER,
         KafkaMode.CONFLUENT,
       ):
-        msg = f"Unsupported Kafka mode: {_get_mode_text(self.config.mode)}"
         raise ConfigurationError(
-          msg,
+          f"Unsupported Kafka mode: {_get_mode_text(mode)}",
           setting_name="mode",
-          setting_value=self.config.mode,
+          setting_value=mode,
         )
-      # Pydantic models are mutable after construction. Revalidate auth before
-      # any SDK object can observe a post-construction downgrade.
-      self._validated_authentication()
-      self._validated_delivery_policy()
+      snapshot = self._capture_connection_snapshot()
+      self._connecting_snapshot = snapshot
       try:
-        if self.config.mode == KafkaMode.STANDALONE:
+        if snapshot.mode == KafkaMode.STANDALONE:
           self._connect_standalone()
-        elif self.config.mode == KafkaMode.CLUSTER:
+        elif snapshot.mode == KafkaMode.CLUSTER:
           self._connect_cluster()
         else:
           self._connect_confluent()
+        self._connection_snapshot = snapshot
+        self._connecting_snapshot = None
         self._log_success_diagnostic(
-          "Connected to Kafka in %s mode", self.config.mode.value
+          "Connected to Kafka in %s mode", snapshot.mode.value
         )
       except KafkaError as e:
         self._abort_partial_connect(suppress_process_control=True)
-        msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
+        msg = f"Failed to connect to Kafka ({snapshot.mode.value}): {e}"
         raise BackendConnectionError(
           msg,
           backend_type="kafka",
@@ -402,7 +439,7 @@ class KafkaBackend(Backend, QueueBackend):
       except Exception as e:
         self._abort_partial_connect(suppress_process_control=True)
         # Unexpected errors (e.g., RuntimeError from mocking in tests)
-        msg = f"Failed to connect to Kafka ({self.config.mode.value}): {e}"
+        msg = f"Failed to connect to Kafka ({snapshot.mode.value}): {e}"
         raise BackendConnectionError(
           msg,
           backend_type="kafka",
@@ -448,6 +485,8 @@ class KafkaBackend(Backend, QueueBackend):
     admin = self._admin_client
     self._producer = None
     self._admin_client = None
+    self._connection_snapshot = None
+    self._connecting_snapshot = None
     primary_error: BaseException | None = None
     for closer in (producer, admin):
       if closer is not None:
@@ -469,45 +508,151 @@ class KafkaBackend(Backend, QueueBackend):
     if primary_error is not None and not suppress_process_control:
       raise primary_error
 
-  def _build_common_config(self) -> dict[str, Any]:
-    """Build common Kafka client configuration.
+  def _capture_connection_snapshot(self) -> _KafkaConnectionSnapshot:
+    """Copy and revalidate every setting consumed by one client generation."""
+    raw_values = self.config.__dict__.copy()
+    try:
+      validated = KafkaSettings.model_validate(raw_values, strict=True)
+    except ConfigurationError as exc:
+      setting_name = exc.setting_name or "kafka"
+      raise ConfigurationError(
+        f"Invalid Kafka setting '{setting_name}'.",
+        setting_name=setting_name,
+      ) from None
+    except ValidationError as exc:
+      errors = exc.errors()
+      location = errors[0].get("loc", ()) if errors else ()
+      setting_name = str(location[0]) if location else "kafka"
+      raise ConfigurationError(
+        f"Invalid Kafka setting '{setting_name}'.",
+        setting_name=setting_name,
+      ) from None
 
-    Returns:
-        Dictionary of Kafka client configuration options.
-    """
-    mechanism, username, password, _api_key, _api_secret = (
-      self._validated_authentication()
+    if validated.enable_auto_commit is not False:
+      raise ConfigurationError(
+        (
+          "KafkaBackend requires enable_auto_commit=False because queue "
+          "delivery completion is controlled by QueueBackend.ack()."
+        ),
+        setting_name="enable_auto_commit",
+      )
+    mechanism, username, password, api_key, api_secret = (
+      validate_kafka_authentication(
+        validated.mode,
+        validated.security_protocol,
+        validated.sasl_mechanism,
+        validated.sasl_username,
+        validated.sasl_password,
+        validated.confluent_api_key,
+        validated.confluent_api_secret,
+      )
     )
-    acks, _partitions, _replicas, _retention, _min_isr = (
-      self._validated_delivery_policy()
+    validate_kafka_transport_security(
+      validated.mode,
+      validated.security_protocol,
+      validated.ssl_check_hostname,
     )
+    acks, max_priority_partitions, replicas, retention, min_isr = (
+      validate_kafka_delivery_policy(
+        validated.acks,
+        validated.max_priority_partitions,
+        validated.num_partitions,
+        validated.replication_factor,
+        validated.retention_ms,
+        validated.min_insync_replicas,
+      )
+    )
+    if validated.mode == KafkaMode.CLUSTER and validated.cluster_brokers:
+      bootstrap_servers = ",".join(validated.cluster_brokers)
+    elif validated.mode == KafkaMode.CONFLUENT:
+      bootstrap_servers = (validated.confluent_bootstrap_servers or "").strip()
+      if not bootstrap_servers:
+        bootstrap_servers = validated.bootstrap_servers
+    else:
+      bootstrap_servers = validated.bootstrap_servers
+
+    return _KafkaConnectionSnapshot(
+      mode=validated.mode,
+      bootstrap_servers=bootstrap_servers,
+      security_protocol=validated.security_protocol,
+      sasl_mechanism=mechanism,
+      sasl_username=username,
+      sasl_password=(
+        _RedactedStr(password) if password is not None else None
+      ),
+      confluent_api_key=(
+        _RedactedStr(api_key) if api_key is not None else None
+      ),
+      confluent_api_secret=(
+        _RedactedStr(api_secret) if api_secret is not None else None
+      ),
+      ssl_cafile=validated.ssl_cafile,
+      ssl_certfile=validated.ssl_certfile,
+      ssl_keyfile=validated.ssl_keyfile,
+      ssl_check_hostname=validated.ssl_check_hostname,
+      acks=acks,
+      retries=validated.retries,
+      batch_size=validated.batch_size,
+      linger_ms=validated.linger_ms,
+      compression_type=validated.compression_type,
+      max_in_flight_requests_per_connection=(
+        validated.max_in_flight_requests_per_connection
+      ),
+      request_timeout_ms=validated.request_timeout_ms,
+      max_priority_partitions=max_priority_partitions,
+      num_partitions=validated.num_partitions,
+      replication_factor=replicas,
+      retention_ms=retention,
+      min_insync_replicas=min_isr,
+      group_id=validated.group_id,
+      auto_offset_reset=validated.auto_offset_reset,
+      auto_commit_interval_ms=validated.auto_commit_interval_ms,
+      max_poll_records=validated.max_poll_records,
+      session_timeout_ms=validated.session_timeout_ms,
+    )
+
+  def _connection_snapshot_or_capture(self) -> _KafkaConnectionSnapshot:
+    """Return the published generation plan or validate one for direct use."""
+    return (
+      self._connection_snapshot
+      or self._connecting_snapshot
+      or self._capture_connection_snapshot()
+    )
+
+  def _build_common_config(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
+    """Build common Kafka client configuration from one frozen snapshot."""
+    snapshot = snapshot or self._connection_snapshot_or_capture()
     config: dict[str, Any] = {
-      "acks": acks,
-      "retries": self.config.retries,
-      "batch_size": self.config.batch_size,
-      "linger_ms": self.config.linger_ms,
-      "compression_type": self.config.compression_type,
-      "max_in_flight_requests_per_connection": self.config.max_in_flight_requests_per_connection,
-      "request_timeout_ms": self.config.request_timeout_ms,
+      "acks": snapshot.acks,
+      "retries": snapshot.retries,
+      "batch_size": snapshot.batch_size,
+      "linger_ms": snapshot.linger_ms,
+      "compression_type": snapshot.compression_type,
+      "max_in_flight_requests_per_connection": (
+        snapshot.max_in_flight_requests_per_connection
+      ),
+      "request_timeout_ms": snapshot.request_timeout_ms,
     }
 
-    # Add SASL/SSL configuration if security is enabled
-    if self.config.security_protocol != "PLAINTEXT":
-      config["security_protocol"] = self.config.security_protocol
-
-      if mechanism is not None:
-        config["sasl_mechanism"] = mechanism
-      if username is not None and password is not None:
-        config["sasl_plain_username"] = username
-        config["sasl_plain_password"] = _RedactedStr(password)
-
-      if self.config.ssl_cafile:
-        config["ssl_cafile"] = self.config.ssl_cafile
-      if self.config.ssl_certfile:
-        config["ssl_certfile"] = self.config.ssl_certfile
-      if self.config.ssl_keyfile:
-        config["ssl_keyfile"] = self.config.ssl_keyfile
-      config["ssl_check_hostname"] = self.config.ssl_check_hostname
+    if snapshot.security_protocol != "PLAINTEXT":
+      config["security_protocol"] = snapshot.security_protocol
+      if snapshot.sasl_mechanism is not None:
+        config["sasl_mechanism"] = snapshot.sasl_mechanism
+      if (
+        snapshot.sasl_username is not None
+        and snapshot.sasl_password is not None
+      ):
+        config["sasl_plain_username"] = snapshot.sasl_username
+        config["sasl_plain_password"] = snapshot.sasl_password
+      if snapshot.ssl_cafile:
+        config["ssl_cafile"] = snapshot.ssl_cafile
+      if snapshot.ssl_certfile:
+        config["ssl_certfile"] = snapshot.ssl_certfile
+      if snapshot.ssl_keyfile:
+        config["ssl_keyfile"] = snapshot.ssl_keyfile
+      config["ssl_check_hostname"] = snapshot.ssl_check_hostname
 
     return config
 
@@ -543,35 +688,32 @@ class KafkaBackend(Backend, QueueBackend):
       self.config.min_insync_replicas,
     )
 
-  def _bootstrap_servers(self) -> str:
-    """Return bootstrap servers for the current Kafka mode."""
-    if self.config.mode == KafkaMode.CLUSTER and self.config.cluster_brokers:
-      return ",".join(self.config.cluster_brokers)
-    if self.config.mode == KafkaMode.CONFLUENT:
-      # R28-C-1: `.strip()` so a whitespace-only ``confluent_bootstrap_servers``
-      # falls back to ``bootstrap_servers`` — matching the R28-C validator's
-      # semantics. Pre-R28-C-1 bare ``or`` returned the whitespace string to
-      # kafka-python → opaque connect error despite the validator passing.
-      return (self.config.confluent_bootstrap_servers or "").strip() or (
-        self.config.bootstrap_servers
-      )
-    return self.config.bootstrap_servers
+  def _bootstrap_servers(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> str:
+    """Return bootstrap servers from one validated connection snapshot."""
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    return snapshot.bootstrap_servers
 
-  def _build_client_security_config(self) -> dict[str, Any]:
+  def _build_client_security_config(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
     """Build consumer/admin-safe security config without producer-only args."""
-    _mechanism, _username, _password, api_key, api_secret = (
-      self._validated_authentication()
-    )
-    if self.config.mode == KafkaMode.CONFLUENT:
-      if api_key is not None and api_secret is not None:
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    if snapshot.mode == KafkaMode.CONFLUENT:
+      if (
+        snapshot.confluent_api_key is not None
+        and snapshot.confluent_api_secret is not None
+      ):
         return {
           "security_protocol": "SASL_SSL",
           "sasl_mechanism": "PLAIN",
-          "sasl_plain_username": _RedactedStr(api_key),
-          "sasl_plain_password": _RedactedStr(api_secret),
+          "sasl_plain_username": snapshot.confluent_api_key,
+          "sasl_plain_password": snapshot.confluent_api_secret,
+          "ssl_check_hostname": snapshot.ssl_check_hostname,
         }
 
-    common_config = self._build_common_config()
+    common_config = self._build_common_config(snapshot)
     client_config: dict[str, Any] = {}
     for key in (
       "security_protocol",
@@ -587,19 +729,25 @@ class KafkaBackend(Backend, QueueBackend):
         client_config[key] = common_config[key]
     return client_config
 
-  def _build_producer_config(self) -> dict[str, Any]:
+  def _build_producer_config(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> dict[str, Any]:
     """Build producer config with mode-specific bootstrap and security settings."""
-    config = self._build_common_config()
-    config["bootstrap_servers"] = self._bootstrap_servers()
-    if self.config.mode == KafkaMode.CONFLUENT:
-      config.update(self._build_client_security_config())
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    config = self._build_common_config(snapshot)
+    config["bootstrap_servers"] = snapshot.bootstrap_servers
+    if snapshot.mode == KafkaMode.CONFLUENT:
+      config.update(self._build_client_security_config(snapshot))
     return config
 
-  def _connect_standalone(self) -> None:
+  def _connect_standalone(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> None:
     """Connect to standalone Kafka broker."""
-    bootstrap = self._bootstrap_servers()
-    producer_config = self._build_producer_config()
-    client_security_config = self._build_client_security_config()
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    bootstrap = snapshot.bootstrap_servers
+    producer_config = self._build_producer_config(snapshot)
+    client_security_config = self._build_client_security_config(snapshot)
 
     self._producer = KafkaProducer(**producer_config)
     self._admin_client = KafkaAdminClient(
@@ -609,14 +757,17 @@ class KafkaBackend(Backend, QueueBackend):
     )
     self._log_success_diagnostic("Connected to standalone Kafka at %s", bootstrap)
 
-  def _connect_cluster(self) -> None:
+  def _connect_cluster(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> None:
     """Connect to Kafka cluster.
 
     Uses cluster_brokers if configured, otherwise falls back to bootstrap_servers.
     """
-    bootstrap = self._bootstrap_servers()
-    producer_config = self._build_producer_config()
-    client_security_config = self._build_client_security_config()
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    bootstrap = snapshot.bootstrap_servers
+    producer_config = self._build_producer_config(snapshot)
+    client_security_config = self._build_client_security_config(snapshot)
 
     self._producer = KafkaProducer(**producer_config)
     self._admin_client = KafkaAdminClient(
@@ -626,14 +777,17 @@ class KafkaBackend(Backend, QueueBackend):
     )
     self._log_success_diagnostic("Connected to Kafka cluster at %s", bootstrap)
 
-  def _connect_confluent(self) -> None:
+  def _connect_confluent(
+    self, snapshot: _KafkaConnectionSnapshot | None = None
+  ) -> None:
     """Connect to Confluent Cloud.
 
     Uses SASL/SSL authentication with Confluent-specific settings.
     """
-    bootstrap = self._bootstrap_servers()
-    producer_config = self._build_producer_config()
-    client_security_config = self._build_client_security_config()
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    bootstrap = snapshot.bootstrap_servers
+    producer_config = self._build_producer_config(snapshot)
+    client_security_config = self._build_client_security_config(snapshot)
 
     self._producer = KafkaProducer(**producer_config)
     self._admin_client = KafkaAdminClient(
@@ -662,6 +816,8 @@ class KafkaBackend(Backend, QueueBackend):
         self._consumer = None
         self._consumer_auto_offset_reset = None
         self._admin_client = None
+        self._connection_snapshot = None
+        self._connecting_snapshot = None
         self._consumer_generation += 1
         self._assignment_epoch += 1
         self._subscribed_topic = None
@@ -719,7 +875,11 @@ class KafkaBackend(Backend, QueueBackend):
     """
     return BackendType.KAFKA
 
-  def _ensure_topic_exists(self, queue_name: str) -> None:
+  def _ensure_topic_exists(
+    self,
+    queue_name: str,
+    snapshot: _KafkaConnectionSnapshot | None = None,
+  ) -> None:
     """Ensure Kafka topic exists for queue.
 
     Uses a local cache to avoid repeated existence checks. Attempts to
@@ -735,9 +895,11 @@ class KafkaBackend(Backend, QueueBackend):
     """
     _validate_topic_name(queue_name)
     topic_name = f"scrapy-{queue_name}"
-    _acks, partitions, replicas, retention, min_isr = (
-      self._validated_delivery_policy()
-    )
+    snapshot = snapshot or self._connection_snapshot_or_capture()
+    partitions = snapshot.num_partitions
+    replicas = snapshot.replication_factor
+    retention = snapshot.retention_ms
+    min_isr = snapshot.min_insync_replicas
     policy = (partitions, replicas, retention, min_isr)
 
     # Skip if topic is already known to exist
@@ -953,9 +1115,13 @@ class KafkaBackend(Backend, QueueBackend):
         QueueError: If the push operation fails.
     """
     try:
-      self._ensure_topic_exists(queue_name)
+      snapshot = self._connection_snapshot_or_capture()
+      self._ensure_topic_exists(queue_name, snapshot)
       topic_name = f"scrapy-{queue_name}"
-      partition = max(0, min(int(priority), self.config.max_priority_partitions - 1))
+      partition = max(
+        0,
+        min(int(priority), snapshot.max_priority_partitions - 1),
+      )
 
       if self._producer is None:
         msg = "KafkaBackend not connected: producer is None"
@@ -1076,16 +1242,17 @@ class KafkaBackend(Backend, QueueBackend):
 
       # Create consumer if not exists
       if self._consumer is None:
-        auto_offset_reset = self.config.auto_offset_reset
+        snapshot = self._connection_snapshot_or_capture()
+        auto_offset_reset = snapshot.auto_offset_reset
         consumer = KafkaConsumer(
-          bootstrap_servers=self._bootstrap_servers(),
-          group_id=self.config.group_id,
+          bootstrap_servers=snapshot.bootstrap_servers,
+          group_id=snapshot.group_id,
           auto_offset_reset=auto_offset_reset,
           enable_auto_commit=False,
-          auto_commit_interval_ms=self.config.auto_commit_interval_ms,
-          max_poll_records=self.config.max_poll_records,
-          session_timeout_ms=self.config.session_timeout_ms,
-          **self._build_client_security_config(),
+          auto_commit_interval_ms=snapshot.auto_commit_interval_ms,
+          max_poll_records=snapshot.max_poll_records,
+          session_timeout_ms=snapshot.session_timeout_ms,
+          **self._build_client_security_config(snapshot),
         )
         if consumer is not None:
           self._consumer_generation += 1
@@ -1311,6 +1478,7 @@ class KafkaBackend(Backend, QueueBackend):
     """
     _validate_topic_name(queue_name)
     topic_name = f"scrapy-{queue_name}"
+    snapshot = self._connection_snapshot_or_capture()
     # KafkaConsumer is explicitly not thread-safe. Keep assignment, group
     # offset, and watermark calls in the same transaction as poll/ack/nack and
     # disconnect, and capture the handle once for the whole calculation.
@@ -1322,7 +1490,7 @@ class KafkaBackend(Backend, QueueBackend):
           topic_assignment = {tp for tp in assignment if tp.topic == topic_name}
           if topic_assignment:
             auto_offset_reset = (
-              self._consumer_auto_offset_reset or self.config.auto_offset_reset
+              self._consumer_auto_offset_reset or snapshot.auto_offset_reset
             )
             return self._consumer_group_lag(
               consumer,
@@ -1341,13 +1509,13 @@ class KafkaBackend(Backend, QueueBackend):
     temp_consumer: KafkaConsumer | None = None
     try:
       try:
-        auto_offset_reset = self.config.auto_offset_reset
+        auto_offset_reset = snapshot.auto_offset_reset
         temp_consumer = KafkaConsumer(
-          bootstrap_servers=self._bootstrap_servers(),
-          group_id=self.config.group_id,
+          bootstrap_servers=snapshot.bootstrap_servers,
+          group_id=snapshot.group_id,
           auto_offset_reset=auto_offset_reset,
           enable_auto_commit=False,
-          **self._build_client_security_config(),
+          **self._build_client_security_config(snapshot),
         )
         partitions = temp_consumer.partitions_for_topic(topic_name)
         if not partitions:
