@@ -999,6 +999,27 @@ def test_mongodb_uri_tls_policy_options_are_rejected(query):
 @pytest.mark.parametrize(
   "query",
   [
+    "proxyHost=proxy-secret.example.test",
+    "proxyPort=1080;proxyUsername=proxy-user",
+    "proxyPassword=proxy-secret",
+    "PrOxYhOsT=proxy-secret.example.test&PROXYPORT=1080",
+  ],
+)
+def test_mongodb_uri_proxy_options_are_rejected_without_leakage(query):
+  """Proxy authority and credentials stay outside an untyped URI channel."""
+  from scrapy_extension.settings import MongoDBSettings
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBSettings(uri=f"mongodb://db.example.test:27017/?{query}")
+
+  assert exc_info.value.setting_name == "uri"
+  assert "proxy-secret" not in str(exc_info.value)
+  assert "proxy-secret" not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+  "query",
+  [
     "authMechanismProperties=AWS_SESSION_TOKEN:uri-secret",
     "tlsCertificateKeyFilePassword=uri-secret",
   ],

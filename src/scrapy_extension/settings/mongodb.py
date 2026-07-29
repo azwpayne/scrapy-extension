@@ -206,6 +206,14 @@ _INSECURE_TLS_URI_OPTIONS: frozenset[str] = frozenset(
     "tlsinsecure",
   }
 )
+_MONGODB_PROXY_URI_OPTIONS: frozenset[str] = frozenset(
+  {
+    "proxyhost",
+    "proxyport",
+    "proxyusername",
+    "proxypassword",
+  }
+)
 _EXTERNAL_AUTH_MECHANISMS: frozenset[str] = frozenset(
   {"GSSAPI", "MONGODB-AWS", "MONGODB-X509"}
 )
@@ -283,6 +291,11 @@ def validate_mongodb_uri(value: object) -> str:
   option_names = {
     name for name, _value in _mongodb_uri_option_pairs(parsed.query)
   }
+  if option_names & _MONGODB_PROXY_URI_OPTIONS:
+    raise ConfigurationError(
+      "MongoDB URI must not contain proxy query options.",
+      setting_name="uri",
+    )
   if option_names & _INSECURE_TLS_URI_OPTIONS:
     raise ConfigurationError(
       "MongoDB URI must not disable TLS certificate or hostname verification.",

@@ -181,6 +181,14 @@ def test_mongodb_connect_rejects_mutated_unacknowledged_w_before_sdk_io(mocker):
       "runtime-uri-secret",
     ),
     (
+      "mongodb://db.example.test:27017/?proxyHost=runtime-uri-secret",
+      "runtime-uri-secret",
+    ),
+    (
+      "mongodb://db.example.test:27017/?proxyPassword=runtime-uri-secret",
+      "runtime-uri-secret",
+    ),
+    (
       "mongodb://db.example.test:27017/#?tlsAllowInvalidHostnames=true",
       "runtime-uri-secret",
     ),
