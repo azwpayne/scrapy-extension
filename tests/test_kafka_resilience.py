@@ -99,7 +99,7 @@ def test_ack_token_eq_true_for_equal_tokens_and_hash_stable() -> None:
 
 def test_push_raises_when_producer_becomes_none(mocker) -> None:
   """Lines 454-455: ``is_connected()`` passed but the producer became None
-  before ``send()`` (concurrent disconnect) → BackendConnectionError
+  before ``send()`` (concurrent disconnect) → the public static ``QueueError``
   rather than ``AttributeError`` on ``None.send()``. ``_ensure_topic_exists``
   is stubbed so the topic-check (which would itself raise on a None admin
   client) doesn't preempt the producer-None guard under test."""
@@ -107,8 +107,11 @@ def test_push_raises_when_producer_becomes_none(mocker) -> None:
   backend._producer = None
   mocker.patch.object(backend, "is_connected", return_value=True)
   mocker.patch.object(backend, "_ensure_topic_exists")  # don't let topic-check preempt
-  with pytest.raises(BackendConnectionError, match="producer is None"):
+  with pytest.raises(QueueError) as exc_info:
     backend.push("q", b"x")
+  assert str(exc_info.value) == "Failed to push Kafka message."
+  assert exc_info.value.queue_name is None
+  assert exc_info.value.operation == "push"
 
 
 def test_ensure_topic_exists_raises_when_admin_client_is_none() -> None:
@@ -372,8 +375,10 @@ def test_queue_len_raises_on_temp_consumer_kafka_error(mocker) -> None:
   assert exc_info.value.operation == "queue_len"
 
 
-def test_queue_len_preserves_kafka_error_when_failed_probe_close_interrupts(mocker) -> None:
-  """A cleanup interrupt cannot replace the failed depth query's QueueError."""
+def test_queue_len_preserves_terminal_error_when_failed_probe_close_interrupts(
+  mocker,
+) -> None:
+  """A cleanup interrupt cannot replace the terminal failed-depth error."""
   backend = _backend()
   backend._consumer = None
   primary = KafkaError("end_offsets boom")
@@ -387,7 +392,9 @@ def test_queue_len_preserves_kafka_error_when_failed_probe_close_interrupts(mock
   with pytest.raises(QueueError) as raised:
     backend.queue_len("q")
 
-  assert raised.value.__cause__ is primary
+  assert str(raised.value) == "Failed to inspect Kafka queue."
+  assert raised.value.__cause__ is None
+  assert raised.value.__context__ is None
   assert raised.value.operation == "queue_len"
   mock_temp.close.assert_called_once_with()
 

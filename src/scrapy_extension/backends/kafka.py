@@ -60,6 +60,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
 )
 from scrapy_extension.settings import KafkaMode, KafkaSettings
 from scrapy_extension.settings._broker_endpoints import (
@@ -92,6 +93,16 @@ def _validate_topic_name(name: str) -> None:
         )
 
 
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a public queue argument before its terminal error boundary."""
+  _validate_topic_name(queue_name)
+
+
 logger = logging.getLogger(__name__)
 
 _KAFKA_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
@@ -116,6 +127,28 @@ _KAFKA_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
   {
     f"Failed to connect to Kafka ({mode.value})."
     for mode in KafkaMode
+  }
+)
+_KAFKA_CLEAR_QUEUE_UNSUPPORTED_MESSAGE = (
+  "Kafka clear_queue is unsupported: asynchronous topic delete/recreate "
+  "cannot preserve active consumer-group offsets or protect messages "
+  "accepted after clear returns. Stop and drain the queue with an "
+  "operator-controlled Kafka maintenance workflow instead."
+)
+_KAFKA_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Kafka create-topics response has no valid topic_errors list.",
+    "Kafka create-topics response contains a malformed topic entry.",
+    "Kafka create-topics response did not identify the requested topic.",
+    "Kafka create-topics response contains an invalid error code.",
+    "Existing Kafka topic policy does not match the configured queue policy.",
+    "Kafka returned an invalid end offset.",
+    "Kafka returned an invalid beginning offset.",
+    "Kafka returned invalid offset metadata.",
+    "Kafka consumer group has no committed offset and "
+    "auto_offset_reset='none'.",
+    "Kafka returned an invalid committed offset.",
+    _KAFKA_CLEAR_QUEUE_UNSUPPORTED_MESSAGE,
   }
 )
 
@@ -1135,6 +1168,12 @@ class KafkaBackend(Backend, QueueBackend):
       raise policy_error()
 
   # QueueBackend implementation
+  @queue_operation_error_boundary(
+    "push",
+    "Failed to push Kafka message.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to priority queue.
 
@@ -1169,6 +1208,12 @@ class KafkaBackend(Backend, QueueBackend):
         operation="push",
       ) from e
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop Kafka message.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
@@ -1196,6 +1241,12 @@ class KafkaBackend(Backend, QueueBackend):
       self._last_record = record
       return cast(bytes, record.value)
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop Kafka message.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
   ) -> tuple[bytes | None, Any | None]:
@@ -1321,6 +1372,11 @@ class KafkaBackend(Backend, QueueBackend):
       ) from e
     return None
 
+  @queue_operation_error_boundary(
+    "ack",
+    "Failed to ack Kafka message.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+  )
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message.
 
@@ -1441,6 +1497,11 @@ class KafkaBackend(Backend, QueueBackend):
       self._watermarks.pop(topic_partition, None)
       self._high_water.pop(topic_partition, None)
 
+  @queue_operation_error_boundary(
+    "nack",
+    "Failed to nack Kafka message.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+  )
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Nack a popped message without committing its offset.
 
@@ -1489,6 +1550,12 @@ class KafkaBackend(Backend, QueueBackend):
         raise QueueError(msg, operation="nack") from e
       self._last_record = None
 
+  @queue_operation_error_boundary(
+    "queue_len",
+    "Failed to inspect Kafka queue.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
 
@@ -1654,6 +1721,12 @@ class KafkaBackend(Backend, QueueBackend):
       total += max(0, end - start)
     return total
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    "Failed to clear Kafka queue.",
+    safe_messages=_KAFKA_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Reject Kafka clear because delete/recreate is not linearizable.
 
@@ -1668,10 +1741,7 @@ class KafkaBackend(Backend, QueueBackend):
     """
     _validate_topic_name(queue_name)
     raise QueueError(
-      "Kafka clear_queue is unsupported: asynchronous topic delete/recreate "
-      "cannot preserve active consumer-group offsets or protect messages "
-      "accepted after clear returns. Stop and drain the queue with an "
-      "operator-controlled Kafka maintenance workflow instead.",
+      _KAFKA_CLEAR_QUEUE_UNSUPPORTED_MESSAGE,
       queue_name=queue_name,
       operation="clear_queue",
     )

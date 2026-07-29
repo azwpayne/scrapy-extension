@@ -1265,8 +1265,8 @@ class TestKafkaBackendPush:
 
     with pytest.raises(QueueError) as exc_info:
       backend.push("testq", b"item")
-    assert "Failed to push to queue" in str(exc_info.value)
-    assert exc_info.value.queue_name == "testq"
+    assert str(exc_info.value) == "Failed to push Kafka message."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "push"
 
 
@@ -1473,8 +1473,8 @@ class TestKafkaBackendPop:
 
     with pytest.raises(QueueError) as exc_info:
       backend.pop("testq")
-    assert "Failed to pop from queue" in str(exc_info.value)
-    assert exc_info.value.queue_name == "testq"
+    assert str(exc_info.value) == "Failed to pop Kafka message."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "pop"
 
   def test_pop_does_not_auto_ack_after_round_12(self, mocker):
@@ -1614,7 +1614,7 @@ class TestKafkaBackendQueueLen:
     with pytest.raises(QueueError) as exc_info:
       backend.queue_len("cold")
 
-    assert exc_info.value.queue_name == "cold"
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "queue_len"
 
   def test_live_consumer_depth_uses_committed_not_fetched_position(self, mocker):
@@ -1832,7 +1832,8 @@ class TestKafkaBackendQueueLen:
 
     with pytest.raises(QueueError) as exc_info:
       backend.queue_len("testq")
-    assert exc_info.value.queue_name == "testq"
+    assert str(exc_info.value) == "Failed to inspect Kafka queue."
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "queue_len"
 
   def test_queue_len_raises_on_kafka_error_temp_consumer(self, mocker):
@@ -1894,7 +1895,7 @@ class TestKafkaBackendClearQueue:
     with pytest.raises(QueueError, match="Kafka clear_queue is unsupported") as exc_info:
       backend.clear_queue("testq")
 
-    assert exc_info.value.queue_name == "testq"
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "clear_queue"
 
 
