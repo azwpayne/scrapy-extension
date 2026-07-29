@@ -5,7 +5,10 @@ import traceback
 import pytest
 
 from scrapy_extension.backends.base import BackendType
-from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.connectors import (
+  ConnectionManager,
+  _rebuild_connect_attempt_error,
+)
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 
 
@@ -77,6 +80,56 @@ def test_connection_manager_rejects_hostile_outer_inputs_without_dispatch():
     _assert_package_traceback_locals_are_redacted(error, marker)
 
   assert calls == []
+
+
+def test_rebuild_lazy_attempt_errors_never_reuses_raw_failure_graph():
+  """Shared lazy-attempt errors are new, static objects for every safe type."""
+  marker = "lazy-attempt-error-rebuild-secret-marker"
+
+  import_error = _rebuild_connect_attempt_error(ImportError(marker))
+  assert isinstance(import_error, ImportError)
+  assert str(import_error) == (
+    "Selected backend could not be initialized because an import failed."
+  )
+  assert marker not in repr(import_error)
+
+  connection_error = _rebuild_connect_attempt_error(
+    BackendConnectionError(marker, backend_type=marker)
+  )
+  assert isinstance(connection_error, BackendConnectionError)
+  assert str(connection_error) == (
+    "Connection manager failed to connect to the selected backend."
+  )
+  assert connection_error.backend_type == "connection-manager"
+  assert marker not in repr(connection_error.__dict__)
+
+  safe_configuration_error = _rebuild_connect_attempt_error(
+    ConfigurationError(
+      "Invalid backend setting 'retry_attempts'.",
+      setting_name="retry_attempts",
+    )
+  )
+  assert isinstance(safe_configuration_error, ConfigurationError)
+  assert str(safe_configuration_error) == "Invalid backend setting 'retry_attempts'."
+  assert safe_configuration_error.setting_name == "retry_attempts"
+
+  unsafe_configuration_error = _rebuild_connect_attempt_error(
+    ConfigurationError(marker, setting_name=marker, setting_value=marker)
+  )
+  assert isinstance(unsafe_configuration_error, ConfigurationError)
+  assert str(unsafe_configuration_error) == "Connection manager configuration is invalid."
+  assert unsafe_configuration_error.setting_name == "configuration"
+  assert unsafe_configuration_error.setting_value is None
+  assert marker not in repr(unsafe_configuration_error.__dict__)
+
+  unexpected_error = _rebuild_connect_attempt_error(RuntimeError(marker))
+  assert isinstance(unexpected_error, ConfigurationError)
+  assert str(unexpected_error) == "Connection manager configuration is invalid."
+  assert unexpected_error.setting_name == "configuration"
+  assert marker not in repr(unexpected_error.__dict__)
+
+  interrupt = KeyboardInterrupt(marker)
+  assert _rebuild_connect_attempt_error(interrupt) is interrupt
 
 
 def test_get_manager_discards_failed_deepcopy_snapshot():
@@ -1210,6 +1263,248 @@ def test_backend_property_concurrent_first_connect_single_connect(mocker):
   assert all(r is mock_backend for r in results)
   # Exactly one _create_backend call (single connect).
   assert ConnectionManager._create_backend.call_count == 1
+
+
+def test_lazy_owner_failure_publishes_before_retry_monitor_reentry(mocker):
+  """A failed lazy owner must wake peers before ``on_retry`` can re-enter.
+
+  Before Round 43A, the callback below waited on the owner's attempt event
+  while the owner waited for the callback to return.  Run it in a daemon
+  thread so a regression fails promptly instead of stalling the test process.
+  """
+  import threading
+
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 1, "retry_delay": 0},
+  )
+  failed = mocker.MagicMock(name="failed-backend")
+  failed.connect.side_effect = OSError("temporary failure")
+  mocker.patch.object(manager, "_create_backend", return_value=failed)
+  mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+  monitor_states: list[tuple[bool, bool]] = []
+  reentrant_errors: list[BackendConnectionError] = []
+
+  class _Monitor:
+    def on_connect(self, backend_type: str) -> None:
+      del backend_type
+
+    def on_disconnect(self, backend_type: str, reason: object) -> None:
+      del backend_type, reason
+
+    def on_retry(self, backend_type: str, attempt: int) -> None:
+      del backend_type, attempt
+      monitor_states.append(
+        (manager._connecting, manager._connected_event.is_set())
+      )
+      try:
+        _ = manager.backend
+      except BackendConnectionError as error:
+        reentrant_errors.append(error)
+
+  manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+  outcomes: list[BaseException] = []
+
+  def materialize() -> None:
+    try:
+      _ = manager.backend
+    except BaseException as error:  # noqa: BLE001 - capture owner outcome
+      outcomes.append(error)
+
+  owner = threading.Thread(target=materialize, daemon=True)
+  owner.start()
+  owner.join(timeout=2.0)
+
+  assert not owner.is_alive(), "lazy owner deadlocked in its retry monitor"
+  assert failed.connect.call_count == 2
+  assert monitor_states == [(False, True)]
+  assert len(outcomes) == len(reentrant_errors) == 1
+  assert isinstance(outcomes[0], BackendConnectionError)
+  assert str(reentrant_errors[0]) == str(outcomes[0])
+  assert manager._connecting is False
+
+
+def test_lazy_owner_publishes_sanitized_mutated_config_error_to_peer(mocker):
+  """Peer and retry monitor never receive a mutated-settings failure graph."""
+  import threading
+
+  marker = "lazy-owner-mutated-config-secret-marker"
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 1, "retry_delay": 0},
+  )
+  first_attempt_entered = threading.Event()
+  allow_first_failure = threading.Event()
+  attempts = 0
+
+  def attempt_connection() -> None:
+    nonlocal attempts
+    attempts += 1
+    if attempts == 1:
+      first_attempt_entered.set()
+      assert allow_first_failure.wait(timeout=2.0), "test did not release owner"
+      raise OSError("temporary failure")
+    raw_attempts = manager.settings["retry_attempts"]
+    raise ConfigurationError(
+      f"retry_attempts rejected: {raw_attempts}",
+      setting_name="retry_attempts",
+      setting_value=raw_attempts,
+    )
+
+  mocker.patch.object(manager, "_attempt_connection", side_effect=attempt_connection)
+  mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+  outcomes: dict[str, BaseException] = {}
+  monitor_states: list[tuple[bool, bool]] = []
+  reentrant_errors: list[ConfigurationError] = []
+
+  class _Monitor:
+    def on_connect(self, backend_type: str) -> None:
+      del backend_type
+
+    def on_disconnect(self, backend_type: str, reason: object) -> None:
+      del backend_type, reason
+
+    def on_retry(self, backend_type: str, attempt: int) -> None:
+      del backend_type, attempt
+      monitor_states.append(
+        (manager._connecting, manager._connected_event.is_set())
+      )
+      try:
+        _ = manager.backend
+      except ConfigurationError as error:
+        reentrant_errors.append(error)
+
+  manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+
+  def materialize(label: str) -> None:
+    try:
+      _ = manager.backend
+    except BaseException as error:  # noqa: BLE001 - inspect owner and peer
+      outcomes[label] = error
+
+  owner = threading.Thread(target=materialize, args=("owner",), daemon=True)
+  owner.start()
+  assert first_attempt_entered.wait(timeout=2.0), "owner did not start attempt"
+  attempt = manager._connect_attempt
+  assert attempt is not None
+  peer_waiting = threading.Event()
+  original_wait = attempt.event.wait
+
+  def observed_wait(timeout: float | None = None) -> bool:
+    peer_waiting.set()
+    return original_wait(timeout)
+
+  mocker.patch.object(attempt.event, "wait", side_effect=observed_wait)
+  peer = threading.Thread(target=materialize, args=("peer",), daemon=True)
+  peer.start()
+  assert peer_waiting.wait(timeout=2.0), "peer did not join owner's attempt"
+
+  manager.settings["retry_attempts"] = marker
+  allow_first_failure.set()
+  owner.join(timeout=2.0)
+  peer.join(timeout=2.0)
+
+  assert not owner.is_alive()
+  assert not peer.is_alive()
+  assert set(outcomes) == {"owner", "peer"}
+  assert attempts == 2
+  assert monitor_states == [(False, True)]
+  assert len(reentrant_errors) == 1
+  for error in outcomes.values():
+    assert isinstance(error, ConfigurationError)
+    assert str(error) == "Connection manager configuration is invalid."
+    assert error.setting_name == "retry_attempts"
+    assert error.setting_value is None
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_package_traceback_locals_are_redacted(error, marker)
+
+  reentrant_error = reentrant_errors[0]
+  assert str(reentrant_error) == "Connection manager configuration is invalid."
+  assert reentrant_error.setting_name == "retry_attempts"
+  assert reentrant_error.setting_value is None
+  assert marker not in repr(reentrant_error.__dict__)
+  assert marker not in "".join(traceback.format_exception(reentrant_error))
+  assert reentrant_error.__cause__ is None
+  assert reentrant_error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(reentrant_error, marker)
+
+  published_error = attempt.error
+  assert isinstance(published_error, ConfigurationError)
+  assert str(published_error) == "Connection manager configuration is invalid."
+  assert published_error.setting_name == "retry_attempts"
+  assert published_error.setting_value is None
+  assert published_error.__traceback__ is None
+  assert published_error.__cause__ is None
+  assert published_error.__context__ is None
+  assert marker not in repr(published_error.__dict__)
+
+
+def test_lazy_owner_retry_success_publishes_before_monitor_reentry(mocker):
+  """Retry and connect hooks see the completed lazy result, not its owner."""
+  import threading
+
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 1, "retry_delay": 0},
+  )
+  failed = mocker.MagicMock(name="failed-backend")
+  failed.connect.side_effect = OSError("temporary failure")
+  recovered = mocker.MagicMock(name="recovered-backend")
+  mocker.patch.object(
+    manager,
+    "_create_backend",
+    side_effect=[failed, recovered],
+  )
+  mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+  monitor_states: list[tuple[str, bool, bool]] = []
+  reentries: list[object] = []
+  connect_reentries: list[str] = []
+
+  class _Monitor:
+    def on_connect(self, backend_type: str) -> None:
+      del backend_type
+      monitor_states.append(
+        ("connect", manager._connecting, manager._connected_event.is_set())
+      )
+      reentries.append(manager.backend)
+      manager.connect()
+      connect_reentries.append("connect")
+
+    def on_disconnect(self, backend_type: str, reason: object) -> None:
+      del backend_type, reason
+
+    def on_retry(self, backend_type: str, attempt: int) -> None:
+      del backend_type, attempt
+      monitor_states.append(
+        ("retry", manager._connecting, manager._connected_event.is_set())
+      )
+      reentries.append(manager.backend)
+      manager.connect()
+      connect_reentries.append("retry")
+
+  manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+  outcomes: list[BaseException | object] = []
+
+  def materialize() -> None:
+    try:
+      outcomes.append(manager.backend)
+    except BaseException as error:  # noqa: BLE001 - capture owner outcome
+      outcomes.append(error)
+
+  owner = threading.Thread(target=materialize, daemon=True)
+  owner.start()
+  owner.join(timeout=2.0)
+
+  assert not owner.is_alive(), "lazy owner deadlocked in its lifecycle monitor"
+  assert outcomes == [recovered]
+  assert monitor_states == [("retry", False, True), ("connect", False, True)]
+  assert reentries == [recovered, recovered]
+  assert connect_reentries == ["retry", "connect"]
+  assert failed.connect.call_count == recovered.connect.call_count == 1
+  assert manager._connecting is False
 
 
 def test_direct_concurrent_connect_calls_create_one_backend(mocker):

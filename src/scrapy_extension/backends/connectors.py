@@ -806,6 +806,21 @@ class _ConnectionAttempt:
     self.error: BaseException | None = None
 
 
+class _LazyConnectionContext(threading.local):
+  """Per-thread lazy-owner state used while lifecycle hooks are dispatched.
+
+  ``ConnectionManager.connect()`` remains a public, independently callable
+  method.  A thread-local marker distinguishes the lazy ``backend`` owner
+  from a concurrent direct caller, and lets a lifecycle callback read the
+  result that its owner has already published without starting a recursive
+  connection attempt.
+  """
+
+  def __init__(self) -> None:
+    self.owner_attempt: _ConnectionAttempt | None = None
+    self.dispatch_attempt: _ConnectionAttempt | None = None
+
+
 def _normalized_manager_backend_type(value: object) -> str | None:
   """Accept only a bundled enum member or an exact backend registry key."""
   if isinstance(value, BackendType):
@@ -927,6 +942,59 @@ def _manager_terminal_error_boundary(
     return wrapped
 
   return decorate
+
+
+def _rebuild_connect_attempt_error(error: BaseException) -> BaseException:
+  """Build the terminal ``connect()`` contract without raising ``error``.
+
+  A lazy attempt stores one result for multiple waiters.  Raising that shared
+  object, even through a decorator, attaches a traceback to the prototype and
+  can retain the owner's mutable settings.  This mirrors the two public
+  ``connect()`` boundaries by inspecting only exact built-in error types and
+  returning a fresh, traceback-free replacement.
+  """
+  if isinstance(error, ImportError):
+    return ImportError(
+      "Selected backend could not be initialized because an import failed."
+    )
+
+  if isinstance(error, BackendConnectionError):
+    return BackendConnectionError(
+      _safe_manager_connection_message(error),
+      backend_type=_safe_manager_connection_backend_type(error),
+    )
+
+  if type(error) is ConfigurationError:
+    raw_args = error.args
+    raw_message = (
+      raw_args[0]
+      if type(raw_args) is tuple and len(raw_args) == 1
+      else None
+    )
+    message = "Connection manager configuration is invalid."
+    if type(raw_message) is str:
+      try:
+        if _is_safe_manager_configuration_message(raw_message):
+          message = raw_message
+      except Exception:  # noqa: BLE001 - fail closed on custom error state
+        pass
+    setting_name = error.setting_name
+    if (
+      type(setting_name) is not str
+      or setting_name not in _MANAGER_CONFIGURATION_SETTING_NAMES
+    ):
+      setting_name = "configuration"
+    return ConfigurationError(message, setting_name=setting_name)
+
+  if isinstance(error, Exception):
+    return ConfigurationError(
+      "Connection manager configuration is invalid.",
+      setting_name="configuration",
+    )
+
+  # Control-flow ``BaseException`` values intentionally retain their public
+  # semantics; they are never used as normal connection-attempt diagnostics.
+  return error
 
 
 def _registry_type_name(value: object) -> str:
@@ -1188,6 +1256,11 @@ class ConnectionManager:
     self._connecting: bool = False
     self._connected_event = threading.Event()
     self._connect_attempt: _ConnectionAttempt | None = None
+    # ``backend`` owners mark only their own thread here before calling the
+    # public ``connect()`` method.  That lets ``connect()`` resolve and signal
+    # this lazy attempt before it invokes a user-supplied lifecycle monitor,
+    # without changing the independent direct-connect path.
+    self._lazy_connection_context = _LazyConnectionContext()
     # Circuit-breaker holder. Lazily constructed on first
     # ``get_*_backend()`` call from the env-loaded ``Settings``
     # (``SCRAPY_CIRCUIT_BREAKER_ENABLED``). ``None`` while disabled — which
@@ -1577,16 +1650,124 @@ class ConnectionManager:
         ConfigurationError: If generic or backend-specific settings are invalid.
         ImportError: If the selected backend's optional dependency is missing.
     """
+    # A lifecycle hook may itself invoke ``connect()``.  During a lazy-owner
+    # callback, the owner has already published a terminal result, so replay
+    # that result instead of starting a nested transaction from the callback.
+    if self._lazy_connection_context.dispatch_attempt is not None:
+      self._backend_from_reentrant_lazy_monitor()
+      return
+
     monitor_events: list[_MonitorEvent] = []
+    lazy_attempt = self._lazy_connection_context.owner_attempt
+    if lazy_attempt is not None:
+      # Publish the result, then leave the exception handler before dispatch.
+      # A callback that re-enters ``backend`` must not inherit the owner's raw
+      # failure as ``__context__`` merely because the monitor ran in a
+      # ``finally`` while that failure was being propagated.
+      terminal_error: BaseException | None = None
+      try:
+        with self._connect_lock:
+          self._connect_with_retries(monitor_events)
+      except BaseException as error:
+        terminal_error = error
+      else:
+        terminal_error = self._complete_lazy_connection_attempt(lazy_attempt, None)
+
+      if terminal_error is not None:
+        terminal_error = self._complete_lazy_connection_attempt(
+          lazy_attempt,
+          terminal_error,
+        )
+        assert terminal_error is not None
+      # Monitor implementations are user-extensible and may call back into
+      # the manager. Dispatch after both the connection transaction and lazy
+      # attempt publication have completed, outside every manager lock.
+      self._dispatch_monitor_events(monitor_events, lazy_attempt)
+      if terminal_error is not None:
+        raise _rebuild_connect_attempt_error(terminal_error)
+      return
+
     try:
       with self._connect_lock:
         self._connect_with_retries(monitor_events)
     finally:
-      # Monitor implementations are user-extensible and may call back into
-      # the manager. Dispatch only after the complete connection transaction
-      # releases ``_connect_lock``; otherwise on_connect/on_retry/on_disconnect
-      # can self-deadlock on a same-thread re-entrant connect().
+      # Preserve direct ``connect()`` monitor ordering and behavior. This
+      # path has no lazy owner event to publish before its callbacks run.
       self._dispatch_monitor_events(monitor_events)
+
+  def _complete_lazy_connection_attempt(
+    self,
+    attempt: _ConnectionAttempt,
+    connect_error: BaseException | None,
+  ) -> BaseException | None:
+    """Publish one lazy owner result before its monitor callbacks run.
+
+    ``connect()`` invokes this after releasing ``_connect_lock`` and before
+    dispatching its deferred lifecycle events.  The owner property repeats
+    the call after ``connect()`` returns so mocked or third-party overrides of
+    ``connect()`` retain the same defensive completion contract.  The event
+    makes the operation idempotent: a callback's control-flow exception can
+    never undo the result already delivered to waiting peers.
+    """
+    # A mocked or third-party ``connect()`` override can bypass the public
+    # decorator stack.  Never let that raw failure become the shared result
+    # observed by waiters or a reentrant monitor callback.
+    if connect_error is not None:
+      connect_error = _rebuild_connect_attempt_error(connect_error)
+
+    with self._lock:
+      if attempt.event.is_set():
+        return attempt.error
+
+      if connect_error is None and self._retired:
+        connect_error = BackendConnectionError(
+          "ConnectionManager was released while connecting",
+          backend_type=str(self.backend_type),
+        )
+
+      if connect_error is None:
+        # Capture the published handle exactly once under the same state lock
+        # used by reconnect/close. Returning a second ``self._backend`` read
+        # allowed reconnect to detach it after a non-null guard, leaking None
+        # through this property and into interface-proxy construction.
+        if self._backend is None:
+          connect_error = BackendConnectionError(
+            "connect() did not produce a backend",
+            backend_type=str(self.backend_type),
+          )
+
+      attempt.error = connect_error
+      self._connecting = False
+      attempt.event.set()
+      return connect_error
+
+  def _backend_from_reentrant_lazy_monitor(self) -> Backend | None:
+    """Return the result published for the active lazy monitor callback.
+
+    A retry callback on a terminally failed lazy attempt must observe that
+    attempt's typed error rather than electing itself as a new owner.  On a
+    successful attempt it receives the exact backend that was published for
+    the owner and peer cohort.  Calls outside this narrow callback context
+    return ``None`` and follow the ordinary fast/slow accessor paths.
+    """
+    attempt = self._lazy_connection_context.dispatch_attempt
+    if attempt is None:
+      return None
+    if attempt.error is not None:
+      raise _rebuild_connect_attempt_error(attempt.error)
+    with self._lock:
+      if self._retired:
+        raise BackendConnectionError(
+          "ConnectionManager was released while connecting",
+          backend_type=str(self.backend_type),
+        )
+      backend = self._backend
+    if backend is not None:
+      return backend
+    raise BackendConnectionError(
+      "connect() did not produce a backend",
+      backend_type=str(self.backend_type),
+    )
 
   def _connect_with_retries(self, monitor_events: list[_MonitorEvent]) -> None:
     """Run one serialized transaction and record deferred monitor events."""
@@ -1994,10 +2175,24 @@ class ConnectionManager:
         hook_name,
       )
 
-  def _dispatch_monitor_events(self, events: list[_MonitorEvent]) -> None:
-    """Dispatch ordered lifecycle events after manager locks are released."""
-    for hook_name, args in events:
-      self._notify_monitor(hook_name, *args)
+  def _dispatch_monitor_events(
+    self,
+    events: list[_MonitorEvent],
+    lazy_attempt: _ConnectionAttempt | None = None,
+  ) -> None:
+    """Dispatch ordered lifecycle events after manager locks are released.
+
+    Direct calls keep the original behavior.  A lazy owner's callback gets a
+    thread-local view of its already-published result so reentry cannot join
+    an owner that is currently waiting for the callback to return.
+    """
+    previous_attempt = self._lazy_connection_context.dispatch_attempt
+    self._lazy_connection_context.dispatch_attempt = lazy_attempt
+    try:
+      for hook_name, args in events:
+        self._notify_monitor(hook_name, *args)
+    finally:
+      self._lazy_connection_context.dispatch_attempt = previous_attempt
 
   @property
   @_manager_terminal_error_boundary()
@@ -2037,6 +2232,10 @@ class ConnectionManager:
         BackendConnectionError: If connection fails or ``connect()``
             violates its contract (returns without setting ``_backend``).
     """
+    reentrant_backend = self._backend_from_reentrant_lazy_monitor()
+    if reentrant_backend is not None:
+      return reentrant_backend
+
     # Fast path: lock-free read. The second terminal-state check closes the
     # common ordering where close() retires the manager between the first
     # check and the backend read. The slow path remains the synchronization
@@ -2075,43 +2274,38 @@ class ConnectionManager:
       # Wait for the owner to resolve connect() — without holding _lock.
       attempt.event.wait()
       if attempt.error is not None:
-        raise attempt.error
+        raise _rebuild_connect_attempt_error(attempt.error)
 
     # Owner path: connect WITHOUT holding _lock so the retry-loop
     # time.sleep backoff does not block peer threads (A2).
     connect_error: BaseException | None = None
+    self._lazy_connection_context.owner_attempt = attempt
     try:
       self.connect()
     except BaseException as e:  # noqa: BLE001 - re-signal to all waiters
       connect_error = e
-    published_backend: Backend | None = None
-    with self._lock:
-      # A final-holder close can win after connect() publishes a backend but
-      # before this owner fans the result out. close() has already detached
-      # and disconnected that backend, so convert the apparent success into
-      # a terminal error before waking peers.
-      if connect_error is None and self._retired:
-        connect_error = BackendConnectionError(
-          "ConnectionManager was released while connecting",
-          backend_type=str(self.backend_type),
-        )
-      if connect_error is None:
-        # Capture the published handle exactly once under the same state lock
-        # used by reconnect/close. Returning a second ``self._backend`` read
-        # allowed reconnect to detach it after a non-null guard, leaking None
-        # through this property and into interface-proxy construction.
-        published_backend = self._backend
-        if published_backend is None:
-          connect_error = BackendConnectionError(
-            "connect() did not produce a backend",
-            backend_type=str(self.backend_type),
-          )
-      attempt.error = connect_error
-      self._connecting = False
-      attempt.event.set()
+    finally:
+      self._lazy_connection_context.owner_attempt = None
+
+    # The real ``connect()`` path publishes before its monitor callbacks; a
+    # mocked override does not know about that internal handoff, so complete
+    # defensively here as well.  The attempt event makes this idempotent and
+    # returns the exact safe terminal result that all already-waiting peers
+    # received.
+    connect_error = self._complete_lazy_connection_attempt(
+      attempt,
+      connect_error,
+    )
 
     if connect_error is not None:
-      raise connect_error
+      raise _rebuild_connect_attempt_error(connect_error)
+
+    with self._lock:
+      # Capture the published handle exactly once under the same state lock
+      # used by reconnect/close. Returning a second ``self._backend`` read
+      # allowed reconnect to detach it after a non-null guard, leaking None
+      # through this property and into interface-proxy construction.
+      published_backend = self._backend
 
     # Keep the local-value guard explicit so the contract remains true under
     # future refactors and ``python -O`` as well as in the static type system.
