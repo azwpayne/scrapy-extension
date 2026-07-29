@@ -19,6 +19,11 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from scrapy_extension.backends.base import Backend, BackendType, QueueBackend
+from scrapy_extension.backends.circuit_breaker import (
+  BreakerState,
+  CircuitBreaker,
+  wrap_queue_backend,
+)
 from scrapy_extension.backends.connectors import (
   SET_CAPABLE_BACKENDS,
   STORAGE_CAPABLE_BACKENDS,
@@ -36,6 +41,59 @@ from scrapy_extension.settings import RocketMQMode, RocketMQSettings
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_value_is_redacted(
+  value: object, marker: str, seen: set[int] | None = None
+) -> None:
+  """Walk a bounded public exception graph without trusting ``repr``."""
+  if seen is None:
+    seen = set()
+  value_id = id(value)
+  if value_id in seen:
+    return
+  seen.add(value_id)
+  if isinstance(value, str):
+    assert marker not in value
+    return
+  if isinstance(value, bytes):
+    assert marker.encode() not in value
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      _assert_value_is_redacted(key, marker, seen)
+      _assert_value_is_redacted(item, marker, seen)
+    return
+  if isinstance(value, (tuple, list, set, frozenset)):
+    for item in value:
+      _assert_value_is_redacted(item, marker, seen)
+    return
+  try:
+    attributes = vars(value)
+  except TypeError:
+    return
+  _assert_value_is_redacted(attributes, marker, seen)
+
+
+def _assert_capability_error_is_redacted(
+  error: BaseException, marker: str
+) -> None:
+  """Assert that a public static capability error has no backend graph."""
+  assert marker not in str(error)
+  assert marker not in repr(error.args)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  assert marker not in "".join(traceback.format_exception(error))
+
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+      for value in frame.f_locals.values():
+        _assert_value_is_redacted(value, marker)
+    trace = trace.tb_next
 
 
 def _patch_rocketmq(mocker):
@@ -1565,6 +1623,42 @@ def test_queue_len_reports_unsupported_risk1() -> None:
   backend = RocketMQBackend(RocketMQSettings())
   with pytest.raises(NotImplementedError, match="broker-side depth RPC"):
     backend.queue_len("test_queue")
+
+
+def test_queue_len_rebuilds_static_capability_error_without_backend_graph() -> None:
+  marker = "round44-rocketmq-depth-private-marker"
+  backend = RocketMQBackend(
+    RocketMQSettings(namesrv_address=f"{marker}.example:8081")
+  )
+  _reset_queue_len_warned()
+
+  with pytest.raises(NotImplementedError) as exc_info:
+    backend.queue_len(marker)
+
+  error = exc_info.value
+  assert type(error) is NotImplementedError
+  assert str(error) == "RocketMQ queue depth is unsupported: no broker-side depth RPC"
+  _assert_capability_error_is_redacted(error, marker)
+
+
+def test_queue_len_proxy_keeps_static_capability_error_and_breaker_neutral() -> None:
+  marker = "round44-rocketmq-depth-proxy-marker"
+  backend = RocketMQBackend(
+    RocketMQSettings(namesrv_address=f"{marker}.example:8081")
+  )
+  breaker = CircuitBreaker("rocketmq-capability-depth", failure_threshold=1)
+  proxy = wrap_queue_backend(backend, breaker)
+  _reset_queue_len_warned()
+
+  with pytest.raises(NotImplementedError) as exc_info:
+    proxy.queue_len(marker)
+
+  assert str(exc_info.value) == (
+    "RocketMQ queue depth is unsupported: no broker-side depth RPC"
+  )
+  assert breaker.state is BreakerState.CLOSED
+  assert breaker.failure_count == 0
+  _assert_capability_error_is_redacted(exc_info.value, marker)
 
 
 def test_queue_len_warns_once_risk1(caplog) -> None:

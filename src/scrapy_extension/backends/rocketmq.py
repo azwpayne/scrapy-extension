@@ -49,6 +49,7 @@ from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
   import_error_traceback_boundary,
+  not_implemented_error_boundary,
 )
 from scrapy_extension.settings import RocketMQSettings
 from scrapy_extension.settings._broker_endpoints import (
@@ -77,6 +78,9 @@ _ROCKETMQ_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
     "RocketMQBackend consumer initialization returned None",
     "Failed to connect to RocketMQ.",
   }
+)
+_ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE = (
+  "RocketMQ queue depth is unsupported: no broker-side depth RPC"
 )
 
 # Module-level warn-once flag for the unsupported-depth signal (Risk 1).
@@ -108,6 +112,16 @@ _MIN_LONG_POLL_DURATION = 5
 # a stalled broker. Mirrors the R21 cap discipline
 # (``CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S`` / ``_MAX_BACKOFF_S``).
 _MAX_REQUEST_TIMEOUT_S = 300
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a public queue argument before its terminal error boundary."""
+  _validate_key_name(queue_name, "queue_name")
 
 
 class _RocketMQAckToken:
@@ -811,6 +825,10 @@ class RocketMQBackend(Backend, QueueBackend):
         self._last_msg = None
         self._last_delivery = None
 
+  @not_implemented_error_boundary(
+    _ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE,
+    validator=_validate_queue_name_argument,
+  )
   def queue_len(self, queue_name: str) -> int:
     """Report that queue depth is unsupported by the RocketMQ client.
 
@@ -827,7 +845,6 @@ class RocketMQBackend(Backend, QueueBackend):
       NotImplementedError: Always; the client has no broker-side depth RPC.
     """
     global _queue_len_warned
-    _validate_key_name(queue_name, "queue_name")
     if not _queue_len_warned:
       _queue_len_warned = True
       # The warning only describes the already-established capability
@@ -841,9 +858,7 @@ class RocketMQBackend(Backend, QueueBackend):
         )
       except BaseException:
         pass
-    raise NotImplementedError(
-      "RocketMQ queue depth is unsupported: no broker-side depth RPC"
-    )
+    raise NotImplementedError(_ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE)
 
   def clear_queue(self, queue_name: str) -> None:
     """Report that RocketMQ broker-side queue purge is unsupported.

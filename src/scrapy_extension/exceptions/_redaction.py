@@ -144,6 +144,58 @@ def queue_operation_error_boundary(
   return decorate
 
 
+def not_implemented_error_boundary(
+  message: str,
+  *,
+  validator: Callable[..., None] | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+  """Rebuild one documented static capability error outside private frames.
+
+  Some public backend operations intentionally report an unavailable broker
+  capability with a fixed :class:`NotImplementedError`.  The literal itself is
+  safe, but raising it inside a backend method leaves that method's traceback
+  holding the backend object and caller-controlled operation arguments.  This
+  boundary keeps the documented concrete exception and exact fixed message
+  while releasing those frames first.
+
+  ``validator`` runs before the protected call so existing input-validation
+  failures retain their normal public contract.  Only the exact built-in
+  ``NotImplementedError`` is reconstructed: subclasses and every other
+  exception are unknown backend/plugin behavior and intentionally propagate
+  unchanged.  ``BaseException`` control flow is likewise never converted.
+  """
+
+  def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+      if validator is not None:
+        validator(*args, **kwargs)
+      caught_error: NotImplementedError | None = None
+      try:
+        return function(*args, **kwargs)
+      except NotImplementedError as error:
+        if type(error) is not NotImplementedError:
+          del args
+          del kwargs
+          raise
+        caught_error = error
+      except BaseException:
+        del args
+        del kwargs
+        raise
+
+      assert caught_error is not None
+      sanitized_error = NotImplementedError(message)
+      del args
+      del kwargs
+      del caught_error
+      raise sanitized_error
+
+    return wrapped
+
+  return decorate
+
+
 def sanitize_configuration_error(
   error: ConfigurationError,
   allowed_setting_names: Collection[str],

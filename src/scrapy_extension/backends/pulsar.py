@@ -50,6 +50,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  not_implemented_error_boundary,
   queue_operation_error_boundary,
 )
 from scrapy_extension.settings import PulsarMode, PulsarSettings
@@ -68,6 +69,9 @@ _PULSAR_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
 )
 _PULSAR_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
   {"clear_queue is not supported without the Pulsar admin API"}
+)
+_PULSAR_QUEUE_LEN_UNSUPPORTED_MESSAGE = (
+  "Pulsar queue depth requires the admin API, which is not configured"
 )
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
@@ -1074,6 +1078,10 @@ class PulsarBackend(Backend, QueueBackend):
       return self._consumer
     return None
 
+  @not_implemented_error_boundary(
+    _PULSAR_QUEUE_LEN_UNSUPPORTED_MESSAGE,
+    validator=_validate_queue_name_argument,
+  )
   def queue_len(self, queue_name: str) -> int:
     """Report that queue depth is unavailable without the Pulsar admin API.
 
@@ -1084,10 +1092,7 @@ class PulsarBackend(Backend, QueueBackend):
         ValueError: If queue_name contains invalid characters.
         NotImplementedError: Always; backlog depth requires the admin API.
     """
-    _validate_key_name(queue_name, "queue_name")
-    raise NotImplementedError(
-      "Pulsar queue depth requires the admin API, which is not configured"
-    )
+    raise NotImplementedError(_PULSAR_QUEUE_LEN_UNSUPPORTED_MESSAGE)
 
   @queue_operation_error_boundary(
     "clear_queue",

@@ -23,6 +23,11 @@ from scrapy_extension.backends.base import (
   SetBackend,
   StorageBackend,
 )
+from scrapy_extension.backends.circuit_breaker import (
+  BreakerState,
+  CircuitBreaker,
+  wrap_queue_backend,
+)
 from scrapy_extension.backends.pulsar import (
   PulsarBackend,
   _PulsarAckToken,
@@ -32,8 +37,62 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.exceptions._redaction import not_implemented_error_boundary
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import PulsarMode, PulsarSettings
+
+
+def _assert_value_is_redacted(
+  value: object, marker: str, seen: set[int] | None = None
+) -> None:
+  """Walk a bounded public exception graph without trusting ``repr``."""
+  if seen is None:
+    seen = set()
+  value_id = id(value)
+  if value_id in seen:
+    return
+  seen.add(value_id)
+  if isinstance(value, str):
+    assert marker not in value
+    return
+  if isinstance(value, bytes):
+    assert marker.encode() not in value
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      _assert_value_is_redacted(key, marker, seen)
+      _assert_value_is_redacted(item, marker, seen)
+    return
+  if isinstance(value, (tuple, list, set, frozenset)):
+    for item in value:
+      _assert_value_is_redacted(item, marker, seen)
+    return
+  try:
+    attributes = vars(value)
+  except TypeError:
+    return
+  _assert_value_is_redacted(attributes, marker, seen)
+
+
+def _assert_capability_error_is_redacted(
+  error: BaseException, marker: str
+) -> None:
+  """Assert that a public static capability error has no backend graph."""
+  assert marker not in str(error)
+  assert marker not in repr(error.args)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  assert marker not in "".join(traceback.format_exception(error))
+
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+      for value in frame.f_locals.values():
+        _assert_value_is_redacted(value, marker)
+    trace = trace.tb_next
 
 
 def _make_backend(**overrides) -> PulsarBackend:
@@ -1264,6 +1323,80 @@ class TestPulsarLenClear:
     b, _ = _connected(mocker)
     with pytest.raises(NotImplementedError, match="admin API"):
       b.queue_len("queue1")
+
+  def test_queue_len_rebuilds_static_capability_error_without_backend_graph(
+    self,
+  ) -> None:
+    marker = "round44-pulsar-depth-private-marker"
+    backend = _make_backend(service_url=f"pulsar://{marker}.example:6650")
+
+    with pytest.raises(NotImplementedError) as exc_info:
+      backend.queue_len(marker)
+
+    error = exc_info.value
+    assert type(error) is NotImplementedError
+    assert str(error) == (
+      "Pulsar queue depth requires the admin API, which is not configured"
+    )
+    _assert_capability_error_is_redacted(error, marker)
+
+  def test_queue_len_proxy_keeps_static_capability_error_and_breaker_neutral(
+    self,
+  ) -> None:
+    marker = "round44-pulsar-depth-proxy-marker"
+    backend = _make_backend(service_url=f"pulsar://{marker}.example:6650")
+    breaker = CircuitBreaker("pulsar-capability-depth", failure_threshold=1)
+    proxy = wrap_queue_backend(backend, breaker)
+
+    with pytest.raises(NotImplementedError) as exc_info:
+      proxy.queue_len(marker)
+
+    assert str(exc_info.value) == (
+      "Pulsar queue depth requires the admin API, which is not configured"
+    )
+    assert breaker.state is BreakerState.CLOSED
+    assert breaker.failure_count == 0
+    _assert_capability_error_is_redacted(exc_info.value, marker)
+
+  def test_queue_len_keeps_invalid_name_validation_outside_capability_boundary(
+    self,
+  ) -> None:
+    with pytest.raises(ValueError, match="Invalid queue_name"):
+      _make_backend().queue_len("invalid queue name")
+
+  @pytest.mark.parametrize(
+    "error",
+    (
+      RuntimeError("unknown capability marker"),
+      KeyboardInterrupt("control-flow capability marker"),
+    ),
+  )
+  def test_capability_boundary_preserves_unknown_and_control_flow_errors(
+    self, error: BaseException
+  ) -> None:
+    @not_implemented_error_boundary("safe capability error")
+    def operation(_queue_name: str) -> None:
+      raise error
+
+    with pytest.raises(type(error)) as exc_info:
+      operation("queue")
+
+    assert exc_info.value is error
+
+  def test_capability_boundary_preserves_not_implemented_subclasses(self) -> None:
+    class PluginCapabilityError(NotImplementedError):
+      pass
+
+    error = PluginCapabilityError("plugin capability marker")
+
+    @not_implemented_error_boundary("safe capability error")
+    def operation(_queue_name: str) -> None:
+      raise error
+
+    with pytest.raises(PluginCapabilityError) as exc_info:
+      operation("queue")
+
+    assert exc_info.value is error
 
   def test_unsupported_depth_keeps_scheduler_conservative(self) -> None:
     backend = _make_backend()
