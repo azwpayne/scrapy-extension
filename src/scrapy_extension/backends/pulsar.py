@@ -50,6 +50,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
 )
 from scrapy_extension.settings import PulsarMode, PulsarSettings
 from scrapy_extension.settings.pulsar import validate_pulsar_connection
@@ -65,6 +66,9 @@ _PULSAR_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
 _PULSAR_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
   {"Failed to connect to Pulsar."}
 )
+_PULSAR_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {"clear_queue is not supported without the Pulsar admin API"}
+)
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
@@ -74,6 +78,16 @@ _PULSAR_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
 # broker, not in this set). The POP itself is never dropped. 10k is generous
 # for normal CONCURRENT_REQUESTS backpressure and tight enough to flag a leak.
 _MAX_IN_FLIGHT = 10_000
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a public queue argument before its terminal error boundary."""
+  _validate_key_name(queue_name, "queue_name")
 
 
 class _PulsarAckToken:
@@ -703,6 +717,12 @@ class PulsarBackend(Backend, QueueBackend):
       )
 
   # QueueBackend implementation
+  @queue_operation_error_boundary(
+    "push",
+    "Failed to push Pulsar message.",
+    safe_messages=_PULSAR_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Publish ``item`` to the topic for ``queue_name`` (priority ignored).
 
@@ -729,6 +749,12 @@ class PulsarBackend(Backend, QueueBackend):
         operation="push",
       ) from e
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop Pulsar message.",
+    safe_messages=_PULSAR_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Receive the next message from the Shared subscription.
 
@@ -756,6 +782,12 @@ class PulsarBackend(Backend, QueueBackend):
     self._last_delivery = (consumer, msg)
     return _message_bytes(msg)
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop Pulsar message.",
+    safe_messages=_PULSAR_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
   ) -> tuple[bytes | None, Any | None]:
@@ -875,6 +907,11 @@ class PulsarBackend(Backend, QueueBackend):
         operation="pop",
       ) from e
 
+  @queue_operation_error_boundary(
+    "ack",
+    "Failed to ack Pulsar message.",
+    safe_messages=_PULSAR_SAFE_QUEUE_MESSAGES,
+  )
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message via ``consumer.acknowledge``.
 
@@ -946,6 +983,11 @@ class PulsarBackend(Backend, QueueBackend):
     token._settle("acked", acknowledge)
     self._discard_in_flight(token)
 
+  @queue_operation_error_boundary(
+    "nack",
+    "Failed to nack Pulsar message.",
+    safe_messages=_PULSAR_SAFE_QUEUE_MESSAGES,
+  )
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Negative-acknowledge a popped message for re-delivery.
 
@@ -1047,6 +1089,12 @@ class PulsarBackend(Backend, QueueBackend):
       "Pulsar queue depth requires the admin API, which is not configured"
     )
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    "Failed to clear Pulsar queue.",
+    safe_messages=_PULSAR_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Report that broker-side queue purge is unsupported.
 

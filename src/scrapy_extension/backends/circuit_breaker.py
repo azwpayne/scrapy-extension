@@ -30,12 +30,14 @@ from __future__ import annotations
 import math
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from enum import Enum
 from typing import Any, NamedTuple
 
 from scrapy_extension.backends.base import QueueBackend, SetBackend, StorageBackend
 from scrapy_extension.exceptions import BackendError
+from scrapy_extension.exceptions._redaction import sanitize_backend_error
 
 __all__ = [
   "CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S",
@@ -53,6 +55,26 @@ __all__ = [
 # forever — permanent fail-fast with no self-heal. Mirrors throttle's
 # ``THROTTLE_MAX_MIN_INTERVAL_S`` ceiling discipline.
 CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S: float = 3600.0
+
+_SAFE_QUEUE_OPERATIONS = frozenset(
+  {"push", "pop", "ack", "nack", "queue_len", "clear_queue"}
+)
+_SAFE_STORAGE_OPERATIONS = frozenset(
+  {"store", "retrieve", "delete", "exists", "ttl", "clear_storage"}
+)
+_QUEUE_METHOD_OPERATIONS = {
+  "push": "push",
+  "_push_with_durability": "push",
+  "pop": "pop",
+  "pop_with_ack": "pop",
+  "ack": "ack",
+  "nack": "nack",
+}
+_STORAGE_METHOD_OPERATIONS = {
+  "store": "store",
+  "retrieve": "retrieve",
+  "delete": "delete",
+}
 
 
 class BreakerState(str, Enum):
@@ -439,7 +461,11 @@ class _BackendProxyBase:
         bound = getattr(backend, method_name)
       except AttributeError:
         continue
-      object.__setattr__(self, method_name, _wrap_bound(breaker, bound))
+      object.__setattr__(
+        self,
+        method_name,
+        _wrap_bound(breaker, backend, method_name, bound),
+      )
     for method_name in self._FORWARDED:
       try:
         forwarded = getattr(backend, method_name)
@@ -455,20 +481,108 @@ class _BackendProxyBase:
     return getattr(self._backend, name)
 
 
-def _wrap_bound(breaker: CircuitBreaker, func: Callable[..., Any]) -> Callable[..., Any]:
-  """Return a thin wrapper that funnels ``func`` through ``breaker.call``.
+class _ProtectedBoundOperation:
+  """Call one captured backend operation without publishing its reference graph.
 
-  Using ``breaker.call`` (rather than re-implementing the state machine inline)
-  keeps a single source of truth for state transitions and locking. The wrapper
-  preserves ``functools.wraps``-style metadata for debuggability.
+  A closure over a bound method keeps ``method.__self__`` in every escaped
+  traceback.  That object can expose live endpoint and credential settings
+  even when a breaker is already OPEN and never calls the backend.  This
+  wrapper keeps only weak references, drops resolved locals before raising,
+  and reconstructs public ``BackendError`` instances after ``breaker.call``
+  has unwound.
   """
 
-  def _wrapped(*args: Any, **kwargs: Any) -> Any:
-    return breaker.call(func, *args, **kwargs)
+  __slots__ = (
+    "__name__",
+    "_backend_ref",
+    "_breaker",
+    "_method_name",
+    "_snapshot_ref",
+  )
 
-  _wrapped.__name__ = getattr(func, "__name__", "wrapped")
-  _wrapped.__doc__ = getattr(func, "__doc__", None)
-  return _wrapped
+  def __init__(
+    self,
+    breaker: CircuitBreaker,
+    backend: Any,
+    method_name: str,
+    func: Callable[..., Any],
+  ) -> None:
+    self._breaker = breaker
+    self._backend_ref = weakref.ref(backend)
+    self._method_name = method_name
+    self.__name__ = getattr(func, "__name__", method_name)
+    snapshot_ref: Callable[[], Callable[..., Any] | None] | None
+    try:
+      if getattr(func, "__self__", None) is not None:
+        snapshot_ref = weakref.WeakMethod(func)
+      else:
+        snapshot_ref = weakref.ref(func)
+    except TypeError:
+      # The production backends expose Python methods, which support weak
+      # references.  A non-weakrefable plugin callable remains operational by
+      # resolving it through the proxy's already-owned backend on each call.
+      snapshot_ref = None
+    self._snapshot_ref = snapshot_ref
+
+  def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    backend = self._backend_ref()
+    method = self._snapshot_ref() if self._snapshot_ref is not None else None
+    if method is None and backend is not None:
+      method = getattr(backend, self._method_name)
+    if method is None:
+      unavailable = BackendError("Backend operation is unavailable.")
+      del args
+      del kwargs
+      del backend
+      del method
+      del self
+      raise unavailable
+
+    breaker = self._breaker
+    caught_error: BackendError | None = None
+    try:
+      return breaker.call(method, *args, **kwargs)
+    except BackendError as error:
+      caught_error = error
+    except BaseException:
+      del args
+      del kwargs
+      del backend
+      del method
+      del breaker
+      del self
+      raise
+
+    assert caught_error is not None
+    if type(caught_error) is CircuitBreakerOpenError:
+      sanitized_error: BackendError = CircuitBreakerOpenError("backend-operation")
+    else:
+      sanitized_error = sanitize_backend_error(
+        caught_error,
+        message="Backend operation failed.",
+        safe_queue_operations=_SAFE_QUEUE_OPERATIONS,
+        safe_storage_operations=_SAFE_STORAGE_OPERATIONS,
+        fallback_queue_operation=_QUEUE_METHOD_OPERATIONS.get(self._method_name),
+        fallback_storage_operation=_STORAGE_METHOD_OPERATIONS.get(self._method_name),
+      )
+    del args
+    del kwargs
+    del backend
+    del method
+    del breaker
+    del caught_error
+    del self
+    raise sanitized_error
+
+
+def _wrap_bound(
+  breaker: CircuitBreaker,
+  backend: Any,
+  method_name: str,
+  func: Callable[..., Any],
+) -> Callable[..., Any]:
+  """Return a protected snapshot wrapper for one backend operation."""
+  return _ProtectedBoundOperation(breaker, backend, method_name, func)
 
 
 class _QueueBackendProxy(_BackendProxyBase, QueueBackend):

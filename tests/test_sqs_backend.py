@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import binascii
 import threading
 import traceback
 from contextlib import contextmanager
@@ -787,14 +786,14 @@ class TestSqsConnect:
 
 
 class TestSqsPushPop:
-  def test_disconnected_push_preserves_queue_context(self) -> None:
+  def test_disconnected_push_redacts_queue_context(self) -> None:
     b = _make_backend()
 
     with pytest.raises(QueueError) as exc_info:
       b.push("queue1", b"payload")
 
     assert exc_info.value.operation == "push"
-    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.queue_name is None
 
   def test_invalid_queue_name_precedes_disconnected_state(self) -> None:
     b = _make_backend()
@@ -881,7 +880,7 @@ class TestSqsPushPop:
       over_limit.push("queue1", largest_raw_payload + b"x")
 
     assert exc_info.value.operation == "push"
-    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.queue_name is None
     over_limit_client.get_queue_url.assert_not_called()
     over_limit_client.send_message.assert_not_called()
 
@@ -932,7 +931,7 @@ class TestSqsPushPop:
     with pytest.raises(QueueError) as exc_info:
       b.pop("queue1")
 
-    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "pop"
     client.delete_message.assert_called_once_with(
       QueueUrl="https://sqs/test",
@@ -958,7 +957,8 @@ class TestSqsPushPop:
       b.pop("queue1")
 
     assert raised.value.operation == "pop"
-    assert isinstance(raised.value.__cause__, binascii.Error)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     client.delete_message.assert_called_once_with(
       QueueUrl="https://sqs/test", ReceiptHandle="rh"
     )
@@ -1089,7 +1089,8 @@ class TestSqsLenClear:
       b.queue_len("queue1")
 
     assert exc_info.value.operation == "queue_len"
-    assert isinstance(exc_info.value.__cause__, KeyError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_queue_len_non_numeric_depth_attribute_raises_queue_error(
     self, mocker
@@ -1107,7 +1108,8 @@ class TestSqsLenClear:
       b.queue_len("queue1")
 
     assert exc_info.value.operation == "queue_len"
-    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_queue_len_error_raises_queue_error(self, mocker) -> None:
     """R-sqs-qlen: queue_len must wrap backend errors as QueueError, NOT
@@ -1127,7 +1129,8 @@ class TestSqsLenClear:
     with pytest.raises(QueueError) as exc_info:
       b.queue_len("queue1")
     assert exc_info.value.operation == "queue_len"
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_clear_purges_queue(self, mocker) -> None:
     b, client = _connected(mocker)

@@ -61,6 +61,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
 )
 from scrapy_extension.settings import SqsMode, SqsSettings
 from scrapy_extension.settings._aws import (
@@ -85,6 +86,15 @@ _SQS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
 )
 _SQS_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
   {"Failed to create SQS client."}
+)
+_SQS_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "SQS payload must contain at least one raw byte because MessageBody "
+    "cannot be empty.",
+    "SQS payload exceeds the 786,432 raw bytes that fit after base64 "
+    "encoding within the 1 MiB MessageBody limit.",
+    "Malformed SQS message: missing ReceiptHandle.",
+  }
 )
 
 # SQS caps WaitTimeSeconds at 20.
@@ -147,6 +157,16 @@ def _physical_queue_name(prefix: str, queue_name: str) -> str:
 # broker, not in this set). The POP itself is never dropped. 10k is generous
 # for normal CONCURRENT_REQUESTS backpressure and tight enough to flag a leak.
 _MAX_IN_FLIGHT = 10_000
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a public queue argument before its terminal error boundary."""
+  _validate_key_name(queue_name, "queue_name")
 
 
 class _SqsQueueLifecycle:
@@ -698,6 +718,12 @@ class SqsBackend(Backend, QueueBackend):
       return lifecycle
 
   # QueueBackend implementation
+  @queue_operation_error_boundary(
+    "push",
+    "Failed to push SQS message.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Send ``item`` to the SQS queue (priority ignored).
 
@@ -744,6 +770,12 @@ class SqsBackend(Backend, QueueBackend):
             operation="push",
           ) from e
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop SQS message.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Receive one message from the SQS queue.
 
@@ -777,6 +809,12 @@ class SqsBackend(Backend, QueueBackend):
     assert receipt is not None  # noqa: S101  # nosec B101
     return body
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop SQS message.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
   ) -> tuple[bytes | None, _SqsAckToken | None]:
@@ -1009,7 +1047,7 @@ class SqsBackend(Backend, QueueBackend):
         receipt = msg.get("ReceiptHandle")
         if not isinstance(receipt, str) or not receipt:
           raise QueueError(
-            f"Malformed SQS message in queue {queue_name}: missing ReceiptHandle",
+            "Malformed SQS message: missing ReceiptHandle.",
             queue_name=queue_name,
             operation="pop",
           )
@@ -1054,6 +1092,11 @@ class SqsBackend(Backend, QueueBackend):
           self._add_in_flight(token)
         return (url, body, receipt, epoch, token)
 
+  @queue_operation_error_boundary(
+    "ack",
+    "Failed to ack SQS message.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+  )
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Delete a popped message so it isn't redelivered.
 
@@ -1093,6 +1136,11 @@ class SqsBackend(Backend, QueueBackend):
       return
     self._settle_legacy_receipt(action="ack")
 
+  @queue_operation_error_boundary(
+    "nack",
+    "Failed to nack SQS message.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+  )
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Make a popped message immediately visible for re-delivery.
 
@@ -1162,6 +1210,12 @@ class SqsBackend(Backend, QueueBackend):
             last_receipt, receipt_epoch, generation_key
           )
 
+  @queue_operation_error_boundary(
+    "queue_len",
+    "Failed to inspect SQS queue.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def queue_len(self, queue_name: str) -> int:
     """Return the approximate total pending message count for the queue.
 
@@ -1227,6 +1281,12 @@ class SqsBackend(Backend, QueueBackend):
         self._last_receipt_epoch = None
         self._last_receipt_generation_key = None
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    "Failed to clear SQS queue.",
+    safe_messages=_SQS_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Purge the SQS queue and wait out AWS's destructive async window.
 

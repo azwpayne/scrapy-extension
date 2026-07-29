@@ -1,15 +1,147 @@
-"""Static configuration-error boundaries for untrusted validation inputs."""
+"""Static error boundaries for untrusted configuration and backend inputs."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Collection
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
-from scrapy_extension.exceptions.base import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions.base import (
+  BackendConnectionError,
+  BackendError,
+  ConfigurationError,
+  QueueError,
+  SerializationError,
+  StorageError,
+)
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
+
+
+def sanitize_backend_error(
+  error: BackendError,
+  *,
+  message: str,
+  safe_queue_operations: Collection[str] = (),
+  safe_storage_operations: Collection[str] = (),
+  fallback_queue_operation: str | None = None,
+  fallback_storage_operation: str | None = None,
+) -> BackendError:
+  """Rebuild a backend error without its traceback graph or user data.
+
+  Public operation boundaries cannot safely re-raise an error from a client
+  library: its traceback can retain credentials, endpoints, queue identifiers,
+  payloads, and opaque delivery tokens.  The known package exception classes
+  are reconstructed with only static metadata.  Unknown subclasses retain
+  their class when they can be allocated without invoking custom initializers;
+  otherwise they collapse to :class:`BackendError` rather than preserving an
+  untrusted object graph.
+  """
+  error_type = type(error)
+  if error_type is QueueError:
+    queue_error = cast(QueueError, error)
+    operation = queue_error.operation
+    safe_operation = (
+      operation
+      if type(operation) is str and operation in safe_queue_operations
+      else (
+        fallback_queue_operation
+        if fallback_queue_operation in safe_queue_operations
+        else None
+      )
+    )
+    return QueueError(message, operation=safe_operation)
+  if error_type is StorageError:
+    storage_error = cast(StorageError, error)
+    operation = storage_error.operation
+    safe_operation = (
+      operation
+      if type(operation) is str and operation in safe_storage_operations
+      else (
+        fallback_storage_operation
+        if fallback_storage_operation in safe_storage_operations
+        else None
+      )
+    )
+    return StorageError(message, operation=safe_operation)
+  if error_type is BackendConnectionError:
+    return BackendConnectionError(message)
+  if error_type is SerializationError:
+    return SerializationError(message)
+  if error_type is ConfigurationError:
+    return ConfigurationError(message)
+  if error_type is BackendError:
+    return BackendError(message)
+
+  # A plugin may define a thin ``BackendError`` subclass.  Preserve that
+  # public type without calling arbitrary ``__init__`` code or copying its
+  # attributes.  ``BaseException.__init__`` gives it a single static arg; an
+  # exotic allocator that cannot support this safely falls back to the base.
+  try:
+    replacement = error_type.__new__(error_type)
+    BaseException.__init__(replacement, message)
+  except Exception:  # noqa: BLE001 - custom exception allocation is untrusted
+    return BackendError(message)
+  if isinstance(replacement, BackendError):
+    return replacement
+  return BackendError(message)
+
+
+def queue_operation_error_boundary(
+  operation: str,
+  message: str,
+  *,
+  safe_messages: Collection[str] = (),
+  validator: Callable[..., None] | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+  """Make one public queue operation publish a redacted ``QueueError``.
+
+  ``validator`` deliberately runs before the protected call so established
+  ``ValueError`` input contracts remain visible to callers.  Once I/O begins,
+  every regular exception is reconstructed after all implementation frames
+  have unwound.  The replacement has a fixed operation, no logical queue
+  identifier, and no exception chain.  ``BaseException`` control flow remains
+  untouched.
+  """
+
+  def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+      if validator is not None:
+        validator(*args, **kwargs)
+      caught_error: Exception | None = None
+      try:
+        return function(*args, **kwargs)
+      except Exception as error:  # noqa: BLE001 - terminal public boundary
+        caught_error = error
+      except BaseException:
+        del args
+        del kwargs
+        raise
+
+      replacement_message = message
+      raw_args: object = None
+      if type(caught_error) is QueueError:
+        raw_args = caught_error.args
+        if (
+          type(raw_args) is tuple
+          and len(raw_args) == 1
+          and type(raw_args[0]) is str
+          and raw_args[0] in safe_messages
+        ):
+          replacement_message = raw_args[0]
+      sanitized_error = QueueError(replacement_message, operation=operation)
+      del args
+      del kwargs
+      del caught_error
+      del raw_args
+      del replacement_message
+      raise sanitized_error
+
+    return wrapped
+
+  return decorate
 
 
 def sanitize_configuration_error(

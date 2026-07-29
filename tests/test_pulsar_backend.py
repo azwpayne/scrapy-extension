@@ -609,9 +609,10 @@ class TestPulsarPop:
     with pytest.raises(QueueError) as exc_info:
       b.pop("queue1")
 
-    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "pop"
-    assert exc_info.value.__cause__ is failure
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_pop_reuses_consumer_for_same_topic(self, mocker) -> None:
     consumer = mocker.MagicMock()
@@ -1285,7 +1286,7 @@ class TestPulsarLenClear:
     with pytest.raises(QueueError) as exc_info:
       b.clear_queue("queue1")
 
-    assert exc_info.value.queue_name == "queue1"
+    assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "clear_queue"
     assert "not supported" in str(exc_info.value)
 
