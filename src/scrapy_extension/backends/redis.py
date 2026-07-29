@@ -995,6 +995,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           return False
         result = generation.client.ping()
         return bool(result) if result is not None else False
+    except BackendConnectionError:
+      # A health callback can enter a package lifecycle guard (for example,
+      # re-entrant disconnect while this probe owns a generation lease).  That
+      # invariant must remain observable instead of being mistaken for a
+      # transient driver failure.
+      raise
     except Exception:
       return False
 
