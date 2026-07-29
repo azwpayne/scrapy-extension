@@ -153,7 +153,10 @@ def test_ci_artifact_smoke_installs_all_extras_and_root_exports() -> None:
   ):
     assert f"import {dependency}" in smoke_block
 
-  assert 'find_spec("rocketmq") is not None' in smoke_block
+  assert "import rocketmq" in smoke_block
+  assert 'pathlib.Path(sys.prefix) / "rocketmq-import-home"' in smoke_block
+  assert "os.path.expanduser = _isolated_expanduser" in smoke_block
+  assert "find_spec(\"rocketmq\")" not in smoke_block
 
   for export in (
     "DynamoDBBackend",

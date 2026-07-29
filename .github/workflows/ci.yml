@@ -79,9 +79,9 @@ jobs:
             uv pip install --python "$all_venv/bin/python" "${artifact}[all]"
             "$all_venv/bin/python" -I - <<'PY'
           import pathlib
+          import os
           import sys
           from importlib.metadata import version
-          from importlib.util import find_spec
 
           import boto3
           import elasticsearch
@@ -91,6 +91,23 @@ jobs:
           import pymemcache
           import pymongo
           import redis
+
+          _expanduser = os.path.expanduser
+          _rocketmq_home = pathlib.Path(sys.prefix) / "rocketmq-import-home"
+
+          def _isolated_expanduser(path: str) -> str:
+              if path == "~":
+                  return str(_rocketmq_home)
+              if path.startswith("~/"):
+                  return str(_rocketmq_home / path[2:])
+              return _expanduser(path)
+
+          os.path.expanduser = _isolated_expanduser
+          try:
+              import rocketmq
+          finally:
+              os.path.expanduser = _expanduser
+
           import scrapy_extension
 
           optional_exports = (
@@ -130,7 +147,6 @@ jobs:
               str(venv_root)
           )
           assert version("scrapy-extension")
-          assert find_spec("rocketmq") is not None
           assert all(getattr(scrapy_extension, name) for name in optional_exports)
           PY
           done
