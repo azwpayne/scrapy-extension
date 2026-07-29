@@ -565,8 +565,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       pass
 
   def _discard_client(self, *, suppress_process_control: bool = False) -> bool:
-    """Clear all handles and best-effort close the current client."""
-    ordinary_close_failed = False
+    """Clear all handles and best-effort close the current client.
+
+    Returns whether a close failure was suppressed. Callers converting a
+    startup failure to a fixed public error emit the resulting diagnostic only
+    after their outer exception handler has completed.
+    """
+    close_failed = False
     with self._connection_lock:
       client = self._client
       self._client = None
@@ -578,16 +583,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         try:
           client.close()
         except Exception:
-          ordinary_close_failed = True
+          close_failed = True
         except BaseException:
           if not suppress_process_control:
             raise
-          try:
-            logger.debug("Process-control interruption while closing failed MongoDB client")
-          except BaseException:
-            # Failed-connect cleanup must never replace the original exception.
-            pass
-    return ordinary_close_failed
+          close_failed = True
+    return close_failed
 
   def _build_client_kwargs(
     self, snapshot: _MongoDBConnectionSnapshot | None = None

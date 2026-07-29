@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 import threading
 import traceback
 from collections.abc import Callable
@@ -205,6 +207,38 @@ def test_build_failure_keeps_primary_error_when_aborted_close_diagnostic_interru
   resource.meta.client.close.assert_called_once_with()
   debug.assert_called_once_with("Suppressed aborted DynamoDB resource close error")
   assert backend.is_connected() is False
+
+
+def test_build_failure_logs_after_candidate_cleanup_context_unwinds(mocker) -> None:
+  """The fixed startup diagnostic cannot retain a candidate-close signal."""
+
+  class _ExceptionContextProbe(logging.Handler):
+    def __init__(self) -> None:
+      super().__init__()
+      self.contexts: list[tuple[object, object, object]] = []
+
+    def emit(self, _record: logging.LogRecord) -> None:
+      self.contexts.append(sys.exc_info())
+
+  backend = _backend()
+  resource, table = _resource(mocker)
+  table.load.side_effect = RuntimeError("candidate load failed")
+  resource.meta.client.close.side_effect = SystemExit("candidate close interrupted")
+  _patch_resource(mocker, return_value=resource)
+  probe = _ExceptionContextProbe()
+  previous_level = dynamodb_module.logger.level
+  dynamodb_module.logger.setLevel(logging.DEBUG)
+  dynamodb_module.logger.addHandler(probe)
+
+  try:
+    with pytest.raises(BackendConnectionError):
+      backend.connect()
+  finally:
+    dynamodb_module.logger.removeHandler(probe)
+    dynamodb_module.logger.setLevel(previous_level)
+
+  assert resource.meta.client.close.call_count == 1
+  assert probe.contexts == [(None, None, None)]
 
 
 def test_publish_failure_keeps_primary_error_when_candidate_close_is_interrupted(

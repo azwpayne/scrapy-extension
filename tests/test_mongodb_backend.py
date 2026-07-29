@@ -1,3 +1,5 @@
+import logging
+import sys
 import traceback
 from datetime import datetime, timedelta, timezone
 
@@ -96,6 +98,39 @@ def test_mongodb_network_failure_does_not_retain_mutated_uri_snapshot(mocker):
   assert error.__cause__ is None
   assert error.__context__ is None
   _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_mongodb_failed_connect_logs_after_cleanup_context_unwinds(mocker) -> None:
+  """A suppressed close interruption must not reach a logging handler."""
+  from pymongo.errors import ConnectionFailure
+
+  class _ExceptionContextProbe(logging.Handler):
+    def __init__(self) -> None:
+      super().__init__()
+      self.contexts: list[tuple[object, object, object]] = []
+
+    def emit(self, _record: logging.LogRecord) -> None:
+      self.contexts.append(sys.exc_info())
+
+  client = mocker.MagicMock()
+  client.admin.command.side_effect = ConnectionFailure("startup failed")
+  client.close.side_effect = SystemExit("client close interrupted")
+  mocker.patch("scrapy_extension.backends.mongodb.MongoClient", return_value=client)
+  logger = logging.getLogger("scrapy_extension.backends.mongodb")
+  probe = _ExceptionContextProbe()
+  previous_level = logger.level
+  logger.setLevel(logging.DEBUG)
+  logger.addHandler(probe)
+
+  try:
+    with pytest.raises(BackendConnectionError):
+      MongoDBBackend(MongoDBSettings()).connect()
+  finally:
+    logger.removeHandler(probe)
+    logger.setLevel(previous_level)
+
+  client.close.assert_called_once_with()
+  assert probe.contexts == [(None, None, None)]
 
 
 @pytest.mark.parametrize(
@@ -961,7 +996,9 @@ def test_mongodb_connect_cleans_half_initialized_handles_after_base_exception(
   assert backend._set_collection is None
   assert backend._storage_collection is None
   client.close.assert_called_once()
-  log.assert_called_once()
+  # A raw KeyboardInterrupt is re-raised directly, so there is no safe point
+  # to run a diagnostic handler without exposing it through ``sys.exc_info``.
+  log.assert_not_called()
 
 
 def test_mongodb_backend_disconnect(mocker):

@@ -6,6 +6,8 @@ candidate is being initialized must close that candidate, so
 """
 from __future__ import annotations
 
+import logging
+import sys
 import threading
 
 import pytest
@@ -34,15 +36,57 @@ def test_connect_discards_client_on_unexpected_error(mocker) -> None:
   assert backend._client is None
 
 
+def test_failed_connect_logs_after_candidate_cleanup_context_unwinds(mocker) -> None:
+  """Candidate-close diagnostics cannot inherit the driver failure context."""
+
+  class _ExceptionContextProbe(logging.Handler):
+    def __init__(self) -> None:
+      super().__init__()
+      self.contexts: list[tuple[object, object, object]] = []
+
+    def emit(self, _record: logging.LogRecord) -> None:
+      self.contexts.append(sys.exc_info())
+
+  backend = ElasticSearchBackend(ElasticSearchSettings())
+  candidate = mocker.MagicMock(ping=lambda: True)
+  candidate.close.side_effect = SystemExit("candidate close interrupted")
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=candidate
+  )
+  mocker.patch.object(
+    ElasticSearchBackend, "_ensure_indices", side_effect=RuntimeError("startup failed")
+  )
+  logger = logging.getLogger("scrapy_extension.backends.elasticsearch")
+  probe = _ExceptionContextProbe()
+  previous_level = logger.level
+  logger.setLevel(logging.DEBUG)
+  logger.addHandler(probe)
+
+  try:
+    with pytest.raises(BackendConnectionError):
+      backend.connect()
+  finally:
+    logger.removeHandler(probe)
+    logger.setLevel(previous_level)
+
+  candidate.close.assert_called_once_with()
+  assert probe.contexts == [(None, None, None)]
+
+
 def test_connect_discards_client_on_keyboard_interrupt(mocker) -> None:
   backend = ElasticSearchBackend(ElasticSearchSettings())
-  _patch_connected_client(mocker)
+  candidate = mocker.MagicMock(ping=lambda: True)
+  candidate.close.side_effect = SystemExit("candidate close interrupted")
+  mocker.patch(
+    "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=candidate
+  )
   mocker.patch.object(
     ElasticSearchBackend, "_ensure_indices", side_effect=KeyboardInterrupt
   )
   with pytest.raises(KeyboardInterrupt):
     backend.connect()
   assert backend._client is None
+  candidate.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

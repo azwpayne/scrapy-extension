@@ -1742,27 +1742,29 @@ class ConnectionManager:
       # A callback that re-enters ``backend`` must not inherit the owner's raw
       # failure as ``__context__`` merely because the monitor ran in a
       # ``finally`` while that failure was being propagated.
-      terminal_error: BaseException | None = None
+      lazy_terminal_error: BaseException | None = None
       try:
         with self._connect_lock:
           self._connect_with_retries(monitor_events)
       except BaseException as error:
-        terminal_error = error
+        lazy_terminal_error = error
       else:
-        terminal_error = self._complete_lazy_connection_attempt(lazy_attempt, None)
-
-      if terminal_error is not None:
-        terminal_error = self._complete_lazy_connection_attempt(
-          lazy_attempt,
-          terminal_error,
+        lazy_terminal_error = self._complete_lazy_connection_attempt(
+          lazy_attempt, None
         )
-        assert terminal_error is not None
+
+      if lazy_terminal_error is not None:
+        lazy_terminal_error = self._complete_lazy_connection_attempt(
+          lazy_attempt,
+          lazy_terminal_error,
+        )
+        assert lazy_terminal_error is not None
       # Monitor implementations are user-extensible and may call back into
       # the manager. Dispatch after both the connection transaction and lazy
       # attempt publication have completed, outside every manager lock.
       self._dispatch_monitor_events(monitor_events, lazy_attempt)
-      if terminal_error is not None:
-        raise _rebuild_connect_attempt_error(terminal_error)
+      if lazy_terminal_error is not None:
+        raise _rebuild_connect_attempt_error(lazy_terminal_error)
       return
 
     terminal_error: Exception | None = None
@@ -2133,19 +2135,19 @@ class ConnectionManager:
 
     # The final holder released while backend.connect() was in flight. Dispose
     # the successful handle instead of resurrecting an evicted manager.
+    disconnect_failed = False
     try:
       backend.disconnect()
     except BaseException:  # noqa: BLE001 - teardown remains best-effort
       # This teardown is best-effort.  In particular, a control-flow signal
       # from a broken backend must not replace the typed error which explains
       # why the successful connection was discarded.
-      try:
-        logger.warning("Error disconnecting released backend")
-      except BaseException:
-        # Diagnostics are also best-effort: a custom logging handler can raise
-        # a control-flow signal, but close winning the publication race remains
-        # the causal terminal condition for this connection attempt.
-        pass
+      disconnect_failed = True
+    if disconnect_failed:
+      # Leave the cleanup handler before diagnostics. A custom logging handler
+      # is application code and must not be able to inspect the raw teardown
+      # exception through ``sys.exc_info()``.
+      _log_diagnostic(logger.warning, "Error disconnecting released backend")
     raise BackendConnectionError(
       "Connection completed after ConnectionManager release; backend discarded",
       backend_type=str(self.backend_type),

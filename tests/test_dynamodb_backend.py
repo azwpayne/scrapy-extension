@@ -546,7 +546,7 @@ class TestDynamoDBStorageOps:
       ConditionExpression="expire_at = :exp",
       ExpressionAttributeValues={":exp": 1.0},
     )
-    debug.assert_called_once_with("Suppressed dynamodb cleanup error")
+    debug.assert_called_once_with("Suppressed DynamoDB expired-item cleanup failure.")
 
   @pytest.mark.parametrize("operation", ["retrieve", "exists", "ttl"])
   def test_expired_lazy_reap_propagates_direct_cleanup_control(

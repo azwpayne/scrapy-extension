@@ -144,6 +144,13 @@ class _DynamoDBGeneration:
   snapshot: _DynamoDBConnectionSnapshot
 
 
+@dataclass
+class _DynamoDBConnectCleanupState:
+  """Deferred diagnostics collected while a private candidate is unwound."""
+
+  aborted_resource_close_failed: bool = False
+
+
 def _validate_partition_key(key: str) -> None:
   """Validate the package key grammar and DynamoDB's physical byte ceiling."""
   _validate_key_name(key, "key")
@@ -350,51 +357,59 @@ class DynamoDBBackend(Backend, StorageBackend):
     return snapshot, kwargs
 
   @staticmethod
-  def _close_resource(resource: Any) -> None:
-    """Best-effort close a candidate or retired botocore HTTP client."""
+  def _close_resource(resource: Any) -> bool:
+    """Best-effort close a candidate or retired botocore HTTP client.
+
+    Returns whether an ordinary close failure was suppressed.  The caller owns
+    the diagnostic so a candidate-abort caller can defer it until its primary
+    startup exception has fully unwound.
+    """
     if resource is None:
-      return
-    close_failed = False
+      return False
     try:
       resource.meta.client.close()
     except Exception:
-      close_failed = True
-    if close_failed:
-      # Closing a retired resource is best-effort. A logging handler is also
-      # diagnostic-only here, so it cannot turn an ordinary close failure into
-      # a lifecycle control failure or observe the raw close error through
-      # ``sys.exc_info()``. Do not cover ``close()`` itself: direct
-      # KeyboardInterrupt/SystemExit remains observable to the caller.
-      try:
-        logger.debug("Suppressed DynamoDB resource close error")
-      except BaseException:
-        pass
+      return True
+    return False
+
+  @staticmethod
+  def _log_resource_close_diagnostic() -> None:
+    """Emit the ordinary detached-resource close diagnostic."""
+    try:
+      logger.debug("Suppressed DynamoDB resource close error")
+    except BaseException:
+      pass
+
+  @staticmethod
+  def _log_aborted_resource_close_diagnostic() -> None:
+    """Emit the private-candidate cleanup diagnostic after startup unwinds."""
+    try:
+      logger.debug("Suppressed aborted DynamoDB resource close error")
+    except BaseException:
+      pass
 
   @classmethod
-  def _close_aborted_resource(cls, resource: Any) -> None:
+  def _close_aborted_resource(cls, resource: Any) -> bool:
     """Close an unpublished candidate without masking its primary failure.
 
     This helper is deliberately restricted to candidate-abort paths.  Normal
     ``disconnect()`` keeps ``BaseException`` observable to its caller, while
     an exception that already aborted candidate construction/publication must
-    remain the causal error even if SDK cleanup is interrupted.
+    remain the causal error even if SDK cleanup is interrupted.  It reports
+    completion status instead of logging because callers commonly invoke it
+    under the primary failure's ``except`` suite.
     """
     try:
-      cls._close_resource(resource)
+      return cls._close_resource(resource)
     except BaseException:
-      # This diagnostic runs after construction/publication has already failed.
-      # A user logging handler can itself raise a control exception, which must
-      # not replace that causal failure while the candidate remains private.
-      try:
-        logger.debug("Suppressed aborted DynamoDB resource close error")
-      except BaseException:
-        pass
+      return True
 
   def _build_candidate(
     self,
     snapshot: _DynamoDBConnectionSnapshot,
     resource_kwargs: dict[str, Any],
     request_epoch: int,
+    cleanup_state: _DynamoDBConnectCleanupState,
   ) -> _DynamoDBGeneration:
     """Prepare one private generation without mutating published state."""
     session: Any = None
@@ -456,7 +471,9 @@ class DynamoDBBackend(Backend, StorageBackend):
         snapshot=snapshot,
       )
     except BaseException:
-      self._close_aborted_resource(resource)
+      cleanup_state.aborted_resource_close_failed = (
+        self._close_aborted_resource(resource)
+      )
       raise
 
   def _publish_generation_locked(
@@ -659,21 +676,33 @@ class DynamoDBBackend(Backend, StorageBackend):
       snapshot, resource_kwargs = self._capture_connection_snapshot()
       candidate: _DynamoDBGeneration | None = None
       startup_error: BackendConnectionError | None = None
+      cleanup_state = _DynamoDBConnectCleanupState()
+      connect_cancelled = False
+      stale_failure = False
       try:
         candidate = self._build_candidate(
-          snapshot, resource_kwargs, request_epoch
+          snapshot, resource_kwargs, request_epoch, cleanup_state
         )
       except _DynamoDBConnectCancelled:
-        return
+        connect_cancelled = True
       except Exception:
         # Teardown intentionally cancels an in-progress connection attempt.
         # A late SDK failure from that stale attempt is not a new live error.
         with self._operation_lock:
-          if request_epoch != self._lifecycle_epoch:
-            return
-        startup_error = BackendConnectionError(
-          "Failed to connect to DynamoDB.", backend_type="dynamodb"
-        )
+          stale_failure = request_epoch != self._lifecycle_epoch
+        if not stale_failure:
+          startup_error = BackendConnectionError(
+            "Failed to connect to DynamoDB.", backend_type="dynamodb"
+          )
+
+      if cleanup_state.aborted_resource_close_failed:
+        # The raw candidate failure and any nested close interruption have both
+        # unwound. A custom logging handler therefore receives only this fixed
+        # diagnostic rather than an SDK exception graph through ``sys.exc_info``.
+        self._log_aborted_resource_close_diagnostic()
+
+      if connect_cancelled or stale_failure:
+        return
 
       if startup_error is not None:
         # Raise outside the SDK exception handler so endpoint/credential text
@@ -706,7 +735,9 @@ class DynamoDBBackend(Backend, StorageBackend):
           self._close_aborted_resource(candidate.resource)
         raise
       if not publish:
-        self._close_resource(candidate.resource)
+        close_failed = self._close_resource(candidate.resource)
+        if close_failed:
+          self._log_resource_close_diagnostic()
         return
       # Publication is the lifecycle linearization point. A success-only
       # diagnostic handler is outside that transaction: it must not make
@@ -718,11 +749,14 @@ class DynamoDBBackend(Backend, StorageBackend):
 
   def disconnect(self) -> None:
     """Fence connect intents, drain operations, and close the retired client."""
+    close_failed = False
     with self._operation_lock:
       self._lifecycle_epoch += 1
       generation = self._detach_generation_locked()
       if generation is not None:
-        self._close_resource(generation.resource)
+        close_failed = self._close_resource(generation.resource)
+    if close_failed:
+      self._log_resource_close_diagnostic()
 
   def is_connected(self) -> bool:
     """Return True if a complete generation is currently published."""

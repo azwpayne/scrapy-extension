@@ -1,10 +1,13 @@
 """Tests for connection manager."""
 
+import logging
+import sys
 import traceback
 from types import SimpleNamespace
 
 import pytest
 
+from scrapy_extension.backends import connectors as connectors_module
 from scrapy_extension.backends.base import (
   Backend,
   BackendType,
@@ -490,6 +493,62 @@ def test_attempt_connection_close_wins_preserves_discard_error_when_warning_inte
   assert "backend discarded" in str(outcome[0])
   backend.disconnect.assert_called_once_with()
   assert manager._backend is None
+
+
+def test_attempt_connection_close_wins_logs_after_disconnect_context_unwinds(
+  mocker,
+) -> None:
+  """A release-race diagnostic cannot expose the detached close exception."""
+  import threading
+
+  class _ExceptionContextProbe(logging.Handler):
+    def __init__(self) -> None:
+      super().__init__()
+      self.contexts: list[tuple[object, object, object]] = []
+
+    def emit(self, _record: logging.LogRecord) -> None:
+      self.contexts.append(sys.exc_info())
+
+  manager = ConnectionManager(BackendType.REDIS)
+  connect_entered = threading.Event()
+  allow_connect_return = threading.Event()
+
+  def _connect() -> None:
+    connect_entered.set()
+    assert allow_connect_return.wait(timeout=5), "test did not release connect"
+
+  backend = mocker.MagicMock()
+  backend.connect.side_effect = _connect
+  backend.disconnect.side_effect = RuntimeError("detached close failed")
+  mocker.patch.object(manager, "_create_backend", return_value=backend)
+
+  probe = _ExceptionContextProbe()
+  previous_level = connectors_module.logger.level
+  connectors_module.logger.setLevel(logging.WARNING)
+  connectors_module.logger.addHandler(probe)
+  outcome: list[BaseException] = []
+
+  def _attempt() -> None:
+    try:
+      manager._attempt_connection()
+    except BaseException as exc:  # noqa: BLE001 - capture worker terminal signal
+      outcome.append(exc)
+
+  try:
+    worker = threading.Thread(target=_attempt)
+    worker.start()
+    assert connect_entered.wait(timeout=5), "backend.connect() was not entered"
+    manager.close()
+    allow_connect_return.set()
+    worker.join(timeout=5)
+  finally:
+    connectors_module.logger.removeHandler(probe)
+    connectors_module.logger.setLevel(previous_level)
+
+  assert not worker.is_alive(), "connection attempt did not finish"
+  assert len(outcome) == 1
+  assert isinstance(outcome[0], BackendConnectionError)
+  assert probe.contexts == [(None, None, None)]
 
 
 def test_close_swallows_backend_disconnect_error_and_still_evicts(mocker):

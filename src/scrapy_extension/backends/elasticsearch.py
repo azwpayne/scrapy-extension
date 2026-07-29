@@ -314,6 +314,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       snapshot = self._capture_connection_snapshot()
       candidate: Elasticsearch | None = None
       startup_error: BackendConnectionError | None = None
+      cleanup_diagnostic_pending = False
       try:
         kwargs = self._build_kwargs(snapshot)
         if snapshot.mode == ElasticSearchMode.CLOUD:
@@ -346,7 +347,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         except BaseException:
           pass
       except (BackendConnectionError, ApiError, TransportError):
-        self._abort_failed_connect(candidate)
+        cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
         startup_error = BackendConnectionError(
           f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
           backend_type="elasticsearch",
@@ -354,7 +355,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       except Exception:
         # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
         # must roll back a post-publication candidate as well as close it.
-        self._abort_failed_connect(candidate)
+        cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
         startup_error = BackendConnectionError(
           f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
           backend_type="elasticsearch",
@@ -365,12 +366,26 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._abort_failed_connect(candidate)
         raise
 
+      if cleanup_diagnostic_pending:
+        # The driver failure and nested candidate-close interruption have
+        # unwound. Keep the fixed diagnostic outside their exception suites so
+        # a user handler cannot recover either raw exception via ``sys.exc_info``.
+        self._log_failed_connect_cleanup_diagnostic()
+
       if startup_error is not None:
         # Raise outside the driver exception handler so endpoint/credential
         # text cannot survive through ``__cause__`` or ``__context__``.
         raise startup_error
 
-  def _abort_failed_connect(self, candidate: Elasticsearch | None) -> None:
+  @staticmethod
+  def _log_failed_connect_cleanup_diagnostic() -> None:
+    """Report a completed failed-connect cleanup without its error object."""
+    try:
+      logger.debug("Failed to close ElasticSearch connect candidate")
+    except BaseException:
+      pass
+
+  def _abort_failed_connect(self, candidate: Elasticsearch | None) -> bool:
     """Detach and close only this failed connect candidate.
 
     Roll back only if the currently published generation is this exact
@@ -380,7 +395,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     failure.
     """
     if candidate is None:
-      return
+      return False
 
     if self._client is candidate:
       self._client = None
@@ -390,12 +405,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       candidate.close()
     except BaseException:
       # Preserve the primary error from connect, including KeyboardInterrupt
-      # and SystemExit.  Logging is also isolated because user-installed
-      # handlers can raise control-flow exceptions.
-      try:
-        logger.debug("Failed to close ElasticSearch connect candidate")
-      except BaseException:
-        pass
+      # and SystemExit. The caller emits a fixed diagnostic after the startup
+      # handler has finished, when it is safe to invoke application logging.
+      return True
+    return False
 
   def _discard_candidate(self, candidate: Elasticsearch | None) -> None:
     """Best-effort close for a client generation that was never published."""
