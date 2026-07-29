@@ -252,14 +252,14 @@ class RabbitMQBackend(Backend, QueueBackend):
       try:
         channel.close()
       except Exception:
-        pass
+        logger.debug("Ignoring RabbitMQ channel-close failure", exc_info=True)
       except BaseException as exc:
         primary_error = exc
     if connection is not None and connection is not keep_connection:
       try:
         connection.close()
       except Exception:
-        pass
+        logger.debug("Ignoring RabbitMQ connection-close failure", exc_info=True)
       except BaseException as exc:
         if primary_error is None:
           primary_error = exc

@@ -674,7 +674,7 @@ class KafkaBackend(Backend, QueueBackend):
         try:
           client.close()
         except Exception:
-          pass
+          logger.debug("Ignoring Kafka client-close failure", exc_info=True)
         except BaseException as error:
           if primary_error is None:
             primary_error = error
