@@ -66,6 +66,9 @@ def test_kafka_confluent_empty_override_keeps_bootstrap_fallback() -> None:
     "broker:9092#fragment",
     "br\N{LATIN SMALL LETTER O WITH STROKE}ker:9092",
     "999.1.1.1:9092",
+    "127.1:9092",
+    "0x7f.0.0.1:9092",
+    "2130706433:9092",
     "broker:9092,,other:9092",
     "broker:\x009092",
     "[::1]:0",
@@ -116,6 +119,7 @@ def test_rocketmq_accepts_its_documented_proxy_endpoint_forms(endpoint: str) -> 
     "broker:0",
     "192.0.2.10:65536",
     "999.1.1.1:8081",
+    "0x7f.0.0.1:8081",
     "192.0.2.10:8081;;192.0.2.11:8081",
   ],
 )

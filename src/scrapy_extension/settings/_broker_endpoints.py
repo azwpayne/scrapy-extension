@@ -65,13 +65,27 @@ def _parse_ipv4(value: str) -> str | None:
 
 
 def _is_pseudo_ipv4(value: str) -> bool:
-  """Recognize invalid dotted-decimal forms before DNS validation.
+  """Recognize non-canonical IPv4 forms before DNS validation.
 
-  A string such as ``999.1.1.1`` must not become a DNS hostname merely because
-  every label is syntactically valid DNS.  Valid numeric IPv4 is handled first.
+  A string such as ``999.1.1.1``, ``127.1``, or ``0x7f.0.0.1`` must not become
+  a DNS hostname merely because every label is syntactically valid DNS.  Some
+  socket implementations reinterpret those forms as IPv4 literals.  Valid
+  canonical IPv4 is handled first.
   """
   labels = value.split(".")
-  return len(labels) == 4 and all(label.isdigit() for label in labels)
+  return bool(labels) and all(_is_numeric_ipv4_component(label) for label in labels)
+
+
+def _is_numeric_ipv4_component(value: str) -> bool:
+  """Return whether one label participates in a legacy numeric IPv4 spelling."""
+  if value.isdigit():
+    return True
+  lowered = value.lower()
+  return (
+    lowered.startswith("0x")
+    and len(lowered) > 2
+    and all(character in "0123456789abcdef" for character in lowered[2:])
+  )
 
 
 def _parse_dns(value: str) -> str | None:
