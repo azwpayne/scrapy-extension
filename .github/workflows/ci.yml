@@ -74,6 +74,65 @@ jobs:
             uv venv --python ${{ matrix.python-version }} "$venv"
             uv pip install --python "$venv/bin/python" "$artifact"
             "$venv/bin/python" -I -c "import pathlib, scrapy_extension; from importlib.metadata import version; assert str(pathlib.Path(scrapy_extension.__file__).resolve()).startswith(str(pathlib.Path('$venv').resolve())); assert version('scrapy-extension')"
+            all_venv=".venv-package-smoke-all-$(basename "$artifact" | tr -cd '[:alnum:]')"
+            uv venv --python ${{ matrix.python-version }} "$all_venv"
+            uv pip install --python "$all_venv/bin/python" "${artifact}[all]"
+            "$all_venv/bin/python" -I - <<'PY'
+          import pathlib
+          import sys
+          from importlib.metadata import version
+          from importlib.util import find_spec
+
+          import boto3
+          import elasticsearch
+          import kafka
+          import pika
+          import pulsar
+          import pymemcache
+          import pymongo
+          import redis
+          import scrapy_extension
+
+          optional_exports = (
+              "DynamoDBBackend",
+              "DynamoDBMode",
+              "DynamoDBSettings",
+              "ElasticSearchBackend",
+              "ElasticSearchMode",
+              "ElasticSearchSettings",
+              "KafkaBackend",
+              "KafkaMode",
+              "KafkaSettings",
+              "MemcachedBackend",
+              "MemcachedMode",
+              "MemcachedSettings",
+              "MongoDBBackend",
+              "MongoDBMode",
+              "MongoDBSettings",
+              "PulsarBackend",
+              "PulsarMode",
+              "PulsarSettings",
+              "RabbitMQBackend",
+              "RabbitMQMode",
+              "RabbitMQSettings",
+              "RedisBackend",
+              "RedisMode",
+              "RedisSettings",
+              "RocketMQBackend",
+              "RocketMQMode",
+              "RocketMQSettings",
+              "SqsBackend",
+              "SqsMode",
+              "SqsSettings",
+          )
+          venv_root = pathlib.Path(sys.prefix).resolve()
+          assert str(pathlib.Path(scrapy_extension.__file__).resolve()).startswith(
+              str(venv_root)
+          )
+          assert version("scrapy-extension")
+          assert find_spec("rocketmq") is not None
+          assert all(getattr(scrapy_extension, name) for name in optional_exports)
+          PY
           done
       - name: Unit tests with coverage (integration deselected)
         if: matrix.python-version == '3.10'

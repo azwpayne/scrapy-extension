@@ -125,6 +125,73 @@ def test_ci_smoke_installs_and_imports_both_release_artifacts() -> None:
   assert "--no-deps" not in smoke_block.split("- name:", 1)[0]
 
 
+def test_ci_artifact_smoke_installs_all_extras_and_root_exports() -> None:
+  """R45: every release artifact must prove its optional surface installs."""
+  workflow = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+  ).read_text(encoding="utf-8")
+  smoke_block = workflow.split("- name: Smoke-test package artifacts", 1)[1]
+  smoke_block = smoke_block.split("- name:", 1)[0]
+
+  assert 'all_venv=".venv-package-smoke-all-' in smoke_block
+  assert 'uv venv --python ${{ matrix.python-version }} "$all_venv"' in smoke_block
+  assert (
+    'uv pip install --python "$all_venv/bin/python" "${artifact}[all]"'
+    in smoke_block
+  )
+  assert '"$all_venv/bin/python" -I - <<\'PY\'' in smoke_block
+
+  for dependency in (
+    "boto3",
+    "elasticsearch",
+    "kafka",
+    "pika",
+    "pulsar",
+    "pymemcache",
+    "pymongo",
+    "redis",
+  ):
+    assert f"import {dependency}" in smoke_block
+
+  assert 'find_spec("rocketmq") is not None' in smoke_block
+
+  for export in (
+    "DynamoDBBackend",
+    "DynamoDBMode",
+    "DynamoDBSettings",
+    "ElasticSearchBackend",
+    "ElasticSearchMode",
+    "ElasticSearchSettings",
+    "KafkaBackend",
+    "KafkaMode",
+    "KafkaSettings",
+    "MemcachedBackend",
+    "MemcachedMode",
+    "MemcachedSettings",
+    "MongoDBBackend",
+    "MongoDBMode",
+    "MongoDBSettings",
+    "PulsarBackend",
+    "PulsarMode",
+    "PulsarSettings",
+    "RabbitMQBackend",
+    "RabbitMQMode",
+    "RabbitMQSettings",
+    "RedisBackend",
+    "RedisMode",
+    "RedisSettings",
+    "RocketMQBackend",
+    "RocketMQMode",
+    "RocketMQSettings",
+    "SqsBackend",
+    "SqsMode",
+    "SqsSettings",
+  ):
+    assert f'"{export}"' in smoke_block
+  assert "getattr(scrapy_extension, name)" in smoke_block
+  assert "pathlib.Path(sys.prefix).resolve()" in smoke_block
+
+
 @pytest.mark.parametrize(
   "value",
   [
@@ -1038,7 +1105,7 @@ def test_queue_pop_isolates_monitor_failure_from_deserialization_error() -> None
   queue._monitor = MagicMock(name="Monitor")
   queue._monitor.on_error.side_effect = RuntimeError("monitor failed")
 
-  with pytest.raises(SerializationError, match="must be a JSON object"):
+  with pytest.raises(SerializationError, match="Queue pop deserialization failed"):
     queue._pop(0)
 
 
@@ -1052,7 +1119,7 @@ def test_queue_preserves_malformed_payload_error_when_ack_fails() -> None:
   queue.__dict__["_serializer"] = serializer
   queue._ack = MagicMock(side_effect=QueueError("ack failed"))  # type: ignore[method-assign]
 
-  with pytest.raises(SerializationError, match="must be a JSON object"):
+  with pytest.raises(SerializationError, match="Queue pop deserialization failed"):
     queue._pop(0)
 
   queue._ack.assert_called_once_with(token="token")
