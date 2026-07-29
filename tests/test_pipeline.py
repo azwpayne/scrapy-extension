@@ -1959,6 +1959,45 @@ class TestBackendPipelineCloseBaseException:
     strategy.close.assert_called_once()
     manager.close.assert_called_once()
 
+  def test_close_locked_secondary_manager_diagnostic_has_no_active_exception(
+    self, mocker
+  ) -> None:
+    """A handler cannot recover the secondary teardown failure.
+
+    The primary strategy failure must still win, and manager teardown must run
+    after it.  The distinct markers ensure the logging record and handler
+    context expose neither failure from the secondary diagnostic path.
+    """
+    primary_marker = "round50-pipeline-primary-close-marker"
+    secondary_marker = "round50-pipeline-secondary-close-marker"
+    call_order: list[str] = []
+    manager = mocker.MagicMock()
+    strategy = mocker.MagicMock()
+
+    def fail_strategy_close() -> None:
+      call_order.append("strategy")
+      raise RuntimeError(primary_marker)
+
+    def fail_manager_close() -> None:
+      call_order.append("manager")
+      raise SystemExit(secondary_marker)
+
+    strategy.close.side_effect = fail_strategy_close
+    manager.close.side_effect = fail_manager_close
+    pipeline = BackendPipeline(connection_manager=manager, storage_strategy=strategy)
+
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.ERROR,
+    ) as handler:
+      with pytest.raises(RuntimeError, match=primary_marker) as exc_info:
+        pipeline._close_locked()
+
+    assert str(exc_info.value) == primary_marker
+    assert call_order == ["strategy", "manager"]
+    _assert_handler_records_are_redacted(handler, secondary_marker)
+    assert all(primary_marker not in record.getMessage() for record in handler.records)
+
 
 def test_from_crawler_wires_monitor_into_connection_manager(mocker) -> None:
   """R25-F: from_crawler threads the ScrapyStatsMonitor into the pipeline's

@@ -541,6 +541,7 @@ class BackendPipeline:
     # strategy flush already succeeded — propagates instead of being swallowed.
     # Mirror the dupefilter primary_error pattern (dupefilter.py, PR #63 sibling).
     primary_error: BaseException | None = None
+    secondary_manager_close_failed = False
     try:
       self.storage_strategy.close()
     except BaseException as exc:
@@ -561,13 +562,16 @@ class BackendPipeline:
           if primary_error is None:
             primary_error = exc
           else:
-            try:
-              logger.exception(
-                "connection_manager.close() failed during teardown"
-              )
-            except BaseException:
-              # Logging must never mask the preserved primary error.
-              pass
+            # The primary strategy error wins, but wait until this ``except``
+            # suite has exited before reporting the secondary manager failure.
+            # A synchronous custom logging handler can otherwise inspect the
+            # raw manager exception through ``sys.exc_info()``.
+            secondary_manager_close_failed = True
+    if secondary_manager_close_failed:
+      _emit_diagnostic(
+        logger.error,
+        "connection_manager.close() failed during teardown",
+      )
     if primary_error is not None:
       raise primary_error
 
