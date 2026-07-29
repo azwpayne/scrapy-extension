@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- **`JSONSerializer` now rejects Pydantic `SecretStr` and `SecretBytes`.**
+  These wrappers previously became recoverable queue/storage payload values.
+  Explicitly encrypt a value before serialization, or intentionally unwrap it
+  only after accepting the persistence risk.
+
 Round-9/14 hardening introduced config-time validators that **refuse to start**
 crawlers carrying unsafe or incoherent config. Each item is security-motivated
 and was previously a silent footgun, but they ARE behavior breaks — read before

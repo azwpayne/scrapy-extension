@@ -90,13 +90,10 @@ def _json_default(obj: object) -> object:
     return str(obj)
   type_name = type(obj).__name__
   if type_name in {"SecretStr", "SecretBytes"}:
-    # pydantic secrets in request.meta (#31) — emit the underlying value via
-    # the duck-typed accessor (no pydantic import; the type-name check mirrors
-    # exceptions/base._is_secret_value). Deserialize yields a plain str —
-    # SecretStr is not reconstructable from JSON without a pydantic hook; the
-    # goal here is "does not crash the push path".
-    get_secret_value = getattr(obj, "get_secret_value", None)
-    return get_secret_value() if callable(get_secret_value) else str(obj)
+    raise TypeError(
+      f"{type_name} values cannot be JSON serialized; explicitly encrypt or "
+      "unwrap only after accepting persistence risk."
+    )
   raise TypeError(
     f"Object of type {type_name} is not JSON serializable. "
     f"Pre-serialize {type_name} instances before pushing to the queue, "

@@ -1,6 +1,7 @@
 """Tests for backend implementations."""
 
 import pytest
+from pydantic import SecretBytes, SecretStr
 
 from scrapy_extension.backends.base import (
   BackendType,
@@ -153,18 +154,21 @@ class TestJSONSerializer:
       "raw": b"\x00\xffB"
     }
 
-  def test_secret_str_in_meta_serializes(self):
-    """#31: pydantic SecretStr in request.meta serializes (does not raise
-    TypeError). Round-trip yields a plain str (SecretStr is not reconstructable
-    from JSON without a pydantic hook); the bar here is 'does not crash push'.
-    """
-    from pydantic import SecretStr
-
+  @pytest.mark.parametrize(
+    ("value", "wrapper", "secret"),
+    [
+      (SecretStr("hunter2"), "SecretStr", "hunter2"),
+      (SecretBytes(b"bytes-secret"), "SecretBytes", "bytes-secret"),
+    ],
+  )
+  def test_secret_wrappers_fail_closed(self, value, wrapper, secret):
+    """Secret wrappers must never become queue/storage payload bytes."""
     serializer = JSONSerializer()
-    data = {"token": SecretStr("hunter2")}
-    serialized = serializer.serialize(data)  # must not raise
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["token"] == "hunter2"
+
+    with pytest.raises(TypeError, match=wrapper) as exc_info:
+      serializer.serialize({"nested": [value]})
+
+    assert secret not in str(exc_info.value)
 
   def test_string_looking_like_base64_stays_str(self):
     """Guard: a plain string that happens to be valid base64 is NOT decoded.
