@@ -1,5 +1,7 @@
 """Tests for BackendPipeline component."""
 
+import logging
+import traceback
 import warnings
 from dataclasses import dataclass
 
@@ -14,8 +16,63 @@ from scrapy_extension.exceptions import (
   BackendError,
   SerializationError,
   StorageBackpressureError,
+  StorageError,
 )
 from scrapy_extension.pipeline.pipeline import BackendPipeline
+
+
+def _assert_pipeline_value_is_redacted(
+  value: object,
+  marker: str,
+  seen: set[int] | None = None,
+) -> None:
+  """Walk bounded builtin/attribute graphs without trusting ``repr``."""
+  if seen is None:
+    seen = set()
+  value_id = id(value)
+  if value_id in seen:
+    return
+  seen.add(value_id)
+  if isinstance(value, str):
+    assert marker not in value
+    return
+  if isinstance(value, bytes):
+    assert marker.encode() not in value
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      _assert_pipeline_value_is_redacted(key, marker, seen)
+      _assert_pipeline_value_is_redacted(item, marker, seen)
+    return
+  if isinstance(value, (tuple, list, set, frozenset)):
+    for item in value:
+      _assert_pipeline_value_is_redacted(item, marker, seen)
+    return
+  try:
+    attributes = vars(value)
+  except TypeError:
+    return
+  _assert_pipeline_value_is_redacted(attributes, marker, seen)
+
+
+def _assert_pipeline_public_error_is_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Assert a process-item terminal error cannot recover private store data."""
+  assert marker not in str(error)
+  assert marker not in repr(error.args)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  assert marker not in "".join(traceback.format_exception(error))
+
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      _assert_pipeline_value_is_redacted(frame.f_locals, marker)
+    trace = trace.tb_next
 
 
 class SampleItem(Item):
@@ -1043,7 +1100,10 @@ class TestBackendPipelineStorageStrategy:
     spider = mocker.Mock()
     spider.name = "s"
 
-    with pytest.raises(BackendError, match="max_storage_errors"):
+    with pytest.raises(
+      BackendError,
+      match=r"^Pipeline storage failure threshold exceeded\.$",
+    ):
       pipeline.process_item(SampleItem(name="a", value=1), spider)
 
     assert strategy.pending == 1
@@ -1070,6 +1130,48 @@ class TestBackendPipelineStorageStrategy:
 
     assert exc_info.value.operation == "store"
     spider.crawler.stats.inc_value.assert_not_called()
+
+  def test_batched_backpressure_rebuilds_a_terminal_error_after_private_frames(
+    self, mock_connection_manager, mocker
+  ):
+    """Admission rejection must not retain item/key/strategy data in traceback."""
+    marker = "round44_pipeline_backpressure_private_marker"
+
+    class _SensitiveBackpressureError(StorageBackpressureError):
+      def __init__(self) -> None:
+        super().__init__(operation=marker)
+        self.private_state = {"marker": marker}
+
+    def reject_store(*_args, **_kwargs):
+      private_call_state = {"marker": marker}
+      del private_call_state
+      raise _SensitiveBackpressureError
+
+    monitor = mocker.Mock()
+    strategy = mocker.Mock()
+    strategy.emits_store_events = True
+    strategy.store.side_effect = reject_store
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      key_prefix=marker,
+      storage_strategy=strategy,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = marker
+
+    with pytest.raises(StorageBackpressureError) as exc_info:
+      pipeline.process_item(SampleItem(name=marker, value=marker), spider)
+
+    error = exc_info.value
+    assert type(error) is StorageBackpressureError
+    assert str(error) == "Batched storage is at capacity."
+    assert error.operation == "store"
+    assert error.key is None
+    _assert_pipeline_public_error_is_redacted(error, marker)
+    spider.crawler.stats.inc_value.assert_not_called()
+    monitor.on_error.assert_not_called()
 
   def test_max_item_bytes_still_rejects_oversize_with_strategy(
     self, mock_connection_manager, mocker
@@ -1160,7 +1262,7 @@ class TestBackendPipelineStorageEscalation:
 
   Default (``max_storage_errors=None``) preserves the swallow-and-stat
   behavior — zero compat break. When set to an int N, the pipeline tracks
-  consecutive storage failures and re-raises (wrapped as ``BackendError``)
+  consecutive storage failures and re-raises a fixed ``BackendError``
   once the consecutive count exceeds N, so a persistent storage outage
   surfaces loudly instead of being silently swallowed as success.
   """
@@ -1191,7 +1293,7 @@ class TestBackendPipelineStorageEscalation:
 
     Pre-B1 this raises ``AttributeError`` (no ``max_storage_errors`` kwarg) /
     never escalates — RED. Post-B1 the 3rd failure exceeds the threshold and
-    re-raises wrapped as ``BackendError``.
+    re-raises a fixed ``BackendError``.
     """
     pipeline = BackendPipeline(
       connection_manager=mock_connection_manager,
@@ -1210,8 +1312,50 @@ class TestBackendPipelineStorageEscalation:
     pipeline.process_item(SampleItem(name="b", value=2), mock_spider)
 
     # 3rd consecutive failure: count becomes 3 > 2 → escalate.
-    with pytest.raises(BackendError, match="consecutive storage"):
+    with pytest.raises(
+      BackendError,
+      match=r"^Pipeline storage failure threshold exceeded\.$",
+    ):
       pipeline.process_item(SampleItem(name="c", value=3), mock_spider)
+
+  def test_threshold_error_is_terminally_redacted(
+    self, mock_connection_manager, mocker, caplog
+  ):
+    """The opt-in escalation cannot expose its failing item/key/error graph."""
+    marker = "round44_pipeline_threshold_private_marker"
+    monitor = mocker.Mock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      key_prefix=marker,
+      max_storage_errors=0,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    raw_error = RuntimeError(marker)
+    mock_connection_manager.get_storage_backend().store.side_effect = raw_error
+    spider = mocker.Mock()
+    spider.name = marker
+
+    with caplog.at_level(
+      logging.WARNING,
+      logger="scrapy_extension.pipeline.pipeline",
+    ):
+      with pytest.raises(BackendError) as exc_info:
+        pipeline.process_item(SampleItem(name=marker, value=marker), spider)
+
+    error = exc_info.value
+    assert type(error) is BackendError
+    assert str(error) == "Pipeline storage failure threshold exceeded."
+    _assert_pipeline_public_error_is_redacted(error, marker)
+    assert pipeline._consecutive_storage_errors == 1
+    spider.crawler.stats.inc_value.assert_called_once_with("pipeline/storage_errors")
+
+    monitor.on_error.assert_called_once()
+    reported_error = monitor.on_error.call_args.args[1]
+    assert type(reported_error) is StorageError
+    _assert_pipeline_public_error_is_redacted(reported_error, marker)
+    assert all(marker not in record.getMessage() for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
   def test_successful_store_resets_consecutive_counter(
     self, mock_connection_manager, mocker
@@ -1306,11 +1450,11 @@ class TestBackendPipelineMonitorWiring:
   def test_storage_failure_emits_monitor_on_error(
     self, mock_connection_manager, mocker
   ):
-    """R32-B: a storage failure must emit ``monitor.on_error('store', e)`` —
-    consistent with the sibling serialization arm (line 494), the batched
-    age-flusher, queue, and dupefilter. Pre-R32-B the storage arm only
-    incremented ``pipeline/storage_errors``, so an operator alerting on the
-    documented ``errors/store`` counter missed synchronous store failures."""
+    """A store failure emits one fresh, key-free ``StorageError`` to monitor.
+
+    The event preserves the store error counter while withholding the raw
+    backend exception graph from monitor extensions.
+    """
     monitor = mocker.Mock()
     pipeline = BackendPipeline(
       connection_manager=mock_connection_manager,
@@ -1329,7 +1473,47 @@ class TestBackendPipelineMonitorWiring:
 
     monitor.on_error.assert_called_once()
     assert monitor.on_error.call_args[0][0] == "store"
-    assert monitor.on_error.call_args[0][1] is sentinel
+    reported_error = monitor.on_error.call_args[0][1]
+    assert isinstance(reported_error, StorageError)
+    assert reported_error is not sentinel
+    assert str(reported_error) == "Pipeline storage operation failed."
+    assert reported_error.operation == "store"
+    assert reported_error.key is None
+
+  def test_best_effort_store_diagnostics_and_monitor_are_redacted(
+    self, mock_connection_manager, mocker, caplog
+  ):
+    """The default swallow path logs and reports no key/item/backend details."""
+    marker = "round44_pipeline_monitor_private_marker"
+    monitor = mocker.Mock()
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      key_prefix=marker,
+      monitor=monitor,
+    )
+    pipeline._storage_supported = True
+    raw_error = RuntimeError(marker)
+    mock_connection_manager.get_storage_backend().store.side_effect = raw_error
+    spider = mocker.Mock()
+    spider.name = marker
+    item = SampleItem(name=marker, value=marker)
+
+    with caplog.at_level(
+      logging.WARNING,
+      logger="scrapy_extension.pipeline.pipeline",
+    ):
+      assert pipeline.process_item(item, spider) is item
+
+    monitor.on_error.assert_called_once()
+    reported_error = monitor.on_error.call_args.args[1]
+    assert type(reported_error) is StorageError
+    assert str(reported_error) == "Pipeline storage operation failed."
+    assert reported_error.operation == "store"
+    assert reported_error.key is None
+    _assert_pipeline_public_error_is_redacted(reported_error, marker)
+    spider.crawler.stats.inc_value.assert_called_once_with("pipeline/storage_errors")
+    assert all(marker not in record.getMessage() for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
   def test_on_store_failure_does_not_fail_already_persisted_item(
     self, mock_connection_manager, mocker

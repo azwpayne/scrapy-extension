@@ -8,9 +8,10 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
-from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from functools import cached_property, wraps
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from itemadapter import ItemAdapter, is_item
 
@@ -21,6 +22,7 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   SerializationError,
   StorageBackpressureError,
+  StorageError,
 )
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
@@ -41,11 +43,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
 #: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
 DEFAULT_PIPELINE_MAX_ITEM_BYTES = 1_048_576
 
 #: Risk 5 — default ceiling on consecutive storage errors before the pipeline
-#: re-raises (wrapped as BackendError) instead of swallowing forever. The
+#: re-raises a fixed ``BackendError`` instead of swallowing forever. The
 #: pre-Risk-5 from_settings default was ``None`` (infinite swallow), which meant
 #: a persistent storage outage was silently absorbed as success-shaped item
 #: returns — silent data loss at fleet scale. ``10`` surfaces a sustained
@@ -53,6 +58,57 @@ DEFAULT_PIPELINE_MAX_ITEM_BYTES = 1_048_576
 #: blips. Operators who want the old infinite-swallow behavior can pass
 #: ``max_storage_errors=None`` to the constructor directly.
 DEFAULT_MAX_STORAGE_ERRORS = 10
+
+_PIPELINE_STORAGE_FAILURE_MESSAGE = "Pipeline storage operation failed."
+_PIPELINE_STORAGE_THRESHOLD_MESSAGE = "Pipeline storage failure threshold exceeded."
+
+
+class _PipelineStorageFailureThresholdExceeded(Exception):
+  """Private control signal selecting the public storage threshold error."""
+
+
+def _pipeline_store_error_boundary(
+  function: Callable[_P, _T],
+) -> Callable[_P, _T]:
+  """Rebuild pipeline store-path terminal errors outside private frames.
+
+  ``process_item`` keeps the item, generated key, serialized payload, and
+  storage strategy in its implementation frames.  Re-raising a backpressure
+  result or threshold failure directly from that path would expose those
+  values through traceback inspection even when its message is static.  The
+  wrapped public boundary waits until those frames unwind, then constructs a
+  fresh, fixed public error.  Serialization and lifecycle failures deliberately
+  pass through unchanged; their compatibility contracts are separate slices.
+  """
+
+  @wraps(function)
+  def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+    backpressure = False
+    threshold_exceeded = False
+    try:
+      return function(*args, **kwargs)
+    except StorageBackpressureError:
+      backpressure = True
+    except _PipelineStorageFailureThresholdExceeded:
+      threshold_exceeded = True
+    except BaseException:
+      del args
+      del kwargs
+      raise
+
+    del args
+    del kwargs
+    if backpressure:
+      del backpressure
+      del threshold_exceeded
+      raise StorageBackpressureError(operation="store")
+
+    assert threshold_exceeded
+    del backpressure
+    del threshold_exceeded
+    raise BackendError(_PIPELINE_STORAGE_THRESHOLD_MESSAGE)
+
+  return wrapped
 
 
 def _emit_diagnostic(method: Any, message: str, *args: Any, **kwargs: Any) -> None:
@@ -80,8 +136,8 @@ class BackendPipeline:
           (passthrough default — byte-identical to pre-strategy behavior;
           ``batched`` buffers + flushes on threshold/close).
       max_storage_errors: C2 escalation threshold. ``None`` (default) keeps the
-          best-effort swallow-and-stat behavior; an int N re-raises the storage
-          error wrapped as :class:`~scrapy_extension.exceptions.BackendError`
+          best-effort swallow-and-stat behavior; an int N re-raises a fixed
+          :class:`~scrapy_extension.exceptions.BackendError`
           once consecutive failures exceed N (counter resets on a successful
           store).
   """
@@ -114,8 +170,8 @@ class BackendPipeline:
         max_storage_errors: C2 escalation. ``None`` (default) preserves the
             best-effort behavior (storage errors swallowed, item returned,
             ``pipeline/storage_errors`` stat incremented). When set to N, the
-            pipeline tracks consecutive storage failures and re-raises the
-            error wrapped as :class:`~scrapy_extension.exceptions.BackendError`
+            pipeline tracks consecutive storage failures and re-raises a fixed
+            :class:`~scrapy_extension.exceptions.BackendError`
             once the consecutive count exceeds N — surfacing a persistent
             storage outage loudly instead of silently reporting success.
             Counter resets to 0 on every successful store.
@@ -505,6 +561,7 @@ class BackendPipeline:
     if primary_error is not None:
       raise primary_error
 
+  @_pipeline_store_error_boundary
   def process_item(self, item: Any, spider: Spider | None = None) -> Any:
     """Process one item while excluding concurrent terminal teardown."""
     with self._lifecycle_lock:
@@ -577,7 +634,8 @@ class BackendPipeline:
     except StorageBackpressureError:
       # This item was never admitted to the volatile strategy buffer. It is
       # not a retryable backend failure, so best-effort storage handling must
-      # not return success-shaped data to Scrapy.
+      # not return success-shaped data to Scrapy.  The public boundary rebuilds
+      # a fresh result only after this frame releases key, payload, and item.
       raise
     except (
       ConfigurationError,
@@ -590,40 +648,37 @@ class BackendPipeline:
       # the item would report success-shaped data loss and retrying cannot heal
       # it, so preserve their original typed failure for Scrapy/operator policy.
       raise
-    except Exception as e:
+    except Exception:
+      reported_error = StorageError(
+        _PIPELINE_STORAGE_FAILURE_MESSAGE,
+        operation="store",
+      )
       _emit_diagnostic(
         logger.warning,
-        "Failed to store item %s: %s. Item will not be persisted.",
-        key,
-        e,
+        "Failed to store item. Item will not be persisted.",
       )
       self._inc_stat(spider, "pipeline/storage_errors")
-      # R32-B: emit on_error("store", e) for observability parity with the
+      # R32-B: emit one sanitized store error for observability parity with the
       # sibling serialization arm (above), the batched age-flusher, queue, and
       # dupefilter — so a ScrapyStatsMonitor increments the documented
       # ``errors/store`` counter for synchronous store failures (the most common
       # storage failure mode), not just serialization + batched-flush failures.
       try:
-        self._monitor.on_error("store", e)
+        self._monitor.on_error("store", reported_error)
       except Exception:  # noqa: BLE001 - telemetry cannot mask storage
         _emit_diagnostic(
           logger.debug,
           "monitor.on_error(store) raised; ignored",
-          exc_info=True,
         )
       # C2: opt-in loud-fail. Default (max_storage_errors=None) keeps the
       # best-effort swallow-and-stat behavior — zero compat break. When set,
-      # track consecutive failures and re-raise once the count exceeds N so a
-      # persistent storage outage surfaces instead of being silently absorbed
-      # as a success-shaped item return.
+      # track consecutive failures and re-raise a fixed error once the count
+      # exceeds N so a persistent storage outage surfaces instead of being
+      # silently absorbed as a success-shaped item return.
       if self.max_storage_errors is not None:
         self._consecutive_storage_errors += 1
         if self._consecutive_storage_errors > self.max_storage_errors:
-          raise BackendError(
-            f"Pipeline exceeded max_storage_errors ({self.max_storage_errors}): "
-            f"{self._consecutive_storage_errors} consecutive storage failures "
-            f"(last error on key {key!r}: {e})"
-          ) from e
+          raise _PipelineStorageFailureThresholdExceeded
       return item
     # Strategy acceptance resets the consecutive error counter. Direct
     # strategies emit on_store here; buffering strategies emit it only when
