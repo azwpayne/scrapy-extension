@@ -1497,8 +1497,8 @@ class TestRedisBackendSetOperations:
   def test_set_add_error(self, redis_settings, mock_redis, mocker):
     """R-dupe-1 (option b): RedisError during set add is wrapped as
     BackendConnectionError so BackendDupeFilter's graceful-degradation arm
-    catches it (degrade to not-seen) instead of crashing the crawl. The raw
-    RedisError is chained (``from e``) for diagnosis.
+    catches it (degrade to not-seen) instead of crashing the crawl. The
+    terminal public boundary intentionally drops the raw driver graph.
 
     Supersedes R31-A1's "must propagate raw" — but preserves R31-A1's core
     concern: add does NOT return False on error (no silent mis-treatment as
@@ -1518,7 +1518,8 @@ class TestRedisBackendSetOperations:
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.add("test_set", b"test_item")
     assert exc_info.value.backend_type == "redis"
-    assert isinstance(exc_info.value.__cause__, RedisError)  # raw error chained
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_set_remove_success(self, redis_settings, mock_redis, mocker):
     """Test set remove returns True on successful removal."""
@@ -1558,7 +1559,8 @@ class TestRedisBackendSetOperations:
     with pytest.raises(BackendConnectionError, match="set remove failed") as exc_info:
       backend.remove("test_set", b"test_item")
     assert exc_info.value.backend_type == "redis"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_set_contains_error(self, redis_settings, mock_redis, mocker):
     """RedisError on contains becomes a typed backend failure, not False.
@@ -1578,7 +1580,8 @@ class TestRedisBackendSetOperations:
     with pytest.raises(BackendConnectionError, match="membership check failed") as exc_info:
       backend.contains("test_set", b"test_item")
     assert exc_info.value.backend_type == "redis"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_set_len_error(self, redis_settings, mock_redis, mocker):
     """RedisError on set_len must not masquerade as an empty set."""
@@ -1593,7 +1596,8 @@ class TestRedisBackendSetOperations:
     with pytest.raises(BackendConnectionError, match="length read failed") as exc_info:
       backend.set_len("test_set")
     assert exc_info.value.backend_type == "redis"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_clear_set_error(self, redis_settings, mock_redis, mocker):
     """R-rclears: clear_set raises BackendConnectionError on RedisError (not swallow).
@@ -1674,7 +1678,9 @@ class TestRedisBackendStorageOperations:
     with pytest.raises(StorageError) as exc_info:
       backend.store("test_key", b"test_data")
     assert exc_info.value.operation == "store"
-    assert exc_info.value.key == "test_key"
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   @pytest.mark.parametrize("ttl", [None, 60])
   def test_storage_store_false_result_is_failure(
@@ -1693,7 +1699,9 @@ class TestRedisBackendStorageOperations:
       backend.store("test_key", b"test_data", ttl=ttl)
 
     assert exc_info.value.operation == "store"
-    assert exc_info.value.key == "test_key"
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_storage_retrieve_string_conversion(self, redis_settings, mock_redis, mocker):
     """Test storage retrieve converts string to bytes."""
@@ -1727,8 +1735,9 @@ class TestRedisBackendStorageOperations:
     with pytest.raises(StorageError, match="storage read failed") as exc_info:
       backend.retrieve("test_key")
     assert exc_info.value.operation == "retrieve"
-    assert exc_info.value.key == "test_key"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_delete_success(self, redis_settings, mock_redis, mocker):
     """Test delete returns True on successful deletion."""
@@ -1769,8 +1778,9 @@ class TestRedisBackendStorageOperations:
     with pytest.raises(StorageError, match="storage delete failed") as exc_info:
       backend.delete("test_key")
     assert exc_info.value.operation == "delete"
-    assert exc_info.value.key == "test_key"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_exists_true(self, redis_settings, mock_redis, mocker):
     """Test exists returns True when key exists."""
@@ -1814,8 +1824,9 @@ class TestRedisBackendStorageOperations:
     with pytest.raises(StorageError, match="existence check failed") as exc_info:
       backend.exists("test_key")
     assert exc_info.value.operation == "exists"
-    assert exc_info.value.key == "test_key"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_ttl_with_ttl(self, redis_settings, mock_redis, mocker):
     """Test ttl returns seconds when TTL is set."""
@@ -1878,8 +1889,9 @@ class TestRedisBackendStorageOperations:
     with pytest.raises(StorageError, match="TTL read failed") as exc_info:
       backend.ttl("test_key")
     assert exc_info.value.operation == "ttl"
-    assert exc_info.value.key == "test_key"
-    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
   def test_clear_storage_with_prefix(self, redis_settings, mock_redis, mocker):
     """Test clear_storage with prefix uses scan_iter."""

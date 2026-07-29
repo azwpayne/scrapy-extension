@@ -911,7 +911,8 @@ def test_clear_storage_failure_reports_possible_partial_completion(
 
   assert exc_info.value.operation == "clear_storage"
   assert exc_info.value.key is None
-  assert exc_info.value.__cause__ is failure
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   assert "private driver detail" not in str(exc_info.value)
   assert client.delete.call_args_list == [
     mocker.call(b"tenant:storage:first"),

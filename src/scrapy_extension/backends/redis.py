@@ -65,6 +65,8 @@ from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
   queue_operation_error_boundary,
+  set_operation_error_boundary,
+  storage_operation_error_boundary,
 )
 from scrapy_extension.settings import RedisMode
 from scrapy_extension.settings.redis import (
@@ -101,6 +103,39 @@ _REDIS_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
     "Redis pop reported structural corruption.",
     "Redis queue length read failed.",
     "Redis queue clear failed.",
+  }
+)
+_REDIS_SAFE_STORAGE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Redis rejected a storage write.",
+    "Redis storage read returned an invalid response type.",
+  }
+)
+_REDIS_DIRECT_OPERATION_NAMES: frozenset[str] = frozenset(
+  {
+    "add to a set",
+    "remove from a set",
+    "check set membership",
+    "read a set length",
+    "clear a set",
+    "store a value",
+    "retrieve a value",
+    "delete a value",
+    "check value existence",
+    "read a value TTL",
+    "clear storage",
+  }
+)
+_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  _REDIS_SAFE_CONNECTION_MESSAGES
+  | {"Cannot disconnect Redis re-entrantly from an active operation."}
+  | {
+    f"Cannot {operation} while Redis is disconnecting."
+    for operation in _REDIS_DIRECT_OPERATION_NAMES
+  }
+  | {
+    f"Redis connection changed while starting {operation}."
+    for operation in _REDIS_DIRECT_OPERATION_NAMES
   }
 )
 
@@ -176,6 +211,50 @@ def _validate_pop_arguments(
   """Preserve queue-name and finite timeout validation outside redaction."""
   _validate_key_name(queue_name, "queue_name")
   _normalize_pop_timeout(timeout)
+
+
+def _validate_set_name_argument(
+  _backend: object,
+  set_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate one public Redis set name before I/O can begin."""
+  _validate_key_name(set_name, "set_name")
+
+
+def _validate_store_arguments(
+  _backend: object,
+  key: str,
+  _data: bytes,
+  ttl: int | None = None,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate Redis storage write inputs outside the terminal boundary."""
+  _validate_key_name(key, "key")
+  _validate_ttl(ttl)
+
+
+def _validate_storage_key_argument(
+  _backend: object,
+  key: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate one public Redis storage key before I/O can begin."""
+  _validate_key_name(key, "key")
+
+
+def _validate_storage_prefix_argument(
+  _backend: object,
+  prefix: str | None = None,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate an optional Redis storage prefix before I/O can begin."""
+  if prefix is not None:
+    _validate_key_name(prefix, "prefix")
 
 
 def _new_no_replay_retry() -> Retry:
@@ -1288,6 +1367,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ) from e
 
   # SetBackend implementation using Redis Sets
+  @set_operation_error_boundary(
+    "Redis set add failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_set_name_argument,
+  )
   def add(self, set_name: str, item: bytes) -> bool:
     """Add item to set.
 
@@ -1312,6 +1397,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           "Redis set add failed.", backend_type="redis"
         ) from e
 
+  @set_operation_error_boundary(
+    "Redis set remove failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_set_name_argument,
+  )
   def remove(self, set_name: str, item: bytes) -> bool:
     """Remove item from set.
 
@@ -1337,6 +1428,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           backend_type="redis",
         ) from e
 
+  @set_operation_error_boundary(
+    "Redis set membership check failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_set_name_argument,
+  )
   def contains(self, set_name: str, item: bytes) -> bool:
     """Check if item is in set.
 
@@ -1363,6 +1460,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ) from e
       return bool(result)
 
+  @set_operation_error_boundary(
+    "Redis set length read failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_set_name_argument,
+  )
   def set_len(self, set_name: str) -> int:
     """Get set size.
 
@@ -1389,6 +1492,12 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           backend_type="redis",
         ) from e
 
+  @set_operation_error_boundary(
+    "Redis set clear failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_set_name_argument,
+  )
   def clear_set(self, set_name: str) -> None:
     """Clear all items from set.
 
@@ -1413,6 +1522,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         ) from e
 
   # StorageBackend implementation using Redis Strings
+  @storage_operation_error_boundary(
+    "store",
+    "Redis storage write failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_STORAGE_MESSAGES,
+    safe_connection_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_store_arguments,
+  )
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
     """Store data with key.
 
@@ -1452,6 +1569,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           key=key,
         )
 
+  @storage_operation_error_boundary(
+    "retrieve",
+    "Redis storage read failed.",
+    "redis",
+    safe_messages=_REDIS_SAFE_STORAGE_MESSAGES,
+    safe_connection_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_storage_key_argument,
+  )
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
 
@@ -1486,6 +1611,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         key=key,
       )
 
+  @storage_operation_error_boundary(
+    "delete",
+    "Redis storage delete failed.",
+    "redis",
+    safe_connection_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_storage_key_argument,
+  )
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
@@ -1509,6 +1641,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           "Redis storage delete failed.", operation="delete", key=key
         ) from e
 
+  @storage_operation_error_boundary(
+    "exists",
+    "Redis storage existence check failed.",
+    "redis",
+    safe_connection_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_storage_key_argument,
+  )
   def exists(self, key: str) -> bool:
     """Check if key exists.
 
@@ -1532,6 +1671,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           "Redis storage existence check failed.", operation="exists", key=key
         ) from e
 
+  @storage_operation_error_boundary(
+    "ttl",
+    "Redis storage TTL read failed.",
+    "redis",
+    safe_connection_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_storage_key_argument,
+  )
   def ttl(self, key: str) -> int | None:
     """Get remaining time-to-live.
 
@@ -1559,6 +1705,13 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # -2 = no key, -1 = no TTL, >= 0 = remaining seconds.
       return None if result < 0 else result
 
+  @storage_operation_error_boundary(
+    "clear_storage",
+    "Redis storage clear failed and may be partially complete.",
+    "redis",
+    safe_connection_messages=_REDIS_SAFE_DIRECT_OPERATION_CONNECTION_MESSAGES,
+    validator=_validate_storage_prefix_argument,
+  )
   def clear_storage(self, prefix: str | None = None) -> None:
     """Clear all stored data, optionally filtered by prefix.
 

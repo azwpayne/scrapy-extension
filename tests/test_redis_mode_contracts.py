@@ -737,7 +737,10 @@ def test_cluster_sdk_exception_obeys_every_operation_contract(
     assert exc_info.value.__context__ is None
     assert exc_info.value.queue_name is None
   else:
-    assert exc_info.value.__cause__ is failure
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    if type(exc_info.value) is StorageError:
+      assert exc_info.value.key is None
   assert getattr(exc_info.value, field_name) == field_value
   assert _SECRET not in str(exc_info.value)
 
@@ -755,7 +758,9 @@ def test_cluster_root_exception_is_also_typed_and_sanitized(mocker) -> None:
   with pytest.raises(StorageError) as exc_info:
     backend.retrieve("item")
 
-  assert exc_info.value.__cause__ is failure
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
+  assert exc_info.value.key is None
   assert _SECRET not in str(exc_info.value)
 
 
@@ -797,7 +802,10 @@ def test_pool_child_deadlock_obeys_every_operation_contract(
     assert exc_info.value.__context__ is None
     assert exc_info.value.queue_name is None
   else:
-    assert exc_info.value.__cause__ is failure
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    if type(exc_info.value) is StorageError:
+      assert exc_info.value.key is None
   assert getattr(exc_info.value, field_name) == field_value
 
 

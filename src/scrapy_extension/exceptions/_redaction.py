@@ -158,6 +158,7 @@ def set_operation_error_boundary(
   message: str,
   backend_type: str,
   *,
+  safe_messages: Collection[str] = (),
   validator: Callable[..., None] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
   """Rebuild a known direct set connection failure without private state.
@@ -166,10 +167,12 @@ def set_operation_error_boundary(
   :class:`BackendConnectionError` class so callers can make their documented
   graceful-degradation decision.  Its original traceback can still retain a
   logical set name, payload, client object, or mutable settings graph.  This
-  boundary publishes a new fixed error only after those implementation frames
-  have unwound.  It deliberately leaves subclasses and unknown exceptions
-  alone: a bundled operation must not silently redefine plugin/custom error
-  contracts just because it is protected by this terminal boundary.
+  boundary may preserve an exact approved static message through
+  ``safe_messages``; all other messages use ``message``.  It publishes a new
+  error only after implementation frames have unwound.  It deliberately leaves
+  subclasses and unknown exceptions alone: a bundled operation must not
+  silently redefine plugin/custom error contracts just because it is protected
+  by this terminal boundary.
   """
 
   def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -177,7 +180,7 @@ def set_operation_error_boundary(
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
       if validator is not None:
         validator(*args, **kwargs)
-      caught_connection_error = False
+      caught_connection_error: BackendConnectionError | None = None
       try:
         return function(*args, **kwargs)
       except BackendConnectionError as error:
@@ -185,17 +188,30 @@ def set_operation_error_boundary(
           del args
           del kwargs
           raise
-        caught_connection_error = True
+        caught_connection_error = error
       except BaseException:
         del args
         del kwargs
         raise
 
-      assert caught_connection_error
-      sanitized_error = BackendConnectionError(message, backend_type=backend_type)
+      assert caught_connection_error is not None
+      replacement_message = message
+      raw_args: object = caught_connection_error.args
+      if (
+        type(raw_args) is tuple
+        and len(raw_args) == 1
+        and type(raw_args[0]) is str
+        and raw_args[0] in safe_messages
+      ):
+        replacement_message = raw_args[0]
+      sanitized_error = BackendConnectionError(
+        replacement_message, backend_type=backend_type
+      )
       del args
       del kwargs
       del caught_connection_error
+      del replacement_message
+      del raw_args
       raise sanitized_error
 
     return wrapped
@@ -208,6 +224,8 @@ def storage_operation_error_boundary(
   message: str,
   backend_type: str,
   *,
+  safe_messages: Collection[str] = (),
+  safe_connection_messages: Collection[str] = (),
   validator: Callable[..., None] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
   """Publish a terminal direct-storage error without key or backend graphs.
@@ -216,9 +234,11 @@ def storage_operation_error_boundary(
   contract or the exact ``BackendConnectionError`` not-connected contract.
   Both are reconstructed from static caller-selected metadata.  Storage
   failures retain their fixed operation but never the logical key; connection
-  failures retain a trusted bundled backend type.  Input validation runs
-  outside the protected call.  Custom exception subclasses and unknown
-  implementation failures are intentionally not converted.
+  failures retain a trusted bundled backend type.  A caller may preserve a
+  known fixed storage or connection message through ``safe_messages`` and
+  ``safe_connection_messages``; all other messages use ``message``.  Input
+  validation runs outside the protected call.  Custom exception subclasses
+  and unknown implementation failures are intentionally not converted.
   """
 
   def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -226,8 +246,8 @@ def storage_operation_error_boundary(
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
       if validator is not None:
         validator(*args, **kwargs)
-      caught_storage_error = False
-      caught_connection_error = False
+      caught_storage_error: StorageError | None = None
+      caught_connection_error: BackendConnectionError | None = None
       try:
         return function(*args, **kwargs)
       except StorageError as error:
@@ -235,31 +255,53 @@ def storage_operation_error_boundary(
           del args
           del kwargs
           raise
-        caught_storage_error = True
+        caught_storage_error = error
       except BackendConnectionError as error:
         if type(error) is not BackendConnectionError:
           del args
           del kwargs
           raise
-        caught_connection_error = True
+        caught_connection_error = error
       except BaseException:
         del args
         del kwargs
         raise
 
-      if caught_storage_error:
+      replacement_message = message
+      raw_args: object = None
+      if caught_storage_error is not None:
+        raw_args = caught_storage_error.args
+        if (
+          type(raw_args) is tuple
+          and len(raw_args) == 1
+          and type(raw_args[0]) is str
+          and raw_args[0] in safe_messages
+        ):
+          replacement_message = raw_args[0]
         sanitized_error: BackendError = StorageError(
-          message,
+          replacement_message,
           operation=operation,
           key=None,
         )
       else:
-        assert caught_connection_error
-        sanitized_error = BackendConnectionError(message, backend_type=backend_type)
+        assert caught_connection_error is not None
+        raw_args = caught_connection_error.args
+        if (
+          type(raw_args) is tuple
+          and len(raw_args) == 1
+          and type(raw_args[0]) is str
+          and raw_args[0] in safe_connection_messages
+        ):
+          replacement_message = raw_args[0]
+        sanitized_error = BackendConnectionError(
+          replacement_message, backend_type=backend_type
+        )
       del args
       del kwargs
       del caught_storage_error
       del caught_connection_error
+      del replacement_message
+      del raw_args
       raise sanitized_error
 
     return wrapped
