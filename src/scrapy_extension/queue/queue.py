@@ -356,9 +356,16 @@ class BackendQueue:
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise error
+    delay = 0.0
+    delay_error: Exception | None = None
     try:
       delay = float(raw_delay or 0.0)
-    except (OverflowError, TypeError, ValueError) as e:
+    except (OverflowError, TypeError, ValueError) as caught_error:
+      # Finish this exception suite before acknowledging/logging the rejected
+      # replacement. Either hook can be application-provided and must not
+      # observe the conversion failure through ``sys.exc_info()``.
+      delay_error = caught_error
+    if delay_error is not None:
       error = QueueError(
         "Invalid queue delay "
         f"{_invalid_routing_value_description(raw_delay)}: expected a finite number >= 0",
@@ -366,7 +373,7 @@ class BackendQueue:
         operation="push",
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
-      raise error from e
+      raise error from delay_error
     if not math.isfinite(delay) or delay < 0:
       error = QueueError(
         "Invalid queue delay "
@@ -394,16 +401,22 @@ class BackendQueue:
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise error
     raw_source = request.meta.get("source", "default")
+    source = ""
+    source_error: Exception | None = None
     try:
       source = str(raw_source or "default")
-    except Exception as e:
+    except Exception as caught_error:
+      # See the delay-normalization path above: external cleanup must run
+      # only after the raw conversion failure has unwound from this frame.
+      source_error = caught_error
+    if source_error is not None:
       error = QueueError(
         f"Invalid queue source of type {type(raw_source).__name__}",
         queue_name=self.queue_name,
         operation="push",
       )
       self._terminate_invalid_replacement(request, replacement_ack_token)
-      raise error from e
+      raise error from source_error
     if isinstance(self._strategy, QueueStrategy):
       prepared_push = self._strategy._prepare_push(
         self.queue_name,
@@ -445,10 +458,16 @@ class BackendQueue:
         queue_name=self.queue_name,
         operation="push",
       )
+    serialization_failed = False
     try:
       request_dict = self._request_to_dict(request)
       data = self._serializer.serialize(request_dict)
     except Exception:
+      # Do not terminate a replacement from this suite. Acknowledgement and
+      # stats hooks are externally extensible and would otherwise receive the
+      # raw request-conversion failure through ``sys.exc_info()``.
+      serialization_failed = True
+    if serialization_failed:
       self._terminate_invalid_replacement(request, replacement_ack_token)
       raise SerializationError(
         _QUEUE_PUSH_MONITOR_FAILURE,
@@ -662,6 +681,7 @@ class BackendQueue:
         self._inc_stat("scheduler/queue/empty_payload_dropped")
       return None
 
+    deserialization_failed = False
     try:
       if len(data) > self.max_item_bytes:
         self._inc_stat("scheduler/queue/oversize_dropped")
@@ -679,7 +699,13 @@ class BackendQueue:
       self._validate_request_dict(request_dict)
       request = self._request_from_dict(request_dict)
     except Exception:
+      # The fixed error/poison handling below deliberately runs after this
+      # suite. Custom stats and logging hooks must not recover a malformed
+      # broker payload from the caught parser error.
+      deserialization_failed = True
+    if deserialization_failed:
       poison_terminated = ack_token is None
+      malformed_ack_failed = False
       if ack_token is not None:
         try:
           # Deserialization failures are deterministic for the same bytes. A
@@ -690,10 +716,12 @@ class BackendQueue:
           self._ack(token=ack_token)
           poison_terminated = True
         except Exception:  # noqa: BLE001 - preserve the deserialize failure
-          try:
-            logger.error("Failed to acknowledge malformed payload")
-          except BaseException:
-            pass
+          malformed_ack_failed = True
+      if malformed_ack_failed:
+        try:
+          logger.error("Failed to acknowledge malformed payload")
+        except BaseException:
+          pass
       if poison_terminated:
         self._inc_stat("scheduler/queue/poison_dropped")
       raise SerializationError(
@@ -1088,9 +1116,14 @@ class BackendQueue:
     """Drop a deterministic-invalid replacement's consumed broker delivery."""
     if token is None:
       return
+    acknowledgement_failed = False
     try:
       self._ack(token=token)
     except Exception:  # noqa: BLE001 - preserve the local validation error
+      # Keep the diagnostic outside this exception suite so a logging handler
+      # cannot inspect the acknowledgement failure through ``sys.exc_info()``.
+      acknowledgement_failed = True
+    if acknowledgement_failed:
       try:
         logger.error("Failed to acknowledge invalid replacement")
       except BaseException:

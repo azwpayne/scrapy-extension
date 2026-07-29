@@ -1673,6 +1673,35 @@ class TestBackendPipelineMonitorWiring:
     monitor.on_error.assert_called_once()
     _assert_handler_records_are_redacted(handler, marker)
 
+  def test_serialization_stats_callback_runs_after_raw_error_unwinds(
+    self, mock_connection_manager
+  ):
+    """A custom stats extension cannot inspect the serializer failure."""
+    marker = "round48-pipeline-serialization-stats-marker"
+    observed_contexts: list[tuple[object | None, object | None, object | None]] = []
+
+    class StatsProbe:
+      def inc_value(self, _stat_name: str) -> None:
+        observed_contexts.append(sys.exc_info())
+
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    pipeline._storage_supported = True
+    spider = type(
+      "Spider",
+      (),
+      {"name": "safe-spider", "crawler": type("Crawler", (), {"stats": StatsProbe()})()},
+    )()
+
+    def fail_serialization(_item: object) -> bytes:
+      raise RuntimeError(marker)
+
+    pipeline._serialize_item = fail_serialization
+
+    with pytest.raises(SerializationError, match="Failed to serialize item"):
+      pipeline.process_item(SampleItem(name="safe", value=1), spider)
+
+    assert observed_contexts == [(None, None, None)]
+
   def test_on_store_failure_does_not_fail_already_persisted_item(
     self, mock_connection_manager, mocker
   ):

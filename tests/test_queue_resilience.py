@@ -21,6 +21,8 @@ docstrings promise and production relies on.
 from __future__ import annotations
 
 import logging
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,6 +33,36 @@ from scrapy_extension.backends.base import _QueuePushReceipt
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+
+
+class _StatsExceptionContextProbe:
+  """Record the exception state visible to a stats extension."""
+
+  def __init__(self) -> None:
+    self.calls: list[tuple[str, tuple[object | None, object | None, object | None]]] = []
+
+  def inc_value(self, stat_name: str) -> None:
+    self.calls.append((stat_name, sys.exc_info()))
+
+
+class _LoggingExceptionContextProbe(logging.Handler):
+  """Record what a synchronous logging handler can inspect during ``emit``."""
+
+  def __init__(self) -> None:
+    super().__init__(logging.DEBUG)
+    self.records: list[logging.LogRecord] = []
+    self.contexts: list[tuple[object | None, object | None, object | None]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.contexts.append(sys.exc_info())
+
+
+def _assert_no_active_exception(
+  contexts: list[tuple[object | None, object | None, object | None]],
+) -> None:
+  assert contexts
+  assert contexts == [(None, None, None)] * len(contexts)
 
 
 def _delay() -> DelayQueueStrategy:
@@ -721,6 +753,180 @@ def test_terminal_ack_fallback_diagnostic_preserves_primary_outcome(
       )
 
   logger_exception.assert_called_once()
+
+
+def test_invalid_replacement_ack_diagnostic_runs_after_its_exception_unwinds() -> None:
+  """A logger handler cannot inspect a swallowed replacement-ack failure."""
+  marker = "round48-invalid-replacement-ack-marker"
+  backend = MagicMock(name="QueueBackend")
+  backend.ack.side_effect = RuntimeError(marker)
+  queue = BackendQueue(connection_manager=_cm(queue_backend=backend), queue_name="q")
+  logger_name = "scrapy_extension.queue.queue"
+  source_logger = logging.getLogger(logger_name)
+  old_level = source_logger.level
+  probe = _LoggingExceptionContextProbe()
+  source_logger.setLevel(logging.DEBUG)
+  source_logger.addHandler(probe)
+  try:
+    queue._terminate_invalid_replacement(Request("https://example.com"), "token")
+  finally:
+    source_logger.removeHandler(probe)
+    source_logger.setLevel(old_level)
+
+  _assert_no_active_exception(probe.contexts)
+  assert all(marker not in record.getMessage() for record in probe.records)
+  assert all(marker not in repr(record.args) for record in probe.records)
+  assert all(record.exc_info is None for record in probe.records)
+  assert all(record.exc_text is None for record in probe.records)
+
+
+def test_invalid_delay_replacement_stats_run_after_conversion_unwinds() -> None:
+  """Replacement cleanup cannot expose a failed delay conversion to stats."""
+  marker = "round48-invalid-delay-marker"
+
+  class BrokenDelay(float):
+    def __float__(self) -> float:
+      raise ValueError(marker)
+
+  stats = _StatsExceptionContextProbe()
+  spider = SimpleNamespace(crawler=SimpleNamespace(stats=stats))
+  backend = MagicMock(name="QueueBackend")
+  queue = BackendQueue(
+    connection_manager=_cm(queue_backend=backend),
+    queue_name="q",
+    spider=spider,
+    monitor=MagicMock(name="Monitor"),
+  )
+  request = Request(
+    "https://example.com",
+    meta={"_backend_ack_token": "token", "delay": BrokenDelay(1)},
+  )
+
+  with pytest.raises(QueueError, match="Invalid queue delay"):
+    queue._push(request, 0)
+
+  assert [name for name, _context in stats.calls] == [
+    "scheduler/queue/replacement_poison_dropped"
+  ]
+  _assert_no_active_exception([context for _name, context in stats.calls])
+
+
+def test_invalid_source_replacement_stats_run_after_conversion_unwinds() -> None:
+  """Replacement cleanup cannot expose a failed source conversion to stats."""
+  marker = "round48-invalid-source-marker"
+
+  class BrokenSource:
+    def __str__(self) -> str:
+      raise RuntimeError(marker)
+
+  stats = _StatsExceptionContextProbe()
+  spider = SimpleNamespace(crawler=SimpleNamespace(stats=stats))
+  backend = MagicMock(name="QueueBackend")
+  queue = BackendQueue(
+    connection_manager=_cm(queue_backend=backend),
+    queue_name="q",
+    spider=spider,
+    monitor=MagicMock(name="Monitor"),
+  )
+  request = Request(
+    "https://example.com",
+    meta={"_backend_ack_token": "token", "source": BrokenSource()},
+  )
+
+  with pytest.raises(QueueError, match="Invalid queue source"):
+    queue._push(request, 0)
+
+  assert [name for name, _context in stats.calls] == [
+    "scheduler/queue/replacement_poison_dropped"
+  ]
+  _assert_no_active_exception([context for _name, context in stats.calls])
+
+
+def test_serialization_replacement_stats_run_after_conversion_unwinds() -> None:
+  """Replacement cleanup cannot expose a failed serializer to stats."""
+  marker = "round48-serialization-marker"
+  stats = _StatsExceptionContextProbe()
+  spider = SimpleNamespace(crawler=SimpleNamespace(stats=stats))
+  backend = MagicMock(name="QueueBackend")
+  queue = BackendQueue(
+    connection_manager=_cm(queue_backend=backend),
+    queue_name="q",
+    spider=spider,
+    monitor=MagicMock(name="Monitor"),
+  )
+  queue._request_to_dict = MagicMock(side_effect=RuntimeError(marker))
+  request = Request(
+    "https://example.com",
+    meta={"_backend_ack_token": "token"},
+  )
+
+  with pytest.raises(SerializationError, match="Queue push serialization failed"):
+    queue._push(request, 0)
+
+  assert [name for name, _context in stats.calls] == [
+    "scheduler/queue/replacement_poison_dropped"
+  ]
+  _assert_no_active_exception([context for _name, context in stats.calls])
+
+
+def test_malformed_payload_ack_diagnostic_runs_after_exception_unwinds() -> None:
+  """A logger handler cannot inspect a malformed payload or failed ack."""
+  marker = "round48-malformed-ack-marker"
+  backend = MagicMock(name="QueueBackend")
+  backend.ack.side_effect = RuntimeError(marker)
+  strategy = MagicMock(name="QueueStrategy")
+  strategy.pop_with_ack.return_value = (marker.encode(), "token")
+  strategy.queue_len.return_value = 0
+  queue = BackendQueue(
+    connection_manager=_cm(queue_backend=backend),
+    queue_name="q",
+    queue_strategy=strategy,
+    monitor=MagicMock(name="Monitor"),
+  )
+  logger_name = "scrapy_extension.queue.queue"
+  source_logger = logging.getLogger(logger_name)
+  old_level = source_logger.level
+  probe = _LoggingExceptionContextProbe()
+  source_logger.setLevel(logging.DEBUG)
+  source_logger.addHandler(probe)
+  try:
+    with pytest.raises(SerializationError, match="Queue pop deserialization failed"):
+      queue._pop(0)
+  finally:
+    source_logger.removeHandler(probe)
+    source_logger.setLevel(old_level)
+
+  _assert_no_active_exception(probe.contexts)
+  assert all(marker not in record.getMessage() for record in probe.records)
+  assert all(marker not in repr(record.args) for record in probe.records)
+  assert all(record.exc_info is None for record in probe.records)
+  assert all(record.exc_text is None for record in probe.records)
+
+
+def test_malformed_payload_stats_run_after_deserialization_unwinds() -> None:
+  """The poison-drop stats hook cannot inspect malformed broker bytes."""
+  marker = "round48-malformed-payload-marker"
+  stats = _StatsExceptionContextProbe()
+  spider = SimpleNamespace(crawler=SimpleNamespace(stats=stats))
+  backend = MagicMock(name="QueueBackend")
+  strategy = MagicMock(name="QueueStrategy")
+  strategy.pop_with_ack.return_value = (marker.encode(), "token")
+  strategy.queue_len.return_value = 0
+  queue = BackendQueue(
+    connection_manager=_cm(queue_backend=backend),
+    queue_name="q",
+    spider=spider,
+    queue_strategy=strategy,
+    monitor=MagicMock(name="Monitor"),
+  )
+
+  with pytest.raises(SerializationError, match="Queue pop deserialization failed"):
+    queue._pop(0)
+
+  assert [name for name, _context in stats.calls] == [
+    "scheduler/queue/poison_dropped"
+  ]
+  _assert_no_active_exception([context for _name, context in stats.calls])
 
 
 @pytest.mark.parametrize(

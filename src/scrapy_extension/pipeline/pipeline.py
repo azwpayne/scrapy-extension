@@ -607,11 +607,17 @@ class BackendPipeline:
       return item
 
     key = self._generate_item_key(spider)
+    serialization_failed = False
     try:
       data = self._serialize_item(item)
     except SerializationError:
       raise
     except Exception:
+      # The stat collector can be application-provided. Run it only after the
+      # serializer failure has left this frame so it cannot inspect private
+      # item state through ``sys.exc_info()``.
+      serialization_failed = True
+    if serialization_failed:
       self._inc_stat(spider, "pipeline/serialization_errors")
       raise SerializationError(
         _PIPELINE_SERIALIZATION_MONITOR_FAILURE,
