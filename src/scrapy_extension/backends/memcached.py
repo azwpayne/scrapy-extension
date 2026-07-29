@@ -18,9 +18,11 @@ pymemcache API used (stable):
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
 from threading import Lock
-from typing import Any, cast
+from typing import Any, ParamSpec, TypeVar, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -45,6 +47,7 @@ from scrapy_extension.exceptions import BackendConnectionError
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  storage_operation_error_boundary,
 )
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MemcachedMode, MemcachedSettings
@@ -56,12 +59,117 @@ from scrapy_extension.settings.memcached import (
 
 logger = logging.getLogger(__name__)
 
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
 _MEMCACHED_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
   MemcachedSettings.model_fields
 )
 _MEMCACHED_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
   {"Failed to connect to Memcached."}
 )
+_MEMCACHED_STORAGE_STORE_ERROR = "Memcached storage store failed."
+_MEMCACHED_STORAGE_RETRIEVE_ERROR = "Memcached storage retrieve failed."
+_MEMCACHED_STORAGE_DELETE_ERROR = "Memcached storage delete failed."
+_MEMCACHED_STORAGE_EXISTS_ERROR = "Memcached storage existence check failed."
+_MEMCACHED_STORAGE_CLEAR_ERROR = "Memcached storage clear failed."
+_MEMCACHED_CLEAR_STORAGE_PREFIX_UNSUPPORTED_MESSAGE = (
+  "Memcached flush_all does not support prefix scoping; pass "
+  "prefix=None only when a server-wide flush is explicitly acceptable."
+)
+_MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE = (
+  "Memcached clear_storage would flush every key on the server. Set "
+  "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=true (allow_flush_all=True) only "
+  "for a dedicated cache where that destructive scope is intended."
+)
+_MEMCACHED_CLEAR_STORAGE_CAPABILITY_MESSAGES: frozenset[str] = frozenset(
+  {
+    _MEMCACHED_CLEAR_STORAGE_PREFIX_UNSUPPORTED_MESSAGE,
+    _MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE,
+  }
+)
+
+
+def _validate_storage_key_argument(
+  _backend: object,
+  key: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate a direct Memcached storage key before implementation frames."""
+  _validate_key_name(key, "key")
+
+
+def _validate_store_arguments(
+  _backend: object,
+  key: str,
+  data: bytes,
+  ttl: int | None = None,
+) -> None:
+  """Validate a direct Memcached storage write before its terminal boundary."""
+  del data
+  _validate_key_name(key, "key")
+  _validate_ttl(ttl)
+
+
+def _validate_storage_prefix_argument(
+  _backend: object,
+  prefix: str | None = None,
+) -> None:
+  """Validate a non-empty clear prefix before backend implementation frames."""
+  if prefix is not None:
+    _validate_key_name(prefix, "prefix")
+
+
+def _clear_storage_capability_error_boundary(
+  function: Callable[_P, _T],
+) -> Callable[_P, _T]:
+  """Rebuild the two documented Memcached clear capability errors safely.
+
+  ``clear_storage`` intentionally has two distinct static
+  :class:`NotImplementedError` contracts: prefix-scoped flushing is not
+  possible and a server-wide flush needs an explicit connected-generation
+  opt-in.  Both literals are public API, but raising either from the backend
+  method retains its configuration and caller prefix in traceback locals.
+  Reconstruct only those exact built-in errors after all implementation frames
+  unwind; subclasses and unknown behavior keep their established contract.
+  """
+
+  @wraps(function)
+  def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+    caught_error: NotImplementedError | None = None
+    try:
+      return function(*args, **kwargs)
+    except NotImplementedError as error:
+      if type(error) is not NotImplementedError:
+        del args
+        del kwargs
+        raise
+      caught_error = error
+    except BaseException:
+      del args
+      del kwargs
+      raise
+
+    assert caught_error is not None
+    replacement_message = _MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE
+    raw_args: object = caught_error.args
+    if (
+      type(raw_args) is tuple
+      and len(raw_args) == 1
+      and type(raw_args[0]) is str
+      and raw_args[0] in _MEMCACHED_CLEAR_STORAGE_CAPABILITY_MESSAGES
+    ):
+      replacement_message = raw_args[0]
+    sanitized_error = NotImplementedError(replacement_message)
+    del args
+    del kwargs
+    del caught_error
+    del raw_args
+    del replacement_message
+    raise sanitized_error
+
+  return wrapped
 
 
 @dataclass(frozen=True)
@@ -256,6 +364,12 @@ class MemcachedBackend(Backend, StorageBackend):
     return BackendType.MEMCACHED
 
   # StorageBackend implementation
+  @storage_operation_error_boundary(
+    "store",
+    _MEMCACHED_STORAGE_STORE_ERROR,
+    "memcached",
+    validator=_validate_store_arguments,
+  )
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
     """Store ``data`` under ``key`` with optional TTL.
 
@@ -286,6 +400,12 @@ class MemcachedBackend(Backend, StorageBackend):
         key=key,
       )
 
+  @storage_operation_error_boundary(
+    "retrieve",
+    _MEMCACHED_STORAGE_RETRIEVE_ERROR,
+    "memcached",
+    validator=_validate_storage_key_argument,
+  )
   def retrieve(self, key: str) -> bytes | None:
     """Retrieve data by key.
 
@@ -310,6 +430,12 @@ class MemcachedBackend(Backend, StorageBackend):
         msg = f"Failed to retrieve key {key!r} from Memcached: {e}"
         raise StorageError(msg, operation="retrieve", key=key) from e
 
+  @storage_operation_error_boundary(
+    "delete",
+    _MEMCACHED_STORAGE_DELETE_ERROR,
+    "memcached",
+    validator=_validate_storage_key_argument,
+  )
   def delete(self, key: str) -> bool:
     """Delete data by key.
 
@@ -334,6 +460,12 @@ class MemcachedBackend(Backend, StorageBackend):
         msg = f"Failed to delete key {key!r} in Memcached: {e}"
         raise StorageError(msg, operation="delete", key=key) from e
 
+  @storage_operation_error_boundary(
+    "exists",
+    _MEMCACHED_STORAGE_EXISTS_ERROR,
+    "memcached",
+    validator=_validate_storage_key_argument,
+  )
   def exists(self, key: str) -> bool:
     """Check if a key exists.
 
@@ -373,6 +505,13 @@ class MemcachedBackend(Backend, StorageBackend):
     _validate_key_name(key, "key")
     return None
 
+  @_clear_storage_capability_error_boundary
+  @storage_operation_error_boundary(
+    "clear_storage",
+    _MEMCACHED_STORAGE_CLEAR_ERROR,
+    "memcached",
+    validator=_validate_storage_prefix_argument,
+  )
   def clear_storage(self, prefix: str | None = None) -> None:
     """Flush all server keys only when explicitly enabled.
 
@@ -390,20 +529,13 @@ class MemcachedBackend(Backend, StorageBackend):
     """
     if prefix is not None:
       _validate_key_name(prefix, "prefix")
-      raise NotImplementedError(
-        "Memcached flush_all does not support prefix scoping; pass "
-        "prefix=None only when a server-wide flush is explicitly acceptable."
-      )
+      raise NotImplementedError(_MEMCACHED_CLEAR_STORAGE_PREFIX_UNSUPPORTED_MESSAGE)
     with self._operation_lock:
       with self._lifecycle_lock:
         client = self._client
         snapshot = self._connection_snapshot
       if snapshot is None or not snapshot.allow_flush_all:
-        raise NotImplementedError(
-          "Memcached clear_storage would flush every key on the server. Set "
-          "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=true (allow_flush_all=True) only "
-          "for a dedicated cache where that destructive scope is intended."
-        )
+        raise NotImplementedError(_MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE)
       try:
         flushed = client.flush_all()
       except Exception as e:

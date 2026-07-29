@@ -695,7 +695,7 @@ class TestMemcachedStorageErrorContract:
       b.store("key1", b"value")
 
     assert exc_info.value.operation == "store"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
 
   def test_store_failure_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -703,8 +703,8 @@ class TestMemcachedStorageErrorContract:
     with pytest.raises(StorageError) as exc_info:
       b.store("key1", b"value")
     assert exc_info.value.operation == "store"
-    assert exc_info.value.key == "key1"
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
   def test_retrieve_failure_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -712,7 +712,7 @@ class TestMemcachedStorageErrorContract:
     with pytest.raises(StorageError) as exc_info:
       b.retrieve("key1")
     assert exc_info.value.operation == "retrieve"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
 
   def test_delete_failure_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -720,7 +720,7 @@ class TestMemcachedStorageErrorContract:
     with pytest.raises(StorageError) as exc_info:
       b.delete("key1")
     assert exc_info.value.operation == "delete"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
 
   def test_exists_failure_raises_storage_error(self, mocker) -> None:
     b, client = _connected(mocker)
@@ -728,7 +728,7 @@ class TestMemcachedStorageErrorContract:
     with pytest.raises(StorageError) as exc_info:
       b.exists("key1")
     assert exc_info.value.operation == "exists"
-    assert exc_info.value.key == "key1"
+    assert exc_info.value.key is None
 
   def test_clear_storage_failure_raises_storage_error(self, mocker) -> None:
     b = _make_backend(allow_flush_all=True)
@@ -739,6 +739,8 @@ class TestMemcachedStorageErrorContract:
     with pytest.raises(StorageError) as exc_info:
       b.clear_storage()
     assert exc_info.value.operation == "clear_storage"
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
 
   def test_storage_error_is_backend_error_subclass(self, mocker) -> None:
     """``except BackendError`` must catch storage-path failures."""
