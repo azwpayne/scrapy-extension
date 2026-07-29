@@ -114,6 +114,8 @@ def _drain(backend, queue: str, n: int, deadline_s: float = 15.0):  # type: igno
 _BROKER_CONTAINER = os.environ.get("SCRAPY_TEST_ROCKETMQ_BROKER_CONTAINER", "scrapy-ext-rocketmq-broker")
 _BROKER_ADDR = os.environ.get("SCRAPY_TEST_ROCKETMQ_BROKER_ADDR", "scrapy-ext-rocketmq-broker:10911")
 _NAMESRV_ADDR = os.environ.get("SCRAPY_TEST_ROCKETMQ_INTERNAL_NAMESRV", "rocketmq-namesrv:9876")
+_ROCKETMQ_SDK_LOCAL_IP_CACHE_ATTRIBUTE = "_Misc__LOCAL_IP"
+_ROCKETMQ_SDK_LOOPBACK_ADDRESS = "127.0.0.1"
 
 
 def _ensure_topic(backend, queue_name: str) -> None:  # type: ignore[no-untyped-def]
@@ -150,7 +152,33 @@ def _ensure_topic(backend, queue_name: str) -> None:  # type: ignore[no-untyped-
 
 
 @pytest.fixture(scope="module")
-def rocketmq_backend():  # type: ignore[no-untyped-def]
+def _rocketmq_sdk_loopback_identity():  # type: ignore[no-untyped-def]
+  """Prevent the SDK metadata path from probing a public route in CI.
+
+  ``rocketmq-python-client==5.1.1`` discovers a local source IP by connecting
+  an UDP socket to ``8.8.8.8``.  That address is neither a broker endpoint nor
+  message traffic, and expanding pytest-socket's allow-list would permit any
+  protocol/port to that public host.  The local fixture's real broker is
+  loopback, which is also the SDK's documented fallback after probe failure;
+  seed its private cache only for this integration module, then restore the
+  caller's prior process-wide value after backend teardown.
+  """
+  from rocketmq.v5.util.misc import Misc
+
+  previous = getattr(Misc, _ROCKETMQ_SDK_LOCAL_IP_CACHE_ATTRIBUTE)
+  setattr(
+    Misc,
+    _ROCKETMQ_SDK_LOCAL_IP_CACHE_ATTRIBUTE,
+    _ROCKETMQ_SDK_LOOPBACK_ADDRESS,
+  )
+  try:
+    yield Misc
+  finally:
+    setattr(Misc, _ROCKETMQ_SDK_LOCAL_IP_CACHE_ATTRIBUTE, previous)
+
+
+@pytest.fixture(scope="module")
+def rocketmq_backend(_rocketmq_sdk_loopback_identity):  # type: ignore[no-untyped-def]
   """Connect a RocketMQBackend once per module; disconnect on teardown.
 
   Unique consumer/producer groups per run avoid cross-talk with any real
@@ -178,6 +206,22 @@ def unique_prefix() -> str:
   the topic is ``scrapy-queue_{queue_name}``.
   """
   return f"inttest-{uuid.uuid4().hex}"
+
+
+def test_sdk_loopback_identity_avoids_public_route_probe(
+  _rocketmq_sdk_loopback_identity, mocker
+):  # type: ignore[no-untyped-def]
+  """The fixture must use the SDK cache without constructing a probe socket."""
+  socket_constructor = mocker.patch(
+    "rocketmq.v5.util.misc.socket.socket",
+    side_effect=AssertionError("RocketMQ metadata attempted a public route probe"),
+  )
+
+  assert (
+    _rocketmq_sdk_loopback_identity.get_local_ip()
+    == _ROCKETMQ_SDK_LOOPBACK_ADDRESS
+  )
+  socket_constructor.assert_not_called()
 
 
 def test_push_pop_round_trip(rocketmq_backend, unique_prefix):

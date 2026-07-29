@@ -146,6 +146,26 @@ def test_integration_ci_and_compose_share_locked_elasticsearch_contract() -> Non
   assert compose["services"]["elasticsearch"]["image"] == expected_image
 
 
+def test_integration_ci_keeps_rocketmq_route_probe_socket_isolated() -> None:
+  """R51: live brokers use loopback without granting public route probes."""
+  repository_root = Path(__file__).resolve().parents[1]
+  workflow = yaml.safe_load(
+    (repository_root / ".github" / "workflows" / "ci.yml").read_text(
+      encoding="utf-8"
+    )
+  )
+  integration_steps = workflow["jobs"]["integration-tests"]["steps"]
+  integration_run = next(
+    step["run"]
+    for step in integration_steps
+    if step.get("name") == "Run integration tests"
+  )
+
+  assert "--allow-hosts=localhost,127.0.0.1,::1" in integration_run
+  assert "8.8.8.8" not in integration_run
+  assert "--force-enable-socket" not in integration_run
+
+
 def test_ci_smoke_installs_and_imports_both_release_artifacts() -> None:
   """R51: wheel and sdist must execute outside the source checkout."""
   workflow = (
