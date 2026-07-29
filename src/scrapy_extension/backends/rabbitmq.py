@@ -284,23 +284,29 @@ class RabbitMQBackend(Backend, QueueBackend):
   ) -> None:
     """Best-effort close a detached or losing connection generation."""
     primary_error: BaseException | None = None
+    channel_close_failed = False
     if channel is not None and channel is not keep_channel:
       try:
         channel.close()
       except Exception:
-        logger.debug("Ignoring RabbitMQ channel-close failure")
+        channel_close_failed = True
       except BaseException as exc:
         primary_error = exc
+    connection_close_failed = False
     if connection is not None and connection is not keep_connection:
       try:
         connection.close()
       except Exception:
-        logger.debug("Ignoring RabbitMQ connection-close failure")
+        connection_close_failed = True
       except BaseException as exc:
         if primary_error is None:
           primary_error = exc
     if primary_error is not None:
       raise primary_error
+    if channel_close_failed:
+      logger.debug("Ignoring RabbitMQ channel-close failure")
+    if connection_close_failed:
+      logger.debug("Ignoring RabbitMQ connection-close failure")
 
   def _publish_handles_locked(
     self,

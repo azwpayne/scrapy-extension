@@ -255,7 +255,9 @@ class RocketMQBackend(Backend, QueueBackend):
       # Retire it before beginning a fresh generation; this preserves the
       # failure cleanup contract while preventing a one-sided client leak.
       if self._producer is not None or self._consumer is not None:
-        self._abort_partial_connect()
+        residual_cleanup_failed = self._abort_partial_connect()
+        if residual_cleanup_failed:
+          self._log_cleanup_diagnostic()
       self._connect_unlocked()
 
   @import_error_traceback_boundary
@@ -304,6 +306,7 @@ class RocketMQBackend(Backend, QueueBackend):
 
     startup_error: BackendConnectionError | None = None
     invariant_error: BackendConnectionError | None = None
+    cleanup_diagnostic_pending = False
     try:
       # Credentials: empty Credentials() for no-auth (the broker fixture runs
       # with auth disabled); Credentials(ak, sk) when both are provided.
@@ -353,7 +356,7 @@ class RocketMQBackend(Backend, QueueBackend):
           self._consumer.startup()
           self._consumer_generation += 1
     except Exception:
-      self._abort_partial_connect()
+      cleanup_diagnostic_pending = self._abort_partial_connect()
       startup_error = BackendConnectionError(
         "Failed to connect to RocketMQ.", backend_type="rocketmq"
       )
@@ -371,8 +374,13 @@ class RocketMQBackend(Backend, QueueBackend):
     if invariant_error is not None:
       # These local contract violations use fixed text, so preserve their
       # existing public diagnostics while still raising outside any handler.
-      self._abort_partial_connect()
+      cleanup_diagnostic_pending = self._abort_partial_connect()
       startup_error = invariant_error
+
+    if cleanup_diagnostic_pending:
+      # The startup handler has finished, so a logging extension cannot
+      # recover the raw driver failure through ``sys.exc_info()``.
+      self._log_cleanup_diagnostic()
 
     if startup_error is not None:
       # Raise outside the driver exception handler so endpoint/credential text
@@ -388,7 +396,15 @@ class RocketMQBackend(Backend, QueueBackend):
     except BaseException:
       pass
 
-  def _abort_partial_connect(self) -> None:
+  @staticmethod
+  def _log_cleanup_diagnostic() -> None:
+    """Emit a fixed best-effort detached-client cleanup diagnostic."""
+    try:
+      logger.debug("RocketMQ detached client shutdown failed.")
+    except BaseException:
+      pass
+
+  def _abort_partial_connect(self) -> bool:
     """Detach and best-effort stop clients created by a failed connect."""
     producer = self._producer
     consumer = self._consumer
@@ -398,7 +414,7 @@ class RocketMQBackend(Backend, QueueBackend):
     self._subscribed_topics.clear()
     self._last_msg = None
     self._last_delivery = None
-    self._shutdown_detached_clients(
+    return self._shutdown_detached_clients(
       (consumer, "consumer"),
       (producer, "producer"),
       suppress_control_errors=True,
@@ -417,9 +433,11 @@ class RocketMQBackend(Backend, QueueBackend):
       self._subscribed_topics.clear()
       self._last_msg = None
       self._last_delivery = None
-      self._shutdown_detached_clients(
+      cleanup_failed = self._shutdown_detached_clients(
         (producer, "producer"), (consumer, "consumer")
       )
+      if cleanup_failed:
+        self._log_cleanup_diagnostic()
       # This diagnostic follows the completed disconnect state transition. A
       # misbehaving logging handler must not report the completed operation as
       # failed or resurrect an already-detached client generation.
@@ -432,30 +450,22 @@ class RocketMQBackend(Backend, QueueBackend):
   def _shutdown_detached_clients(
     *clients: tuple[Any | None, str],
     suppress_control_errors: bool = False,
-  ) -> None:
+  ) -> bool:
     """Shut down every detached client, retaining the first control exception."""
     primary_error: BaseException | None = None
+    ordinary_shutdown_failed = False
     for closer, _label in clients:
       if closer is not None:
         try:
           closer.shutdown()
         except Exception:
-          # Cleanup diagnostics are strictly best-effort.  A misbehaving
-          # logging handler can raise a control exception; it must neither
-          # interrupt cleanup of later detached clients nor replace the
-          # failed-connect error that caused this abort.
-          try:
-            if suppress_control_errors:
-              logger.debug("Failed to abort partial RocketMQ client")
-            else:
-              logger.warning("RocketMQ client shutdown raised; ignoring")
-          except BaseException:
-            pass
+          ordinary_shutdown_failed = True
         except BaseException as error:
           if primary_error is None:
             primary_error = error
     if primary_error is not None and not suppress_control_errors:
       raise primary_error
+    return ordinary_shutdown_failed
 
   def is_connected(self) -> bool:
     """Check if RocketMQ is connected (both clients running).

@@ -400,12 +400,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
   def _discard_candidate(self, candidate: Elasticsearch | None) -> None:
     """Best-effort close for a client generation that was never published."""
     if candidate is not None:
+      close_failed = False
       try:
         candidate.close()
       except Exception:
+        close_failed = True
+      if close_failed:
         # A logging handler is extension code and may itself raise a control
         # exception. Normal disconnect is best-effort for ordinary close
-        # failures, so diagnostics must not turn that path into a failure.
+        # failures, so diagnostics must not turn that path into a failure or
+        # observe the raw driver exception through ``sys.exc_info()``.
         # Deliberately do not catch BaseException from ``close``: once the
         # generation has been detached, direct control-flow interruption
         # remains observable to the caller.
@@ -1054,6 +1058,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       except BaseException:
         pass
       return True
+    reap_failed = False
     try:
       self.client.delete(
         index=self._active_snapshot().storage_index,
@@ -1064,8 +1069,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except (ConflictError, NotFoundError):
       pass
     except (ApiError, TransportError):
+      reap_failed = True
+
+    if reap_failed:
       # Only the already-caught ordinary cleanup error is best-effort.  A
       # direct control exception from ``delete`` still propagates normally.
+      # Logging happens after the handler so custom handlers cannot observe
+      # the raw SDK failure through ``sys.exc_info()``.
       try:
         logger.warning("Failed to reap expired ES storage key")
       except BaseException:

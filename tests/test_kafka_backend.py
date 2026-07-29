@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 import traceback
 from threading import Event, Thread
 
@@ -10,6 +12,7 @@ from kafka import TopicPartition
 from kafka.admin import NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
 
+from scrapy_extension.backends import kafka as kafka_module
 from scrapy_extension.backends.kafka import KafkaBackend
 from scrapy_extension.exceptions import (
   BackendConnectionError,
@@ -316,6 +319,44 @@ class TestKafkaBackendConnect:
     assert backend._producer is None
     # No leak: the partially-assigned producer was closed before nulling.
     mock_producer.close.assert_called_once()
+
+  def test_failed_connect_cleanup_log_has_no_active_driver_exception(
+    self, mocker
+  ) -> None:
+    """A cleanup handler runs only after the failed-connect suite has exited."""
+
+    class _ExceptionContextHandler(logging.Handler):
+      def __init__(self) -> None:
+        super().__init__()
+        self.contexts: list[tuple[object, object, object]] = []
+
+      def emit(self, record: logging.LogRecord) -> None:
+        del record
+        self.contexts.append(sys.exc_info())
+
+    backend = KafkaBackend(KafkaSettings())
+    producer = mocker.MagicMock()
+    producer.close.side_effect = RuntimeError("close failure marker")
+
+    def fail_after_assigning_producer(_snapshot: object) -> None:
+      backend._producer = producer
+      raise RuntimeError("connect failure marker")
+
+    mocker.patch.object(
+      backend, "_connect_standalone", side_effect=fail_after_assigning_producer
+    )
+    handler = _ExceptionContextHandler()
+    original_level = kafka_module.logger.level
+    kafka_module.logger.setLevel(logging.DEBUG)
+    kafka_module.logger.addHandler(handler)
+    try:
+      with pytest.raises(BackendConnectionError):
+        backend.connect()
+    finally:
+      kafka_module.logger.removeHandler(handler)
+      kafka_module.logger.setLevel(original_level)
+
+    assert handler.contexts == [(None, None, None)]
 
   def test_connect_admin_client_baseexception_nulls_producer_no_wedge(self, mocker):
     """R16-A: a BaseException mid-construction must not skip the abort arm.

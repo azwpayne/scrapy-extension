@@ -452,6 +452,14 @@ class KafkaBackend(Backend, QueueBackend):
     except BaseException:
       pass
 
+  @staticmethod
+  def _log_cleanup_diagnostic() -> None:
+    """Report a completed cleanup failure without exposing its exception."""
+    try:
+      logger.debug("Failed to close a detached Kafka client.")
+    except BaseException:
+      pass
+
   @backend_connection_error_boundary(
     "Failed to connect to Kafka.",
     "kafka",
@@ -483,7 +491,11 @@ class KafkaBackend(Backend, QueueBackend):
       # Detach it before beginning a fresh generation; otherwise a successful
       # retry would overwrite and leak that residual client.
       if self._producer is not None or self._admin_client is not None:
-        self._abort_partial_connect(suppress_process_control=True)
+        residual_cleanup_failed = self._abort_partial_connect(
+          suppress_process_control=True
+        )
+        if residual_cleanup_failed:
+          self._log_cleanup_diagnostic()
 
       mode = getattr(self.config, "mode", None)
       if mode not in (
@@ -497,6 +509,7 @@ class KafkaBackend(Backend, QueueBackend):
         )
       snapshot = self._capture_connection_snapshot()
       startup_error: BackendConnectionError | None = None
+      cleanup_diagnostic_pending = False
       try:
         if snapshot.mode == KafkaMode.STANDALONE:
           self._connect_standalone(snapshot)
@@ -509,13 +522,17 @@ class KafkaBackend(Backend, QueueBackend):
           "Connected to Kafka in %s mode", snapshot.mode.value
         )
       except KafkaError:
-        self._abort_partial_connect(suppress_process_control=True)
+        cleanup_diagnostic_pending = self._abort_partial_connect(
+          suppress_process_control=True
+        )
         startup_error = BackendConnectionError(
           f"Failed to connect to Kafka ({snapshot.mode.value}).",
           backend_type="kafka",
         )
       except Exception:
-        self._abort_partial_connect(suppress_process_control=True)
+        cleanup_diagnostic_pending = self._abort_partial_connect(
+          suppress_process_control=True
+        )
         # Unexpected driver/plugin errors are not safe public diagnostics.
         startup_error = BackendConnectionError(
           f"Failed to connect to Kafka ({snapshot.mode.value}).",
@@ -532,12 +549,19 @@ class KafkaBackend(Backend, QueueBackend):
         self._abort_partial_connect(suppress_process_control=True)
         raise
 
+      if cleanup_diagnostic_pending:
+        # The driver failure's handler has finished.  Do not let a custom
+        # logging handler inspect it through ``sys.exc_info()``.
+        self._log_cleanup_diagnostic()
+
       if startup_error is not None:
         # Raise outside the driver exception handler so endpoint/credential
         # text cannot survive through ``__cause__`` or ``__context__``.
         raise startup_error
 
-  def _abort_partial_connect(self, *, suppress_process_control: bool = False) -> None:
+  def _abort_partial_connect(
+    self, *, suppress_process_control: bool = False
+  ) -> bool:
     """Close+null any clients assigned before ``connect()`` failed.
 
     R-kacc: in each ``_connect_*`` path ``self._producer`` is assigned
@@ -561,7 +585,9 @@ class KafkaBackend(Backend, QueueBackend):
     callers receive the first ``BaseException`` after all cleanup has been
     attempted. ``connect()`` uses ``suppress_process_control=True`` so cleanup
     cannot replace the original failed-connect cause or prevent a residual
-    generation from being retired before a retry.
+    generation from being retired before a retry. The return value records an
+    ordinary close failure for a caller to diagnose after its exception handler
+    has exited.
     """
     producer = self._producer
     admin = self._admin_client
@@ -569,25 +595,19 @@ class KafkaBackend(Backend, QueueBackend):
     self._admin_client = None
     self._connection_snapshot = None
     primary_error: BaseException | None = None
+    ordinary_close_failed = False
     for closer in (producer, admin):
       if closer is not None:
         try:
           closer.close()
         except Exception:
-          # A logging handler is application code and may itself raise a
-          # process-control exception.  This abort path is used while a
-          # connect failure is already in flight, so diagnostics must not
-          # interrupt teardown of the remaining detached sibling or replace
-          # that causal failure.
-          try:
-            logger.debug("Failed to abort partial Kafka client")
-          except BaseException:
-            pass
+          ordinary_close_failed = True
         except BaseException as error:
           if primary_error is None:
             primary_error = error
     if primary_error is not None and not suppress_process_control:
       raise primary_error
+    return ordinary_close_failed
 
   @configuration_error_boundary(
     "Kafka configuration is invalid.",
@@ -896,17 +916,20 @@ class KafkaBackend(Backend, QueueBackend):
   def _close_detached_clients(*clients: Any) -> None:
     """Close every detached client, retaining the first control exception."""
     primary_error: BaseException | None = None
+    ordinary_close_failed = False
     for client in clients:
       if client is not None:
         try:
           client.close()
         except Exception:
-          logger.debug("Ignoring Kafka client-close failure")
+          ordinary_close_failed = True
         except BaseException as error:
           if primary_error is None:
             primary_error = error
     if primary_error is not None:
       raise primary_error
+    if ordinary_close_failed:
+      logger.debug("Ignoring Kafka client-close failure")
 
   def is_connected(self) -> bool:
     """Check if Kafka is connected.

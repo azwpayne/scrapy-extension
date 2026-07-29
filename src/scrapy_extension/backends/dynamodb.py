@@ -354,12 +354,16 @@ class DynamoDBBackend(Backend, StorageBackend):
     """Best-effort close a candidate or retired botocore HTTP client."""
     if resource is None:
       return
+    close_failed = False
     try:
       resource.meta.client.close()
     except Exception:
+      close_failed = True
+    if close_failed:
       # Closing a retired resource is best-effort. A logging handler is also
       # diagnostic-only here, so it cannot turn an ordinary close failure into
-      # a lifecycle control failure. Do not cover ``close()`` itself: direct
+      # a lifecycle control failure or observe the raw close error through
+      # ``sys.exc_info()``. Do not cover ``close()`` itself: direct
       # KeyboardInterrupt/SystemExit remains observable to the caller.
       try:
         logger.debug("Suppressed DynamoDB resource close error")
@@ -813,7 +817,7 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     Centralizes the TTL-expiry contract shared by ``retrieve`` / ``exists`` /
     ``ttl``: if the item's ``expire_at`` is in the past, delete it best-effort
-    (via ``_swallow``) so the table does not accumulate dead rows, and return True.
+    so the table does not accumulate dead rows, and return True.
 
     R-dyncas: the delete is a CAS on ``expire_at`` rather than unconditional.
     A concurrent ``store()`` after the strongly consistent read therefore makes
@@ -822,12 +826,21 @@ class DynamoDBBackend(Backend, StorageBackend):
     if expiry is None or expiry[1] > time.time():
       return False
     raw_expiry, _ = expiry
-    with _swallow():
+    cleanup = _swallow()
+    with cleanup:
       table.delete_item(
         Key={"pk": key},
         ConditionExpression="expire_at = :exp",
         ExpressionAttributeValues={":exp": raw_expiry},
       )
+    if cleanup.suppressed_error:
+      # The context manager has completed its suppression before this
+      # diagnostic runs, so a logging extension cannot observe the raw delete
+      # error through ``sys.exc_info()``.
+      try:
+        logger.debug("Suppressed DynamoDB expired-item cleanup failure.")
+      except BaseException:
+        pass
     return True
 
   # StorageBackend implementation
@@ -1173,9 +1186,13 @@ class DynamoDBBackend(Backend, StorageBackend):
 
 
 class _swallow:
-  """Context manager that swallows cleanup-path errors."""
+  """Context manager that records and swallows ordinary cleanup errors."""
+
+  def __init__(self) -> None:
+    self.suppressed_error = False
 
   def __enter__(self) -> _swallow:
+    self.suppressed_error = False
     return self
 
   def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
@@ -1187,11 +1204,7 @@ class _swallow:
     # delete_item (the operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    # Expired-item reaping is best-effort. Keep an ordinary delete failure
-    # suppressed even if a diagnostic logging handler raises a control error;
-    # direct BaseException from delete_item returned above remains observable.
-    try:
-      logger.debug("Suppressed dynamodb cleanup error")
-    except BaseException:
-      pass
+    # The caller emits a fixed diagnostic only after this context manager has
+    # completed suppression; direct BaseException remains observable.
+    self.suppressed_error = True
     return True

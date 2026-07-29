@@ -212,6 +212,7 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
       are NOT included here — :func:`get_registry` merges them with
       bundled-wins precedence.
   """
+  enumeration_failed = False
   try:
     # ``entry_points(group=...)`` is the modern select-by-group API,
     # available on every supported Python (>=3.10). The legacy dict form
@@ -225,6 +226,12 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
       importlib.metadata.entry_points(group=_ENTRY_POINT_GROUP)
     )
   except Exception:  # noqa: BLE001 - registry discovery must never crash callers
+    enumeration_failed = True
+
+  if enumeration_failed:
+    # Do not invoke application logging while the metadata failure is still
+    # active: a handler can otherwise read the plugin traceback from
+    # ``sys.exc_info()``.
     _log_diagnostic(
       logger.warning,
       "Failed to enumerate entry-points; skipping third-party backend discovery.",
@@ -234,15 +241,23 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
   discovered: dict[str, BackendDescriptor] = {}
   conflicted_names: set[str] = set()
   for ep in eps:
+    descriptor: BackendDescriptor | None = None
+    plugin_load_failed = False
     try:
       descriptor = _load_plugin_descriptor(ep)
     except Exception:  # noqa: BLE001 - graceful-skip: never propagate
+      plugin_load_failed = True
+
+    if plugin_load_failed:
+      # This log intentionally follows the exception suite so plugin details
+      # cannot be recovered by a custom handler from ``sys.exc_info()``.
       _log_diagnostic(
         logger.warning,
         "Skipping invalid third-party backend entry-point; "
         "bundled backends remain available.",
       )
       continue
+    assert descriptor is not None
     name = descriptor.backend_type
     if name in conflicted_names:
       _log_diagnostic(

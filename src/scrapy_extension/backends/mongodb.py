@@ -494,6 +494,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       w_timeout_ms=snapshot.w_timeout_ms,
     )
     startup_error: BackendConnectionError | None = None
+    cleanup_diagnostic_pending = False
     try:
       if snapshot.mode == MongoDBMode.STANDALONE:
         self._connect_standalone(snapshot, marker_options)
@@ -504,13 +505,17 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       else:
         self._connect_atlas(snapshot, marker_options)
     except ConnectionFailure:
-      self._discard_client(suppress_process_control=True)
+      cleanup_diagnostic_pending = self._discard_client(
+        suppress_process_control=True
+      )
       startup_error = BackendConnectionError(
         f"Failed to connect to MongoDB ({snapshot.mode.value}).",
         backend_type="mongodb",
       )
     except BackendConnectionError:
-      self._discard_client(suppress_process_control=True)
+      cleanup_diagnostic_pending = self._discard_client(
+        suppress_process_control=True
+      )
       # Marker/setup helpers may retain a driver cause. The public startup
       # boundary must not re-expose that exception graph.
       startup_error = BackendConnectionError(
@@ -521,7 +526,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       self._discard_client(suppress_process_control=True)
       raise
     except Exception:
-      self._discard_client(suppress_process_control=True)
+      cleanup_diagnostic_pending = self._discard_client(
+        suppress_process_control=True
+      )
       # Unexpected driver/plugin errors are not safe public diagnostics.
       startup_error = BackendConnectionError(
         f"Failed to connect to MongoDB ({snapshot.mode.value}).",
@@ -530,6 +537,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except BaseException:
       self._discard_client(suppress_process_control=True)
       raise
+
+    if cleanup_diagnostic_pending:
+      # The driver failure is no longer active.  Reporting the independent
+      # close failure here prevents custom handlers from seeing it through
+      # ``sys.exc_info()``.
+      self._log_cleanup_diagnostic()
 
     if startup_error is not None:
       # Raise outside the driver exception handler so endpoint/credential text
@@ -543,8 +556,17 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     except BaseException:
       pass
 
-  def _discard_client(self, *, suppress_process_control: bool = False) -> None:
+  @staticmethod
+  def _log_cleanup_diagnostic() -> None:
+    """Emit a fixed best-effort MongoDB cleanup diagnostic."""
+    try:
+      logger.debug("Failed to close MongoDB client")
+    except BaseException:
+      pass
+
+  def _discard_client(self, *, suppress_process_control: bool = False) -> bool:
     """Clear all handles and best-effort close the current client."""
+    ordinary_close_failed = False
     with self._connection_lock:
       client = self._client
       self._client = None
@@ -556,14 +578,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         try:
           client.close()
         except Exception:
-          try:
-            logger.debug("Failed to close MongoDB client")
-          except BaseException:
-            # A close failure is already best-effort here.  Its diagnostic
-            # must not turn ordinary disconnect into a process-control
-            # failure; direct control exceptions from ``client.close`` are
-            # handled by the separate arm below.
-            pass
+          ordinary_close_failed = True
         except BaseException:
           if not suppress_process_control:
             raise
@@ -572,6 +587,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
           except BaseException:
             # Failed-connect cleanup must never replace the original exception.
             pass
+    return ordinary_close_failed
 
   def _build_client_kwargs(
     self, snapshot: _MongoDBConnectionSnapshot | None = None
@@ -962,7 +978,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def disconnect(self) -> None:
     """Close MongoDB connection."""
-    self._discard_client()
+    if self._discard_client():
+      self._log_cleanup_diagnostic()
 
   def is_connected(self) -> bool:
     """Check if MongoDB is connected.
@@ -1410,6 +1427,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     if self._storage_collection is None:
       msg = "MongoDBBackend not connected: storage collection is None"
       raise BackendConnectionError(msg, backend_type="mongodb")
+    reap_failed = False
     try:
       # The read snapshot may be stale: a concurrent store() can replace the
       # same key before this delete runs. Matching the observed expireAt makes
@@ -1422,6 +1440,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       # ordinary delete failure is best-effort.  Keep diagnostics from changing
       # that result; direct control exceptions from ``delete_one`` are not
       # caught by this PyMongoError arm.
+      reap_failed = True
+    if reap_failed:
+      # The cleanup handler has completed, so a custom logger cannot read the
+      # raw PyMongo failure from ``sys.exc_info()``.
       try:
         logger.warning("Failed to reap expired MongoDB storage key")
       except BaseException:

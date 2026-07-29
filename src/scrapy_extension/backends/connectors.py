@@ -1884,10 +1884,16 @@ class ConnectionManager:
       # probe outside ``_lock`` because Redis/MongoDB/ElasticSearch probes may
       # perform network I/O; holding the shared state lock here would block
       # close() and peer access for the entire timeout window.
+      health_check_failed = False
       try:
         connected = backend.is_connected()
       except Exception:
         connected = False
+        health_check_failed = True
+      if health_check_failed:
+        # Leave the health-probe handler before diagnostics.  Logging handlers
+        # are application code and must not inherit the driver's raw failure
+        # through ``sys.exc_info()``.
         _log_diagnostic(
           logger.debug,
           "Backend health check failed before reconnect",
@@ -1918,9 +1924,12 @@ class ConnectionManager:
         break
 
     if stale_backend is not None:
+      stale_disconnect_failed = False
       try:
         stale_backend.disconnect()
       except Exception:
+        stale_disconnect_failed = True
+      if stale_disconnect_failed:
         _log_diagnostic(logger.warning, "Error disconnecting stale backend")
       monitor_events.append(
         ("on_disconnect", (str(self.backend_type), None))
@@ -1931,6 +1940,7 @@ class ConnectionManager:
 
     failed_attempt = False
     for attempt in range(total_attempts):
+      attempt_failed = False
       try:
         self._attempt_connection()
       except (ConfigurationError, ValidationError, ImportError):
@@ -1947,9 +1957,15 @@ class ConnectionManager:
         # (KeyboardInterrupt, SystemExit)): raise`` here was unreachable dead code:
         # nothing caught by ``except Exception`` can be an instance of either.)
         failed_attempt = True
+        attempt_failed = True
+
+      if attempt_failed:
+        # The driver exception is no longer active here.  Keep continuation
+        # telemetry fixed and do not expose a backend failure via a custom
+        # logging handler's ``sys.exc_info()``.
         _log_diagnostic(
           logger.warning,
-          "Connection attempt %d/%d failed", attempt + 1, total_attempts
+          "Connection attempt failed.",
         )
         with self._lock:
           retired = self._retired
@@ -1964,11 +1980,12 @@ class ConnectionManager:
             ("on_retry", (str(self.backend_type), attempt + 1))
           )
           time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
-      else:
-        _log_diagnostic(logger.debug, "Connected to %s", self.backend_type)
-        # Preserve transaction order, then dispatch outside ``_connect_lock``.
-        monitor_events.append(("on_connect", (str(self.backend_type),)))
-        return
+        continue
+
+      _log_diagnostic(logger.debug, "Connected to %s", self.backend_type)
+      # Preserve transaction order, then dispatch outside ``_connect_lock``.
+      monitor_events.append(("on_connect", (str(self.backend_type),)))
+      return
 
     if failed_attempt:
       attempt_word = "attempt" if total_attempts == 1 else "attempts"
@@ -2199,17 +2216,22 @@ class ConnectionManager:
 
     if backend is None:
       return
+    disconnect_failed = False
     try:
       # Network teardown must not hold manager state while it blocks. The
       # handle was already detached under ``_lock``, so no accessor can publish
       # it as live during disconnect.
       backend.disconnect()
-      _log_diagnostic(logger.debug, "Disconnected from %s", self.backend_type)
     except Exception:
       # Broad catch — mirrors R25-A1's connect-path cleanup. Registry eviction
       # and state detachment are already complete, so teardown errors remain
       # observable without breaking the caller's close chain.
+      disconnect_failed = True
+
+    if disconnect_failed:
       _log_diagnostic(logger.warning, "Error during disconnect")
+    else:
+      _log_diagnostic(logger.debug, "Disconnected from %s", self.backend_type)
 
     # Lifecycle callbacks are user code. Dispatch after both registry and
     # manager locks are released so re-entry observes the terminal state and
@@ -2263,13 +2285,18 @@ class ConnectionManager:
 
   def _notify_monitor(self, hook_name: str, *args: Any) -> None:
     """Emit one lifecycle hook without letting telemetry alter control flow."""
+    monitor_failed = False
     try:
       getattr(self._monitor, hook_name)(*args)
     except Exception:
+      monitor_failed = True
+
+    if monitor_failed:
+      # The callback's exception handler has ended, so the diagnostic cannot
+      # expose monitor internals through a logging handler's ``sys.exc_info``.
       _log_diagnostic(
         logger.debug,
-        "Monitor.%s raised; ignored",
-        hook_name,
+        "Connection monitor callback raised; ignored.",
       )
 
   def _dispatch_monitor_events(
