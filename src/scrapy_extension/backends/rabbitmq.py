@@ -74,6 +74,7 @@ _RABBITMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
   {
     "Not connected to RabbitMQ",
     "RabbitMQ publish was not confirmed.",
+    "RabbitMQ connection changed while waiting for a message",
     "Cannot clear RabbitMQ queue while deliveries are in-flight.",
   }
 )
