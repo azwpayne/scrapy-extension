@@ -2048,6 +2048,39 @@ class TestRedisBackendPingAndConnection:
     backend.connect()
     assert backend.ping() is False
 
+  @pytest.mark.parametrize("method", ["is_connected", "ping"])
+  @pytest.mark.parametrize(
+    "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
+  )
+  def test_health_probe_returns_false_on_unexpected_exception(
+    self, redis_settings, mock_redis, mocker, method, error
+  ):
+    """Health probes remain boolean for ordinary driver failures."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_redis.ping.side_effect = [True, error]
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    backend.connect()
+
+    assert getattr(backend, method)() is False
+
+  @pytest.mark.parametrize("method", ["is_connected", "ping"])
+  @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+  def test_health_probe_propagates_control_flow(
+    self, redis_settings, mock_redis, mocker, method, error_type
+  ):
+    """Health probes do not convert terminal control flow into False."""
+    from scrapy_extension.backends.redis import RedisBackend
+
+    mock_redis.ping.side_effect = [True, error_type("stop")]
+    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+    backend = RedisBackend(redis_settings)
+    backend.connect()
+
+    with pytest.raises(error_type):
+      getattr(backend, method)()
+
   def test_client_property_auto_connect(self, redis_settings, mock_redis, mocker):
     """Test client property triggers auto-connect if not connected."""
     from scrapy_extension.backends.redis import RedisBackend

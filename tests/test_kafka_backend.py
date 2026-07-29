@@ -897,6 +897,29 @@ class TestKafkaBackendPing:
 
     assert result is False
 
+  @pytest.mark.parametrize(
+    "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
+  )
+  def test_ping_returns_false_on_unexpected_exception(self, mocker, error):
+    """Test ping stays a boolean API for ordinary driver failures."""
+    backend = KafkaBackend(KafkaSettings())
+    mock_admin = mocker.MagicMock()
+    mock_admin.list_topics.side_effect = error
+    backend._admin_client = mock_admin
+
+    assert backend.ping() is False
+
+  @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+  def test_ping_propagates_control_flow(self, mocker, error_type):
+    """Test ping does not convert terminal control flow into False."""
+    backend = KafkaBackend(KafkaSettings())
+    mock_admin = mocker.MagicMock()
+    mock_admin.list_topics.side_effect = error_type("stop")
+    backend._admin_client = mock_admin
+
+    with pytest.raises(error_type):
+      backend.ping()
+
   def test_ping_returns_false_when_admin_client_is_none(self):
     """Test ping returns False when admin_client is None."""
     config = KafkaSettings()

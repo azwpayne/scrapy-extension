@@ -974,7 +974,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       if self._client is None:
         return False
       self._client.admin.command("ping")
-    except PyMongoError:
+    except Exception:
       return False
     else:
       return True

@@ -926,7 +926,7 @@ class KafkaBackend(Backend, QueueBackend):
       if self._admin_client:
         self._admin_client.list_topics()
         return True
-    except KafkaError:
+    except Exception:
       return False
     else:
       return False

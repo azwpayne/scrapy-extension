@@ -989,14 +989,14 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
   def ping(self) -> bool:
     """Probe one existing generation without triggering lazy connection."""
-    with self._lease_existing_generation() as generation:
-      if generation is None:
-        return False
-      try:
+    try:
+      with self._lease_existing_generation() as generation:
+        if generation is None:
+          return False
         result = generation.client.ping()
         return bool(result) if result is not None else False
-      except _REDIS_OPERATION_ERRORS:
-        return False
+    except Exception:
+      return False
 
   @property
   def backend_type(self) -> BackendType:

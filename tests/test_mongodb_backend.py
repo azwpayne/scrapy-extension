@@ -1890,6 +1890,37 @@ def test_mongodb_backend_is_connected_returns_false_on_pymongo_error(mocker):
   assert result is False
 
 
+@pytest.mark.parametrize("method", ["is_connected", "ping"])
+@pytest.mark.parametrize(
+  "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
+)
+def test_mongodb_backend_health_probes_return_false_on_unexpected_exception(
+  mocker, method, error
+):
+  """Health probes remain boolean for ordinary driver failures."""
+  backend = MongoDBBackend(MongoDBSettings())
+  mock_client = mocker.MagicMock()
+  mock_client.admin.command.side_effect = error
+  backend._client = mock_client
+
+  assert getattr(backend, method)() is False
+
+
+@pytest.mark.parametrize("method", ["is_connected", "ping"])
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_mongodb_backend_health_probes_propagate_control_flow(
+  mocker, method, error_type
+):
+  """Health probes do not convert terminal control flow into False."""
+  backend = MongoDBBackend(MongoDBSettings())
+  mock_client = mocker.MagicMock()
+  mock_client.admin.command.side_effect = error_type("stop")
+  backend._client = mock_client
+
+  with pytest.raises(error_type):
+    getattr(backend, method)()
+
+
 def test_mongodb_backend_ping_delegates_to_is_connected(mocker):
   """Test ping returns result of is_connected."""
   config = MongoDBSettings()

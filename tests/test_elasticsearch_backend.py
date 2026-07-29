@@ -1071,6 +1071,40 @@ class TestPing:
     b._client.ping.return_value = True
     assert b.ping() is True
 
+  @pytest.mark.parametrize(
+    ("response", "expected"), [(1, True), (0, False), (None, False)]
+  )
+  def test_is_connected_normalizes_ping_response_to_bool(
+    self, mocker, response, expected
+  ):
+    b = _mock_backend(mocker)
+    b._client.ping.return_value = response
+
+    assert b.is_connected() is expected
+
+  @pytest.mark.parametrize("method", ["is_connected", "ping"])
+  @pytest.mark.parametrize(
+    "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
+  )
+  def test_health_probe_returns_false_on_unexpected_exception(
+    self, mocker, method, error
+  ):
+    """Health probes remain boolean for ordinary driver failures."""
+    b = _mock_backend(mocker)
+    b._client.ping.side_effect = error
+
+    assert getattr(b, method)() is False
+
+  @pytest.mark.parametrize("method", ["is_connected", "ping"])
+  @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+  def test_health_probe_propagates_control_flow(self, mocker, method, error_type):
+    """Health probes do not convert terminal control flow into False."""
+    b = _mock_backend(mocker)
+    b._client.ping.side_effect = error_type("stop")
+
+    with pytest.raises(error_type):
+      getattr(b, method)()
+
   def test_ping_disconnected(self):
     backend = ElasticSearchBackend(ElasticSearchSettings())
     assert backend.ping() is False
