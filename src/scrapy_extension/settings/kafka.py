@@ -181,6 +181,18 @@ def validate_kafka_authentication(
   return mechanism, username, password, key, secret
 
 
+def validate_kafka_transport_security(
+  mode: object, security_protocol: object, ssl_check_hostname: object
+) -> None:
+  """Reject TLS configurations that disable broker hostname verification."""
+  uses_tls = security_protocol in {"SSL", "SASL_SSL"} or mode == KafkaMode.CONFLUENT
+  if uses_tls and ssl_check_hostname is not True:
+    raise ConfigurationError(
+      "Kafka TLS connections require ssl_check_hostname=True.",
+      setting_name="ssl_check_hostname",
+    )
+
+
 def _kafka_policy_int(value: object, field_name: str, minimum: int) -> int:
   """Return a bounded policy integer, rejecting bools after model mutation."""
   if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -448,6 +460,9 @@ class KafkaSettings(BaseSettings):
       self.sasl_password,
       self.confluent_api_key,
       self.confluent_api_secret,
+    )
+    validate_kafka_transport_security(
+      self.mode, self.security_protocol, self.ssl_check_hostname
     )
     return self
 

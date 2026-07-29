@@ -57,8 +57,9 @@ from scrapy_extension.exceptions import (
 )
 from scrapy_extension.settings import KafkaMode
 from scrapy_extension.settings.kafka import (
-  validate_kafka_authentication,
-  validate_kafka_delivery_policy,
+    validate_kafka_authentication,
+    validate_kafka_delivery_policy,
+    validate_kafka_transport_security,
 )
 
 # Topic name validation pattern - only allow alphanumeric, dots, underscores, hyphens
@@ -514,6 +515,11 @@ class KafkaBackend(Backend, QueueBackend):
     self,
   ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     """Revalidate and extract the current mechanism-aware credentials."""
+    validate_kafka_transport_security(
+      self.config.mode,
+      self.config.security_protocol,
+      self.config.ssl_check_hostname,
+    )
     return validate_kafka_authentication(
       self.config.mode,
       self.config.security_protocol,

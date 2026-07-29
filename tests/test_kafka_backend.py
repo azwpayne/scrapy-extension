@@ -610,24 +610,9 @@ class TestKafkaBackendBuildCommonConfig:
     producer.assert_not_called()
     admin.assert_not_called()
 
-  def test_build_common_config_ssl_no_cafile(self):
-    """Test config building with SSL but no CA file."""
-    config = KafkaSettings(
-      security_protocol="SSL",
-      ssl_cafile=None,
-      ssl_certfile=None,
-      ssl_keyfile=None,
-      ssl_check_hostname=False,
-    )
-    backend = KafkaBackend(config)
-
-    result = backend._build_common_config()
-
-    assert result["security_protocol"] == "SSL"
-    assert "ssl_cafile" not in result
-    assert "ssl_certfile" not in result
-    assert "ssl_keyfile" not in result
-    assert result["ssl_check_hostname"] is False
+  def test_ssl_hostname_verification_cannot_be_disabled(self):
+    with pytest.raises(ConfigurationError, match="ssl_check_hostname"):
+      KafkaSettings(security_protocol="SSL", ssl_check_hostname=False)
 
 
 class TestKafkaBackendClusterMode:
@@ -2006,7 +1991,7 @@ def test_kafka_build_common_config_redacts_sasl_password(mocker):
   from scrapy_extension.settings.kafka import KafkaSettings
 
   config = KafkaSettings(
-    security_protocol="SASL_PLAINTEXT",
+    security_protocol="SASL_SSL",
     sasl_mechanism="PLAIN",
     sasl_username="alice",
     sasl_password="super-secret-pwd",
