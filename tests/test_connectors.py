@@ -337,6 +337,30 @@ def test_create_backend_rebuilds_bundled_loader_runtime_failures(
   _assert_package_traceback_locals_are_redacted(error, marker)
 
 
+def test_rebuild_connect_attempt_error_fails_closed_when_message_check_crashes(
+  monkeypatch: pytest.MonkeyPatch,
+):
+  """A defensive manager-message check must not publish its candidate text."""
+  from scrapy_extension.backends import connectors
+
+  def _raise_from_message_check(_: str) -> bool:
+    raise RuntimeError("message-check-secret-marker")
+
+  monkeypatch.setattr(
+    connectors,
+    "_is_safe_manager_configuration_message",
+    _raise_from_message_check,
+  )
+
+  rebuilt = connectors._rebuild_connect_attempt_error(
+    ConfigurationError("candidate-manager-message", setting_name="configuration")
+  )
+
+  assert type(rebuilt) is ConfigurationError
+  assert str(rebuilt) == "Connection manager configuration is invalid."
+  assert rebuilt.setting_name == "configuration"
+
+
 
 class TestConnectionManagerCreateBackend:
   """Tests for _create_backend method."""

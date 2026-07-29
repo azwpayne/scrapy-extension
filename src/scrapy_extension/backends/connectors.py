@@ -1055,7 +1055,7 @@ def _rebuild_connect_attempt_error(error: BaseException) -> BaseException:
         if _is_safe_manager_configuration_message(raw_message):
           message = raw_message
       except Exception:  # noqa: BLE001 - fail closed on custom error state
-        pass
+        message = "Connection manager configuration is invalid."
     setting_name = error.setting_name
     if (
       type(setting_name) is not str
