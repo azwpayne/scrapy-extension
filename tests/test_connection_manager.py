@@ -1066,9 +1066,14 @@ def test_reconnect_isolates_breaker_from_retired_backend_failures(mocker):
   assert manager._breaker is not retired_breaker
   assert breaker_during_disconnect == [manager._breaker]
   retired.pop_mock.side_effect = QueueError("late retired failure")
-  with pytest.raises(QueueError, match="late retired failure"):
+  with pytest.raises(QueueError) as exc_info:
     retired_proxy.pop("queue")
 
+  assert str(exc_info.value) == "Backend operation failed."
+  assert exc_info.value.operation == "pop"
+  assert exc_info.value.queue_name is None
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   assert retired_breaker.state is BreakerState.OPEN
   assert manager._breaker is not None
   assert manager._breaker.state is BreakerState.CLOSED
