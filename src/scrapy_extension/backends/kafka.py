@@ -277,7 +277,6 @@ class KafkaBackend(Backend, QueueBackend):
     # remain a short critical section for ack/rebalance callbacks.
     self._connection_lock = threading.RLock()
     self._connection_snapshot: _KafkaConnectionSnapshot | None = None
-    self._connecting_snapshot: _KafkaConnectionSnapshot | None = None
     self._producer: KafkaProducer | None = None
     self._consumer: KafkaConsumer | None = None
     self._consumer_auto_offset_reset: str | None = None
@@ -416,16 +415,14 @@ class KafkaBackend(Backend, QueueBackend):
           setting_value=mode,
         )
       snapshot = self._capture_connection_snapshot()
-      self._connecting_snapshot = snapshot
       try:
         if snapshot.mode == KafkaMode.STANDALONE:
-          self._connect_standalone()
+          self._connect_standalone(snapshot)
         elif snapshot.mode == KafkaMode.CLUSTER:
-          self._connect_cluster()
+          self._connect_cluster(snapshot)
         else:
-          self._connect_confluent()
+          self._connect_confluent(snapshot)
         self._connection_snapshot = snapshot
-        self._connecting_snapshot = None
         self._log_success_diagnostic(
           "Connected to Kafka in %s mode", snapshot.mode.value
         )
@@ -486,7 +483,6 @@ class KafkaBackend(Backend, QueueBackend):
     self._producer = None
     self._admin_client = None
     self._connection_snapshot = None
-    self._connecting_snapshot = None
     primary_error: BaseException | None = None
     for closer in (producer, admin):
       if closer is not None:
@@ -612,12 +608,15 @@ class KafkaBackend(Backend, QueueBackend):
     )
 
   def _connection_snapshot_or_capture(self) -> _KafkaConnectionSnapshot:
-    """Return the published generation plan or validate one for direct use."""
-    return (
-      self._connection_snapshot
-      or self._connecting_snapshot
-      or self._capture_connection_snapshot()
-    )
+    """Return the published generation plan or validate one for direct use.
+
+    Public operations serialize with a concurrent connect before inspecting
+    generation state. A snapshot under construction is never visible: once the
+    connection gate is released there is either a published generation or no
+    connection attempt, in which case direct use captures a fresh plan.
+    """
+    with self._connection_lock:
+      return self._connection_snapshot or self._capture_connection_snapshot()
 
   def _build_common_config(
     self, snapshot: _KafkaConnectionSnapshot | None = None
@@ -655,38 +654,6 @@ class KafkaBackend(Backend, QueueBackend):
       config["ssl_check_hostname"] = snapshot.ssl_check_hostname
 
     return config
-
-  def _validated_authentication(
-    self,
-  ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
-    """Revalidate and extract the current mechanism-aware credentials."""
-    validate_kafka_transport_security(
-      self.config.mode,
-      self.config.security_protocol,
-      self.config.ssl_check_hostname,
-    )
-    return validate_kafka_authentication(
-      self.config.mode,
-      self.config.security_protocol,
-      self.config.sasl_mechanism,
-      self.config.sasl_username,
-      self.config.sasl_password,
-      self.config.confluent_api_key,
-      self.config.confluent_api_secret,
-    )
-
-  def _validated_delivery_policy(
-    self,
-  ) -> tuple[int | str, int, int, int, int]:
-    """Revalidate broker acknowledgement and topic durability settings."""
-    return validate_kafka_delivery_policy(
-      self.config.acks,
-      self.config.max_priority_partitions,
-      self.config.num_partitions,
-      self.config.replication_factor,
-      self.config.retention_ms,
-      self.config.min_insync_replicas,
-    )
 
   def _bootstrap_servers(
     self, snapshot: _KafkaConnectionSnapshot | None = None
@@ -755,7 +722,7 @@ class KafkaBackend(Backend, QueueBackend):
       client_id="scrapy-extension-admin",
       **client_security_config,
     )
-    self._log_success_diagnostic("Connected to standalone Kafka at %s", bootstrap)
+    self._log_success_diagnostic("Connected to standalone Kafka")
 
   def _connect_cluster(
     self, snapshot: _KafkaConnectionSnapshot | None = None
@@ -775,7 +742,7 @@ class KafkaBackend(Backend, QueueBackend):
       client_id="scrapy-extension-admin",
       **client_security_config,
     )
-    self._log_success_diagnostic("Connected to Kafka cluster at %s", bootstrap)
+    self._log_success_diagnostic("Connected to Kafka cluster")
 
   def _connect_confluent(
     self, snapshot: _KafkaConnectionSnapshot | None = None
@@ -795,7 +762,7 @@ class KafkaBackend(Backend, QueueBackend):
       client_id="scrapy-extension-admin",
       **client_security_config,
     )
-    self._log_success_diagnostic("Connected to Confluent Cloud at %s", bootstrap)
+    self._log_success_diagnostic("Connected to Confluent Cloud")
 
   def disconnect(self) -> None:
     """Close Kafka connection."""
@@ -817,7 +784,6 @@ class KafkaBackend(Backend, QueueBackend):
         self._consumer_auto_offset_reset = None
         self._admin_client = None
         self._connection_snapshot = None
-        self._connecting_snapshot = None
         self._consumer_generation += 1
         self._assignment_epoch += 1
         self._subscribed_topic = None

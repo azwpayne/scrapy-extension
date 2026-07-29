@@ -133,6 +133,80 @@ def test_connected_generation_uses_tls_snapshot_for_temporary_consumer(mocker) -
   consumer.close.assert_called_once()
 
 
+def test_unpublished_connect_snapshot_cannot_reach_concurrent_consumer(
+  mocker
+) -> None:
+  """An overlapping operation waits for a candidate to publish or fail."""
+  from threading import Event, Thread
+
+  settings = KafkaSettings(security_protocol="SSL")
+  backend = KafkaBackend(settings)
+  producer_entered = Event()
+  release_producer = Event()
+
+  def block_producer(**_kwargs: object) -> object:
+    producer_entered.set()
+    assert release_producer.wait(timeout=5)
+    return mocker.MagicMock()
+
+  mocker.patch(
+    "scrapy_extension.backends.kafka.KafkaProducer", side_effect=block_producer
+  )
+  mocker.patch(
+    "scrapy_extension.backends.kafka.KafkaAdminClient",
+    return_value=mocker.MagicMock(),
+  )
+  consumer_instance = mocker.MagicMock()
+  consumer_instance.partitions_for_topic.return_value = None
+  consumer = mocker.patch(
+    "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer_instance
+  )
+  connection_errors: list[BaseException] = []
+  queue_errors: list[BaseException] = []
+  queue_results: list[int] = []
+  queue_finished = Event()
+
+  def connect() -> None:
+    try:
+      backend.connect()
+    except BaseException as exc:  # noqa: BLE001 - propagate after joining
+      connection_errors.append(exc)
+
+  thread = Thread(target=connect)
+  thread.start()
+  assert producer_entered.wait(timeout=5)
+
+  # The candidate captured verified TLS. Public work must not consume it while
+  # connect is incomplete. It waits for the successful publication and then
+  # uses the immutable generation rather than the mutated live setting.
+  settings.ssl_check_hostname = False
+  def queue_len() -> None:
+    try:
+      queue_results.append(backend.queue_len("jobs"))
+    except BaseException as exc:  # noqa: BLE001 - assert after joining
+      queue_errors.append(exc)
+    finally:
+      queue_finished.set()
+
+  queue_thread = Thread(target=queue_len)
+  queue_thread.start()
+  try:
+    assert not queue_finished.wait(timeout=0.1)
+    consumer.assert_not_called()
+  finally:
+    release_producer.set()
+    thread.join(timeout=5)
+    queue_thread.join(timeout=5)
+
+  assert not thread.is_alive()
+  assert not queue_thread.is_alive()
+  assert connection_errors == []
+  assert queue_errors == []
+  assert queue_results == [0]
+  assert backend._connection_snapshot is not None
+  assert consumer.call_args.kwargs["ssl_check_hostname"] is True
+
+
 def test_confluent_clients_receive_explicit_verified_tls_configuration(mocker) -> None:
   settings = KafkaSettings(
     mode=KafkaMode.CONFLUENT,

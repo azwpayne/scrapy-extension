@@ -432,7 +432,7 @@ class TestKafkaBackendConnect:
     connect_error = KeyboardInterrupt("connect interrupted")
     producer.close.side_effect = RuntimeError("producer close failed")
 
-    def fail_after_assigning_both_clients() -> None:
+    def fail_after_assigning_both_clients(_snapshot: object) -> None:
       backend._producer = producer
       backend._admin_client = admin
       raise connect_error
