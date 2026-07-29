@@ -8,19 +8,45 @@
 from __future__ import annotations
 
 from enum import Enum
-from ipaddress import ip_address
-from typing import Literal, cast
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from typing import Literal, NoReturn, cast
 from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
+from scrapy_extension.exceptions._redaction import configuration_error_boundary
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 _VALID_MONGO_SCHEMES: tuple[str, ...] = ("mongodb://", "mongodb+srv://")
+_MONGODB_CONFIGURATION_FIELD_NAMES: frozenset[str] = frozenset(
+  {
+    "auth_mechanism",
+    "auth_source",
+    "collection_names",
+    "database",
+    "mode",
+    "mongos_routers",
+    "password",
+    "replica_set_members",
+    "replica_set_name",
+    "tls_allow_invalid_certificates",
+    "tls_enabled",
+    "uri",
+    "username",
+    "w",
+    "w_timeout_ms",
+  }
+)
+_MONGODB_CONFIGURATION_ERROR = "MongoDB configuration is invalid."
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_collection_domains(
   queue_collection: object,
   set_collection: object,
@@ -65,11 +91,16 @@ def validate_mongodb_collection_domains(
   return validated_names
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_write_concern(
   w: object, w_timeout_ms: object
 ) -> tuple[int | str, int | None]:
   """Return a write concern whose completion confirms server acknowledgement."""
   normalized_w: int | str
+  normalized_timeout: int | None
   if isinstance(w, bool):
     raise ConfigurationError(
       "MongoDB w must be a positive integer or 'majority', not a boolean.",
@@ -87,13 +118,18 @@ def validate_mongodb_write_concern(
     if candidate == "majority":
       normalized_w = candidate
     else:
+      numeric_w: int | None = None
+      invalid_w = False
       try:
         numeric_w = int(candidate, 10)
       except ValueError:
+        invalid_w = True
+      if invalid_w:
         raise ConfigurationError(
           "MongoDB w must be a positive integer or 'majority'.",
           setting_name="w",
-        ) from None
+        )
+      assert numeric_w is not None
       if numeric_w < 1:
         raise ConfigurationError(
           "MongoDB mutations require an acknowledged write concern (w >= 1).",
@@ -121,13 +157,18 @@ def validate_mongodb_write_concern(
       )
     normalized_timeout = w_timeout_ms
   elif isinstance(w_timeout_ms, str):
+    normalized_timeout = None
+    invalid_timeout = False
     try:
       normalized_timeout = int(w_timeout_ms.strip(), 10)
     except ValueError:
+      invalid_timeout = True
+    if invalid_timeout:
       raise ConfigurationError(
         "MongoDB w_timeout_ms must be a non-negative integer or None.",
         setting_name="w_timeout_ms",
-      ) from None
+      )
+    assert normalized_timeout is not None
     if normalized_timeout < 0:
       raise ConfigurationError(
         "MongoDB w_timeout_ms must be a non-negative integer or None.",
@@ -190,6 +231,10 @@ _LOCAL_PLAINTEXT_BLOCKED_TOPOLOGY_OPTIONS: frozenset[str] = frozenset(
 )
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_uri(value: object) -> str:
   """Require a safe MongoDB URI before it reaches the driver.
 
@@ -211,12 +256,17 @@ def validate_mongodb_uri(value: object) -> str:
     raise ConfigurationError(
       "MongoDB URI must not contain fragments.", setting_name="uri"
     )
+  parsed = None
+  malformed_uri = False
   try:
     parsed = urlsplit(value)
   except ValueError:
+    malformed_uri = True
+  if malformed_uri:
     raise ConfigurationError(
       "MongoDB URI is malformed.", setting_name="uri"
-    ) from None
+    )
+  assert parsed is not None
   if not parsed.netloc:
     raise ConfigurationError(
       "MongoDB URI must include at least one server endpoint.",
@@ -249,6 +299,10 @@ def validate_mongodb_uri(value: object) -> str:
   return value
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_database(value: object) -> str:
   """Require a concrete database name before indexing a client with it."""
   if type(value) is not str or not value.strip():
@@ -259,6 +313,10 @@ def validate_mongodb_database(value: object) -> str:
   return value
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_auth_source(value: object) -> str:
   """Require a concrete authentication source before calling PyMongo."""
   if type(value) is not str or not value.strip():
@@ -269,6 +327,10 @@ def validate_mongodb_auth_source(value: object) -> str:
   return value
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_replica_set_name(value: object) -> str | None:
   """Require a concrete optional replica-set name for the driver kwarg."""
   if value is None:
@@ -281,7 +343,7 @@ def validate_mongodb_replica_set_name(value: object) -> str | None:
   return value
 
 
-def _invalid_mongodb_seed_endpoint(setting_name: str) -> None:
+def _invalid_mongodb_seed_endpoint(setting_name: str) -> NoReturn:
   """Raise a static error without echoing possibly credential-bearing input."""
   raise ConfigurationError(
     "MongoDB seed endpoints must be host, host:port, or '[IPv6]:port' values.",
@@ -340,7 +402,7 @@ def _parse_mongodb_seed_endpoint(
   """
   if type(value) is not str or not value or value != value.strip():
     _invalid_mongodb_seed_endpoint(setting_name)
-  text = cast(str, value)
+  text = value
   if "," in text or any(char.isspace() or char in "/@?#\\%" for char in text):
     _invalid_mongodb_seed_endpoint(setting_name)
 
@@ -355,18 +417,24 @@ def _parse_mongodb_seed_endpoint(
       if not remainder.startswith(":"):
         _invalid_mongodb_seed_endpoint(setting_name)
       port = _parse_mongodb_seed_port(remainder[1:], setting_name)
+    address: IPv4Address | IPv6Address | None = None
     try:
       address = ip_address(host)
     except ValueError:
+      pass
+    if address is None:
       _invalid_mongodb_seed_endpoint(setting_name)
     if address.version != 6:
       _invalid_mongodb_seed_endpoint(setting_name)
     normalized_host = str(address)
     uri_seed = f"[{normalized_host}]"
   else:
+    address = None
     try:
       address = ip_address(text)
     except ValueError:
+      pass
+    if address is None:
       if text.count(":") > 1:
         _invalid_mongodb_seed_endpoint(setting_name)
       if ":" in text:
@@ -386,6 +454,10 @@ def _parse_mongodb_seed_endpoint(
   return uri_seed, normalized_host
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_seed_endpoints(
   value: object, setting_name: str
 ) -> tuple[str, ...]:
@@ -400,7 +472,7 @@ def validate_mongodb_seed_endpoints(
   )
 
 
-def _invalid_mongodb_uri_authority() -> None:
+def _invalid_mongodb_uri_authority() -> NoReturn:
   """Raise a static URI error without reflecting an untrusted authority."""
   raise ConfigurationError(
     "MongoDB URI must contain valid server endpoint authorities.",
@@ -415,9 +487,12 @@ def _validate_mongodb_uri_authority(scheme: str, authority: str) -> None:
     if not endpoints:
       _invalid_mongodb_uri_authority()
     for endpoint in endpoints:
+      valid_endpoint = True
       try:
         _parse_mongodb_seed_endpoint(endpoint, "uri")
       except ConfigurationError:
+        valid_endpoint = False
+      if not valid_endpoint:
         _invalid_mongodb_uri_authority()
     return
 
@@ -429,12 +504,21 @@ def _validate_mongodb_uri_authority(scheme: str, authority: str) -> None:
     or any(char in authority for char in ":[]")
   ):
     _invalid_mongodb_uri_authority()
+  normalized_host: str | None = None
+  invalid_host = False
   try:
     normalized_host = _normalize_mongodb_seed_host(authority, "uri")
-    ip_address(normalized_host)
   except ConfigurationError:
+    invalid_host = True
+  if invalid_host:
     _invalid_mongodb_uri_authority()
+  assert normalized_host is not None
+  is_ip_address = True
+  try:
+    ip_address(normalized_host)
   except ValueError:
+    is_ip_address = False
+  if not is_ip_address:
     return
   _invalid_mongodb_uri_authority()
 
@@ -467,6 +551,10 @@ def uses_mongodb_external_auth(mechanism: object) -> bool:
   return type(mechanism) is str and mechanism in _EXTERNAL_AUTH_MECHANISMS
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_authentication(
   username: object,
   password: object,
@@ -616,6 +704,10 @@ def _mongodb_endpoints_are_loopback(
   )
 
 
+@configuration_error_boundary(
+  _MONGODB_CONFIGURATION_ERROR,
+  _MONGODB_CONFIGURATION_FIELD_NAMES,
+)
 def validate_mongodb_transport_security(
   *,
   mode: MongoDBMode,
@@ -693,7 +785,7 @@ def validate_mongodb_transport_security(
     )
 
 
-class MongoDBSettings(BaseSettings):
+class MongoDBSettings(RedactedBaseSettings):
   """MongoDB-specific settings for all deployment modes.
 
   These settings configure the MongoDB connection and can be set
@@ -710,6 +802,7 @@ class MongoDBSettings(BaseSettings):
     env_prefix="SCRAPY_MONGO_",
     case_sensitive=False,
     extra="forbid",
+    hide_input_in_errors=True,
   )
 
   # === Mode Selection ===
@@ -1069,11 +1162,8 @@ class MongoDBSettings(BaseSettings):
         (
           "min_pool_size must be <= max_pool_size — an inverted pair makes "
           "the connection pool unable to satisfy any checkout (deadlock "
-          "under load). "
-          f"Got min_pool_size={self.min_pool_size}, "
-          f"max_pool_size={self.max_pool_size}."
+          "under load)."
         ),
         setting_name="min_pool_size",
-        setting_value=self.min_pool_size,
       )
     return self

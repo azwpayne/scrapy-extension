@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.backends.base import BackendType
@@ -17,9 +17,10 @@ from scrapy_extension.backends.circuit_breaker import (
   CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
 )
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 
-class Settings(BaseSettings):
+class Settings(RedactedBaseSettings):
   """Base settings for scrapy-extension.
 
   These settings apply to all backend types and can be configured
@@ -36,6 +37,7 @@ class Settings(BaseSettings):
     env_prefix="SCRAPY_",
     case_sensitive=False,
     extra="forbid",
+    hide_input_in_errors=True,
   )
 
   backend_type: BackendType | str = Field(
@@ -86,7 +88,7 @@ class Settings(BaseSettings):
     if isinstance(value, BackendType):
       return value
     # (2) & (3) String — try bundled-member coercion, then registry lookup.
-    if isinstance(value, str):
+    if type(value) is str:
       try:
         return BackendType(value)
       except ValueError:
@@ -95,23 +97,17 @@ class Settings(BaseSettings):
       # Imported lazily to avoid an import cycle at module-load time
       # (registry imports exceptions, which is fine, but settings is imported
       # extremely early — keep the registry import inside the validator).
-      from scrapy_extension.backends.registry import get_registry
+      from scrapy_extension.backends.registry import get_descriptor
 
-      if value in get_registry():
-        return value
-      valid = ", ".join(repr(k) for k in sorted(get_registry()))
-      msg = (
-        f"{value!r} is not a registered backend type. "
-        f"Valid values: {valid}."
-      )
-      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
+      # ``get_descriptor`` keeps public lookup errors static and lists only
+      # bundled keys; installed plugin metadata is not configuration output.
+      get_descriptor(value)
+      return value
     # Non-str, non-BackendType input (e.g. int) → ConfigurationError, NOT
     # pydantic ValidationError (consistent exception family).
     raise ConfigurationError(
-      f"backend_type must be a string or BackendType, got {type(value).__name__}: "
-      f"{value!r}",
+      "Selected backend type is not a registered backend type.",
       setting_name="SCRAPY_BACKEND_TYPE",
-      setting_value=value,
     )
   serializer: Literal["json"] = Field(
     default="json",
@@ -326,19 +322,13 @@ class Settings(BaseSettings):
     """
     if self.backpressure_pause_at is not None and self.backpressure_pause_at < 0:
       raise ConfigurationError(
-        (
-          "backpressure_pause_at must be >= 0 "
-          f"(got {self.backpressure_pause_at!r})"
-        ),
+        "backpressure_pause_at must be >= 0.",
         setting_name="backpressure_pause_at",
         setting_value=self.backpressure_pause_at,
       )
     if self.backpressure_resume_at is not None and self.backpressure_resume_at < 0:
       raise ConfigurationError(
-        (
-          "backpressure_resume_at must be >= 0 "
-          f"(got {self.backpressure_resume_at!r})"
-        ),
+        "backpressure_resume_at must be >= 0.",
         setting_name="backpressure_resume_at",
         setting_value=self.backpressure_resume_at,
       )
@@ -351,8 +341,7 @@ class Settings(BaseSettings):
         (
           "backpressure_resume_at must be <= backpressure_pause_at "
           "(otherwise the resume condition can never be reached once "
-          f"paused): resume_at={self.backpressure_resume_at!r} > "
-          f"pause_at={self.backpressure_pause_at!r}"
+          "paused)."
         ),
         setting_name="backpressure_resume_at",
         setting_value=self.backpressure_resume_at,

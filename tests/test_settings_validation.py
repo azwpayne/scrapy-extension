@@ -1686,7 +1686,7 @@ class TestR14BBackendTypeThirdPartyString:
       Settings(backend_type=42)  # type: ignore[arg-type]
     assert not isinstance(exc_info.value, ValidationError)
     assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
-    assert exc_info.value.setting_value == 42
+    assert exc_info.value.setting_value is None
 
 
 class _FakeBackend:

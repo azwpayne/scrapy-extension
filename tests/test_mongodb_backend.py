@@ -7,6 +7,23 @@ from scrapy_extension.backends.mongodb import MongoDBBackend
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode, MongoDBSettings
+from scrapy_extension.settings.mongodb import (
+  validate_mongodb_uri,
+  validate_mongodb_write_concern,
+)
+
+
+def _assert_package_traceback_locals_are_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Verify failed startup does not retain a mutable URI snapshot."""
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+    trace = trace.tb_next
 
 
 class _IdentityString(str):
@@ -50,6 +67,31 @@ def test_mongodb_backend_connect(mocker):
 
   mock_instance.admin.command.assert_called_once_with("ping")
   assert backend.is_connected()
+
+
+def test_mongodb_network_failure_does_not_retain_mutated_uri_snapshot(mocker):
+  from pymongo.errors import ConnectionFailure
+
+  marker = "mongodb-mutable-uri-marker"
+  config = MongoDBSettings(server_selection_timeout_ms=1)
+  config.uri = f"mongodb://127.0.0.1:1/{marker}"
+  client = mocker.MagicMock()
+  client.admin.command.side_effect = ConnectionFailure("driver failed")
+  mocker.patch(
+    "scrapy_extension.backends.mongodb.MongoClient",
+    return_value=client,
+  )
+
+  with pytest.raises(BackendConnectionError) as exc_info:
+    MongoDBBackend(config).connect()
+
+  error = exc_info.value
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
 
 
 @pytest.mark.parametrize(
@@ -453,6 +495,71 @@ def test_mongodb_connect_revalidates_mutated_snapshot_options_before_sdk_io(
     backend.connect()
 
   assert exc_info.value.setting_name == setting_name
+  client.assert_not_called()
+
+
+def test_mongodb_snapshot_invalid_mode_does_not_retain_mutated_value(mocker):
+  marker = "mongodb-mode-secret-marker"
+  config = MongoDBSettings()
+  config.mode = marker  # type: ignore[assignment]
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBBackend(config).connect()
+
+  error = exc_info.value
+  assert error.setting_name == "mode"
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  ("validator", "marker"),
+  [
+    (
+      lambda marker: validate_mongodb_write_concern(marker, None),
+      "mongodb-write-concern-secret-marker",
+    ),
+    (
+      lambda marker: validate_mongodb_uri(f"mongodb://localhost:{marker}"),
+      "mongodb-uri-port-secret-marker",
+    ),
+  ],
+)
+def test_mongodb_static_validation_errors_do_not_retain_conversion_context(
+  validator, marker
+):
+  with pytest.raises(ConfigurationError) as exc_info:
+    validator(marker)
+
+  error = exc_info.value
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+
+
+def test_mongodb_snapshot_seed_validation_does_not_retain_endpoint_context(mocker):
+  marker = "mongodb-replica-seed-secret-marker"
+  config = MongoDBSettings(mode=MongoDBMode.REPLICA_SET, replica_set_name="rs0")
+  config.replica_set_members = [f"[{marker}]"]
+  client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    MongoDBBackend(config).connect()
+
+  error = exc_info.value
+  assert error.setting_name == "replica_set_members"
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
   client.assert_not_called()
 
 

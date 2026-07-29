@@ -10,10 +10,11 @@ from enum import Enum
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 _VALID_ES_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
@@ -30,7 +31,7 @@ class ElasticSearchMode(str, Enum):
   CLOUD = "cloud"
 
 
-class ElasticSearchSettings(BaseSettings):
+class ElasticSearchSettings(RedactedBaseSettings):
   """ElasticSearch-specific settings.
 
   Supports two deployment modes:
@@ -58,6 +59,7 @@ class ElasticSearchSettings(BaseSettings):
     env_prefix="SCRAPY_ELASTICSEARCH_",
     case_sensitive=False,
     extra="forbid",
+    hide_input_in_errors=True,
   )
 
   # === Mode Selection ===
@@ -157,14 +159,12 @@ class ElasticSearchSettings(BaseSettings):
           "CLOUD mode uses 'cloud_id' and does not require hosts."
         ),
         setting_name="hosts",
-        setting_value=self.hosts,
       )
     for host in self.hosts:
       if not isinstance(host, str) or not host:
         raise ConfigurationError(
           "each hosts entry must be a non-empty http:// or https:// endpoint.",
           setting_name="hosts",
-          setting_value=self.hosts,
         )
       # Check raw input before urlsplit(), which deliberately normalizes some
       # controls such as newlines. Do not include the host in an error because
@@ -174,16 +174,19 @@ class ElasticSearchSettings(BaseSettings):
           "hosts entries must not contain whitespace or control characters.",
           setting_name="hosts",
         )
+      invalid_authority = False
       try:
         parsed = urlsplit(host)
         # Accessing .port validates the numeric port, including out-of-range
         # values, without imposing a port on deployments that use a proxy.
         _ = parsed.port
-      except ValueError as exc:
+      except ValueError:
+        invalid_authority = True
+      if invalid_authority:
         raise ConfigurationError(
           "each hosts entry must contain a valid network authority.",
           setting_name="hosts",
-        ) from exc
+        )
       if (
         parsed.scheme.lower() not in _VALID_ES_SCHEMES
         or not parsed.netloc
@@ -327,8 +330,7 @@ class ElasticSearchSettings(BaseSettings):
       raise ConfigurationError(
         (
           "Credentials over http:// (cleartext) are not permitted; use "
-          "https:// for any authenticated host or remove the credentials. "
-          f"Got hosts={self.hosts!r} with api_key/password set."
+          "https:// for any authenticated host or remove the credentials."
         ),
         setting_name="hosts",
       )

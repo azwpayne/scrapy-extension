@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import traceback
 import warnings
 from dataclasses import dataclass
 from typing import Any
@@ -53,6 +54,12 @@ def _register_kwarg() -> BackendDescriptor:
 
 def _register_good_plugin() -> BackendDescriptor:
   return _make_descriptor("goodplugin", capabilities=frozenset({"queue"}))
+
+
+def _register_metadata_secret_plugin() -> BackendDescriptor:
+  return _make_descriptor(
+    "pluginmetadata_secret_marker", capabilities=frozenset({"queue"})
+  )
 
 
 def _register_overclaimed_plugin() -> BackendDescriptor:
@@ -117,6 +124,10 @@ def _broken_plugin() -> BackendDescriptor:
   raise ImportError("simulated plugin import failure")
 
 
+def _secret_broken_plugin() -> BackendDescriptor:
+  raise RuntimeError("registry-plugin-secret-marker")
+
+
 # ---------------------------------------------------------------------------
 # Test helpers: fake entry-points + descriptor factory.
 # ---------------------------------------------------------------------------
@@ -166,6 +177,37 @@ def _make_descriptor(
     settings_cls_path=settings_cls_path,
     capabilities=capabilities,
   )
+
+
+def _assert_redacted_error(error: BaseException, *markers: str) -> None:
+  """Assert marker-bearing plugin/configuration data escaped no public surface."""
+  public_forms = (
+    str(error),
+    repr(error.__dict__),
+    "".join(traceback.format_exception(error)),
+  )
+  for marker in markers:
+    assert all(marker not in form for form in public_forms)
+    trace = error.__traceback__
+    while trace is not None:
+      frame = trace.tb_frame
+      if "/src/scrapy_extension/" in frame.f_code.co_filename:
+        locals_snapshot = frame.f_locals
+        assert marker not in repr(locals_snapshot)
+        for local in locals_snapshot.values():
+          if type(local) is connectors.ConnectionManager:
+            settings = vars(local).get("settings")
+            if settings is not None:
+              assert marker not in repr(settings)
+          if type(local) is tuple:
+            for argument in local:
+              if type(argument) is connectors.ConnectionManager:
+                settings = vars(argument).get("settings")
+                if settings is not None:
+                  assert marker not in repr(settings)
+      trace = trace.tb_next
+  assert error.__cause__ is None
+  assert error.__context__ is None
 
 
 def _patch_entry_points(monkeypatch: pytest.MonkeyPatch, eps: list[_FakeEntryPoint]) -> None:
@@ -316,6 +358,33 @@ class TestBundledBackendsStillWork:
       assert name in registry, f"Missing bundled backend: {name}"
 
 
+def test_unknown_descriptor_does_not_disclose_request_or_plugin_metadata(monkeypatch):
+  from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+  plugin_marker = "pluginmetadata_secret_marker"
+  request_marker = "unknown-backend-request-secret-marker"
+  _patch_entry_points(
+    monkeypatch,
+    [
+      _FakeEntryPoint(
+        name=plugin_marker,
+        value="tests.test_registry._register_metadata_secret_plugin",
+        group=_ENTRY_POINT_GROUP,
+      )
+    ],
+  )
+  _reset_registry_cache()
+
+  try:
+    with pytest.raises(ConfigurationError) as exc_info:
+      get_descriptor(request_marker)
+  finally:
+    _reset_registry_cache()
+
+  _assert_redacted_error(exc_info.value, plugin_marker, request_marker)
+  assert "redis" in str(exc_info.value)
+
+
 class TestThirdPartyDiscovered:
   """Test 2: third_party_discovered."""
 
@@ -364,6 +433,106 @@ class TestDescriptorBoundary:
   def _runtime_descriptor() -> BackendDescriptor:
     return _make_descriptor("runtime_contract", capabilities=frozenset({"queue"}))
 
+  def test_descriptor_validation_rejects_type_subclasses_without_dispatch(self):
+    """External metadata must be exact built-ins before any protocol executes."""
+    from scrapy_extension.backends import registry as registry_mod
+
+    marker = "plugin-descriptor-subclass-marker"
+    calls: list[str] = []
+
+    class _EvilString(str):
+      def __hash__(self) -> int:
+        calls.append("hash")
+        raise RuntimeError(marker)
+
+      def __format__(self, format_spec: str) -> str:
+        del format_spec
+        calls.append("format")
+        raise RuntimeError(marker)
+
+    class _EvilFrozenSet(frozenset[str]):
+      def __iter__(self):
+        calls.append("iter")
+        raise RuntimeError(marker)
+
+    class _EvilCapabilityString(str):
+      def __hash__(self) -> int:
+        calls.append("capability-hash")
+        return str.__hash__(self)
+
+    class _DescriptorSubclass(BackendDescriptor):
+      pass
+
+    evil_capability = _EvilCapabilityString("queue")
+    evil_capabilities = frozenset({evil_capability})
+    calls.clear()
+    candidates = (
+      (
+        _EvilString("evilplugin"),
+        _make_descriptor("evilplugin", capabilities=frozenset({"queue"})),
+      ),
+      (
+        "evilplugin",
+        _DescriptorSubclass(
+          "evilplugin",
+          "tests.test_registry._StubBackend",
+          "tests.test_registry._StubSettings",
+          frozenset({"queue"}),
+        ),
+      ),
+      (
+        "evilplugin",
+        BackendDescriptor(
+          _EvilString("evilplugin"),
+          "tests.test_registry._StubBackend",
+          "tests.test_registry._StubSettings",
+          frozenset({"queue"}),
+        ),
+      ),
+      (
+        "evilplugin",
+        BackendDescriptor(
+          "evilplugin",
+          _EvilString("tests.test_registry._StubBackend"),
+          "tests.test_registry._StubSettings",
+          frozenset({"queue"}),
+        ),
+      ),
+      (
+        "evilplugin",
+        BackendDescriptor(
+          "evilplugin",
+          "tests.test_registry._StubBackend",
+          "tests.test_registry._StubSettings",
+          _EvilFrozenSet({"queue"}),
+        ),
+      ),
+      (
+        "evilplugin",
+        BackendDescriptor(
+          "evilplugin",
+          "tests.test_registry._StubBackend",
+          "tests.test_registry._StubSettings",
+          evil_capabilities,
+        ),
+      ),
+    )
+
+    for name, descriptor in candidates:
+      calls.clear()
+
+      class _EntryPoint:
+        def __init__(self, entry_name: object, entry_descriptor: object) -> None:
+          self.name = entry_name
+          self._descriptor = entry_descriptor
+
+        def load(self):
+          return lambda: self._descriptor
+
+      with pytest.raises((TypeError, ValueError)):
+        registry_mod._load_plugin_descriptor(_EntryPoint(name, descriptor))  # type: ignore[arg-type]
+      assert calls == []
+
   def test_plugin_loader_path_errors_are_configuration_errors(self, monkeypatch):
     descriptor = self._runtime_descriptor()
     monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
@@ -375,6 +544,24 @@ class TestDescriptorBoundary:
 
     with pytest.raises(ConfigurationError, match="invalid plugin class path"):
       connectors.ConnectionManager("runtime_contract")._create_backend()
+
+  def test_plugin_loader_metadata_is_not_retained(self, monkeypatch):
+    marker = "plugin-metadata-secret-marker"
+    descriptor = _make_descriptor(
+      marker,
+      capabilities=frozenset({"queue"}),
+    )
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    def _missing_path(_: str) -> object:
+      raise AttributeError(f"plugin loader detail: {marker}")
+
+    monkeypatch.setattr(connectors, "_load_object", _missing_path)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      connectors.ConnectionManager(marker)._create_backend()
+
+    _assert_redacted_error(exc_info.value, marker)
 
   def test_plugin_requires_callable_backend_and_settings_classes(self, monkeypatch):
     descriptor = self._runtime_descriptor()
@@ -400,6 +587,205 @@ class TestDescriptorBoundary:
 
     with pytest.raises(ConfigurationError, match="could not be constructed"):
       connectors.ConnectionManager("runtime_contract")._create_backend()
+
+  def test_plugin_constructor_diagnostics_are_not_retained(self, monkeypatch):
+    descriptor = self._runtime_descriptor()
+    marker = "plugin-constructor-secret-marker"
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    class _BrokenBackend:
+      def __init__(self, settings: object) -> None:
+        del settings
+        raise RuntimeError(f"plugin constructor diagnostic included {marker}")
+
+    def _load(path: str) -> object:
+      return _BrokenBackend if path == descriptor.backend_cls_path else _StubSettings
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      connectors.ConnectionManager(
+        "runtime_contract", {"password": marker}
+      )._create_backend()
+
+    _assert_redacted_error(exc_info.value, marker)
+
+  def test_plugin_settings_loader_failure_during_connect_is_not_retried(
+    self, monkeypatch
+  ):
+    descriptor = self._runtime_descriptor()
+    marker = "plugin-settings-loader-secret-marker"
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    def _load(path: str) -> object:
+      if path == descriptor.settings_cls_path:
+        raise ImportError(marker)
+      raise AssertionError("backend construction must not start")
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+    monkeypatch.setattr(connectors.time, "sleep", sleep_calls.append)
+    manager = connectors.ConnectionManager(
+      "runtime_contract", {"retry_attempts": 3, "retry_delay": 1}
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      manager.connect()
+
+    _assert_redacted_error(exc_info.value, marker)
+    assert manager._backend is None
+    assert sleep_calls == []
+
+  def test_plugin_settings_loader_failure_during_adaptation_is_static(
+    self, monkeypatch
+  ):
+    descriptor = self._runtime_descriptor()
+    marker = "plugin-adaptation-loader-secret-marker"
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(
+      connectors,
+      "_load_object",
+      lambda _: (_ for _ in ()).throw(ImportError(marker)),
+    )
+    settings = MagicMock()
+    settings.get.side_effect = lambda key, default=None: (
+      "runtime_contract" if key == "SCRAPY_BACKEND_TYPE" else default
+    )
+    settings.getdict.return_value = {}
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      connectors.resolve_backend_config(
+        settings,
+        type_key="SCRAPY_QUEUE_BACKEND_TYPE",
+        settings_key="SCRAPY_QUEUE_BACKEND_SETTINGS",
+      )
+
+    _assert_redacted_error(exc_info.value, marker)
+
+  def test_plugin_model_field_metadata_failure_is_not_public(self, monkeypatch):
+    descriptor = self._runtime_descriptor()
+    marker = "plugin-model-fields-secret-marker"
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    class _ExplosiveMeta(type):
+      @property
+      def model_fields(cls) -> object:
+        del cls
+        raise RuntimeError(marker)
+
+    class _ExplosiveSettings(metaclass=_ExplosiveMeta):
+      def __init__(self, **kwargs: object) -> None:
+        del kwargs
+        raise RuntimeError(marker)
+
+    def _load(path: str) -> object:
+      return _StubBackend if path == descriptor.backend_cls_path else _ExplosiveSettings
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      connectors.ConnectionManager("runtime_contract")._create_backend()
+
+    _assert_redacted_error(exc_info.value, marker)
+
+  def test_plugin_model_field_name_subclass_is_ignored_without_dispatch(
+    self, monkeypatch
+  ):
+    """Plugin metadata field labels must be exact strings before set algebra."""
+    descriptor = self._runtime_descriptor()
+    marker = "plugin-field-name-subclass-secret-marker"
+    calls: list[str] = []
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    class _ExplosiveFieldName(str):
+      def __hash__(self) -> int:
+        return hash("retry_attempts")
+
+      def __eq__(self, other: object) -> bool:
+        del other
+        calls.append("eq")
+        raise RuntimeError(marker)
+
+    class _PluginSettings:
+      model_fields = {_ExplosiveFieldName("retry_attempts"): object()}
+
+      def __init__(self, **kwargs: object) -> None:
+        del kwargs
+
+    def _load(path: str) -> object:
+      return _StubBackend if path == descriptor.backend_cls_path else _PluginSettings
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+    backend = connectors.ConnectionManager(
+      "runtime_contract", {"password": marker}
+    )._create_backend()
+
+    assert isinstance(backend, _StubBackend)
+    assert calls == []
+
+  def test_bundled_optional_dependency_import_error_is_preserved(self, monkeypatch):
+    descriptor = get_descriptor("redis")
+    marker = "bundled-optional-dependency-marker"
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(
+      connectors,
+      "_load_object",
+      lambda _: (_ for _ in ()).throw(ImportError(marker)),
+    )
+
+    with pytest.raises(ImportError) as exc_info:
+      connectors.ConnectionManager("redis")._create_backend()
+
+    error = exc_info.value
+    assert str(error) == "Selected backend could not be initialized because an import failed."
+    _assert_redacted_error(error, marker)
+
+  @pytest.mark.parametrize("stage", ["loader", "settings", "backend"])
+  def test_bundled_constructor_import_error_is_preserved_without_retry(
+    self,
+    monkeypatch,
+    stage,
+  ):
+    """Bundled optional imports retain their public type at every lazy stage."""
+    descriptor = get_descriptor("redis")
+    marker = f"bundled-{stage}-import-error-marker"
+    sleeps: list[float] = []
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(connectors.time, "sleep", sleeps.append)
+
+    class _ImportErrorSettings:
+      def __init__(self, **kwargs: object) -> None:
+        del kwargs
+        if stage == "settings":
+          raise ImportError(marker)
+
+    class _ImportErrorBackend:
+      def __init__(self, settings: object) -> None:
+        del settings
+        if stage == "backend":
+          raise ImportError(marker)
+
+    def _load(path: str) -> object:
+      if stage == "loader":
+        raise ImportError(marker)
+      if path == descriptor.settings_cls_path:
+        return _ImportErrorSettings
+      return _ImportErrorBackend
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+    manager = connectors.ConnectionManager(
+      "redis",
+      {"retry_attempts": 3, "retry_delay": 0.01},
+    )
+
+    with pytest.raises(ImportError) as exc_info:
+      manager.connect()
+
+    error = exc_info.value
+    assert str(error) == "Selected backend could not be initialized because an import failed."
+    _assert_redacted_error(error, marker)
+    assert manager._backend is None
+    assert sleeps == []
 
   def test_plugin_missing_backend_base_class_fails_fast(self, monkeypatch):
     descriptor = self._runtime_descriptor()
@@ -591,10 +977,10 @@ class TestCapabilityGated:
 
     assert exc_info.value.setting_name == "SCRAPY_SET_BACKEND_TYPE"
     msg = str(exc_info.value)
-    # The capable backends list must name at least one set-capable backend
-    # (redis/mongodb/elasticsearch are bundled + set-capable).
+    # The capable backends list must name at least one bundled set-capable
+    # backend, without exposing the selected third-party plugin metadata.
     assert "redis" in msg
-    assert "mybackend" in msg
+    assert "mybackend" not in msg
 
 
 class TestNameConflictBundledWins:
@@ -629,7 +1015,7 @@ class TestNameConflictBundledWins:
     # not just any descriptor named "redis".
     desc = get_descriptor("redis")
     assert desc.backend_cls_path == "scrapy_extension.backends.redis.RedisBackend"
-    assert "shadows bundled backend" in caplog.text
+    assert "shadows a bundled backend" in caplog.text
 
 
 class TestImportErrorGracefulSkip:
@@ -684,7 +1070,36 @@ class TestImportErrorGracefulSkip:
     # The good plugin was discovered; the broken one was not.
     assert "goodplugin" in registry
     assert "broken" not in registry
-    assert "Skipping 3rd-party backend entry-point 'broken'" in caplog.text
+    assert "Skipping invalid third-party backend entry-point" in caplog.text
+
+  def test_plugin_skip_diagnostics_redact_untrusted_metadata(
+    self, monkeypatch, caplog
+  ):
+    from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+
+    marker = "registry-plugin-secret-marker"
+    _patch_entry_points(
+      monkeypatch,
+      [
+        _FakeEntryPoint(
+          name=marker,
+          value="tests.test_registry._secret_broken_plugin",
+          group=_ENTRY_POINT_GROUP,
+        )
+      ],
+    )
+    _reset_registry_cache()
+
+    with caplog.at_level(logging.WARNING):
+      registry = get_registry()
+
+    assert marker not in registry
+    assert marker not in caplog.text
+    for record in caplog.records:
+      assert marker not in record.getMessage()
+      assert marker not in repr(record.args)
+      assert record.exc_info is None
+      assert record.exc_text is None
 
 
 class TestLazyImportPreserved:
@@ -782,7 +1197,10 @@ class TestEntryPointApiIsModern:
 
 class TestHasCapability:
   def test_has_capability_for_bundled(self):
+    from scrapy_extension.backends.base import BackendType
+
     _reset_registry_cache()
+    assert get_descriptor(BackendType.REDIS).backend_type == "redis"
     assert has_capability("redis", "queue") is True
     assert has_capability("redis", "set") is True
     assert has_capability("redis", "storage") is True
@@ -793,6 +1211,22 @@ class TestHasCapability:
   def test_has_capability_unknown_backend(self):
     _reset_registry_cache()
     assert has_capability("not-a-backend", "queue") is False
+
+  def test_lookup_rejects_hostile_string_subclasses_without_dispatch(self):
+    marker = "registry-hostile-string-marker"
+    calls: list[str] = []
+
+    class _EvilString(str):
+      def __hash__(self) -> int:
+        calls.append("hash")
+        raise RuntimeError(marker)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      get_descriptor(_EvilString("redis"))  # type: ignore[arg-type]
+
+    assert marker not in str(exc_info.value)
+    assert has_capability("redis", _EvilString("queue")) is False  # type: ignore[arg-type]
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +1333,7 @@ class TestPluginDiscoveryErrors:
     # The good peer plugin was discovered; the broken one was skipped.
     assert "goodplugin" in registry
     assert plugin_name not in registry
-    assert f"entry-point '{plugin_name}'" in caplog.text
+    assert "Skipping invalid third-party backend entry-point" in caplog.text
 
   def test_wrong_return_type_skips_with_warning(self, monkeypatch, caplog):
     """A non-BackendDescriptor return raises TypeError → skip + warning log."""

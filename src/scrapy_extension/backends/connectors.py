@@ -16,6 +16,7 @@ registry to maintain.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import json
@@ -33,10 +34,11 @@ from datetime import time as datetime_time
 from decimal import Decimal
 from difflib import get_close_matches
 from enum import Enum
+from functools import wraps
 from json import JSONEncoder
 from pathlib import PurePath
 from types import ModuleType
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, ParamSpec, TypeVar, cast
 from uuid import UUID
 
 from pydantic import BaseModel, SecretBytes, SecretStr, ValidationError
@@ -64,11 +66,14 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.exceptions._redaction import configuration_error_boundary
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 
 logger = logging.getLogger(__name__)
 
 _MonitorEvent = tuple[str, tuple[Any, ...]]
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 
 
 def _log_diagnostic(
@@ -125,14 +130,233 @@ _CONNECTION_MANAGER_DEFAULTS: dict[str, int | float] = {
   "retry_attempts": 3,
   "retry_delay": 1.0,
 }
+_MANAGER_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
+  {
+    "SCRAPY_BACKEND_TYPE",
+    "api_key",
+    "backend_settings",
+    "retry_attempts",
+    "retry_delay",
+  }
+)
+_RESOLVED_BACKEND_SETTING_NAMES: frozenset[str] = frozenset(
+  {
+    "SCRAPY_BACKEND_TYPE",
+    "SCRAPY_QUEUE_BACKEND_TYPE",
+    "SCRAPY_SET_BACKEND_TYPE",
+    "SCRAPY_STORAGE_BACKEND_TYPE",
+    "backend_settings",
+  }
+)
+_SAFE_BACKEND_SETTING_HINTS: frozenset[str] = frozenset(
+  {
+    "database",
+    "SCRAPY_MONGO_DATABASE",
+  }
+)
+_SAFE_MANAGER_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Invalid backend setting 'backend_settings'.",
+    "Selected backend could not be constructed.",
+    "Selected backend has an invalid plugin class path.",
+    "Selected backend must provide callable backend and settings classes.",
+    (
+      "Selected backend type is not a registered backend type. "
+      f"Valid bundled values: {', '.join(repr(name) for name in sorted(_BUNDLED_BACKEND_TYPES))}."
+    ),
+  }
+)
+_SAFE_MANAGER_CONNECTION_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Cannot connect a released ConnectionManager",
+    "Cannot access a released ConnectionManager",
+    "ConnectionManager was released while connecting",
+    "connect() did not produce a backend",
+    "Connection completed after ConnectionManager release; backend discarded",
+  }
+)
+_SAFE_BACKEND_SETTING_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Unknown bundled backend setting.",
+    *(
+      f"Unknown bundled backend setting. Did you mean {hint!r}?"
+      for hint in _SAFE_BACKEND_SETTING_HINTS
+    ),
+  }
+)
+
+
+def _is_safe_capability_message(message: str) -> bool:
+  """Accept only deterministic capability diagnostics with bundled names."""
+  if len(message) > 512:
+    return False
+  prefix = "Selected "
+  separator = " does not support the "
+  suffix = " interface and is missing capabilities. Capable bundled backends: "
+  if (
+    not message.startswith(prefix)
+    or separator not in message
+    or suffix not in message
+  ):
+    return False
+  selected, remainder = message[len(prefix) :].split(separator, maxsplit=1)
+  if suffix not in remainder:
+    return False
+  component, rendered_backends = remainder.split(suffix, maxsplit=1)
+  if selected not in _BUNDLED_BACKEND_TYPES | {"third-party backend"}:
+    return False
+  if component not in {"queue", "set", "storage"} or not rendered_backends.endswith("."):
+    return False
+  try:
+    capable = ast.literal_eval(rendered_backends[:-1])
+  except (SyntaxError, ValueError):
+    return False
+  return (
+    type(capable) is list
+    and capable == sorted(capable)
+    and all(type(name) is str and name in _BUNDLED_BACKEND_TYPES for name in capable)
+  )
+
+
+def _is_safe_resolved_backend_message(message: str) -> bool:
+  """Allow only static typo hints or capability diagnostics at this boundary."""
+  return message in _SAFE_BACKEND_SETTING_MESSAGES or _is_safe_capability_message(
+    message
+  )
+
+
+def _is_safe_manager_configuration_message(message: str) -> bool:
+  """Allow static plugin-boundary diagnostics without trusting plugin text."""
+  if message in _SAFE_MANAGER_MESSAGES:
+    return True
+  setting_prefix = "Invalid backend setting '"
+  if message.startswith(setting_prefix) and message.endswith("'."):
+    setting_name = message[len(setting_prefix) : -2]
+    return setting_name in _MANAGER_CONFIGURATION_SETTING_NAMES
+  contract_prefix = "Selected "
+  contract_separator = " does not implement its declared contract: missing "
+  if (
+    not message.startswith(contract_prefix)
+    or contract_separator not in message
+    or not message.endswith(".")
+  ):
+    return False
+  selected, rendered_interfaces = message[len(contract_prefix) : -1].split(
+    contract_separator,
+    maxsplit=1,
+  )
+  if selected not in _BUNDLED_BACKEND_TYPES | {"third-party backend"}:
+    return False
+  interfaces = rendered_interfaces.split(", ")
+  allowed_interfaces = {"Backend", "QueueBackend", "SetBackend", "StorageBackend"}
+  return bool(interfaces) and all(name in allowed_interfaces for name in interfaces)
 
 
 def _model_field_names(settings_cls: Any) -> frozenset[str]:
-  """Return declared Pydantic field names without assuming a model class."""
-  fields = getattr(settings_cls, "model_fields", None)
-  if not isinstance(fields, Mapping):
+  """Return declared field names without trusting plugin metadata access."""
+  try:
+    fields = getattr(settings_cls, "model_fields", None)
+    if not isinstance(fields, Mapping):
+      return frozenset()
+    return frozenset(name for name in fields if type(name) is str)
+  except Exception:  # noqa: BLE001 - third-party metadata is untrusted
+    # Field names are used only to preserve retry-setting ownership. A broken
+    # plugin declaration must fail closed rather than publish its diagnostic.
     return frozenset()
-  return frozenset(name for name in fields if isinstance(name, str))
+
+
+def _load_descriptor_object(descriptor: BackendDescriptor, dotted_path: str) -> Any:
+  """Load a descriptor object without exposing third-party loader details.
+
+  Bundled optional dependencies intentionally retain their established
+  ``ImportError`` behavior. Third-party descriptors are untrusted metadata,
+  so any loader failure becomes one static configuration error after the
+  handler has finished and cannot retain a plugin path or import diagnostic.
+  """
+  loaded: Any = None
+  plugin_load_failed = False
+  try:
+    loaded = _load_object(dotted_path)
+  except ImportError:
+    if descriptor.backend_type in _BUNDLED_BACKEND_TYPES:
+      raise
+    plugin_load_failed = True
+  except Exception:  # noqa: BLE001 - third-party loader diagnostics are private
+    if descriptor.backend_type in _BUNDLED_BACKEND_TYPES:
+      raise
+    plugin_load_failed = True
+  if plugin_load_failed:
+    raise ConfigurationError(
+      "Selected backend has an invalid plugin class path.",
+      setting_name="SCRAPY_BACKEND_TYPE",
+    )
+  return loaded
+
+
+class _BundledOptionalDependencyFailure(Exception):
+  """Private resolver sentinel with no loader diagnostic or traceback chain."""
+
+
+def _bundled_optional_dependency_boundary(
+  function: Callable[_P, _T],
+) -> Callable[_P, _T]:
+  """Publish a fresh static ImportError after resolver frames have unwound."""
+
+  @wraps(function)
+  def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+    dependency_failure = False
+    try:
+      return function(*args, **kwargs)
+    except _BundledOptionalDependencyFailure:
+      dependency_failure = True
+    except BaseException:
+      del args
+      del kwargs
+      raise
+    assert dependency_failure
+    sanitized_error = ImportError(
+      "A bundled backend optional dependency is unavailable."
+    )
+    del args
+    del kwargs
+    del dependency_failure
+    raise sanitized_error
+
+  return wrapped
+
+
+def _load_resolver_settings_class(descriptor: BackendDescriptor) -> Any:
+  """Load a resolver model while tagging only bundled missing dependencies."""
+  try:
+    return _load_descriptor_object(descriptor, descriptor.settings_cls_path)
+  except ImportError:
+    if descriptor.backend_type in _BUNDLED_BACKEND_TYPES:
+      raise _BundledOptionalDependencyFailure from None
+    raise
+
+
+def _safe_manager_setting_name(
+  error: Exception,
+  backend_type: str,
+  field_names: frozenset[str],
+) -> str:
+  """Return a verified bundled field name without retaining error input."""
+  if backend_type not in _BUNDLED_BACKEND_TYPES:
+    return "backend_settings"
+  candidate: object = None
+  if type(error) is ConfigurationError:
+    candidate = error.setting_name
+  elif type(error) is ValidationError:
+    try:
+      errors = error.errors()
+      detail = errors[0] if type(errors) is list and errors else None
+      location = detail.get("loc", ()) if type(detail) is dict else ()
+      candidate = location[0] if type(location) is tuple and location else None
+    except Exception:  # noqa: BLE001 - plugin error renderers are untrusted
+      return "backend_settings"
+  if type(candidate) is str and candidate in field_names:
+    return candidate
+  return "backend_settings"
 
 
 _CAPABILITY_INTERFACES: dict[str, type[ABC]] = {
@@ -161,8 +385,13 @@ def _validate_backend_contract(
     if not isinstance(backend, interface):
       missing.append(interface.__name__)
   if missing:
+    backend_label = (
+      descriptor.backend_type
+      if descriptor.backend_type in _BUNDLED_BACKEND_TYPES
+      else "Selected third-party backend"
+    )
     msg = (
-      f"Backend {descriptor.backend_type!r} does not implement its declared "
+      f"{backend_label} does not implement its declared "
       f"contract: missing {', '.join(missing)}."
     )
     raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
@@ -230,6 +459,14 @@ def _load_object(dotted_path: str) -> Any:
   return getattr(module, name)
 
 
+@_bundled_optional_dependency_boundary
+@configuration_error_boundary(
+  "Backend configuration is invalid.",
+  _RESOLVED_BACKEND_SETTING_NAMES,
+  preserve_static_message=True,
+  safe_message_predicate=_is_safe_resolved_backend_message,
+  pass_through_exception_types=(_BundledOptionalDependencyFailure,),
+)
 def resolve_backend_config(
   settings: Any,
   type_key: str,
@@ -291,6 +528,11 @@ def resolve_backend_config(
           or if ``required_capabilities`` is set and the backend does not
           declare all of them.
   """
+  safe_component_name = (
+    component_name
+    if type(component_name) is str and component_name in {"queue", "set", "storage"}
+    else "component"
+  )
   scrapy_component_type = settings.get(type_key)
   scrapy_global_type = settings.get("SCRAPY_BACKEND_TYPE")
   if scrapy_component_type:
@@ -330,12 +572,18 @@ def resolve_backend_config(
       capable = sorted(
         name
         for name, descriptor in get_registry().items()
-        if all(cap in descriptor.capabilities for cap in required_capabilities)
+        if name in _BUNDLED_BACKEND_TYPES
+        and all(cap in descriptor.capabilities for cap in required_capabilities)
+      )
+      selected_backend = (
+        backend_type
+        if backend_type in _BUNDLED_BACKEND_TYPES
+        else "third-party backend"
       )
       msg = (
-        f"Backend {backend_type!r} does not support the {component_name} "
-        f"interface required by this component (missing capabilities: "
-        f"{sorted(missing)}). Capable backends: {capable}."
+        f"Selected {selected_backend} does not support the {safe_component_name} "
+        f"interface and is missing capabilities. Capable bundled backends: "
+        f"{capable}."
       )
       raise ConfigurationError(msg, setting_name=source_key)
 
@@ -356,7 +604,7 @@ def _adapt_backend_settings(
     # public values stay with the plugin while ``manager_retry_*`` continues
     # to configure ConnectionManager independently.
     descriptor = get_descriptor(backend_type)
-    settings_cls = _load_object(descriptor.settings_cls_path)
+    settings_cls = _load_resolver_settings_class(descriptor)
     return _merge_connection_manager_settings(
       settings,
       {},
@@ -365,7 +613,7 @@ def _adapt_backend_settings(
     )
 
   descriptor = get_descriptor(backend_type)
-  settings_cls = _load_object(descriptor.settings_cls_path)
+  settings_cls = _load_resolver_settings_class(descriptor)
   if not isinstance(settings_cls, type) or not issubclass(settings_cls, BaseModel):
     return _merge_connection_manager_settings(
       settings,
@@ -386,12 +634,8 @@ def _adapt_backend_settings(
   field_names = frozenset(settings_cls.model_fields)
   allowed_nested_names = field_names | _CONNECTION_MANAGER_SETTING_NAMES
   for setting_name in nested_settings:
-    if not isinstance(setting_name, str) or setting_name not in allowed_nested_names:
-      raise _unknown_backend_setting(
-        str(setting_name),
-        allowed_nested_names,
-        backend_type,
-      )
+    if type(setting_name) is not str or setting_name not in allowed_nested_names:
+      raise _unknown_backend_setting(setting_name, allowed_nested_names, backend_type)
 
   flat_key_to_field = {
     f"{env_prefix}{field_name.upper()}".upper(): field_name
@@ -400,7 +644,7 @@ def _adapt_backend_settings(
   flat_settings: dict[str, Any] = {}
   if isinstance(settings, Mapping):
     for setting_name, value in settings.items():
-      if not isinstance(setting_name, str):
+      if type(setting_name) is not str:
         continue
       normalized_name = setting_name.upper()
       field_name = flat_key_to_field.get(normalized_name)
@@ -491,16 +735,25 @@ def _merge_connection_manager_settings(
 
 
 def _unknown_backend_setting(
-  setting_name: str,
+  setting_name: object,
   valid_names: frozenset[str],
   backend_type: str,
 ) -> ConfigurationError:
-  """Build a value-free typo error with a best-effort setting suggestion."""
-  suggestions = get_close_matches(setting_name, sorted(valid_names), n=1, cutoff=0.6)
-  suggestion = f" Did you mean {suggestions[0]!r}?" if suggestions else ""
+  """Build a static typo error without retaining an untrusted setting key."""
+  suggestions = (
+    get_close_matches(setting_name, sorted(valid_names), n=1, cutoff=0.6)
+    if type(setting_name) is str
+    else []
+  )
+  suggestion = (
+    f" Did you mean {suggestions[0]!r}?"
+    if suggestions and suggestions[0] in _SAFE_BACKEND_SETTING_HINTS
+    else ""
+  )
+  scope = "bundled backend" if backend_type in _BUNDLED_BACKEND_TYPES else "backend"
   return ConfigurationError(
-    f"Unknown {backend_type!r} backend setting {setting_name!r}.{suggestion}",
-    setting_name=setting_name,
+    f"Unknown {scope} setting.{suggestion}",
+    setting_name="backend_settings",
   )
 
 
@@ -511,9 +764,9 @@ def _normalize_backend_type(value: object, setting_name: str) -> str:
   forced ``BackendType(value)``. The registry now keys on plain strings
   so 3rd-party backends (registered via entry-points) route through the
   same path. ``BackendType`` members pass through via their string
-  ``.value``; plain strings pass through unchanged; anything else is
-  stringified then validated against the registry (unknown → typed
-  ``ConfigurationError`` with the setting name + value attached).
+  ``.value``; plain strings pass through unchanged. Values outside that
+  contract and unknown backend names receive static typed errors instead of
+  being stringified or reflected into public configuration diagnostics.
 
   Args:
       value: The raw setting value (``BackendType``, ``str``, or other).
@@ -528,21 +781,20 @@ def _normalize_backend_type(value: object, setting_name: str) -> str:
   """
   if isinstance(value, BackendType):
     return value.value
-  if isinstance(value, str):
-    candidate = value
-  else:
-    candidate = str(value)
+  if type(value) is not str:
+    raise ConfigurationError(
+      "Selected backend type is not registered.", setting_name=setting_name
+    )
+  candidate = value
+  is_registered = True
   try:
     get_descriptor(candidate)
   except ConfigurationError:
-    valid = sorted(get_registry().keys())
-    msg = (
-      f"Invalid backend type {value!r} for setting {setting_name!r}. "
-      f"Valid values: {valid}."
-    )
+    is_registered = False
+  if not is_registered:
     raise ConfigurationError(
-      msg, setting_name=setting_name, setting_value=value
-    ) from None
+      "Selected backend type is not registered.", setting_name=setting_name
+    )
   return candidate
 
 
@@ -552,6 +804,129 @@ class _ConnectionAttempt:
   def __init__(self) -> None:
     self.event = threading.Event()
     self.error: BaseException | None = None
+
+
+def _normalized_manager_backend_type(value: object) -> str | None:
+  """Accept only a bundled enum member or an exact backend registry key."""
+  if isinstance(value, BackendType):
+    return value.value
+  if type(value) is str:
+    return value
+  return None
+
+
+def _safe_manager_connection_message(error: BackendConnectionError) -> str:
+  """Keep only deterministic manager startup messages after redaction."""
+  fallback = "Connection manager failed to connect to the selected backend."
+  if type(error) is not BackendConnectionError:
+    return fallback
+  raw_args = error.args
+  if type(raw_args) is not tuple or len(raw_args) != 1:
+    return fallback
+  message = raw_args[0]
+  if type(message) is not str:
+    return fallback
+  if message in _SAFE_MANAGER_CONNECTION_MESSAGES:
+    return message
+  prefix = "Failed to connect after "
+  if not message.startswith(prefix):
+    return fallback
+  rendered_count, separator, suffix = message[len(prefix) :].partition(" ")
+  if separator != " " or not rendered_count.isascii() or not rendered_count.isdigit():
+    return fallback
+  if len(rendered_count) > 2:
+    return fallback
+  count = int(rendered_count)
+  if not 1 <= count <= 21:
+    return fallback
+  expected_suffix = "attempt." if count == 1 else "attempts."
+  return message if suffix == expected_suffix else fallback
+
+
+def _safe_manager_connection_backend_type(error: BackendConnectionError) -> str:
+  """Keep an exact bundled backend label, otherwise use a static label."""
+  if type(error) is BackendConnectionError:
+    backend_type = error.backend_type
+    if type(backend_type) is str and backend_type in _BUNDLED_BACKEND_TYPES:
+      return backend_type
+    if type(backend_type) is str:
+      for bundled_type in BackendType:
+        if backend_type == str(bundled_type):
+          return bundled_type.value
+  return "connection-manager"
+
+
+def _manager_terminal_error_boundary(
+  unsupported_capability: str | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+  """Replace startup errors after all manager frames have unwound.
+
+  ``ConnectionManager`` stores the selected backend configuration on ``self``.
+  Re-raising even a previously-redacted error from a public accessor restores
+  a traceback frame that exposes that configuration to introspection.  This
+  outer boundary therefore rebuilds operational startup errors only after
+  the accessor's inner frames have been removed.  Its companion configuration
+  boundary handles validation errors and drops its own arguments before this
+  wrapper observes them.
+  """
+
+  def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+      connection_error: BackendConnectionError | None = None
+      import_failed = False
+      unsupported = False
+      try:
+        return function(*args, **kwargs)
+      except BackendConnectionError as error:
+        connection_error = error
+      except ImportError:
+        import_failed = True
+      except NotImplementedError:
+        unsupported = True
+      except BaseException:
+        del args
+        del kwargs
+        raise
+      if connection_error is not None:
+        message = _safe_manager_connection_message(connection_error)
+        backend_type = _safe_manager_connection_backend_type(connection_error)
+        sanitized_error = BackendConnectionError(message, backend_type=backend_type)
+        del args
+        del kwargs
+        del connection_error
+        del import_failed
+        del unsupported
+        del message
+        del backend_type
+        raise sanitized_error
+      if import_failed:
+        sanitized_import_error = ImportError(
+          "Selected backend could not be initialized because an import failed."
+        )
+        del args
+        del kwargs
+        del connection_error
+        del import_failed
+        del unsupported
+        raise sanitized_import_error
+      if unsupported:
+        operation = unsupported_capability or "requested"
+        sanitized_not_implemented = NotImplementedError(
+          f"Selected backend does not support {operation} operations"
+        )
+        del args
+        del kwargs
+        del connection_error
+        del import_failed
+        del unsupported
+        del operation
+        raise sanitized_not_implemented
+      raise AssertionError("manager terminal boundary did not select an error")
+
+    return wrapped
+
+  return decorate
 
 
 def _registry_type_name(value: object) -> str:
@@ -766,8 +1141,23 @@ class ConnectionManager:
             or a ``BackendType`` member which is a ``str`` subclass).
         settings: Backend-specific settings dictionary.
     """
-    self.backend_type = backend_type
-    self.settings = settings or {}
+    normalized_backend_type = _normalized_manager_backend_type(backend_type)
+    if normalized_backend_type is None or (
+      settings is not None and type(settings) is not dict
+    ):
+      input_error = ConfigurationError(
+        "Connection manager requires a backend registry-key string and settings dictionary.",
+        setting_name="backend_settings",
+      )
+      del backend_type
+      del settings
+      raise input_error
+    self.backend_type = (
+      backend_type
+      if isinstance(backend_type, BackendType)
+      else normalized_backend_type
+    )
+    self.settings = settings if settings is not None else {}
     self._backend: Backend | None = None
     self._lock = threading.Lock()
     # Serialize the complete create/connect/publish transaction. The lazy
@@ -841,9 +1231,41 @@ class ConnectionManager:
     """
     # Hash and retain the same deep snapshot. Otherwise a caller can mutate a
     # nested value after hashing and make the old registry key point at new
-    # connection settings.
-    settings_snapshot = deepcopy(settings) if settings is not None else {}
-    key = cls._registry_key(backend_type, settings_snapshot)
+    # connection settings.  Do not invoke truthiness, hashing, deepcopy, or
+    # normalisation on arbitrary container/type subclasses before this public
+    # configuration boundary has verified their outer shape.
+    normalized_backend_type = _normalized_manager_backend_type(backend_type)
+    if normalized_backend_type is None or (
+      settings is not None and type(settings) is not dict
+    ):
+      input_error = ConfigurationError(
+        "Connection manager requires a backend registry-key string and settings dictionary.",
+        setting_name="backend_settings",
+      )
+      del backend_type
+      del settings
+      raise input_error
+
+    settings_snapshot: dict[str, Any] | None = None
+    key: str | None = None
+    snapshot_failed = False
+    try:
+      settings_snapshot = deepcopy(settings) if settings is not None else {}
+      key = cls._registry_key(normalized_backend_type, settings_snapshot)
+    except Exception:  # noqa: BLE001 - nested config values are untrusted
+      snapshot_failed = True
+    if snapshot_failed:
+      input_error = ConfigurationError(
+        "Connection manager settings cannot be normalized.",
+        setting_name="backend_settings",
+      )
+      del backend_type
+      del settings
+      del settings_snapshot
+      del key
+      raise input_error
+    assert settings_snapshot is not None
+    assert key is not None
 
     victims: list[ConnectionManager] = []
     with cls._registry_lock:
@@ -972,32 +1394,60 @@ class ConnectionManager:
     normalization avoids address-bearing or secret-bearing ``repr`` fallbacks
     and is deterministic across equivalent settings objects.
     """
-    bt_key = (
-      backend_type.value
-      if isinstance(backend_type, BackendType)
-      else backend_type
-    )
-
-    normalized_settings = [
-      "connection-manager-registry-v1",
-      _normalize_registry_value(settings, set()),
-    ]
-    try:
-      settings_key = json.dumps(
-        normalized_settings,
-        ensure_ascii=True,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    bt_key = _normalized_manager_backend_type(backend_type)
+    if bt_key is None or type(settings) is not dict:
+      input_error = ConfigurationError(
+        "Connection manager requires a backend registry-key string and settings dictionary.",
+        setting_name="backend_settings",
       )
-    except (TypeError, ValueError):
-      # ``normalized_settings`` contains JSON-native values only. This branch
-      # keeps key generation available if the module-level JSON facade is
-      # replaced/fails, without falling back to a plaintext ``repr``.
-      settings_key = _canonical_registry_json(normalized_settings)
+      del backend_type
+      del settings
+      raise input_error
+
+    normalized_settings: list[Any] | None = None
+    settings_key: str | None = None
+    normalization_failed = False
+    try:
+      normalized_settings = [
+        "connection-manager-registry-v1",
+        _normalize_registry_value(settings, set()),
+      ]
+      try:
+        settings_key = json.dumps(
+          normalized_settings,
+          ensure_ascii=True,
+          allow_nan=False,
+          sort_keys=True,
+          separators=(",", ":"),
+        )
+      except (TypeError, ValueError):
+        # ``normalized_settings`` contains JSON-native values only. This
+        # retains the former JSON-facade fallback without plaintext repr.
+        settings_key = _canonical_registry_json(normalized_settings)
+    except Exception:  # noqa: BLE001 - nested settings can run custom code
+      normalization_failed = True
+    if normalization_failed:
+      input_error = ConfigurationError(
+        "Connection manager settings cannot be normalized.",
+        setting_name="backend_settings",
+      )
+      del backend_type
+      del settings
+      del normalized_settings
+      del settings_key
+      raise input_error
+    assert settings_key is not None
     settings_digest = hashlib.sha256(settings_key.encode("utf-8")).hexdigest()
     return f"{bt_key}:{settings_digest}"
 
+  @_manager_terminal_error_boundary()
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(ImportError,),
+  )
   def _create_backend(self) -> Backend:
     """Create a backend instance based on type.
 
@@ -1020,20 +1470,10 @@ class ConnectionManager:
       if isinstance(self.backend_type, BackendType)
       else self.backend_type
     )
-    try:
-      backend_cls = _load_object(descriptor.backend_cls_path)
-      settings_cls = _load_object(descriptor.settings_cls_path)
-    except (AttributeError, ValueError, TypeError) as exc:
-      msg = (
-        f"Backend {descriptor.backend_type!r} has an invalid plugin class "
-        f"path: {exc}"
-      )
-      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE") from exc
+    backend_cls = _load_descriptor_object(descriptor, descriptor.backend_cls_path)
+    settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
     if not callable(backend_cls) or not callable(settings_cls):
-      msg = (
-        f"Backend {descriptor.backend_type!r} must provide callable backend "
-        "and settings classes."
-      )
+      msg = "Selected backend must provide callable backend and settings classes."
       raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
     backend_field_names = _model_field_names(settings_cls)
     manager_only_names = _CONNECTION_MANAGER_SETTING_NAMES - backend_field_names
@@ -1043,16 +1483,69 @@ class ConnectionManager:
       if name not in _CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS
       and name not in manager_only_names
     }
+    bundled_descriptor = descriptor.backend_type in _BUNDLED_BACKEND_TYPES
+    settings_obj: Any = None
+    settings_error: ConfigurationError | None = None
     try:
-      backend = backend_cls(settings_cls(**backend_settings))
-    except TypeError as exc:
-      # A plugin's constructor contract is static configuration.  Retrying it
+      settings_obj = settings_cls(**backend_settings)
+    except ImportError:
+      if bundled_descriptor:
+        raise
+      settings_error = ConfigurationError(
+        "Invalid backend setting 'backend_settings'.",
+        setting_name="backend_settings",
+      )
+    except (ConfigurationError, ValidationError, TypeError) as error:
+      setting_name = _safe_manager_setting_name(
+        error, descriptor.backend_type, backend_field_names
+      )
+      settings_error = ConfigurationError(
+        f"Invalid backend setting '{setting_name}'.",
+        setting_name=setting_name,
+      )
+    except Exception as error:  # noqa: BLE001 - plugin settings are untrusted
+      if bundled_descriptor:
+        raise
+      setting_name = _safe_manager_setting_name(
+        error, descriptor.backend_type, backend_field_names
+      )
+      settings_error = ConfigurationError(
+        f"Invalid backend setting '{setting_name}'.",
+        setting_name=setting_name,
+      )
+    if settings_error is not None:
+      # Pydantic errors retain raw input in their error graph. Keep manager
+      # construction typed and non-retryable without publishing that input.
+      raise settings_error
+
+    backend: object | None = None
+    constructor_error: ConfigurationError | None = None
+    try:
+      backend = backend_cls(settings_obj)
+    except ImportError:
+      if bundled_descriptor:
+        raise
+      constructor_error = ConfigurationError(
+        "Selected backend could not be constructed.",
+        setting_name="SCRAPY_BACKEND_TYPE",
+      )
+    except TypeError:
+      constructor_error = ConfigurationError(
+        "Selected backend could not be constructed.",
+        setting_name="SCRAPY_BACKEND_TYPE",
+      )
+    except Exception:  # noqa: BLE001 - plugin constructors are untrusted
+      if bundled_descriptor:
+        raise
+      # A plugin's constructor contract is static configuration. Retrying it
       # as though it were a transient network failure only delays a useful
       # error and can leave operators with a misleading BackendConnectionError.
-      msg = (
-        f"Backend {descriptor.backend_type!r} could not be constructed: {exc}"
+      constructor_error = ConfigurationError(
+        "Selected backend could not be constructed.",
+        setting_name="SCRAPY_BACKEND_TYPE",
       )
-      raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE") from exc
+    if constructor_error is not None:
+      raise constructor_error
     # Bundled descriptors and implementations ship together and are covered by
     # their backend contract suite.  Third-party descriptors are executable
     # metadata from another distribution, so enforce the runtime contract at
@@ -1061,6 +1554,15 @@ class ConnectionManager:
       return _validate_backend_contract(backend, descriptor)
     return cast("Backend", backend)
 
+  @_manager_terminal_error_boundary()
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    sanitize_exception_types=(ValidationError,),
+    pass_through_exception_types=(BackendConnectionError, ImportError),
+  )
   def connect(self) -> None:
     """Establish connection with retry logic.
 
@@ -1072,8 +1574,7 @@ class ConnectionManager:
 
     Raises:
         BackendConnectionError: If all network retry attempts fail.
-        ConfigurationError: If generic retry controls are invalid.
-        ValidationError: If backend-specific Pydantic settings are invalid.
+        ConfigurationError: If generic or backend-specific settings are invalid.
         ImportError: If the selected backend's optional dependency is missing.
     """
     monitor_events: list[_MonitorEvent] = []
@@ -1217,7 +1718,7 @@ class ConnectionManager:
       if isinstance(self.backend_type, BackendType)
       else self.backend_type
     )
-    settings_cls = _load_object(descriptor.settings_cls_path)
+    settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
     backend_field_names = _model_field_names(settings_cls)
 
     raw_attempts = self.settings.get(
@@ -1233,24 +1734,31 @@ class ConnectionManager:
         ),
       ),
     )
+    retry_attempts: int | None = None
+    invalid_attempts = False
     try:
       if isinstance(raw_attempts, bool):
         raise ValueError
       retry_attempts = int(raw_attempts)
       if isinstance(raw_attempts, float) and not raw_attempts.is_integer():
         raise ValueError
-    except (TypeError, ValueError, OverflowError) as e:
-      raise ConfigurationError(
+    except Exception:  # noqa: BLE001 - custom numeric coercion is untrusted
+      invalid_attempts = True
+    if invalid_attempts:
+      policy_error = ConfigurationError(
         "retry_attempts must be an integer between 0 and 20",
         setting_name="retry_attempts",
-        setting_value=raw_attempts,
-      ) from e
+      )
+      del raw_attempts
+      raise policy_error
+    assert retry_attempts is not None
     if not 0 <= retry_attempts <= 20:
-      raise ConfigurationError(
+      policy_error = ConfigurationError(
         "retry_attempts must be between 0 and 20",
         setting_name="retry_attempts",
-        setting_value=raw_attempts,
       )
+      del raw_attempts
+      raise policy_error
 
     raw_delay = self.settings.get(
       _CONNECTION_MANAGER_INTERNAL_KEYS["retry_delay"],
@@ -1265,22 +1773,29 @@ class ConnectionManager:
         ),
       ),
     )
+    retry_delay: float | None = None
+    invalid_delay = False
     try:
       if isinstance(raw_delay, bool):
         raise ValueError
       retry_delay = float(raw_delay)
-    except (TypeError, ValueError, OverflowError) as e:
-      raise ConfigurationError(
+    except Exception:  # noqa: BLE001 - custom numeric coercion is untrusted
+      invalid_delay = True
+    if invalid_delay:
+      policy_error = ConfigurationError(
         "retry_delay must be a finite non-negative number",
         setting_name="retry_delay",
-        setting_value=raw_delay,
-      ) from e
-    if not math.isfinite(retry_delay) or retry_delay < 0:
-      raise ConfigurationError(
-        "retry_delay must be a finite non-negative number",
-        setting_name="retry_delay",
-        setting_value=raw_delay,
       )
+      del raw_delay
+      raise policy_error
+    assert retry_delay is not None
+    if not math.isfinite(retry_delay) or retry_delay < 0:
+      policy_error = ConfigurationError(
+        "retry_delay must be a finite non-negative number",
+        setting_name="retry_delay",
+      )
+      del raw_delay
+      raise policy_error
     return retry_attempts, retry_delay
 
   def _attempt_connection(self) -> None:
@@ -1341,6 +1856,10 @@ class ConnectionManager:
       backend_type=str(self.backend_type),
     )
 
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+  )
   def close(self) -> None:
     """Release this holder's acquire on the shared manager (refcount).
 
@@ -1481,6 +2000,14 @@ class ConnectionManager:
       self._notify_monitor(hook_name, *args)
 
   @property
+  @_manager_terminal_error_boundary()
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(BackendConnectionError, ImportError),
+  )
   def backend(self) -> Backend:
     """Get the backend instance, connecting if necessary.
 
@@ -1593,6 +2120,14 @@ class ConnectionManager:
       raise BackendConnectionError(msg, backend_type=str(self.backend_type))
     return published_backend
 
+  @_manager_terminal_error_boundary()
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(BackendConnectionError, ImportError),
+  )
   def is_connected(self) -> bool:
     """Check if backend is connected.
 
@@ -1662,6 +2197,14 @@ class ConnectionManager:
       self._breaker_configured = True
       return self._breaker
 
+  @_manager_terminal_error_boundary()
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(BackendConnectionError, ImportError),
+  )
   def _get_backend_breaker_snapshot(
     self,
   ) -> tuple[Backend, CircuitBreaker | None]:
@@ -1702,6 +2245,18 @@ class ConnectionManager:
         if backend is self._backend and breaker is self._breaker:
           return backend, breaker
 
+  @_manager_terminal_error_boundary("queue")
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(
+      BackendConnectionError,
+      ImportError,
+      NotImplementedError,
+    ),
+  )
   def get_queue_backend(self) -> QueueBackend:
     """Get the queue backend interface.
 
@@ -1725,6 +2280,20 @@ class ConnectionManager:
 
     return wrap_queue_backend(backend, breaker)
 
+  @_manager_terminal_error_boundary()
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    sanitize_exception_types=(ValidationError,),
+    pass_through_exception_types=(
+      BackendConnectionError,
+      ImportError,
+      QueueError,
+    ),
+    catch_unexpected=False,
+  )
   def _push_queue_with_durability(
     self,
     queue_name: str,
@@ -1785,6 +2354,18 @@ class ConnectionManager:
       )
     return _QueuePushReceipt(worker_crash_durable=durable)
 
+  @_manager_terminal_error_boundary("set")
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(
+      BackendConnectionError,
+      ImportError,
+      NotImplementedError,
+    ),
+  )
   def get_set_backend(self) -> SetBackend:
     """Get the set backend interface.
 
@@ -1806,6 +2387,18 @@ class ConnectionManager:
 
     return wrap_set_backend(backend, breaker)
 
+  @_manager_terminal_error_boundary("storage")
+  @configuration_error_boundary(
+    "Connection manager configuration is invalid.",
+    _MANAGER_CONFIGURATION_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_message_predicate=_is_safe_manager_configuration_message,
+    pass_through_exception_types=(
+      BackendConnectionError,
+      ImportError,
+      NotImplementedError,
+    ),
+  )
   def get_storage_backend(self) -> StorageBackend:
     """Get the storage backend interface.
 

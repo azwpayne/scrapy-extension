@@ -40,6 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 
+from scrapy_extension.backends.base import BackendType
 from scrapy_extension.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
@@ -226,57 +227,40 @@ def _discover_entry_points() -> dict[str, BackendDescriptor]:
   except Exception:  # noqa: BLE001 - registry discovery must never crash callers
     _log_diagnostic(
       logger.warning,
-      "Failed to enumerate entry-points for group %r; skipping 3rd-party "
-      "backend discovery.",
-      _ENTRY_POINT_GROUP,
-      exc_info=True,
+      "Failed to enumerate entry-points; skipping third-party backend discovery.",
     )
     return {}
 
   discovered: dict[str, BackendDescriptor] = {}
-  discovered_sources: dict[str, str] = {}
   conflicted_names: set[str] = set()
   for ep in eps:
     try:
       descriptor = _load_plugin_descriptor(ep)
-    except Exception as exc:  # noqa: BLE001 - graceful-skip: never propagate
+    except Exception:  # noqa: BLE001 - graceful-skip: never propagate
       _log_diagnostic(
         logger.warning,
-        "Skipping 3rd-party backend entry-point %r (group %r): %s: %s; "
+        "Skipping invalid third-party backend entry-point; "
         "bundled backends remain available.",
-        ep.name,
-        _ENTRY_POINT_GROUP,
-        type(exc).__name__,
-        exc,
-        exc_info=True,
       )
       continue
     name = descriptor.backend_type
-    source = getattr(ep, "value", "<unknown>")
     if name in conflicted_names:
       _log_diagnostic(
         logger.error,
-        "Skipping additional 3rd-party backend entry-point %r from %r: "
-        "the backend name is already conflicted.",
-        name,
-        source,
+        "Skipping additional third-party backend entry-point with a "
+        "conflicted backend name.",
       )
       continue
     if name in discovered:
-      previous_source = discovered_sources.pop(name)
       discovered.pop(name)
       conflicted_names.add(name)
       _log_diagnostic(
         logger.error,
-        "Skipping duplicate 3rd-party backend name %r: entry-points %r and "
-        "%r both claim it; neither plugin is registered.",
-        name,
-        previous_source,
-        source,
+        "Skipping duplicate third-party backend name; neither plugin is "
+        "registered.",
       )
       continue
     discovered[name] = descriptor
-    discovered_sources[name] = source
   return discovered
 
 
@@ -305,65 +289,42 @@ def _load_plugin_descriptor(ep: importlib.metadata.EntryPoint) -> BackendDescrip
       ValueError: If the returned descriptor fails validation.
       Exception: Whatever the callable raises (propagated to the skip handler).
   """
-  # ``ep.load()`` resolves the dotted path to the registration CALLABLE;
-  # the 3rd-party contract is that the callable takes no args and returns
-  # a BackendDescriptor. Invoke it here.
+  # Validate the external name before any descriptor can be put in a dict or
+  # set.  Plugin metadata accepts exact built-ins only: subclasses can define
+  # hostile hash/membership methods which must never execute at discovery.
+  if type(ep.name) is not str or not _NAME_PATTERN.fullmatch(ep.name):
+    raise ValueError("Entry-point has an invalid backend name.")
+  # ``ep.load()`` resolves the dotted path to the registration callable.
   registration = ep.load()
   descriptor = registration()
-  if not isinstance(descriptor, BackendDescriptor):
-    msg = (
-      f"Entry-point {ep.name!r} registration callable returned "
-      f"{type(descriptor).__name__}, expected BackendDescriptor."
-    )
-    raise TypeError(msg)
-  if not isinstance(ep.name, str) or not _NAME_PATTERN.fullmatch(ep.name):
-    msg = (
-      f"Entry-point name {ep.name!r} must match {_NAME_PATTERN.pattern!r}."
-    )
-    raise ValueError(msg)
-  if not isinstance(descriptor.backend_type, str) or not _NAME_PATTERN.fullmatch(
-    descriptor.backend_type
+  if type(descriptor) is not BackendDescriptor:
+    raise TypeError("Entry-point registration returned an invalid descriptor.")
+  if (
+    type(descriptor.backend_type) is not str
+    or not _NAME_PATTERN.fullmatch(descriptor.backend_type)
   ):
-    msg = (
-      f"Entry-point {ep.name!r} registered an invalid backend_type "
-      f"{descriptor.backend_type!r}; must match {_NAME_PATTERN.pattern!r}."
-    )
-    raise ValueError(msg)
+    raise ValueError("Entry-point descriptor has an invalid backend type.")
   if descriptor.backend_type != ep.name:
-    msg = (
-      f"Entry-point name {ep.name!r} does not match descriptor backend_type "
-      f"{descriptor.backend_type!r}."
-    )
-    raise ValueError(msg)
+    raise ValueError("Entry-point descriptor backend name does not match.")
   for field_name, dotted_path in (
     ("backend_cls_path", descriptor.backend_cls_path),
     ("settings_cls_path", descriptor.settings_cls_path),
   ):
     if (
-      not isinstance(dotted_path, str)
+      type(dotted_path) is not str
       or len(dotted_path.split(".")) < 2
       or any(not part.isidentifier() for part in dotted_path.split("."))
     ):
-      msg = (
-        f"Entry-point {ep.name!r} registered invalid {field_name} "
-        f"{dotted_path!r}; expected a dotted Python identifier path."
-      )
-      raise ValueError(msg)
-  if not isinstance(descriptor.capabilities, frozenset) or any(
-    not isinstance(capability, str) for capability in descriptor.capabilities
+      del field_name
+      del dotted_path
+      raise ValueError("Entry-point descriptor has an invalid class path.")
+  if type(descriptor.capabilities) is not frozenset or any(
+    type(capability) is not str for capability in descriptor.capabilities
   ):
-    msg = (
-      f"Entry-point {ep.name!r} capabilities must be a frozenset of strings."
-    )
-    raise TypeError(msg)
+    raise TypeError("Entry-point descriptor has invalid capabilities.")
   invalid = descriptor.capabilities - _VALID_CAPABILITIES
   if invalid:
-    msg = (
-      f"Entry-point {ep.name!r} (backend {descriptor.backend_type!r}) "
-      f"declared unsupported capabilities {sorted(invalid)!r}; valid: "
-      f"{sorted(_VALID_CAPABILITIES)!r}."
-    )
-    raise ValueError(msg)
+    raise ValueError("Entry-point descriptor has unsupported capabilities.")
   return descriptor
 
 
@@ -390,9 +351,8 @@ def get_registry() -> dict[str, BackendDescriptor]:
         # registry availability depend on their Python warning filters.
         _log_diagnostic(
           logger.warning,
-          "3rd-party backend entry-point %r shadows bundled backend; "
-          "bundled wins. Rename the plugin backend_type to avoid the conflict.",
-          name,
+          "Third-party backend entry-point shadows a bundled backend; "
+          "bundled backend wins.",
         )
         continue
       bundled[name] = descriptor
@@ -411,18 +371,27 @@ def get_descriptor(backend_type: str) -> BackendDescriptor:
 
   Raises:
       ConfigurationError: If ``backend_type`` is not registered. The error
-          message lists all valid keys (fail-fast UX — preserves the prior
-          ``_coerce_backend_type`` behavior of telling the operator exactly
-          which backends ARE available).
+          lists only bundled keys so a failed public configuration path cannot
+          disclose installed third-party entry-point metadata.
   """
+  if isinstance(backend_type, BackendType):
+    backend_type = backend_type.value
+  elif type(backend_type) is not str:
+    del backend_type
+    raise ConfigurationError(
+      "Selected backend type is not a registered backend type.",
+      setting_name="SCRAPY_BACKEND_TYPE",
+    )
   registry = get_registry()
   descriptor = registry.get(backend_type)
   if descriptor is None:
-    valid = ", ".join(repr(k) for k in sorted(registry))
+    valid = ", ".join(repr(k) for k in sorted(_BUNDLED_DESCRIPTORS))
     msg = (
-      f"{backend_type!r} is not a registered backend type. "
-      f"Valid values: {valid}."
+      "Selected backend type is not a registered backend type. "
+      f"Valid bundled values: {valid}."
     )
+    del backend_type
+    del registry
     raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
   return descriptor
 
@@ -441,6 +410,8 @@ def has_capability(backend_type: str, capability: str) -> bool:
   Returns:
       True if the backend is registered and has the capability.
   """
+  if type(capability) is not str:
+    return False
   try:
     descriptor = get_descriptor(backend_type)
   except ConfigurationError:

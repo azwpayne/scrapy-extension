@@ -544,7 +544,8 @@ class TestModeConfigurationErrors:
     backend = MongoDBBackend(settings)
     with pytest.raises(ConfigurationError) as exc_info:
       backend.connect()
-    assert "invalid_mode" in str(exc_info.value)
+    assert "Unsupported MongoDB mode" in str(exc_info.value)
+    assert "invalid_mode" not in str(exc_info.value)
 
   def test_rabbitmq_unsupported_mode(self, mocker):
     """Test RabbitMQ backend with unsupported mode."""

@@ -49,6 +49,10 @@ from scrapy_extension.exceptions import (
   ConfigurationError,
   QueueError,
 )
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import MongoDBMode
 from scrapy_extension.settings.mongodb import (
@@ -75,6 +79,37 @@ logger = logging.getLogger(__name__)
 
 _CAPABILITY_DOMAIN_MARKER_ID = "scrapy-extension:capability-domain:v1"
 _CAPABILITY_DOMAIN_MARKER_FIELD = "scrapy_extension_capability_domain"
+_MONGODB_CONNECT_SETTING_NAMES: frozenset[str] = frozenset(
+  {
+    "auth_mechanism",
+    "auth_source",
+    "collection_names",
+    "database",
+    "journal",
+    "max_idle_time_ms",
+    "max_pool_size",
+    "min_pool_size",
+    "mode",
+    "mongos_routers",
+    "password",
+    "read_preference",
+    "replica_set_members",
+    "replica_set_name",
+    "server_selection_timeout_ms",
+    "tls_allow_invalid_certificates",
+    "tls_ca_file",
+    "tls_cert_file",
+    "tls_enabled",
+    "tls_key_file",
+    "uri",
+    "username",
+    "w",
+    "w_timeout_ms",
+  }
+)
+_MONGODB_SAFE_CONNECT_MESSAGES: frozenset[str] = frozenset(
+  {"Unsupported MongoDB mode."}
+)
 
 
 @dataclass(frozen=True)
@@ -155,13 +190,26 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     self._storage_collection: Collection[dict[str, Any]] | None = None
     # Cache client kwargs to avoid rebuilding on reconnection
     self._client_kwargs: dict[str, Any] | None = None
-    # Cache read preference to avoid string manipulation on every call
-    self._read_preference: str | None = self._compute_read_preference()
+    # Read preference is captured only during the guarded connection snapshot.
+    # Validating mutable config in ``__init__`` would bypass that public error
+    # boundary and retain raw values in constructor traceback frames.
+    self._read_preference: str | None = None
     # A backend can be used directly as well as through ConnectionManager.
     # Serialize publication/retirement of its client graph so concurrent direct
     # callers cannot create two clients and lose one without closing it.
     self._connection_lock = RLock()
 
+  @backend_connection_error_boundary(
+    "Failed to connect to MongoDB.",
+    "mongodb",
+  )
+  @configuration_error_boundary(
+    "MongoDB configuration is invalid.",
+    _MONGODB_CONNECT_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_MONGODB_SAFE_CONNECT_MESSAGES,
+    catch_unexpected=False,
+  )
   def connect(self) -> None:
     """Establish connection to MongoDB based on deployment mode.
 
@@ -228,6 +276,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
     return result
 
+  @configuration_error_boundary(
+    "MongoDB configuration is invalid.",
+    _MONGODB_CONNECT_SETTING_NAMES,
+    preserve_static_message=True,
+    safe_messages=_MONGODB_SAFE_CONNECT_MESSAGES,
+  )
   def _capture_connection_snapshot(self) -> _MongoDBConnectionSnapshot:
     """Capture and validate every value consumed by one client generation.
 
@@ -237,16 +291,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
     mode = self.config.mode
     if not isinstance(mode, MongoDBMode):
-      try:
-        mode_text = str(mode)
-      except (TypeError, ValueError):
-        mode_value = getattr(mode, "value", None)
-        try:
-          mode_text = str(mode_value)
-        except (TypeError, ValueError):
-          mode_text = type(mode).__name__
       raise ConfigurationError(
-        f"Unsupported MongoDB mode: {mode_text}", setting_name="mode"
+        "Unsupported MongoDB mode.", setting_name="mode"
       )
 
     uri = validate_mongodb_uri(self.config.uri)

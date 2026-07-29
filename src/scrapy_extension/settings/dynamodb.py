@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.settings._aws import (
@@ -17,6 +17,7 @@ from scrapy_extension.settings._aws import (
   validate_aws_endpoint,
   validate_aws_region_name,
 )
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 _DEFAULT_LOCAL_ENDPOINT = "http://localhost:4566"
 
@@ -33,7 +34,7 @@ class DynamoDBMode(str, Enum):
   CLOUD = "cloud"
 
 
-class DynamoDBSettings(BaseSettings):
+class DynamoDBSettings(RedactedBaseSettings):
   """Amazon DynamoDB settings (StorageBackend — NoSQL KV).
 
   Configurable via environment variables with the SCRAPY_DYNAMODB_ prefix.
@@ -43,7 +44,10 @@ class DynamoDBSettings(BaseSettings):
   """
 
   model_config = SettingsConfigDict(
-    env_prefix="SCRAPY_DYNAMODB_", case_sensitive=False, extra="forbid"
+    env_prefix="SCRAPY_DYNAMODB_",
+    case_sensitive=False,
+    extra="forbid",
+    hide_input_in_errors=True,
   )
 
   mode: DynamoDBMode = Field(

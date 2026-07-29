@@ -97,7 +97,8 @@ def test_rocketmq_connect_wraps_a_genuinely_missing_dependency(
   with pytest.raises(BackendConnectionError) as exc_info:
     RocketMQBackend(RocketMQSettings()).connect()
   assert "not installed" in str(exc_info.value)
-  assert exc_info.value.__cause__ is missing
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
 
 
 def test_rocketmq_connect_preserves_dependency_internal_import_error(

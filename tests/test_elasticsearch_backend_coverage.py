@@ -142,7 +142,8 @@ class TestConnect:
     with pytest.raises(BackendConnectionError) as exc_info:
       backend.connect()
     assert "elasticsearch" in str(exc_info.value).lower()
-    assert "Connection failed" in str(exc_info.value)
+    assert str(exc_info.value) == "Failed to connect to Elasticsearch."
+    assert "Connection failed" not in str(exc_info.value)
     assert backend._client is None
     mock_client.close.assert_called_once()
 

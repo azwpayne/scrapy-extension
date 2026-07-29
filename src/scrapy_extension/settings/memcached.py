@@ -10,10 +10,11 @@ from enum import Enum
 from ipaddress import ip_address
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 
 class MemcachedMode(str, Enum):
@@ -71,14 +72,9 @@ def validate_memcached_connection(
 ) -> tuple[MemcachedMode, str, int, bool]:
   """Validate one complete Memcached connection snapshot."""
   if mode is not MemcachedMode.STANDALONE:
-    try:
-      mode_text = str(mode)
-    except (TypeError, ValueError):
-      mode_text = getattr(mode, "value", repr(mode))
     raise ConfigurationError(
-      f"Unsupported Memcached mode: {mode_text}",
+      "Unsupported Memcached mode.",
       setting_name="mode",
-      setting_value=mode,
     )
   normalized_host = normalize_memcached_host(host)
   if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -121,7 +117,7 @@ def normalize_memcached_flush_setting(allow_flush_all: object) -> bool:
   return validate_memcached_flush_policy(allow_flush_all)
 
 
-class MemcachedSettings(BaseSettings):
+class MemcachedSettings(RedactedBaseSettings):
   """Memcached-specific settings (key-value cache / NoSQL).
 
   Configurable via environment variables with the SCRAPY_MEMCACHED_ prefix.
@@ -130,7 +126,10 @@ class MemcachedSettings(BaseSettings):
   """
 
   model_config = SettingsConfigDict(
-    env_prefix="SCRAPY_MEMCACHED_", case_sensitive=False, extra="forbid"
+    env_prefix="SCRAPY_MEMCACHED_",
+    case_sensitive=False,
+    extra="forbid",
+    hide_input_in_errors=True,
   )
 
   mode: MemcachedMode = Field(

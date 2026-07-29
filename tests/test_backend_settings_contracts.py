@@ -61,11 +61,10 @@ def test_direct_bundled_settings_reject_unknown_fields(
     settings_cls(definitely_not_a_setting=True)
 
   errors = exc_info.value.errors()
-  assert any(
-    error["type"] == "extra_forbidden"
-    and error["loc"] == ("definitely_not_a_setting",)
-    for error in errors
-  )
+  assert errors
+  assert all(error["type"] == "value_error" for error in errors)
+  assert all(error["loc"] == ("configuration",) for error in errors)
+  assert all(error["input"] is None for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -395,7 +394,7 @@ def test_flat_backend_setting_typo_fails_fast() -> None:
   with pytest.raises(ConfigurationError) as exc_info:
     _resolve_queue(settings)
 
-  assert exc_info.value.setting_name == "SCRAPY_MONGO_DATABSE"
+  assert exc_info.value.setting_name == "backend_settings"
   assert "SCRAPY_MONGO_DATABASE" in str(exc_info.value)
 
 
@@ -410,8 +409,28 @@ def test_nested_backend_setting_typo_fails_fast() -> None:
   with pytest.raises(ConfigurationError) as exc_info:
     _resolve_queue(settings)
 
-  assert exc_info.value.setting_name == "databse"
+  assert exc_info.value.setting_name == "backend_settings"
   assert "database" in str(exc_info.value)
+
+
+def test_unknown_backend_setting_does_not_retain_the_raw_key() -> None:
+  marker = "nested-backend-setting-secret-marker"
+  settings = ScrapySettings(
+    {
+      "SCRAPY_BACKEND_TYPE": "mongodb",
+      "SCRAPY_BACKEND_SETTINGS": {marker: "value"},
+    }
+  )
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    _resolve_queue(settings)
+
+  error = exc_info.value
+  assert error.setting_name == "backend_settings"
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
 
 
 def test_backend_setting_typo_in_environment_fails_fast(
@@ -423,7 +442,7 @@ def test_backend_setting_typo_in_environment_fails_fast(
   with pytest.raises(ConfigurationError) as exc_info:
     _resolve_queue(settings)
 
-  assert exc_info.value.setting_name == "SCRAPY_MONGO_DATABSE"
+  assert exc_info.value.setting_name == "backend_settings"
 
 
 def test_nested_connection_manager_retry_settings_remain_valid() -> None:

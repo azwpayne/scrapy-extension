@@ -1,10 +1,127 @@
 """Tests for connection manager."""
 
+import traceback
+
 import pytest
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+
+
+def _assert_package_traceback_locals_are_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Check package frames cannot expose a rejected configuration input."""
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      locals_snapshot = frame.f_locals
+      assert marker not in repr(locals_snapshot)
+      for local in locals_snapshot.values():
+        if type(local) is ConnectionManager:
+          settings = vars(local).get("settings")
+          if settings is not None:
+            assert marker not in repr(settings)
+        if type(local) is tuple:
+          for argument in local:
+            if type(argument) is ConnectionManager:
+              settings = vars(argument).get("settings")
+              if settings is not None:
+                assert marker not in repr(settings)
+    trace = trace.tb_next
+
+
+def test_connection_manager_rejects_hostile_outer_inputs_without_dispatch():
+  marker = "manager-hostile-outer-input-marker"
+  calls: list[str] = []
+
+  class _HostileBackendType(str):
+    def __hash__(self) -> int:
+      calls.append("hash")
+      raise RuntimeError(marker)
+
+    def __format__(self, format_spec: str) -> str:
+      del format_spec
+      calls.append("format")
+      raise RuntimeError(marker)
+
+  class _HostileSettings(dict[str, object]):
+    def __bool__(self) -> bool:
+      calls.append("bool")
+      raise RuntimeError(marker)
+
+    def __deepcopy__(self, memo: object) -> object:
+      del memo
+      calls.append("deepcopy")
+      raise RuntimeError(marker)
+
+  for factory in (
+    lambda: ConnectionManager(_HostileBackendType("redis")),  # type: ignore[arg-type]
+    lambda: ConnectionManager("redis", _HostileSettings()),  # type: ignore[arg-type]
+    lambda: ConnectionManager.get_manager(
+      _HostileBackendType("redis")  # type: ignore[arg-type]
+    ),
+    lambda: ConnectionManager.get_manager(
+      "redis", _HostileSettings()  # type: ignore[arg-type]
+    ),
+  ):
+    with pytest.raises(ConfigurationError) as exc_info:
+      factory()
+    error = exc_info.value
+    assert error.setting_name == "backend_settings"
+    assert marker not in str(error)
+    assert marker not in repr(error.__dict__)
+    _assert_package_traceback_locals_are_redacted(error, marker)
+
+  assert calls == []
+
+
+def test_get_manager_discards_failed_deepcopy_snapshot():
+  marker = "manager-deepcopy-snapshot-marker"
+  before = dict(ConnectionManager._managers)
+
+  class _ExplosiveSnapshotValue:
+    def __deepcopy__(self, memo: object) -> object:
+      del memo
+      raise RuntimeError(marker)
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    ConnectionManager.get_manager("redis", {"value": _ExplosiveSnapshotValue()})
+
+  error = exc_info.value
+  assert error.setting_name == "backend_settings"
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+  assert dict(ConnectionManager._managers) == before
+
+
+def test_close_sanitizes_failed_registry_key_normalization():
+  marker = "manager-close-normalization-marker"
+
+  class _ExplosiveRegistryValue:
+    def __getattribute__(self, name: str) -> object:
+      if name == "__dict__":
+        raise RuntimeError(marker)
+      return super().__getattribute__(name)
+
+  manager = ConnectionManager("redis", {"value": _ExplosiveRegistryValue()})
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager.close()
+
+  error = exc_info.value
+  assert str(error) == "Connection manager configuration is invalid."
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
 
 
 def test_connection_manager_get_manager_singleton():
@@ -431,6 +548,77 @@ def test_connect_rejects_invalid_retry_policy_before_backend_creation(
   create_backend.assert_not_called()
 
 
+@pytest.mark.parametrize("field", ["retry_attempts", "retry_delay"])
+def test_connect_retry_policy_does_not_retain_raw_configuration_value(field):
+  marker = f"manager-{field}-secret-marker"
+  manager = ConnectionManager(BackendType.REDIS, {field: marker})
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager.connect()
+
+  error = exc_info.value
+  assert error.setting_name == field
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.setting_value is None
+  assert error.__cause__ is None
+  assert error.__context__ is None
+
+
+@pytest.mark.parametrize(
+  ("field", "coercion_method"),
+  [("retry_attempts", "__int__"), ("retry_delay", "__float__")],
+)
+def test_connect_retry_policy_sanitizes_custom_numeric_coercion(
+  mocker, field, coercion_method
+):
+  """Custom conversion diagnostics are configuration errors, never retries."""
+  marker = f"manager-{field}-coercion-secret-marker"
+
+  class _ExplosiveNumber:
+    def __int__(self) -> int:
+      raise RuntimeError(marker)
+
+    def __float__(self) -> float:
+      raise RuntimeError(marker)
+
+  value = _ExplosiveNumber()
+  manager = ConnectionManager(BackendType.REDIS, {field: value})
+  create_backend = mocker.patch.object(manager, "_create_backend")
+  sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager.connect()
+
+  error = exc_info.value
+  assert coercion_method in {"__int__", "__float__"}
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  create_backend.assert_not_called()
+  sleep.assert_not_called()
+
+
+def test_connect_settings_validation_does_not_retain_secret_input():
+  marker = "manager-settings-secret-marker"
+  manager = ConnectionManager(BackendType.ELASTICSEARCH, {"api_key": [marker]})
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager.connect()
+
+  error = exc_info.value
+  assert error.setting_name == "api_key"
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  assert manager._backend is None
+
+
 def test_connect_normalizes_string_retry_policy(mocker):
   manager = ConnectionManager(
     BackendType.REDIS,
@@ -465,11 +653,146 @@ def test_connect_does_not_retry_configuration_errors(mocker):
   )
   sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
 
-  with pytest.raises(ConfigurationError, match="invalid backend setting"):
+  with pytest.raises(
+    ConfigurationError,
+    match="Connection manager configuration is invalid.",
+  ):
     manager.connect()
 
   attempt.assert_called_once_with()
   sleep.assert_not_called()
+
+
+def test_connect_sanitizes_plugin_validation_errors_without_retry(mocker):
+  """A plugin's Pydantic error is configuration, never a raw public failure."""
+  from pydantic import BaseModel, ValidationError
+
+  marker = "manager-plugin-validation-error-marker"
+
+  class _PluginModel(BaseModel):
+    retries: int
+
+  class _PluginValidationError(ValidationError):
+    """Third-party validation subclasses must follow the same redaction path."""
+
+  try:
+    _PluginModel(retries=marker)
+  except ValidationError as error:
+    validation_error = _PluginValidationError.from_exception_data(
+      "PluginSettings", error.errors()
+    )
+  else:  # pragma: no cover - documents the test fixture invariant
+    raise AssertionError("fixture must create a ValidationError")
+
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"retry_attempts": 3, "retry_delay": 0.25},
+  )
+  attempt = mocker.patch.object(
+    manager,
+    "_attempt_connection",
+    side_effect=validation_error,
+  )
+  sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager.connect()
+
+  sanitized_error = exc_info.value
+  assert str(sanitized_error) == "Connection manager configuration is invalid."
+  assert marker not in repr(sanitized_error.__dict__)
+  assert marker not in "".join(traceback.format_exception(sanitized_error))
+  assert sanitized_error.__cause__ is None
+  assert sanitized_error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(sanitized_error, marker)
+  attempt.assert_called_once_with()
+  sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+  "accessor",
+  ["connect", "backend", "queue", "set", "storage", "durable_push"],
+)
+def test_manager_public_startup_boundaries_drop_settings_from_tracebacks(
+  mocker, accessor
+):
+  """Every public startup route rebuilds failures after manager frames exit."""
+  marker = f"manager-{accessor}-traceback-secret-marker"
+  manager = ConnectionManager(
+    BackendType.REDIS,
+    {"api_key": marker, "retry_attempts": 0, "retry_delay": 0},
+  )
+  mocker.patch.object(manager, "_attempt_connection", side_effect=RuntimeError(marker))
+
+  with pytest.raises(BackendConnectionError) as exc_info:
+    if accessor == "connect":
+      manager.connect()
+    elif accessor == "backend":
+      _ = manager.backend
+    elif accessor == "queue":
+      manager.get_queue_backend()
+    elif accessor == "set":
+      manager.get_set_backend()
+    elif accessor == "storage":
+      manager.get_storage_backend()
+    else:
+      manager._push_queue_with_durability("jobs", b"payload")
+
+  error = exc_info.value
+  assert str(error) == "Failed to connect after 1 attempt."
+  assert error.backend_type == "redis"
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+@pytest.mark.parametrize("accessor", ["backend", "queue", "set", "storage"])
+def test_manager_accessors_rebuild_configuration_errors_without_manager_frames(accessor):
+  marker = f"manager-{accessor}-configuration-secret-marker"
+  manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": marker})
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    if accessor == "backend":
+      _ = manager.backend
+    elif accessor == "queue":
+      manager.get_queue_backend()
+    elif accessor == "set":
+      manager.get_set_backend()
+    else:
+      manager.get_storage_backend()
+
+  error = exc_info.value
+  assert str(error) == "Connection manager configuration is invalid."
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+@pytest.mark.parametrize("error_kind", ["connection", "configuration"])
+def test_is_connected_rebuilds_plugin_failures_without_manager_frames(error_kind):
+  marker = f"manager-is-connected-{error_kind}-secret-marker"
+  manager = ConnectionManager(BackendType.REDIS, {"api_key": marker})
+
+  class _Backend:
+    def is_connected(self) -> bool:
+      if error_kind == "connection":
+        raise BackendConnectionError(marker, backend_type="redis")
+      raise ConfigurationError(marker, setting_name="api_key")
+
+  manager._backend = _Backend()  # type: ignore[assignment]
+
+  expected_type = BackendConnectionError if error_kind == "connection" else ConfigurationError
+  with pytest.raises(expected_type) as exc_info:
+    manager.is_connected()
+
+  error = exc_info.value
+  assert marker not in str(error)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
 
 
 def test_connect_replaces_existing_disconnected_backend(mocker):

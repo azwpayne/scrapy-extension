@@ -10,9 +10,10 @@ from enum import Enum
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 
 class KafkaMode(str, Enum):
@@ -96,11 +97,9 @@ def validate_kafka_authentication(
         "SASL credentials (sasl_username / sasl_password / sasl_mechanism) "
         "require a 'SASL_'-prefixed security_protocol "
         "('SASL_SSL'); kafka-python silently ignores "
-        "the SASL fields otherwise (auth never attempted). "
-        f"Got security_protocol={protocol!r}."
+        "the SASL fields otherwise (auth never attempted)."
       ),
       setting_name="security_protocol",
-      setting_value=protocol,
     )
 
   mechanism: str | None = None
@@ -244,7 +243,7 @@ def validate_kafka_delivery_policy(
   return normalized_acks, priority_partitions, replicas, retention, min_isr
 
 
-class KafkaSettings(BaseSettings):
+class KafkaSettings(RedactedBaseSettings):
   """Kafka-specific settings for all deployment modes.
 
   These settings configure the Kafka connection and can be set
@@ -260,6 +259,7 @@ class KafkaSettings(BaseSettings):
     env_prefix="SCRAPY_KAFKA_",
     case_sensitive=False,
     extra="forbid",
+    hide_input_in_errors=True,
   )
 
   # === Mode Selection ===

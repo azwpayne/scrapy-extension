@@ -15,9 +15,10 @@ from typing import Annotated, Any
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import NoDecode, SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 
 class RedisMode(str, Enum):
@@ -277,7 +278,7 @@ def validate_redis_transport_security(
     )
 
 
-class RedisSettings(BaseSettings):
+class RedisSettings(RedactedBaseSettings):
   """Redis-specific settings for all deployment modes.
 
   These settings configure the Redis connection and can be set
@@ -322,6 +323,7 @@ class RedisSettings(BaseSettings):
     env_prefix="SCRAPY_REDIS_",
     case_sensitive=False,
     extra="forbid",
+    hide_input_in_errors=True,
   )
 
   # === Mode Selection ===

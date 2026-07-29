@@ -11,10 +11,11 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 _VALID_PULSAR_SCHEMES: tuple[str, ...] = ("pulsar://", "pulsar+ssl://")
 
@@ -184,7 +185,7 @@ class PulsarMode(str, Enum):
   CLUSTER = "cluster"
 
 
-class PulsarSettings(BaseSettings):
+class PulsarSettings(RedactedBaseSettings):
   """Pulsar-specific settings.
 
   Configurable via environment variables with the SCRAPY_PULSAR_ prefix.
@@ -192,7 +193,10 @@ class PulsarSettings(BaseSettings):
   """
 
   model_config = SettingsConfigDict(
-    env_prefix="SCRAPY_PULSAR_", case_sensitive=False, extra="forbid"
+    env_prefix="SCRAPY_PULSAR_",
+    case_sensitive=False,
+    extra="forbid",
+    hide_input_in_errors=True,
   )
 
   mode: PulsarMode = Field(

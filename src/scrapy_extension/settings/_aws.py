@@ -27,11 +27,9 @@ def validate_aws_region_name(region_name: object) -> str:
       (
         "region_name must be a lowercase, hyphen-delimited AWS region "
         "identifier ending in a numeric label (e.g. 'us-east-1', "
-        "'us-gov-west-1', 'eusc-de-east-1'). "
-        f"Got region_name={region_name!r}."
+        "'us-gov-west-1', 'eusc-de-east-1')."
       ),
       setting_name="region_name",
-      setting_value=region_name,
     )
   return region_name
 

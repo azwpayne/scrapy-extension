@@ -17,6 +17,19 @@ from scrapy_extension.settings.elasticsearch import (
 )
 
 
+def _assert_package_traceback_locals_are_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Verify startup failures do not retain mutable endpoint snapshots."""
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+    trace = trace.tb_next
+
+
 def _mock_backend(mocker, **settings_kwargs):
   config = ElasticSearchSettings(**settings_kwargs)
   backend = ElasticSearchBackend(config)
@@ -113,6 +126,27 @@ class TestConnection:
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
 
+  def test_network_failure_does_not_retain_mutated_endpoint_snapshot(self, mocker):
+    marker = "elasticsearch-mutable-endpoint-marker"
+    config = ElasticSearchSettings()
+    config.hosts = [f"http://{marker}:9200"]
+    client = mocker.MagicMock(ping=mocker.MagicMock(return_value=False))
+    mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch",
+      return_value=client,
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+      ElasticSearchBackend(config).connect()
+
+    error = exc_info.value
+    assert marker not in str(error)
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_package_traceback_locals_are_redacted(error, marker)
+
   def test_connect_cloud(self, mocker):
     mock_client = mocker.MagicMock(
       ping=mocker.MagicMock(return_value=True),
@@ -142,7 +176,7 @@ class TestConnection:
     """
     from pydantic import ValidationError
 
-    with pytest.raises(ValidationError, match="cloud_id"):
+    with pytest.raises(ValidationError):
       ElasticSearchSettings(mode=ElasticSearchMode.CLOUD)
 
   def test_cloud_mode_without_auth_fails_at_construction(self):
@@ -158,7 +192,7 @@ class TestConnection:
     from pydantic import ValidationError
 
     # cloud_id present but no api_key and no basic_auth → must fail.
-    with pytest.raises(ValidationError, match="auth"):
+    with pytest.raises(ValidationError):
       ElasticSearchSettings(
         mode=ElasticSearchMode.CLOUD, cloud_id="test:abc"
       )
@@ -209,6 +243,26 @@ class TestConnection:
 
     assert exc_info.value.setting_name == "hosts"
     assert "top-secret-es-key" not in str(exc_info.value)
+    client_factory.assert_not_called()
+
+  def test_snapshot_validation_does_not_retain_mutated_secret_input(self, mocker):
+    marker = "elasticsearch-snapshot-secret-marker"
+    config = ElasticSearchSettings(hosts=["https://es.example:9200"])
+    config.api_key = [marker]  # type: ignore[assignment]
+    client_factory = mocker.patch(
+      "scrapy_extension.backends.elasticsearch.Elasticsearch"
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchBackend(config).connect()
+
+    error = exc_info.value
+    assert error.setting_name == "api_key"
+    assert marker not in str(error)
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
     client_factory.assert_not_called()
 
   def test_connect_rejects_mutated_capability_index_overlap(self, mocker):

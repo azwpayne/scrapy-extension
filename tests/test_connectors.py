@@ -14,7 +14,11 @@ from scrapy_extension.backends.base import (
   StorageBackend,
 )
 from scrapy_extension.backends.connectors import ConnectionManager
-from scrapy_extension.exceptions import BackendConnectionError, QueueError
+from scrapy_extension.exceptions import (
+  BackendConnectionError,
+  ConfigurationError,
+  QueueError,
+)
 
 # Expected concrete class name per BackendType. Asserting ``type(backend).__name__``
 # (in addition to ``backend.backend_type``) catches a case block wiring the WRONG
@@ -33,6 +37,304 @@ _EXPECTED_BACKEND_CLASS: dict[BackendType, str] = {
   BackendType.MEMCACHED: "MemcachedBackend",
   BackendType.DYNAMODB: "DynamoDBBackend",
 }
+
+
+def _assert_package_traceback_locals_are_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Check a sanitizing wrapper does not retain its rejected input."""
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      locals_snapshot = frame.f_locals
+      assert marker not in repr(locals_snapshot)
+      for local in locals_snapshot.values():
+        if type(local) is ConnectionManager:
+          settings = vars(local).get("settings")
+          if settings is not None:
+            assert marker not in repr(settings)
+        if type(local) is tuple:
+          for argument in local:
+            if type(argument) is ConnectionManager:
+              settings = vars(argument).get("settings")
+              if settings is not None:
+                assert marker not in repr(settings)
+    trace = trace.tb_next
+
+
+def test_resolve_boundary_rejects_hostile_configuration_error_subclass():
+  """A plugin error subclass must not run code while the boundary sanitizes it."""
+  from scrapy_extension.backends.connectors import resolve_backend_config
+
+  marker = "hostile-configuration-error-marker"
+
+  class _HostileConfigurationError(ConfigurationError):
+    def __getattribute__(self, name: str) -> object:
+      if name in {"args", "setting_name"}:
+        raise RuntimeError(marker)
+      return super().__getattribute__(name)
+
+  class _Settings:
+    def get(self, key: str, default: object = None) -> object:
+      del key, default
+      raise _HostileConfigurationError(marker)
+
+    def getdict(self, key: str, default: object = None) -> object:
+      del key, default
+      raise AssertionError("getdict must not run after the rejected error")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    resolve_backend_config(
+      _Settings(),
+      "SCRAPY_QUEUE_BACKEND_TYPE",
+      "SCRAPY_QUEUE_BACKEND_SETTINGS",
+    )
+
+  error = exc_info.value
+  assert str(error) == "Backend configuration is invalid."
+  assert error.setting_name == "configuration"
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_resolve_boundary_rebuilds_bundled_import_error_without_loader_frames(
+  monkeypatch: pytest.MonkeyPatch,
+):
+  """Resolver keeps ImportError semantics without retaining Scrapy settings."""
+  from scrapy_extension.backends import connectors
+
+  marker = "resolver-bundled-import-secret-marker"
+
+  class _Settings:
+    def get(self, key: str, default: object = None) -> object:
+      if key == "SCRAPY_QUEUE_BACKEND_TYPE":
+        return "redis"
+      return default
+
+    def getdict(self, key: str, default: object = None) -> object:
+      del key
+      return {} if default is None else default
+
+  monkeypatch.setattr(
+    connectors,
+    "_load_object",
+    lambda _: (_ for _ in ()).throw(ImportError(marker)),
+  )
+
+  with pytest.raises(ImportError) as exc_info:
+    connectors.resolve_backend_config(
+      _Settings(),
+      "SCRAPY_QUEUE_BACKEND_TYPE",
+      "SCRAPY_QUEUE_BACKEND_SETTINGS",
+    )
+
+  error = exc_info.value
+  assert str(error) == "A bundled backend optional dependency is unavailable."
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_capability_message_parser_accepts_only_bundled_structures():
+  """The message whitelist is structural, not a plugin-controlled format."""
+  from scrapy_extension.backends import connectors
+
+  valid = (
+    "Selected redis does not support the queue interface and is missing capabilities. "
+    "Capable bundled backends: ['elasticsearch', 'mongodb', 'redis']."
+  )
+  assert connectors._is_safe_capability_message(valid) is True
+  assert connectors._is_safe_capability_message("x" * 513) is False
+  assert (
+    connectors._is_safe_capability_message(
+      "Selected untrusted does not support the queue interface and is missing "
+      "capabilities. Capable bundled backends: ['redis']."
+    )
+    is False
+  )
+  assert (
+    connectors._is_safe_capability_message(
+      "Selected redis does not support the secret interface and is missing "
+      "capabilities. Capable bundled backends: ['redis']."
+    )
+    is False
+  )
+  assert (
+    connectors._is_safe_capability_message(
+      "Selected redis does not support the queue interface and is missing "
+      "capabilities. Capable bundled backends: [not-a-python-list]."
+    )
+    is False
+  )
+  assert (
+    connectors._is_safe_capability_message(
+      "Selected redis interface and is missing capabilities. Capable bundled "
+      "backends: ['redis']. does not support the queue"
+    )
+    is False
+  )
+
+
+def test_manager_connection_message_parser_rejects_untrusted_variants():
+  """Only bounded manager retry grammar survives a rebuilt connection error."""
+  from scrapy_extension.backends import connectors
+
+  fallback = "Connection manager failed to connect to the selected backend."
+
+  class _SubclassedConnectionError(BackendConnectionError):
+    pass
+
+  assert (
+    connectors._safe_manager_connection_message(
+      _SubclassedConnectionError("Failed to connect after 1 attempt.")
+    )
+    == fallback
+  )
+
+  malformed_args = BackendConnectionError("ignored")
+  malformed_args.args = ("first", "second")
+  assert connectors._safe_manager_connection_message(malformed_args) == fallback
+  assert (
+    connectors._safe_manager_connection_message(
+      BackendConnectionError("Failed to connect after invalid attempts.")
+    )
+    == fallback
+  )
+  assert (
+    connectors._safe_manager_connection_message(
+      BackendConnectionError("Failed to connect after 999 attempts.")
+    )
+    == fallback
+  )
+  assert (
+    connectors._safe_manager_connection_message(
+      BackendConnectionError("Failed to connect after 22 attempts.")
+    )
+    == fallback
+  )
+  assert (
+    connectors._safe_manager_connection_message(
+      BackendConnectionError("Failed to connect after 1 attempt.")
+    )
+    == "Failed to connect after 1 attempt."
+  )
+
+  assert (
+    connectors._safe_manager_connection_backend_type(
+      BackendConnectionError("failed", backend_type="redis")
+    )
+    == "redis"
+  )
+  assert (
+    connectors._safe_manager_connection_backend_type(
+      BackendConnectionError("failed", backend_type="BackendType.REDIS")
+    )
+    == "redis"
+  )
+  assert (
+    connectors._safe_manager_connection_backend_type(
+      BackendConnectionError("failed", backend_type="untrusted-plugin")
+    )
+    == "connection-manager"
+  )
+
+
+def test_manager_configuration_message_parser_rejects_unknown_descriptor():
+  """A plugin-controlled descriptor name cannot enter a preserved error."""
+  from scrapy_extension.backends import connectors
+
+  assert (
+    connectors._is_safe_manager_configuration_message(
+      "Selected endpoint-secret does not implement its declared contract: missing "
+      "Backend."
+    )
+    is False
+  )
+
+
+def test_manager_setting_name_uses_only_verified_bundled_fields():
+  """A static field label may survive only when it is actually declared."""
+  from scrapy_extension.backends import connectors
+
+  fields = frozenset({"host"})
+  assert (
+    connectors._safe_manager_setting_name(
+      ConfigurationError("invalid", setting_name="host"), "redis", fields
+    )
+    == "host"
+  )
+  assert (
+    connectors._safe_manager_setting_name(
+      ConfigurationError("invalid", setting_name="endpoint-secret"), "redis", fields
+    )
+    == "backend_settings"
+  )
+  assert (
+    connectors._safe_manager_setting_name(RuntimeError("invalid"), "redis", fields)
+    == "backend_settings"
+  )
+
+
+def test_configuration_boundary_fails_closed_when_message_predicate_crashes():
+  """An allowlist predicate is untrusted code and must not publish its input."""
+  from scrapy_extension.exceptions._redaction import configuration_error_boundary
+
+  marker = "predicate-redaction-secret-marker"
+
+  def _raising_predicate(_: str) -> bool:
+    raise RuntimeError(marker)
+
+  @configuration_error_boundary(
+    "Configuration is invalid.",
+    {"host"},
+    preserve_static_message=True,
+    safe_message_predicate=_raising_predicate,
+  )
+  def _raise_configuration_error() -> None:
+    raise ConfigurationError("potentially-safe-message", setting_name="host")
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    _raise_configuration_error()
+
+  error = exc_info.value
+  assert str(error) == "Configuration is invalid."
+  assert error.setting_name == "host"
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_create_backend_rebuilds_bundled_loader_runtime_failures(
+  monkeypatch: pytest.MonkeyPatch,
+):
+  """A bundled loader fault cannot retain manager settings at the API boundary."""
+  from scrapy_extension.backends import connectors
+
+  marker = "bundled-loader-runtime-secret-marker"
+
+  def _raise_loader_error(_: str) -> object:
+    raise RuntimeError(marker)
+
+  monkeypatch.setattr(connectors, "_load_object", _raise_loader_error)
+  manager = ConnectionManager(BackendType.REDIS, {"password": marker})
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    manager._create_backend()
+
+  error = exc_info.value
+  assert str(error) == "Connection manager configuration is invalid."
+  assert error.setting_name == "configuration"
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
 
 
 
@@ -1102,8 +1404,8 @@ class TestResolveBackendConfigEnumNormalization:
 
   def test_invalid_string_raises_configuration_error(self):
     """An invalid backend type string must raise ``ConfigurationError``
-    (not bare ``ValueError``) so the caller sees a typed error with the
-    offending setting name + value attached."""
+    (not bare ``ValueError``) so the caller sees a typed static error without
+    retaining the untrusted setting value."""
     from scrapy_extension.backends.connectors import resolve_backend_config
     from scrapy_extension.exceptions import ConfigurationError
 
@@ -1113,7 +1415,7 @@ class TestResolveBackendConfigEnumNormalization:
         settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
       )
     assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
-    assert exc_info.value.setting_value == "not-a-backend"
+    assert exc_info.value.setting_value is None
 
   def test_invalid_global_raises_configuration_error(self):
     """Same normalization on the GLOBAL fallback path
@@ -1127,7 +1429,7 @@ class TestResolveBackendConfigEnumNormalization:
         settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
       )
     assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
-    assert exc_info.value.setting_value == "bogus"
+    assert exc_info.value.setting_value is None
 
   def test_non_string_value_raises_configuration_error(self):
     """A non-string, non-enum value (e.g. an int from a programmatic caller)

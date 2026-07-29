@@ -48,12 +48,35 @@ from scrapy_extension.exceptions import (
   QueueError,
   StorageError,
 )
+from scrapy_extension.exceptions._redaction import (
+  backend_connection_error_boundary,
+  configuration_error_boundary,
+)
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
 
 if TYPE_CHECKING:
   from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 logger = logging.getLogger(__name__)
+
+_ELASTICSEARCH_CONNECT_SETTING_NAMES: frozenset[str] = frozenset(
+  {
+    "api_key",
+    "ca_certs",
+    "cloud_id",
+    "hosts",
+    "max_retries",
+    "mode",
+    "password",
+    "queue_index",
+    "request_timeout",
+    "retry_on_timeout",
+    "set_index",
+    "storage_index",
+    "username",
+    "verify_certs",
+  }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +126,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     # from replacing (or closing) an in-flight candidate.
     self._lifecycle_lock = threading.RLock()
 
+  @configuration_error_boundary(
+    "Elasticsearch configuration is invalid.",
+    _ELASTICSEARCH_CONNECT_SETTING_NAMES,
+  )
   def _capture_connection_snapshot(self) -> _ElasticSearchConnectionSnapshot:
     """Copy and revalidate every value used by one client generation.
 
@@ -111,6 +138,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     before an SDK call, while the frozen result prevents later mutation from
     retargeting a live client's capability operations.
     """
+    validated: ElasticSearchSettings | None = None
+    settings_error: ConfigurationError | None = None
     try:
       validated = type(self.config).model_validate(self.config.__dict__.copy())
     except ConfigurationError:
@@ -119,10 +148,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       errors = exc.errors()
       location = errors[0].get("loc", ()) if errors else ()
       setting_name = str(location[0]) if location else "elasticsearch"
-      raise ConfigurationError(
+      settings_error = ConfigurationError(
         f"Invalid Elasticsearch setting '{setting_name}'.",
         setting_name=setting_name,
-      ) from exc
+      )
+
+    if settings_error is not None:
+      # Raise outside the Pydantic handler so mutable input cannot survive in
+      # the public error's cause or context graph.
+      raise settings_error
+    assert validated is not None
 
     return _ElasticSearchConnectionSnapshot(
       mode=validated.mode,
@@ -183,6 +218,15 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       )
     return kwargs
 
+  @backend_connection_error_boundary(
+    "Failed to connect to Elasticsearch.",
+    "elasticsearch",
+  )
+  @configuration_error_boundary(
+    "Elasticsearch configuration is invalid.",
+    _ELASTICSEARCH_CONNECT_SETTING_NAMES,
+    catch_unexpected=False,
+  )
   def connect(self) -> None:
     """Establish connection to ElasticSearch.
 
@@ -233,7 +277,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
       except (BackendConnectionError, ApiError, TransportError):
         self._abort_failed_connect(candidate)
         startup_error = BackendConnectionError(
-          f"Failed to connect to ElasticSearch ({snapshot.mode.value}).",
+          f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
           backend_type="elasticsearch",
         )
       except Exception:
@@ -241,7 +285,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # must roll back a post-publication candidate as well as close it.
         self._abort_failed_connect(candidate)
         startup_error = BackendConnectionError(
-          f"Failed to connect to ElasticSearch ({snapshot.mode.value}).",
+          f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
           backend_type="elasticsearch",
         )
       except BaseException:

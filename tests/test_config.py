@@ -1,11 +1,31 @@
 """Tests for configuration module."""
 
+import traceback
+
 import pytest
 from pydantic import ValidationError
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.exceptions import ConfigurationError
-from scrapy_extension.settings import RedisSettings, Settings
+from scrapy_extension.settings import (
+  ElasticSearchSettings,
+  MongoDBSettings,
+  RedisSettings,
+  Settings,
+)
+
+
+def _assert_package_traceback_locals_are_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Ensure replacement boundaries do not retain raw input in package frames."""
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+    trace = trace.tb_next
 
 
 class TestSettings:
@@ -40,6 +60,137 @@ class TestSettings:
   def test_storage_buffer_max_age_must_be_positive(self, age):
     with pytest.raises(ValidationError):
       Settings(storage_buffer_max_age_s=age)
+
+
+@pytest.mark.parametrize(
+  ("factory", "marker"),
+  [
+    (
+      lambda marker: Settings(retry_attempts=marker),
+      "base-settings-validation-secret-marker",
+    ),
+    (
+      lambda marker: ElasticSearchSettings(api_key=[marker]),
+      "elasticsearch-settings-validation-secret-marker",
+    ),
+    (
+      lambda marker: MongoDBSettings(password=[marker]),
+      "mongodb-settings-validation-secret-marker",
+    ),
+  ],
+)
+def test_direct_settings_validation_errors_do_not_retain_raw_input(factory, marker):
+  """Pydantic's rendered and structured error APIs must both be redacted."""
+  with pytest.raises(ValidationError) as exc_info:
+    factory(marker)
+
+  error = exc_info.value
+  public_forms = (
+    str(error),
+    repr(error),
+    repr(getattr(error, "__dict__", {})),
+    "".join(traceback.format_exception(error)),
+    repr(error.errors()),
+    error.json(),
+  )
+  assert all(marker not in form for form in public_forms)
+  assert all(detail["input"] is None for detail in error.errors())
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_unknown_backend_type_does_not_retain_the_raw_value():
+  marker = "base-backend-type-secret-marker"
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    Settings(backend_type=marker)  # type: ignore[arg-type]
+
+  error = exc_info.value
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.setting_value is None
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_spoofed_settings_class_cannot_receive_bundled_message_trust():
+  """Module/name metadata must not impersonate one exact bundled model."""
+  from pydantic import model_validator
+
+  from scrapy_extension.settings._redacted import RedactedBaseSettings
+
+  marker = "spoofed-settings-message-secret-marker"
+
+  class _SpoofedSettings(RedactedBaseSettings):
+    value: str = "configured"
+
+    @model_validator(mode="after")
+    def _raise_untrusted_error(self):
+      raise ConfigurationError(marker, setting_name="value")
+
+  _SpoofedSettings.__module__ = "scrapy_extension.settings.base"
+  _SpoofedSettings.__qualname__ = "Settings"
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    _SpoofedSettings()
+
+  error = exc_info.value
+  assert str(error) == "Settings contain an invalid configuration value."
+  assert error.setting_name == "settings"
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_settings_boundary_does_not_introspect_hostile_error_subclasses():
+  """A validator's exception subclass cannot execute code during redaction."""
+  from pydantic import model_validator
+
+  from scrapy_extension.settings._redacted import RedactedBaseSettings
+
+  marker = "hostile-settings-configuration-error-marker"
+
+  class _HostileConfigurationError(ConfigurationError):
+    def __getattribute__(self, name: str) -> object:
+      if name in {"args", "setting_name"}:
+        raise RuntimeError(marker)
+      return super().__getattribute__(name)
+
+  class _UntrustedSettings(RedactedBaseSettings):
+    value: str = "configured"
+
+    @model_validator(mode="after")
+    def _raise_untrusted_error(self):
+      raise _HostileConfigurationError(marker)
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    _UntrustedSettings()
+
+  error = exc_info.value
+  assert str(error) == "Settings contain an invalid configuration value."
+  assert error.setting_name == "settings"
+  assert marker not in repr(error.__dict__)
+  _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_malformed_environment_setting_does_not_retain_source_diagnostics(
+  monkeypatch,
+):
+  marker = "direct-settings-env-secret-marker"
+  monkeypatch.setenv("SCRAPY_ELASTICSEARCH_HOSTS", marker)
+
+  with pytest.raises(ConfigurationError) as exc_info:
+    ElasticSearchSettings()
+
+  error = exc_info.value
+  assert error.setting_name == "settings"
+  assert marker not in str(error)
+  assert marker not in repr(error.__dict__)
+  assert marker not in "".join(traceback.format_exception(error))
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  _assert_package_traceback_locals_are_redacted(error, marker)
 
 
 class TestRedisSettings:
@@ -482,7 +633,7 @@ class TestSec2MongoTlsModeGuard:
     with pytest.raises(ConfigurationError) as exc_info:
       MongoDBSettings(mode=MongoDBMode.ATLAS, tls_allow_invalid_certificates=True)
     assert exc_info.value.setting_name == "tls_allow_invalid_certificates"
-    assert exc_info.value.setting_value is True
+    assert exc_info.value.setting_value is None
 
   def test_sharded_cluster_with_insecure_tls_rejected(self):
     """SHARDED_CLUSTER + True → ConfigurationError."""
@@ -573,6 +724,27 @@ class TestSec3ElasticsearchCleartextCredsGuard:
       ElasticSearchSettings(
         hosts=["http://es:9200"], api_key=SecretStr("key-123")
       )
+
+  def test_cleartext_error_does_not_echo_host_or_credential(self):
+    from pydantic import SecretStr
+
+    from scrapy_extension.settings import ElasticSearchSettings
+
+    host_marker = "elasticsearch-host-secret-marker"
+    credential_marker = "elasticsearch-api-secret-marker"
+    with pytest.raises(ConfigurationError) as exc_info:
+      ElasticSearchSettings(
+        hosts=[f"http://{host_marker}:9200"],
+        api_key=SecretStr(credential_marker),
+      )
+
+    error = exc_info.value
+    for marker in (host_marker, credential_marker):
+      assert marker not in str(error)
+      assert marker not in repr(error.__dict__)
+      assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
   def test_https_host_with_basic_auth_accepted(self):
     """https:// host + complete basic auth → accepted."""

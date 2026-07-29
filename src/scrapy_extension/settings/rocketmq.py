@@ -6,10 +6,11 @@ import re
 from enum import Enum
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 # host:port — host is any non-colon run of chars (DNS name, IPv4, IPv6-bracketed
 # forms are accepted by the client); port is digits only. Rejects bare host,
@@ -61,14 +62,9 @@ def validate_rocketmq_connection(
         RocketMQMode.CLUSTER,
         RocketMQMode.CLOUD,
     ):
-        try:
-            mode_text = str(mode)
-        except (TypeError, ValueError):
-            mode_text = getattr(mode, "value", repr(mode))
         raise ConfigurationError(
-            f"Unsupported RocketMQ mode: {mode_text}",
+            "Unsupported RocketMQ mode.",
             setting_name="mode",
-            setting_value=mode,
         )
 
     if not isinstance(namesrv_address, str):
@@ -117,13 +113,14 @@ def validate_rocketmq_connection(
     return mode, namesrv_address, key_text, secret_text, tls_enabled
 
 
-class RocketMQSettings(BaseSettings):
+class RocketMQSettings(RedactedBaseSettings):
     """Configuration for RocketMQ backend."""
 
     model_config = SettingsConfigDict(
         env_prefix="SCRAPY_ROCKETMQ_",
         case_sensitive=False,
         extra="forbid",
+        hide_input_in_errors=True,
     )
 
     # === Mode Selection ===

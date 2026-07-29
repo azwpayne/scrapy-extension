@@ -13,9 +13,10 @@ from typing import Any, Literal
 from urllib.parse import unquote
 
 from pydantic import AmqpDsn, Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 
 class RabbitMQMode(str, Enum):
@@ -211,7 +212,7 @@ def validate_rabbitmq_connection(
   return normalized_host, parsed_nodes
 
 
-class RabbitMQSettings(BaseSettings):
+class RabbitMQSettings(RedactedBaseSettings):
   """RabbitMQ-specific settings for all deployment modes.
 
   These settings configure the RabbitMQ connection and can be set
@@ -227,6 +228,7 @@ class RabbitMQSettings(BaseSettings):
     env_prefix="SCRAPY_RABBITMQ_",
     case_sensitive=False,
     extra="forbid",
+    hide_input_in_errors=True,
   )
 
   # === Mode Selection ===
@@ -460,11 +462,9 @@ class RabbitMQSettings(BaseSettings):
         (
           "RabbitMQ CLUSTER mode requires 'cluster_nodes' to be set "
           "(a non-empty list of host:port). Without it the client connects "
-          f"to a single host:port, losing cluster topology. "
-          f"Got cluster_nodes={self.cluster_nodes!r}."
+          "to a single host:port, losing cluster topology."
         ),
         setting_name="cluster_nodes",
-        setting_value=self.cluster_nodes,
       )
     # R30-B: strip-aware — whitespace ``ha_mode`` (``not "  "`` is False)
     # bypassed the bare truthiness check and surfaced later as a misleading
@@ -479,10 +479,9 @@ class RabbitMQSettings(BaseSettings):
           "RabbitMQ MIRRORED_QUEUES mode requires 'ha_mode' to be set "
           "(one of: all, exactly, nodes). Without it the connect path "
           "silently skips HA policy setup — the queue is non-mirrored "
-          f"despite the mode name. Got ha_mode={self.ha_mode!r}."
+          "despite the mode name."
         ),
         setting_name="ha_mode",
-        setting_value=self.ha_mode,
       )
     validate_rabbitmq_connection(
       host=self.host,
