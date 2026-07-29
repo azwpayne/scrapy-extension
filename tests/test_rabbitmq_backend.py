@@ -1,6 +1,8 @@
 """Tests for RabbitMQ backend implementation."""
 
 import ssl
+import traceback
+from types import SimpleNamespace
 
 import pika.exceptions
 import pytest
@@ -13,6 +15,62 @@ from scrapy_extension.exceptions import (
   QueueError,
 )
 from scrapy_extension.settings import RabbitMQMode, RabbitMQSettings
+
+
+def _assert_rabbitmq_value_is_redacted(
+  value: object,
+  marker: str,
+  seen: set[int] | None = None,
+) -> None:
+  """Walk the terminal error graph without trusting custom ``repr`` methods."""
+  if seen is None:
+    seen = set()
+  value_id = id(value)
+  if value_id in seen:
+    return
+  seen.add(value_id)
+  if isinstance(value, str):
+    assert marker not in value
+    return
+  if isinstance(value, bytes):
+    assert marker.encode() not in value
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      _assert_rabbitmq_value_is_redacted(key, marker, seen)
+      _assert_rabbitmq_value_is_redacted(item, marker, seen)
+    return
+  if isinstance(value, (tuple, list, set, frozenset)):
+    for item in value:
+      _assert_rabbitmq_value_is_redacted(item, marker, seen)
+    return
+  try:
+    attributes = vars(value)
+  except TypeError:
+    return
+  _assert_rabbitmq_value_is_redacted(attributes, marker, seen)
+
+
+def _assert_rabbitmq_operation_error_is_redacted(
+  error: BaseException,
+  marker: str,
+) -> None:
+  """Assert a direct public queue error has no private backend graph."""
+  assert marker not in str(error)
+  assert marker not in repr(error.args)
+  assert marker not in repr(error.__dict__)
+  assert error.__cause__ is None
+  assert error.__context__ is None
+  assert marker not in "".join(traceback.format_exception(error))
+
+  trace = error.__traceback__
+  while trace is not None:
+    frame = trace.tb_frame
+    if "/src/scrapy_extension/" in frame.f_code.co_filename:
+      assert marker not in repr(frame.f_locals)
+      for value in frame.f_locals.values():
+        _assert_rabbitmq_value_is_redacted(value, marker)
+    trace = trace.tb_next
 
 
 def test_rabbitmq_backend_connect(mocker):
@@ -293,7 +351,91 @@ def test_rabbitmq_push_confirm_failure_raises_queue_error(mocker, publish_error)
     backend.push("test_queue", b"test_item")
 
   assert exc_info.value.operation == "push"
-  assert exc_info.value.__cause__ is publish_error
+  assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+  ("method", "expected_operation"),
+  (
+    ("push", "push"),
+    ("pop", "pop"),
+    ("pop_with_ack", "pop"),
+    ("ack", "ack"),
+    ("nack", "nack"),
+    ("queue_len", "queue_len"),
+    ("clear_queue", "clear_queue"),
+  ),
+)
+def test_rabbitmq_direct_queue_errors_are_terminally_redacted(
+  mocker,
+  method: str,
+  expected_operation: str,
+) -> None:
+  """Round 44: direct queue methods must shed config/queue/payload graphs."""
+  marker = "round44-rabbitmq-private-marker"
+  backend = RabbitMQBackend(
+    RabbitMQSettings(
+      host=f"{marker}.example",
+      username="user",
+      password="safe",
+      ssl_enabled=True,
+    )
+  )
+  backend._round44_private = SimpleNamespace(marker=marker)  # type: ignore[attr-defined]
+  channel = mocker.MagicMock()
+  backend._activate_channel(mocker.MagicMock(), channel)
+
+  if method == "push":
+    channel.basic_publish.side_effect = RuntimeError(marker)
+    invoke = lambda: backend.push(marker, marker.encode())
+  elif method in {"pop", "pop_with_ack"}:
+    channel.basic_get.side_effect = RuntimeError(marker)
+    invoke = lambda: getattr(backend, method)(marker)
+  elif method == "ack":
+    backend._last_delivery_tag = 1
+    backend._last_delivery_queue = marker
+    channel.basic_ack.side_effect = RuntimeError(marker)
+    invoke = lambda: backend.ack(marker)
+  elif method == "nack":
+    backend._last_delivery_tag = 1
+    backend._last_delivery_queue = marker
+    channel.basic_nack.side_effect = RuntimeError(marker)
+    invoke = lambda: backend.nack(marker)
+  elif method == "queue_len":
+    channel.queue_declare.side_effect = RuntimeError(marker)
+    invoke = lambda: backend.queue_len(marker)
+  else:
+    channel.queue_purge.side_effect = RuntimeError(marker)
+    invoke = lambda: backend.clear_queue(marker)
+
+  with pytest.raises(QueueError) as exc_info:
+    invoke()
+
+  error = exc_info.value
+  assert error.operation == expected_operation
+  assert error.queue_name is None
+  _assert_rabbitmq_operation_error_is_redacted(error, marker)
+
+
+def test_rabbitmq_queue_error_boundary_preserves_base_exception(mocker) -> None:
+  marker = "round44-rabbitmq-baseexception"
+  backend = RabbitMQBackend(
+    RabbitMQSettings(
+      host=f"{marker}.example",
+      username="user",
+      password="safe",
+      ssl_enabled=True,
+    )
+  )
+  channel = mocker.MagicMock()
+  backend._activate_channel(mocker.MagicMock(), channel)
+  interrupt = KeyboardInterrupt(marker)
+  channel.basic_get.side_effect = interrupt
+
+  with pytest.raises(KeyboardInterrupt) as exc_info:
+    backend.pop(marker)
+
+  assert exc_info.value is interrupt
 
 
 def test_rabbitmq_backend_push_clamps_negative_priority_to_zero(mocker):
@@ -1043,7 +1185,7 @@ def test_rabbitmq_backend_clear_queue_no_channel():
   with pytest.raises(QueueError) as exc_info:
     backend.clear_queue("test_queue")
 
-  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.queue_name is None
   assert exc_info.value.operation == "clear_queue"
 
 
@@ -1068,9 +1210,9 @@ def test_rabbitmq_backend_clear_queue_amqp_error(mocker):
 
   with pytest.raises(QueueError) as exc_info:
     backend.clear_queue("test_queue")
-  assert exc_info.value.queue_name == "test_queue"
+  assert exc_info.value.queue_name is None
   assert exc_info.value.operation == "clear_queue"
-  assert "Purge failed" in str(exc_info.value)
+  assert str(exc_info.value) == "Failed to clear RabbitMQ queue."
 
 
 @pytest.mark.parametrize("method", ["push", "pop", "queue_len", "clear_queue"])

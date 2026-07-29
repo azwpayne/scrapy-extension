@@ -48,6 +48,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
   backend_connection_error_boundary,
   configuration_error_boundary,
+  queue_operation_error_boundary,
 )
 from scrapy_extension.settings import RabbitMQMode, RabbitMQSettings
 from scrapy_extension.settings.rabbitmq import validate_rabbitmq_connection
@@ -69,6 +70,13 @@ _RABBITMQ_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
     for mode in RabbitMQMode
   }
 )
+_RABBITMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "Not connected to RabbitMQ",
+    "RabbitMQ publish was not confirmed.",
+    "Cannot clear RabbitMQ queue while deliveries are in-flight.",
+  }
+)
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
 # adds one entry; without a cap a long-running process with slow acks (or a
@@ -78,6 +86,16 @@ _RABBITMQ_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
 # signal, never the ack state). 10k is generous for normal CONCURRENT_REQUESTS
 # backpressure and tight enough to flag a real leak.
 _MAX_IN_FLIGHT = 10_000
+
+
+def _validate_queue_name_argument(
+  _backend: object,
+  queue_name: str,
+  *_args: Any,
+  **_kwargs: Any,
+) -> None:
+  """Validate public queue names before a terminal error boundary."""
+  _validate_key_name(queue_name, "queue_name")
 
 
 class _RabbitMQAckToken:
@@ -1029,6 +1047,12 @@ class RabbitMQBackend(Backend, QueueBackend):
     self._declared_queues.add(queue_name)
 
   # QueueBackend implementation
+  @queue_operation_error_boundary(
+    "push",
+    "Failed to push RabbitMQ message.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
     """Push item to priority queue.
 
@@ -1104,7 +1128,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         # UnroutableError/NackError on failure. Some compatible channels return
         # a boolean instead, so reject an explicit negative confirmation too.
         if confirmed is False:
-          msg = f"RabbitMQ publish to queue {queue_name} was not confirmed"
+          msg = "RabbitMQ publish was not confirmed."
           raise QueueError(msg, queue_name=queue_name, operation="push")
       except AMQPError as e:
         msg = f"Failed to push to queue {queue_name}: {e}"
@@ -1115,6 +1139,12 @@ class RabbitMQBackend(Backend, QueueBackend):
         ) from e
       return _QueuePushReceipt(worker_crash_durable=durable)
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop RabbitMQ message.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
     """Pop highest priority item from queue.
 
@@ -1137,6 +1167,12 @@ class RabbitMQBackend(Backend, QueueBackend):
     body, _token = self._basic_get(queue_name, timeout=timeout)
     return body
 
+  @queue_operation_error_boundary(
+    "pop",
+    "Failed to pop RabbitMQ message.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def pop_with_ack(
     self, queue_name: str, timeout: float = 0.0
   ) -> tuple[bytes | None, _RabbitMQAckToken | None]:
@@ -1305,6 +1341,11 @@ class RabbitMQBackend(Backend, QueueBackend):
         operation="pop",
       ) from e
 
+  @queue_operation_error_boundary(
+    "ack",
+    "Failed to ack RabbitMQ message.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+  )
   def ack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Ack a popped message via ``basic_ack``.
 
@@ -1365,6 +1406,11 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._last_delivery_tag = None
         self._last_delivery_queue = None
 
+  @queue_operation_error_boundary(
+    "nack",
+    "Failed to nack RabbitMQ message.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+  )
   def nack(self, queue_name: str, *, token: Any | None = None) -> None:
     """Nack a popped message; requeue it for retry.
 
@@ -1418,6 +1464,12 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._last_delivery_tag = None
         self._last_delivery_queue = None
 
+  @queue_operation_error_boundary(
+    "queue_len",
+    "Failed to get queue length.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def queue_len(self, queue_name: str) -> int:
     """Get queue length.
 
@@ -1446,6 +1498,12 @@ class RabbitMQBackend(Backend, QueueBackend):
         raise QueueError(msg, queue_name=queue_name, operation="queue_len") from e
       return cast(int, result.method.message_count)
 
+  @queue_operation_error_boundary(
+    "clear_queue",
+    "Failed to clear RabbitMQ queue.",
+    safe_messages=_RABBITMQ_SAFE_QUEUE_MESSAGES,
+    validator=_validate_queue_name_argument,
+  )
   def clear_queue(self, queue_name: str) -> None:
     """Purge a queue only when no local delivery can resurrect old work.
 
@@ -1474,11 +1532,7 @@ class RabbitMQBackend(Backend, QueueBackend):
       pending = self._pending_deliveries.get(queue_name, 0)
       if pending:
         raise QueueError(
-          (
-            f"Cannot clear RabbitMQ queue {queue_name} while {pending} "
-            "delivery/deliveries are in-flight; ack or nack them first, or "
-            "disconnect, reconnect, and retry the clear."
-          ),
+          "Cannot clear RabbitMQ queue while deliveries are in-flight.",
           queue_name=queue_name,
           operation="clear_queue",
         )
