@@ -25,6 +25,7 @@ from scrapy_extension.backends.base import (
   _validate_key_name,
 )
 from scrapy_extension.exceptions import QueueError, SerializationError
+from scrapy_extension.exceptions._redaction import serialization_error_boundary
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
 from scrapy_extension.queue.strategies.base import (
@@ -45,6 +46,11 @@ logger = logging.getLogger(__name__)
 
 #: Default per-item serialized-byte cap (1 MiB — matches Memcached's 1 MB ceiling).
 DEFAULT_QUEUE_MAX_ITEM_BYTES = 1_048_576
+
+_QUEUE_PUSH_SERIALIZATION_FAILURE = "Failed to serialize request."
+_QUEUE_POP_SERIALIZATION_FAILURE = "Failed to deserialize request."
+_QUEUE_PUSH_MONITOR_FAILURE = "Queue push serialization failed."
+_QUEUE_POP_MONITOR_FAILURE = "Queue pop deserialization failed."
 
 #: R25-B/R26-A: ceiling (bytes) for a restored strategy snapshot. A corrupt or
 #: malicious multi-GB blob at the snapshot key would OOM-kill worker startup
@@ -277,6 +283,10 @@ class BackendQueue:
       request_dict[_BODY_CODEC_FIELD] = _BODY_CODEC_BASE64_V1
     return request_dict
 
+  @serialization_error_boundary(
+    _QUEUE_PUSH_SERIALIZATION_FAILURE,
+    serializer="json",
+  )
   def push(self, request: Request, priority: float = 0.0) -> None:
     """Push a request to the queue.
 
@@ -308,6 +318,13 @@ class BackendQueue:
   # bypass a direct class-level monkeypatch of ``BackendQueue.push``.
   _scheduler_protocol_push = push
 
+  @serialization_error_boundary(
+    _QUEUE_PUSH_SERIALIZATION_FAILURE,
+    serializer="json",
+    monitor_operation="push",
+    monitor_messages=(_QUEUE_PUSH_MONITOR_FAILURE,),
+    logger=logger,
+  )
   def _push_with_durability(
     self,
     request: Request,
@@ -431,35 +448,20 @@ class BackendQueue:
     try:
       request_dict = self._request_to_dict(request)
       data = self._serializer.serialize(request_dict)
-    except Exception as e:
+    except Exception:
       self._terminate_invalid_replacement(request, replacement_ack_token)
-      # R14-D: emit on_error so serialization failures surface as
-      # ``errors/push`` instead of being dead observability (the hook
-      # previously had zero call sites). Raised below — emit BEFORE the
-      # raise so the counter is incremented even though we re-raise.
-      try:
-        self._monitor.on_error("push", e)
-      except Exception:  # noqa: BLE001 - telemetry cannot mask the real error
-        try:
-          logger.debug("monitor.on_error(push) raised; ignored", exc_info=True)
-        except BaseException:
-          pass
-      msg = f"Failed to serialize request: {e}"
       raise SerializationError(
-        msg,
-        data=request,
+        _QUEUE_PUSH_MONITOR_FAILURE,
         serializer="json",
-      ) from e
+      ) from None
 
     if len(data) > self.max_item_bytes:
       self._inc_stat("scheduler/queue/oversize_dropped")
       self._terminate_invalid_replacement(request, replacement_ack_token)
-      msg = (
-        f"Serialized request ({len(data)} bytes) exceeds max_item_bytes "
-        f"({self.max_item_bytes}). Rejecting push to avoid silent drop by "
-        f"capped storage backends."
+      raise SerializationError(
+        _QUEUE_PUSH_SERIALIZATION_FAILURE,
+        serializer="json",
       )
-      raise SerializationError(msg, data=request, serializer="json")
 
     # R14-F: after a successful strategy push, consume delay/source so a re-pushed
     # retry (Scrapy retry middleware re-queues the same request object with
@@ -525,6 +527,13 @@ class BackendQueue:
         pass
     return push_is_durable
 
+  @serialization_error_boundary(
+    _QUEUE_POP_SERIALIZATION_FAILURE,
+    serializer="json",
+    monitor_operation="pop",
+    monitor_messages=(_QUEUE_POP_MONITOR_FAILURE,),
+    logger=logger,
+  )
   def pop(self, timeout: float = 0.0) -> Request | None:
     """Pop a request from the queue.
 
@@ -661,7 +670,7 @@ class BackendQueue:
       self._decode_body(request_dict)
       self._validate_request_dict(request_dict)
       request = self._request_from_dict(request_dict)
-    except Exception as e:
+    except Exception:
       poison_terminated = ack_token is None
       if ack_token is not None:
         try:
@@ -682,22 +691,10 @@ class BackendQueue:
             pass
       if poison_terminated:
         self._inc_stat("scheduler/queue/poison_dropped")
-      # R14-D: emit on_error so deserialize failures surface as ``errors/pop``
-      # instead of being dead observability. Emitted BEFORE the raise so the
-      # counter is incremented even though we re-raise.
-      try:
-        self._monitor.on_error("pop", e)
-      except Exception:  # noqa: BLE001 - telemetry cannot mask the real error
-        try:
-          logger.debug("monitor.on_error(pop) raised; ignored", exc_info=True)
-        except BaseException:
-          pass
-      msg = f"Failed to deserialize request: {e}"
       raise SerializationError(
-        msg,
-        data=data,
+        _QUEUE_POP_MONITOR_FAILURE,
         serializer="json",
-      ) from e
+      ) from None
     # Carry the backend ack token through the request so the scheduler can
     # correlate ack/nack back to the specific message that was popped. Only
     # inject when there's an actual token — atomic-pop backends return None

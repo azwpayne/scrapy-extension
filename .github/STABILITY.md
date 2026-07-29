@@ -36,7 +36,7 @@ comes from this document; being exported does not automatically make it Stable.
 | `scrapy_extension.backends.connectors.resolve_backend_config()` | Stable | Public fully qualified import used by all three component factories. |
 | `scrapy_extension.monitor.Monitor` / `NullMonitor` / `ScrapyStatsMonitor` | Stable | Public subpackage exports. The hook set is additive; fresh hooks are tiered below. |
 | `BackendType`, `Serializer`, `JSONSerializer`, and `Settings` | Stable | Root-package exports and core extension contracts. |
-| Root-exported exception classes | Stable | `BackendError`, `BackendConnectionError`, `QueueError`, `StorageError`, `SerializationError`, and `ConfigurationError`; documented context attributes are part of each concrete exception's contract. |
+| Root-exported exception classes | Stable | `BackendError`, `BackendConnectionError`, `QueueError`, `StorageError`, `SerializationError`, and `ConfigurationError`; documented context attributes are part of each concrete exception's contract. As a security boundary, terminal queue/pipeline `SerializationError` instances intentionally expose `data=None` and fixed text only; `serializer` remains available. |
 | Root-exported concrete backend, mode, and backend-settings classes | Inherit backend tier | Stable except the Memcached classes, which are Experimental with that backend. |
 | Root-exported membership filters, `DedupeStrategy`, and `build_membership_filter()` | Inherit strategy tier | See the strategy table below. |
 | Established component/backend selection settings | Stable | Includes `SCRAPY_BACKEND_TYPE`, per-component backend type/settings pairs, and dedup/queue/storage strategy selectors. Fresh settings and hooks are listed separately below. |

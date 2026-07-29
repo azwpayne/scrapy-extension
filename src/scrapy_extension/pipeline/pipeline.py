@@ -24,6 +24,7 @@ from scrapy_extension.exceptions import (
   StorageBackpressureError,
   StorageError,
 )
+from scrapy_extension.exceptions._redaction import serialization_error_boundary
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
   StorageStrategy,
@@ -61,6 +62,8 @@ DEFAULT_MAX_STORAGE_ERRORS = 10
 
 _PIPELINE_STORAGE_FAILURE_MESSAGE = "Pipeline storage operation failed."
 _PIPELINE_STORAGE_THRESHOLD_MESSAGE = "Pipeline storage failure threshold exceeded."
+_PIPELINE_SERIALIZATION_FAILURE_MESSAGE = "Failed to serialize item."
+_PIPELINE_SERIALIZATION_MONITOR_FAILURE = "Pipeline item serialization failed."
 
 
 class _PipelineStorageFailureThresholdExceeded(Exception):
@@ -77,8 +80,9 @@ def _pipeline_store_error_boundary(
   result or threshold failure directly from that path would expose those
   values through traceback inspection even when its message is static.  The
   wrapped public boundary waits until those frames unwind, then constructs a
-  fresh, fixed public error.  Serialization and lifecycle failures deliberately
-  pass through unchanged; their compatibility contracts are separate slices.
+  fresh, fixed public error. An outer serialization boundary handles the
+  separately versioned serialization contract after this wrapper releases its
+  own frames. Lifecycle failures deliberately pass through unchanged.
   """
 
   @wraps(function)
@@ -561,6 +565,13 @@ class BackendPipeline:
     if primary_error is not None:
       raise primary_error
 
+  @serialization_error_boundary(
+    _PIPELINE_SERIALIZATION_FAILURE_MESSAGE,
+    serializer="json",
+    monitor_operation="store",
+    monitor_messages=(_PIPELINE_SERIALIZATION_MONITOR_FAILURE,),
+    logger=logger,
+  )
   @_pipeline_store_error_boundary
   def process_item(self, item: Any, spider: Spider | None = None) -> Any:
     """Process one item while excluding concurrent terminal teardown."""
@@ -594,21 +605,12 @@ class BackendPipeline:
       data = self._serialize_item(item)
     except SerializationError:
       raise
-    except Exception as e:
+    except Exception:
       self._inc_stat(spider, "pipeline/serialization_errors")
-      try:
-        self._monitor.on_error("store", e)
-      except Exception:  # noqa: BLE001 - telemetry cannot mask serialization
-        _emit_diagnostic(
-          logger.debug,
-          "monitor.on_error(store) raised; ignored",
-          exc_info=True,
-        )
       raise SerializationError(
-        f"Failed to serialize item: {e}",
-        data=item,
+        _PIPELINE_SERIALIZATION_MONITOR_FAILURE,
         serializer="json",
-      ) from e
+      ) from None
 
     # D2: reject oversize payloads loudly (DoS guard). Unlike a transient
     # storage error (swallowed below to keep the spider alive), this is a
@@ -622,12 +624,10 @@ class BackendPipeline:
       # keep working (mirrors monitor/stats.py ``queue/pop_count`` aliasing).
       self._inc_stat(spider, "pipeline/oversize_dropped")
       self._inc_stat(spider, "pipeline/oversize_rejected")
-      msg = (
-        f"Serialized item ({len(data)} bytes) exceeds max_item_bytes "
-        f"({self.max_item_bytes}). Rejecting store to avoid silent drop by "
-        f"capped storage backends."
+      raise SerializationError(
+        _PIPELINE_SERIALIZATION_FAILURE_MESSAGE,
+        serializer="json",
       )
-      raise SerializationError(msg, data=item, serializer="json")
 
     try:
       self._store_item(key, data)

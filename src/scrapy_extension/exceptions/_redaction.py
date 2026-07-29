@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection
 from functools import wraps
+from logging import Logger
 from typing import ParamSpec, TypeVar, cast
 
 from scrapy_extension.exceptions.base import (
@@ -212,6 +213,84 @@ def set_operation_error_boundary(
       del caught_connection_error
       del replacement_message
       del raw_args
+      raise sanitized_error
+
+    return wrapped
+
+  return decorate
+
+
+def serialization_error_boundary(
+  message: str,
+  *,
+  serializer: str,
+  monitor_operation: str | None = None,
+  monitor_messages: Collection[str] = (),
+  logger: Logger | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+  """Rebuild an exact public serialization failure after private frames unwind.
+
+  Queue and pipeline serialization paths retain complete requests, item values,
+  or broker bytes in their implementation frames. They can also be reached by
+  monitor extension points. This boundary publishes a fresh fixed
+  :class:`SerializationError` only after the protected call returns, releasing
+  the original error graph and caller arguments first. When ``monitor_operation``
+  is supplied, it dispatches a separate static event object after that release;
+  a monitor therefore cannot obtain the original failure through ``sys.exc_info``
+  or the event object. ``monitor_messages`` is an exact static allowlist so
+  existing operation-specific event timing is preserved.
+
+  Only the exact built-in ``SerializationError`` is rebuilt. Subclasses and all
+  ``BaseException`` control flow preserve their existing public contracts.
+  """
+
+  def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+      caught_error: SerializationError | None = None
+      try:
+        return function(*args, **kwargs)
+      except SerializationError as error:
+        if type(error) is not SerializationError:
+          del args
+          del kwargs
+          raise
+        caught_error = error
+      except BaseException:
+        del args
+        del kwargs
+        raise
+
+      assert caught_error is not None
+      raw_args: object = caught_error.args
+      notify_monitor = (
+        monitor_operation is not None
+        and type(raw_args) is tuple
+        and len(raw_args) == 1
+        and type(raw_args[0]) is str
+        and raw_args[0] in monitor_messages
+      )
+      monitor = (
+        getattr(args[0], "_monitor", None) if notify_monitor else None
+      )
+      event_error = SerializationError(message, serializer=serializer)
+      sanitized_error = SerializationError(message, serializer=serializer)
+      del args
+      del kwargs
+      del caught_error
+      del raw_args
+
+      if monitor is not None and monitor_operation is not None:
+        try:
+          monitor.on_error(monitor_operation, event_error)
+        except Exception:  # noqa: BLE001 - telemetry cannot mask serialization
+          if logger is not None:
+            try:
+              logger.debug("monitor.on_error(%s) raised; ignored", monitor_operation)
+            except BaseException:
+              pass
+      del monitor
+      del event_error
       raise sanitized_error
 
     return wrapped

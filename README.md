@@ -926,7 +926,7 @@ BackendError (base)
 ├── QueueError               — queue operation failures (includes queue_name, operation)
 ├── StorageError             — storage operation failures (includes operation, key)
 │   └── StorageBackpressureError — item was not admitted to a full batched buffer
-├── SerializationError       — serialization failures (includes data, serializer)
+├── SerializationError       — serialization failures (includes serializer)
 └── ConfigurationError       — invalid settings (includes setting_name, setting_value)
 ```
 
@@ -934,6 +934,16 @@ Project exceptions expose the context shown above where applicable. Pydantic
 schema failures are `pydantic.ValidationError`, not `BackendError`, while
 project cross-field, capability, and unknown-setting failures use
 `ConfigurationError`.
+
+### Serialization error privacy migration
+
+Public `BackendQueue.push()`, scheduler-facing queue push, `BackendQueue.pop()`,
+and `BackendPipeline.process_item()` rebuild terminal `SerializationError`
+instances with fixed operation text, `data=None`, `serializer="json"`, and no
+exception chain. This prevents request URLs/headers/bodies, broker payloads,
+items, and serializer diagnostics from reaching application error handlers or
+monitor extensions. Treat `.data` as unavailable at these terminal boundaries;
+private serializer helpers may still use it for local debugging.
 
 ## Examples
 

@@ -620,7 +620,7 @@ class TestBackendPipelineProcessItem:
 
     item = object()
 
-    with pytest.raises(SerializationError, match="Unsupported pipeline item type"):
+    with pytest.raises(SerializationError, match="Failed to serialize item"):
       pipeline.process_item(item, mock_spider)  # type: ignore[arg-type]
 
     mock_connection_manager.get_storage_backend().store.assert_not_called()
@@ -874,7 +874,7 @@ class TestBackendPipelineMaxItemBytes:
 
     big_item = SampleItem(name="X" * 200, value=1)
 
-    with pytest.raises(SerializationError, match="exceeds.*max"):
+    with pytest.raises(SerializationError, match="Failed to serialize item"):
       pipeline.process_item(big_item, mock_spider)
 
     # Risk 5: renamed ``oversize_dropped`` → ``oversize_rejected`` (canonical);

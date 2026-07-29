@@ -582,7 +582,7 @@ class TestBackendQueuePush:
     def foreign_callback(response):
       return response
 
-    with pytest.raises(SerializationError, match="instance method"):
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
       queue.push(Request("https://example.com", callback=foreign_callback))
 
     mock_connection_manager.get_queue_backend().push.assert_not_called()
@@ -616,7 +616,7 @@ class TestBackendQueuePush:
       queue_name="test_queue",
     )
 
-    with pytest.raises(SerializationError, match="request class"):
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
       queue.push(CustomRequest("https://example.com"))
 
     mock_connection_manager.get_queue_backend().push.assert_not_called()
@@ -849,9 +849,9 @@ class TestBackendQueuePush:
     with pytest.raises(SerializationError) as exc_info:
       queue.push(request)
 
-    assert "Failed to serialize request" in str(exc_info.value)
+    assert str(exc_info.value) == "Failed to serialize request."
     assert exc_info.value.serializer == "json"
-    assert exc_info.value.data is request
+    assert exc_info.value.data is None
 
   def test_push_propagates_backend_queue_error(self, mock_connection_manager, mock_spider):
     """Backend queue failures must not be wrapped as SerializationError."""
@@ -1370,7 +1370,7 @@ class TestBackendQueuePush:
       max_item_bytes=64,
     )
 
-    with pytest.raises(SerializationError, match="exceeds max_item_bytes"):
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
       queue.push(request)
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
@@ -1557,7 +1557,7 @@ class TestBackendQueuePop:
       "token-1",
     )
 
-    with pytest.raises(SerializationError, match="instance method"):
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
       queue.pop()
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
@@ -1590,7 +1590,7 @@ class TestBackendQueuePop:
       "token-1",
     )
 
-    with pytest.raises(SerializationError, match="instance method"):
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
       queue.pop()
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
@@ -1623,7 +1623,7 @@ class TestBackendQueuePop:
       "token-1",
     )
 
-    with pytest.raises(SerializationError, match="dunder"):
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
       queue.pop()
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
@@ -1754,9 +1754,9 @@ class TestBackendQueuePop:
     with pytest.raises(SerializationError) as exc_info:
       queue.pop()
 
-    assert "Failed to deserialize request" in str(exc_info.value)
+    assert str(exc_info.value) == "Failed to deserialize request."
     assert exc_info.value.serializer == "json"
-    assert exc_info.value.data == b"invalid json"
+    assert exc_info.value.data is None
 
   def test_pop_acks_and_drops_token_when_deserialization_fails(
     self, mock_connection_manager, mock_spider, mocker
@@ -1813,7 +1813,7 @@ class TestBackendQueuePop:
     )
     deserialize = mocker.spy(queue._serializer, "deserialize")
 
-    with pytest.raises(SerializationError, match="exceeds max_item_bytes"):
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
       queue.pop()
 
     deserialize.assert_not_called()
@@ -1860,7 +1860,7 @@ class TestBackendQueuePop:
       queue_strategy=strategy,
     )
 
-    with pytest.raises(SerializationError, match=field):
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
       queue.pop()
 
     mock_connection_manager.get_queue_backend().ack.assert_called_once_with(
@@ -1901,7 +1901,7 @@ class TestBackendQueuePop:
       queue_strategy=strategy,
     )
 
-    with pytest.raises(SerializationError, match="request class"):
+    with pytest.raises(SerializationError, match="Failed to deserialize request"):
       queue.pop()
 
     dynamic_loader.assert_not_called()
@@ -1991,7 +1991,7 @@ class TestBackendQueueMaxItemBytes:
     )
     request = Request(url="https://example.com", body=b"x" * 200)
 
-    with pytest.raises(SerializationError, match="exceeds.*max"):
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
       queue.push(request)
 
     spider.crawler.stats.inc_value.assert_called_with(
@@ -2029,7 +2029,7 @@ class TestBackendQueueMaxItemBytes:
     )
     request = Request(url="https://example.com", body=b"x" * 200)
 
-    with pytest.raises(SerializationError, match="exceeds.*max"):
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
       queue.push(request)
 
   def test_default_max_item_bytes_allows_typical_request(
