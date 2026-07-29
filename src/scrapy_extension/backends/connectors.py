@@ -1765,13 +1765,32 @@ class ConnectionManager:
         raise _rebuild_connect_attempt_error(terminal_error)
       return
 
+    terminal_error: Exception | None = None
+    monitor_dispatch_started = False
     try:
-      with self._connect_lock:
-        self._connect_with_retries(monitor_events)
-    finally:
-      # Preserve direct ``connect()`` monitor ordering and behavior. This
-      # path has no lazy owner event to publish before its callbacks run.
+      try:
+        with self._connect_lock:
+          self._connect_with_retries(monitor_events)
+      except Exception as error:
+        # End the exception handler before invoking user-extensible monitor
+        # callbacks. Otherwise their ``sys.exc_info()`` exposes the manager's
+        # raw failure traceback and settings while the terminal boundary has
+        # not yet rebuilt the public error.
+        terminal_error = error
+
+      # Set this before dispatch so a monitor's BaseException is never
+      # dispatched twice by the fallback below. Ordinary monitor failures are
+      # still handled by ``_notify_monitor`` as best-effort diagnostics.
+      monitor_dispatch_started = True
       self._dispatch_monitor_events(monitor_events)
+      if terminal_error is not None:
+        raise terminal_error
+    finally:
+      if not monitor_dispatch_started:
+        # Keep direct calls' existing BaseException behavior: a control-flow
+        # exception bypasses the ordinary-error capture but still dispatches
+        # events already buffered by the serialized retry transaction.
+        self._dispatch_monitor_events(monitor_events)
 
   def _complete_lazy_connection_attempt(
     self,
