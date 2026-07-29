@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scrapy_extension.backends import connectors
 from scrapy_extension.backends.base import Backend, QueueBackend
 from scrapy_extension.backends.registry import (
   BackendDescriptor,
@@ -33,6 +34,7 @@ from scrapy_extension.backends.registry import (
   get_registry,
   has_capability,
 )
+from scrapy_extension.exceptions import ConfigurationError
 
 # ---------------------------------------------------------------------------
 # Module-level registration callables.
@@ -357,6 +359,59 @@ class TestThirdPartyDiscovered:
 
 class TestDescriptorBoundary:
   """Malformed or ambiguous plugins never enter or abort the registry."""
+
+  @staticmethod
+  def _runtime_descriptor() -> BackendDescriptor:
+    return _make_descriptor("runtime_contract", capabilities=frozenset({"queue"}))
+
+  def test_plugin_loader_path_errors_are_configuration_errors(self, monkeypatch):
+    descriptor = self._runtime_descriptor()
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    def _missing_path(_: str) -> object:
+      raise AttributeError("missing plugin symbol")
+
+    monkeypatch.setattr(connectors, "_load_object", _missing_path)
+
+    with pytest.raises(ConfigurationError, match="invalid plugin class path"):
+      connectors.ConnectionManager("runtime_contract")._create_backend()
+
+  def test_plugin_requires_callable_backend_and_settings_classes(self, monkeypatch):
+    descriptor = self._runtime_descriptor()
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(connectors, "_load_object", lambda _: object())
+
+    with pytest.raises(ConfigurationError, match="callable backend and settings"):
+      connectors.ConnectionManager("runtime_contract")._create_backend()
+
+  def test_plugin_constructor_type_error_is_not_retried(self, monkeypatch):
+    descriptor = self._runtime_descriptor()
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    class _BrokenBackend:
+      def __init__(self, settings: object) -> None:
+        del settings
+        raise TypeError("unsupported settings")
+
+    def _load(path: str) -> object:
+      return _BrokenBackend if path == descriptor.backend_cls_path else _StubSettings
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+
+    with pytest.raises(ConfigurationError, match="could not be constructed"):
+      connectors.ConnectionManager("runtime_contract")._create_backend()
+
+  def test_plugin_missing_backend_base_class_fails_fast(self, monkeypatch):
+    descriptor = self._runtime_descriptor()
+    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+
+    def _load(path: str) -> object:
+      return (lambda settings: object()) if path == descriptor.backend_cls_path else _StubSettings
+
+    monkeypatch.setattr(connectors, "_load_object", _load)
+
+    with pytest.raises(ConfigurationError, match="missing Backend, QueueBackend"):
+      connectors.ConnectionManager("runtime_contract")._create_backend()
 
   def test_selected_plugin_overclaim_fails_before_connection_retry(self, monkeypatch):
     """Runtime interface validation happens on first use, not discovery."""
