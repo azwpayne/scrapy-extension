@@ -27,6 +27,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from scrapy_extension.exceptions import StorageBackpressureError
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies.base import StorageStrategy
 
@@ -72,7 +73,11 @@ class BatchedStorageStrategy(StorageStrategy):
       max_buffer_age_s: Risk 2 — age cap (seconds) beyond which a background
           flush fires, bounding the crash-before-flush loss window. ``None``
           disables it (flush only on threshold / close).
-      pending: Count of items currently buffered (not yet flushed).
+      max_pending: Maximum number of accepted-but-not-yet-persisted records,
+          including both buffered and currently flushing entries. ``None``
+          uses ``2 * threshold``.
+      pending: Count of accepted-but-not-yet-persisted records, including the
+          in-flight snapshot currently being written.
   """
 
   emits_store_events = True
@@ -82,6 +87,7 @@ class BatchedStorageStrategy(StorageStrategy):
     threshold: int = DEFAULT_BATCH_THRESHOLD,
     *,
     max_buffer_age_s: float | None = None,
+    max_pending: int | None = None,
     monitor: Monitor | None = None,
   ) -> None:
     """Initialize the batched strategy.
@@ -94,13 +100,20 @@ class BatchedStorageStrategy(StorageStrategy):
             of the in-flight batch to roughly this value. ``None`` (default)
             disables the age-based flush — byte-identical to the pre-Risk-2
             behavior (flush only on threshold / close).
+        max_pending: Maximum accepted-but-not-yet-persisted item count across
+            the pending buffer and the snapshot currently being flushed. When
+            full, :meth:`store` rejects the new item immediately with
+            :class:`~scrapy_extension.exceptions.StorageBackpressureError`.
+            ``None`` (default) uses ``2 * threshold``.
         monitor: Optional observability monitor. When ``None`` (default)
             :class:`~scrapy_extension.monitor.base.NullMonitor`. Emits
-            ``on_buffer_depth(len(buffer))`` after each buffered item so a
-            wired collector can alert before the loss window grows.
+            ``on_buffer_depth(buffer + in_flight)`` after each accepted item
+            and flush outcome so a wired collector sees the true outstanding
+            backlog.
 
     Raises:
-        ValueError: If ``threshold`` is less than 1, or a configured
+        ValueError: If ``threshold`` is less than 1, ``max_pending`` is not a
+            non-boolean integer at least ``threshold``, or a configured
             ``max_buffer_age_s`` is not positive.
     """
     # R21-D: NaN bypasses plain comparison guards (nan < 1 and nan <= 0 are both
@@ -112,6 +125,17 @@ class BatchedStorageStrategy(StorageStrategy):
     if threshold < 1:
       msg = f"threshold must be >= 1, got {threshold}"
       raise ValueError(msg)
+    if max_pending is None:
+      max_pending = 2 * threshold
+    if isinstance(max_pending, bool) or not isinstance(max_pending, int):
+      msg = f"max_pending must be an int >= threshold, got {max_pending!r}"
+      raise ValueError(msg)
+    if max_pending < threshold:
+      msg = (
+        "max_pending must be >= threshold "
+        f"({threshold}), got {max_pending}"
+      )
+      raise ValueError(msg)
     if max_buffer_age_s is not None and (
       not math.isfinite(max_buffer_age_s) or max_buffer_age_s <= 0
     ):
@@ -119,7 +143,12 @@ class BatchedStorageStrategy(StorageStrategy):
       raise ValueError(msg)
     self.threshold = threshold
     self.max_buffer_age_s = max_buffer_age_s
+    self.max_pending = max_pending
     self._buffer: list[_BufferedEntry] = []
+    # Entries are removed from ``_buffer`` before their backend call so other
+    # callers can enqueue while network I/O runs.  Keep their count separately
+    # so admission, ``pending``, and monitor depth retain a hard total bound.
+    self._in_flight_count = 0
     self._lock = threading.Lock()
     # Serializes the complete snapshot/write/requeue transaction. The buffer
     # lock alone cannot make close wait for a threshold flush after that flush
@@ -136,9 +165,13 @@ class BatchedStorageStrategy(StorageStrategy):
 
   @property
   def pending(self) -> int:
-    """Number of items currently buffered (thread-safe snapshot)."""
+    """Number of accepted-but-not-yet-persisted items (thread-safe)."""
     with self._lock:
-      return len(self._buffer)
+      return self._pending_locked()
+
+  def _pending_locked(self) -> int:
+    """Return the outstanding count while ``_lock`` is held."""
+    return len(self._buffer) + self._in_flight_count
 
   def set_monitor(self, monitor: Monitor) -> None:
     """Inject a monitor after construction (Risk 2 wiring).
@@ -207,11 +240,16 @@ class BatchedStorageStrategy(StorageStrategy):
     with self._lock:
       if self._closed:
         raise RuntimeError("batched storage strategy is closed")
+      if self._pending_locked() >= self.max_pending:
+        # Admission must fail before deciding whether a threshold flush should
+        # run. In particular, a full strategy never waits for ``_flush_lock``
+        # merely to discover that it cannot accept another record.
+        raise StorageBackpressureError(operation="store")
       self._buffer.append((storage_backend, key, value, ttl))
       if self._oldest_ts is None:
         self._oldest_ts = time.monotonic()
-      depth = len(self._buffer)
-      if depth >= self.threshold:
+      depth = self._pending_locked()
+      if len(self._buffer) >= self.threshold:
         flush_now = True
     # on_buffer_depth is a no-op under NullMonitor; emit outside the lock and
     # guard it so a misbehaving monitor can never crash the store path
@@ -369,6 +407,7 @@ class BatchedStorageStrategy(StorageStrategy):
       batch = list(self._buffer)
       self._buffer = []
       self._oldest_ts = None  # buffer drained; age resets on next append
+      self._in_flight_count += len(batch)
     for i, (storage_backend, key, value, ttl) in enumerate(batch):
       try:
         storage_backend.store(key, value, ttl=ttl)
@@ -397,6 +436,10 @@ class BatchedStorageStrategy(StorageStrategy):
           # active; neither monitor nor diagnostic code may replace it.
           pass
         raise
+      # This entry is known durable before observability runs. Release exactly
+      # one admission slot under the same lock that protects the buffer so a
+      # concurrent caller can use it without violating the total cap.
+      self._release_persisted_entry()
       try:
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - persistence already succeeded
@@ -418,8 +461,15 @@ class BatchedStorageStrategy(StorageStrategy):
         raise
     if batch:
       with self._lock:
-        remaining_depth = len(self._buffer)
+        remaining_depth = self._pending_locked()
       self._emit_buffer_depth(remaining_depth)
+
+  def _release_persisted_entry(self) -> None:
+    """Release one in-flight admission slot after a durable backend write."""
+    with self._lock:
+      if self._in_flight_count <= 0:  # pragma: no cover - invariant guard
+        raise RuntimeError("batched storage in-flight accounting underflow")
+      self._in_flight_count -= 1
 
   def _requeue_tail(self, tail: list[_BufferedEntry]) -> int:
     """Prepend an unattempted snapshot tail without changing entry identity."""
@@ -427,13 +477,20 @@ class BatchedStorageStrategy(StorageStrategy):
       # New items may have been appended between the snapshot and a failure —
       # preserve them after the earlier snapshot tail.  ``tail`` contains the
       # original entry tuples, so each carries its exact backend capability.
+      tail_size = len(tail)
+      if tail_size > self._in_flight_count:  # pragma: no cover - invariant guard
+        raise RuntimeError("batched storage in-flight accounting underflow")
       tail.extend(self._buffer)
       self._buffer = tail
+      # The tail remains outstanding, but changes ownership from the snapshot
+      # to the retry buffer. Decrementing in-flight before returning preserves
+      # the total (buffer + in-flight) count under the lock.
+      self._in_flight_count -= tail_size
       # Re-enqueued tail's oldest is approximately now (per-item timestamps
       # aren't tracked), giving retries a fresh conservative age budget.
       if self._buffer:
         self._oldest_ts = time.monotonic()
-      return len(self._buffer)
+      return self._pending_locked()
 
   def _ensure_flusher(self) -> None:
     """Start the age-based background flusher (Risk 2), exactly once.

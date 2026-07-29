@@ -4,6 +4,7 @@ from scrapy_extension.exceptions.base import (
   ConfigurationError,
   QueueError,
   SerializationError,
+  StorageBackpressureError,
   StorageError,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
   "ConfigurationError",
   "QueueError",
   "SerializationError",
+  "StorageBackpressureError",
   "StorageError",
 ]

@@ -100,6 +100,23 @@ class StorageError(BackendError):
     self.key = key
 
 
+class StorageBackpressureError(StorageError):
+  """Item admission was rejected because the batched buffer is full.
+
+  Unlike a backend :class:`StorageError`, this means the item was never
+  accepted by the in-process batching strategy.  The message is intentionally
+  fixed: rejected keys and values must not become part of an operational
+  exception surface.
+  """
+
+  def __init__(self, *, operation: str | None = "store") -> None:
+    super().__init__(
+      "Batched storage is at capacity.",
+      operation=operation,
+      key=None,
+    )
+
+
 class SerializationError(BackendError):
   """Exception raised for serialization/deserialization errors.
 

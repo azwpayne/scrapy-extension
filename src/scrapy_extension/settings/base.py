@@ -173,6 +173,18 @@ class Settings(RedactedBaseSettings):
       "``BackendPipeline.from_settings`` → ``BatchedStorageStrategy(max_buffer_age_s=…)``."
     ),
   )
+  storage_buffer_max_pending: int | None = Field(
+    default=None,
+    gt=0,
+    description=(
+      "Maximum accepted-but-not-yet-persisted items for the batched storage "
+      "strategy, counting both its retry buffer and a backend-write snapshot. "
+      "``None`` (default) uses twice the batch threshold. The effective value "
+      "must be at least that threshold; ``BackendPipeline.from_settings`` "
+      "enforces the same strict non-boolean integer contract for "
+      "``SCRAPY_STORAGE_BUFFER_MAX_PENDING``."
+    ),
+  )
   dedup_strict: bool = Field(
     default=False,
     description=(

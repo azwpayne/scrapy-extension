@@ -20,6 +20,7 @@ from scrapy_extension.exceptions import (
   BackendError,
   ConfigurationError,
   SerializationError,
+  StorageBackpressureError,
 )
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
@@ -202,19 +203,36 @@ class BackendPipeline:
         if raw_age is not None
         else None
       )
+      raw_max_pending = settings.get("SCRAPY_STORAGE_BUFFER_MAX_PENDING")
+      buffer_max_pending = (
+        parse_int_setting(
+          raw_max_pending,
+          "SCRAPY_STORAGE_BUFFER_MAX_PENDING",
+          minimum=1,
+        )
+        if raw_max_pending is not None
+        else None
+      )
       try:
         storage_strategy = create_storage_strategy(
           storage_strategy_name,
           max_buffer_age_s=buffer_max_age_s,
+          max_pending=buffer_max_pending,
         )
       except ConfigurationError as exc:
-        if exc.setting_name != "storage_strategy":
-          raise
-        raise ConfigurationError(
-          str(exc),
-          setting_name="SCRAPY_STORAGE_STRATEGY",
-          setting_value=storage_strategy_name,
-        ) from exc
+        if exc.setting_name == "storage_strategy":
+          raise ConfigurationError(
+            str(exc),
+            setting_name="SCRAPY_STORAGE_STRATEGY",
+            setting_value=storage_strategy_name,
+          ) from exc
+        if exc.setting_name == "max_pending":
+          raise ConfigurationError(
+            str(exc),
+            setting_name="SCRAPY_STORAGE_BUFFER_MAX_PENDING",
+            setting_value=raw_max_pending,
+          ) from exc
+        raise
       except (TypeError, ValueError, OverflowError) as exc:
         raise ConfigurationError(
           f"Invalid SCRAPY_STORAGE_STRATEGY configuration: {exc}",
@@ -556,6 +574,11 @@ class BackendPipeline:
 
     try:
       self._store_item(key, data)
+    except StorageBackpressureError:
+      # This item was never admitted to the volatile strategy buffer. It is
+      # not a retryable backend failure, so best-effort storage handling must
+      # not return success-shaped data to Scrapy.
+      raise
     except (
       ConfigurationError,
       SerializationError,

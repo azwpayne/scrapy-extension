@@ -349,6 +349,11 @@ def test_ack_gate_settings_fail_fast_as_configuration_error(
     ("SCRAPY_STORAGE_BUFFER_MAX_AGE_S", 0, {}),
     ("SCRAPY_STORAGE_BUFFER_MAX_AGE_S", -1, {}),
     ("SCRAPY_STORAGE_BUFFER_MAX_AGE_S", True, {}),
+    ("SCRAPY_STORAGE_BUFFER_MAX_PENDING", "invalid", {}),
+    ("SCRAPY_STORAGE_BUFFER_MAX_PENDING", 0, {}),
+    ("SCRAPY_STORAGE_BUFFER_MAX_PENDING", -1, {}),
+    ("SCRAPY_STORAGE_BUFFER_MAX_PENDING", True, {}),
+    ("SCRAPY_STORAGE_BUFFER_MAX_PENDING", 99, {}),
     ("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS", "invalid", {}),
     ("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS", -1, {}),
     ("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS", True, {}),
@@ -391,6 +396,7 @@ def test_pipeline_accepts_numeric_environment_strings(
         "SCRAPY_BACKEND_TYPE": "redis",
         "SCRAPY_STORAGE_STRATEGY": "batched",
         "SCRAPY_STORAGE_BUFFER_MAX_AGE_S": "2.5",
+        "SCRAPY_STORAGE_BUFFER_MAX_PENDING": "200",
         "SCRAPY_PIPELINE_MAX_STORAGE_ERRORS": "0",
         "SCRAPY_PIPELINE_TTL": "3600",
         "SCRAPY_PIPELINE_MAX_ITEM_BYTES": "2048",
@@ -399,6 +405,7 @@ def test_pipeline_accepts_numeric_environment_strings(
   )
 
   assert pipeline.storage_strategy.max_buffer_age_s == pytest.approx(2.5)
+  assert pipeline.storage_strategy.max_pending == 200
   assert pipeline.max_storage_errors == 0
   assert pipeline.ttl == 3600
   assert pipeline.max_item_bytes == 2048

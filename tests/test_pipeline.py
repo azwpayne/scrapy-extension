@@ -13,6 +13,7 @@ from scrapy_extension.exceptions import (
   BackendConnectionError,
   BackendError,
   SerializationError,
+  StorageBackpressureError,
 )
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 
@@ -1047,6 +1048,28 @@ class TestBackendPipelineStorageStrategy:
 
     assert strategy.pending == 1
     monitor.on_store.assert_not_called()
+
+  def test_batched_backpressure_is_propagated_without_best_effort_swallowing(
+    self, mock_connection_manager, mocker
+  ):
+    """Admission rejection is not a persisted-or-retryable storage outcome."""
+    strategy = mocker.Mock()
+    strategy.emits_store_events = True
+    strategy.store.side_effect = StorageBackpressureError(operation="store")
+    pipeline = BackendPipeline(
+      connection_manager=mock_connection_manager,
+      storage_strategy=strategy,
+      max_storage_errors=None,
+    )
+    pipeline._storage_supported = True
+    spider = mocker.Mock()
+    spider.name = "s"
+
+    with pytest.raises(StorageBackpressureError) as exc_info:
+      pipeline.process_item(SampleItem(name="a", value=1), spider)
+
+    assert exc_info.value.operation == "store"
+    spider.crawler.stats.inc_value.assert_not_called()
 
   def test_max_item_bytes_still_rejects_oversize_with_strategy(
     self, mock_connection_manager, mocker

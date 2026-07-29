@@ -83,6 +83,13 @@ def create_storage_strategy(name: str, **opts: Any) -> StorageStrategy:
     # Risk 2: thread max_buffer_age_s + monitor through to the strategy so
     # the crash-before-flush loss window can be bounded from settings.
     kwargs: dict[str, Any] = {"threshold": threshold}
+    max_pending = opts.get("max_pending")
+    if max_pending is not None:
+      kwargs["max_pending"] = parse_int_setting(
+        max_pending,
+        "max_pending",
+        minimum=threshold,
+      )
     max_buffer_age_s = opts.get("max_buffer_age_s")
     if max_buffer_age_s is not None:
       kwargs["max_buffer_age_s"] = max_buffer_age_s

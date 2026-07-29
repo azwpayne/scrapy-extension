@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.exceptions import ConfigurationError, StorageBackpressureError
 from scrapy_extension.storage.strategies import (
   BatchedStorageStrategy,
   PassthroughStorageStrategy,
@@ -253,6 +253,8 @@ class TestBatchedStorageStrategy:
 
     # The first flush detached k1, so k2 remains the close-only tail.
     strat.store(backend, "k2", b"v2")
+    assert strat.pending == 2
+    assert strat._in_flight_count == 1
     close_done = threading.Event()
     close_errors: list[BaseException] = []
 
@@ -279,6 +281,7 @@ class TestBatchedStorageStrategy:
     assert close_errors == []
     assert [call.args[0] for call in backend.store.call_args_list] == ["k1", "k2"]
     assert strat.pending == 0
+    assert strat._in_flight_count == 0
 
   def test_close_drains_buffer_when_flusher_completes_after_old_join_window(
     self, monkeypatch, mocker
@@ -378,6 +381,10 @@ class TestBatchedStorageStrategy:
     strat = BatchedStorageStrategy()
     assert strat.threshold == 100
 
+  def test_default_max_pending_is_twice_the_threshold(self) -> None:
+    strat = BatchedStorageStrategy(threshold=7)
+    assert strat.max_pending == 14
+
   def test_invalid_threshold_raises(self) -> None:
     with pytest.raises(ValueError, match="threshold"):
       BatchedStorageStrategy(threshold=0)
@@ -401,6 +408,127 @@ class TestBatchedStorageStrategy:
     with pytest.raises(ValueError, match="threshold"):
       BatchedStorageStrategy(threshold=float("nan"))
 
+  @pytest.mark.parametrize("max_pending", [True, 1.5, "2", 0, -1])
+  def test_invalid_max_pending_raises(self, max_pending: object) -> None:
+    with pytest.raises(ValueError, match="max_pending"):
+      BatchedStorageStrategy(threshold=2, max_pending=max_pending)  # type: ignore[arg-type]
+
+  def test_max_pending_must_cover_one_complete_batch(self) -> None:
+    with pytest.raises(ValueError, match="max_pending must be >= threshold"):
+      BatchedStorageStrategy(threshold=3, max_pending=2)
+
+  def test_hard_backpressure_counts_inflight_and_rejects_without_lock_wait(
+    self, monkeypatch, mocker
+  ) -> None:
+    """A blocked flush cannot hide its detached snapshot from admission.
+
+    The second item is buffered while the first is blocked in backend I/O.
+    The third reaches the total cap and must return immediately even after the
+    normal flush-lock timeout is made deliberately large.
+    """
+    from scrapy_extension.monitor.base import Monitor
+
+    monkeypatch.setattr(batched_module, "_FLUSH_LOCK_TIMEOUT_S", 0.01)
+    backend = mocker.Mock()
+    monitor = mocker.Mock(spec=Monitor)
+    first_store_entered = threading.Event()
+    release_first_store = threading.Event()
+    first_errors: list[BaseException] = []
+
+    def blocking_store(key: str, *_args, **_kwargs) -> None:
+      if key == "first":
+        first_store_entered.set()
+        assert release_first_store.wait(timeout=2.0), "blocked write was not released"
+
+    backend.store.side_effect = blocking_store
+    strat = BatchedStorageStrategy(threshold=1, max_pending=2, monitor=monitor)
+
+    def store_first() -> None:
+      try:
+        strat.store(backend, "first", b"one")
+      except BaseException as error:  # noqa: BLE001 - assert after release
+        first_errors.append(error)
+
+    first_thread = threading.Thread(target=store_first, daemon=True)
+    first_thread.start()
+    assert first_store_entered.wait(timeout=2.0), "first flush did not start"
+    assert strat.pending == 1
+
+    # This accepted item may make a bounded, unsuccessful flush attempt while
+    # the first snapshot owns the serialization lock.
+    strat.store(backend, "second", b"two")
+    assert strat.pending == 2
+    assert monitor.on_buffer_depth.call_args_list[-1].args == (2,)
+
+    # A full strategy must not wait for this intentionally huge lock timeout.
+    monkeypatch.setattr(batched_module, "_FLUSH_LOCK_TIMEOUT_S", 10.0)
+    rejected_done = threading.Event()
+    rejected: list[StorageBackpressureError] = []
+
+    def reject_third() -> None:
+      try:
+        strat.store(backend, "sensitive-third-key", b"sensitive-third-value")
+      except StorageBackpressureError as error:
+        rejected.append(error)
+      finally:
+        rejected_done.set()
+
+    rejected_thread = threading.Thread(target=reject_third, daemon=True)
+    rejected_thread.start()
+    try:
+      assert rejected_done.wait(timeout=0.5), "full admission waited on flush lock"
+      assert len(rejected) == 1
+      error = rejected[0]
+      assert str(error) == "Batched storage is at capacity."
+      assert error.operation == "store"
+      assert error.key is None
+      assert "sensitive-third" not in str(error)
+      assert strat.pending == 2
+    finally:
+      release_first_store.set()
+      first_thread.join(timeout=2.0)
+      rejected_thread.join(timeout=2.0)
+
+    assert not first_thread.is_alive()
+    assert first_errors == []
+    # The durable first record frees one slot; the second remains buffered.
+    assert strat.pending == 1
+    strat.flush()
+    assert [call.args[0] for call in backend.store.call_args_list] == [
+      "first",
+      "second",
+    ]
+    assert strat.pending == 0
+
+  def test_failed_snapshot_tail_requeues_without_leaking_inflight_capacity(
+    self, mocker
+  ) -> None:
+    attempts: list[str] = []
+    failed = False
+    backend = mocker.Mock()
+
+    def fail_once(key: str, *_args, **_kwargs) -> None:
+      nonlocal failed
+      attempts.append(key)
+      if key == "second" and not failed:
+        failed = True
+        raise RuntimeError("backend down")
+
+    backend.store.side_effect = fail_once
+    strat = BatchedStorageStrategy(threshold=2, max_pending=2)
+    strat.store(backend, "first", b"one")
+    with pytest.raises(RuntimeError, match="backend down"):
+      strat.store(backend, "second", b"two")
+
+    assert strat.pending == 1
+    assert strat._in_flight_count == 0
+
+    # The retry tail consumes one slot, not two: the replacement admission is
+    # accepted and flushes both records in FIFO order after recovery.
+    strat.store(backend, "third", b"three")
+    assert attempts == ["first", "second", "second", "third"]
+    assert strat.pending == 0
+
   def test_thread_safety_no_corruption(self, mocker) -> None:
     """Concurrent stores + flushes don't lose or duplicate items."""
     backend = mocker.Mock()
@@ -411,10 +539,10 @@ class TestBatchedStorageStrategy:
 
     backend.store.side_effect = slow_store
 
-    strat = BatchedStorageStrategy(threshold=50)
     n_threads = 8
     per_thread = 20
     total = n_threads * per_thread
+    strat = BatchedStorageStrategy(threshold=50, max_pending=total)
 
     def worker(tid: int) -> None:
       for i in range(per_thread):
@@ -753,6 +881,7 @@ class TestBatchedStoragePartialFailure:
       strat.store(backend, "k3", b"v3")
 
     assert strat.pending == 1
+    assert strat._in_flight_count == 0
     tail_backend, tail_key, tail_value, tail_ttl = strat._buffer[0]
     assert tail_backend is backend
     assert (tail_key, tail_value, tail_ttl) == ("k3", b"v3", None)
@@ -798,7 +927,7 @@ class TestBatchedStoragePartialFailure:
     """Sustained failure stays retryable while remaining visible to callers."""
     backend = mocker.Mock()
     backend.store.side_effect = RuntimeError("backend down")
-    strat = BatchedStorageStrategy(threshold=2)
+    strat = BatchedStorageStrategy(threshold=2, max_pending=10)
     strat.store(backend, "k0", b"v")
     for i in range(1, 10):
       with pytest.raises(RuntimeError, match="backend down"):
@@ -822,9 +951,16 @@ class TestStorageStrategyFactory:
     assert isinstance(strat, PassthroughStorageStrategy)
 
   def test_batched(self) -> None:
-    strat = create_storage_strategy("batched", threshold=50)
+    strat = create_storage_strategy("batched", threshold=50, max_pending=75)
     assert isinstance(strat, BatchedStorageStrategy)
     assert strat.threshold == 50
+    assert strat.max_pending == 75
+
+  def test_batched_rejects_max_pending_below_threshold(self) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+      create_storage_strategy("batched", threshold=50, max_pending=49)
+
+    assert exc_info.value.setting_name == "max_pending"
 
   def test_batched_rejects_float_threshold(self) -> None:
     """R25-C: a float threshold must raise ConfigurationError, not silently

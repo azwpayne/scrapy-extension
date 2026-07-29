@@ -41,6 +41,7 @@ from scrapy_extension.exceptions import (
     ConfigurationError,
     QueueError,
     SerializationError,
+    StorageBackpressureError,
     StorageError,
 )
 from scrapy_extension.monitor import Monitor, NullMonitor, ScrapyStatsMonitor
@@ -317,6 +318,7 @@ __all__ = [
     "SqsMode",
     "SqsSettings",
     "StorageBackend",
+    "StorageBackpressureError",
     "StorageError",
     "build_membership_filter",
     "resolve_backend_config",

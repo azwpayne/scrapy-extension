@@ -140,14 +140,17 @@ Select a `StorageStrategy` via `SCRAPY_STORAGE_STRATEGY` — no code change requ
 | Strategy | When to use | Durability boundary |
 |---|---|---|
 | `passthrough` (default) | Item loss is unacceptable; backend round trips are acceptable. | Each item is written directly to the selected `StorageBackend`. |
-| `batched` | Higher throughput is more important than immediate persistence. | Backend-bound items sit in a global FIFO until threshold / spider close. Each item drains through the exact backend supplied with it; hard crash before flush loses the buffer, while store exceptions re-enqueue the backend-bound unwritten tail. |
+| `batched` | Higher throughput is more important than immediate persistence. | Backend-bound items sit in a global FIFO until threshold / spider close. Each item drains through the exact backend supplied with it; hard crash before flush loses the buffer, while store exceptions re-enqueue the backend-bound unwritten tail. Accepted work is bounded across the buffer and in-flight flush snapshot. |
 
 ```python
 # settings.py
 SCRAPY_STORAGE_STRATEGY = "batched"
+# Default is 2 × the batch threshold (200 with the bundled threshold of 100).
+# Must be an integer no smaller than that threshold.
+SCRAPY_STORAGE_BUFFER_MAX_PENDING = 200
 ```
 
-Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance.
+Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance. When a blocked backend keeps the cap full, the next item is rejected immediately with `StorageBackpressureError`; treat that as an admission failure and let the crawler's retry/failure policy decide what to do, rather than assuming the item was persisted.
 
 ## Redis namespace rollout
 
@@ -303,7 +306,7 @@ expect one in-flight operation per connected backend generation.
 | RocketMQ queue pop | Single-outcome message token plus `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the invisibility lease. | No automatic renewal. Token-aware pop never fills the legacy ack slot; ack/nack on one token serialize and a failure remains locally retryable. Explicit nack shortens the lease to RocketMQ's 10-second minimum. Pair set/storage through per-component backends. |
 | Backend/plugin declaring `supports_concurrent_ack=False` | Single ack slot only. | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` is set. | Keep concurrency at 1, or pick a backend with a real in-flight ack set. |
 | Stateful queue strategies | In-process scheduling/fairness/rate state. | Hard crash can lose held strategy state; a token-bearing replacement is rejected before it enters volatile delay/time-wheel/round-robin/ring-buffer state. | Use a backend-durable push path when replacing an unacked broker delivery; zero effective delay remains a direct backend push. |
-| `batched` storage | Backend-bound in-process write buffer. | Hard crash before flush loses buffered items; an ordinary partial failure retries the failing item and tail against their original backends. | Keep caller-owned backends alive through drain and coordinate one shared strategy lifecycle; prefer `passthrough` when persistence must happen before item acknowledgement. |
+| `batched` storage | Backend-bound in-process write buffer plus active flush snapshot. | Hard crash before flush loses buffered or in-flight items; an ordinary partial failure retries the failing item and tail against their original backends. | Keep caller-owned backends alive through drain and coordinate one shared strategy lifecycle; prefer `passthrough` when persistence must happen before item acknowledgement. |
 
 For TimeWheel specifically, a failed live-backend publication leaves the
 failing slot entry and its untouched tail in original order; entries whose push

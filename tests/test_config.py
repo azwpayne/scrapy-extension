@@ -61,6 +61,11 @@ class TestSettings:
     with pytest.raises(ValidationError):
       Settings(storage_buffer_max_age_s=age)
 
+  @pytest.mark.parametrize("max_pending", [0, -1])
+  def test_storage_buffer_max_pending_must_be_positive(self, max_pending):
+    with pytest.raises(ValidationError):
+      Settings(storage_buffer_max_pending=max_pending)
+
 
 @pytest.mark.parametrize(
   ("factory", "marker"),

@@ -31,6 +31,7 @@ class TestCoreImportsAlwaysAvailable:
             "ConfigurationError",
             "QueueError",
             "SerializationError",
+            "StorageBackpressureError",
             "QueueBackend",
             "SetBackend",
             "StorageBackend",
@@ -933,6 +934,5 @@ class TestDirCompanionExposesLazyImports:
         assert not missing, (
             f"Lazy backends missing from dir(scrapy_extension.backends): {sorted(missing)}"
         )
-
 
 

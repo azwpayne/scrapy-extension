@@ -277,19 +277,20 @@ class Monitor:
     """
 
   def on_buffer_depth(self, depth: int) -> None:
-    """Record the BatchedStorageStrategy buffer fill (gauge).
+    """Record BatchedStorageStrategy's outstanding-work gauge.
 
     Emitted by :meth:`BatchedStorageStrategy.store
     <scrapy_extension.storage.strategies.batched.BatchedStorageStrategy.store>`
     after each buffered item so operators can alert before the crash-before-
     flush loss window grows (the batch is at-least-once on store *exceptions*
     but a crash mid-batch loses the in-flight buffer — a documented failure
-    mode). ``depth`` is the number of items currently buffered (not yet
-    flushed). Default no-op so existing subclasses and :class:`NullMonitor`
-    keep working unchanged.
+    mode). ``depth`` includes both buffered records and any snapshot currently
+    being written to a backend, so it matches the strategy's bounded admission
+    count. Default no-op so existing subclasses and :class:`NullMonitor` keep
+    working unchanged.
 
     Args:
-        depth: Number of items currently buffered, pending flush.
+        depth: Number of accepted-but-not-yet-persisted items.
     """
 
   def on_delay_depth(self, depth: int) -> None:

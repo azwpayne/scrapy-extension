@@ -301,11 +301,11 @@ class ScrapyStatsMonitor(Monitor):
     """Set the ``pipeline/buffer_depth`` gauge (batched-storage operability).
 
     Lets operators alert before the crash-before-flush loss window grows.
-    ``depth`` is the number of items currently buffered in the
-    :class:`BatchedStorageStrategy`, pending flush.
+    ``depth`` is the number of accepted-but-not-yet-persisted items in the
+    :class:`BatchedStorageStrategy`, including any in-flight backend snapshot.
 
     Args:
-        depth: Number of items currently buffered, pending flush.
+        depth: Number of accepted-but-not-yet-persisted items.
     """
     self._stats.set_value("pipeline/buffer_depth", depth)
 

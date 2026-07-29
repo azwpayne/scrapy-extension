@@ -748,9 +748,14 @@ entries, but cannot lose the only copy of entries not yet processed.
 | Strategy | Behavior | Durability note |
 |----------|----------|-----------------|
 | `passthrough` (default) | writes each serialized item directly to the selected `StorageBackend` | backend durability applies immediately after `store()` returns |
-| `batched` | buffers backend-bound records and flushes them in global insertion order at threshold / spider close | every record retains the exact backend passed to its `store()` call through age/manual/close drains and partial-failure retry; a hard crash before flush still loses the in-process batch |
+| `batched` | buffers backend-bound records and flushes them in global insertion order at threshold / spider close | every record retains the exact backend passed to its `store()` call through age/manual/close drains and partial-failure retry; accepted work is capped across the retry buffer and in-flight snapshot (default: `2 × threshold`), and a full strategy raises `StorageBackpressureError` before accepting another item |
 
 Use `passthrough` when item loss is unacceptable. Use `batched` only when throughput is worth the crash-before-flush trade-off and duplicate writes are acceptable after partial flush retry.
+
+Set `SCRAPY_STORAGE_BUFFER_MAX_PENDING` to an integer no smaller than the
+batch threshold when a tighter or larger live backlog is appropriate. The cap
+counts both records still buffered and records detached for a currently blocked
+backend flush, so it prevents unbounded process memory growth during an outage.
 
 ### Ack and durability matrix
 
@@ -920,6 +925,7 @@ BackendError (base)
 ├── BackendConnectionError   — connection failures (includes backend_type)
 ├── QueueError               — queue operation failures (includes queue_name, operation)
 ├── StorageError             — storage operation failures (includes operation, key)
+│   └── StorageBackpressureError — item was not admitted to a full batched buffer
 ├── SerializationError       — serialization failures (includes data, serializer)
 └── ConfigurationError       — invalid settings (includes setting_name, setting_value)
 ```
