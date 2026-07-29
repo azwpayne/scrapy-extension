@@ -393,7 +393,7 @@ class TestDynamoDBStorageOps:
     table.delete_item.return_value = response
 
     with pytest.raises(
-      StorageError, match="^DynamoDB storage delete failed\\.$"
+      StorageError, match="^DynamoDB returned a malformed DeleteItem response$"
     ) as exc_info:
       b.delete("key1")
 
@@ -430,7 +430,9 @@ class TestDynamoDBStorageOps:
     b, table = _connected(mocker)
     table.delete_item.return_value = {"Attributes": {"pk": _EqualKey()}}
 
-    with pytest.raises(StorageError, match="^DynamoDB storage delete failed\\.$"):
+    with pytest.raises(
+      StorageError, match="^DynamoDB returned a malformed DeleteItem response$"
+    ):
       b.delete("key1")
 
   def test_exists_true_for_current(self, mocker) -> None:

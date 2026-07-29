@@ -90,6 +90,32 @@ _DDB_MAX_ITEM_BYTES = 400 * 1_024
 _DDB_BATCH_WRITE_LIMIT = 25
 _DDB_BATCH_MAX_ATTEMPTS = 8
 _DDB_BATCH_BACKOFF_BASE_SECONDS = 0.05
+_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX = "DynamoDB clear is partially complete: "
+_DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX = (
+  f" delete request(s) remained unprocessed after {_DDB_BATCH_MAX_ATTEMPTS} attempts"
+)
+_DYNAMODB_SAFE_STORAGE_MESSAGES: frozenset[str] = frozenset(
+  {
+    "DynamoDB backend is not connected",
+    "DynamoDB returned a malformed batch-write response; the clear may be "
+    "partially complete",
+    "DynamoDB returned a malformed scan response; the clear may be "
+    "partially complete",
+    "DynamoDB returned a malformed out-of-scope scan response; the clear may "
+    "be partially complete",
+    "DynamoDB clear is partially complete: Scan returned a repeated pagination "
+    "cursor",
+    "Failed to clear DynamoDB table; the clear may be partially complete",
+    "DynamoDB returned a non-mapping item response",
+    "DynamoDB returned a malformed Item mapping",
+    "DynamoDB returned a malformed DeleteItem response",
+    "DynamoDB item has a non-numeric expire_at attribute",
+    "DynamoDB item has an invalid numeric expire_at attribute",
+    "DynamoDB item has a non-finite expire_at attribute",
+    "DynamoDB item has an unreadable binary value attribute",
+    "DynamoDB item has a missing or non-binary value attribute",
+  }
+)
 _MISSING = object()
 _DDB_USABLE_TABLE_STATUSES = frozenset({"ACTIVE", "UPDATING"})
 
@@ -158,6 +184,25 @@ def _validate_dynamodb_storage_prefix_argument(
   """Validate an optional direct DynamoDB clear prefix before backend work."""
   if prefix is not None:
     _validate_key_name(prefix, "prefix")
+
+
+def _is_safe_dynamodb_storage_message(message: str) -> bool:
+  """Allow only the bounded dynamic retry-exhaustion diagnostic."""
+  if not (
+    message.startswith(_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX)
+    and message.endswith(_DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX)
+  ):
+    return False
+  count = message[
+    len(_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX) : -len(
+      _DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX
+    )
+  ]
+  return (
+    count.isascii()
+    and count.isdecimal()
+    and 1 <= int(count) <= _DDB_BATCH_WRITE_LIMIT
+  )
 
 
 def _number_size_upper_bound(value: int) -> int:
@@ -560,9 +605,8 @@ class DynamoDBBackend(Backend, StorageBackend):
         except BaseException:
           pass
         raise StorageError(
-          "DynamoDB clear is partially complete: "
-          f"{len(pending)} delete request(s) remained unprocessed after "
-          f"{_DDB_BATCH_MAX_ATTEMPTS} attempts",
+          f"{_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX}{len(pending)}"
+          f"{_DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX}",
           operation="clear_storage",
           key=None,
         )
@@ -791,6 +835,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     "store",
     _DYNAMODB_STORAGE_STORE_ERROR,
     "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_STORAGE_MESSAGES,
+    safe_message_predicate=_is_safe_dynamodb_storage_message,
     validator=_validate_dynamodb_store_arguments,
   )
   def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
@@ -832,6 +878,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     "retrieve",
     _DYNAMODB_STORAGE_RETRIEVE_ERROR,
     "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_STORAGE_MESSAGES,
+    safe_message_predicate=_is_safe_dynamodb_storage_message,
     validator=_validate_dynamodb_storage_key_argument,
   )
   def retrieve(self, key: str) -> bytes | None:
@@ -879,6 +927,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     "delete",
     _DYNAMODB_STORAGE_DELETE_ERROR,
     "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_STORAGE_MESSAGES,
+    safe_message_predicate=_is_safe_dynamodb_storage_message,
     validator=_validate_dynamodb_storage_key_argument,
   )
   def delete(self, key: str) -> bool:
@@ -912,6 +962,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     "exists",
     _DYNAMODB_STORAGE_EXISTS_ERROR,
     "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_STORAGE_MESSAGES,
+    safe_message_predicate=_is_safe_dynamodb_storage_message,
     validator=_validate_dynamodb_storage_key_argument,
   )
   def exists(self, key: str) -> bool:
@@ -946,6 +998,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     "ttl",
     _DYNAMODB_STORAGE_TTL_ERROR,
     "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_STORAGE_MESSAGES,
+    safe_message_predicate=_is_safe_dynamodb_storage_message,
     validator=_validate_dynamodb_storage_key_argument,
   )
   def ttl(self, key: str) -> int | None:
@@ -990,6 +1044,8 @@ class DynamoDBBackend(Backend, StorageBackend):
     "clear_storage",
     _DYNAMODB_STORAGE_CLEAR_ERROR,
     "dynamodb",
+    safe_messages=_DYNAMODB_SAFE_STORAGE_MESSAGES,
+    safe_message_predicate=_is_safe_dynamodb_storage_message,
     validator=_validate_dynamodb_storage_prefix_argument,
   )
   def clear_storage(self, prefix: str | None = None) -> None:

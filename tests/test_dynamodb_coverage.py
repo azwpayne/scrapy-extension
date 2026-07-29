@@ -49,7 +49,7 @@ class TestDynamoDBErrorPaths:
     with pytest.raises(StorageError) as exc_info:
       b.store("k", b"v")
     assert exc_info.value.operation == "store"
-    assert exc_info.value.key == "k"
+    assert exc_info.value.key is None
 
   def test_retrieve_raises_storage_error(self, mocker) -> None:
     b, table = _connected(mocker)

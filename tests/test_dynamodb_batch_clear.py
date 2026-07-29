@@ -369,7 +369,8 @@ def test_clear_wraps_batch_write_transport_failure(mocker) -> None:
     backend.clear_storage()
 
   assert exc_info.value.operation == "clear_storage"
-  assert exc_info.value.__cause__ is failure
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
   assert "secret" not in str(exc_info.value)
   assert "example.test" not in str(exc_info.value)
   assert "do-not-leak-key" not in str(exc_info.value)

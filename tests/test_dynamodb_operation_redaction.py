@@ -124,7 +124,7 @@ def _failing_storage_operation(
     table.scan.return_value = {"Items": [{"pk": _MARKER}]}
     table.meta.client.batch_write_item.side_effect = failure
     return lambda: backend.clear_storage(_MARKER), "clear_storage", (
-      "DynamoDB storage clear failed."
+      "Failed to clear DynamoDB table; the clear may be partially complete"
     )
   raise AssertionError(f"Unexpected storage operation: {method_name}")
 
@@ -166,7 +166,10 @@ def test_direct_dynamodb_clear_rebuilds_nested_batch_failure_graph(
     backend.clear_storage(_MARKER)
 
   error = exc_info.value
-  assert str(error) == "DynamoDB storage clear failed."
+  assert str(error) == (
+    "DynamoDB returned a malformed batch-write response; the clear may be "
+    "partially complete"
+  )
   assert error.operation == "clear_storage"
   assert error.key is None
   _assert_terminal_error_is_redacted(error, _MARKER)
@@ -180,7 +183,7 @@ def test_direct_dynamodb_disconnected_store_rebuilds_private_error_graph() -> No
     backend.store(_MARKER, _MARKER.encode())
 
   error = exc_info.value
-  assert str(error) == "DynamoDB storage store failed."
+  assert str(error) == "DynamoDB backend is not connected"
   assert error.operation == "store"
   assert error.key is None
   _assert_terminal_error_is_redacted(error, _MARKER)

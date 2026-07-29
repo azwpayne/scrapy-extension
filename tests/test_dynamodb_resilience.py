@@ -153,7 +153,7 @@ def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
   caller (item pipeline) must see the failure, not a silent data loss."""
   backend, table = _connected_backend(mocker)
   table.put_item.side_effect = _FakeClientError("ResourceNotFoundException")
-  with pytest.raises(StorageError, match="table not found"):
+  with pytest.raises(StorageError, match="^DynamoDB storage store failed\\.$"):
     backend.store("k", b"v")
 
 
@@ -169,7 +169,8 @@ def test_exists_raises_storage_error_when_table_vanishes(mocker) -> None:
   with pytest.raises(StorageError) as exc_info:
     backend.exists("k")
   assert exc_info.value.operation == "exists"
-  assert exc_info.value.__cause__ is error
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None
 
 
 def test_exists_returns_false_when_item_is_absent(mocker) -> None:
@@ -191,4 +192,5 @@ def test_ttl_raises_storage_error_when_table_vanishes(mocker) -> None:
   with pytest.raises(StorageError) as exc_info:
     backend.ttl("k")
   assert exc_info.value.operation == "ttl"
-  assert exc_info.value.__cause__ is error
+  assert exc_info.value.__cause__ is None
+  assert exc_info.value.__context__ is None

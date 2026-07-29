@@ -225,6 +225,7 @@ def storage_operation_error_boundary(
   backend_type: str,
   *,
   safe_messages: Collection[str] = (),
+  safe_message_predicate: Callable[[str], bool] | None = None,
   safe_connection_messages: Collection[str] = (),
   validator: Callable[..., None] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
@@ -235,10 +236,11 @@ def storage_operation_error_boundary(
   Both are reconstructed from static caller-selected metadata.  Storage
   failures retain their fixed operation but never the logical key; connection
   failures retain a trusted bundled backend type.  A caller may preserve a
-  known fixed storage or connection message through ``safe_messages`` and
-  ``safe_connection_messages``; all other messages use ``message``.  Input
-  validation runs outside the protected call.  Custom exception subclasses
-  and unknown implementation failures are intentionally not converted.
+  known fixed storage or connection message through ``safe_messages``, a
+  fail-closed ``safe_message_predicate``, and ``safe_connection_messages``;
+  all other messages use ``message``.  Input validation runs outside the
+  protected call.  Custom exception subclasses and unknown implementation
+  failures are intentionally not converted.
   """
 
   def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
@@ -269,13 +271,25 @@ def storage_operation_error_boundary(
 
       replacement_message = message
       raw_args: object = None
+      raw_message: object = None
+      predicate_matches = False
       if caught_storage_error is not None:
         raw_args = caught_storage_error.args
+        if type(raw_args) is tuple and len(raw_args) == 1:
+          raw_message = raw_args[0]
+          if type(raw_message) is str and safe_message_predicate is not None:
+            try:
+              predicate_matches = safe_message_predicate(raw_message)
+            except Exception:  # noqa: BLE001 - safe checks must fail closed
+              predicate_matches = False
         if (
           type(raw_args) is tuple
           and len(raw_args) == 1
           and type(raw_args[0]) is str
-          and raw_args[0] in safe_messages
+          and (
+            raw_args[0] in safe_messages
+            or predicate_matches
+          )
         ):
           replacement_message = raw_args[0]
         sanitized_error: BackendError = StorageError(
@@ -302,6 +316,8 @@ def storage_operation_error_boundary(
       del caught_connection_error
       del replacement_message
       del raw_args
+      del raw_message
+      del predicate_matches
       raise sanitized_error
 
     return wrapped

@@ -682,18 +682,18 @@ def test_every_sdk_operation_is_serialized_behind_store(
 
 
 @pytest.mark.parametrize(
-  ("method_name", "operation", "expected_key"),
+  ("method_name", "operation"),
   [
-    ("store", "store", "key"),
-    ("retrieve", "retrieve", "key"),
-    ("delete", "delete", "key"),
-    ("exists", "exists", "key"),
-    ("ttl", "ttl", "key"),
-    ("clear_storage", "clear_storage", None),
+    ("store", "store"),
+    ("retrieve", "retrieve"),
+    ("delete", "delete"),
+    ("exists", "exists"),
+    ("ttl", "ttl"),
+    ("clear_storage", "clear_storage"),
   ],
 )
 def test_storage_operations_after_disconnect_fail_without_stale_table_io(
-  mocker, method_name: str, operation: str, expected_key: str | None
+  mocker, method_name: str, operation: str
 ) -> None:
   backend = _backend()
   resource, table = _resource(mocker)
@@ -711,7 +711,7 @@ def test_storage_operations_after_disconnect_fail_without_stale_table_io(
       getattr(backend, method_name)("key")
 
   assert exc_info.value.operation == operation
-  assert exc_info.value.key == expected_key
+  assert exc_info.value.key is None
   assert table.method_calls == []
 
 
