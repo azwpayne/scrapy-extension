@@ -194,7 +194,7 @@ class BatchedStorageStrategy(StorageStrategy):
       self._monitor.on_buffer_depth(depth)
     except Exception:  # noqa: BLE001 - monitor must never crash storage
       try:
-        logger.debug("on_buffer_depth hook raised", exc_info=True)
+        logger.debug("on_buffer_depth hook raised")
       except BaseException:
         # This is only fallback diagnostics after an ordinary monitor failure.
         # It must not interrupt a synchronous store or the age-flush daemon.
@@ -208,7 +208,7 @@ class BatchedStorageStrategy(StorageStrategy):
       self._monitor.on_error(operation, error)
     except Exception:  # noqa: BLE001 - monitor must never crash storage
       try:
-        logger.debug("on_error hook raised", exc_info=True)
+        logger.debug("on_error hook raised")
       except BaseException:
         # This is a fallback diagnostic after an ordinary monitor failure.
         # It must not terminate the age-flush retry daemon and strand its
@@ -446,7 +446,7 @@ class BatchedStorageStrategy(StorageStrategy):
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - persistence already succeeded
         try:
-          logger.debug("on_store hook raised", exc_info=True)
+          logger.debug("on_store hook raised")
         except BaseException:
           # A diagnostic handler cannot be allowed to interrupt the remaining
           # snapshot after the monitor's ordinary failure was intentionally

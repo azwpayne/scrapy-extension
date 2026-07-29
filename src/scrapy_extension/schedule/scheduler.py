@@ -1452,7 +1452,7 @@ class BackendScheduler:
       # broker can redeliver. A custom logging handler is only diagnostic and
       # must not replace that documented ``False`` result.
       try:
-        logger.exception(log_message)
+        logger.error(log_message)
       except BaseException:
         pass
       return False
@@ -1481,7 +1481,7 @@ class BackendScheduler:
       # diagnostic handler is interrupted. Exceptions from queue.nack itself
       # still follow the direct queue-control contract above.
       try:
-        logger.exception(log_message)
+        logger.error(log_message)
       except BaseException:
         pass
       return False
@@ -1527,9 +1527,9 @@ class BackendScheduler:
     # logging handler can raise ``BaseException`` (for example when its output
     # stream is interrupted); swallowing that diagnostic failure keeps the
     # actual resource-close error, if any, as the observable outcome.
-    def _log_shutdown_exception(message: str, *args: object) -> None:
+    def _log_shutdown_exception(message: str) -> None:
       try:
-        logger.exception(message, *args)
+        logger.error(message)
       except BaseException:
         pass  # noqa: BLE001 — diagnostics must not abort teardown
 
@@ -1562,7 +1562,7 @@ class BackendScheduler:
           except Exception:
             # Each stale/already-disconnected tuple is independent: one failure
             # must not leave the other handler registered or block later cleanup.
-            _log_shutdown_exception("Failed to disconnect %s during shutdown", signal)
+            _log_shutdown_exception("Failed to disconnect signal during shutdown")
           except BaseException as exc:
             if primary_error is None:
               primary_error = exc
@@ -1880,9 +1880,7 @@ class BackendScheduler:
           except BaseException:
             pass
         try:
-          logger.exception(
-            "Failed to compensate enqueue interruption while preserving signal"
-          )
+          logger.error("Failed to compensate enqueue interruption while preserving signal")
         except BaseException:
           pass
       raise
@@ -1959,8 +1957,7 @@ class BackendScheduler:
     if not callable(forget):
       self._record_enqueue_diagnostic(
         "warning",
-        "Dupefilter %s cannot roll back a fingerprint after queue push failure",
-        type(self.dupefilter).__name__,
+        "Dupefilter cannot roll back a fingerprint after queue push failure",
         stat="scheduler/dupefilter_rollback_error",
       )
       return
@@ -2013,7 +2010,8 @@ class BackendScheduler:
   ) -> None:
     """Emit failure diagnostics without replacing a settled enqueue outcome."""
     try:
-      getattr(logger, level)(message, *args)
+      logger_method = logger.error if level == "exception" else getattr(logger, level)
+      logger_method(message, *args)
     except BaseException:
       pass
     if stat is not None:
@@ -2074,14 +2072,14 @@ class BackendScheduler:
         self._record_stat("scheduler/dequeued")
     except SerializationError:
       try:
-        logger.exception("Failed to deserialize queued request")
+        logger.error("Failed to deserialize queued request")
       except BaseException:
         pass
       self._record_stat("scheduler/deserialization_errors")
       return None
     except (QueueError, BackendConnectionError, CircuitBreakerOpenError):
       try:
-        logger.exception("Failed to get next request")
+        logger.error("Failed to get next request")
       except BaseException:
         pass
       return None

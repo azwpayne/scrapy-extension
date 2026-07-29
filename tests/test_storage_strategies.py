@@ -920,7 +920,7 @@ class TestBatchedStoragePartialFailure:
 
     assert [call.args[0] for call in backend.store.call_args_list] == ["k1", "k2"]
     assert [call.args[0] for call in monitor.on_store.call_args_list] == ["k1", "k2"]
-    debug.assert_called_once_with("on_store hook raised", exc_info=True)
+    debug.assert_called_once_with("on_store hook raised")
     assert strat.pending == 0
     assert strat._in_flight_count == 0
 

@@ -107,10 +107,7 @@ class MemoryMembershipFilter(MembershipFilter):
       self._monitor.on_filter_saturation(used, capacity)
     except Exception:  # noqa: BLE001 - telemetry must not alter filter state
       try:
-        logger.debug(
-          "Memory filter saturation monitor hook raised; ignored",
-          exc_info=True,
-        )
+        logger.debug("Memory filter saturation monitor hook raised; ignored")
       except BaseException:  # noqa: BLE001 - diagnostics are best effort too
         # The monitor exception is the authored control boundary: only this
         # fallback diagnostic is advisory.  A broken logging handler must not

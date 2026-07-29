@@ -223,13 +223,13 @@ def test_persist_snapshot_skips_when_store_raises() -> None:
 @pytest.mark.parametrize(
   ("fallback_site", "diagnostic_method"),
   [
-    pytest.param("snapshot", "exception", id="persist-snapshot"),
+    pytest.param("snapshot", "error", id="persist-snapshot"),
     pytest.param("storage-incapable", "info", id="persist-not-implemented"),
-    pytest.param("persist-resolver", "exception", id="persist-resolver"),
-    pytest.param("store", "exception", id="persist-store"),
-    pytest.param("restore-resolver", "exception", id="restore-resolver"),
-    pytest.param("retrieve", "exception", id="restore-retrieve"),
-    pytest.param("restore", "exception", id="strategy-restore"),
+    pytest.param("persist-resolver", "error", id="persist-resolver"),
+    pytest.param("store", "error", id="persist-store"),
+    pytest.param("restore-resolver", "error", id="restore-resolver"),
+    pytest.param("retrieve", "error", id="restore-retrieve"),
+    pytest.param("restore", "error", id="strategy-restore"),
   ],
 )
 @pytest.mark.parametrize(
@@ -493,7 +493,7 @@ def test_committed_replacement_survives_ack_failure_logger_diagnostic(
     "https://example.com/retry", meta={"_backend_ack_token": "old-token"}
   )
   mocker.patch(
-    "scrapy_extension.queue.queue.logger.exception", side_effect=diagnostic_error
+    "scrapy_extension.queue.queue.logger.error", side_effect=diagnostic_error
   )
 
   bq.push(request)
@@ -693,7 +693,7 @@ def test_terminal_ack_fallback_diagnostic_preserves_primary_outcome(
     queue_strategy=strategy,
   )
   logger_exception = mocker.patch(
-    "scrapy_extension.queue.queue.logger.exception", side_effect=diagnostic_error
+    "scrapy_extension.queue.queue.logger.error", side_effect=diagnostic_error
   )
 
   if failure_site == "empty-nack":
@@ -740,7 +740,7 @@ def test_stats_fallback_diagnostic_preserves_best_effort_primary_result(
     "scrapy_extension.queue.queue.logger.debug", side_effect=diagnostic_error
   )
 
-  with pytest.raises(SerializationError, match="exceeds max_item_bytes"):
+  with pytest.raises(SerializationError, match="Failed to serialize request"):
     bq.push(Request("https://example.com", body=b"too large"))
 
   spider.crawler.stats.inc_value.assert_called_once_with(

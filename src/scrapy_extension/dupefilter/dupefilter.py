@@ -315,7 +315,7 @@ class BackendDupeFilter:
         hook(*args)
       except Exception:  # noqa: BLE001 - telemetry must not alter dedup state
         try:
-          logger.debug("Dupefilter monitor hook raised; ignored", exc_info=True)
+          logger.debug("Dupefilter monitor hook raised; ignored")
         except BaseException:
           # The duplicate-filter decision and any reservation were already
           # linearized before monitor delivery. A broken logging handler must
@@ -1283,10 +1283,7 @@ class BackendDupeFilter:
             self._discard_reservation(owner_reservation)
     except BaseException:
       try:
-        logger.debug(
-          "Failed to compensate interrupted duplicate-filter decision",
-          exc_info=True,
-        )
+        logger.debug("Failed to compensate interrupted duplicate-filter decision")
       except BaseException:
         return
 

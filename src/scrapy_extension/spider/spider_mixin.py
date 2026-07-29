@@ -401,7 +401,7 @@ class BackendSpiderMixin(Spider):
         signal_manager.disconnect(handler, signal)
       except Exception:
         try:
-          logger.exception("Failed to disconnect backend lifecycle signal")
+          logger.error("Failed to disconnect backend lifecycle signal")
         except BaseException:
           pass
       except BaseException as exc:  # noqa: BLE001 - finish sibling cleanup
@@ -448,7 +448,7 @@ class BackendSpiderMixin(Spider):
       # keep the outer ``except Exception`` so direct control-flow exceptions
       # from close_backend still propagate.
       try:
-        logger.exception("close_backend() failed during spider_closed signal")
+        logger.error("close_backend() failed during spider_closed signal")
       except BaseException:
         pass
 
@@ -655,7 +655,7 @@ class BackendSpiderMixin(Spider):
       # Components borrow the mixin's single manager acquire, so each must
       # quiesce its own resources without releasing the manager. The final
       # manager close remains last, while strategies can still persist state.
-      for component, args, label in (
+      for component, args, _label in (
         (scheduler, ("spider-mixin-close",), "scheduler"),
         (queue, (), "queue"),
         (dupefilter, ("spider-mixin-close",), "dupefilter"),
@@ -668,7 +668,7 @@ class BackendSpiderMixin(Spider):
           # Diagnostics must not become a second teardown failure: custom
           # logging handlers can raise process-control exceptions too.
           try:
-            logger.exception("Failed to close backend %s", label)
+            logger.error("Failed to close backend component")
           except BaseException:  # noqa: BLE001 - teardown must continue
             pass
         except BaseException as exc:  # noqa: BLE001 - preserve process control
@@ -682,7 +682,7 @@ class BackendSpiderMixin(Spider):
           # Keep the manager release independent from diagnostic handlers for
           # the same reason as component cleanup above.
           try:
-            logger.exception("Failed to close backend connection manager")
+            logger.error("Failed to close backend connection manager")
           except BaseException:  # noqa: BLE001 - teardown must continue
             pass
         except BaseException as exc:  # noqa: BLE001 - do not mask component error

@@ -507,10 +507,8 @@ class BackendQueue:
         # The replacement commit is already visible. A broken logging handler
         # must not reclassify that committed enqueue as a failed push.
         try:
-          logger.exception(
-            "Failed to acknowledge source delivery after replacement committed "
-            "to queue %r",
-            self.queue_name,
+          logger.error(
+            "Failed to acknowledge source delivery after replacement committed"
           )
         except BaseException:
           pass
@@ -522,7 +520,7 @@ class BackendQueue:
       # Keep the monitor's ordinary failure swallowed even when its fallback
       # diagnostic handler raises a control-flow exception.
       try:
-        logger.debug("monitor.on_push raised; ignored", exc_info=True)
+        logger.debug("monitor.on_push raised; ignored")
       except BaseException:
         pass
     return push_is_durable
@@ -599,7 +597,7 @@ class BackendQueue:
       self._monitor.on_pop(self.queue_name)
     except Exception:  # noqa: BLE001 - atomic backends already removed the item
       try:
-        logger.debug("monitor.on_pop raised; ignored", exc_info=True)
+        logger.debug("monitor.on_pop raised; ignored")
       except BaseException:
         pass
     # U2 operability: record this pop into the rolling window, then emit the
@@ -614,7 +612,7 @@ class BackendQueue:
         self._emit_pop_rate()
       except Exception:  # noqa: BLE001
         try:
-          logger.debug("monitor.on_pop_rate raised; ignored", exc_info=True)
+          logger.debug("monitor.on_pop_rate raised; ignored")
         except BaseException:
           pass
     # Sample depth after each pop — this is the backpressure signal (architect's
@@ -627,7 +625,7 @@ class BackendQueue:
       self._monitor.on_queue_depth(self.queue_name, self._probe_depth())
     except Exception:  # noqa: BLE001
       try:
-        logger.debug("monitor.on_queue_depth raised; ignored", exc_info=True)
+        logger.debug("monitor.on_queue_depth raised; ignored")
       except BaseException:
         pass
 
@@ -644,10 +642,7 @@ class BackendQueue:
             self._nack(token=ack_token)
           except Exception:  # noqa: BLE001 - preserve the ack failure
             try:
-              logger.exception(
-                "Failed to nack empty payload after ack failure from queue %r",
-                self.queue_name,
-              )
+              logger.error("Failed to nack empty payload after ack failure")
             except BaseException:
               pass
           raise
@@ -683,10 +678,7 @@ class BackendQueue:
           poison_terminated = True
         except Exception:  # noqa: BLE001 - preserve the deserialize failure
           try:
-            logger.exception(
-              "Failed to acknowledge malformed payload from queue %r",
-              self.queue_name,
-            )
+            logger.error("Failed to acknowledge malformed payload")
           except BaseException:
             pass
       if poison_terminated:
@@ -1086,10 +1078,7 @@ class BackendQueue:
       self._ack(token=token)
     except Exception:  # noqa: BLE001 - preserve the local validation error
       try:
-        logger.exception(
-          "Failed to acknowledge invalid replacement from queue %r",
-          self.queue_name,
-        )
+        logger.error("Failed to acknowledge invalid replacement")
       except BaseException:
         pass
       return
@@ -1116,7 +1105,7 @@ class BackendQueue:
         stats.inc_value(stat_name)
       except Exception:  # noqa: BLE001 - stats cannot mask the queue result
         try:
-          logger.debug("stats.inc_value(%s) raised; ignored", stat_name, exc_info=True)
+          logger.debug("stats.inc_value raised; ignored")
         except BaseException:
           pass
 
@@ -1252,7 +1241,7 @@ class BackendQueue:
       # handler may raise even a control-flow BaseException; it must not turn
       # the promised non-fatal snapshot failure into a failed close.
       try:
-        logger.exception("strategy.snapshot() raised; skipping persist")
+        logger.error("Strategy snapshot failed; skipping persist")
       except BaseException:
         pass
       return
@@ -1277,10 +1266,7 @@ class BackendQueue:
       return
     except Exception:  # noqa: BLE001 — resolver must not crash close
       try:
-        logger.exception(
-          "Failed to resolve storage backend for queue %r; skipping snapshot persist.",
-          self.queue_name,
-        )
+        logger.error("Failed to resolve storage backend; skipping snapshot persist")
       except BaseException:
         pass
       return
@@ -1314,10 +1300,7 @@ class BackendQueue:
         storage.store(snapshot_key, state)
     except Exception:  # noqa: BLE001 — store must not crash close
       try:
-        logger.exception(
-          "Failed to update strategy snapshot for queue %r; continuing.",
-          self.queue_name,
-        )
+        logger.error("Failed to update strategy snapshot; continuing")
       except BaseException:
         pass
 
@@ -1344,10 +1327,7 @@ class BackendQueue:
       return  # storage-incapable backend — no prior snapshot to restore
     except Exception:  # noqa: BLE001 — resolver must not crash startup
       try:
-        logger.exception(
-          "Failed to resolve storage backend for queue %r; starting clean.",
-          self.queue_name,
-        )
+        logger.error("Failed to resolve storage backend; starting clean")
       except BaseException:
         pass
       return
@@ -1356,10 +1336,7 @@ class BackendQueue:
       state = storage.retrieve(snapshot_key)
     except Exception:  # noqa: BLE001 — retrieve must not crash startup
       try:
-        logger.exception(
-          "Failed to retrieve strategy snapshot for queue %r; starting clean.",
-          self.queue_name,
-        )
+        logger.error("Failed to retrieve strategy snapshot; starting clean")
       except BaseException:
         pass
       return
@@ -1388,9 +1365,6 @@ class BackendQueue:
       self._strategy.restore(bytes(state))
     except Exception:  # noqa: BLE001 — restore must not crash startup (docstring)
       try:
-        logger.exception(
-          "strategy.restore() raised for queue %r; starting clean.",
-          self.queue_name,
-        )
+        logger.error("Strategy snapshot restore failed; starting clean")
       except BaseException:
         pass

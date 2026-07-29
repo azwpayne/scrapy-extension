@@ -689,7 +689,7 @@ class TestEnqueueBranchClosure:
 class TestAckNackFailureObservability:
   """R-ack-obs (ultracode workflow v2): the deferred-ack signal handlers
   ``_on_response_received`` / ``_on_spider_error`` swallow ack/nack
-  ``QueueError`` with ``logger.exception`` only and bump NO stat counter.
+  ``QueueError`` with fixed ``logger.error`` diagnostics and bump NO stat counter.
   At-least-once is PRESERVED (the message stays unacked → visibility-timeout
   redelivery on MQ backends), so the swallow is correct — but operators
   cannot detect ack/nack failure storms via Scrapy stats. Mirror the
@@ -698,7 +698,7 @@ class TestAckNackFailureObservability:
   """
 
   def test_ack_failure_increments_stat(self) -> None:
-    """A QueueError from BackendQueue.ack → logger.exception + scheduler/ack_error."""
+    """A QueueError from BackendQueue.ack → logger.error + scheduler/ack_error."""
     manager = MagicMock(name="ConnectionManager")
     counts, stats = _stats_counter()
     scheduler = BackendScheduler(
@@ -717,7 +717,7 @@ class TestAckNackFailureObservability:
     assert counts.get("scheduler/ack_error") == 1
 
   def test_nack_failure_increments_stat(self) -> None:
-    """A QueueError from BackendQueue.nack → logger.exception + scheduler/nack_error."""
+    """A QueueError from BackendQueue.nack → logger.error + scheduler/nack_error."""
     manager = MagicMock(name="ConnectionManager")
     counts, stats = _stats_counter()
     scheduler = BackendScheduler(
@@ -785,7 +785,7 @@ class TestAckNackFailureObservability:
     getattr(queue, operation).side_effect = BackendError("connection retired")
     scheduler._queue = queue
     mocker.patch(
-      "scrapy_extension.schedule.scheduler.logger.exception",
+      "scrapy_extension.schedule.scheduler.logger.error",
       side_effect=diagnostic_error("diagnostic interrupted"),
     )
     request = Request(
@@ -816,7 +816,7 @@ class TestAckNackFailureObservability:
     getattr(queue, operation).side_effect = control_error("queue interrupted")
     scheduler._queue = queue
     log_exception = mocker.patch(
-      "scrapy_extension.schedule.scheduler.logger.exception",
+      "scrapy_extension.schedule.scheduler.logger.error",
     )
 
     with pytest.raises(control_error, match="queue interrupted"):

@@ -709,7 +709,7 @@ def test_next_request_preserves_empty_poll_when_failure_logger_interrupts(
   queue.pop.side_effect = queue_error
   scheduler._queue = queue
   mocker.patch(
-    "scrapy_extension.schedule.scheduler.logger.exception",
+    "scrapy_extension.schedule.scheduler.logger.error",
     side_effect=diagnostic_error,
   )
 
@@ -728,7 +728,7 @@ def test_next_request_keeps_queue_process_control_observable(
   queue.pop.side_effect = control_error("queue interrupted")
   scheduler._queue = queue
   diagnostic = mocker.patch(
-    "scrapy_extension.schedule.scheduler.logger.exception",
+    "scrapy_extension.schedule.scheduler.logger.error",
   )
 
   with pytest.raises(control_error, match="queue interrupted"):
@@ -1908,7 +1908,7 @@ def test_enqueue_serialization_failure_survives_diagnostic_fault(
   queue.push.side_effect = SerializationError("cannot serialize")
   scheduler._queue = queue
   if diagnostic == "logger":
-    mocker.patch.object(scheduler_module.logger, "exception", side_effect=diagnostic_error)
+    mocker.patch.object(scheduler_module.logger, "error", side_effect=diagnostic_error)
   else:
     stats.inc_value.side_effect = diagnostic_error
 
@@ -1946,7 +1946,7 @@ def test_dedup_outage_fallback_preserves_result_through_diagnostic_fault(
     queue.push.side_effect = QueueError("queue unavailable")
   scheduler._queue = queue
   if diagnostic == "logger":
-    mocker.patch.object(scheduler_module.logger, "exception", side_effect=diagnostic_error)
+    mocker.patch.object(scheduler_module.logger, "error", side_effect=diagnostic_error)
   else:
     stats.inc_value.side_effect = diagnostic_error
 
@@ -1990,7 +1990,7 @@ def test_enqueue_ordinary_rollback_failure_survives_diagnostic_fault(
   queue.push.side_effect = QueueError("queue unavailable")
   scheduler._queue = queue
   if diagnostic == "logger":
-    mocker.patch.object(scheduler_module.logger, "exception", side_effect=diagnostic_error)
+    mocker.patch.object(scheduler_module.logger, "error", side_effect=diagnostic_error)
   else:
     stats.inc_value.side_effect = diagnostic_error
 

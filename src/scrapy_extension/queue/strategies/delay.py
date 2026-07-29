@@ -206,7 +206,7 @@ class DelayQueueStrategy(QueueStrategy):
       self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 — monitor must never crash push
       try:
-        logger.debug("on_delay_depth hook raised", exc_info=True)
+        logger.debug("on_delay_depth hook raised")
       except BaseException:
         # This is fallback telemetry after the held item is already published.
         # A diagnostic handler must not turn the successful push into a failure.
@@ -266,7 +266,7 @@ class DelayQueueStrategy(QueueStrategy):
         self._monitor.on_delay_depth(held)
       except Exception:  # noqa: BLE001 — monitor must never crash push
         try:
-          logger.debug("on_delay_depth hook raised", exc_info=True)
+          logger.debug("on_delay_depth hook raised")
         except BaseException:
           # This is fallback telemetry after the held item is already published.
           # A diagnostic handler must not turn the successful push into a failure.
@@ -421,7 +421,7 @@ class DelayQueueStrategy(QueueStrategy):
       self._monitor.on_delay_depth(held)
     except Exception:  # noqa: BLE001 - monitor must not break the drain path
       try:
-        logger.debug("on_delay_depth hook raised", exc_info=True)
+        logger.debug("on_delay_depth hook raised")
       except BaseException:
         # The held-to-live transfer already completed; fallback telemetry must
         # not report that successful drain as a failure.
@@ -461,7 +461,7 @@ class DelayQueueStrategy(QueueStrategy):
       self._monitor.on_delay_depth(0)
     except Exception:  # noqa: BLE001 - monitor must not break clear()
       try:
-        logger.debug("on_delay_depth hook raised", exc_info=True)
+        logger.debug("on_delay_depth hook raised")
       except BaseException:
         # The explicit clear already completed; fallback telemetry is best effort.
         pass

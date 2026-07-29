@@ -349,7 +349,7 @@ class TestBackendQueueMonitorWiring:
       spider=spider,
       max_item_bytes=64,
     )
-    with pytest.raises(Exception, match="exceeds.*max"):
+    with pytest.raises(SerializationError, match="Failed to serialize request"):
       queue.push(Request(url="https://example.com", body=b"x" * 200))
     # Tier-1 stat preserved
     assert stats.get_value("scheduler/queue/oversize_dropped") == 1
@@ -943,22 +943,24 @@ class TestScrapyStatsMonitorResilience:
 
     caplog.set_level(logging.DEBUG, logger="scrapy_extension.monitor.stats")
     stats = MagicMock()
-    stats.inc_value.side_effect = RuntimeError("stats backend down")
-    stats.set_value.side_effect = RuntimeError("stats backend down")
+    marker = "round45_stats_private_marker"
+    stats.inc_value.side_effect = RuntimeError(marker)
+    stats.set_value.side_effect = RuntimeError(marker)
     monitor = ScrapyStatsMonitor(stats)
     # Must NOT raise — the @_stats_safe wrapper swallows + logs at debug.
     result = getattr(monitor, hook)(**kwargs)
     assert result is None  # hooks return None on the swallowed path
-    # Lock in the debug-log contract (review feedback): the failure is
-    # surfaced for diagnosis, not silently dropped.
+    # The diagnostic is deliberately fixed: a custom LogRecord handler must
+    # not receive a stats exception graph or dynamically supplied hook name.
     debug_msgs = [
       r.getMessage()
       for r in caplog.records
       if r.levelno == logging.DEBUG and r.name == "scrapy_extension.monitor.stats"
     ]
-    assert any(hook in m and "ignored" in m for m in debug_msgs), (
-      f"expected debug log for {hook} failure; got: {debug_msgs}"
-    )
+    assert debug_msgs == ["ScrapyStatsMonitor hook raised; ignored"]
+    assert all(marker not in record.getMessage() for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
+    assert all(record.exc_text is None for record in caplog.records)
 
   def test_stats_failure_remains_suppressed_when_debug_handler_interrupts(
     self, mocker

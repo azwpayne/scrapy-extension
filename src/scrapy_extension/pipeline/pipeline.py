@@ -688,11 +688,7 @@ class BackendPipeline:
       try:
         self._monitor.on_store(key)
       except Exception:  # noqa: BLE001 - storage has already succeeded
-        _emit_diagnostic(
-          logger.debug,
-          "monitor.on_store raised; ignored",
-          exc_info=True,
-        )
+        _emit_diagnostic(logger.debug, "monitor.on_store raised; ignored")
     _emit_diagnostic(logger.debug, "Stored item: %s", key)
     return item
 
@@ -716,12 +712,7 @@ class BackendPipeline:
       try:
         stats.inc_value(stat_name)
       except Exception:  # noqa: BLE001 - stats cannot mask the pipeline result
-        _emit_diagnostic(
-          logger.debug,
-          "stats.inc_value(%s) raised; ignored",
-          stat_name,
-          exc_info=True,
-        )
+        _emit_diagnostic(logger.debug, "stats.inc_value raised; ignored")
 
 
   def _generate_item_key(self, spider: Spider) -> str:

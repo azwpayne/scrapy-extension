@@ -1165,7 +1165,7 @@ class TestOnSpiderClosed:
       spider, "close_backend", side_effect=RuntimeError("close failed")
     )
     mocker.patch(
-      "scrapy_extension.spider.spider_mixin.logger.exception",
+      "scrapy_extension.spider.spider_mixin.logger.error",
       side_effect=diagnostic_error,
     )
 
@@ -1655,7 +1655,7 @@ class TestCloseBackend:
     spider._connection_manager = manager
     scheduler.close.side_effect = RuntimeError("scheduler failed")
     mocker.patch(
-      "scrapy_extension.spider.spider_mixin.logger.exception",
+      "scrapy_extension.spider.spider_mixin.logger.error",
       side_effect=KeyboardInterrupt(),
     )
 

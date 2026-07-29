@@ -1126,7 +1126,7 @@ class TestCloseDiagnosticsAreNonFatal:
     connected_signals = scheduler._connected_signals
     connected_signals.disconnect.side_effect = [RuntimeError("stale"), None]
     mocker.patch(
-      "scrapy_extension.schedule.scheduler.logger.exception",
+      "scrapy_extension.schedule.scheduler.logger.error",
       side_effect=KeyboardInterrupt("interrupted exception logger"),
     )
 
