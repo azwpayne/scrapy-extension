@@ -896,6 +896,62 @@ class TestBatchedStoragePartialFailure:
     ]
     assert strat.pending == 0
 
+  def test_on_store_error_and_debug_control_error_leave_batch_durable(
+    self, mocker
+  ) -> None:
+    """An ordinary monitor failure cannot stop later writes, even if logging fails."""
+    backend = mocker.Mock()
+    monitor = mocker.Mock()
+    monitor.on_store.side_effect = [RuntimeError("monitor down"), None]
+    debug = mocker.patch.object(
+      batched_module.logger,
+      "debug",
+      side_effect=KeyboardInterrupt("debug handler interrupted"),
+    )
+    strat = BatchedStorageStrategy(threshold=2, monitor=monitor)
+
+    strat.store(backend, "k1", b"v1")
+    strat.store(backend, "k2", b"v2")
+
+    assert [call.args[0] for call in backend.store.call_args_list] == ["k1", "k2"]
+    assert [call.args[0] for call in monitor.on_store.call_args_list] == ["k1", "k2"]
+    debug.assert_called_once_with("on_store hook raised", exc_info=True)
+    assert strat.pending == 0
+    assert strat._in_flight_count == 0
+
+  def test_final_on_store_control_error_releases_accounting_without_retry(self, mocker) -> None:
+    """A control signal after the final durable item must not invent a retry tail."""
+    backend = mocker.Mock()
+    monitor = mocker.Mock()
+
+    def stop_after_final_store(key: str) -> None:
+      if key == "k2":
+        raise SystemExit("stop after final durable write")
+
+    monitor.on_store.side_effect = stop_after_final_store
+    strat = BatchedStorageStrategy(threshold=2, monitor=monitor)
+    strat.store(backend, "k1", b"v1")
+
+    with pytest.raises(SystemExit, match="stop after final durable write"):
+      strat.store(backend, "k2", b"v2")
+
+    assert [call.args[0] for call in backend.store.call_args_list] == ["k1", "k2"]
+    assert strat._buffer == []
+    assert strat.pending == 0
+    assert strat._in_flight_count == 0
+
+  def test_empty_retry_tail_is_an_accounting_noop(self) -> None:
+    """An empty recovery tail cannot alter an active snapshot's accounting."""
+    strat = BatchedStorageStrategy(threshold=2)
+    with strat._lock:
+      strat._in_flight_count = 1
+
+    assert strat._requeue_tail([]) == 1
+    assert strat._buffer == []
+    assert strat._oldest_ts is None
+    assert strat.pending == 1
+    assert strat._in_flight_count == 1
+
   def test_backend_primary_survives_warning_and_depth_control_errors(self, mocker) -> None:
     """Recovery diagnostics must not replace the causal backend exception."""
     backend = mocker.Mock()
