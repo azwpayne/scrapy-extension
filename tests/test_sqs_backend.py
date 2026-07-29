@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 import threading
 import traceback
 from contextlib import contextmanager
@@ -10,6 +12,7 @@ from unittest.mock import MagicMock
 import boto3
 import pytest
 
+import scrapy_extension.backends.sqs as sqs_mod
 from scrapy_extension.backends.base import (
   BackendType,
   QueueBackend,
@@ -55,6 +58,19 @@ def _connected(mocker, **client_children):
   _patch_client(mocker, return_value=client)
   b.connect()
   return b, client
+
+
+class _ExceptionContextProbe(logging.Handler):
+  """Capture exception state available to synchronous backend handlers."""
+
+  def __init__(self) -> None:
+    super().__init__(logging.DEBUG)
+    self.records: list[logging.LogRecord] = []
+    self.contexts: list[tuple[object | None, object | None, object | None]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.contexts.append(sys.exc_info())
 
 
 class TestSqsBackendType:
@@ -445,6 +461,27 @@ class TestSqsConnect:
     client.close.assert_called_once_with()
     assert b._generation is None
     assert b._client is None
+
+  def test_disconnect_cleanup_log_has_no_active_close_exception(self, mocker) -> None:
+    marker = "round48-sqs-close-marker"
+    b, client = _connected(mocker)
+    client.close.side_effect = RuntimeError(marker)
+    probe = _ExceptionContextProbe()
+    logger = sqs_mod.logger
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(probe)
+    try:
+      b.disconnect()
+    finally:
+      logger.removeHandler(probe)
+      logger.setLevel(old_level)
+
+    assert [record.getMessage() for record in probe.records] == [
+      "Suppressed SQS cleanup error"
+    ]
+    assert probe.contexts == [(None, None, None)]
+    assert marker not in repr(probe.records)
 
   def test_disconnect_propagates_close_control_exception_after_detach(
     self, mocker
@@ -964,6 +1001,33 @@ class TestSqsPushPop:
     )
     diagnostic.assert_called_once_with("Failed to delete malformed SQS message.")
     assert marker not in repr(diagnostic.call_args_list)
+
+  def test_pop_malformed_body_cleanup_log_has_no_active_error_context(
+    self, mocker
+  ) -> None:
+    marker = "round48-sqs-poison-marker"
+    b, client = _connected(mocker)
+    client.receive_message.return_value = {
+      "Messages": [{"Body": f"!{marker}!", "ReceiptHandle": "rh"}]
+    }
+    client.delete_message.side_effect = RuntimeError(marker)
+    probe = _ExceptionContextProbe()
+    logger = sqs_mod.logger
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(probe)
+    try:
+      with pytest.raises(QueueError) as raised:
+        b.pop("queue1")
+    finally:
+      logger.removeHandler(probe)
+      logger.setLevel(old_level)
+
+    assert [record.getMessage() for record in probe.records] == [
+      "Failed to delete malformed SQS message."
+    ]
+    assert probe.contexts == [(None, None, None)]
+    assert marker not in repr(probe.records)
 
   def test_pop_malformed_body_propagates_direct_delete_interrupt(
     self, mocker

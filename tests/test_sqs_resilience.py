@@ -254,20 +254,17 @@ def test_nack_with_token_keeps_nonmatching_legacy_last_receipt(mocker) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _swallow suppresses + logs a cleanup exception (lines 534-535)
+# _swallow records a cleanup exception for its outer caller
 # ---------------------------------------------------------------------------
 
 
-def test_swallow_suppresses_and_logs_cleanup_exception(caplog) -> None:
-  """Lines 534-535: ``_swallow`` catches an exception raised inside the
-  context, logs it at debug, and suppresses propagation (returns True) —
-  the contract disconnect() relies on so a flaky ``client.close()`` never
-  crashes teardown."""
-  with caplog.at_level(logging.DEBUG):
-    with _swallow():
-      raise RuntimeError("cleanup boom")
-  # Propagation suppressed (we reached this assert without the raise escaping):
-  assert any("Suppressed SQS cleanup error" in r.message for r in caplog.records)
+def test_swallow_suppresses_and_records_cleanup_exception() -> None:
+  """``_swallow`` leaves diagnostics to its outer caller after unwinding."""
+  cleanup = _swallow()
+  with cleanup:
+    raise RuntimeError("cleanup boom")
+  # Propagation suppressed (we reached this assert without the raise escaping).
+  assert cleanup.did_suppress is True
 
 
 def test_swallow_does_not_suppress_base_exception() -> None:
@@ -282,6 +279,7 @@ def test_swallow_does_not_suppress_base_exception() -> None:
   sw.__enter__()
   # Regular Exception is suppressed (returns True).
   assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+  assert sw.did_suppress is True
   # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
   assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
   # No exception (exc_type None) -> False (normal exit, propagate nothing).

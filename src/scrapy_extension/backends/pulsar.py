@@ -453,6 +453,7 @@ class PulsarBackend(Backend, QueueBackend):
     # a concurrent disconnect/reconnect has already retired and replaced.
     published_generation: int | None = None
     startup_error: BackendConnectionError | None = None
+    failed_connect: tuple[Any, int | None] | None = None
     try:
       kwargs: dict[str, Any] = {}
       # Keep the package's public compatibility names, but translate them to
@@ -495,7 +496,10 @@ class PulsarBackend(Backend, QueueBackend):
     except ConfigurationError:
       raise
     except Exception:
-      self._abort_failed_connect(client, published_generation)
+      # Keep only the candidate state while this error suite is active. The
+      # close and its diagnostic run below, after the raw driver error has
+      # unwound, so cleanup hooks cannot recover it through ``sys.exc_info``.
+      failed_connect = (client, published_generation)
       startup_error = BackendConnectionError(
         "Failed to connect to Pulsar.", backend_type="pulsar"
       )
@@ -508,6 +512,15 @@ class PulsarBackend(Backend, QueueBackend):
       self._abort_failed_connect(client, published_generation)
       raise
 
+    if failed_connect is not None:
+      cleanup_failure_count = self._abort_failed_connect(*failed_connect)
+      for _ in range(cleanup_failure_count):
+        try:
+          logger.debug("Failed to close Pulsar connect candidate")
+        except BaseException:
+          # Diagnostics cannot replace the static startup error below.
+          pass
+
     if startup_error is not None:
       # Raise outside the driver exception handler so endpoint/credential text
       # cannot survive through ``__cause__`` or ``__context__``.
@@ -515,7 +528,7 @@ class PulsarBackend(Backend, QueueBackend):
 
   def _abort_failed_connect(
     self, client: Any, published_generation: int | None
-  ) -> None:
+  ) -> int:
     """Detach and best-effort close only this failed connect generation.
 
     A normal connection failure commonly happens before publication.  The
@@ -525,11 +538,13 @@ class PulsarBackend(Backend, QueueBackend):
     already own and have replaced the old client. Pure post-publication
     telemetry is isolated by :meth:`connect` and must not reach this helper.
     Cleanup intentionally swallows *all* exceptions, including control-flow
-    exceptions from driver ``close()``, because this helper runs while another
-    connection failure is already propagating.
+    exceptions from driver ``close()``. The returned failure count lets the
+    normal failure path preserve one static diagnostic per failed close after
+    its original exception has unwound; callers preserving a primary
+    control-flow exception ignore it.
     """
     if client is None:
-      return
+      return 0
 
     handles: list[Any] = []
     if published_generation is None:
@@ -565,16 +580,15 @@ class PulsarBackend(Backend, QueueBackend):
           self._lifecycle_generation += 1
           handles = [*consumers.values(), *producers.values(), client]
 
+    cleanup_failure_count = 0
     for handle in handles:
       try:
         handle.close()
       except BaseException:
-        # A driver close or logging integration must never replace the
-        # connection failure currently being handled.
-        try:
-          logger.debug("Failed to close Pulsar connect candidate")
-        except BaseException:
-          pass
+        # A driver close must never replace the connection failure currently
+        # being handled. The normal failure path logs after this helper returns.
+        cleanup_failure_count += 1
+    return cleanup_failure_count
 
   def disconnect(self) -> None:
     """Close the Pulsar client and release producers/consumers."""
@@ -607,12 +621,15 @@ class PulsarBackend(Backend, QueueBackend):
     """Close every detached handle, retaining the first control exception."""
     primary_error: BaseException | None = None
     for handle in handles:
+      cleanup = _suppress_pulsar_errors()
       try:
-        with _suppress_pulsar_errors():
+        with cleanup:
           handle.close()
       except BaseException as error:
         if primary_error is None:
           primary_error = error
+      if cleanup.did_suppress:
+        _log_suppressed_cleanup_error()
     if primary_error is not None:
       raise primary_error
 
@@ -712,8 +729,11 @@ class PulsarBackend(Backend, QueueBackend):
         if not published:
           self._close_aborted_handle(producer)
         raise
-      with _suppress_pulsar_errors():
+      cleanup = _suppress_pulsar_errors()
+      with cleanup:
         producer.close()
+      if cleanup.did_suppress:
+        _log_suppressed_cleanup_error()
       raise QueueError(
         f"Failed to create Pulsar producer for {topic}: connection changed",
         queue_name=topic,
@@ -888,19 +908,13 @@ class PulsarBackend(Backend, QueueBackend):
     # Subscribe errors must propagate (not be masked as "empty"); only the
     # receive call maps a no-message result to None.
     consumer = self._ensure_consumer(topic)
+    timed_out = False
     try:
       # timeout=0 -> a short poll; Pulsar needs a positive timeout_millis.
       timeout_ms = int(timeout * 1000) if timeout > 0 else 100
-      return (consumer.receive(timeout_millis=timeout_ms), consumer)
+      message = consumer.receive(timeout_millis=timeout_ms)
     except pulsar.Timeout:
-      # No message within the timeout window is the normal "empty" case.
-      # A logging handler is optional diagnostics, so it must not turn a
-      # broker-confirmed empty poll into an operational failure.
-      try:
-        logger.debug("Pulsar receive returned no message.")
-      except BaseException:
-        pass
-      return (None, consumer)
+      timed_out = True
     except Exception as e:
       # Broker disconnects, authorization failures, and invalid consumer state
       # are operational failures, not evidence that the queue is empty. A
@@ -910,6 +924,16 @@ class PulsarBackend(Backend, QueueBackend):
         queue_name=queue_name,
         operation="pop",
       ) from e
+
+    if timed_out:
+      # The timeout handler above has unwound, so a synchronous log handler
+      # cannot recover the driver's exception through ``sys.exc_info``.
+      try:
+        logger.debug("Pulsar receive returned no message.")
+      except BaseException:
+        pass
+      return (None, consumer)
+    return (message, consumer)
 
   @queue_operation_error_boundary(
     "ack",
@@ -1180,8 +1204,11 @@ class PulsarBackend(Backend, QueueBackend):
         if not published:
           self._close_aborted_handle(consumer)
         raise
-      with _suppress_pulsar_errors():
+      cleanup = _suppress_pulsar_errors()
+      with cleanup:
         consumer.close()
+      if cleanup.did_suppress:
+        _log_suppressed_cleanup_error()
       raise QueueError(
         f"Failed to subscribe to Pulsar topic {topic}: connection changed",
         queue_name=topic,
@@ -1217,14 +1244,20 @@ def _message_bytes(msg: Any) -> bytes:
 
 
 class _suppress_pulsar_errors:
-  """Context manager that swallows pulsar-client errors on cleanup paths.
+  """Suppress regular cleanup errors and report that suppression to callers.
 
   Close() calls during disconnect/clear must not raise — a failing close
   during teardown would mask the original error and break cleanup of the
-  remaining handles.
+  remaining handles. ``__exit__`` deliberately performs no diagnostics: it
+  runs with the close error active in ``sys.exc_info()``. Callers inspect
+  :attr:`did_suppress` after the ``with`` statement, then log static context.
   """
 
+  def __init__(self) -> None:
+    self.did_suppress = False
+
   def __enter__(self) -> _suppress_pulsar_errors:
+    self.did_suppress = False
     return self
 
   def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
@@ -1236,12 +1269,14 @@ class _suppress_pulsar_errors:
     # operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    # Diagnostics are strictly secondary to the cleanup contract.  A custom
-    # logging handler can itself raise a control-flow exception; it must not
-    # turn an ordinary close error into that exception or stop later handles
-    # from being released.
-    try:
-      logger.debug("Suppressed pulsar cleanup error")
-    except BaseException:
-      pass
+    self.did_suppress = True
     return True
+
+
+def _log_suppressed_cleanup_error() -> None:
+  """Report a suppressed cleanup failure after its exception context unwinds."""
+  try:
+    logger.debug("Suppressed pulsar cleanup error")
+  except BaseException:
+    # Diagnostics must not stop later handle cleanup or replace terminal errors.
+    pass

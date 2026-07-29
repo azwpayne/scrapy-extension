@@ -560,12 +560,15 @@ class SqsBackend(Backend, QueueBackend):
         generation.queue_urls.clear()
         generation.queue_resolution_locks.clear()
         generation.queue_lifecycles.clear()
+        cleanup = _swallow()
         try:
-          with _swallow():
+          with cleanup:
             generation.client.close()
         except BaseException as error:
           if primary_error is None:
             primary_error = error
+        if cleanup.did_suppress:
+          _log_suppressed_cleanup_error()
     if primary_error is not None:
       raise primary_error
 
@@ -1052,30 +1055,34 @@ class SqsBackend(Backend, QueueBackend):
             operation="pop",
           )
         raw_body = msg.get("Body")
+        decode_failed = False
+        body: bytes = b""
         try:
           if not isinstance(raw_body, str) or not raw_body:
             raise ValueError("message body is missing or empty")
           body = base64.b64decode(raw_body, validate=True)
-        except (binascii.Error, TypeError, ValueError) as e:
+        except (binascii.Error, TypeError, ValueError):
+          decode_failed = True
+
+        if decode_failed:
           # This exact body cannot become valid on retry. Best-effort deletion
           # terminates the poison delivery; failure leaves normal redrive intact.
+          delete_failed = False
           try:
             generation.client.delete_message(
               QueueUrl=url, ReceiptHandle=receipt
             )
           except Exception:  # noqa: BLE001 - preserve the decode failure below
-            # Diagnostic handlers are user-configurable and can themselves
-            # raise a control exception. The malformed body is the causal
-            # failure here, so logging must not replace its QueueError.
-            try:
-              logger.warning("Failed to delete malformed SQS message.")
-            except BaseException:  # noqa: BLE001 - retain decode failure
-              pass
+            delete_failed = True
+          if delete_failed:
+            # Both the decode and delete exception suites have unwound. A
+            # synchronous handler therefore cannot recover either raw error.
+            _log_malformed_message_delete_failure()
           raise QueueError(
-            f"Invalid base64 body in SQS queue {queue_name}: {e}",
+            f"Invalid base64 body in SQS queue {queue_name}.",
             queue_name=queue_name,
             operation="pop",
-          ) from e
+          )
         if record_legacy:
           with self._in_flight_lock:
             self._last_receipt = (url, receipt)
@@ -1336,9 +1343,18 @@ class SqsBackend(Backend, QueueBackend):
 
 
 class _swallow:
-  """Context manager that swallows cleanup-path errors (close() etc.)."""
+  """Suppress regular cleanup errors and report that suppression to callers.
+
+  ``__exit__`` runs with the cleanup exception active.  It only records the
+  outcome; the outer teardown emits its static diagnostic after the ``with``
+  statement completes.
+  """
+
+  def __init__(self) -> None:
+    self.did_suppress = False
 
   def __enter__(self) -> _swallow:
+    self.did_suppress = False
     return self
 
   def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
@@ -1350,11 +1366,23 @@ class _swallow:
     # (the operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    # This diagnostic describes an error we have deliberately decided to
-    # suppress.  A failing logging handler must not turn that ordinary cleanup
-    # failure into a teardown failure (or mask the original close result).
-    try:
-      logger.debug("Suppressed SQS cleanup error")
-    except BaseException:
-      pass
+    self.did_suppress = True
     return True
+
+
+def _log_suppressed_cleanup_error() -> None:
+  """Report a suppressed cleanup failure after its exception context unwinds."""
+  try:
+    logger.debug("Suppressed SQS cleanup error")
+  except BaseException:
+    # A diagnostic handler must not turn best-effort teardown into a failure.
+    pass
+
+
+def _log_malformed_message_delete_failure() -> None:
+  """Report failed poison-message cleanup after both error suites unwind."""
+  try:
+    logger.warning("Failed to delete malformed SQS message.")
+  except BaseException:
+    # The decode failure remains the public failure even if telemetry breaks.
+    pass

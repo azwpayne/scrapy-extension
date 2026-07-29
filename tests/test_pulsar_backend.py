@@ -7,6 +7,7 @@ constructor signatures stay faithful; individual tests patch ``Client`` or
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import traceback
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock
 import pulsar
 import pytest
 
+import scrapy_extension.backends.pulsar as pulsar_mod
 from scrapy_extension.backends.base import (
   BackendType,
   SetBackend,
@@ -110,6 +112,19 @@ def _connected(mocker, **client_children):
   return b, client
 
 
+class _ExceptionContextProbe(logging.Handler):
+  """Capture exception state available to synchronous backend handlers."""
+
+  def __init__(self) -> None:
+    super().__init__(logging.DEBUG)
+    self.records: list[logging.LogRecord] = []
+    self.contexts: list[tuple[object | None, object | None, object | None]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.contexts.append(sys.exc_info())
+
+
 class _InterruptOnLifecycleEntry:
   """Lock proxy that raises at a deterministic lifecycle-lock entry."""
 
@@ -180,6 +195,39 @@ class TestPulsarConnect:
     with pytest.raises(BackendConnectionError):
       b.connect()
     assert b.is_connected() is False
+
+  def test_failed_connect_cleanup_log_has_no_active_driver_exception(
+    self, mocker
+  ) -> None:
+    """Candidate cleanup telemetry runs after the causal driver suite exits."""
+
+    class _FailOnIncrement:
+      def __iadd__(self, _other: object) -> object:
+        raise RuntimeError("round48-pulsar-connect-marker")
+
+    marker = "round48-pulsar-close-marker"
+    b = _make_backend()
+    b._lifecycle_generation = _FailOnIncrement()  # type: ignore[assignment]
+    client = mocker.MagicMock(name="candidate")
+    client.close.side_effect = RuntimeError(marker)
+    mocker.patch.object(pulsar, "Client", return_value=client)
+    probe = _ExceptionContextProbe()
+    logger = pulsar_mod.logger
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(probe)
+    try:
+      with pytest.raises(BackendConnectionError):
+        b.connect()
+    finally:
+      logger.removeHandler(probe)
+      logger.setLevel(old_level)
+
+    assert [record.getMessage() for record in probe.records] == [
+      "Failed to close Pulsar connect candidate"
+    ]
+    assert probe.contexts == [(None, None, None)]
+    assert marker not in repr(probe.records)
 
   @pytest.mark.parametrize(
     "diagnostic_error",
@@ -471,6 +519,27 @@ class TestPulsarConnect:
     for handle in (consumer_a, consumer_b, client):
       handle.close.assert_called_once_with()
 
+  def test_disconnect_cleanup_log_has_no_active_close_exception(self, mocker) -> None:
+    marker = "round48-pulsar-close-marker"
+    b, client = _connected(mocker)
+    client.close.side_effect = RuntimeError(marker)
+    probe = _ExceptionContextProbe()
+    logger = pulsar_mod.logger
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(probe)
+    try:
+      b.disconnect()
+    finally:
+      logger.removeHandler(probe)
+      logger.setLevel(old_level)
+
+    assert [record.getMessage() for record in probe.records] == [
+      "Suppressed pulsar cleanup error"
+    ]
+    assert probe.contexts == [(None, None, None)]
+    assert marker not in repr(probe.records)
+
   def test_stale_producer_close_keeps_connection_changed_queue_error(self, mocker) -> None:
     """R96: a diagnostic interruption cannot replace stale-candidate QueueError."""
     b, client = _connected(mocker)
@@ -639,6 +708,28 @@ class TestPulsarPop:
 
     logger_debug.assert_called_once_with("Pulsar receive returned no message.")
     assert marker not in repr(logger_debug.call_args_list)
+
+  def test_empty_timeout_log_has_no_active_driver_exception(self, mocker) -> None:
+    marker = "round48-pulsar-timeout-marker"
+    consumer = mocker.MagicMock()
+    consumer.receive.side_effect = pulsar.Timeout(marker)
+    b, _ = _connected(mocker, subscribe=consumer)
+    probe = _ExceptionContextProbe()
+    logger = pulsar_mod.logger
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(probe)
+    try:
+      assert b.pop("queue1") is None
+    finally:
+      logger.removeHandler(probe)
+      logger.setLevel(old_level)
+
+    assert [record.getMessage() for record in probe.records] == [
+      "Pulsar receive returned no message."
+    ]
+    assert probe.contexts == [(None, None, None)]
+    assert marker not in repr(probe.records)
 
   @pytest.mark.parametrize(
     "diagnostic_error",

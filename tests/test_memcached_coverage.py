@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import sys
+
 import pytest
 
 import scrapy_extension.backends.memcached as memcached_mod
@@ -17,6 +20,19 @@ def _connected(mocker):
   mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
   b.connect()
   return b, client
+
+
+class _ExceptionContextProbe(logging.Handler):
+  """Capture active exception state visible to synchronous log handlers."""
+
+  def __init__(self) -> None:
+    super().__init__(logging.DEBUG)
+    self.records: list[logging.LogRecord] = []
+    self.contexts: list[tuple[object | None, object | None, object | None]] = []
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self.records.append(record)
+    self.contexts.append(sys.exc_info())
 
 
 class TestMemcachedErrorPaths:
@@ -58,6 +74,30 @@ class TestMemcachedErrorPaths:
     b, client = _connected(mocker)
     client.close.side_effect = RuntimeError("close failed")
     b.disconnect()  # _swallow catches; must not raise
+
+  def test_disconnect_logs_suppressed_cleanup_after_exception_unwinds(
+    self, mocker
+  ) -> None:
+    """A handler cannot inspect the ordinary close error via ``sys.exc_info``."""
+    marker = "round48-memcached-close-marker"
+    b, client = _connected(mocker)
+    client.close.side_effect = RuntimeError(marker)
+    probe = _ExceptionContextProbe()
+    logger = memcached_mod.logger
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(probe)
+    try:
+      b.disconnect()
+    finally:
+      logger.removeHandler(probe)
+      logger.setLevel(old_level)
+
+    assert [record.getMessage() for record in probe.records] == [
+      "Suppressed memcached cleanup error"
+    ]
+    assert probe.contexts == [(None, None, None)]
+    assert marker not in repr(probe.records)
 
   def test_disconnect_ignores_diagnostic_interrupt_after_close_error(
     self, mocker
@@ -119,6 +159,7 @@ class TestMemcachedErrorPaths:
     sw.__enter__()
     # Regular Exception is suppressed (returns True).
     assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+    assert sw.did_suppress is True
     # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
     assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
     # No exception (exc_type None) -> False (normal exit, propagate nothing).

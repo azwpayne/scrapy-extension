@@ -306,8 +306,11 @@ class MemcachedBackend(Backend, StorageBackend):
             self._client = candidate
             self._connection_snapshot = snapshot
       if not publish:
-        with _swallow():
+        cleanup = _swallow()
+        with cleanup:
           candidate.close()
+        if cleanup.did_suppress:
+          _log_suppressed_cleanup_error()
         return
       if not is_memcached_loopback(snapshot.host):
         # The client is already live. Diagnostics must not make a successful
@@ -333,8 +336,11 @@ class MemcachedBackend(Backend, StorageBackend):
         self._client = None
         self._connection_snapshot = None
       if client is not None:
-        with _swallow():
+        cleanup = _swallow()
+        with cleanup:
           client.close()
+        if cleanup.did_suppress:
+          _log_suppressed_cleanup_error()
 
   def is_connected(self) -> bool:
     """Return True if the client has been created."""
@@ -550,9 +556,19 @@ class MemcachedBackend(Backend, StorageBackend):
 
 
 class _swallow:
-  """Context manager that swallows cleanup-path errors (close() etc.)."""
+  """Suppress regular cleanup errors and report that suppression to callers.
+
+  ``__exit__`` deliberately does not log: it executes while the cleanup
+  exception remains active in ``sys.exc_info()``.  The caller can inspect
+  :attr:`did_suppress` after the ``with`` statement has unwound and emit
+  static telemetry without exposing that exception to a logging handler.
+  """
+
+  def __init__(self) -> None:
+    self.did_suppress = False
 
   def __enter__(self) -> _swallow:
+    self.did_suppress = False
     return self
 
   def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
@@ -564,14 +580,17 @@ class _swallow:
     # (the operator's shutdown signal disappeared into a debug log).
     if not isinstance(exc, Exception):
       return False
-    # Cleanup has already failed with a regular exception, so this diagnostic
-    # must not turn a best-effort disconnect (or stale private-candidate
-    # release) into a control-flow interruption when a logging handler fails.
-    try:
-      logger.debug("Suppressed memcached cleanup error")
-    except BaseException:
-      pass
+    self.did_suppress = True
     return True
+
+
+def _log_suppressed_cleanup_error() -> None:
+  """Report a suppressed cleanup failure after its exception context unwinds."""
+  try:
+    logger.debug("Suppressed memcached cleanup error")
+  except BaseException:
+    # A diagnostic handler must not turn best-effort teardown into a failure.
+    pass
 
 
 def _close_failed_candidate(candidate: Any) -> None:

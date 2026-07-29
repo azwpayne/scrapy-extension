@@ -54,6 +54,7 @@ def test_suppress_pulsar_errors_does_not_suppress_base_exception() -> None:
   sw.__enter__()
   # Regular Exception is suppressed (returns True).
   assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+  assert sw.did_suppress is True
   # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
   assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
   # No exception (exc_type None) -> False (normal exit, propagate nothing).
