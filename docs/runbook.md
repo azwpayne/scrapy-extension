@@ -152,14 +152,20 @@ SCRAPY_STORAGE_BUFFER_MAX_PENDING = 200
 SCRAPY_STORAGE_BUFFER_MAX_AGE_S = 60.0
 ```
 
-A threshold-triggered flush runs in the caller that accepts the threshold item:
-its backend exception is raised from that `store()` call. An age-triggered flush
-runs in a daemon thread: it re-enqueues its failing item and tail, increments
-the monitor's `errors/store` counter, logs the failure, and retries on the next
-age interval rather than raising into a pipeline call. Explicit `flush()` and
-`close()` are synchronous: ordinary storage errors propagate after the
-unwritten tail is restored. A hard process crash is different from an
-exception: it can still lose both the buffer and a detached in-flight snapshot.
+A threshold-triggered flush runs in the caller that accepts the threshold item.
+At the strategy API its backend exception is raised from that `store()` call;
+when invoked through `BackendPipeline.process_item`, an ordinary strategy
+exception is instead counted as `pipeline/storage_errors` and monitor
+`errors/store`, then the item is returned. The pipeline raises `BackendError`
+only after consecutive failures exceed `SCRAPY_PIPELINE_MAX_STORAGE_ERRORS`
+(default `10`, so the eleventh consecutive failure); it resets the count after
+a successful strategy call. An age-triggered flush runs in a daemon thread: it
+re-enqueues its failing item and tail, increments the monitor's `errors/store`
+counter, logs the failure, and retries on the next age interval rather than
+raising into a pipeline call. Direct explicit `flush()` and `close()` calls are
+synchronous: ordinary storage errors propagate after the unwritten tail is
+restored. A hard process crash is different from an exception: it can still
+lose both the buffer and a detached in-flight snapshot.
 
 Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance. When a blocked backend keeps the cap full, the next item is rejected immediately with `StorageBackpressureError`; treat that as an admission failure and let the crawler's retry/failure policy decide what to do, rather than assuming the item was persisted.
 
@@ -727,18 +733,33 @@ exist; this is the canonical procedure until it lands):
 4. **Verify source and artifacts before publication:** run `uv run ruff check`,
    `uv run pytest -m "not integration"`, and
    `uv run pytest --cov=scrapy_extension --cov-report=term-missing` (fails below
-   95%), then run `uv build --clear`. In fresh virtual environments, install
-   both the generated wheel and sdist from `dist/` and import the package + one
-   backend. Confirm `__version__` is `X.Y.Z`; inspect each artifact for
-   `py.typed`, public docs, and examples, and confirm `.omc`, local `*.db`,
-   ignored scratch plans, credentials, and editor state are absent. Render the
-   wheel `METADATA` description and verify every non-anchor README link is an
-   absolute web URL. For live backends, set `SCRAPY_TEST_INTEGRATION=1`, the
-   relevant `SCRAPY_TEST_*` variables, and pass `--force-enable-socket`.
+   95%), then run `uv build --clear`. In the release shell, select exactly one
+   wheel and sdist and record their hashes; retain these variables through
+   publication:
+
+   ```bash
+   shopt -s nullglob
+   wheels=(dist/*.whl); sdists=(dist/*.tar.gz)
+   test "${#wheels[@]}" -eq 1 && test "${#sdists[@]}" -eq 1
+   wheel="${wheels[0]}"; sdist="${sdists[0]}"
+   shasum -a 256 "$wheel" "$sdist" | tee dist/SHA256SUMS
+   ```
+
+   In fresh virtual environments, install those exact `$wheel` and `$sdist`
+   artifacts and import the package + one backend. Confirm `__version__` is
+   `X.Y.Z`; inspect each artifact for `py.typed`, public docs, and examples, and
+   confirm `.omc`, local `*.db`, ignored scratch plans, credentials, and editor
+   state are absent. Render the wheel `METADATA` description and verify every
+   non-anchor README link is an absolute web URL. For live backends, set
+   `SCRAPY_TEST_INTEGRATION=1`, the relevant `SCRAPY_TEST_*` variables, and pass
+   `--force-enable-socket`.
 5. **Tag:** `git tag vX.Y.Z` and push the tag after all verification succeeds.
-6. **Publish the verified artifacts:** `uv publish dist/*.whl dist/*.tar.gz`.
-   This repository has no release/publish GitHub Actions workflow, so trusted
-   publishing and artifact attestation cannot be safely automated here yet.
+6. **Publish the verified artifacts:** immediately re-check the recorded hashes
+   and publish only the recorded paths: `shasum -a 256 -c dist/SHA256SUMS && uv
+   publish "$wheel" "$sdist"`. Do not rebuild, replace, or add artifacts after
+   inspection. This repository has no release/publish GitHub Actions workflow,
+   so trusted publishing and artifact attestation cannot be safely automated
+   here yet.
 7. **Verify published install:** in a fresh venv,
    `pip install scrapy-extension==X.Y.Z` and import the package + one backend;
    confirm `__version__` matches.
