@@ -15,13 +15,15 @@ from scrapy_extension.schedule.scheduler import BackendScheduler
 pytestmark = pytest.mark.unit
 
 
-def test_queue_component_config_parses_strategy_values_immutably() -> None:
-  """Queue configuration remains a validated immutable snapshot."""
+def test_queue_component_config_parses_queue_values_immutably() -> None:
+  """The staged snapshot retains every value passed to the queue seam."""
   from scrapy_extension.schedule.scheduler import _QueueComponentConfig
 
   settings = ScrapySettings(
     {
       "SCRAPY_QUEUE_STRATEGY": "delay",
+      "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY": "drop_oldest",
+      "SCRAPY_QUEUE_KEY": "queue-{spider}",
       "SCRAPY_QUEUE_DELAY_DEFAULT": "1.5",
       "SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL": "0.25",
       "SCRAPY_QUEUE_DELAY_MAX_HELD": "25",
@@ -32,12 +34,25 @@ def test_queue_component_config_parses_strategy_values_immutably() -> None:
       "SCRAPY_QUEUE_RING_BUFFER_CAPACITY": "2048",
       "SCRAPY_QUEUE_WORKER_ID": " worker-a ",
       "SCRAPY_QUEUE_PEER_IDS": " worker-b, ,worker-c ",
+      "SCRAPY_BACKPRESSURE_PAUSE_AT": "10",
+      "SCRAPY_BACKPRESSURE_RESUME_AT": "5",
+      "SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY": "25",
+      "SCRAPY_QUEUE_MAX_ITEM_BYTES": "4096",
+      "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": "200",
+      "SCRAPY_MONITOR_POP_RATE_WINDOW_S": "30.0",
+      "SCRAPY_QUEUE_SNAPSHOT_OWNER": "snapshot-a",
     }
   )
 
-  config = _QueueComponentConfig.from_settings(settings)
+  config = _QueueComponentConfig.from_early_settings(settings)
+  config = config.with_queue_key(settings, spider_name="spider-a")
+  config = config.with_strategy_settings(settings)
+  config = config.with_runtime_settings(settings)
 
+  assert config.strategy_type is not None
   assert config.strategy_type.value == "delay"
+  assert config.ring_buffer_full_policy == "drop_oldest"
+  assert config.queue_key == "queue-spider-a"
   assert config.default_delay == 1.5
   assert config.min_interval == 0.25
   assert config.delay_max_held == 25
@@ -48,8 +63,15 @@ def test_queue_component_config_parses_strategy_values_immutably() -> None:
   assert config.capacity == 2048
   assert config.worker_id == "worker-a"
   assert config.peer_ids == ("worker-b", "worker-c")
+  assert config.backpressure_pause_at == 10
+  assert config.backpressure_resume_at == 5
+  assert config.queue_depth_sample_every == 25
+  assert config.queue_max_item_bytes == 4096
+  assert config.monitor_backpressure_threshold == 200
+  assert config.monitor_pop_rate_window_s == 30.0
+  assert config.queue_snapshot_owner == "snapshot-a"
   with pytest.raises(FrozenInstanceError):
-    config.worker_id = "worker-z"  # type: ignore[misc]
+    config.queue_key = "queue-other"  # type: ignore[misc]
 
 
 def test_strategy_is_read_once_before_ring_buffer_safety_gate(

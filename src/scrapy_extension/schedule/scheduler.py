@@ -10,7 +10,7 @@ import logging
 import threading
 import uuid
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from inspect import getattr_static, isawaitable
 from typing import TYPE_CHECKING, Any
 
@@ -60,34 +60,123 @@ _LIFECYCLE_NEW = "new"
 _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
 _MISSING_STATIC_ATTRIBUTE = object()
-_UNSET_QUEUE_STRATEGY = object()
 _EnqueueDiagnostic = tuple[str, str, str | None]
 
 
 @dataclass(frozen=True, slots=True)
 class _QueueComponentConfig:
-  """Validated immutable queue settings used to build a scheduler."""
+  """Validated immutable values passed to the queue and strategy seams."""
 
-  strategy_type: Any
-  default_delay: float
-  min_interval: float
-  delay_max_held: int | None
-  priority_levels: int
-  wheel_size: int
-  ticks_per_second: float
-  steal_timeout: float
-  capacity: int
-  worker_id: str | None
-  peer_ids: tuple[str, ...]
+  strategy_value: Any
+  ring_buffer_full_policy: str
+  queue_key_template: str | None = None
+  queue_key: str | None = None
+  strategy_type: Any | None = None
+  default_delay: float | None = None
+  min_interval: float | None = None
+  delay_max_held: int | None = None
+  priority_levels: int | None = None
+  wheel_size: int | None = None
+  ticks_per_second: float | None = None
+  steal_timeout: float | None = None
+  capacity: int | None = None
+  worker_id: str | None = None
+  peer_ids: tuple[str, ...] = ()
+  backpressure_pause_at: int | None = None
+  backpressure_resume_at: int | None = None
+  queue_depth_sample_every: int | None = None
+  queue_max_item_bytes: int | None = None
+  monitor_backpressure_threshold: int | None = None
+  monitor_pop_rate_window_s: float | None = None
+  queue_snapshot_owner: str | None = None
 
   @classmethod
-  def from_settings(
+  def from_early_settings(
     cls,
     settings: Settings,
-    *,
-    strategy_value: Any = _UNSET_QUEUE_STRATEGY,
   ) -> _QueueComponentConfig:
-    """Parse the queue strategy settings without constructing a strategy."""
+    """Capture the strategy selector and validate the ring-buffer policy."""
+    from scrapy_extension.queue.strategies.factory import QueueStrategyType
+
+    strategy_value = settings.get(
+      "SCRAPY_QUEUE_STRATEGY",
+      QueueStrategyType.PASSTHROUGH.value,
+    )
+    ring_buffer_full_policy = settings.get(
+      "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
+      "reject",
+    )
+    if ring_buffer_full_policy not in ("reject", "drop_oldest", "block"):
+      raise ConfigurationError(
+        "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY must be one of "
+        "'reject', 'drop_oldest', or 'block'.",
+        setting_name="SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
+        setting_value=ring_buffer_full_policy,
+      )
+    if (
+      strategy_value == QueueStrategyType.RING_BUFFER.value
+      and ring_buffer_full_policy == "block"
+    ):
+      raise ConfigurationError(
+        "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY='block' is unsafe with "
+        "BackendScheduler: enqueue_request runs on Scrapy's reactor thread, "
+        "so a full ring buffer would block the same thread that must drain it. "
+        "Use 'reject' or 'drop_oldest'.",
+        setting_name="SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
+        setting_value=ring_buffer_full_policy,
+      )
+    return cls(
+      strategy_value=strategy_value,
+      ring_buffer_full_policy=ring_buffer_full_policy,
+    )
+
+  def with_queue_key(
+    self,
+    settings: Settings,
+    *,
+    spider_name: str | None,
+  ) -> _QueueComponentConfig:
+    """Validate and resolve the queue key at the original factory checkpoint."""
+    queue_key = settings.get("SCRAPY_QUEUE_KEY", "scheduler-queue")
+    if not isinstance(queue_key, str):
+      raise ConfigurationError(
+        f"SCRAPY_QUEUE_KEY must be a string, got {queue_key!r}.",
+        setting_name="SCRAPY_QUEUE_KEY",
+        setting_value=queue_key,
+      )
+    if spider_name is not None:
+      try:
+        _validate_key_name(spider_name, "spider.name")
+      except ValueError as exc:
+        raise ConfigurationError(
+          str(exc),
+          setting_name="spider.name",
+          setting_value=spider_name,
+        ) from exc
+    resolved_queue_key = (
+      queue_key.replace("{spider}", spider_name)
+      if spider_name is not None
+      else queue_key
+    )
+    try:
+      _validate_key_name(
+        resolved_queue_key.replace("{spider}", "spider"),
+        "SCRAPY_QUEUE_KEY",
+      )
+    except ValueError as exc:
+      raise ConfigurationError(
+        str(exc),
+        setting_name="SCRAPY_QUEUE_KEY",
+        setting_value=queue_key,
+      ) from exc
+    return replace(
+      self,
+      queue_key_template=queue_key,
+      queue_key=resolved_queue_key,
+    )
+
+  def with_strategy_settings(self, settings: Settings) -> _QueueComponentConfig:
+    """Parse strategy construction settings after the ack-concurrency gate."""
     from scrapy_extension.queue.strategies.factory import QueueStrategyType
     from scrapy_extension.queue.strategies.priority import MAX_PRIORITY_LEVELS
     from scrapy_extension.queue.strategies.throttle import (
@@ -95,20 +184,15 @@ class _QueueComponentConfig:
     )
     from scrapy_extension.queue.strategies.time_wheel import MAX_WHEEL_SIZE
 
-    if strategy_value is _UNSET_QUEUE_STRATEGY:
-      strategy_value = settings.get(
-        "SCRAPY_QUEUE_STRATEGY",
-        QueueStrategyType.PASSTHROUGH.value,
-      )
     try:
-      strategy_type = QueueStrategyType(strategy_value)
-    except ValueError as e:
+      strategy_type = QueueStrategyType(self.strategy_value)
+    except ValueError as exc:
       valid = ", ".join(repr(member.value) for member in QueueStrategyType)
       raise ConfigurationError(
-        f"Invalid SCRAPY_QUEUE_STRATEGY {strategy_value!r}. Valid: {valid}.",
+        f"Invalid SCRAPY_QUEUE_STRATEGY {self.strategy_value!r}. Valid: {valid}.",
         setting_name="SCRAPY_QUEUE_STRATEGY",
-        setting_value=str(strategy_value),
-      ) from e
+        setting_value=str(self.strategy_value),
+      ) from exc
     default_delay = parse_float_setting(
       settings.get("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
       "SCRAPY_QUEUE_DELAY_DEFAULT",
@@ -120,8 +204,6 @@ class _QueueComponentConfig:
       minimum=0.0,
       maximum=THROTTLE_MAX_MIN_INTERVAL_S,
     )
-    # A non-positive max_held intentionally disables the soft warning; retain
-    # that documented opt-out while still rejecting non-integer inputs.
     delay_max_held_raw = settings.get("SCRAPY_QUEUE_DELAY_MAX_HELD")
     delay_max_held = (
       parse_int_setting(delay_max_held_raw, "SCRAPY_QUEUE_DELAY_MAX_HELD")
@@ -190,7 +272,8 @@ class _QueueComponentConfig:
     peer_ids = tuple(
       peer_id.strip() for peer_id in peer_id_values if peer_id.strip()
     )
-    return cls(
+    return replace(
+      self,
       strategy_type=strategy_type,
       default_delay=default_delay,
       min_interval=min_interval,
@@ -202,6 +285,89 @@ class _QueueComponentConfig:
       capacity=capacity,
       worker_id=worker_id,
       peer_ids=peer_ids,
+    )
+
+  def with_runtime_settings(self, settings: Settings) -> _QueueComponentConfig:
+    """Parse queue and monitor settings after strategy diagnostics."""
+    pause_raw = settings.get("SCRAPY_BACKPRESSURE_PAUSE_AT")
+    resume_raw = settings.get("SCRAPY_BACKPRESSURE_RESUME_AT")
+    pause_at = (
+      parse_int_setting(
+        pause_raw,
+        "SCRAPY_BACKPRESSURE_PAUSE_AT",
+        minimum=0,
+      )
+      if pause_raw is not None
+      else None
+    )
+    resume_at = (
+      parse_int_setting(
+        resume_raw,
+        "SCRAPY_BACKPRESSURE_RESUME_AT",
+        minimum=0,
+      )
+      if resume_raw is not None
+      else None
+    )
+    if pause_at is not None and resume_at is not None and resume_at > pause_at:
+      raise ConfigurationError(
+        "SCRAPY_BACKPRESSURE_RESUME_AT must be <= "
+        "SCRAPY_BACKPRESSURE_PAUSE_AT.",
+        setting_name="SCRAPY_BACKPRESSURE_RESUME_AT",
+        setting_value=resume_raw,
+      )
+    queue_depth_sample_every = parse_int_setting(
+      settings.get("SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY", 100),
+      "SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY",
+      minimum=1,
+    )
+    queue_max_item_bytes = parse_int_setting(
+      settings.get("SCRAPY_QUEUE_MAX_ITEM_BYTES", 1_048_576),
+      "SCRAPY_QUEUE_MAX_ITEM_BYTES",
+      minimum=1,
+    )
+    monitor_backpressure_threshold = parse_int_setting(
+      settings.get("SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD", 1_000),
+      "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD",
+      minimum=0,
+    )
+    monitor_pop_rate_window_s = parse_float_setting(
+      settings.get("SCRAPY_MONITOR_POP_RATE_WINDOW_S", 60.0),
+      "SCRAPY_MONITOR_POP_RATE_WINDOW_S",
+      minimum=0.0,
+      minimum_exclusive=True,
+      maximum=86400.0,
+    )
+    snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
+    queue_snapshot_owner = (
+      snapshot_owner_raw
+      if snapshot_owner_raw is not None
+      else self.worker_id
+    )
+    if queue_snapshot_owner is not None:
+      if not isinstance(queue_snapshot_owner, str):
+        raise ConfigurationError(
+          "SCRAPY_QUEUE_SNAPSHOT_OWNER must be a non-empty string or unset.",
+          setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
+          setting_value=snapshot_owner_raw,
+        )
+      try:
+        _validate_key_name(queue_snapshot_owner, "SCRAPY_QUEUE_SNAPSHOT_OWNER")
+      except ValueError as exc:
+        raise ConfigurationError(
+          str(exc),
+          setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
+          setting_value=snapshot_owner_raw,
+        ) from exc
+    return replace(
+      self,
+      backpressure_pause_at=pause_at,
+      backpressure_resume_at=resume_at,
+      queue_depth_sample_every=queue_depth_sample_every,
+      queue_max_item_bytes=queue_max_item_bytes,
+      monitor_backpressure_threshold=monitor_backpressure_threshold,
+      monitor_pop_rate_window_s=monitor_pop_rate_window_s,
+      queue_snapshot_owner=queue_snapshot_owner,
     )
 
 
@@ -852,33 +1018,7 @@ class BackendScheduler:
       build_queue_strategy,
     )
 
-    strategy_value = settings.get(
-      "SCRAPY_QUEUE_STRATEGY",
-      QueueStrategyType.PASSTHROUGH.value,
-    )
-    ring_buffer_full_policy = settings.get(
-      "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
-      "reject",
-    )
-    if ring_buffer_full_policy not in ("reject", "drop_oldest", "block"):
-      raise ConfigurationError(
-        "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY must be one of "
-        "'reject', 'drop_oldest', or 'block'.",
-        setting_name="SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
-        setting_value=ring_buffer_full_policy,
-      )
-    if (
-      strategy_value == QueueStrategyType.RING_BUFFER.value
-      and ring_buffer_full_policy == "block"
-    ):
-      raise ConfigurationError(
-        "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY='block' is unsafe with "
-        "BackendScheduler: enqueue_request runs on Scrapy's reactor thread, "
-        "so a full ring buffer would block the same thread that must drain it. "
-        "Use 'reject' or 'drop_oldest'.",
-        setting_name="SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
-        setting_value=ring_buffer_full_policy,
-      )
+    queue_config = _QueueComponentConfig.from_early_settings(settings)
 
     backend_type, backend_settings = resolve_backend_config(
       settings,
@@ -887,38 +1027,12 @@ class BackendScheduler:
       required_capabilities={"queue"},
       component_name="queue",
     )
-    queue_key = settings.get("SCRAPY_QUEUE_KEY", "scheduler-queue")
-    if not isinstance(queue_key, str):
-      raise ConfigurationError(
-        f"SCRAPY_QUEUE_KEY must be a string, got {queue_key!r}.",
-        setting_name="SCRAPY_QUEUE_KEY",
-        setting_value=queue_key,
-      )
-    if spider_name is not None:
-      try:
-        _validate_key_name(spider_name, "spider.name")
-      except ValueError as exc:
-        raise ConfigurationError(
-          str(exc),
-          setting_name="spider.name",
-          setting_value=spider_name,
-        ) from exc
-    resolved_queue_key = (
-      queue_key.replace("{spider}", spider_name)
-      if spider_name is not None
-      else queue_key
+    queue_config = queue_config.with_queue_key(
+      settings,
+      spider_name=spider_name,
     )
-    try:
-      _validate_key_name(
-        resolved_queue_key.replace("{spider}", "spider"),
-        "SCRAPY_QUEUE_KEY",
-      )
-    except ValueError as exc:
-      raise ConfigurationError(
-        str(exc),
-        setting_name="SCRAPY_QUEUE_KEY",
-        setting_value=queue_key,
-      ) from exc
+    assert queue_config.queue_key is not None
+    assert queue_config.queue_key_template is not None
     if backend_type in _CONSUMER_SCOPED_BACKENDS:
       # Kafka and RocketMQ each keep one mutable consumer on the backend
       # instance. Sharing that instance across logical queues makes Kafka
@@ -926,8 +1040,8 @@ class BackendScheduler:
       # accumulate both subscriptions on one receive loop. Add a registry-only
       # discriminator so schedulers for different queues get independent
       # consumers; ConnectionManager strips it before Pydantic validation.
-      scope = resolved_queue_key
-      if spider_name is None and "{spider}" in queue_key:
+      scope = queue_config.queue_key
+      if spider_name is None and "{spider}" in queue_config.queue_key_template:
         # Direct ``from_settings`` has no crawler/spider identity yet. Sharing
         # the literal template would join unrelated future queues to one
         # mutable consumer, so this scheduler gets a registry-only opaque scope.
@@ -948,10 +1062,15 @@ class BackendScheduler:
       # hypothetical 3rd-party single-slot backend.
       BackendScheduler._enforce_ack_concurrency_gate(settings, backend_type)
 
-      queue_config = _QueueComponentConfig.from_settings(
-        settings,
-        strategy_value=strategy_value,
-      )
+      queue_config = queue_config.with_strategy_settings(settings)
+      assert queue_config.strategy_type is not None
+      assert queue_config.default_delay is not None
+      assert queue_config.min_interval is not None
+      assert queue_config.priority_levels is not None
+      assert queue_config.wheel_size is not None
+      assert queue_config.ticks_per_second is not None
+      assert queue_config.steal_timeout is not None
+      assert queue_config.capacity is not None
       try:
         queue_strategy = build_queue_strategy(
           queue_config.strategy_type,
@@ -966,7 +1085,7 @@ class BackendScheduler:
           peer_ids=queue_config.peer_ids,
           steal_timeout=queue_config.steal_timeout,
           capacity=queue_config.capacity,
-          full_policy=ring_buffer_full_policy,
+          full_policy=queue_config.ring_buffer_full_policy,
         )
       except (TypeError, ValueError, OverflowError) as exc:
         constructor_setting = {
@@ -988,90 +1107,25 @@ class BackendScheduler:
       # fires only for strategies that do NOT override pop_with_ack (so they
       # lose the MQ per-message token) paired with a requires_ack backend.
       BackendScheduler._warn_strategy_mq_ack_bypass(queue_strategy, backend_type)
-      pause_raw = settings.get("SCRAPY_BACKPRESSURE_PAUSE_AT")
-      resume_raw = settings.get("SCRAPY_BACKPRESSURE_RESUME_AT")
-      pause_at = (
-        parse_int_setting(
-          pause_raw,
-          "SCRAPY_BACKPRESSURE_PAUSE_AT",
-          minimum=0,
-        )
-        if pause_raw is not None
-        else None
-      )
-      resume_at = (
-        parse_int_setting(
-          resume_raw,
-          "SCRAPY_BACKPRESSURE_RESUME_AT",
-          minimum=0,
-        )
-        if resume_raw is not None
-        else None
-      )
-      if pause_at is not None and resume_at is not None and resume_at > pause_at:
-        raise ConfigurationError(
-          "SCRAPY_BACKPRESSURE_RESUME_AT must be <= "
-          "SCRAPY_BACKPRESSURE_PAUSE_AT.",
-          setting_name="SCRAPY_BACKPRESSURE_RESUME_AT",
-          setting_value=resume_raw,
-        )
-      depth_sample_every = parse_int_setting(
-        settings.get("SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY", 100),
-        "SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY",
-        minimum=1,
-      )
-      queue_max_item_bytes = parse_int_setting(
-        settings.get("SCRAPY_QUEUE_MAX_ITEM_BYTES", 1_048_576),
-        "SCRAPY_QUEUE_MAX_ITEM_BYTES",
-        minimum=1,
-      )
-      monitor_backpressure_threshold = parse_int_setting(
-        settings.get("SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD", 1_000),
-        "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD",
-        minimum=0,
-      )
-      monitor_pop_rate_window_s = parse_float_setting(
-        settings.get("SCRAPY_MONITOR_POP_RATE_WINDOW_S", 60.0),
-        "SCRAPY_MONITOR_POP_RATE_WINDOW_S",
-        minimum=0.0,
-        minimum_exclusive=True,
-        maximum=86400.0,
-      )
-      snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
-      queue_snapshot_owner = (
-        snapshot_owner_raw
-        if snapshot_owner_raw is not None
-        else queue_config.worker_id
-      )
-      if queue_snapshot_owner is not None:
-        if not isinstance(queue_snapshot_owner, str):
-          raise ConfigurationError(
-            "SCRAPY_QUEUE_SNAPSHOT_OWNER must be a non-empty string or unset.",
-            setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
-            setting_value=snapshot_owner_raw,
-          )
-        try:
-          _validate_key_name(
-            queue_snapshot_owner,
-            "SCRAPY_QUEUE_SNAPSHOT_OWNER",
-          )
-        except ValueError as exc:
-          raise ConfigurationError(
-            str(exc),
-            setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
-            setting_value=snapshot_owner_raw,
-          ) from exc
+      queue_config = queue_config.with_runtime_settings(settings)
+      assert queue_config.queue_key is not None
+      assert queue_config.queue_depth_sample_every is not None
+      assert queue_config.queue_max_item_bytes is not None
+      assert queue_config.monitor_backpressure_threshold is not None
+      assert queue_config.monitor_pop_rate_window_s is not None
       return cls(
         connection_manager=manager,
-        queue_key=resolved_queue_key,
+        queue_key=queue_config.queue_key,
         queue_strategy=queue_strategy,
-        backpressure_pause_at=pause_at,
-        backpressure_resume_at=resume_at,
-        queue_depth_sample_every=depth_sample_every,
-        queue_max_item_bytes=queue_max_item_bytes,
-        monitor_backpressure_threshold=monitor_backpressure_threshold,
-        monitor_pop_rate_window_s=monitor_pop_rate_window_s,
-        queue_snapshot_owner=queue_snapshot_owner,
+        backpressure_pause_at=queue_config.backpressure_pause_at,
+        backpressure_resume_at=queue_config.backpressure_resume_at,
+        queue_depth_sample_every=queue_config.queue_depth_sample_every,
+        queue_max_item_bytes=queue_config.queue_max_item_bytes,
+        monitor_backpressure_threshold=(
+          queue_config.monitor_backpressure_threshold
+        ),
+        monitor_pop_rate_window_s=queue_config.monitor_pop_rate_window_s,
+        queue_snapshot_owner=queue_config.queue_snapshot_owner,
       )
     except BaseException:
       try:
