@@ -57,7 +57,7 @@ Changelog = "https://github.com/azwpayne/scrapy-extension/blob/main/.github/CHAN
 
 [project.optional-dependencies]
 # NOTE: Backends use PEP 562 lazy imports — deps are loaded on demand.
-redis = ["redis>=7.3.0,<9"]
+redis = ["redis>=8.1.0,<9"]
 mongodb = ["pymongo>=4.8.0,<5"]
 kafka = ["kafka-python-ng>=2.2.2,<3"]
 rabbitmq = ["pika>=1.4.2,<2"]
@@ -71,7 +71,7 @@ memcached = ["pymemcache>=4.0,<5"]
 sqs = ["boto3>=1.43.58,<2"]
 dynamodb = ["boto3>=1.43.58,<2"]
 all = [
-    "redis>=7.3.0,<9",
+    "redis>=8.1.0,<9",
     "pymongo>=4.8.0,<5",
     "kafka-python-ng>=2.2.2,<3",
     "pika>=1.4.2,<2",
@@ -108,7 +108,7 @@ test = [
     # Backend deps — tests import backend modules directly, which triggers
     # the module-level lazy-import guard. All backends must be installable
     # for the test suite to collect.
-    "redis>=7.3.0,<9",
+    "redis>=8.1.0,<9",
     "pymongo>=4.8.0,<5",
     "kafka-python-ng>=2.2.2,<3",
     "pika>=1.4.2,<2",
