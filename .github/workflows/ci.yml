@@ -291,6 +291,7 @@ jobs:
         # block cannot supply its command.
         run: |
           docker run --detach --rm --name scrapy-ext-pulsar \
+            --env PULSAR_MEM="-Xms512m -Xmx512m -XX:MaxDirectMemorySize=512m" \
             --publish 6650:6650 --publish 8080:8080 \
             apachepulsar/pulsar:4.1.2 \
             bin/pulsar standalone
