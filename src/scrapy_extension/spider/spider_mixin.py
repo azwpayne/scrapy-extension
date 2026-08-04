@@ -181,23 +181,29 @@ class BackendSpiderMixin(Spider):
         self._connection_manager = manager
         acquired_here = True
 
+      signal_wiring_failure: BaseException | None = None
       try:
         self._connect_signals()
-      except BaseException:
+      except BaseException as exc:
+        signal_wiring_failure = exc
+      if signal_wiring_failure is not None:
+        cleanup_failed = False
         if acquired_here:
           self._connection_manager = None
           try:
             manager.close()
           except BaseException:
-            # Signal registration is the primary operation.  An arbitrary
-            # logging handler must not replace that registration failure.
-            try:
-              logger.exception(
-                "Failed to release ConnectionManager after signal wiring failure"
-              )
-            except BaseException:
-              pass
-        raise
+            cleanup_failed = True
+        if cleanup_failed:
+          # Signal registration is the primary operation. An arbitrary
+          # logging handler must not replace that registration failure.
+          try:
+            logger.error(
+              "Failed to release ConnectionManager after signal wiring failure"
+            )
+          except BaseException:
+            pass
+        raise signal_wiring_failure
 
       return manager
 

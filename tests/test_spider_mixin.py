@@ -346,12 +346,18 @@ class TestSetupBackend:
   def test_setup_backend_preserves_signal_wiring_error_when_cleanup_logging_fails(
     self, mocker, diagnostic_error
   ):
-    """R130: cleanup diagnostics cannot replace the signal wiring failure."""
+    """Cleanup is isolated before diagnostics retain the wiring failure."""
     manager = mocker.MagicMock(spec=ConnectionManager)
-    manager.close.side_effect = RuntimeError("manager close failed")
+    cleanup_contexts: list[tuple[object | None, object | None, object | None]] = []
+
+    def fail_close() -> None:
+      cleanup_contexts.append(sys.exc_info())
+      raise RuntimeError("manager close failed")
+
+    manager.close.side_effect = fail_close
     mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
-    log_exception = mocker.patch(
-      "scrapy_extension.spider.spider_mixin.logger.exception",
+    log_error = mocker.patch(
+      "scrapy_extension.spider.spider_mixin.logger.error",
       side_effect=diagnostic_error,
     )
 
@@ -369,8 +375,9 @@ class TestSetupBackend:
       spider.setup_backend()
 
     assert captured.value is wiring_error
+    assert cleanup_contexts == [(None, None, None)]
     manager.close.assert_called_once_with()
-    log_exception.assert_called_once_with(
+    log_error.assert_called_once_with(
       "Failed to release ConnectionManager after signal wiring failure"
     )
     assert spider._connection_manager is None

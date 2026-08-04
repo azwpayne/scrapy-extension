@@ -1,5 +1,9 @@
 """Tests for Scrapy components."""
 
+from __future__ import annotations
+
+import logging
+import sys
 from unittest.mock import ANY
 
 import pytest
@@ -842,6 +846,48 @@ class TestBackendScheduler:
 
     assert isinstance(scheduler.dupefilter, RecordingDupeFilter)
     assert scheduler.dupefilter.crawler is mock_crawler
+
+  def test_open_rollback_clears_primary_context_before_cleanup_and_logging(
+    self, mock_connection_manager, mocker
+  ):
+    """A failed open remains primary after context-free cleanup diagnostics."""
+    scheduler = BackendScheduler(connection_manager=mock_connection_manager)
+    spider = mocker.MagicMock()
+    spider.name = "test_spider"
+    original_error = KeyboardInterrupt("open interrupted")
+    cleanup_contexts: list[tuple[object | None, object | None, object | None]] = []
+
+    def fail_connect(_spider: object) -> None:
+      raise original_error
+
+    def fail_close(_reason: str) -> None:
+      cleanup_contexts.append(sys.exc_info())
+      raise RuntimeError("cleanup failed")
+
+    mocker.patch.object(scheduler, "_connect_ack_signals", side_effect=fail_connect)
+    mocker.patch.object(scheduler, "_close_locked", side_effect=fail_close)
+    records: list[logging.LogRecord] = []
+
+    class Handler(logging.Handler):
+      def emit(self, record: logging.LogRecord) -> None:
+        records.append(record)
+        assert sys.exc_info() == (None, None, None)
+
+    source_logger = logging.getLogger("scrapy_extension.schedule.scheduler")
+    handler = Handler()
+    source_logger.addHandler(handler)
+    source_logger.setLevel(logging.ERROR)
+    try:
+      with pytest.raises(KeyboardInterrupt) as captured:
+        scheduler.open(spider)
+    finally:
+      source_logger.removeHandler(handler)
+
+    assert captured.value is original_error
+    assert cleanup_contexts == [(None, None, None)]
+    assert len(records) == 1
+    assert records[0].exc_info is None
+    assert records[0].exc_text is None
 
   def test_open_rejects_invalid_spider_name(self, mock_connection_manager, mocker):
     """R23-D2: spider.name with invalid chars must fail at open, not deep in push.

@@ -461,6 +461,7 @@ class BackendPipeline:
           return
         raise RuntimeError("pipeline is already open for a different spider")
       open_diagnostic: str | None = None
+      open_failure: BaseException | None = None
       try:
         _validate_key_name(spider.name, "spider.name")
         self.storage_strategy.open()
@@ -472,19 +473,21 @@ class BackendPipeline:
           open_diagnostic = "unsupported_storage"
         except BackendConnectionError:
           open_diagnostic = "unreachable_storage"
-      except BaseException:
-        # An open failure is terminal: no Scrapy close callback is guaranteed
-        # after component startup aborts, so roll back both child resources and
-        # the factory's manager acquire here.
+      except BaseException as exc:
+        open_failure = exc
+      if open_failure is not None:
+        cleanup_failed = False
         try:
           self._close_locked()
         except BaseException:
+          cleanup_failed = True
+        if cleanup_failed:
           try:
-            logger.exception("Pipeline cleanup failed during open rollback")
+            logger.error("Pipeline cleanup failed during open rollback")
           except BaseException:
             # Diagnostics must not replace the open failure being unwound.
             pass
-        raise
+        raise open_failure
       if open_diagnostic == "unsupported_storage":
         # The expected capability exception has fully unwound. A custom handler
         # must not recover it through ``sys.exc_info()``.
