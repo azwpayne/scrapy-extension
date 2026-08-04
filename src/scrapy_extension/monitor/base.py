@@ -109,6 +109,9 @@ class Monitor:
   - ``on_disconnect(backend_type, reason)`` — a backend was disconnected.
     Wired (R14-D) from ``ConnectionManager.close``; ``reason`` is the Scrapy
     close reason (may be ``None`` in non-engine teardown paths).
+  - ``on_disconnect_result(backend_type, succeeded)`` — outcome of an attempted
+    backend disconnect. ``succeeded`` is a bounded boolean; no settings,
+    connection strings, or error details are exposed.
   - ``on_retry(backend_type, attempt)`` — a connection retry fired.
     Wired (R14-D) from ``ConnectionManager.connect`` before each backoff
     sleep; ``attempt`` is 1-based (1 = first retry).
@@ -260,6 +263,20 @@ class Monitor:
     Args:
         backend_type: The backend-type registry string that disconnected.
         reason: Scrapy engine close reason (or ``None``).
+    """
+
+  def on_disconnect_result(self, backend_type: str, succeeded: bool) -> None:
+    """Record a bounded backend-disconnect outcome.
+
+    Emitted by :meth:`ConnectionManager.close
+    <scrapy_extension.backends.connectors.ConnectionManager.close>` after it
+    attempts the final backend disconnect. ``succeeded`` is deliberately the
+    only outcome detail so telemetry cannot expose backend settings,
+    connection strings, or exception content.
+
+    Args:
+        backend_type: The backend-type registry string that disconnected.
+        succeeded: Whether ``backend.disconnect()`` returned successfully.
     """
 
   def on_retry(self, backend_type: str, attempt: int) -> None:

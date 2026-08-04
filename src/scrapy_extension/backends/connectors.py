@@ -2229,8 +2229,14 @@ class ConnectionManager:
 
     # Lifecycle callbacks are user code. Dispatch after both registry and
     # manager locks are released so re-entry observes the terminal state and
-    # receives a typed error instead of self-deadlocking.
+    # receives a typed error instead of self-deadlocking. The outcome is a
+    # bounded boolean, never backend configuration or exception details.
     self._notify_monitor("on_disconnect", str(self.backend_type), None)
+    self._notify_monitor(
+      "on_disconnect_result",
+      str(self.backend_type),
+      not disconnect_failed,
+    )
 
   @classmethod
   def clear_registry(cls) -> None:
