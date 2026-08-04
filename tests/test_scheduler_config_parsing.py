@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 from pytest_mock import MockerFixture
 from scrapy.settings import Settings as ScrapySettings
@@ -11,6 +13,77 @@ from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 pytestmark = pytest.mark.unit
+
+
+def test_queue_component_config_parses_strategy_values_immutably() -> None:
+  """Queue configuration remains a validated immutable snapshot."""
+  from scrapy_extension.schedule.scheduler import _QueueComponentConfig
+
+  settings = ScrapySettings(
+    {
+      "SCRAPY_QUEUE_STRATEGY": "delay",
+      "SCRAPY_QUEUE_DELAY_DEFAULT": "1.5",
+      "SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL": "0.25",
+      "SCRAPY_QUEUE_DELAY_MAX_HELD": "25",
+      "SCRAPY_QUEUE_PRIORITY_LEVELS": "4",
+      "SCRAPY_QUEUE_TIME_WHEEL_SIZE": "90",
+      "SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND": "2.0",
+      "SCRAPY_QUEUE_STEAL_TIMEOUT": "0.75",
+      "SCRAPY_QUEUE_RING_BUFFER_CAPACITY": "2048",
+      "SCRAPY_QUEUE_WORKER_ID": " worker-a ",
+      "SCRAPY_QUEUE_PEER_IDS": " worker-b, ,worker-c ",
+    }
+  )
+
+  config = _QueueComponentConfig.from_settings(settings)
+
+  assert config.strategy_type.value == "delay"
+  assert config.default_delay == 1.5
+  assert config.min_interval == 0.25
+  assert config.delay_max_held == 25
+  assert config.priority_levels == 4
+  assert config.wheel_size == 90
+  assert config.ticks_per_second == 2.0
+  assert config.steal_timeout == 0.75
+  assert config.capacity == 2048
+  assert config.worker_id == "worker-a"
+  assert config.peer_ids == ("worker-b", "worker-c")
+  with pytest.raises(FrozenInstanceError):
+    config.worker_id = "worker-z"  # type: ignore[misc]
+
+
+def test_strategy_is_read_once_before_ring_buffer_safety_gate(
+  mocker: MockerFixture,
+) -> None:
+  """A mutable settings source cannot change strategy after safety validation."""
+  settings = mocker.Mock()
+  strategy_values = iter(("passthrough", "ring_buffer"))
+
+  def get(key: str, default: object = None) -> object:
+    if key == "SCRAPY_QUEUE_STRATEGY":
+      return next(strategy_values)
+    if key == "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY":
+      return "block"
+    if key == "SCRAPY_BACKEND_TYPE":
+      return "redis"
+    return default
+
+  settings.get.side_effect = get
+  settings.getdict.return_value = {}
+  manager = mocker.Mock()
+  mocker.patch.object(
+    ConnectionManager,
+    "get_manager",
+    return_value=manager,
+  )
+  build_strategy = mocker.patch(
+    "scrapy_extension.queue.strategies.factory.build_queue_strategy",
+    return_value=mocker.Mock(),
+  )
+
+  BackendScheduler.from_settings(settings)
+
+  assert build_strategy.call_args.args[0].value == "passthrough"
 
 
 @pytest.mark.parametrize(

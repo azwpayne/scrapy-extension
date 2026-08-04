@@ -10,6 +10,7 @@ import logging
 import threading
 import uuid
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from inspect import getattr_static, isawaitable
 from typing import TYPE_CHECKING, Any
 
@@ -59,7 +60,149 @@ _LIFECYCLE_NEW = "new"
 _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
 _MISSING_STATIC_ATTRIBUTE = object()
+_UNSET_QUEUE_STRATEGY = object()
 _EnqueueDiagnostic = tuple[str, str, str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _QueueComponentConfig:
+  """Validated immutable queue settings used to build a scheduler."""
+
+  strategy_type: Any
+  default_delay: float
+  min_interval: float
+  delay_max_held: int | None
+  priority_levels: int
+  wheel_size: int
+  ticks_per_second: float
+  steal_timeout: float
+  capacity: int
+  worker_id: str | None
+  peer_ids: tuple[str, ...]
+
+  @classmethod
+  def from_settings(
+    cls,
+    settings: Settings,
+    *,
+    strategy_value: Any = _UNSET_QUEUE_STRATEGY,
+  ) -> _QueueComponentConfig:
+    """Parse the queue strategy settings without constructing a strategy."""
+    from scrapy_extension.queue.strategies.factory import QueueStrategyType
+    from scrapy_extension.queue.strategies.priority import MAX_PRIORITY_LEVELS
+    from scrapy_extension.queue.strategies.throttle import (
+      THROTTLE_MAX_MIN_INTERVAL_S,
+    )
+    from scrapy_extension.queue.strategies.time_wheel import MAX_WHEEL_SIZE
+
+    if strategy_value is _UNSET_QUEUE_STRATEGY:
+      strategy_value = settings.get(
+        "SCRAPY_QUEUE_STRATEGY",
+        QueueStrategyType.PASSTHROUGH.value,
+      )
+    try:
+      strategy_type = QueueStrategyType(strategy_value)
+    except ValueError as e:
+      valid = ", ".join(repr(member.value) for member in QueueStrategyType)
+      raise ConfigurationError(
+        f"Invalid SCRAPY_QUEUE_STRATEGY {strategy_value!r}. Valid: {valid}.",
+        setting_name="SCRAPY_QUEUE_STRATEGY",
+        setting_value=str(strategy_value),
+      ) from e
+    default_delay = parse_float_setting(
+      settings.get("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
+      "SCRAPY_QUEUE_DELAY_DEFAULT",
+      minimum=0.0,
+    )
+    min_interval = parse_float_setting(
+      settings.get("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
+      "SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL",
+      minimum=0.0,
+      maximum=THROTTLE_MAX_MIN_INTERVAL_S,
+    )
+    # A non-positive max_held intentionally disables the soft warning; retain
+    # that documented opt-out while still rejecting non-integer inputs.
+    delay_max_held_raw = settings.get("SCRAPY_QUEUE_DELAY_MAX_HELD")
+    delay_max_held = (
+      parse_int_setting(delay_max_held_raw, "SCRAPY_QUEUE_DELAY_MAX_HELD")
+      if delay_max_held_raw is not None
+      else None
+    )
+    priority_levels = parse_int_setting(
+      settings.get("SCRAPY_QUEUE_PRIORITY_LEVELS", 3),
+      "SCRAPY_QUEUE_PRIORITY_LEVELS",
+      minimum=1,
+      maximum=MAX_PRIORITY_LEVELS,
+    )
+    wheel_size = parse_int_setting(
+      settings.get("SCRAPY_QUEUE_TIME_WHEEL_SIZE", 60),
+      "SCRAPY_QUEUE_TIME_WHEEL_SIZE",
+      minimum=1,
+      maximum=MAX_WHEEL_SIZE,
+    )
+    ticks_per_second = parse_float_setting(
+      settings.get("SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND", 1.0),
+      "SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND",
+      minimum=0.0,
+      minimum_exclusive=True,
+    )
+    steal_timeout = parse_float_setting(
+      settings.get("SCRAPY_QUEUE_STEAL_TIMEOUT", 0.05),
+      "SCRAPY_QUEUE_STEAL_TIMEOUT",
+      minimum=0.0,
+    )
+    capacity = parse_int_setting(
+      settings.get("SCRAPY_QUEUE_RING_BUFFER_CAPACITY", 1024),
+      "SCRAPY_QUEUE_RING_BUFFER_CAPACITY",
+      minimum=1,
+    )
+    worker_id_raw = settings.get("SCRAPY_QUEUE_WORKER_ID")
+    if worker_id_raw is None:
+      worker_id = None
+    elif not isinstance(worker_id_raw, str) or not worker_id_raw.strip():
+      raise ConfigurationError(
+        "SCRAPY_QUEUE_WORKER_ID must be a non-empty string or unset.",
+        setting_name="SCRAPY_QUEUE_WORKER_ID",
+        setting_value=worker_id_raw,
+      )
+    else:
+      worker_id = worker_id_raw.strip()
+    peer_ids_raw = settings.get("SCRAPY_QUEUE_PEER_IDS")
+    peer_id_values: list[Any] | tuple[Any, ...]
+    if peer_ids_raw is None:
+      peer_id_values = ()
+    elif isinstance(peer_ids_raw, str):
+      peer_id_values = peer_ids_raw.split(",")
+    elif isinstance(peer_ids_raw, (list, tuple)):
+      peer_id_values = peer_ids_raw
+    else:
+      raise ConfigurationError(
+        "SCRAPY_QUEUE_PEER_IDS must be a comma-separated string, list, or tuple.",
+        setting_name="SCRAPY_QUEUE_PEER_IDS",
+        setting_value=peer_ids_raw,
+      )
+    if any(not isinstance(peer_id, str) for peer_id in peer_id_values):
+      raise ConfigurationError(
+        "SCRAPY_QUEUE_PEER_IDS entries must all be strings.",
+        setting_name="SCRAPY_QUEUE_PEER_IDS",
+        setting_value=peer_ids_raw,
+      )
+    peer_ids = tuple(
+      peer_id.strip() for peer_id in peer_id_values if peer_id.strip()
+    )
+    return cls(
+      strategy_type=strategy_type,
+      default_delay=default_delay,
+      min_interval=min_interval,
+      delay_max_held=delay_max_held,
+      priority_levels=priority_levels,
+      wheel_size=wheel_size,
+      ticks_per_second=ticks_per_second,
+      steal_timeout=steal_timeout,
+      capacity=capacity,
+      worker_id=worker_id,
+      peer_ids=peer_ids,
+    )
 
 
 def _static_declaration_rank(component: object, name: str) -> int | None:
@@ -708,11 +851,6 @@ class BackendScheduler:
       QueueStrategyType,
       build_queue_strategy,
     )
-    from scrapy_extension.queue.strategies.priority import MAX_PRIORITY_LEVELS
-    from scrapy_extension.queue.strategies.throttle import (
-      THROTTLE_MAX_MIN_INTERVAL_S,
-    )
-    from scrapy_extension.queue.strategies.time_wheel import MAX_WHEEL_SIZE
 
     strategy_value = settings.get(
       "SCRAPY_QUEUE_STRATEGY",
@@ -810,115 +948,24 @@ class BackendScheduler:
       # hypothetical 3rd-party single-slot backend.
       BackendScheduler._enforce_ack_concurrency_gate(settings, backend_type)
 
-      try:
-        strategy_type = QueueStrategyType(strategy_value)
-      except ValueError as e:
-        valid = ", ".join(repr(member.value) for member in QueueStrategyType)
-        raise ConfigurationError(
-          f"Invalid SCRAPY_QUEUE_STRATEGY {strategy_value!r}. Valid: {valid}.",
-          setting_name="SCRAPY_QUEUE_STRATEGY",
-          setting_value=str(strategy_value),
-        ) from e
-      default_delay = parse_float_setting(
-        settings.get("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
-        "SCRAPY_QUEUE_DELAY_DEFAULT",
-        minimum=0.0,
-      )
-      min_interval = parse_float_setting(
-        settings.get("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
-        "SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL",
-        minimum=0.0,
-        maximum=THROTTLE_MAX_MIN_INTERVAL_S,
-      )
-      # A non-positive max_held intentionally disables the soft warning; retain
-      # that documented opt-out while still rejecting non-integer inputs.
-      delay_max_held_raw = settings.get("SCRAPY_QUEUE_DELAY_MAX_HELD")
-      delay_max_held = (
-        parse_int_setting(delay_max_held_raw, "SCRAPY_QUEUE_DELAY_MAX_HELD")
-        if delay_max_held_raw is not None
-        else None
-      )
-      priority_levels = parse_int_setting(
-        settings.get("SCRAPY_QUEUE_PRIORITY_LEVELS", 3),
-        "SCRAPY_QUEUE_PRIORITY_LEVELS",
-        minimum=1,
-        maximum=MAX_PRIORITY_LEVELS,
-      )
-      wheel_size = parse_int_setting(
-        settings.get("SCRAPY_QUEUE_TIME_WHEEL_SIZE", 60),
-        "SCRAPY_QUEUE_TIME_WHEEL_SIZE",
-        minimum=1,
-        maximum=MAX_WHEEL_SIZE,
-      )
-      ticks_per_second = parse_float_setting(
-        settings.get("SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND", 1.0),
-        "SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND",
-        minimum=0.0,
-        minimum_exclusive=True,
-      )
-      steal_timeout = parse_float_setting(
-        settings.get("SCRAPY_QUEUE_STEAL_TIMEOUT", 0.05),
-        "SCRAPY_QUEUE_STEAL_TIMEOUT",
-        minimum=0.0,
-      )
-      capacity = parse_int_setting(
-        settings.get("SCRAPY_QUEUE_RING_BUFFER_CAPACITY", 1024),
-        "SCRAPY_QUEUE_RING_BUFFER_CAPACITY",
-        minimum=1,
-      )
-      worker_id_raw = settings.get("SCRAPY_QUEUE_WORKER_ID")
-      if worker_id_raw is None:
-        worker_id = None
-      elif not isinstance(worker_id_raw, str) or not worker_id_raw.strip():
-        raise ConfigurationError(
-          "SCRAPY_QUEUE_WORKER_ID must be a non-empty string or unset.",
-          setting_name="SCRAPY_QUEUE_WORKER_ID",
-          setting_value=worker_id_raw,
-        )
-      else:
-        worker_id = worker_id_raw.strip()
-      # Accept Scrapy's comma-separated form as well as native list/tuple values
-      # commonly used in settings.py. Avoid .getlist because unconfigured test
-      # doubles expose it as a non-iterable Mock.
-      peer_ids_raw = settings.get("SCRAPY_QUEUE_PEER_IDS")
-      peer_id_values: list[Any] | tuple[Any, ...]
-      if peer_ids_raw is None:
-        peer_id_values = ()
-      elif isinstance(peer_ids_raw, str):
-        peer_id_values = peer_ids_raw.split(",")
-      elif isinstance(peer_ids_raw, (list, tuple)):
-        peer_id_values = peer_ids_raw
-      else:
-        raise ConfigurationError(
-          "SCRAPY_QUEUE_PEER_IDS must be a comma-separated string, list, or tuple.",
-          setting_name="SCRAPY_QUEUE_PEER_IDS",
-          setting_value=peer_ids_raw,
-        )
-      if any(not isinstance(peer_id, str) for peer_id in peer_id_values):
-        raise ConfigurationError(
-          "SCRAPY_QUEUE_PEER_IDS entries must all be strings.",
-          setting_name="SCRAPY_QUEUE_PEER_IDS",
-          setting_value=peer_ids_raw,
-        )
-      peer_ids = tuple(
-        peer_id.strip()
-        for peer_id in peer_id_values
-        if peer_id.strip()
+      queue_config = _QueueComponentConfig.from_settings(
+        settings,
+        strategy_value=strategy_value,
       )
       try:
         queue_strategy = build_queue_strategy(
-          strategy_type,
+          queue_config.strategy_type,
           manager,
-          default_delay=default_delay,
-          min_interval=min_interval,
-          max_held=delay_max_held,
-          priority_levels=priority_levels,
-          wheel_size=wheel_size,
-          ticks_per_second=ticks_per_second,
-          worker_id=worker_id,
-          peer_ids=peer_ids,
-          steal_timeout=steal_timeout,
-          capacity=capacity,
+          default_delay=queue_config.default_delay,
+          min_interval=queue_config.min_interval,
+          max_held=queue_config.delay_max_held,
+          priority_levels=queue_config.priority_levels,
+          wheel_size=queue_config.wheel_size,
+          ticks_per_second=queue_config.ticks_per_second,
+          worker_id=queue_config.worker_id,
+          peer_ids=queue_config.peer_ids,
+          steal_timeout=queue_config.steal_timeout,
+          capacity=queue_config.capacity,
           full_policy=ring_buffer_full_policy,
         )
       except (TypeError, ValueError, OverflowError) as exc:
@@ -931,7 +978,7 @@ class BackendScheduler:
           ),
           QueueStrategyType.WORK_STEALING: "SCRAPY_QUEUE_PEER_IDS",
           QueueStrategyType.RING_BUFFER: "SCRAPY_QUEUE_RING_BUFFER_CAPACITY",
-        }.get(strategy_type, "SCRAPY_QUEUE_STRATEGY")
+        }.get(queue_config.strategy_type, "SCRAPY_QUEUE_STRATEGY")
         raise ConfigurationError(
           f"Invalid {constructor_setting}: {exc}",
           setting_name=constructor_setting,
@@ -992,7 +1039,9 @@ class BackendScheduler:
       )
       snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
       queue_snapshot_owner = (
-        snapshot_owner_raw if snapshot_owner_raw is not None else worker_id
+        snapshot_owner_raw
+        if snapshot_owner_raw is not None
+        else queue_config.worker_id
       )
       if queue_snapshot_owner is not None:
         if not isinstance(queue_snapshot_owner, str):
