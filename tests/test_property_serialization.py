@@ -24,6 +24,7 @@ pathological inputs that exercise Scrapy-internal parser quirks rather than
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any
 
 import pytest
@@ -102,12 +103,17 @@ _cookies = st.dictionaries(_cookie_keys, _cookie_vals, min_size=0, max_size=3)
 #: contract end-to-end: a ``bytes`` value in ``meta`` / ``cb_kwargs`` must
 #: survive ``_request_to_dict`` → JSON → deserialize → ``request_from_dict``
 #: as ``bytes`` (the serializer encodes bytes via a tagged marker).
+#: ``st.datetimes`` / ``st.dates`` likewise pin the symmetric datetime/date
+#: contract (R53): a ``datetime`` / ``date`` value must survive the round-trip
+#: as the same type (the serializer tags ISO 8601 via a codec marker).
 _scalars = st.one_of(
   st.none(),
   st.booleans(),
   st.integers(min_value=-(1 << 40), max_value=1 << 40),
   st.text(alphabet=st.characters(whitelist_categories=("Ll", "Nd", "Pc")), min_size=0, max_size=10),
   st.binary(min_size=0, max_size=64),
+  st.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2100, 1, 1)),
+  st.dates(min_value=date(2000, 1, 1), max_value=date(2100, 1, 1)),
 )
 _meta_values = st.recursive(
   _scalars,

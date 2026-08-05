@@ -88,16 +88,43 @@ class TestJSONSerializer:
     deserialized = serializer.deserialize(serialized)
     assert deserialized == data
 
-  def test_datetime_serializes_to_isoformat(self):
-    """R17-followup: datetime in request.meta survives as ISO 8601 string."""
+  def test_datetime_round_trips_to_datetime(self):
+    """R53: datetime in request.meta round-trips back to datetime (symmetric).
+
+    Previously (R17) the serializer was asymmetric: ``serialize`` converted a
+    ``datetime`` to an ISO 8601 ``str`` via ``_json_default``, but
+    ``deserialize`` never recognized it -- so a ``datetime`` in ``meta`` came
+    back as a ``str`` permanently, and the R17 docstring's claimed
+    ``datetime.fromisoformat`` round-trip was never implemented. A retry /
+    scheduling middleware doing ``datetime.now() < request.meta['retry_after']``
+    raised ``TypeError`` after one queue cycle. The serializer is now symmetric
+    (mirroring the R17-stopgap -> F1-symmetric promotion already done for
+    ``bytes``): ``datetime`` round-trips to ``datetime``. Timezone-aware and
+    naive datetimes both survive.
+    """
     from datetime import datetime, timezone
 
     serializer = JSONSerializer()
-    dt = datetime(2026, 6, 16, 12, 30, 0, tzinfo=timezone.utc)
-    data = {"scraped_at": dt}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["scraped_at"] == "2026-06-16T12:30:00+00:00"
+    for original in (
+      datetime(2026, 6, 16, 12, 30, 0, tzinfo=timezone.utc),
+      datetime(2026, 6, 16, 12, 30, 0),
+    ):
+      serialized = serializer.serialize({"scraped_at": original})
+      recovered = serializer.deserialize(serialized)["scraped_at"]
+      assert isinstance(recovered, datetime), type(recovered)
+      assert recovered == original
+
+  def test_date_round_trips_to_date(self):
+    """R53: date in request.meta round-trips back to date (symmetric, not widened)."""
+    from datetime import date, datetime
+
+    serializer = JSONSerializer()
+    original = date(2026, 6, 16)
+    serialized = serializer.serialize({"scraped_on": original})
+    recovered = serializer.deserialize(serialized)["scraped_on"]
+    assert isinstance(recovered, date), type(recovered)
+    assert not isinstance(recovered, datetime), type(recovered)
+    assert recovered == original
 
   def test_bytes_round_trips_to_bytes(self):
     """bytes in request.meta round-trips back to bytes (symmetric serializer).
@@ -138,6 +165,35 @@ class TestJSONSerializer:
     invalid_chars = b'{"k": {"__b64__": "!!!!"}}'
     result = serializer.deserialize(invalid_chars)
     assert result == {"k": {"__b64__": "!!!!"}}
+
+  def test_corrupt_datetime_marker_does_not_crash_deserialize(self):
+    """R53: a datetime marker whose ``data`` is not a valid ISO 8601 string (a
+    truncated/corrupt value, or a spider's own meta key shaped like the marker)
+    must NOT crash deserialize via ``ValueError`` -- it falls through as the
+    original dict, mirroring the corrupt-base64 bytes-marker behavior (#31).
+    """
+    serializer = JSONSerializer()
+    corrupt = (
+      b'{"k": {"__scrapy_extension_json_type__": "datetime", "data": "not-a-date"}}'
+    )
+    result = serializer.deserialize(corrupt)
+    assert result == {
+      "k": {"__scrapy_extension_json_type__": "datetime", "data": "not-a-date"}
+    }
+
+  def test_datetime_marker_shaped_user_dict_round_trips_as_dict(self):
+    """R53: a caller-owned dict shaped like the datetime wire marker must NOT be
+    retyped into a ``datetime`` -- the encode-side escape wraps it as a
+    ``_CODEC_DICT`` marker so it survives untouched (collision avoidance).
+    """
+    serializer = JSONSerializer()
+    shaped = {
+      "outer": {
+        "__scrapy_extension_json_type__": "datetime",
+        "data": "2026-01-01T00:00:00",
+      }
+    }
+    assert serializer.deserialize(serializer.serialize(shaped)) == shaped
 
   def test_valid_legacy_marker_shaped_user_dict_round_trips_as_dict(self):
     """A caller-owned dict must not be confused with the bytes wire tag."""

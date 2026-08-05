@@ -43,13 +43,17 @@ _CODEC_TAG = "__scrapy_extension_json_type__"
 _CODEC_DATA = "data"
 _CODEC_BYTES = "bytes"
 _CODEC_DICT = "dict"
+_CODEC_DATETIME = "datetime"
+_CODEC_DATE = "date"
 
 
 def _json_default(obj: object) -> object:
   """JSON default handler for types Scrapy request dicts commonly contain.
 
   Handles the types that appear in real-world ``request.meta``:
-  - ``datetime`` / ``date`` → ISO 8601 string (round-trips via ``datetime.fromisoformat``)
+  - ``datetime`` / ``date`` → tagged ISO 8601 marker (round-trips to the same
+    type via ``fromisoformat``; the marker is escaped like the bytes marker so
+    caller-owned dicts of the same shape survive untouched)
   - ``bytes`` / ``bytearray`` → tagged base64 marker (the recursive codec
     handles these before this fallback in normal ``JSONSerializer`` use)
   - ``Decimal`` → ``str`` (preserves exact decimal representation, avoids float drift)
@@ -71,8 +75,16 @@ def _json_default(obj: object) -> object:
   Raises:
       TypeError: If the object's type isn't handled.
   """
-  if isinstance(obj, (datetime, date)):
-    return obj.isoformat()
+  if isinstance(obj, datetime):
+    return {
+      _CODEC_TAG: _CODEC_DATETIME,
+      _CODEC_DATA: obj.isoformat(),
+    }
+  if isinstance(obj, date):
+    return {
+      _CODEC_TAG: _CODEC_DATE,
+      _CODEC_DATA: obj.isoformat(),
+    }
   if isinstance(obj, (bytes, bytearray)):
     return {
       _CODEC_TAG: _CODEC_BYTES,
@@ -135,17 +147,27 @@ def _looks_like_codec_marker(obj: dict[object, object]) -> bool:
     return True
   return (
     len(obj) == 2
-    and obj.get(_CODEC_TAG) in {_CODEC_BYTES, _CODEC_DICT}
+    and obj.get(_CODEC_TAG) in {_CODEC_BYTES, _CODEC_DICT, _CODEC_DATETIME, _CODEC_DATE}
     and _CODEC_DATA in obj
   )
 
 
 def _encode_json_value(obj: object) -> object:
-  """Recursively encode bytes while escaping marker-shaped caller dictionaries."""
+  """Recursively encode rich types (bytes/datetime/date), escaping marker-shaped dicts."""
   if isinstance(obj, (bytes, bytearray)):
     return {
       _CODEC_TAG: _CODEC_BYTES,
       _CODEC_DATA: base64.b64encode(bytes(obj)).decode("ascii"),
+    }
+  if isinstance(obj, datetime):
+    return {
+      _CODEC_TAG: _CODEC_DATETIME,
+      _CODEC_DATA: obj.isoformat(),
+    }
+  if isinstance(obj, date):
+    return {
+      _CODEC_TAG: _CODEC_DATE,
+      _CODEC_DATA: obj.isoformat(),
     }
   if isinstance(obj, dict):
     for key in obj:
@@ -204,6 +226,26 @@ def _decode_json_value(obj: object) -> object:
     try:
       return base64.b64decode(obj[_CODEC_DATA], validate=True)
     except (binascii.Error, ValueError):
+      pass
+
+  if (
+    len(obj) == 2
+    and obj.get(_CODEC_TAG) == _CODEC_DATETIME
+    and isinstance(obj.get(_CODEC_DATA), str)
+  ):
+    try:
+      return datetime.fromisoformat(obj[_CODEC_DATA])
+    except ValueError:
+      pass
+
+  if (
+    len(obj) == 2
+    and obj.get(_CODEC_TAG) == _CODEC_DATE
+    and isinstance(obj.get(_CODEC_DATA), str)
+  ):
+    try:
+      return date.fromisoformat(obj[_CODEC_DATA])
+    except ValueError:
       pass
 
   legacy = _decode_bytes_tag(obj)
@@ -288,8 +330,8 @@ class JSONSerializer:
     """Serialize an object to JSON bytes.
 
     Uses an escaped recursive codec plus ``_json_default`` for common
-    non-JSON-native types found in Scrapy request dicts (datetime → ISO,
-    bytes → tagged base64 marker).
+    non-JSON-native types found in Scrapy request dicts (``datetime`` / ``date``
+    and ``bytes`` → tagged ISO / base64 markers that round-trip).
     Truly unexpected types raise TypeError with a clear message — no silent
     ``str()`` coercion.
 
