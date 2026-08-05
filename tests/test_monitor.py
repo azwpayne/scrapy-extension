@@ -803,7 +803,7 @@ class TestR14DObservability:
     assert stats.get_value("backend/connect_count") is None
 
   def test_on_disconnect_emitted_on_close(self, mocker):
-    """ConnectionManager.close emits on_disconnect when the backend tears down."""
+    """A successful disconnect emits fixed success telemetry."""
     from scrapy_extension.backends.connectors import ConnectionManager
 
     manager = ConnectionManager.get_manager("redis", {"host": "disc-test"})
@@ -814,7 +814,27 @@ class TestR14DObservability:
     manager.set_monitor(ScrapyStatsMonitor(stats))
     manager.close()
     assert stats.get_value("backend/disconnect_count") == 1
+    assert stats.get_value("backend/disconnect_success_count") == 1
+    assert stats.get_value("backend/disconnect_failure_count") is None
     mock_backend.disconnect.assert_called_once()
+
+  def test_failed_disconnect_emits_fixed_failure_telemetry(self, mocker):
+    """A disconnect error stays suppressed but increments only failure telemetry."""
+    from scrapy_extension.backends.connectors import ConnectionManager
+
+    manager = ConnectionManager("redis")
+    backend = mocker.MagicMock(name="backend")
+    backend.disconnect.side_effect = OSError("network unavailable")
+    manager._backend = backend
+    stats = _stats()
+    manager.set_monitor(ScrapyStatsMonitor(stats))
+
+    manager.close()
+
+    assert stats.get_value("backend/disconnect_count") == 1
+    assert stats.get_value("backend/disconnect_success_count") is None
+    assert stats.get_value("backend/disconnect_failure_count") == 1
+    backend.disconnect.assert_called_once_with()
 
   def test_connection_hooks_noop_on_default_null_monitor(self, mocker):
     """A ConnectionManager with no monitor attached still connects/closes
@@ -904,12 +924,11 @@ class TestR14DObservability:
     assert monitor._stats.get_value("queue/pop_attempt_count") == 2  # type: ignore[attr-defined]
 
   def test_connection_lifecycle_hooks_on_base_monitor_are_noop(self):
-    """on_connect/on_disconnect/on_retry exist on Monitor base + NullMonitor
-    as no-ops (R14-D: new hooks must not break existing subclasses)."""
+    """Connection lifecycle hooks are callable no-ops on the default monitor."""
     null_monitor: Monitor = NullMonitor()
-    # All three new hooks must be callable + return None.
     assert null_monitor.on_connect("redis") is None
     assert null_monitor.on_disconnect("redis", "shutdown") is None
+    assert null_monitor.on_disconnect_result("redis", True) is None
     assert null_monitor.on_retry("redis", 1) is None
 
 

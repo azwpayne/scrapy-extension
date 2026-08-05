@@ -35,23 +35,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
       if "benchmark" in item.keywords:
         item.add_marker(skip_bench)
-    return
-
-  only = config.getoption("--benchmark-only", default=False)
-  # ``--benchmark-enable`` exists only when the plugin is loaded; guard with getattr.
-  enable = config.getoption("--benchmark-enable", default=False)
-  if only or enable:
-    return
-
-  skip_bench = pytest.mark.skip(
-    reason=(
-      "benchmark opt-in: pass --benchmark-only (run only benchmarks) or "
-      "--benchmark-enable (run benchmarks alongside the suite)"
-    ),
-  )
-  for item in items:
-    if "benchmark" in item.keywords:
-      item.add_marker(skip_bench)
+  else:
+    only = config.getoption("--benchmark-only", default=False)
+    # ``--benchmark-enable`` exists only when the plugin is loaded; guard with getattr.
+    enable = config.getoption("--benchmark-enable", default=False)
+    if not (only or enable):
+      skip_bench = pytest.mark.skip(
+        reason=(
+          "benchmark opt-in: pass --benchmark-only (run only benchmarks) or "
+          "--benchmark-enable (run benchmarks alongside the suite)"
+        ),
+      )
+      for item in items:
+        if "benchmark" in item.keywords:
+          item.add_marker(skip_bench)
 
   # R14-G: integration-tier gate. ``tests/integration/*`` e2e tests require a
   # real backend (Redis/Mongo/Kafka/RabbitMQ/ES/RocketMQ) and bit-rot silently

@@ -163,9 +163,11 @@ jobs:
   # containerized backends. Runs in parallel with unit-tests so it never
   # blocks the fast unit lane.
   #
-  # Service healthchecks: redis/mongodb/elasticsearch/rabbitmq all expose
-  # a real healthcheck command. Kafka has no trivial CLI healthcheck in the
-  # bitnami image, so we fall back to a TCP port probe in a wait step.
+  # Service healthchecks: redis/mongodb/elasticsearch/rabbitmq and LocalStack
+  # expose real health endpoints. Kafka and Memcached are probed from the
+  # runner below. Pulsar runs in standalone mode via `docker run` because it needs
+  # the `bin/pulsar standalone` command, which GitHub Actions' services block
+  # cannot express.
   #
   # RocketMQ runs via docker-compose (tests/integration/docker-compose.yml),
   # not the services block, because its broker needs --enable-proxy + a
@@ -242,6 +244,21 @@ jobs:
           KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
         ports:
           - 9092:9092
+      memcached:
+        image: memcached:1.6
+        ports:
+          - 11211:11211
+      localstack:
+        image: localstack/localstack:4.11.1
+        env:
+          SERVICES: sqs,dynamodb
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/init/ready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - name: Set up Python 3.12
@@ -256,16 +273,37 @@ jobs:
         run: >-
           uv run --no-sync python -c
           "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
-      - name: Wait for Kafka port (no CLI healthcheck in bitnami image)
+      - name: Wait for Kafka and Memcached ports
         run: |
           for i in $(seq 1 30); do
-            if (echo > /dev/tcp/localhost/9092) >/dev/null 2>&1; then
-              echo "Kafka broker accepting connections on 9092"
+            if (echo > /dev/tcp/localhost/9092) >/dev/null 2>&1 && \
+              (echo > /dev/tcp/localhost/11211) >/dev/null 2>&1; then
+              echo "Kafka and Memcached are accepting connections"
               exit 0
             fi
-            echo "kafka not ready ($i/30)"; sleep 5
+            echo "Kafka or Memcached not ready ($i/30)"; sleep 5
           done
-          echo "Kafka did not become ready in time" >&2
+          echo "Kafka or Memcached did not become ready in time" >&2
+          exit 1
+      - name: Bring up Pulsar standalone broker
+        # The Pulsar service requires `bin/pulsar standalone`; Docker Compose
+        # is unnecessary for this single container, while the Actions services
+        # block cannot supply its command.
+        run: |
+          docker run --detach --rm --name scrapy-ext-pulsar \
+            --env PULSAR_MEM="-Xms512m -Xmx512m -XX:MaxDirectMemorySize=512m" \
+            --publish 6650:6650 --publish 8080:8080 \
+            apachepulsar/pulsar:4.1.2 \
+            bin/pulsar standalone
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8080/admin/v2/brokers/health >/dev/null; then
+              echo "Pulsar broker is ready"
+              exit 0
+            fi
+            echo "pulsar not ready ($i/30)"; sleep 5
+          done
+          docker logs scrapy-ext-pulsar
+          echo "Pulsar did not become ready in time" >&2
           exit 1
       - name: Bring up RocketMQ (namesrv + broker with --enable-proxy)
         # The broker needs --enable-proxy (gRPC on 8081) + a mounted
@@ -299,6 +337,15 @@ jobs:
           SCRAPY_TEST_ES_HOSTS: http://localhost:9200
           SCRAPY_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
           SCRAPY_TEST_KAFKA_BOOTSTRAP: localhost:9092
+          SCRAPY_TEST_PULSAR_URL: pulsar://localhost:6650
+          SCRAPY_TEST_MEMCACHED_HOST: localhost
+          # LocalStack emulates both AWS services. These are intentionally
+          # non-secret test credentials; no cloud account is contacted.
+          SCRAPY_TEST_SQS_ENDPOINT: http://localhost:4566
+          SCRAPY_TEST_DYNAMODB_ENDPOINT: http://localhost:4566
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
           # gRPC PROXY endpoint (host:8081), NOT the NameServer. The broker
           # runs with --enable-proxy via the compose step above.
           SCRAPY_TEST_ROCKETMQ_NAMESRV: localhost:8081

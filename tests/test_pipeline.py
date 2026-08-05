@@ -483,12 +483,18 @@ class TestBackendPipelineOpenSpider:
     """R86: cleanup and its logger cannot mask the failed open's cause."""
     strategy = mocker.MagicMock()
     original_error = KeyboardInterrupt("open interrupted")
-    strategy.open.side_effect = original_error
-    mock_connection_manager.close.side_effect = RuntimeError("release failed")
-    mocker.patch(
-      "scrapy_extension.pipeline.pipeline.logger.exception",
-      side_effect=SystemExit("logger interrupted"),
-    )
+    cleanup_contexts: list[tuple[object | None, object | None, object | None]] = []
+
+    def fail_open() -> None:
+      raise original_error
+
+    def fail_close() -> None:
+      cleanup_contexts.append(sys.exc_info())
+      raise RuntimeError("release failed")
+
+    strategy.open.side_effect = fail_open
+    strategy.close.side_effect = fail_close
+    mock_connection_manager.close.side_effect = RuntimeError("manager release failed")
     pipeline = BackendPipeline(
       connection_manager=mock_connection_manager,
       storage_strategy=strategy,
@@ -496,13 +502,19 @@ class TestBackendPipelineOpenSpider:
     spider = mocker.Mock(name="spider")
     spider.name = "test_spider"
 
-    with pytest.raises(KeyboardInterrupt) as exc_info:
-      pipeline.open_spider(spider)
+    with _capture_diagnostics(
+      "scrapy_extension.pipeline.pipeline",
+      level=logging.ERROR,
+    ) as handler:
+      with pytest.raises(KeyboardInterrupt) as exc_info:
+        pipeline.open_spider(spider)
 
     assert exc_info.value is original_error
+    assert cleanup_contexts == [(None, None, None)]
     strategy.open.assert_called_once_with()
     strategy.close.assert_called_once_with()
     mock_connection_manager.close.assert_called_once_with()
+    _assert_handler_records_are_redacted(handler, "release failed")
 
   def test_open_spider_rejects_name_that_cannot_form_a_storage_key(
     self, mock_connection_manager, mocker

@@ -312,17 +312,13 @@ def test_push_pop_round_trip(rocketmq_backend, unique_prefix):
   # N (queue rotation + redelivery timing are broker-side concerns the backend
   # does not control). Proving >=1 + fidelity is the honest R7 claim.
   #
-  # If NOTHING came through, skip (not fail): pop_empty+push are independently
-  # proven (pop returns None correctly; push returns real message_ids), so a
-  # 0-delivery round-trip is broker-side delivery flakiness — apache 5.x proxy
-  # intermittently NPEs in ReceiveMessageActivity (npe_hits>0) and/or pins the
-  # consumer to one empty queue (npe_hits==0). Either way the backend code is
-  # correct; the broker didn't deliver within the drain window.
+  # A zero-delivery round-trip is a failed verification, even when the broker
+  # reports no transient receive errors. Service-unavailability skips belong at
+  # the environment/topic setup boundaries above, not here.
   if not received:
-    pytest.skip(
+    pytest.fail(
       f"broker delivered 0 of {n} pushed messages within the drain window "
-      f"({npe_hits} receive NPE(s)); apache proxy delivery flakiness, not a "
-      f"backend issue. Push succeeded (producer accepted all {n})."
+      f"({npe_hits} receive NPE(s)); push succeeded (producer accepted all {n})."
     )
   assert set(received).issubset(set(sent)), f"unexpected body: {received!r}"
 
@@ -360,6 +356,22 @@ def test_pop_empty_returns_none(rocketmq_backend, unique_prefix):
     "pop on empty topic did not return None within 30s "
     "(apache proxy route-cache lag did not resolve)"
   )
+
+
+def test_push_pop_round_trip_fails_when_no_messages_are_delivered(mocker) -> None:
+  """An enabled integration round-trip must fail on zero delivery."""
+  backend = SimpleNamespace(
+    config=SimpleNamespace(topic_prefix="test"),
+    push=mocker.Mock(),
+  )
+  mocker.patch.object(pytest, "skip")
+  mocker.patch.dict(
+    test_push_pop_round_trip.__globals__,
+    {"_ensure_topic": mocker.Mock(), "_drain": mocker.Mock(return_value=([], 0))},
+  )
+
+  with pytest.raises(pytest.fail.Exception, match="broker delivered 0"):
+    test_push_pop_round_trip(backend, "test-queue")
 
 
 def test_queue_len_reports_unsupported(rocketmq_backend, unique_prefix):

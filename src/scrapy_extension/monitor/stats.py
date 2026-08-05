@@ -106,6 +106,10 @@ class ScrapyStatsMonitor(Monitor):
     (R14-D connection-lifecycle). Wired from ``ConnectionManager.connect``.
   - ``backend/disconnect_count`` (counter) — per backend disconnect
     (R14-D connection-lifecycle). Wired from ``ConnectionManager.close``.
+  - ``backend/disconnect_success_count`` (counter) — per successful final
+    backend disconnect.
+  - ``backend/disconnect_failure_count`` (counter) — per failed final backend
+    disconnect; records no exception details.
   - ``backend/retry_count`` (counter) — per connection retry
     (R14-D connection-lifecycle). Wired from ``ConnectionManager.connect``.
 
@@ -286,6 +290,22 @@ class ScrapyStatsMonitor(Monitor):
         reason: Scrapy engine close reason (or ``None``).
     """
     self._stats.inc_value("backend/disconnect_count")
+
+  @_stats_safe
+  def on_disconnect_result(self, backend_type: str, succeeded: bool) -> None:
+    """Increment the fixed success or failure disconnect counter.
+
+    Args:
+        backend_type: The backend-type registry string that disconnected.
+        succeeded: Whether ``backend.disconnect()`` returned successfully.
+    """
+    del backend_type
+    stat_key = (
+      "backend/disconnect_success_count"
+      if succeeded
+      else "backend/disconnect_failure_count"
+    )
+    self._stats.inc_value(stat_key)
 
   @_stats_safe
   def on_retry(self, backend_type: str, attempt: int) -> None:
