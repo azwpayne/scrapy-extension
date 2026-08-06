@@ -1480,6 +1480,13 @@ class BackendScheduler:
                 # Without this, ConnectionManager defaults to NullMonitor and the hooks
                 # R14-D wired are dead observability outside the queue path.
                 self.connection_manager.set_monitor(monitor)
+                # R55: thread the resolved monitor into the snapshot manager too,
+                # so the snapshot backend's connect/disconnect/retry hooks (→
+                # backend/{connect,disconnect,retry}_count) fire — the same R14-D
+                # visibility fix as the queue manager. Guarded: the snapshot
+                # manager is None when no stateful-snapshot pairing is configured.
+                if self._snapshot_connection_manager is not None:
+                    self._snapshot_connection_manager.set_monitor(monitor)
                 self._queue = BackendQueue(
                     connection_manager=self.connection_manager,
                     queue_name=self.queue_key,

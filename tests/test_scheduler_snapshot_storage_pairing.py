@@ -287,3 +287,27 @@ def test_scheduler_persists_kafka_delay_snapshot_through_configured_storage(
     storage.retrieve.assert_called_once()
     storage.store.assert_called_once()
     assert order == ["snapshot-store", "snapshot-release", "queue-release"]
+
+
+def test_scheduler_open_threads_monitor_into_snapshot_manager(mocker) -> None:
+    """R55: open() must thread the resolved monitor into the snapshot
+    ConnectionManager too, not just the queue manager -- otherwise the snapshot
+    backend's connect/disconnect/retry hooks fire against the default
+    NullMonitor and its lifecycle is invisible in stats (the identical gap R14-D
+    closed for the queue manager, reintroduced in 5c2f7c5's snapshot acquire).
+    """
+    queue_manager = mocker.MagicMock(name="queue-manager")
+    snapshot_manager = mocker.MagicMock(name="snapshot-manager")
+    mocker.patch(
+        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
+        side_effect=[queue_manager, snapshot_manager],
+    )
+    scheduler = BackendScheduler.from_settings(_settings())
+
+    scheduler.open(_PairingSpider())
+
+    # R14-D path (queue manager) -- already wired.
+    queue_manager.set_monitor.assert_called_once()
+    # R55: the snapshot manager must receive the same resolved monitor.
+    snapshot_manager.set_monitor.assert_called_once()
+    scheduler.close("test-finished")
