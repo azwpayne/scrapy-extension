@@ -188,7 +188,13 @@ class BackendSpiderMixin(Spider):
         signal_wiring_failure = exc
       if signal_wiring_failure is not None:
         cleanup_failed = False
-        if acquired_here:
+        # Release the manager when this call orphaned it: either we acquired it
+        # here (acquired_here), or _connect_signals detached the old crawler's
+        # spider_closed handler and then failed to wire the new one (leaving
+        # _connected_signals None) -- in the latter case spider_closed can no
+        # longer fire close_backend, so the manager must be released here or it
+        # leaks (registry refcount never decremented) for the life of the process.
+        if acquired_here or self._connected_signals is None:
           self._connection_manager = None
           try:
             manager.close()

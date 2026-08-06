@@ -482,6 +482,49 @@ class TestSetupBackend:
     assert second_signals.connect.call_count == 2
     assert spider._connected_signals is second_signals
 
+  def test_setup_backend_replacement_signal_failure_releases_manager(self, mocker):
+    """R54: if signal rewiring fails on a replacement crawler, the manager is
+    orphaned (old handlers detached inside _connect_signals, new ones rolled
+    back, _connected_signals=None) -- spider_closed can never fire
+    close_backend, so setup_backend must release the manager itself rather than
+    leak it (and the backend connection) for the life of the process.
+
+    Covers the untested intersection of the fresh-acquire signal-failure path
+    (line 288) and the replacement-crawler success path (line 460): replacement
+    crawler + signal-connect failure.
+    """
+    manager = mocker.MagicMock(spec=ConnectionManager)
+    acquire = mocker.patch.object(
+      ConnectionManager, "get_manager", return_value=manager
+    )
+
+    class TestSpider(BackendSpiderMixin, Spider):
+      name = "test_spider"
+      backend_type = BackendType.REDIS
+
+    spider = TestSpider()
+    first_signals = mocker.MagicMock()
+    spider.crawler = mocker.MagicMock(signals=first_signals)
+    spider.setup_backend()  # success: manager acquired, wired to first_signals
+
+    second_signals = mocker.MagicMock()
+    # first connect (spider_opened) succeeds; second (spider_closed) raises
+    second_signals.connect.side_effect = [None, RuntimeError("replacement bus")]
+    spider.crawler = mocker.MagicMock(signals=second_signals)
+
+    with pytest.raises(RuntimeError, match="replacement bus"):
+      spider.setup_backend()
+
+    # Manager acquired once (not re-acquired on the replacement call).
+    acquire.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
+    # R54: the orphaned manager is released, not leaked until process exit.
+    manager.close.assert_called_once_with()
+    assert spider._connection_manager is None
+    # Old crawler's handlers were detached before the new connect failed.
+    assert first_signals.disconnect.call_count == 2
+    assert spider._connected_signals is None
+    assert spider._signals_connected is False
+
   def test_setup_backend_shares_singleton_across_spiders(self):
     """2026-07-11 (§C intent, no mocks): two spiders with identical backend
     config must acquire the SAME ConnectionManager via the singleton registry.
