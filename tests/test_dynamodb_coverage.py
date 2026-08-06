@@ -11,105 +11,105 @@ from scrapy_extension.settings import DynamoDBSettings
 
 
 def _connected(mocker, **overrides):
-  b = DynamoDBBackend(DynamoDBSettings(**overrides))
-  resource = mocker.MagicMock()
-  table = mocker.MagicMock()
-  table.load.return_value = None
-  table.table_status = "ACTIVE"
-  resource.Table.return_value = table
-  table.meta.client = resource.meta.client
-  resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
-  session = mocker.MagicMock()
-  session.resource.return_value = resource
-  mocker.patch.object(boto3.session, "Session", return_value=session)
-  b.connect()
-  return b, table
+    b = DynamoDBBackend(DynamoDBSettings(**overrides))
+    resource = mocker.MagicMock()
+    table = mocker.MagicMock()
+    table.load.return_value = None
+    table.table_status = "ACTIVE"
+    resource.Table.return_value = table
+    table.meta.client = resource.meta.client
+    resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
+    session = mocker.MagicMock()
+    session.resource.return_value = resource
+    mocker.patch.object(boto3.session, "Session", return_value=session)
+    b.connect()
+    return b, table
 
 
 class TestDynamoDBErrorPaths:
-  def test_connect_with_credentials(self, mocker) -> None:
-    b, _ = _connected(mocker, aws_access_key_id="k", aws_secret_access_key="s")
-    assert b.is_connected()
+    def test_connect_with_credentials(self, mocker) -> None:
+        b, _ = _connected(mocker, aws_access_key_id="k", aws_secret_access_key="s")
+        assert b.is_connected()
 
-  def test_ping_failure(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.load.side_effect = RuntimeError("down")
-    assert b.ping() is False
+    def test_ping_failure(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.load.side_effect = RuntimeError("down")
+        assert b.ping() is False
 
-  def test_disconnect(self, mocker) -> None:
-    b, _ = _connected(mocker)
-    b.disconnect()
-    assert b.is_connected() is False
+    def test_disconnect(self, mocker) -> None:
+        b, _ = _connected(mocker)
+        b.disconnect()
+        assert b.is_connected() is False
 
-  def test_store_raises_storage_error(self, mocker) -> None:
-    # R14-A: storage ops raise StorageError instead of silently swallowing
-    # (the old swallow masked throttling/throughput failures as "success").
-    b, table = _connected(mocker)
-    table.put_item.side_effect = RuntimeError("boom")
-    with pytest.raises(StorageError) as exc_info:
-      b.store("k", b"v")
-    assert exc_info.value.operation == "store"
-    assert exc_info.value.key is None
+    def test_store_raises_storage_error(self, mocker) -> None:
+        # R14-A: storage ops raise StorageError instead of silently swallowing
+        # (the old swallow masked throttling/throughput failures as "success").
+        b, table = _connected(mocker)
+        table.put_item.side_effect = RuntimeError("boom")
+        with pytest.raises(StorageError) as exc_info:
+            b.store("k", b"v")
+        assert exc_info.value.operation == "store"
+        assert exc_info.value.key is None
 
-  def test_retrieve_raises_storage_error(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.get_item.side_effect = RuntimeError("boom")
-    with pytest.raises(StorageError) as exc_info:
-      b.retrieve("k")
-    assert exc_info.value.operation == "retrieve"
+    def test_retrieve_raises_storage_error(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.get_item.side_effect = RuntimeError("boom")
+        with pytest.raises(StorageError) as exc_info:
+            b.retrieve("k")
+        assert exc_info.value.operation == "retrieve"
 
-  def test_delete_raises_storage_error(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.delete_item.side_effect = RuntimeError("boom")
-    with pytest.raises(StorageError):
-      b.delete("k")
+    def test_delete_raises_storage_error(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.delete_item.side_effect = RuntimeError("boom")
+        with pytest.raises(StorageError):
+            b.delete("k")
 
-  def test_exists_raises_storage_error(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.get_item.side_effect = RuntimeError("boom")
-    with pytest.raises(StorageError):
-      b.exists("k")
+    def test_exists_raises_storage_error(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.get_item.side_effect = RuntimeError("boom")
+        with pytest.raises(StorageError):
+            b.exists("k")
 
-  def test_ttl_raises_storage_error(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.get_item.side_effect = RuntimeError("boom")
-    with pytest.raises(StorageError):
-      b.ttl("k")
+    def test_ttl_raises_storage_error(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.get_item.side_effect = RuntimeError("boom")
+        with pytest.raises(StorageError):
+            b.ttl("k")
 
-  def test_clear_with_prefix_validates(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.scan.return_value = {"Items": []}
-    b.clear_storage(prefix="foo")
-    table.scan.assert_called_once()
+    def test_clear_with_prefix_validates(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.scan.return_value = {"Items": []}
+        b.clear_storage(prefix="foo")
+        table.scan.assert_called_once()
 
-  def test_clear_raises_storage_error(self, mocker) -> None:
-    b, table = _connected(mocker)
-    table.scan.side_effect = RuntimeError("boom")
-    with pytest.raises(StorageError):
-      b.clear_storage()
+    def test_clear_raises_storage_error(self, mocker) -> None:
+        b, table = _connected(mocker)
+        table.scan.side_effect = RuntimeError("boom")
+        with pytest.raises(StorageError):
+            b.clear_storage()
 
-  def test_retrieve_expired_delete_failure_swallowed(self, mocker) -> None:
-    """_swallow catches a delete failure during expired-item cleanup."""
-    b, table = _connected(mocker)
-    table.get_item.return_value = {"Item": {"pk": "k", "expire_at": 1.0}}
-    table.delete_item.side_effect = RuntimeError("delete failed")
-    assert b.retrieve("k") is None  # expired; inner delete raised, swallowed
+    def test_retrieve_expired_delete_failure_swallowed(self, mocker) -> None:
+        """_swallow catches a delete failure during expired-item cleanup."""
+        b, table = _connected(mocker)
+        table.get_item.return_value = {"Item": {"pk": "k", "expire_at": 1.0}}
+        table.delete_item.side_effect = RuntimeError("delete failed")
+        assert b.retrieve("k") is None  # expired; inner delete raised, swallowed
 
-  def test_swallow_does_not_suppress_base_exception(self) -> None:
-    """R-swallow: _swallow must NOT suppress BaseException (Ctrl+C / SystemExit).
+    def test_swallow_does_not_suppress_base_exception(self) -> None:
+        """R-swallow: _swallow must NOT suppress BaseException (Ctrl+C / SystemExit).
 
-    Pre-fix ``__exit__`` returned True for any non-None ``exc_type``, so a
-    ``KeyboardInterrupt`` raised inside a ``with _swallow():`` cleanup block was
-    trapped -- the operator's shutdown signal disappeared into a debug log. Now
-    only regular Exceptions are suppressed; BaseException propagates.
-    """
-    from scrapy_extension.backends.dynamodb import _swallow
+        Pre-fix ``__exit__`` returned True for any non-None ``exc_type``, so a
+        ``KeyboardInterrupt`` raised inside a ``with _swallow():`` cleanup block was
+        trapped -- the operator's shutdown signal disappeared into a debug log. Now
+        only regular Exceptions are suppressed; BaseException propagates.
+        """
+        from scrapy_extension.backends.dynamodb import _swallow
 
-    sw = _swallow()
-    sw.__enter__()
-    # Regular Exception is suppressed (returns True).
-    assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
-    # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
-    assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
-    # No exception (exc_type None) -> False (normal exit, propagate nothing).
-    assert sw.__exit__(None, None, None) is False
+        sw = _swallow()
+        sw.__enter__()
+        # Regular Exception is suppressed (returns True).
+        assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+        # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
+        assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
+        # No exception (exc_type None) -> False (normal exit, propagate nothing).
+        assert sw.__exit__(None, None, None) is False

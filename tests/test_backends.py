@@ -4,2467 +4,2508 @@ import pytest
 from pydantic import SecretBytes, SecretStr
 
 from scrapy_extension.backends.base import (
-  BackendType,
-  JSONSerializer,
+    BackendType,
+    JSONSerializer,
 )
 from scrapy_extension.exceptions import BackendConnectionError
 
 
 class TestRedisMode:
-  """Test RedisMode enum."""
+    """Test RedisMode enum."""
 
-  def test_standalone_value(self):
-    from scrapy_extension.settings import RedisMode
+    def test_standalone_value(self):
+        from scrapy_extension.settings import RedisMode
 
-    assert RedisMode.STANDALONE.value == "standalone"
+        assert RedisMode.STANDALONE.value == "standalone"
 
-  def test_master_slave_value(self):
-    from scrapy_extension.settings import RedisMode
+    def test_master_slave_value(self):
+        from scrapy_extension.settings import RedisMode
 
-    assert RedisMode.MASTER_SLAVE.value == "master_slave"
+        assert RedisMode.MASTER_SLAVE.value == "master_slave"
 
-  def test_sentinel_value(self):
-    from scrapy_extension.settings import RedisMode
+    def test_sentinel_value(self):
+        from scrapy_extension.settings import RedisMode
 
-    assert RedisMode.SENTINEL.value == "sentinel"
+        assert RedisMode.SENTINEL.value == "sentinel"
 
-  def test_cluster_value(self):
-    from scrapy_extension.settings import RedisMode
+    def test_cluster_value(self):
+        from scrapy_extension.settings import RedisMode
 
-    assert RedisMode.CLUSTER.value == "cluster"
+        assert RedisMode.CLUSTER.value == "cluster"
 
 
 class TestBackendType:
-  """Test BackendType enum."""
+    """Test BackendType enum."""
 
-  def test_redis_value(self):
-    assert BackendType.REDIS.value == "redis"
+    def test_redis_value(self):
+        assert BackendType.REDIS.value == "redis"
 
-  def test_mongodb_value(self):
-    assert BackendType.MONGODB.value == "mongodb"
+    def test_mongodb_value(self):
+        assert BackendType.MONGODB.value == "mongodb"
 
-  def test_kafka_value(self):
-    assert BackendType.KAFKA.value == "kafka"
+    def test_kafka_value(self):
+        assert BackendType.KAFKA.value == "kafka"
 
-  def test_rabbitmq_value(self):
-    assert BackendType.RABBITMQ.value == "rabbitmq"
+    def test_rabbitmq_value(self):
+        assert BackendType.RABBITMQ.value == "rabbitmq"
 
-  def test_invalid_value_lists_valid_options(self):
-    """R3-G7: BackendType(invalid) raises ValueError with valid-values hint."""
-    with pytest.raises(ValueError) as exc_info:
-      BackendType("mysql")
-    msg = str(exc_info.value)
-    assert "'mysql'" in msg
-    assert "redis" in msg
-    assert "mongodb" in msg
-    assert "Valid values:" in msg
+    def test_invalid_value_lists_valid_options(self):
+        """R3-G7: BackendType(invalid) raises ValueError with valid-values hint."""
+        with pytest.raises(ValueError) as exc_info:
+            BackendType("mysql")
+        msg = str(exc_info.value)
+        assert "'mysql'" in msg
+        assert "redis" in msg
+        assert "mongodb" in msg
+        assert "Valid values:" in msg
 
 
 class TestJSONSerializer:
-  """Test JSONSerializer."""
+    """Test JSONSerializer."""
 
-  def test_serialize_dict(self):
-    serializer = JSONSerializer()
-    data = {"key": "value"}
-    result = serializer.serialize(data)
-    assert result == b'{"key": "value"}'
+    def test_serialize_dict(self):
+        serializer = JSONSerializer()
+        data = {"key": "value"}
+        result = serializer.serialize(data)
+        assert result == b'{"key": "value"}'
 
-  def test_deserialize_dict(self):
-    serializer = JSONSerializer()
-    data = b'{"key": "value"}'
-    result = serializer.deserialize(data)
-    assert result == {"key": "value"}
+    def test_deserialize_dict(self):
+        serializer = JSONSerializer()
+        data = b'{"key": "value"}'
+        result = serializer.deserialize(data)
+        assert result == {"key": "value"}
 
-  def test_serialize_list(self):
-    serializer = JSONSerializer()
-    data = [1, 2, 3]
-    result = serializer.serialize(data)
-    assert result == b"[1, 2, 3]"
+    def test_serialize_list(self):
+        serializer = JSONSerializer()
+        data = [1, 2, 3]
+        result = serializer.serialize(data)
+        assert result == b"[1, 2, 3]"
 
-  def test_round_trip(self):
-    serializer = JSONSerializer()
-    data = {"nested": {"key": "value"}, "list": [1, 2, 3]}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized == data
+    def test_round_trip(self):
+        serializer = JSONSerializer()
+        data = {"nested": {"key": "value"}, "list": [1, 2, 3]}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized == data
 
-  def test_datetime_round_trips_to_datetime(self):
-    """R53: datetime in request.meta round-trips back to datetime (symmetric).
+    def test_datetime_round_trips_to_datetime(self):
+        """R53: datetime in request.meta round-trips back to datetime (symmetric).
 
-    Previously (R17) the serializer was asymmetric: ``serialize`` converted a
-    ``datetime`` to an ISO 8601 ``str`` via ``_json_default``, but
-    ``deserialize`` never recognized it -- so a ``datetime`` in ``meta`` came
-    back as a ``str`` permanently, and the R17 docstring's claimed
-    ``datetime.fromisoformat`` round-trip was never implemented. A retry /
-    scheduling middleware doing ``datetime.now() < request.meta['retry_after']``
-    raised ``TypeError`` after one queue cycle. The serializer is now symmetric
-    (mirroring the R17-stopgap -> F1-symmetric promotion already done for
-    ``bytes``): ``datetime`` round-trips to ``datetime``. Timezone-aware and
-    naive datetimes both survive.
-    """
-    from datetime import datetime, timezone
+        Previously (R17) the serializer was asymmetric: ``serialize`` converted a
+        ``datetime`` to an ISO 8601 ``str`` via ``_json_default``, but
+        ``deserialize`` never recognized it -- so a ``datetime`` in ``meta`` came
+        back as a ``str`` permanently, and the R17 docstring's claimed
+        ``datetime.fromisoformat`` round-trip was never implemented. A retry /
+        scheduling middleware doing ``datetime.now() < request.meta['retry_after']``
+        raised ``TypeError`` after one queue cycle. The serializer is now symmetric
+        (mirroring the R17-stopgap -> F1-symmetric promotion already done for
+        ``bytes``): ``datetime`` round-trips to ``datetime``. Timezone-aware and
+        naive datetimes both survive.
+        """
+        from datetime import datetime, timezone
 
-    serializer = JSONSerializer()
-    for original in (
-      datetime(2026, 6, 16, 12, 30, 0, tzinfo=timezone.utc),
-      datetime(2026, 6, 16, 12, 30, 0),
-    ):
-      serialized = serializer.serialize({"scraped_at": original})
-      recovered = serializer.deserialize(serialized)["scraped_at"]
-      assert isinstance(recovered, datetime), type(recovered)
-      assert recovered == original
+        serializer = JSONSerializer()
+        for original in (
+            datetime(2026, 6, 16, 12, 30, 0, tzinfo=timezone.utc),
+            datetime(2026, 6, 16, 12, 30, 0),
+        ):
+            serialized = serializer.serialize({"scraped_at": original})
+            recovered = serializer.deserialize(serialized)["scraped_at"]
+            assert isinstance(recovered, datetime), type(recovered)
+            assert recovered == original
 
-  def test_date_round_trips_to_date(self):
-    """R53: date in request.meta round-trips back to date (symmetric, not widened)."""
-    from datetime import date, datetime
+    def test_date_round_trips_to_date(self):
+        """R53: date in request.meta round-trips back to date (symmetric, not widened)."""
+        from datetime import date, datetime
 
-    serializer = JSONSerializer()
-    original = date(2026, 6, 16)
-    serialized = serializer.serialize({"scraped_on": original})
-    recovered = serializer.deserialize(serialized)["scraped_on"]
-    assert isinstance(recovered, date), type(recovered)
-    assert not isinstance(recovered, datetime), type(recovered)
-    assert recovered == original
+        serializer = JSONSerializer()
+        original = date(2026, 6, 16)
+        serialized = serializer.serialize({"scraped_on": original})
+        recovered = serializer.deserialize(serialized)["scraped_on"]
+        assert isinstance(recovered, date), type(recovered)
+        assert not isinstance(recovered, datetime), type(recovered)
+        assert recovered == original
 
-  def test_bytes_round_trips_to_bytes(self):
-    """bytes in request.meta round-trips back to bytes (symmetric serializer).
+    def test_bytes_round_trips_to_bytes(self):
+        """bytes in request.meta round-trips back to bytes (symmetric serializer).
 
-    Previously (R17) the serializer was asymmetric: ``serialize`` base64-
-    encoded ``bytes`` to a ``str`` via ``_json_default``, but ``deserialize``
-    never decoded it — so a ``bytes`` value in ``meta`` / ``cookies`` /
-    ``cb_kwargs`` came back as a base64 ``str``. R17 accepted that as "survives
-    (not repr)" to avoid the worse ``b'\\x00'`` → ``"b'\\x00'"`` repr corruption.
-    The serializer is now symmetric: ``bytes`` round-trips to ``bytes``, so a
-    spider reading ``request.meta[key]`` after a queue cycle gets back exactly
-    what it pushed — no manual ``base64.b64decode`` workaround.
+        Previously (R17) the serializer was asymmetric: ``serialize`` base64-
+        encoded ``bytes`` to a ``str`` via ``_json_default``, but ``deserialize``
+        never decoded it — so a ``bytes`` value in ``meta`` / ``cookies`` /
+        ``cb_kwargs`` came back as a base64 ``str``. R17 accepted that as "survives
+        (not repr)" to avoid the worse ``b'\\x00'`` → ``"b'\\x00'"`` repr corruption.
+        The serializer is now symmetric: ``bytes`` round-trips to ``bytes``, so a
+        spider reading ``request.meta[key]`` after a queue cycle gets back exactly
+        what it pushed — no manual ``base64.b64decode`` workaround.
 
-    Note: ``bytearray`` also round-trips, narrowing to ``bytes`` (JSON cannot
-    distinguish the two without a second marker; ``bytes`` is the superset
-    callers expect).
-    """
-    serializer = JSONSerializer()
-    data = {"raw": b"\x00\xff\x42"}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["raw"] == b"\x00\xff\x42"
-    assert isinstance(deserialized["raw"], bytes)
+        Note: ``bytearray`` also round-trips, narrowing to ``bytes`` (JSON cannot
+        distinguish the two without a second marker; ``bytes`` is the superset
+        callers expect).
+        """
+        serializer = JSONSerializer()
+        data = {"raw": b"\x00\xff\x42"}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["raw"] == b"\x00\xff\x42"
+        assert isinstance(deserialized["raw"], bytes)
 
-  def test_corrupt_b64_marker_does_not_crash_deserialize(self):
-    """#31: a stored value shaped like {"__b64__": "<invalid base64>"} (a
-    spider's own meta key, or a truncated/corrupt value) must NOT crash the
-    whole request deserialize via binascii.Error -- it falls through as the
-    original dict so the pop surfaces a value instead of dropping the request.
-    """
-    serializer = JSONSerializer()
-    # 'A' is a single base64-alphabet char -> b64decode raises binascii.Error
-    # (data length 1 cannot be 1 more than a multiple of 4).
-    corrupt = b'{"k": {"__b64__": "A"}}'
-    result = serializer.deserialize(corrupt)
-    assert result == {"k": {"__b64__": "A"}}
+    def test_corrupt_b64_marker_does_not_crash_deserialize(self):
+        """#31: a stored value shaped like {"__b64__": "<invalid base64>"} (a
+        spider's own meta key, or a truncated/corrupt value) must NOT crash the
+        whole request deserialize via binascii.Error -- it falls through as the
+        original dict so the pop surfaces a value instead of dropping the request.
+        """
+        serializer = JSONSerializer()
+        # 'A' is a single base64-alphabet char -> b64decode raises binascii.Error
+        # (data length 1 cannot be 1 more than a multiple of 4).
+        corrupt = b'{"k": {"__b64__": "A"}}'
+        result = serializer.deserialize(corrupt)
+        assert result == {"k": {"__b64__": "A"}}
 
-    invalid_chars = b'{"k": {"__b64__": "!!!!"}}'
-    result = serializer.deserialize(invalid_chars)
-    assert result == {"k": {"__b64__": "!!!!"}}
+        invalid_chars = b'{"k": {"__b64__": "!!!!"}}'
+        result = serializer.deserialize(invalid_chars)
+        assert result == {"k": {"__b64__": "!!!!"}}
 
-  def test_corrupt_datetime_marker_does_not_crash_deserialize(self):
-    """R53: a datetime marker whose ``data`` is not a valid ISO 8601 string (a
-    truncated/corrupt value, or a spider's own meta key shaped like the marker)
-    must NOT crash deserialize via ``ValueError`` -- it falls through as the
-    original dict, mirroring the corrupt-base64 bytes-marker behavior (#31).
-    """
-    serializer = JSONSerializer()
-    corrupt = (
-      b'{"k": {"__scrapy_extension_json_type__": "datetime", "data": "not-a-date"}}'
+    def test_corrupt_datetime_marker_does_not_crash_deserialize(self):
+        """R53: a datetime marker whose ``data`` is not a valid ISO 8601 string (a
+        truncated/corrupt value, or a spider's own meta key shaped like the marker)
+        must NOT crash deserialize via ``ValueError`` -- it falls through as the
+        original dict, mirroring the corrupt-base64 bytes-marker behavior (#31).
+        """
+        serializer = JSONSerializer()
+        corrupt = b'{"k": {"__scrapy_extension_json_type__": "datetime", "data": "not-a-date"}}'
+        result = serializer.deserialize(corrupt)
+        assert result == {
+            "k": {"__scrapy_extension_json_type__": "datetime", "data": "not-a-date"}
+        }
+
+    def test_datetime_marker_shaped_user_dict_round_trips_as_dict(self):
+        """R53: a caller-owned dict shaped like the datetime wire marker must NOT be
+        retyped into a ``datetime`` -- the encode-side escape wraps it as a
+        ``_CODEC_DICT`` marker so it survives untouched (collision avoidance).
+        """
+        serializer = JSONSerializer()
+        shaped = {
+            "outer": {
+                "__scrapy_extension_json_type__": "datetime",
+                "data": "2026-01-01T00:00:00",
+            }
+        }
+        assert serializer.deserialize(serializer.serialize(shaped)) == shaped
+
+    def test_valid_legacy_marker_shaped_user_dict_round_trips_as_dict(self):
+        """A caller-owned dict must not be confused with the bytes wire tag."""
+        serializer = JSONSerializer()
+        data = {"outer": {"__b64__": "YWJj"}}
+
+        assert serializer.deserialize(serializer.serialize(data)) == data
+
+    def test_deserialize_still_reads_legacy_bytes_marker(self):
+        """Queued data written by the pre-v2 serializer remains readable."""
+        serializer = JSONSerializer()
+
+        assert serializer.deserialize(b'{"raw": {"__b64__": "AP9C"}}') == {
+            "raw": b"\x00\xffB"
+        }
+
+    @pytest.mark.parametrize(
+        ("value", "wrapper", "secret"),
+        [
+            (SecretStr("hunter2"), "SecretStr", "hunter2"),
+            (SecretBytes(b"bytes-secret"), "SecretBytes", "bytes-secret"),
+        ],
     )
-    result = serializer.deserialize(corrupt)
-    assert result == {
-      "k": {"__scrapy_extension_json_type__": "datetime", "data": "not-a-date"}
-    }
+    def test_secret_wrappers_fail_closed(self, value, wrapper, secret):
+        """Secret wrappers must never become queue/storage payload bytes."""
+        serializer = JSONSerializer()
 
-  def test_datetime_marker_shaped_user_dict_round_trips_as_dict(self):
-    """R53: a caller-owned dict shaped like the datetime wire marker must NOT be
-    retyped into a ``datetime`` -- the encode-side escape wraps it as a
-    ``_CODEC_DICT`` marker so it survives untouched (collision avoidance).
-    """
-    serializer = JSONSerializer()
-    shaped = {
-      "outer": {
-        "__scrapy_extension_json_type__": "datetime",
-        "data": "2026-01-01T00:00:00",
-      }
-    }
-    assert serializer.deserialize(serializer.serialize(shaped)) == shaped
+        with pytest.raises(TypeError, match=wrapper) as exc_info:
+            serializer.serialize({"nested": [value]})
 
-  def test_valid_legacy_marker_shaped_user_dict_round_trips_as_dict(self):
-    """A caller-owned dict must not be confused with the bytes wire tag."""
-    serializer = JSONSerializer()
-    data = {"outer": {"__b64__": "YWJj"}}
+        assert secret not in str(exc_info.value)
 
-    assert serializer.deserialize(serializer.serialize(data)) == data
+    def test_string_looking_like_base64_stays_str(self):
+        """Guard: a plain string that happens to be valid base64 is NOT decoded.
 
-  def test_deserialize_still_reads_legacy_bytes_marker(self):
-    """Queued data written by the pre-v2 serializer remains readable."""
-    serializer = JSONSerializer()
+        Only genuine ``bytes`` — encoded as a tagged ``{"__b64__": ...}`` marker on
+        serialize — decode back to bytes. ASCII strings pass through untouched. A
+        naive "decode every base64-looking string" fix would corrupt this case and
+        every ordinary string token in ``meta``.
+        """
+        serializer = JSONSerializer()
+        data = {"token": "AAEC"}  # valid base64, but it's a str the caller owns
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["token"] == "AAEC"
+        assert isinstance(deserialized["token"], str)
 
-    assert serializer.deserialize(b'{"raw": {"__b64__": "AP9C"}}') == {
-      "raw": b"\x00\xffB"
-    }
+    def test_nested_bytes_round_trip(self):
+        """Bytes nested in lists/dicts (e.g. ``meta['blobs']``) round-trip."""
+        serializer = JSONSerializer()
+        data = {"meta": {"blobs": [b"a", b"b", {"deep": b"c"}]}}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["meta"]["blobs"] == [b"a", b"b", {"deep": b"c"}]
 
-  @pytest.mark.parametrize(
-    ("value", "wrapper", "secret"),
-    [
-      (SecretStr("hunter2"), "SecretStr", "hunter2"),
-      (SecretBytes(b"bytes-secret"), "SecretBytes", "bytes-secret"),
-    ],
-  )
-  def test_secret_wrappers_fail_closed(self, value, wrapper, secret):
-    """Secret wrappers must never become queue/storage payload bytes."""
-    serializer = JSONSerializer()
+    def test_unsupported_type_raises_with_clear_message(self):
+        """R17-followup: truly unexpected types raise TypeError, not silent str()."""
+        serializer = JSONSerializer()
 
-    with pytest.raises(TypeError, match=wrapper) as exc_info:
-      serializer.serialize({"nested": [value]})
+        class Custom:
+            pass
 
-    assert secret not in str(exc_info.value)
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            serializer.serialize({"obj": Custom()})
 
-  def test_string_looking_like_base64_stays_str(self):
-    """Guard: a plain string that happens to be valid base64 is NOT decoded.
+    def test_non_string_mapping_key_is_rejected_instead_of_coerced(self):
+        serializer = JSONSerializer()
 
-    Only genuine ``bytes`` — encoded as a tagged ``{"__b64__": ...}`` marker on
-    serialize — decode back to bytes. ASCII strings pass through untouched. A
-    naive "decode every base64-looking string" fix would corrupt this case and
-    every ordinary string token in ``meta``.
-    """
-    serializer = JSONSerializer()
-    data = {"token": "AAEC"}  # valid base64, but it's a str the caller owns
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["token"] == "AAEC"
-    assert isinstance(deserialized["token"], str)
+        with pytest.raises(TypeError, match="JSON object keys must be strings"):
+            serializer.serialize({1: "value"})
 
-  def test_nested_bytes_round_trip(self):
-    """Bytes nested in lists/dicts (e.g. ``meta['blobs']``) round-trip."""
-    serializer = JSONSerializer()
-    data = {"meta": {"blobs": [b"a", b"b", {"deep": b"c"}]}}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["meta"]["blobs"] == [b"a", b"b", {"deep": b"c"}]
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_float_is_rejected(self, value):
+        serializer = JSONSerializer()
 
-  def test_unsupported_type_raises_with_clear_message(self):
-    """R17-followup: truly unexpected types raise TypeError, not silent str()."""
-    serializer = JSONSerializer()
+        with pytest.raises(ValueError, match="finite"):
+            serializer.serialize({"value": value})
 
-    class Custom:
-      pass
+    @pytest.mark.parametrize("literal", [b"NaN", b"Infinity", b"-Infinity"])
+    def test_non_finite_json_literal_is_rejected_on_deserialize(self, literal):
+        serializer = JSONSerializer()
 
-    with pytest.raises(TypeError, match="not JSON serializable"):
-      serializer.serialize({"obj": Custom()})
+        with pytest.raises(ValueError, match="finite"):
+            serializer.deserialize(b'{"value":' + literal + b"}")
 
-  def test_non_string_mapping_key_is_rejected_instead_of_coerced(self):
-    serializer = JSONSerializer()
+    def test_duplicate_json_object_key_is_rejected(self):
+        serializer = JSONSerializer()
 
-    with pytest.raises(TypeError, match="JSON object keys must be strings"):
-      serializer.serialize({1: "value"})
+        with pytest.raises(ValueError, match="Duplicate JSON object key"):
+            serializer.deserialize(b'{"url":"safe","url":"shadow"}')
 
-  @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-  def test_non_finite_float_is_rejected(self, value):
-    serializer = JSONSerializer()
+    def test_duplicate_escaped_dict_key_is_rejected(self):
+        """A forged v2 dict marker must not collapse duplicate logical keys."""
+        serializer = JSONSerializer()
+        payload = (
+            b'{"__scrapy_extension_json_type__":"dict",'
+            b'"data":[["url","safe"],["url","shadow"]]}'
+        )
 
-    with pytest.raises(ValueError, match="finite"):
-      serializer.serialize({"value": value})
+        with pytest.raises(ValueError, match="Duplicate escaped JSON object key"):
+            serializer.deserialize(payload)
 
-  @pytest.mark.parametrize("literal", [b"NaN", b"Infinity", b"-Infinity"])
-  def test_non_finite_json_literal_is_rejected_on_deserialize(self, literal):
-    serializer = JSONSerializer()
+    def test_decimal_serializes_as_str(self):
+        """R19: Decimal (prices) preserves exact representation, no float drift."""
+        from decimal import Decimal
 
-    with pytest.raises(ValueError, match="finite"):
-      serializer.deserialize(b'{"value":' + literal + b"}")
+        serializer = JSONSerializer()
+        data = {"price": Decimal("19.99")}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["price"] == "19.99"
 
-  def test_duplicate_json_object_key_is_rejected(self):
-    serializer = JSONSerializer()
+    def test_uuid_serializes_as_str(self):
+        """R19: UUID serializes to canonical hex form."""
+        import uuid as uuid_mod
 
-    with pytest.raises(ValueError, match="Duplicate JSON object key"):
-      serializer.deserialize(b'{"url":"safe","url":"shadow"}')
+        serializer = JSONSerializer()
+        uid = uuid_mod.UUID("12345678-1234-5678-1234-567812345678")
+        data = {"request_id": uid}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["request_id"] == "12345678-1234-5678-1234-567812345678"
 
-  def test_duplicate_escaped_dict_key_is_rejected(self):
-    """A forged v2 dict marker must not collapse duplicate logical keys."""
-    serializer = JSONSerializer()
-    payload = (
-      b'{"__scrapy_extension_json_type__":"dict",'
-      b'"data":[["url","safe"],["url","shadow"]]}'
-    )
+    def test_set_serializes_as_list(self):
+        """R19: set/frozenset convert to list (JSON has no set type)."""
+        serializer = JSONSerializer()
+        data = {"tags": {"a", "b", "c"}}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert set(deserialized["tags"]) == {"a", "b", "c"}
 
-    with pytest.raises(ValueError, match="Duplicate escaped JSON object key"):
-      serializer.deserialize(payload)
+    def test_enum_serializes_as_value(self):
+        """R19: Enum members serialize to their .value, not the member name."""
+        from enum import Enum
 
-  def test_decimal_serializes_as_str(self):
-    """R19: Decimal (prices) preserves exact representation, no float drift."""
-    from decimal import Decimal
+        class Status(Enum):
+            PENDING = "pending"
+            DONE = "done"
 
-    serializer = JSONSerializer()
-    data = {"price": Decimal("19.99")}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["price"] == "19.99"
+        serializer = JSONSerializer()
+        data = {"status": Status.DONE}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["status"] == "done"
 
-  def test_uuid_serializes_as_str(self):
-    """R19: UUID serializes to canonical hex form."""
-    import uuid as uuid_mod
+    def test_path_serializes_as_str(self):
+        """R20: pathlib.Path in request.meta survives as string."""
+        from pathlib import Path
 
-    serializer = JSONSerializer()
-    uid = uuid_mod.UUID("12345678-1234-5678-1234-567812345678")
-    data = {"request_id": uid}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["request_id"] == "12345678-1234-5678-1234-567812345678"
-
-  def test_set_serializes_as_list(self):
-    """R19: set/frozenset convert to list (JSON has no set type)."""
-    serializer = JSONSerializer()
-    data = {"tags": {"a", "b", "c"}}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert set(deserialized["tags"]) == {"a", "b", "c"}
-
-  def test_enum_serializes_as_value(self):
-    """R19: Enum members serialize to their .value, not the member name."""
-    from enum import Enum
-
-    class Status(Enum):
-      PENDING = "pending"
-      DONE = "done"
-
-    serializer = JSONSerializer()
-    data = {"status": Status.DONE}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["status"] == "done"
-
-  def test_path_serializes_as_str(self):
-    """R20: pathlib.Path in request.meta survives as string."""
-    from pathlib import Path
-
-    serializer = JSONSerializer()
-    data = {"output": Path("/tmp/output.json")}
-    serialized = serializer.serialize(data)
-    deserialized = serializer.deserialize(serialized)
-    assert deserialized["output"] == "/tmp/output.json"
+        serializer = JSONSerializer()
+        data = {"output": Path("/tmp/output.json")}
+        serialized = serializer.serialize(data)
+        deserialized = serializer.deserialize(serialized)
+        assert deserialized["output"] == "/tmp/output.json"
 
 
 class TestRedisBackend:
-  """Test RedisBackend implementation."""
+    """Test RedisBackend implementation."""
 
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
 
-    return RedisSettings(host="localhost", port=6379)
+        return RedisSettings(host="localhost", port=6379)
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_backend_type(self, redis_settings):
-    """Test backend type is REDIS."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_backend_type(self, redis_settings):
+        """Test backend type is REDIS."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    backend = RedisBackend(redis_settings)
-    assert backend.backend_type == BackendType.REDIS
+        backend = RedisBackend(redis_settings)
+        assert backend.backend_type == BackendType.REDIS
 
-  def test_connect_success(self, redis_settings, mock_redis, mocker):
-    """Test successful connection."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_connect_success(self, redis_settings, mock_redis, mocker):
+        """Test successful connection."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend.is_connected()
-    # ping is called in connect() and is_connected(), so at least once
-    assert mock_redis.ping.call_count >= 1
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend.is_connected()
+        # ping is called in connect() and is_connected(), so at least once
+        assert mock_redis.ping.call_count >= 1
 
-  def test_connect_failure(self, redis_settings, mocker):
-    """Test connection failure raises ConnectionError."""
-    from redis.exceptions import RedisError
+    def test_connect_failure(self, redis_settings, mocker):
+        """Test connection failure raises ConnectionError."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock = mocker.patch("scrapy_extension.backends.redis.Redis")
-    mock.return_value.ping.side_effect = RedisError("Connection refused")
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
-    assert backend._client is None
-    assert backend._master_client is None
-    mock.return_value.close.assert_called_once()
+        mock = mocker.patch("scrapy_extension.backends.redis.Redis")
+        mock.return_value.ping.side_effect = RedisError("Connection refused")
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
+        assert backend._client is None
+        assert backend._master_client is None
+        mock.return_value.close.assert_called_once()
 
-  def test_connect_false_ping_discards_client(self, redis_settings, mocker):
-    """A false probe is a failed connection, not a connected client."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_connect_false_ping_discards_client(self, redis_settings, mocker):
+        """A false probe is a failed connection, not a connected client."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    client = mocker.MagicMock()
-    client.ping.return_value = False
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=client)
-    backend = RedisBackend(redis_settings)
+        client = mocker.MagicMock()
+        client.ping.return_value = False
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=client)
+        backend = RedisBackend(redis_settings)
 
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
 
-    assert backend._client is None
-    assert backend.is_connected() is False
-    client.close.assert_called_once()
+        assert backend._client is None
+        assert backend.is_connected() is False
+        client.close.assert_called_once()
 
-  def test_queue_push(self, redis_settings, mock_redis, mocker):
-    """Test queue push operation."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_queue_push(self, redis_settings, mock_redis, mocker):
+        """Test queue push operation."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_script = mocker.MagicMock()
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.push("test_queue", b"test_data", priority=1.0)
-    # Push uses a Lua script: INCR counter + ZADD + HSET atomically
-    mock_redis.register_script.assert_called_once()
-    mock_script.assert_called_once()
+        mock_script = mocker.MagicMock()
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.push("test_queue", b"test_data", priority=1.0)
+        # Push uses a Lua script: INCR counter + ZADD + HSET atomically
+        mock_redis.register_script.assert_called_once()
+        mock_script.assert_called_once()
 
-  def test_queue_pop(self, redis_settings, mock_redis, mocker):
-    """Test queue pop operation."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_queue_pop(self, redis_settings, mock_redis, mocker):
+        """Test queue pop operation."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_script = mocker.MagicMock()
-    # New signal scheme: [1, payload] = success.
-    mock_script.return_value = [1, b"test_data"]
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.pop("test_queue")
-    assert result == b"test_data"
+        mock_script = mocker.MagicMock()
+        # New signal scheme: [1, payload] = success.
+        mock_script.return_value = [1, b"test_data"]
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.pop("test_queue")
+        assert result == b"test_data"
 
-  def test_queue_pop_empty(self, redis_settings, mock_redis, mocker):
-    """Test queue pop with empty queue."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_queue_pop_empty(self, redis_settings, mock_redis, mocker):
+        """Test queue pop with empty queue."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_script = mocker.MagicMock()
-    # New signal scheme: [0, None] = empty queue.
-    mock_script.return_value = [0, None]
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.pop("test_queue")
-    assert result is None
+        mock_script = mocker.MagicMock()
+        # New signal scheme: [0, None] = empty queue.
+        mock_script.return_value = [0, None]
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.pop("test_queue")
+        assert result is None
 
-  def test_queue_pop_corrupt_payload_raises_queue_error(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Coverage: status==1 (success signal) but the payload is neither str nor
-    bytes (a corrupt Lua return — should never happen, but defensive) must raise
-    QueueError, NOT silently return a wrong-type value. Locks the corrupt-data
-    guard at redis.py:532-536.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
+    def test_queue_pop_corrupt_payload_raises_queue_error(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Coverage: status==1 (success signal) but the payload is neither str nor
+        bytes (a corrupt Lua return — should never happen, but defensive) must raise
+        QueueError, NOT silently return a wrong-type value. Locks the corrupt-data
+        guard at redis.py:532-536.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
 
-    mock_script = mocker.MagicMock()
-    mock_script.return_value = [1, 12345]  # int — neither str nor bytes
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError, match="invalid type"):
-      backend.pop("test_queue")
+        mock_script = mocker.MagicMock()
+        mock_script.return_value = [1, 12345]  # int — neither str nor bytes
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(QueueError, match="invalid type"):
+            backend.pop("test_queue")
 
-  def test_queue_pop_lost_payload_race_returns_none(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """B1: an orphaned member is discarded without stopping queue progress.
+    def test_queue_pop_lost_payload_race_returns_none(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """B1: an orphaned member is discarded without stopping queue progress.
 
-    Atomic ZPOPMIN/HGET/HDEL means status 2 cannot be a live consumer race;
-    it represents stale data left by a legacy writer or prior corruption.
-    The stale member is already unrecoverable, so pop returns None.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
+        Atomic ZPOPMIN/HGET/HDEL means status 2 cannot be a live consumer race;
+        it represents stale data left by a legacy writer or prior corruption.
+        The stale member is already unrecoverable, so pop returns None.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_script = mocker.MagicMock()
-    # New signal scheme: [2, None] = member popped but payload gone (race).
-    mock_script.return_value = [2, None]
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.pop("test_queue")
-    assert result is None
+        mock_script = mocker.MagicMock()
+        # New signal scheme: [2, None] = member popped but payload gone (race).
+        mock_script.return_value = [2, None]
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.pop("test_queue")
+        assert result is None
 
-  @pytest.mark.parametrize(
-    "diagnostic_error",
-    [
-      RuntimeError("logger handler failed"),
-      KeyboardInterrupt("logger handler interrupted"),
-      SystemExit("logger handler exited"),
-    ],
-  )
-  def test_queue_pop_orphan_recovery_ignores_diagnostic_failure(
-    self, redis_settings, mock_redis, mocker, diagnostic_error
-  ):
-    """A post-transaction diagnostic cannot turn stale-member recovery into a failure."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock()
-    mock_script.return_value = [2, None]
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    mocker.patch(
-      "scrapy_extension.backends.redis.logger.debug", side_effect=diagnostic_error
+    @pytest.mark.parametrize(
+        "diagnostic_error",
+        [
+            RuntimeError("logger handler failed"),
+            KeyboardInterrupt("logger handler interrupted"),
+            SystemExit("logger handler exited"),
+        ],
     )
-    backend = RedisBackend(redis_settings)
+    def test_queue_pop_orphan_recovery_ignores_diagnostic_failure(
+        self, redis_settings, mock_redis, mocker, diagnostic_error
+    ):
+        """A post-transaction diagnostic cannot turn stale-member recovery into a failure."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    assert backend.pop("test_queue") is None
-    mock_script.assert_called_once()
+        mock_script = mocker.MagicMock()
+        mock_script.return_value = [2, None]
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        mocker.patch(
+            "scrapy_extension.backends.redis.logger.debug", side_effect=diagnostic_error
+        )
+        backend = RedisBackend(redis_settings)
 
-  def test_queue_pop_corruption_raises_queueerror(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """B1: structural corruption (unexpected payload type) raises QueueError.
+        assert backend.pop("test_queue") is None
+        mock_script.assert_called_once()
 
-    Only a genuine invariant violation — payload decoded to a non-bytes /
-    non-str shape that cannot be normalized — escalates to QueueError.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
+    def test_queue_pop_corruption_raises_queueerror(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """B1: structural corruption (unexpected payload type) raises QueueError.
 
-    mock_script = mocker.MagicMock()
-    # New signal scheme: [3, msg] = structural corruption (e.g. Lua
-    # surfaced an unexpected payload type). We surface it as QueueError.
-    mock_script.return_value = [3, "unexpected payload type: float"]
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError):
-      backend.pop("test_queue")
+        Only a genuine invariant violation — payload decoded to a non-bytes /
+        non-str shape that cannot be normalized — escalates to QueueError.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
 
-  def test_set_add(self, redis_settings, mock_redis, mocker):
-    """Test set add operation."""
-    from scrapy_extension.backends.redis import RedisBackend
+        mock_script = mocker.MagicMock()
+        # New signal scheme: [3, msg] = structural corruption (e.g. Lua
+        # surfaced an unexpected payload type). We surface it as QueueError.
+        mock_script.return_value = [3, "unexpected payload type: float"]
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(QueueError):
+            backend.pop("test_queue")
 
-    mock_redis.sadd.return_value = 1
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.add("test_set", b"test_item")
-    assert result is True
+    def test_set_add(self, redis_settings, mock_redis, mocker):
+        """Test set add operation."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-  def test_set_add_wraps_redis_error(self, redis_settings, mock_redis, mocker):
-    """R-dupe-1 (option b): a transient RedisError during set add is wrapped as
-    BackendConnectionError so BackendDupeFilter's graceful-degradation arm fires
-    (degrade to not-seen) instead of crashing the crawl."""
-    from redis.exceptions import RedisError
+        mock_redis.sadd.return_value = 1
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.add("test_set", b"test_item")
+        assert result is True
 
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_set_add_wraps_redis_error(self, redis_settings, mock_redis, mocker):
+        """R-dupe-1 (option b): a transient RedisError during set add is wrapped as
+        BackendConnectionError so BackendDupeFilter's graceful-degradation arm fires
+        (degrade to not-seen) instead of crashing the crawl."""
+        from redis.exceptions import RedisError
 
-    mock_redis.sadd.side_effect = RedisError("set add failed")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError) as exc_info:
-      backend.add("test_set", b"test_item")
-    assert exc_info.value.backend_type == "redis"
+        from scrapy_extension.backends.redis import RedisBackend
 
-  def test_set_contains(self, redis_settings, mock_redis, mocker):
-    """Test set contains operation."""
-    from scrapy_extension.backends.redis import RedisBackend
+        mock_redis.sadd.side_effect = RedisError("set add failed")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.add("test_set", b"test_item")
+        assert exc_info.value.backend_type == "redis"
 
-    mock_redis.sismember.return_value = True
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.contains("test_set", b"test_item")
-    assert result is True
+    def test_set_contains(self, redis_settings, mock_redis, mocker):
+        """Test set contains operation."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-  def test_storage_store(self, redis_settings, mock_redis, mocker):
-    """Test storage store operation."""
-    from scrapy_extension.backends.redis import RedisBackend
+        mock_redis.sismember.return_value = True
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.contains("test_set", b"test_item")
+        assert result is True
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.store("test_key", b"test_data")
-    mock_redis.set.assert_called_once_with(
-      "scrapy-extension:storage:test_key", b"test_data"
-    )
+    def test_storage_store(self, redis_settings, mock_redis, mocker):
+        """Test storage store operation."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-  def test_storage_retrieve(self, redis_settings, mock_redis, mocker):
-    """Test storage retrieve operation."""
-    from scrapy_extension.backends.redis import RedisBackend
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.store("test_key", b"test_data")
+        mock_redis.set.assert_called_once_with(
+            "scrapy-extension:storage:test_key", b"test_data"
+        )
 
-    mock_redis.get.return_value = b"test_data"
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.retrieve("test_key")
-    assert result == b"test_data"
+    def test_storage_retrieve(self, redis_settings, mock_redis, mocker):
+        """Test storage retrieve operation."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.get.return_value = b"test_data"
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.retrieve("test_key")
+        assert result == b"test_data"
 
 
 class TestRedisBackendModes:
-  """Test RedisBackend with different deployment modes."""
+    """Test RedisBackend with different deployment modes."""
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_standalone_mode_default(self, mock_redis, mocker):
-    """Test standalone mode is default."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_standalone_mode_default(self, mock_redis, mocker):
+        """Test standalone mode is default."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(host="localhost", port=6379)
-    assert settings.mode == RedisMode.STANDALONE
+        settings = RedisSettings(host="localhost", port=6379)
+        assert settings.mode == RedisMode.STANDALONE
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(settings)
-    backend.connect()
-    assert backend.is_connected()
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(settings)
+        backend.connect()
+        assert backend.is_connected()
 
-  def test_sentinel_mode_success(self, mock_redis, mocker):
-    """Test sentinel mode connection."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_sentinel_mode_success(self, mock_redis, mocker):
+        """Test sentinel mode connection."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379", "sentinel2:26379"],
-      sentinel_master_name="mymaster",
-      password="secret",
-      ssl_enabled=True,
-      ssl_cafile="/tls/ca.pem",
-    )
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379", "sentinel2:26379"],
+            sentinel_master_name="mymaster",
+            password="secret",
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
 
-    mock_sentinel = mocker.Mock()
-    mock_sentinel.master_for.return_value = mock_redis
+        mock_sentinel = mocker.Mock()
+        mock_sentinel.master_for.return_value = mock_redis
 
-    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel)
-    backend = RedisBackend(settings)
-    backend.connect()
-    assert backend.is_connected()
-    mock_sentinel.master_for.assert_called_once()
+        mocker.patch(
+            "scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel
+        )
+        backend = RedisBackend(settings)
+        backend.connect()
+        assert backend.is_connected()
+        mock_sentinel.master_for.assert_called_once()
 
-  def test_sentinel_mode_missing_sentinels(self):
-    """Test sentinel mode requires sentinels configuration (validated at construction).
+    def test_sentinel_mode_missing_sentinels(self):
+        """Test sentinel mode requires sentinels configuration (validated at construction).
 
-    R1-P2-20 fix: cross-mode validation runs at RedisSettings construction,
-    so misconfiguration fails fast rather than at connect() time. R9-b SV2
-    upgrades the raised exception from pydantic ValidationError to the
-    project's ``ConfigurationError`` (with ``setting_name=``) for a named,
-    debuggable failure.
-    """
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        R1-P2-20 fix: cross-mode validation runs at RedisSettings construction,
+        so misconfiguration fails fast rather than at connect() time. R9-b SV2
+        upgrades the raised exception from pydantic ValidationError to the
+        project's ``ConfigurationError`` (with ``setting_name=``) for a named,
+        debuggable failure.
+        """
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      RedisSettings(
-        mode=RedisMode.SENTINEL,
-        sentinel_master_name="mymaster",
-      )
-    assert "sentinels" in str(exc_info.value).lower()
-    assert exc_info.value.setting_name == "sentinels"
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(
+                mode=RedisMode.SENTINEL,
+                sentinel_master_name="mymaster",
+            )
+        assert "sentinels" in str(exc_info.value).lower()
+        assert exc_info.value.setting_name == "sentinels"
 
-  def test_sentinel_mode_missing_master_name(self):
-    """Sentinel mode with empty master_name fails fast (R1-P2-20 + R9-b SV2)."""
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_sentinel_mode_missing_master_name(self):
+        """Sentinel mode with empty master_name fails fast (R1-P2-20 + R9-b SV2)."""
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      RedisSettings(
-        mode=RedisMode.SENTINEL,
-        sentinels=["redis-sentinel-1:26379"],
-        sentinel_master_name="",
-      )
-    assert "sentinel_master_name" in str(exc_info.value).lower()
-    assert exc_info.value.setting_name == "sentinel_master_name"
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(
+                mode=RedisMode.SENTINEL,
+                sentinels=["redis-sentinel-1:26379"],
+                sentinel_master_name="",
+            )
+        assert "sentinel_master_name" in str(exc_info.value).lower()
+        assert exc_info.value.setting_name == "sentinel_master_name"
 
-  def test_standalone_mode_passes_validation(self):
-    """Standalone mode requires no mode-specific fields (R1-P2-20 sanity check)."""
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_standalone_mode_passes_validation(self):
+        """Standalone mode requires no mode-specific fields (R1-P2-20 sanity check)."""
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(mode=RedisMode.STANDALONE)
-    assert settings.mode == RedisMode.STANDALONE
+        settings = RedisSettings(mode=RedisMode.STANDALONE)
+        assert settings.mode == RedisMode.STANDALONE
 
-  def test_cluster_mode_success(self, mock_redis, mocker):
-    """Test cluster mode connection."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_cluster_mode_success(self, mock_redis, mocker):
+        """Test cluster mode connection."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER,
-      cluster_startup_nodes=["node1:7000", "node2:7000", "node3:7000"],
-      password="secret",
-      ssl_enabled=True,
-      ssl_cafile="/tls/ca.pem",
-    )
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER,
+            cluster_startup_nodes=["node1:7000", "node2:7000", "node3:7000"],
+            password="secret",
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
 
-    mocker.patch(
-      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_redis
-    )
-    backend = RedisBackend(settings)
-    backend.connect()
-    assert backend.is_connected()
+        mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster", return_value=mock_redis
+        )
+        backend = RedisBackend(settings)
+        backend.connect()
+        assert backend.is_connected()
 
-  def test_master_slave_mode_success(self, mock_redis, mocker):
-    """The deprecated master-slave alias connects to one static primary."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_master_slave_mode_success(self, mock_redis, mocker):
+        """The deprecated master-slave alias connects to one static primary."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.MASTER_SLAVE,
-      host="master.redis.com",
-      port=6379,
-    )
+        settings = RedisSettings(
+            mode=RedisMode.MASTER_SLAVE,
+            host="master.redis.com",
+            port=6379,
+        )
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(settings)
-    with pytest.warns(FutureWarning, match="primary-only"):
-      backend.connect()
-    assert backend.is_connected()
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(settings)
+        with pytest.warns(FutureWarning, match="primary-only"):
+            backend.connect()
+        assert backend.is_connected()
 
-  def test_cluster_mode_uses_startup_nodes(self, mock_redis, mocker):
-    """Test cluster mode uses startup nodes configuration."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_cluster_mode_uses_startup_nodes(self, mock_redis, mocker):
+        """Test cluster mode uses startup nodes configuration."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER,
-      cluster_startup_nodes=["node1:7000", "node2:7000"],
-    )
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER,
+            cluster_startup_nodes=["node1:7000", "node2:7000"],
+        )
 
-    mock_cluster_class = mocker.patch("scrapy_extension.backends.redis.RedisCluster")
-    mock_cluster_class.return_value = mock_redis
-    backend = RedisBackend(settings)
-    backend.connect()
-    mock_cluster_class.assert_called_once()
-    call_kwargs = mock_cluster_class.call_args.kwargs
-    assert "startup_nodes" in call_kwargs
-    assert len(call_kwargs["startup_nodes"]) == 2
+        mock_cluster_class = mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster"
+        )
+        mock_cluster_class.return_value = mock_redis
+        backend = RedisBackend(settings)
+        backend.connect()
+        mock_cluster_class.assert_called_once()
+        call_kwargs = mock_cluster_class.call_args.kwargs
+        assert "startup_nodes" in call_kwargs
+        assert len(call_kwargs["startup_nodes"]) == 2
 
-  def test_sentinel_mode_configuration(self, mock_redis, mocker):
-    """Test sentinel mode configuration options."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_sentinel_mode_configuration(self, mock_redis, mocker):
+        """Test sentinel mode configuration options."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"],
-      sentinel_master_name="myredis",
-      sentinel_password="sentinel_pass",
-      password="redis_pass",
-      db=0,
-      ssl_enabled=True,
-      ssl_cafile="/tls/ca.pem",
-    )
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379", "sentinel2:26379", "sentinel3:26379"],
+            sentinel_master_name="myredis",
+            sentinel_password="sentinel_pass",
+            password="redis_pass",
+            db=0,
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
 
-    mock_sentinel = mocker.Mock()
-    mock_sentinel.master_for.return_value = mock_redis
+        mock_sentinel = mocker.Mock()
+        mock_sentinel.master_for.return_value = mock_redis
 
-    mock_sentinel_class = mocker.patch("scrapy_extension.backends.redis.Sentinel")
-    mock_sentinel_class.return_value = mock_sentinel
-    backend = RedisBackend(settings)
-    backend.connect()
-    mock_sentinel_class.assert_called_once()
-    # Verify sentinels were passed correctly
-    call_args = mock_sentinel_class.call_args
-    assert len(call_args.args[0]) == 3  # Three sentinel tuples
+        mock_sentinel_class = mocker.patch("scrapy_extension.backends.redis.Sentinel")
+        mock_sentinel_class.return_value = mock_sentinel
+        backend = RedisBackend(settings)
+        backend.connect()
+        mock_sentinel_class.assert_called_once()
+        # Verify sentinels were passed correctly
+        call_args = mock_sentinel_class.call_args
+        assert len(call_args.args[0]) == 3  # Three sentinel tuples
 
-  def test_sentinel_mode_with_username(self, mock_redis, mocker):
-    """Test sentinel mode with username configuration."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_sentinel_mode_with_username(self, mock_redis, mocker):
+        """Test sentinel mode with username configuration."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379"],
-      sentinel_master_name="mymaster",
-      sentinel_username="sentinel_user",
-      sentinel_password="sentinel_pass",
-      ssl_enabled=True,
-      ssl_cafile="/tls/ca.pem",
-    )
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379"],
+            sentinel_master_name="mymaster",
+            sentinel_username="sentinel_user",
+            sentinel_password="sentinel_pass",
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
 
-    mock_sentinel = mocker.Mock()
-    mock_sentinel.master_for.return_value = mock_redis
+        mock_sentinel = mocker.Mock()
+        mock_sentinel.master_for.return_value = mock_redis
 
-    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel)
-    backend = RedisBackend(settings)
-    backend.connect()
-    assert backend.is_connected()
+        mocker.patch(
+            "scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel
+        )
+        backend = RedisBackend(settings)
+        backend.connect()
+        assert backend.is_connected()
 
-  def test_master_slave_mode_with_replicas(self, mocker):
-    """Replica-read intent is rejected instead of being a silent no-op."""
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_master_slave_mode_with_replicas(self, mocker):
+        """Replica-read intent is rejected instead of being a silent no-op."""
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      RedisSettings(
-        mode=RedisMode.MASTER_SLAVE,
-        host="master.redis.com",
-        port=6379,
-        replicas=["replica1.redis.com:6379", "replica2.redis.com:6379"],
-      )
-    assert exc_info.value.setting_name == "replicas"
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(
+                mode=RedisMode.MASTER_SLAVE,
+                host="master.redis.com",
+                port=6379,
+                replicas=["replica1.redis.com:6379", "replica2.redis.com:6379"],
+            )
+        assert exc_info.value.setting_name == "replicas"
 
-  def test_cluster_mode_fallback_host_port(self, mock_redis, mocker):
-    """Test cluster mode falls back to host:port when no startup nodes."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_cluster_mode_fallback_host_port(self, mock_redis, mocker):
+        """Test cluster mode falls back to host:port when no startup nodes."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER,
-      host="cluster.redis.com",
-      port=7000,
-      # No cluster_startup_nodes configured
-    )
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER,
+            host="cluster.redis.com",
+            port=7000,
+            # No cluster_startup_nodes configured
+        )
 
-    mock_cluster_class = mocker.patch("scrapy_extension.backends.redis.RedisCluster")
-    mock_cluster_class.return_value = mock_redis
-    backend = RedisBackend(settings)
-    backend.connect()
-    mock_cluster_class.assert_called_once()
-    call_kwargs = mock_cluster_class.call_args.kwargs
-    # Should fall back to host:port
-    assert len(call_kwargs["startup_nodes"]) == 1
+        mock_cluster_class = mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster"
+        )
+        mock_cluster_class.return_value = mock_redis
+        backend = RedisBackend(settings)
+        backend.connect()
+        mock_cluster_class.assert_called_once()
+        call_kwargs = mock_cluster_class.call_args.kwargs
+        # Should fall back to host:port
+        assert len(call_kwargs["startup_nodes"]) == 1
 
 
 class TestRedisSentinelClusterWiring:
-  """Exercise Sentinel/Cluster connection paths beyond constructor-level mocks.
+    """Exercise Sentinel/Cluster connection paths beyond constructor-level mocks.
 
-  These tests mock the CLIENT returned by Sentinel.master_for() / RedisCluster,
-  but let the real Sentinel / RedisCluster classes (or lightly-mocked versions
-  that still exercise the parsing + wiring logic) run, proving:
-  - sentinel_tuples parsing (``rsplit(':', 1)`` + ``int(port)``)
-  - Sentinel(...).master_for(master_name) call shape + master client stored as self._client
-  - ClusterNode wiring from cluster_startup_nodes
-  - malformed sentinel/node entries surface a clear error
-  """
-
-  @pytest.fixture
-  def mock_master_client(self, mocker):
-    """Mock master client returned by Sentinel.master_for()."""
-    client = mocker.Mock()
-    client.ping.return_value = True
-    return client
-
-  def test_sentinel_parses_tuples_and_calls_master_for(self, mock_master_client, mocker):
-    """_connect_sentinel parses sentinel_tuples, calls Sentinel(sentinels).master_for(name).
-
-    Sentinel is real-captured-then-mocked: we verify the parsed sentinel_tuples
-    are passed to Sentinel() in exactly the ``(host, int(port))`` shape, and that
-    master_for is called with the configured master_name. The master client is
-    then stored as self._client and is_operable through ping().
+    These tests mock the CLIENT returned by Sentinel.master_for() / RedisCluster,
+    but let the real Sentinel / RedisCluster classes (or lightly-mocked versions
+    that still exercise the parsing + wiring logic) run, proving:
+    - sentinel_tuples parsing (``rsplit(':', 1)`` + ``int(port)``)
+    - Sentinel(...).master_for(master_name) call shape + master client stored as self._client
+    - ClusterNode wiring from cluster_startup_nodes
+    - malformed sentinel/node entries surface a clear error
     """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel-a:26379", "sentinel-b:26380", "sentinel-c:26381"],
-      sentinel_master_name="mymaster",
-      password="secret",
-      ssl_enabled=True,
-      ssl_cafile="/tls/ca.pem",
-    )
+    @pytest.fixture
+    def mock_master_client(self, mocker):
+        """Mock master client returned by Sentinel.master_for()."""
+        client = mocker.Mock()
+        client.ping.return_value = True
+        return client
 
-    captured_sentinel = {}
+    def test_sentinel_parses_tuples_and_calls_master_for(
+        self, mock_master_client, mocker
+    ):
+        """_connect_sentinel parses sentinel_tuples, calls Sentinel(sentinels).master_for(name).
 
-    def fake_sentinel_factory(sentinels, **kwargs):
-      captured_sentinel["sentinels"] = sentinels
-      captured_sentinel["kwargs"] = kwargs
-      instance = mocker.Mock()
-      instance.master_for.return_value = mock_master_client
-      return instance
+        Sentinel is real-captured-then-mocked: we verify the parsed sentinel_tuples
+        are passed to Sentinel() in exactly the ``(host, int(port))`` shape, and that
+        master_for is called with the configured master_name. The master client is
+        then stored as self._client and is_operable through ping().
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    mocker.patch("scrapy_extension.backends.redis.Sentinel", side_effect=fake_sentinel_factory)
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel-a:26379", "sentinel-b:26380", "sentinel-c:26381"],
+            sentinel_master_name="mymaster",
+            password="secret",
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
 
-    backend = RedisBackend(settings)
-    backend.connect()
+        captured_sentinel = {}
 
-    # 1) sentinel_tuples parsed as (host, int_port) tuples
-    assert captured_sentinel["sentinels"] == [
-      ("sentinel-a", 26379),
-      ("sentinel-b", 26380),
-      ("sentinel-c", 26381),
-    ]
-    # all ports coerced to int (not str)
-    assert all(isinstance(p, int) for _, p in captured_sentinel["sentinels"])
+        def fake_sentinel_factory(sentinels, **kwargs):
+            captured_sentinel["sentinels"] = sentinels
+            captured_sentinel["kwargs"] = kwargs
+            instance = mocker.Mock()
+            instance.master_for.return_value = mock_master_client
+            return instance
 
-    # 2) master_for called with the configured master_name
-    sentinel_instance = backend._sentinel
-    sentinel_instance.master_for.assert_called_once()
-    assert sentinel_instance.master_for.call_args.args[0] == "mymaster"
+        mocker.patch(
+            "scrapy_extension.backends.redis.Sentinel",
+            side_effect=fake_sentinel_factory,
+        )
 
-    # 3) master client is stored as self._client and responds to ping
-    assert backend._client is mock_master_client
-    assert backend._master_client is mock_master_client
-    mock_master_client.ping.assert_called()
-    assert backend.is_connected()
+        backend = RedisBackend(settings)
+        backend.connect()
 
-  def test_sentinel_master_client_is_operable_for_set(self, mock_master_client, mocker):
-    """The discovered master client flows through to real ops (set/ping)."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        # 1) sentinel_tuples parsed as (host, int_port) tuples
+        assert captured_sentinel["sentinels"] == [
+            ("sentinel-a", 26379),
+            ("sentinel-b", 26380),
+            ("sentinel-c", 26381),
+        ]
+        # all ports coerced to int (not str)
+        assert all(isinstance(p, int) for _, p in captured_sentinel["sentinels"])
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379"],
-      sentinel_master_name="mymaster",
-    )
+        # 2) master_for called with the configured master_name
+        sentinel_instance = backend._sentinel
+        sentinel_instance.master_for.assert_called_once()
+        assert sentinel_instance.master_for.call_args.args[0] == "mymaster"
 
-    sentinel_instance = mocker.Mock()
-    sentinel_instance.master_for.return_value = mock_master_client
-    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=sentinel_instance)
+        # 3) master client is stored as self._client and responds to ping
+        assert backend._client is mock_master_client
+        assert backend._master_client is mock_master_client
+        mock_master_client.ping.assert_called()
+        assert backend.is_connected()
 
-    backend = RedisBackend(settings)
-    backend.connect()
+    def test_sentinel_master_client_is_operable_for_set(
+        self, mock_master_client, mocker
+    ):
+        """The discovered master client flows through to real ops (set/ping)."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    # The client property returns the master client — set() routes through it.
-    assert backend.client is mock_master_client
-    backend.client.set("k", "v")
-    mock_master_client.set.assert_called_once_with("k", "v")
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379"],
+            sentinel_master_name="mymaster",
+        )
 
-  def test_sentinel_empty_sentinels_raises_configuration_error(self, mocker):
-    """Empty sentinels list → ConfigurationError.
+        sentinel_instance = mocker.Mock()
+        sentinel_instance.master_for.return_value = mock_master_client
+        mocker.patch(
+            "scrapy_extension.backends.redis.Sentinel", return_value=sentinel_instance
+        )
 
-    The R9-b SV2 mode-validator rejects empty ``sentinels`` at construction
-    with the project's ``ConfigurationError`` (upgraded from pydantic's
-    ValidationError so the failure is named/debuggable), so we bypass it by
-    constructing with a valid config then mutating ``sentinels`` to []
-    before connect() — exercising the defensive guard in _connect_sentinel.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        backend = RedisBackend(settings)
+        backend.connect()
 
-    # Construction with empty sentinels is rejected by the SV2 validator
-    with pytest.raises(ConfigurationError) as construct_exc:
-      RedisSettings(mode=RedisMode.SENTINEL, sentinels=[])
-    assert construct_exc.value.setting_name == "sentinels"
+        # The client property returns the master client — set() routes through it.
+        assert backend.client is mock_master_client
+        backend.client.set("k", "v")
+        mock_master_client.set.assert_called_once_with("k", "v")
 
-    # Defensive guard: build valid, then blank out sentinels pre-connect
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379"],
-      sentinel_master_name="mymaster",
-    )
-    settings.sentinels = []
+    def test_sentinel_empty_sentinels_raises_configuration_error(self, mocker):
+        """Empty sentinels list → ConfigurationError.
 
-    backend = RedisBackend(settings)
-    with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
-    assert exc_info.value.setting_name == "sentinels"
+        The R9-b SV2 mode-validator rejects empty ``sentinels`` at construction
+        with the project's ``ConfigurationError`` (upgraded from pydantic's
+        ValidationError so the failure is named/debuggable), so we bypass it by
+        constructing with a valid config then mutating ``sentinels`` to []
+        before connect() — exercising the defensive guard in _connect_sentinel.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-  def test_sentinel_malformed_entry_no_port_raises(self, mocker):
-    """A missing port fails at settings construction with a named field."""
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        # Construction with empty sentinels is rejected by the SV2 validator
+        with pytest.raises(ConfigurationError) as construct_exc:
+            RedisSettings(mode=RedisMode.SENTINEL, sentinels=[])
+        assert construct_exc.value.setting_name == "sentinels"
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      RedisSettings(
-        mode=RedisMode.SENTINEL,
-        sentinels=["sentinel-without-port"],
-        sentinel_master_name="mymaster",
-      )
-    assert exc_info.value.setting_name == "sentinels"
+        # Defensive guard: build valid, then blank out sentinels pre-connect
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379"],
+            sentinel_master_name="mymaster",
+        )
+        settings.sentinels = []
 
-  def test_sentinel_malformed_entry_non_numeric_port_raises(self, mocker):
-    """A non-ASCII-decimal port fails at settings construction."""
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        backend = RedisBackend(settings)
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend.connect()
+        assert exc_info.value.setting_name == "sentinels"
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      RedisSettings(
-        mode=RedisMode.SENTINEL,
-        sentinels=["sentinel1:not-a-port"],
-        sentinel_master_name="mymaster",
-      )
-    assert exc_info.value.setting_name == "sentinels"
+    def test_sentinel_malformed_entry_no_port_raises(self, mocker):
+        """A missing port fails at settings construction with a named field."""
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-  def test_cluster_parses_startup_nodes_into_cluster_nodes(self, mock_master_client, mocker):
-    """_connect_cluster parses cluster_startup_nodes into ClusterNode objects.
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(
+                mode=RedisMode.SENTINEL,
+                sentinels=["sentinel-without-port"],
+                sentinel_master_name="mymaster",
+            )
+        assert exc_info.value.setting_name == "sentinels"
 
-    Captures the RedisCluster(startup_nodes=...) call and asserts each entry is
-    a real ClusterNode with the right host and int port.
-    """
-    from redis.cluster import ClusterNode
+    def test_sentinel_malformed_entry_non_numeric_port_raises(self, mocker):
+        """A non-ASCII-decimal port fails at settings construction."""
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(
+                mode=RedisMode.SENTINEL,
+                sentinels=["sentinel1:not-a-port"],
+                sentinel_master_name="mymaster",
+            )
+        assert exc_info.value.setting_name == "sentinels"
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER,
-      cluster_startup_nodes=["node-a:7000", "node-b:7001", "node-c:7002"],
-      password="secret",
-      ssl_enabled=True,
-      ssl_cafile="/tls/ca.pem",
-    )
+    def test_cluster_parses_startup_nodes_into_cluster_nodes(
+        self, mock_master_client, mocker
+    ):
+        """_connect_cluster parses cluster_startup_nodes into ClusterNode objects.
 
-    captured: dict[str, object] = {}
+        Captures the RedisCluster(startup_nodes=...) call and asserts each entry is
+        a real ClusterNode with the right host and int port.
+        """
+        from redis.cluster import ClusterNode
 
-    def fake_cluster_factory(*args, **kwargs):
-      captured["kwargs"] = kwargs
-      mock_client = mocker.Mock()
-      mock_client.ping.return_value = True
-      return mock_client
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    mocker.patch("scrapy_extension.backends.redis.RedisCluster", side_effect=fake_cluster_factory)
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER,
+            cluster_startup_nodes=["node-a:7000", "node-b:7001", "node-c:7002"],
+            password="secret",
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
 
-    backend = RedisBackend(settings)
-    backend.connect()
+        captured: dict[str, object] = {}
 
-    startup_nodes = captured["kwargs"]["startup_nodes"]
-    assert len(startup_nodes) == 3
-    # Each entry is a real ClusterNode (not a tuple/str) with host + int port
-    assert all(isinstance(n, ClusterNode) for n in startup_nodes)
-    assert [(n.host, n.port) for n in startup_nodes] == [
-      ("node-a", 7000),
-      ("node-b", 7001),
-      ("node-c", 7002),
-    ]
-    assert all(isinstance(n.port, int) for n in startup_nodes)
+        def fake_cluster_factory(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            mock_client = mocker.Mock()
+            mock_client.ping.return_value = True
+            return mock_client
 
-  def test_cluster_malformed_startup_node_raises(self, mocker):
-    """A malformed Cluster seed fails before any SDK construction."""
-    from scrapy_extension.exceptions import ConfigurationError
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster",
+            side_effect=fake_cluster_factory,
+        )
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      RedisSettings(
-        mode=RedisMode.CLUSTER,
-        cluster_startup_nodes=["node-no-port"],
-      )
-    assert exc_info.value.setting_name == "cluster_startup_nodes"
+        backend = RedisBackend(settings)
+        backend.connect()
 
-  def test_cluster_no_failover_rediscovery_path_exists(self, mock_master_client, mocker):
-    """Document the failover gap: the backend delegates failover to the
-    master_for() proxy and has no explicit discover_master() / reconnect path.
+        startup_nodes = captured["kwargs"]["startup_nodes"]
+        assert len(startup_nodes) == 3
+        # Each entry is a real ClusterNode (not a tuple/str) with host + int port
+        assert all(isinstance(n, ClusterNode) for n in startup_nodes)
+        assert [(n.host, n.port) for n in startup_nodes] == [
+            ("node-a", 7000),
+            ("node-b", 7001),
+            ("node-c", 7002),
+        ]
+        assert all(isinstance(n.port, int) for n in startup_nodes)
 
-    Sentinel.master_for() returns a proxy that lazily re-discovers the master
-    on MasterNotFoundError-style exceptions (handled inside redis-py). The
-    backend code does NOT call discover_master() itself, nor does it reconnect
-    on connection loss beyond a fresh connect() call. This test pins that
-    behavior so a future change is intentional.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_cluster_malformed_startup_node_raises(self, mocker):
+        """A malformed Cluster seed fails before any SDK construction."""
+        from scrapy_extension.exceptions import ConfigurationError
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379"],
-      sentinel_master_name="mymaster",
-    )
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(
+                mode=RedisMode.CLUSTER,
+                cluster_startup_nodes=["node-no-port"],
+            )
+        assert exc_info.value.setting_name == "cluster_startup_nodes"
 
-    sentinel_instance = mocker.Mock()
-    sentinel_instance.master_for.return_value = mock_master_client
-    # Ensure discover_master is never invoked by _connect_sentinel
-    sentinel_instance.discover_master = mocker.Mock()
-    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=sentinel_instance)
+    def test_cluster_no_failover_rediscovery_path_exists(
+        self, mock_master_client, mocker
+    ):
+        """Document the failover gap: the backend delegates failover to the
+        master_for() proxy and has no explicit discover_master() / reconnect path.
 
-    backend = RedisBackend(settings)
-    backend.connect()
+        Sentinel.master_for() returns a proxy that lazily re-discovers the master
+        on MasterNotFoundError-style exceptions (handled inside redis-py). The
+        backend code does NOT call discover_master() itself, nor does it reconnect
+        on connection loss beyond a fresh connect() call. This test pins that
+        behavior so a future change is intentional.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    # Failover delegation: the backend builds the connection via master_for()
-    # only — it never queries discover_master() during a normal connect.
-    sentinel_instance.master_for.assert_called_once()
-    sentinel_instance.discover_master.assert_not_called()
-    # And there is no public reconnect/re-discovery method on the backend
-    assert not hasattr(backend, "discover_master")
-    assert not hasattr(backend, "reconnect")
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379"],
+            sentinel_master_name="mymaster",
+        )
+
+        sentinel_instance = mocker.Mock()
+        sentinel_instance.master_for.return_value = mock_master_client
+        # Ensure discover_master is never invoked by _connect_sentinel
+        sentinel_instance.discover_master = mocker.Mock()
+        mocker.patch(
+            "scrapy_extension.backends.redis.Sentinel", return_value=sentinel_instance
+        )
+
+        backend = RedisBackend(settings)
+        backend.connect()
+
+        # Failover delegation: the backend builds the connection via master_for()
+        # only — it never queries discover_master() during a normal connect.
+        sentinel_instance.master_for.assert_called_once()
+        sentinel_instance.discover_master.assert_not_called()
+        # And there is no public reconnect/re-discovery method on the backend
+        assert not hasattr(backend, "discover_master")
+        assert not hasattr(backend, "reconnect")
 
 
 class TestRedisBackendDisconnect:
-  """Test RedisBackend disconnect functionality."""
+    """Test RedisBackend disconnect functionality."""
 
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
 
-    return RedisSettings(host="localhost", port=6379)
+        return RedisSettings(host="localhost", port=6379)
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_disconnect_single_client(self, redis_settings, mock_redis, mocker):
-    """Test disconnect with single client."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_disconnect_single_client(self, redis_settings, mock_redis, mocker):
+        """Test disconnect with single client."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend.is_connected()
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend.is_connected()
 
-    backend.disconnect()
-    assert not backend.is_connected()
-    mock_redis.close.assert_called_once()
+        backend.disconnect()
+        assert not backend.is_connected()
+        mock_redis.close.assert_called_once()
 
-  def test_disconnect_master_slave_primary_alias_closes_once(self, mocker):
-    """The primary-only alias owns and closes one distinct client."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_disconnect_master_slave_primary_alias_closes_once(self, mocker):
+        """The primary-only alias owns and closes one distinct client."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.MASTER_SLAVE,
-      host="master.redis.com",
-      port=6379,
-    )
+        settings = RedisSettings(
+            mode=RedisMode.MASTER_SLAVE,
+            host="master.redis.com",
+            port=6379,
+        )
 
-    mock_master = mocker.Mock()
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_master)
-    backend = RedisBackend(settings)
-    with pytest.warns(FutureWarning, match="primary-only"):
-      backend.connect()
-    assert backend.is_connected()
+        mock_master = mocker.Mock()
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_master)
+        backend = RedisBackend(settings)
+        with pytest.warns(FutureWarning, match="primary-only"):
+            backend.connect()
+        assert backend.is_connected()
 
-    backend.disconnect()
-    assert not backend.is_connected()
-    mock_master.close.assert_called_once()
+        backend.disconnect()
+        assert not backend.is_connected()
+        mock_master.close.assert_called_once()
 
-  def test_disconnect_error_suppressed(self, redis_settings, mock_redis, mocker):
-    """Test disconnect suppresses RedisError during close."""
-    from redis.exceptions import RedisError
+    def test_disconnect_error_suppressed(self, redis_settings, mock_redis, mocker):
+        """Test disconnect suppresses RedisError during close."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    mock_redis.close.side_effect = RedisError("Already closed")
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    # Should not raise
-    backend.disconnect()
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        mock_redis.close.side_effect = RedisError("Already closed")
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        # Should not raise
+        backend.disconnect()
 
 
 class TestRedisBackendQueueOperations:
-  """Test RedisBackend queue operations with error handling."""
-
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
-
-    return RedisSettings(host="localhost", port=6379)
-
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
-
-  def test_queue_push_with_priority(self, redis_settings, mock_redis, mocker):
-    """Test queue push with priority passes negated score to the Lua script."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock()
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.push("test_queue", b"test_data", priority=5.0)
-    # args = [member_uuid, -priority, item]
-    args = mock_script.call_args.kwargs["args"]
-    assert args[1] == -5.0
-
-  def test_queue_push_error(self, redis_settings, mock_redis, mocker):
-    """Test queue push raises QueueError on RedisError."""
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_script = mocker.MagicMock()
-    mock_script.side_effect = RedisError("Script eval error")
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError) as exc_info:
-      backend.push("test_queue", b"test_data")
-    assert "push" in str(exc_info.value).lower()
-
-  def test_queue_pop_blocking(self, redis_settings, mock_redis, mocker):
-    """A blocking pop returns a payload through the atomic Lua path."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock(return_value=[1, b"blocked_data"])
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.pop("test_queue", timeout=5.0)
-    assert result == b"blocked_data"
-    mock_redis.bzpopmin.assert_not_called()
-    mock_redis.pipeline.assert_not_called()
-
-  def test_queue_pop_blocking_timeout(self, redis_settings, mock_redis, mocker):
-    """An empty blocking pop polls until its monotonic deadline."""
-    from types import SimpleNamespace
-
-    from scrapy_extension.backends import redis as redis_module
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock(return_value=[0, None])
-    mock_redis.register_script.return_value = mock_script
-    now = [10.0]
-    sleep = mocker.Mock(side_effect=lambda delay: now.__setitem__(0, now[0] + delay))
-    mocker.patch.object(
-      redis_module,
-      "time",
-      SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
-    )
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend._generation is not None
-    wait = mocker.patch.object(
-      backend._generation.retired,
-      "wait",
-      side_effect=lambda delay: now.__setitem__(0, now[0] + delay) or False,
-    )
-    result = backend.pop("test_queue", timeout=1.0)
-    assert result is None
-    assert now[0] == pytest.approx(11.0)
-    assert mock_script.call_count > 1
-    assert wait.call_count > 1
-    mock_redis.bzpopmin.assert_not_called()
-
-  def test_queue_pop_error(self, redis_settings, mock_redis, mocker):
-    """Test queue pop raises QueueError on RedisError."""
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_script = mocker.MagicMock()
-    mock_script.side_effect = RedisError("Script eval error")
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError) as exc_info:
-      backend.pop("test_queue")
-    assert "pop" in str(exc_info.value).lower()
-
-  def test_queue_len_error(self, redis_settings, mock_redis, mocker):
-    """R-qlen: queue_len must wrap RedisError as QueueError, NOT swallow to 0.
-
-    Pre-R-qlen this returned 0 (pinned by this test as ``== 0``), conflating an
-    empty queue with a backend failure. The scheduler trusts ``len(queue)`` for
-    ``has_pending_requests`` / the backpressure gate — a swallowed 0 during a
-    Redis blip can trigger premature idle/CloseSpider and loses the backpressure
-    signal at the worst moment. ``pop()`` wraps RedisError as QueueError;
-    queue_len now matches. The scheduler's ``next_request`` already handles
-    QueueError from ``len(self._queue)`` (returns None safely — see
-    scheduler.py backpressure docstring).
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_redis.zcard.side_effect = RedisError("Card error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError):
-      backend.queue_len("test_queue")
-
-  def test_clear_queue_error(self, redis_settings, mock_redis, mocker):
-    """R-clearq: clear_queue raises QueueError on RedisError (not log + swallow).
-
-    Parity with rabbitmq clear_queue (#69) and the queue_len stance: a failed
-    clear must surface, not silently return None (stale messages would be
-    redelivered as duplicate work next run).
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_redis.delete.side_effect = RedisError("Delete error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(QueueError) as exc_info:
-      backend.clear_queue("test_queue")
-    assert exc_info.value.operation == "clear_queue"
-
-  def test_push_uses_lua_script(self, redis_settings, mock_redis, mocker):
-    """Push must use a Lua script for atomic INCR + ZADD + HSET."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock()
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.push("test_queue", b"data", priority=1.0)
-
-    mock_redis.register_script.assert_called_once()
-    script_body = mock_redis.register_script.call_args.args[0]
-    assert "INCR" in script_body
-    assert "ZADD" in script_body
-    assert "HSET" in script_body
-    keys = mock_script.call_args.kwargs["keys"]
-    assert keys == [
-      "{scrapy-extension:queue:test_queue}:items",
-      "{scrapy-extension:queue:test_queue}:payload",
-      "{scrapy-extension:queue:test_queue}:counter",
-    ]
-
-  def test_push_identical_bytes_use_distinct_members(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Two pushes of identical bytes must produce distinct ZSET members.
-
-    Regression for R1-P0-1: pre-fix, both pushes shared the raw item as the
-    ZSET member and the second silently overwrote the first.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock()
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.push("test_queue", b"identical", priority=1.0)
-    backend.push("test_queue", b"identical", priority=1.0)
-
-    assert mock_script.call_count == 2
-    member_uuid_first = mock_script.call_args_list[0].kwargs["args"][0]
-    member_uuid_second = mock_script.call_args_list[1].kwargs["args"][0]
-    assert member_uuid_first != member_uuid_second, (
-      "Identical payloads must produce distinct member uuids; "
-      "the Lua script prefixes each with an INCR counter."
-    )
-
-  def test_payload_key_uses_hash_tag(self, redis_settings, mock_redis, mocker):
-    """Payload key must use a Redis Cluster hash tag so it shares a slot with the queue.
-
-    Without a shared hash tag, MULTI/EXEC across the queue ZSET and payload
-    sidecar raises CROSSSLOT in Redis Cluster mode.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    queue_key = backend._queue_key("test_queue")
-    payload_key = backend._payload_key("test_queue")
-    assert queue_key == "{scrapy-extension:queue:test_queue}:items"
-    assert payload_key == "{scrapy-extension:queue:test_queue}:payload"
-    assert queue_key.split("}", 1)[0] == payload_key.split("}", 1)[0]
-
-  def test_pop_raises_on_missing_payload(self, redis_settings, mock_redis, mocker):
-    """B1: an orphaned member is recoverable; malformed payloads are not.
-
-    Previously the Lua script returned ``-1`` when HGET missed and pop
-    escalated every such miss to QueueError. B1 distinguishes:
-
-    - orphaned member (``[2, _]`` — ZSET member has no sidecar payload):
-      recoverable → stale member is discarded and pop returns None.
-    - structural corruption (``[3, msg]`` — payload decoded to an
-      unexpected type): QueueError, so the caller can surface it.
-
-    Regression for R4-C1 / B1.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    # Orphaned member: stale and unrecoverable, returns None (no raise).
-    mock_script_race = mocker.MagicMock()
-    mock_script_race.return_value = [2, None]
-    mock_redis.register_script.return_value = mock_script_race
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    assert backend.pop("test_queue") is None
-
-    # Structural corruption: loud QueueError.
-    mock_script_corrupt = mocker.MagicMock()
-    mock_script_corrupt.return_value = [3, "unexpected payload type: float"]
-    mock_redis.register_script.return_value = mock_script_corrupt
-    with pytest.raises(QueueError, match="structural corruption"):
-      backend.pop("test_queue")
-
-  def test_non_blocking_pop_uses_lua_script(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Non-blocking pop must use a Lua script for ZPOPMIN+HGET+HDEL atomicity.
-
-    Regression for R5-C1: the previous pipeline(transaction=True) approach
-    left an orphan window between ZPOPMIN and HGET/HDEL if the worker
-    crashed mid-pop.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock()
-    mock_script.return_value = [1, b"payload"]  # New signal scheme: [1, payload] = success.
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.pop("test_queue")  # timeout=0 (default)
-
-    mock_redis.register_script.assert_called_once()
-    script_body = mock_redis.register_script.call_args.args[0]
-    assert "ZPOPMIN" in script_body
-    assert "HGET" in script_body
-    assert "HDEL" in script_body
-    mock_script.assert_called_once()
-    keys = mock_script.call_args.kwargs["keys"]
-    assert keys == [
-      "{scrapy-extension:queue:test_queue}:items",
-      "{scrapy-extension:queue:test_queue}:payload",
-    ]
-
-  def test_pop_normalizes_str_payload_to_bytes(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """With decode_responses=True, Lua script returns str; pop must return bytes.
-
-    Regression for R6-C1: pre-fix, pop raised QueueError when the script
-    returned a str because isinstance(result, bytes) failed.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock()
-    # New signal scheme: [1, payload] = success; decode_responses=True → str payload.
-    mock_script.return_value = [1, "string_payload"]
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.pop("test_queue")
-    assert result == b"string_payload"
-    assert isinstance(result, bytes)
-
-  def test_blocking_pop_uses_atomic_lua_for_consume(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Blocking pop uses one Lua operation, avoiding a post-BZPOP crash gap."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock(return_value=[1, b"payload"])
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.pop("test_queue", timeout=5.0)
-    assert result == b"payload"
-    script_body = mock_redis.register_script.call_args.args[0]
-    assert "ZPOPMIN" in script_body
-    assert "HGET" in script_body
-    assert "HDEL" in script_body
-    mock_redis.bzpopmin.assert_not_called()
-    mock_redis.pipeline.assert_not_called()
-
-  def test_pop_raises_on_unexpected_payload_type(self, redis_settings, mock_redis, mocker):
-    """R5: a pop result that is not a 2-element [status, payload] list → QueueError (defensive)."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_script = mocker.MagicMock()
-    mock_script.return_value = 3.14  # float — not the expected [status, payload] list shape
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-
-    with pytest.raises(QueueError, match="Malformed Redis pop response"):
-      backend.pop("test_queue")
-
-  def test_blocking_pop_wraps_lua_redis_error(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """A RedisError from an atomic blocking-pop attempt becomes QueueError."""
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_script = mocker.MagicMock(side_effect=RedisError("script failed"))
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-
-    with pytest.raises(QueueError, match="Redis queue pop failed"):
-      backend.pop("test_queue", timeout=5.0)
-
-  def test_blocking_pop_discards_orphan_and_keeps_polling(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """A stale member is removed atomically before polling the next item."""
-    from types import SimpleNamespace
-
-    from scrapy_extension.backends import redis as redis_module
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock(side_effect=[[2, None], [1, b"next"]])
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch.object(
-      redis_module,
-      "time",
-      SimpleNamespace(monotonic=lambda: 10.0, sleep=mocker.Mock()),
-    )
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-
-    assert backend.pop("test_queue", timeout=5.0) == b"next"
-    assert mock_script.call_count == 2
-
-  def test_blocking_pop_normalizes_str_to_bytes(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Blocking-pop + decode_responses=True: str payload → bytes (R6 normalization)."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_script = mocker.MagicMock(return_value=[1, "str_payload"])
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-
-    assert backend.pop("test_queue", timeout=5.0) == b"str_payload"
-
-  def test_blocking_pop_raises_on_unexpected_payload_type(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Blocking-pop Lua result with a non-bytes payload raises QueueError."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import QueueError
-
-    mock_script = mocker.MagicMock(return_value=[1, 3.14])
-    mock_redis.register_script.return_value = mock_script
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-
-    with pytest.raises(QueueError, match="invalid type"):
-      backend.pop("test_queue", timeout=5.0)
+    """Test RedisBackend queue operations with error handling."""
+
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
+
+        return RedisSettings(host="localhost", port=6379)
+
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
+
+    def test_queue_push_with_priority(self, redis_settings, mock_redis, mocker):
+        """Test queue push with priority passes negated score to the Lua script."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock()
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.push("test_queue", b"test_data", priority=5.0)
+        # args = [member_uuid, -priority, item]
+        args = mock_script.call_args.kwargs["args"]
+        assert args[1] == -5.0
+
+    def test_queue_push_error(self, redis_settings, mock_redis, mocker):
+        """Test queue push raises QueueError on RedisError."""
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_script = mocker.MagicMock()
+        mock_script.side_effect = RedisError("Script eval error")
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(QueueError) as exc_info:
+            backend.push("test_queue", b"test_data")
+        assert "push" in str(exc_info.value).lower()
+
+    def test_queue_pop_blocking(self, redis_settings, mock_redis, mocker):
+        """A blocking pop returns a payload through the atomic Lua path."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock(return_value=[1, b"blocked_data"])
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.pop("test_queue", timeout=5.0)
+        assert result == b"blocked_data"
+        mock_redis.bzpopmin.assert_not_called()
+        mock_redis.pipeline.assert_not_called()
+
+    def test_queue_pop_blocking_timeout(self, redis_settings, mock_redis, mocker):
+        """An empty blocking pop polls until its monotonic deadline."""
+        from types import SimpleNamespace
+
+        from scrapy_extension.backends import redis as redis_module
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock(return_value=[0, None])
+        mock_redis.register_script.return_value = mock_script
+        now = [10.0]
+        sleep = mocker.Mock(
+            side_effect=lambda delay: now.__setitem__(0, now[0] + delay)
+        )
+        mocker.patch.object(
+            redis_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
+        )
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend._generation is not None
+        wait = mocker.patch.object(
+            backend._generation.retired,
+            "wait",
+            side_effect=lambda delay: now.__setitem__(0, now[0] + delay) or False,
+        )
+        result = backend.pop("test_queue", timeout=1.0)
+        assert result is None
+        assert now[0] == pytest.approx(11.0)
+        assert mock_script.call_count > 1
+        assert wait.call_count > 1
+        mock_redis.bzpopmin.assert_not_called()
+
+    def test_queue_pop_error(self, redis_settings, mock_redis, mocker):
+        """Test queue pop raises QueueError on RedisError."""
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_script = mocker.MagicMock()
+        mock_script.side_effect = RedisError("Script eval error")
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(QueueError) as exc_info:
+            backend.pop("test_queue")
+        assert "pop" in str(exc_info.value).lower()
+
+    def test_queue_len_error(self, redis_settings, mock_redis, mocker):
+        """R-qlen: queue_len must wrap RedisError as QueueError, NOT swallow to 0.
+
+        Pre-R-qlen this returned 0 (pinned by this test as ``== 0``), conflating an
+        empty queue with a backend failure. The scheduler trusts ``len(queue)`` for
+        ``has_pending_requests`` / the backpressure gate — a swallowed 0 during a
+        Redis blip can trigger premature idle/CloseSpider and loses the backpressure
+        signal at the worst moment. ``pop()`` wraps RedisError as QueueError;
+        queue_len now matches. The scheduler's ``next_request`` already handles
+        QueueError from ``len(self._queue)`` (returns None safely — see
+        scheduler.py backpressure docstring).
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_redis.zcard.side_effect = RedisError("Card error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(QueueError):
+            backend.queue_len("test_queue")
+
+    def test_clear_queue_error(self, redis_settings, mock_redis, mocker):
+        """R-clearq: clear_queue raises QueueError on RedisError (not log + swallow).
+
+        Parity with rabbitmq clear_queue (#69) and the queue_len stance: a failed
+        clear must surface, not silently return None (stale messages would be
+        redelivered as duplicate work next run).
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_redis.delete.side_effect = RedisError("Delete error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(QueueError) as exc_info:
+            backend.clear_queue("test_queue")
+        assert exc_info.value.operation == "clear_queue"
+
+    def test_push_uses_lua_script(self, redis_settings, mock_redis, mocker):
+        """Push must use a Lua script for atomic INCR + ZADD + HSET."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock()
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.push("test_queue", b"data", priority=1.0)
+
+        mock_redis.register_script.assert_called_once()
+        script_body = mock_redis.register_script.call_args.args[0]
+        assert "INCR" in script_body
+        assert "ZADD" in script_body
+        assert "HSET" in script_body
+        keys = mock_script.call_args.kwargs["keys"]
+        assert keys == [
+            "{scrapy-extension:queue:test_queue}:items",
+            "{scrapy-extension:queue:test_queue}:payload",
+            "{scrapy-extension:queue:test_queue}:counter",
+        ]
+
+    def test_push_identical_bytes_use_distinct_members(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Two pushes of identical bytes must produce distinct ZSET members.
+
+        Regression for R1-P0-1: pre-fix, both pushes shared the raw item as the
+        ZSET member and the second silently overwrote the first.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock()
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.push("test_queue", b"identical", priority=1.0)
+        backend.push("test_queue", b"identical", priority=1.0)
+
+        assert mock_script.call_count == 2
+        member_uuid_first = mock_script.call_args_list[0].kwargs["args"][0]
+        member_uuid_second = mock_script.call_args_list[1].kwargs["args"][0]
+        assert member_uuid_first != member_uuid_second, (
+            "Identical payloads must produce distinct member uuids; "
+            "the Lua script prefixes each with an INCR counter."
+        )
+
+    def test_payload_key_uses_hash_tag(self, redis_settings, mock_redis, mocker):
+        """Payload key must use a Redis Cluster hash tag so it shares a slot with the queue.
+
+        Without a shared hash tag, MULTI/EXEC across the queue ZSET and payload
+        sidecar raises CROSSSLOT in Redis Cluster mode.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        queue_key = backend._queue_key("test_queue")
+        payload_key = backend._payload_key("test_queue")
+        assert queue_key == "{scrapy-extension:queue:test_queue}:items"
+        assert payload_key == "{scrapy-extension:queue:test_queue}:payload"
+        assert queue_key.split("}", 1)[0] == payload_key.split("}", 1)[0]
+
+    def test_pop_raises_on_missing_payload(self, redis_settings, mock_redis, mocker):
+        """B1: an orphaned member is recoverable; malformed payloads are not.
+
+        Previously the Lua script returned ``-1`` when HGET missed and pop
+        escalated every such miss to QueueError. B1 distinguishes:
+
+        - orphaned member (``[2, _]`` — ZSET member has no sidecar payload):
+          recoverable → stale member is discarded and pop returns None.
+        - structural corruption (``[3, msg]`` — payload decoded to an
+          unexpected type): QueueError, so the caller can surface it.
+
+        Regression for R4-C1 / B1.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        # Orphaned member: stale and unrecoverable, returns None (no raise).
+        mock_script_race = mocker.MagicMock()
+        mock_script_race.return_value = [2, None]
+        mock_redis.register_script.return_value = mock_script_race
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        assert backend.pop("test_queue") is None
+
+        # Structural corruption: loud QueueError.
+        mock_script_corrupt = mocker.MagicMock()
+        mock_script_corrupt.return_value = [3, "unexpected payload type: float"]
+        mock_redis.register_script.return_value = mock_script_corrupt
+        with pytest.raises(QueueError, match="structural corruption"):
+            backend.pop("test_queue")
+
+    def test_non_blocking_pop_uses_lua_script(self, redis_settings, mock_redis, mocker):
+        """Non-blocking pop must use a Lua script for ZPOPMIN+HGET+HDEL atomicity.
+
+        Regression for R5-C1: the previous pipeline(transaction=True) approach
+        left an orphan window between ZPOPMIN and HGET/HDEL if the worker
+        crashed mid-pop.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock()
+        mock_script.return_value = [
+            1,
+            b"payload",
+        ]  # New signal scheme: [1, payload] = success.
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.pop("test_queue")  # timeout=0 (default)
+
+        mock_redis.register_script.assert_called_once()
+        script_body = mock_redis.register_script.call_args.args[0]
+        assert "ZPOPMIN" in script_body
+        assert "HGET" in script_body
+        assert "HDEL" in script_body
+        mock_script.assert_called_once()
+        keys = mock_script.call_args.kwargs["keys"]
+        assert keys == [
+            "{scrapy-extension:queue:test_queue}:items",
+            "{scrapy-extension:queue:test_queue}:payload",
+        ]
+
+    def test_pop_normalizes_str_payload_to_bytes(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """With decode_responses=True, Lua script returns str; pop must return bytes.
+
+        Regression for R6-C1: pre-fix, pop raised QueueError when the script
+        returned a str because isinstance(result, bytes) failed.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock()
+        # New signal scheme: [1, payload] = success; decode_responses=True → str payload.
+        mock_script.return_value = [1, "string_payload"]
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.pop("test_queue")
+        assert result == b"string_payload"
+        assert isinstance(result, bytes)
+
+    def test_blocking_pop_uses_atomic_lua_for_consume(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Blocking pop uses one Lua operation, avoiding a post-BZPOP crash gap."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock(return_value=[1, b"payload"])
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.pop("test_queue", timeout=5.0)
+        assert result == b"payload"
+        script_body = mock_redis.register_script.call_args.args[0]
+        assert "ZPOPMIN" in script_body
+        assert "HGET" in script_body
+        assert "HDEL" in script_body
+        mock_redis.bzpopmin.assert_not_called()
+        mock_redis.pipeline.assert_not_called()
+
+    def test_pop_raises_on_unexpected_payload_type(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """R5: a pop result that is not a 2-element [status, payload] list → QueueError (defensive)."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_script = mocker.MagicMock()
+        mock_script.return_value = (
+            3.14  # float — not the expected [status, payload] list shape
+        )
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+
+        with pytest.raises(QueueError, match="Malformed Redis pop response"):
+            backend.pop("test_queue")
+
+    def test_blocking_pop_wraps_lua_redis_error(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """A RedisError from an atomic blocking-pop attempt becomes QueueError."""
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_script = mocker.MagicMock(side_effect=RedisError("script failed"))
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+
+        with pytest.raises(QueueError, match="Redis queue pop failed"):
+            backend.pop("test_queue", timeout=5.0)
+
+    def test_blocking_pop_discards_orphan_and_keeps_polling(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """A stale member is removed atomically before polling the next item."""
+        from types import SimpleNamespace
+
+        from scrapy_extension.backends import redis as redis_module
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock(side_effect=[[2, None], [1, b"next"]])
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch.object(
+            redis_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: 10.0, sleep=mocker.Mock()),
+        )
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+
+        assert backend.pop("test_queue", timeout=5.0) == b"next"
+        assert mock_script.call_count == 2
+
+    def test_blocking_pop_normalizes_str_to_bytes(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Blocking-pop + decode_responses=True: str payload → bytes (R6 normalization)."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_script = mocker.MagicMock(return_value=[1, "str_payload"])
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+
+        assert backend.pop("test_queue", timeout=5.0) == b"str_payload"
+
+    def test_blocking_pop_raises_on_unexpected_payload_type(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Blocking-pop Lua result with a non-bytes payload raises QueueError."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import QueueError
+
+        mock_script = mocker.MagicMock(return_value=[1, 3.14])
+        mock_redis.register_script.return_value = mock_script
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+
+        with pytest.raises(QueueError, match="invalid type"):
+            backend.pop("test_queue", timeout=5.0)
 
 
 class TestRedisBackendSetOperations:
-  """Test RedisBackend set operations with error handling."""
+    """Test RedisBackend set operations with error handling."""
 
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
 
-    return RedisSettings(host="localhost", port=6379)
+        return RedisSettings(host="localhost", port=6379)
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_set_add_already_exists(self, redis_settings, mock_redis, mocker):
-    """Test set add returns False when item already exists."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_set_add_already_exists(self, redis_settings, mock_redis, mocker):
+        """Test set add returns False when item already exists."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.sadd.return_value = 0  # Already exists
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.add("test_set", b"existing_item")
-    assert result is False
+        mock_redis.sadd.return_value = 0  # Already exists
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.add("test_set", b"existing_item")
+        assert result is False
 
-  def test_set_add_error(self, redis_settings, mock_redis, mocker):
-    """R-dupe-1 (option b): RedisError during set add is wrapped as
-    BackendConnectionError so BackendDupeFilter's graceful-degradation arm
-    catches it (degrade to not-seen) instead of crashing the crawl. The
-    terminal public boundary intentionally drops the raw driver graph.
+    def test_set_add_error(self, redis_settings, mock_redis, mocker):
+        """R-dupe-1 (option b): RedisError during set add is wrapped as
+        BackendConnectionError so BackendDupeFilter's graceful-degradation arm
+        catches it (degrade to not-seen) instead of crashing the crawl. The
+        terminal public boundary intentionally drops the raw driver graph.
 
-    Supersedes R31-A1's "must propagate raw" — but preserves R31-A1's core
-    concern: add does NOT return False on error (no silent mis-treatment as
-    duplicate, which would drop new requests during network blips). It still
-    raises a typed, catchable exception; only the type changed from raw
-    ``RedisError`` to ``BackendConnectionError`` so ``except BackendError``
-    (the dupefilter's degradation arm) catches it uniformly across backends.
-    """
-    from redis.exceptions import RedisError
+        Supersedes R31-A1's "must propagate raw" — but preserves R31-A1's core
+        concern: add does NOT return False on error (no silent mis-treatment as
+        duplicate, which would drop new requests during network blips). It still
+        raises a typed, catchable exception; only the type changed from raw
+        ``RedisError`` to ``BackendConnectionError`` so ``except BackendError``
+        (the dupefilter's degradation arm) catches it uniformly across backends.
+        """
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import BackendConnectionError
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import BackendConnectionError
 
-    mock_redis.sadd.side_effect = RedisError("Add error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError) as exc_info:
-      backend.add("test_set", b"test_item")
-    assert exc_info.value.backend_type == "redis"
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
+        mock_redis.sadd.side_effect = RedisError("Add error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.add("test_set", b"test_item")
+        assert exc_info.value.backend_type == "redis"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
-  def test_set_remove_success(self, redis_settings, mock_redis, mocker):
-    """Test set remove returns True on successful removal."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_set_remove_success(self, redis_settings, mock_redis, mocker):
+        """Test set remove returns True on successful removal."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.srem.return_value = 1
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.remove("test_set", b"test_item")
-    assert result is True
+        mock_redis.srem.return_value = 1
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.remove("test_set", b"test_item")
+        assert result is True
 
-  def test_set_remove_not_found(self, redis_settings, mock_redis, mocker):
-    """Test set remove returns False when item not found."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_set_remove_not_found(self, redis_settings, mock_redis, mocker):
+        """Test set remove returns False when item not found."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.srem.return_value = 0
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.remove("test_set", b"missing_item")
-    assert result is False
+        mock_redis.srem.return_value = 0
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.remove("test_set", b"missing_item")
+        assert result is False
 
-  def test_set_remove_error(self, redis_settings, mock_redis, mocker):
-    """RedisError on remove becomes a typed backend failure, not False.
+    def test_set_remove_error(self, redis_settings, mock_redis, mocker):
+        """RedisError on remove becomes a typed backend failure, not False.
 
-    Returning False conflated "item not in set" with "couldn't reach the
-    backend". A raw redis-py exception also leaks an implementation detail;
-    all Redis SetBackend failures use BackendConnectionError.
-    """
-    from redis.exceptions import RedisError
+        Returning False conflated "item not in set" with "couldn't reach the
+        backend". A raw redis-py exception also leaks an implementation detail;
+        all Redis SetBackend failures use BackendConnectionError.
+        """
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import BackendConnectionError
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import BackendConnectionError
 
-    mock_redis.srem.side_effect = RedisError("Remove error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError, match="set remove failed") as exc_info:
-      backend.remove("test_set", b"test_item")
-    assert exc_info.value.backend_type == "redis"
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
+        mock_redis.srem.side_effect = RedisError("Remove error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(
+            BackendConnectionError, match="set remove failed"
+        ) as exc_info:
+            backend.remove("test_set", b"test_item")
+        assert exc_info.value.backend_type == "redis"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
-  def test_set_contains_error(self, redis_settings, mock_redis, mocker):
-    """RedisError on contains becomes a typed backend failure, not False.
+    def test_set_contains_error(self, redis_settings, mock_redis, mocker):
+        """RedisError on contains becomes a typed backend failure, not False.
 
-    Returning False conflated "not in set" with "couldn't check" — the
-    standard ``if not set.contains(fp): set.add(fp)`` pattern would
-    produce duplicates during network blips.
-    """
-    from redis.exceptions import RedisError
+        Returning False conflated "not in set" with "couldn't check" — the
+        standard ``if not set.contains(fp): set.add(fp)`` pattern would
+        produce duplicates during network blips.
+        """
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import BackendConnectionError
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import BackendConnectionError
 
-    mock_redis.sismember.side_effect = RedisError("Member error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError, match="membership check failed") as exc_info:
-      backend.contains("test_set", b"test_item")
-    assert exc_info.value.backend_type == "redis"
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
+        mock_redis.sismember.side_effect = RedisError("Member error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(
+            BackendConnectionError, match="membership check failed"
+        ) as exc_info:
+            backend.contains("test_set", b"test_item")
+        assert exc_info.value.backend_type == "redis"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
-  def test_set_len_error(self, redis_settings, mock_redis, mocker):
-    """RedisError on set_len must not masquerade as an empty set."""
-    from redis.exceptions import RedisError
+    def test_set_len_error(self, redis_settings, mock_redis, mocker):
+        """RedisError on set_len must not masquerade as an empty set."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import BackendConnectionError
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import BackendConnectionError
 
-    mock_redis.scard.side_effect = RedisError("Card error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError, match="length read failed") as exc_info:
-      backend.set_len("test_set")
-    assert exc_info.value.backend_type == "redis"
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
+        mock_redis.scard.side_effect = RedisError("Card error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(
+            BackendConnectionError, match="length read failed"
+        ) as exc_info:
+            backend.set_len("test_set")
+        assert exc_info.value.backend_type == "redis"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
-  def test_clear_set_error(self, redis_settings, mock_redis, mocker):
-    """R-rclears: clear_set raises BackendConnectionError on RedisError (not swallow).
+    def test_clear_set_error(self, redis_settings, mock_redis, mocker):
+        """R-rclears: clear_set raises BackendConnectionError on RedisError (not swallow).
 
-    Parity with redis add (R-dupe-1 #38): wrap the raw RedisError so
-    BackendDupeFilter's graceful-degradation arm fires. A swallowed clear hides
-    a failed dedup-set reset -> stale fingerprints -> duplicate requests.
-    """
-    from redis.exceptions import RedisError
+        Parity with redis add (R-dupe-1 #38): wrap the raw RedisError so
+        BackendDupeFilter's graceful-degradation arm fires. A swallowed clear hides
+        a failed dedup-set reset -> stale fingerprints -> duplicate requests.
+        """
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import BackendConnectionError
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import BackendConnectionError
 
-    mock_redis.delete.side_effect = RedisError("Delete error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError) as exc_info:
-      backend.clear_set("test_set")
-    assert exc_info.value.backend_type == "redis"
+        mock_redis.delete.side_effect = RedisError("Delete error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.clear_set("test_set")
+        assert exc_info.value.backend_type == "redis"
 
 
 class TestRedisBackendStorageOperations:
-  """Test RedisBackend storage operations with error handling."""
-
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
-
-    return RedisSettings(host="localhost", port=6379)
-
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
-
-  def test_storage_store_with_ttl(self, redis_settings, mock_redis, mocker):
-    """Test storage store with TTL uses SETEX."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.store("test_key", b"test_data", ttl=3600)
-    mock_redis.setex.assert_called_once_with(
-      "scrapy-extension:storage:test_key", 3600, b"test_data"
-    )
-
-  def test_storage_store_no_ttl(self, redis_settings, mock_redis, mocker):
-    """Test storage store without TTL uses SET."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.store("test_key", b"test_data")
-    mock_redis.set.assert_called_once_with(
-      "scrapy-extension:storage:test_key", b"test_data"
-    )
-
-  def test_storage_store_error(self, redis_settings, mock_redis, mocker):
-    """R-store: RedisError on store must raise StorageError, not be swallowed.
-
-    Pre-fix ``store()`` caught ``RedisError`` and returned normally, so the
-    item pipeline treated the failed write as a success — silent data loss AND
-    the ``max_storage_errors`` (C2) escalation was neutered (the success arm
-    reset the consecutive-error counter). Now mirrors the
-    mongodb/elasticsearch/memcached/dynamodb ``store()`` contracts (all raise
-    ``StorageError``). Redis ``retrieve()`` already propagates (R32-A1); this
-    closes the last storage-path swallow on the Redis backend.
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import StorageError
-
-    mock_redis.set.side_effect = RedisError("Write error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(StorageError) as exc_info:
-      backend.store("test_key", b"test_data")
-    assert exc_info.value.operation == "store"
-    assert exc_info.value.key is None
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  @pytest.mark.parametrize("ttl", [None, 60])
-  def test_storage_store_false_result_is_failure(
-    self, redis_settings, mock_redis, mocker, ttl
-  ):
-    """Redis rejecting a write is an operational failure, not success."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import StorageError
-
-    command = mock_redis.set if ttl is None else mock_redis.setex
-    command.return_value = False
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-
-    with pytest.raises(StorageError) as exc_info:
-      backend.store("test_key", b"test_data", ttl=ttl)
-
-    assert exc_info.value.operation == "store"
-    assert exc_info.value.key is None
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  def test_storage_retrieve_string_conversion(self, redis_settings, mock_redis, mocker):
-    """Test storage retrieve converts string to bytes."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.get.return_value = "string_data"
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.retrieve("test_key")
-    assert result == b"string_data"
-
-  def test_storage_retrieve_error(self, redis_settings, mock_redis, mocker):
-    """R32-A1: RedisError on retrieve must propagate, NOT return None.
-
-    Returning None on RedisError conflated "key doesn't exist" with
-    "couldn't reach the backend". Callers writing ``if storage.retrieve(k)
-    is None: create_new()`` would silently overwrite existing data during
-    any network blip / Redis failover — silent data loss.
-    The StorageBackend.retrieve contract (base.py) says None = "not found";
-    real errors propagate so callers can distinguish.
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.get.side_effect = RedisError("Read error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    from scrapy_extension.exceptions import StorageError
-
-    with pytest.raises(StorageError, match="storage read failed") as exc_info:
-      backend.retrieve("test_key")
-    assert exc_info.value.operation == "retrieve"
-    assert exc_info.value.key is None
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  def test_delete_success(self, redis_settings, mock_redis, mocker):
-    """Test delete returns True on successful deletion."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.delete.return_value = 1
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.delete("test_key")
-    assert result is True
-
-  def test_delete_not_found(self, redis_settings, mock_redis, mocker):
-    """Test delete returns False when key not found."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.delete.return_value = 0
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.delete("missing_key")
-    assert result is False
-
-  def test_delete_error(self, redis_settings, mock_redis, mocker):
-    """R34-A1: RedisError on delete must propagate, NOT return False.
-
-    Returning False conflated "key didn't exist" with "couldn't reach
-    the backend". The StorageBackend.delete contract (base.py) says
-    False = "didn't exist"; real errors propagate.
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.delete.side_effect = RedisError("Delete error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    from scrapy_extension.exceptions import StorageError
-
-    with pytest.raises(StorageError, match="storage delete failed") as exc_info:
-      backend.delete("test_key")
-    assert exc_info.value.operation == "delete"
-    assert exc_info.value.key is None
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  def test_exists_true(self, redis_settings, mock_redis, mocker):
-    """Test exists returns True when key exists."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.exists.return_value = 1
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.exists("test_key")
-    assert result is True
-
-  def test_exists_false(self, redis_settings, mock_redis, mocker):
-    """Test exists returns False when key does not exist."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.exists.return_value = 0
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.exists("missing_key")
-    assert result is False
-
-  def test_exists_error(self, redis_settings, mock_redis, mocker):
-    """R33-A1: RedisError on exists must propagate, NOT return False.
-
-    Returning False on RedisError conflated "key doesn't exist" with
-    "couldn't reach the backend". Callers writing ``if not
-    storage.exists(k): create_new()`` would silently overwrite existing
-    data during any network blip / Redis failover — silent data loss.
-    The StorageBackend.exists contract (base.py) says False = "doesn't
-    exist"; real errors propagate so callers can distinguish.
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.exists.side_effect = RedisError("Exists error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    from scrapy_extension.exceptions import StorageError
-
-    with pytest.raises(StorageError, match="existence check failed") as exc_info:
-      backend.exists("test_key")
-    assert exc_info.value.operation == "exists"
-    assert exc_info.value.key is None
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  def test_ttl_with_ttl(self, redis_settings, mock_redis, mocker):
-    """Test ttl returns seconds when TTL is set."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.ttl.return_value = 3600
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.ttl("test_key")
-    assert result == 3600
-
-  def test_ttl_zero_is_a_live_non_negative_result(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Redis reports zero during the final sub-second of a live TTL."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.ttl.return_value = 0
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    assert backend.ttl("test_key") == 0
-
-  def test_ttl_no_ttl(self, redis_settings, mock_redis, mocker):
-    """Test ttl returns None when no TTL set (-1)."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.ttl.return_value = -1
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.ttl("test_key")
-    assert result is None
-
-  def test_ttl_key_not_exists(self, redis_settings, mock_redis, mocker):
-    """Test ttl returns None when key doesn't exist (R1-P0-4 contract fix)."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.ttl.return_value = -2
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.ttl("missing_key")
-    assert result is None
-
-  def test_ttl_error(self, redis_settings, mock_redis, mocker):
-    """R34-A1: RedisError on ttl must propagate, NOT return None.
-
-    Returning None conflated "no TTL" with "couldn't reach the backend".
-    The StorageBackend.ttl contract reserves None for a missing, permanent,
-    expired, or otherwise unobservable TTL; real errors propagate so callers
-    can distinguish "no observable TTL" from "couldn't check".
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.ttl.side_effect = RedisError("TTL error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    from scrapy_extension.exceptions import StorageError
-
-    with pytest.raises(StorageError, match="TTL read failed") as exc_info:
-      backend.ttl("test_key")
-    assert exc_info.value.operation == "ttl"
-    assert exc_info.value.key is None
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  def test_clear_storage_with_prefix(self, redis_settings, mock_redis, mocker):
-    """Test clear_storage with prefix uses scan_iter."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.scan_iter.return_value = iter(["key1", "key2"])
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.clear_storage(prefix="test_prefix")
-    mock_redis.scan_iter.assert_called_once_with(
-      match="scrapy-extension:storage:test_prefix*"
-    )
-    assert mock_redis.delete.call_count == 2
-
-  def test_clear_storage_no_prefix(self, redis_settings, mock_redis, mocker):
-    """Test clear_storage without prefix scans only owned storage keys."""
-    from scrapy_extension.backends.redis import RedisBackend
-
-    mock_redis.scan_iter.return_value = iter([])
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.clear_storage()
-    mock_redis.scan_iter.assert_called_once_with(match="scrapy-extension:storage:*")
-    mock_redis.flushdb.assert_not_called()
-
-  def test_clear_storage_cluster_with_prefix(self):
-    """Test clear_storage with cluster and prefix.
-
-    Note: isinstance check with mocked RedisCluster doesn't work with mocks.
-    This test verifies the non-cluster branch behavior with prefix via the
-    regular Redis client path. Cluster-specific behavior is covered by
-    integration tests with real Redis Cluster.
-    """
-    # Cluster mode with prefix uses scan_iter - tested via code inspection
-    # The isinstance check is the limiting factor for direct mocking
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
-
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
-    )
-    backend = RedisBackend(settings)
-    # Verify settings are correctly stored for cluster mode
-    assert backend.config.mode == RedisMode.CLUSTER
-
-  def test_clear_storage_cluster_no_prefix(self):
-    """Test clear_storage with cluster without prefix.
-
-    The executable cluster scan contract is covered by the coverage-gap test;
-    this keeps the mode construction path pinned independently.
-    """
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
-
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
-    )
-    backend = RedisBackend(settings)
-    # Verify settings are correctly stored for cluster mode
-    assert backend.config.mode == RedisMode.CLUSTER
-
-  def test_clear_storage_error(self, redis_settings, mock_redis, mocker):
-    """R-rclears: clear_storage raises StorageError on RedisError (not swallow).
-
-    Parity with redis store (R-store #59) and mongodb/memcached/dynamodb/es
-    clear_storage (all raise StorageError). redis was the lone swallow.
-    """
-    from redis.exceptions import RedisError
-
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.exceptions import StorageError
-
-    mock_redis.scan_iter.side_effect = RedisError("Scan error")
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(StorageError) as exc_info:
-      backend.clear_storage()
-    assert exc_info.value.operation == "clear_storage"
+    """Test RedisBackend storage operations with error handling."""
+
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
+
+        return RedisSettings(host="localhost", port=6379)
+
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
+
+    def test_storage_store_with_ttl(self, redis_settings, mock_redis, mocker):
+        """Test storage store with TTL uses SETEX."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.store("test_key", b"test_data", ttl=3600)
+        mock_redis.setex.assert_called_once_with(
+            "scrapy-extension:storage:test_key", 3600, b"test_data"
+        )
+
+    def test_storage_store_no_ttl(self, redis_settings, mock_redis, mocker):
+        """Test storage store without TTL uses SET."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.store("test_key", b"test_data")
+        mock_redis.set.assert_called_once_with(
+            "scrapy-extension:storage:test_key", b"test_data"
+        )
+
+    def test_storage_store_error(self, redis_settings, mock_redis, mocker):
+        """R-store: RedisError on store must raise StorageError, not be swallowed.
+
+        Pre-fix ``store()`` caught ``RedisError`` and returned normally, so the
+        item pipeline treated the failed write as a success — silent data loss AND
+        the ``max_storage_errors`` (C2) escalation was neutered (the success arm
+        reset the consecutive-error counter). Now mirrors the
+        mongodb/elasticsearch/memcached/dynamodb ``store()`` contracts (all raise
+        ``StorageError``). Redis ``retrieve()`` already propagates (R32-A1); this
+        closes the last storage-path swallow on the Redis backend.
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import StorageError
+
+        mock_redis.set.side_effect = RedisError("Write error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(StorageError) as exc_info:
+            backend.store("test_key", b"test_data")
+        assert exc_info.value.operation == "store"
+        assert exc_info.value.key is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.parametrize("ttl", [None, 60])
+    def test_storage_store_false_result_is_failure(
+        self, redis_settings, mock_redis, mocker, ttl
+    ):
+        """Redis rejecting a write is an operational failure, not success."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import StorageError
+
+        command = mock_redis.set if ttl is None else mock_redis.setex
+        command.return_value = False
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+
+        with pytest.raises(StorageError) as exc_info:
+            backend.store("test_key", b"test_data", ttl=ttl)
+
+        assert exc_info.value.operation == "store"
+        assert exc_info.value.key is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_storage_retrieve_string_conversion(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Test storage retrieve converts string to bytes."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.get.return_value = "string_data"
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.retrieve("test_key")
+        assert result == b"string_data"
+
+    def test_storage_retrieve_error(self, redis_settings, mock_redis, mocker):
+        """R32-A1: RedisError on retrieve must propagate, NOT return None.
+
+        Returning None on RedisError conflated "key doesn't exist" with
+        "couldn't reach the backend". Callers writing ``if storage.retrieve(k)
+        is None: create_new()`` would silently overwrite existing data during
+        any network blip / Redis failover — silent data loss.
+        The StorageBackend.retrieve contract (base.py) says None = "not found";
+        real errors propagate so callers can distinguish.
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.get.side_effect = RedisError("Read error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        from scrapy_extension.exceptions import StorageError
+
+        with pytest.raises(StorageError, match="storage read failed") as exc_info:
+            backend.retrieve("test_key")
+        assert exc_info.value.operation == "retrieve"
+        assert exc_info.value.key is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_delete_success(self, redis_settings, mock_redis, mocker):
+        """Test delete returns True on successful deletion."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.delete.return_value = 1
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.delete("test_key")
+        assert result is True
+
+    def test_delete_not_found(self, redis_settings, mock_redis, mocker):
+        """Test delete returns False when key not found."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.delete.return_value = 0
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.delete("missing_key")
+        assert result is False
+
+    def test_delete_error(self, redis_settings, mock_redis, mocker):
+        """R34-A1: RedisError on delete must propagate, NOT return False.
+
+        Returning False conflated "key didn't exist" with "couldn't reach
+        the backend". The StorageBackend.delete contract (base.py) says
+        False = "didn't exist"; real errors propagate.
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.delete.side_effect = RedisError("Delete error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        from scrapy_extension.exceptions import StorageError
+
+        with pytest.raises(StorageError, match="storage delete failed") as exc_info:
+            backend.delete("test_key")
+        assert exc_info.value.operation == "delete"
+        assert exc_info.value.key is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_exists_true(self, redis_settings, mock_redis, mocker):
+        """Test exists returns True when key exists."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.exists.return_value = 1
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.exists("test_key")
+        assert result is True
+
+    def test_exists_false(self, redis_settings, mock_redis, mocker):
+        """Test exists returns False when key does not exist."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.exists.return_value = 0
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.exists("missing_key")
+        assert result is False
+
+    def test_exists_error(self, redis_settings, mock_redis, mocker):
+        """R33-A1: RedisError on exists must propagate, NOT return False.
+
+        Returning False on RedisError conflated "key doesn't exist" with
+        "couldn't reach the backend". Callers writing ``if not
+        storage.exists(k): create_new()`` would silently overwrite existing
+        data during any network blip / Redis failover — silent data loss.
+        The StorageBackend.exists contract (base.py) says False = "doesn't
+        exist"; real errors propagate so callers can distinguish.
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.exists.side_effect = RedisError("Exists error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        from scrapy_extension.exceptions import StorageError
+
+        with pytest.raises(StorageError, match="existence check failed") as exc_info:
+            backend.exists("test_key")
+        assert exc_info.value.operation == "exists"
+        assert exc_info.value.key is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_ttl_with_ttl(self, redis_settings, mock_redis, mocker):
+        """Test ttl returns seconds when TTL is set."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.ttl.return_value = 3600
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.ttl("test_key")
+        assert result == 3600
+
+    def test_ttl_zero_is_a_live_non_negative_result(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Redis reports zero during the final sub-second of a live TTL."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.ttl.return_value = 0
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        assert backend.ttl("test_key") == 0
+
+    def test_ttl_no_ttl(self, redis_settings, mock_redis, mocker):
+        """Test ttl returns None when no TTL set (-1)."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.ttl.return_value = -1
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.ttl("test_key")
+        assert result is None
+
+    def test_ttl_key_not_exists(self, redis_settings, mock_redis, mocker):
+        """Test ttl returns None when key doesn't exist (R1-P0-4 contract fix)."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.ttl.return_value = -2
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.ttl("missing_key")
+        assert result is None
+
+    def test_ttl_error(self, redis_settings, mock_redis, mocker):
+        """R34-A1: RedisError on ttl must propagate, NOT return None.
+
+        Returning None conflated "no TTL" with "couldn't reach the backend".
+        The StorageBackend.ttl contract reserves None for a missing, permanent,
+        expired, or otherwise unobservable TTL; real errors propagate so callers
+        can distinguish "no observable TTL" from "couldn't check".
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.ttl.side_effect = RedisError("TTL error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        from scrapy_extension.exceptions import StorageError
+
+        with pytest.raises(StorageError, match="TTL read failed") as exc_info:
+            backend.ttl("test_key")
+        assert exc_info.value.operation == "ttl"
+        assert exc_info.value.key is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_clear_storage_with_prefix(self, redis_settings, mock_redis, mocker):
+        """Test clear_storage with prefix uses scan_iter."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.scan_iter.return_value = iter(["key1", "key2"])
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.clear_storage(prefix="test_prefix")
+        mock_redis.scan_iter.assert_called_once_with(
+            match="scrapy-extension:storage:test_prefix*"
+        )
+        assert mock_redis.delete.call_count == 2
+
+    def test_clear_storage_no_prefix(self, redis_settings, mock_redis, mocker):
+        """Test clear_storage without prefix scans only owned storage keys."""
+        from scrapy_extension.backends.redis import RedisBackend
+
+        mock_redis.scan_iter.return_value = iter([])
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.clear_storage()
+        mock_redis.scan_iter.assert_called_once_with(match="scrapy-extension:storage:*")
+        mock_redis.flushdb.assert_not_called()
+
+    def test_clear_storage_cluster_with_prefix(self):
+        """Test clear_storage with cluster and prefix.
+
+        Note: isinstance check with mocked RedisCluster doesn't work with mocks.
+        This test verifies the non-cluster branch behavior with prefix via the
+        regular Redis client path. Cluster-specific behavior is covered by
+        integration tests with real Redis Cluster.
+        """
+        # Cluster mode with prefix uses scan_iter - tested via code inspection
+        # The isinstance check is the limiting factor for direct mocking
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
+
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+        )
+        backend = RedisBackend(settings)
+        # Verify settings are correctly stored for cluster mode
+        assert backend.config.mode == RedisMode.CLUSTER
+
+    def test_clear_storage_cluster_no_prefix(self):
+        """Test clear_storage with cluster without prefix.
+
+        The executable cluster scan contract is covered by the coverage-gap test;
+        this keeps the mode construction path pinned independently.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
+
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+        )
+        backend = RedisBackend(settings)
+        # Verify settings are correctly stored for cluster mode
+        assert backend.config.mode == RedisMode.CLUSTER
+
+    def test_clear_storage_error(self, redis_settings, mock_redis, mocker):
+        """R-rclears: clear_storage raises StorageError on RedisError (not swallow).
+
+        Parity with redis store (R-store #59) and mongodb/memcached/dynamodb/es
+        clear_storage (all raise StorageError). redis was the lone swallow.
+        """
+        from redis.exceptions import RedisError
+
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.exceptions import StorageError
+
+        mock_redis.scan_iter.side_effect = RedisError("Scan error")
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(StorageError) as exc_info:
+            backend.clear_storage()
+        assert exc_info.value.operation == "clear_storage"
 
 
 class TestRedisBackendPingAndConnection:
-  """Test RedisBackend ping and connection state methods."""
+    """Test RedisBackend ping and connection state methods."""
 
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
 
-    return RedisSettings(host="localhost", port=6379)
+        return RedisSettings(host="localhost", port=6379)
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_is_connected_true(self, redis_settings, mock_redis, mocker):
-    """Test is_connected returns True when ping succeeds."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_is_connected_true(self, redis_settings, mock_redis, mocker):
+        """Test is_connected returns True when ping succeeds."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.ping.return_value = True
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend.is_connected() is True
+        mock_redis.ping.return_value = True
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend.is_connected() is True
 
-  def test_is_connected_false_when_none(self, redis_settings):
-    """Test is_connected returns False when client is None."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_is_connected_false_when_none(self, redis_settings):
+        """Test is_connected returns False when client is None."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    backend = RedisBackend(redis_settings)
-    # Never connected
-    assert backend.is_connected() is False
+        backend = RedisBackend(redis_settings)
+        # Never connected
+        assert backend.is_connected() is False
 
-  def test_is_connected_false_on_error(self, redis_settings, mock_redis, mocker):
-    """Test is_connected returns False on RedisError."""
-    from redis.exceptions import RedisError
+    def test_is_connected_false_on_error(self, redis_settings, mock_redis, mocker):
+        """Test is_connected returns False on RedisError."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.backends.redis import RedisBackend
 
-    # First ping succeeds to allow connect, then fails for is_connected check
-    mock_redis.ping.side_effect = [True, RedisError("Ping error")]
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend.is_connected() is False
+        # First ping succeeds to allow connect, then fails for is_connected check
+        mock_redis.ping.side_effect = [True, RedisError("Ping error")]
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend.is_connected() is False
 
-  def test_ping_success(self, redis_settings, mock_redis, mocker):
-    """Test ping returns True on success."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_ping_success(self, redis_settings, mock_redis, mocker):
+        """Test ping returns True on success."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.ping.return_value = True
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend.ping() is True
+        mock_redis.ping.return_value = True
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend.ping() is True
 
-  def test_ping_false_when_none(self, redis_settings):
-    """Test ping returns False when client is None."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_ping_false_when_none(self, redis_settings):
+        """Test ping returns False when client is None."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    backend = RedisBackend(redis_settings)
-    assert backend.ping() is False
+        backend = RedisBackend(redis_settings)
+        assert backend.ping() is False
 
-  def test_ping_false_on_error(self, redis_settings, mock_redis, mocker):
-    """Test ping returns False on RedisError."""
-    from redis.exceptions import RedisError
+    def test_ping_false_on_error(self, redis_settings, mock_redis, mocker):
+        """Test ping returns False on RedisError."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.backends.redis import RedisBackend
 
-    # First ping succeeds to allow connect, then fails for ping check
-    mock_redis.ping.side_effect = [True, RedisError("Ping error")]
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
-    assert backend.ping() is False
+        # First ping succeeds to allow connect, then fails for ping check
+        mock_redis.ping.side_effect = [True, RedisError("Ping error")]
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
+        assert backend.ping() is False
 
-  @pytest.mark.parametrize("method", ["is_connected", "ping"])
-  @pytest.mark.parametrize(
-    "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
-  )
-  def test_health_probe_returns_false_on_unexpected_exception(
-    self, redis_settings, mock_redis, mocker, method, error
-  ):
-    """Health probes remain boolean for ordinary driver failures."""
-    from scrapy_extension.backends.redis import RedisBackend
+    @pytest.mark.parametrize("method", ["is_connected", "ping"])
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
+    )
+    def test_health_probe_returns_false_on_unexpected_exception(
+        self, redis_settings, mock_redis, mocker, method, error
+    ):
+        """Health probes remain boolean for ordinary driver failures."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.ping.side_effect = [True, error]
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
+        mock_redis.ping.side_effect = [True, error]
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
 
-    assert getattr(backend, method)() is False
+        assert getattr(backend, method)() is False
 
-  @pytest.mark.parametrize("method", ["is_connected", "ping"])
-  @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
-  def test_health_probe_propagates_control_flow(
-    self, redis_settings, mock_redis, mocker, method, error_type
-  ):
-    """Health probes do not convert terminal control flow into False."""
-    from scrapy_extension.backends.redis import RedisBackend
+    @pytest.mark.parametrize("method", ["is_connected", "ping"])
+    @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+    def test_health_probe_propagates_control_flow(
+        self, redis_settings, mock_redis, mocker, method, error_type
+    ):
+        """Health probes do not convert terminal control flow into False."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.ping.side_effect = [True, error_type("stop")]
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    backend.connect()
+        mock_redis.ping.side_effect = [True, error_type("stop")]
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        backend.connect()
 
-    with pytest.raises(error_type):
-      getattr(backend, method)()
+        with pytest.raises(error_type):
+            getattr(backend, method)()
 
-  def test_client_property_auto_connect(self, redis_settings, mock_redis, mocker):
-    """Test client property triggers auto-connect if not connected."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_client_property_auto_connect(self, redis_settings, mock_redis, mocker):
+        """Test client property triggers auto-connect if not connected."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    # Access client property without calling connect
-    client = backend.client
-    assert client is mock_redis
-    # Verify ping was called during auto-connect
-    assert getattr(mock_redis.ping, "call_count", 0) > 0
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        # Access client property without calling connect
+        client = backend.client
+        assert client is mock_redis
+        # Verify ping was called during auto-connect
+        assert getattr(mock_redis.ping, "call_count", 0) > 0
 
 
 class TestRedisBackendConnectErrors:
-  """Test RedisBackend connection error handling."""
+    """Test RedisBackend connection error handling."""
 
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
 
-    return RedisSettings(host="localhost", port=6379)
+        return RedisSettings(host="localhost", port=6379)
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_connect_standalone_connection_error(self, redis_settings, mocker):
-    """Test connect raises BackendConnectionError on ConnectionError."""
-    from redis.exceptions import ConnectionError as RedisConnError
+    def test_connect_standalone_connection_error(self, redis_settings, mocker):
+        """Test connect raises BackendConnectionError on ConnectionError."""
+        from redis.exceptions import ConnectionError as RedisConnError
 
-    from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock = mocker.patch("scrapy_extension.backends.redis.Redis")
-    mock.return_value.ping.side_effect = RedisConnError("Connection refused")
-    backend = RedisBackend(redis_settings)
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
+        mock = mocker.patch("scrapy_extension.backends.redis.Redis")
+        mock.return_value.ping.side_effect = RedisConnError("Connection refused")
+        backend = RedisBackend(redis_settings)
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
 
-  def test_connect_master_slave_error(self, mocker):
-    """Test connect raises BackendConnectionError for master-slave mode."""
-    from redis.exceptions import RedisError
+    def test_connect_master_slave_error(self, mocker):
+        """Test connect raises BackendConnectionError for master-slave mode."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(mode=RedisMode.MASTER_SLAVE, host="master.redis.com")
-    mock = mocker.patch("scrapy_extension.backends.redis.Redis")
-    mock.return_value.ping.side_effect = RedisError("Master error")
-    backend = RedisBackend(settings)
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
+        settings = RedisSettings(mode=RedisMode.MASTER_SLAVE, host="master.redis.com")
+        mock = mocker.patch("scrapy_extension.backends.redis.Redis")
+        mock.return_value.ping.side_effect = RedisError("Master error")
+        backend = RedisBackend(settings)
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
 
-  def test_connect_sentinel_error(self, mocker):
-    """Test connect raises BackendConnectionError for sentinel mode."""
-    from redis.exceptions import RedisError
+    def test_connect_sentinel_error(self, mocker):
+        """Test connect raises BackendConnectionError for sentinel mode."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.SENTINEL,
-      sentinels=["sentinel1:26379"],
-      sentinel_master_name="mymaster",
-    )
-    mock_sentinel = mocker.patch("scrapy_extension.backends.redis.Sentinel")
-    mock_sentinel.return_value.master_for.side_effect = RedisError("Sentinel error")
-    backend = RedisBackend(settings)
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
+        settings = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["sentinel1:26379"],
+            sentinel_master_name="mymaster",
+        )
+        mock_sentinel = mocker.patch("scrapy_extension.backends.redis.Sentinel")
+        mock_sentinel.return_value.master_for.side_effect = RedisError("Sentinel error")
+        backend = RedisBackend(settings)
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
 
-  def test_connect_cluster_error(self, mocker):
-    """Test connect raises BackendConnectionError for cluster mode."""
-    from redis.exceptions import RedisError
+    def test_connect_cluster_error(self, mocker):
+        """Test connect raises BackendConnectionError for cluster mode."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
-    )
-    mock = mocker.patch("scrapy_extension.backends.redis.RedisCluster")
-    mock.return_value.ping.side_effect = RedisError("Cluster error")
-    backend = RedisBackend(settings)
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+        )
+        mock = mocker.patch("scrapy_extension.backends.redis.RedisCluster")
+        mock.return_value.ping.side_effect = RedisError("Cluster error")
+        backend = RedisBackend(settings)
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
 
 
 class TestRedisBackendCoverageGaps:
-  """Tests covering previously missing coverage lines in RedisBackend."""
+    """Tests covering previously missing coverage lines in RedisBackend."""
 
-  @pytest.fixture
-  def redis_settings(self):
-    """Create Redis settings."""
-    from scrapy_extension.settings import RedisSettings
+    @pytest.fixture
+    def redis_settings(self):
+        """Create Redis settings."""
+        from scrapy_extension.settings import RedisSettings
 
-    return RedisSettings(host="localhost", port=6379)
+        return RedisSettings(host="localhost", port=6379)
 
-  @pytest.fixture
-  def mock_redis(self, mocker):
-    """Create mock Redis client."""
-    return mocker.Mock()
+    @pytest.fixture
+    def mock_redis(self, mocker):
+        """Create mock Redis client."""
+        return mocker.Mock()
 
-  def test_validate_key_name_empty(self):
-    """Test _validate_key_name raises ValueError for empty name (line 33)."""
-    from scrapy_extension.backends.redis import _validate_key_name
+    def test_validate_key_name_empty(self):
+        """Test _validate_key_name raises ValueError for empty name (line 33)."""
+        from scrapy_extension.backends.redis import _validate_key_name
 
-    with pytest.raises(ValueError, match="Invalid name"):
-      _validate_key_name("")
+        with pytest.raises(ValueError, match="Invalid name"):
+            _validate_key_name("")
 
-  def test_import_error_message(self):
-    """Test ImportError includes helpful install message (lines 43-44)."""
-    import subprocess
-    import sys
+    def test_import_error_message(self):
+        """Test ImportError includes helpful install message (lines 43-44)."""
+        import subprocess
+        import sys
 
-    # Use subprocess to avoid corrupting the current process's module state
-    result = subprocess.run(
-      [
-        sys.executable,
-        "-c",
-        (
-          "import sys\n"
-          "# Block redis from being imported\n"
-          "import importlib.util\n"
-          "sys.modules['redis'] = None\n"
-          "sys.modules['redis.exceptions'] = None\n"
-          "sys.modules['redis.cluster'] = None\n"
-          "sys.modules['redis.sentinel'] = None\n"
-          "try:\n"
-          "    import scrapy_extension.backends.redis\n"
-          "    print('ERROR: No ImportError raised')\n"
-          "    sys.exit(1)\n"
-          "except ImportError as e:\n"
-          "    msg = str(e)\n"
-          '    if "pip install scrapy-extension[redis]" in msg:\n'
-          "        print('PASS')\n"
-          "    else:\n"
-          "        print(f'ERROR: Wrong message: {msg}')\n"
-          "        sys.exit(1)\n"
-        ),
-      ],
-      capture_output=True,
-      text=True,
-    )
-    assert result.returncode == 0, (
-      f"subprocess failed: {result.stderr}\n{result.stdout}"
-    )
-    assert "PASS" in result.stdout
+        # Use subprocess to avoid corrupting the current process's module state
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys\n"
+                    "# Block redis from being imported\n"
+                    "import importlib.util\n"
+                    "sys.modules['redis'] = None\n"
+                    "sys.modules['redis.exceptions'] = None\n"
+                    "sys.modules['redis.cluster'] = None\n"
+                    "sys.modules['redis.sentinel'] = None\n"
+                    "try:\n"
+                    "    import scrapy_extension.backends.redis\n"
+                    "    print('ERROR: No ImportError raised')\n"
+                    "    sys.exit(1)\n"
+                    "except ImportError as e:\n"
+                    "    msg = str(e)\n"
+                    '    if "pip install scrapy-extension[redis]" in msg:\n'
+                    "        print('PASS')\n"
+                    "    else:\n"
+                    "        print(f'ERROR: Wrong message: {msg}')\n"
+                    "        sys.exit(1)\n"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"subprocess failed: {result.stderr}\n{result.stdout}"
+        )
+        assert "PASS" in result.stdout
 
-  def test_connect_cluster_branch(self, mock_redis, mocker):
-    """Test connect() CLUSTER branch and logger.debug (lines 113->118)."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_connect_cluster_branch(self, mock_redis, mocker):
+        """Test connect() CLUSTER branch and logger.debug (lines 113->118)."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
-    )
-    mocker.patch(
-      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_redis
-    )
-    backend = RedisBackend(settings)
-    backend.connect()
-    # The CLUSTER branch is exercised; verify it connected
-    assert backend.is_connected()
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+        )
+        mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster", return_value=mock_redis
+        )
+        backend = RedisBackend(settings)
+        backend.connect()
+        # The CLUSTER branch is exercised; verify it connected
+        assert backend.is_connected()
 
-  def test_connect_master_slave_no_replicas(self, mock_redis, mocker):
-    """Test _connect_master_slave with no replicas skips logging (line 169->exit)."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_connect_master_slave_no_replicas(self, mock_redis, mocker):
+        """Test _connect_master_slave with no replicas skips logging (line 169->exit)."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.MASTER_SLAVE,
-      host="master.redis.com",
-      port=6379,
-      replicas=[],
-    )
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(settings)
-    backend.connect()
-    assert backend.is_connected()
-    # With replicas=None, the `if self.config.replicas:` branch is skipped
+        settings = RedisSettings(
+            mode=RedisMode.MASTER_SLAVE,
+            host="master.redis.com",
+            port=6379,
+            replicas=[],
+        )
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(settings)
+        backend.connect()
+        assert backend.is_connected()
+        # With replicas=None, the `if self.config.replicas:` branch is skipped
 
-  def test_disconnect_separate_master_client(self, redis_settings, mocker):
-    """Test disconnect closes separate _master_client (lines 283-285)."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_disconnect_separate_master_client(self, redis_settings, mocker):
+        """Test disconnect closes separate _master_client (lines 283-285)."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_master = mocker.Mock()
-    mock_client = mocker.Mock()
+        mock_master = mocker.Mock()
+        mock_client = mocker.Mock()
 
-    backend = RedisBackend(redis_settings)
-    # Manually create a scenario where _master_client is separate from _client
-    backend._master_client = mock_master
-    backend._client = mock_client
-    backend._sentinel = mocker.Mock()
+        backend = RedisBackend(redis_settings)
+        # Manually create a scenario where _master_client is separate from _client
+        backend._master_client = mock_master
+        backend._client = mock_client
+        backend._sentinel = mocker.Mock()
 
-    backend.disconnect()
-    # Both should be closed
-    mock_master.close.assert_called()
-    mock_client.close.assert_called()
-    assert backend._master_client is None
-    assert backend._client is None
-    assert backend._sentinel is None
+        backend.disconnect()
+        # Both should be closed
+        mock_master.close.assert_called()
+        mock_client.close.assert_called()
+        assert backend._master_client is None
+        assert backend._client is None
+        assert backend._sentinel is None
 
-  def test_disconnect_clears_shared_master_reference(self, redis_settings, mocker):
-    """Master and active client may be the same object in HA modes."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_disconnect_clears_shared_master_reference(self, redis_settings, mocker):
+        """Master and active client may be the same object in HA modes."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    client = mocker.Mock()
-    backend = RedisBackend(redis_settings)
-    backend._master_client = client
-    backend._client = client
+        client = mocker.Mock()
+        backend = RedisBackend(redis_settings)
+        backend._master_client = client
+        backend._client = client
 
-    backend.disconnect()
+        backend.disconnect()
 
-    client.close.assert_called_once()
-    assert backend._master_client is None
-    assert backend._client is None
+        client.close.assert_called_once()
+        assert backend._master_client is None
+        assert backend._client is None
 
-  def test_disconnect_master_client_redis_error_suppressed(
-    self, redis_settings, mocker
-  ):
-    """Test disconnect suppresses RedisError when closing _master_client (lines 283-285)."""
-    from redis.exceptions import RedisError
+    def test_disconnect_master_client_redis_error_suppressed(
+        self, redis_settings, mocker
+    ):
+        """Test disconnect suppresses RedisError when closing _master_client (lines 283-285)."""
+        from redis.exceptions import RedisError
 
-    from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_master = mocker.Mock()
-    mock_master.close.side_effect = RedisError("Already closed")
-    mock_client = mocker.Mock()
+        mock_master = mocker.Mock()
+        mock_master.close.side_effect = RedisError("Already closed")
+        mock_client = mocker.Mock()
 
-    backend = RedisBackend(redis_settings)
-    backend._master_client = mock_master
-    backend._client = mock_client
+        backend = RedisBackend(redis_settings)
+        backend._master_client = mock_master
+        backend._client = mock_client
 
-    # Should not raise
-    backend.disconnect()
-    assert backend._master_client is None
-    assert backend._client is None
+        # Should not raise
+        backend.disconnect()
+        assert backend._master_client is None
+        assert backend._client is None
 
-  def test_disconnect_clears_sentinel(self, redis_settings, mocker):
-    """Test disconnect sets _sentinel to None (lines 287->292)."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_disconnect_clears_sentinel(self, redis_settings, mocker):
+        """Test disconnect sets _sentinel to None (lines 287->292)."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_client = mocker.Mock()
-    backend = RedisBackend(redis_settings)
-    backend._client = mock_client
-    backend._sentinel = mocker.Mock()
+        mock_client = mocker.Mock()
+        backend = RedisBackend(redis_settings)
+        backend._client = mock_client
+        backend._sentinel = mocker.Mock()
 
-    backend.disconnect()
-    assert backend._sentinel is None
-    assert backend._client is None
+        backend.disconnect()
+        assert backend._sentinel is None
+        assert backend._client is None
 
-  def test_retrieve_returns_none_for_missing_key(
-    self, redis_settings, mock_redis, mocker
-  ):
-    """Test retrieve returns None when key doesn't exist (line 573)."""
-    from scrapy_extension.backends.redis import RedisBackend
+    def test_retrieve_returns_none_for_missing_key(
+        self, redis_settings, mock_redis, mocker
+    ):
+        """Test retrieve returns None when key doesn't exist (line 573)."""
+        from scrapy_extension.backends.redis import RedisBackend
 
-    mock_redis.get.return_value = None
-    mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
-    backend = RedisBackend(redis_settings)
-    result = backend.retrieve("missing_key")
-    assert result is None
+        mock_redis.get.return_value = None
+        mocker.patch("scrapy_extension.backends.redis.Redis", return_value=mock_redis)
+        backend = RedisBackend(redis_settings)
+        result = backend.retrieve("missing_key")
+        assert result is None
 
-  def test_clear_storage_cluster_with_prefix(self, mocker):
-    """Test clear_storage cluster scan_iter branch (lines 661-662)."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_clear_storage_cluster_with_prefix(self, mocker):
+        """Test clear_storage cluster scan_iter branch (lines 661-662)."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
-    )
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+        )
 
-    mock_cluster = mocker.MagicMock()
-    mock_cluster.scan_iter.return_value = iter([b"prefix:key1", b"prefix:key2"])
-    mock_cluster.ping.return_value = True
+        mock_cluster = mocker.MagicMock()
+        mock_cluster.scan_iter.return_value = iter([b"prefix:key1", b"prefix:key2"])
+        mock_cluster.ping.return_value = True
 
-    mocker.patch(
-      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
-    )
-    # Patch isinstance so it returns True for the mock_cluster instance
-    original_isinstance = isinstance
-    mocker.patch(
-      "scrapy_extension.backends.redis.isinstance",
-      side_effect=lambda obj, cls: (
-        True if obj is mock_cluster else original_isinstance(obj, cls)
-      ),
-    )
-    backend = RedisBackend(settings)
-    backend.connect()
-    backend.clear_storage(prefix="prefix")
+        mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
+        )
+        # Patch isinstance so it returns True for the mock_cluster instance
+        original_isinstance = isinstance
+        mocker.patch(
+            "scrapy_extension.backends.redis.isinstance",
+            side_effect=lambda obj, cls: (
+                True if obj is mock_cluster else original_isinstance(obj, cls)
+            ),
+        )
+        backend = RedisBackend(settings)
+        backend.connect()
+        backend.clear_storage(prefix="prefix")
 
-    mock_cluster.scan_iter.assert_called_once_with(
-      match="scrapy-extension:storage:prefix*"
-    )
-    assert mock_cluster.delete.call_count == 2
+        mock_cluster.scan_iter.assert_called_once_with(
+            match="scrapy-extension:storage:prefix*"
+        )
+        assert mock_cluster.delete.call_count == 2
 
-  def test_clear_storage_cluster_no_prefix(self, mocker):
-    """Cluster cleanup scans only the owned storage domain, never FLUSHALL."""
-    from scrapy_extension.backends.redis import RedisBackend
-    from scrapy_extension.settings import RedisMode, RedisSettings
+    def test_clear_storage_cluster_no_prefix(self, mocker):
+        """Cluster cleanup scans only the owned storage domain, never FLUSHALL."""
+        from scrapy_extension.backends.redis import RedisBackend
+        from scrapy_extension.settings import RedisMode, RedisSettings
 
-    settings = RedisSettings(
-      mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
-    )
+        settings = RedisSettings(
+            mode=RedisMode.CLUSTER, cluster_startup_nodes=["node1:7000"]
+        )
 
-    mock_cluster = mocker.MagicMock()
-    mock_cluster.ping.return_value = True
-    mock_cluster.scan_iter.return_value = iter([])
+        mock_cluster = mocker.MagicMock()
+        mock_cluster.ping.return_value = True
+        mock_cluster.scan_iter.return_value = iter([])
 
-    mocker.patch(
-      "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
-    )
-    # Patch isinstance so it returns True for the mock_cluster instance
-    original_isinstance = isinstance
-    mocker.patch(
-      "scrapy_extension.backends.redis.isinstance",
-      side_effect=lambda obj, cls: (
-        True if obj is mock_cluster else original_isinstance(obj, cls)
-      ),
-    )
-    backend = RedisBackend(settings)
-    backend.connect()
-    backend.clear_storage()
+        mocker.patch(
+            "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
+        )
+        # Patch isinstance so it returns True for the mock_cluster instance
+        original_isinstance = isinstance
+        mocker.patch(
+            "scrapy_extension.backends.redis.isinstance",
+            side_effect=lambda obj, cls: (
+                True if obj is mock_cluster else original_isinstance(obj, cls)
+            ),
+        )
+        backend = RedisBackend(settings)
+        backend.connect()
+        backend.clear_storage()
 
-    mock_cluster.scan_iter.assert_called_once_with(match="scrapy-extension:storage:*")
-    mock_cluster.flushall.assert_not_called()
+        mock_cluster.scan_iter.assert_called_once_with(
+            match="scrapy-extension:storage:*"
+        )
+        mock_cluster.flushall.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2474,57 +2515,59 @@ class TestRedisBackendCoverageGaps:
 
 
 def test_sentinel_ping_failure_wrapped_as_connection_error(mocker):
-  """SEC-6: a ``master_for(...).ping()`` failure (bad master name, unreachable
-  sentinels) is wrapped as BackendConnectionError, not surfaced as whatever
-  raw exception redis-py raises (which varies across versions)."""
-  from scrapy_extension.backends.redis import RedisBackend
-  from scrapy_extension.exceptions import BackendConnectionError
-  from scrapy_extension.settings import RedisMode, RedisSettings
+    """SEC-6: a ``master_for(...).ping()`` failure (bad master name, unreachable
+    sentinels) is wrapped as BackendConnectionError, not surfaced as whatever
+    raw exception redis-py raises (which varies across versions)."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
+    from scrapy_extension.settings import RedisMode, RedisSettings
 
-  settings = RedisSettings(
-    mode=RedisMode.SENTINEL,
-    sentinels=["sentinel-a:26379"],
-    sentinel_master_name="mymaster",
-    password="secret",
-    ssl_enabled=True,
-    ssl_cafile="/tls/ca.pem",
-  )
+    settings = RedisSettings(
+        mode=RedisMode.SENTINEL,
+        sentinels=["sentinel-a:26379"],
+        sentinel_master_name="mymaster",
+        password="secret",
+        ssl_enabled=True,
+        ssl_cafile="/tls/ca.pem",
+    )
 
-  mock_sentinel = mocker.Mock()
-  mock_master = mocker.Mock()
-  mock_master.ping.side_effect = RuntimeError("master unknown")
-  mock_sentinel.master_for.return_value = mock_master
-  mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel)
+    mock_sentinel = mocker.Mock()
+    mock_master = mocker.Mock()
+    mock_master.ping.side_effect = RuntimeError("master unknown")
+    mock_sentinel.master_for.return_value = mock_master
+    mocker.patch("scrapy_extension.backends.redis.Sentinel", return_value=mock_sentinel)
 
-  backend = RedisBackend(settings)
-  with pytest.raises(BackendConnectionError) as exc_info:
-    backend.connect()
-  assert exc_info.value.backend_type == "redis"
-  assert "master unknown" not in str(exc_info.value)
-  assert exc_info.value.__cause__ is None
+    backend = RedisBackend(settings)
+    with pytest.raises(BackendConnectionError) as exc_info:
+        backend.connect()
+    assert exc_info.value.backend_type == "redis"
+    assert "master unknown" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
 
 
 def test_cluster_ping_failure_wrapped_as_connection_error(mocker):
-  """SEC-6: a RedisCluster ping() failure is wrapped as BackendConnectionError."""
-  from scrapy_extension.backends.redis import RedisBackend
-  from scrapy_extension.exceptions import BackendConnectionError
-  from scrapy_extension.settings import RedisMode, RedisSettings
+    """SEC-6: a RedisCluster ping() failure is wrapped as BackendConnectionError."""
+    from scrapy_extension.backends.redis import RedisBackend
+    from scrapy_extension.exceptions import BackendConnectionError
+    from scrapy_extension.settings import RedisMode, RedisSettings
 
-  settings = RedisSettings(
-    mode=RedisMode.CLUSTER,
-    cluster_startup_nodes=["node-a:7000"],
-    password="secret",
-    ssl_enabled=True,
-    ssl_cafile="/tls/ca.pem",
-  )
+    settings = RedisSettings(
+        mode=RedisMode.CLUSTER,
+        cluster_startup_nodes=["node-a:7000"],
+        password="secret",
+        ssl_enabled=True,
+        ssl_cafile="/tls/ca.pem",
+    )
 
-  mock_cluster = mocker.Mock()
-  mock_cluster.ping.side_effect = RuntimeError("cluster unreachable")
-  mocker.patch("scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster)
+    mock_cluster = mocker.Mock()
+    mock_cluster.ping.side_effect = RuntimeError("cluster unreachable")
+    mocker.patch(
+        "scrapy_extension.backends.redis.RedisCluster", return_value=mock_cluster
+    )
 
-  backend = RedisBackend(settings)
-  with pytest.raises(BackendConnectionError) as exc_info:
-    backend.connect()
-  assert exc_info.value.backend_type == "redis"
-  assert "cluster unreachable" not in str(exc_info.value)
-  assert exc_info.value.__cause__ is None
+    backend = RedisBackend(settings)
+    with pytest.raises(BackendConnectionError) as exc_info:
+        backend.connect()
+    assert exc_info.value.backend_type == "redis"
+    assert "cluster unreachable" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None

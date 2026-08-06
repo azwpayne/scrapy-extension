@@ -16,87 +16,87 @@ from typing import Any
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.storage.strategies.base import StorageStrategy
 from scrapy_extension.storage.strategies.batched import (
-  DEFAULT_BATCH_THRESHOLD,
-  BatchedStorageStrategy,
+    DEFAULT_BATCH_THRESHOLD,
+    BatchedStorageStrategy,
 )
 from scrapy_extension.storage.strategies.passthrough import (
-  PassthroughStorageStrategy,
+    PassthroughStorageStrategy,
 )
 from scrapy_extension.utils._config import parse_int_setting
 
 
 class StorageStrategyType(str, Enum):
-  """Selectable storage strategies.
+    """Selectable storage strategies.
 
-  Attributes:
-      PASSTHROUGH: Default — delegates to StorageBackend unchanged (byte-identical
-          to the pre-strategy BackendPipeline behavior).
-      BATCHED: Buffers items and flushes in bulk at a threshold / on close.
-  """
+    Attributes:
+        PASSTHROUGH: Default — delegates to StorageBackend unchanged (byte-identical
+            to the pre-strategy BackendPipeline behavior).
+        BATCHED: Buffers items and flushes in bulk at a threshold / on close.
+    """
 
-  PASSTHROUGH = "passthrough"
-  BATCHED = "batched"
+    PASSTHROUGH = "passthrough"
+    BATCHED = "batched"
 
-  @classmethod
-  def _missing_(cls, value: object) -> StorageStrategyType:
-    valid = ", ".join(repr(m.value) for m in cls)
-    raise ValueError(f"{value!r} is not a valid {cls.__name__}. Valid: {valid}.")
+    @classmethod
+    def _missing_(cls, value: object) -> StorageStrategyType:
+        valid = ", ".join(repr(m.value) for m in cls)
+        raise ValueError(f"{value!r} is not a valid {cls.__name__}. Valid: {valid}.")
 
 
 def create_storage_strategy(name: str, **opts: Any) -> StorageStrategy:
-  """Build the storage strategy for ``name``.
+    """Build the storage strategy for ``name``.
 
-  Args:
-      name: Strategy name (``"passthrough"`` or ``"batched"``). Case-insensitive
-          via :class:`StorageStrategyType` lookup.
-      **opts: Strategy-specific options. ``BatchedStorageStrategy`` accepts
-          ``threshold`` (int, default 100); passthrough accepts none.
+    Args:
+        name: Strategy name (``"passthrough"`` or ``"batched"``). Case-insensitive
+            via :class:`StorageStrategyType` lookup.
+        **opts: Strategy-specific options. ``BatchedStorageStrategy`` accepts
+            ``threshold`` (int, default 100); passthrough accepts none.
 
-  Returns:
-      A concrete StorageStrategy instance.
+    Returns:
+        A concrete StorageStrategy instance.
 
-  Raises:
-      ConfigurationError: If ``name`` is not a known storage strategy.
-  """
-  try:
-    strategy_type = StorageStrategyType(name)
-  except ValueError as e:
-    msg = (
-      f"Unknown storage strategy: {name!r}. Valid: "
-      f"{', '.join(repr(m.value) for m in StorageStrategyType)}."
+    Raises:
+        ConfigurationError: If ``name`` is not a known storage strategy.
+    """
+    try:
+        strategy_type = StorageStrategyType(name)
+    except ValueError as e:
+        msg = (
+            f"Unknown storage strategy: {name!r}. Valid: "
+            f"{', '.join(repr(m.value) for m in StorageStrategyType)}."
+        )
+        raise ConfigurationError(
+            msg, setting_name="storage_strategy", setting_value=name
+        ) from e
+
+    if strategy_type is StorageStrategyType.PASSTHROUGH:
+        return PassthroughStorageStrategy()
+    if strategy_type is StorageStrategyType.BATCHED:
+        # R25-C: validate via parse_int_setting so a float threshold (e.g. 50.9) is
+        # rejected with ConfigurationError instead of silently truncating to 50
+        # (which subverted BatchedStorageStrategy.__init__'s R21-D strict-int guard)
+        # and bad types raise the codebase-standard ConfigurationError instead of a
+        # bare TypeError/ValueError.
+        threshold = parse_int_setting(
+            opts.get("threshold", DEFAULT_BATCH_THRESHOLD), "threshold", minimum=1
+        )
+        # Risk 2: thread max_buffer_age_s + monitor through to the strategy so
+        # the crash-before-flush loss window can be bounded from settings.
+        kwargs: dict[str, Any] = {"threshold": threshold}
+        max_pending = opts.get("max_pending")
+        if max_pending is not None:
+            kwargs["max_pending"] = parse_int_setting(
+                max_pending,
+                "max_pending",
+                minimum=threshold,
+            )
+        max_buffer_age_s = opts.get("max_buffer_age_s")
+        if max_buffer_age_s is not None:
+            kwargs["max_buffer_age_s"] = max_buffer_age_s
+        monitor = opts.get("monitor")
+        if monitor is not None:
+            kwargs["monitor"] = monitor
+        return BatchedStorageStrategy(**kwargs)
+    raise ConfigurationError(  # pragma: no cover
+        f"Unknown storage strategy: {strategy_type!r}"
     )
-    raise ConfigurationError(
-      msg, setting_name="storage_strategy", setting_value=name
-    ) from e
-
-  if strategy_type is StorageStrategyType.PASSTHROUGH:
-    return PassthroughStorageStrategy()
-  if strategy_type is StorageStrategyType.BATCHED:
-    # R25-C: validate via parse_int_setting so a float threshold (e.g. 50.9) is
-    # rejected with ConfigurationError instead of silently truncating to 50
-    # (which subverted BatchedStorageStrategy.__init__'s R21-D strict-int guard)
-    # and bad types raise the codebase-standard ConfigurationError instead of a
-    # bare TypeError/ValueError.
-    threshold = parse_int_setting(
-      opts.get("threshold", DEFAULT_BATCH_THRESHOLD), "threshold", minimum=1
-    )
-    # Risk 2: thread max_buffer_age_s + monitor through to the strategy so
-    # the crash-before-flush loss window can be bounded from settings.
-    kwargs: dict[str, Any] = {"threshold": threshold}
-    max_pending = opts.get("max_pending")
-    if max_pending is not None:
-      kwargs["max_pending"] = parse_int_setting(
-        max_pending,
-        "max_pending",
-        minimum=threshold,
-      )
-    max_buffer_age_s = opts.get("max_buffer_age_s")
-    if max_buffer_age_s is not None:
-      kwargs["max_buffer_age_s"] = max_buffer_age_s
-    monitor = opts.get("monitor")
-    if monitor is not None:
-      kwargs["monitor"] = monitor
-    return BatchedStorageStrategy(**kwargs)
-  raise ConfigurationError(  # pragma: no cover
-    f"Unknown storage strategy: {strategy_type!r}"
-  )

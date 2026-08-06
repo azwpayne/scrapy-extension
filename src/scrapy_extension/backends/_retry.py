@@ -36,30 +36,30 @@ _MAX_BACKOFF_S: float = 3600.0
 
 
 def compute_full_jitter_backoff(attempt: int, base_delay: float) -> float:
-  """Full-jitter exponential backoff sleep duration (AWS Architecture Blog).
+    """Full-jitter exponential backoff sleep duration (AWS Architecture Blog).
 
-  ``delay = base_delay * 2**attempt``; full jitter returns ``uniform(0, delay)``.
-  Full (not "equal"/"decorrelated") jitter prevents thundering herd when many
-  workers retry simultaneously after a coordinated outage (e.g. Redis failover).
-  The caller sleeps for the returned value.
+    ``delay = base_delay * 2**attempt``; full jitter returns ``uniform(0, delay)``.
+    Full (not "equal"/"decorrelated") jitter prevents thundering herd when many
+    workers retry simultaneously after a coordinated outage (e.g. Redis failover).
+    The caller sleeps for the returned value.
 
-  The computed ``delay`` is capped at :data:`_MAX_BACKOFF_S` (R21-C) so a huge
-  finite ``base_delay`` cannot overflow to ``inf`` and trigger an
-  ``OverflowError`` from ``time.sleep``. Normal configs are unaffected.
+    The computed ``delay`` is capped at :data:`_MAX_BACKOFF_S` (R21-C) so a huge
+    finite ``base_delay`` cannot overflow to ``inf`` and trigger an
+    ``OverflowError`` from ``time.sleep``. Normal configs are unaffected.
 
-  Args:
-      attempt: 0-based just-failed attempt index (0 = first failure → the first
-          retry follows this sleep).
-      base_delay: Caller-owned base delay in seconds. ConnectionManager passes
-          its ``retry_delay`` setting; bounded backend policies may pass their
-          own validated/fixed value.
+    Args:
+        attempt: 0-based just-failed attempt index (0 = first failure → the first
+            retry follows this sleep).
+        base_delay: Caller-owned base delay in seconds. ConnectionManager passes
+            its ``retry_delay`` setting; bounded backend policies may pass their
+            own validated/fixed value.
 
-  Returns:
-      Seconds to sleep — ``uniform(0, min(base_delay * 2**attempt, _MAX_BACKOFF_S))``.
-      Always non-negative and finite; 0 on the first attempt when ``base_delay`` is 0.
-  """
-  delay = min(base_delay * (2**attempt), _MAX_BACKOFF_S)
-  # nosec B311: random.uniform is intentional full-jitter backoff, not a
-  # cryptographic primitive. Switching to secrets would remove the bounded-
-  # range API we rely on without improving security.
-  return random.uniform(0, delay)  # nosec B311 - jitter, not cryptographic
+    Returns:
+        Seconds to sleep — ``uniform(0, min(base_delay * 2**attempt, _MAX_BACKOFF_S))``.
+        Always non-negative and finite; 0 on the first attempt when ``base_delay`` is 0.
+    """
+    delay = min(base_delay * (2**attempt), _MAX_BACKOFF_S)
+    # random.uniform is intentional full-jitter backoff, not a
+    # cryptographic primitive. Switching to secrets would remove the bounded-
+    # range API we rely on without improving security.
+    return random.uniform(0, delay)  # nosec B311

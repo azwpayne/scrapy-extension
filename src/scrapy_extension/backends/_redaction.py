@@ -21,45 +21,45 @@ __all__ = ["_RedactedStr"]
 
 
 class _RedactedStr(str):
-  """``str`` subclass that hides its value in ``repr()``.
+    """``str`` subclass that hides its value in ``repr()``.
 
-  The str VALUE is the real secret so client libraries receive a usable
-  string (``str(instance)`` returns the secret, indexing works, equality
-  works). Only ``repr(instance)`` returns the mask, so ``repr(config_dict)``
-  and repr-based local-variable dumps don't reveal the raw credential while
-  the wrapper is retained.
+    The str VALUE is the real secret so client libraries receive a usable
+    string (``str(instance)`` returns the secret, indexing works, equality
+    works). Only ``repr(instance)`` returns the mask, so ``repr(config_dict)``
+    and repr-based local-variable dumps don't reveal the raw credential while
+    the wrapper is retained.
 
-  Note: this is defense-in-depth against accidental repr logging/capture,
-  NOT against ordinary string formatting, serialization, or an adversary who
-  can read process memory. The raw value is still reachable via
-  ``str(instance)`` or by indexing.
-  """
+    Note: this is defense-in-depth against accidental repr logging/capture,
+    NOT against ordinary string formatting, serialization, or an adversary who
+    can read process memory. The raw value is still reachable via
+    ``str(instance)`` or by indexing.
+    """
 
-  __slots__ = ()
+    __slots__ = ()
 
-  def __repr__(self) -> str:
-    return "<redacted>"
+    def __repr__(self) -> str:
+        return "<redacted>"
 
 
 def _redact(value: Any) -> Any:
-  """Wrap ``value`` in ``_RedactedStr`` if it is a non-empty string.
+    """Wrap ``value`` in ``_RedactedStr`` if it is a non-empty string.
 
-  Idempotent: passing an already-redacted value returns it unchanged.
-  Non-string / empty values pass through untouched so callers can use this
-  unconditionally on the output of ``secret_value(...)`` without special-
-  casing unset (``None``) or empty credentials.
+    Idempotent: passing an already-redacted value returns it unchanged.
+    Non-string / empty values pass through untouched so callers can use this
+    unconditionally on the output of ``secret_value(...)`` without special-
+    casing unset (``None``) or empty credentials.
 
-  Args:
-      value: The value to wrap (typically ``secret_value(self.config.password)``).
+    Args:
+        value: The value to wrap (typically ``secret_value(self.config.password)``).
 
-  Returns:
-      A ``_RedactedStr`` wrapping ``value`` when ``value`` is a non-empty
-      ``str``; otherwise ``value`` unchanged.
-  """
-  if isinstance(value, _RedactedStr):
-    # Already redacted — return the SAME object (referential idempotency,
-    # so _redact(_redact(x)) is _redact(x), matching the docstring claim).
+    Returns:
+        A ``_RedactedStr`` wrapping ``value`` when ``value`` is a non-empty
+        ``str``; otherwise ``value`` unchanged.
+    """
+    if isinstance(value, _RedactedStr):
+        # Already redacted — return the SAME object (referential idempotency,
+        # so _redact(_redact(x)) is _redact(x), matching the docstring claim).
+        return value
+    if isinstance(value, str) and value:
+        return _RedactedStr(value)
     return value
-  if isinstance(value, str) and value:
-    return _RedactedStr(value)
-  return value

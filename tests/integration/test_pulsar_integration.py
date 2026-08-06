@@ -29,35 +29,35 @@ import uuid
 import pytest
 
 pytestmark = [
-  pytest.mark.integration,
-  pytest.mark.skipif(
-    not os.environ.get("SCRAPY_TEST_PULSAR_URL"),
-    reason=(
-      "Set SCRAPY_TEST_PULSAR_URL (e.g. pulsar://localhost:6650) to run "
-      "Pulsar integration tests against a live broker."
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("SCRAPY_TEST_PULSAR_URL"),
+        reason=(
+            "Set SCRAPY_TEST_PULSAR_URL (e.g. pulsar://localhost:6650) to run "
+            "Pulsar integration tests against a live broker."
+        ),
     ),
-  ),
 ]
 
 
 def test_push_pop_round_trip() -> None:
-  """Real-broker round-trip: push → pop (queue ABC, Shared subscription)."""
-  from scrapy_extension.backends.pulsar import PulsarBackend
-  from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
+    """Real-broker round-trip: push → pop (queue ABC, Shared subscription)."""
+    from scrapy_extension.backends.pulsar import PulsarBackend
+    from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
 
-  settings = PulsarSettings(
-    mode=PulsarMode.STANDALONE,
-    service_url=os.environ["SCRAPY_TEST_PULSAR_URL"],
-    subscription_name=f"inttest-{uuid.uuid4().hex[:8]}",
-  )
-  backend = PulsarBackend(settings)
-  backend.connect()
-  try:
-    topic = f"inttest-{uuid.uuid4().hex[:8]}"
-    payload = b'{"v":1}'
-    backend.push(topic, payload)
-    # pop blocks on the timeout param for up to 10s for the message to arrive.
-    popped = backend.pop(topic, timeout=10.0)
-    assert popped == payload
-  finally:
-    backend.disconnect()
+    settings = PulsarSettings(
+        mode=PulsarMode.STANDALONE,
+        service_url=os.environ["SCRAPY_TEST_PULSAR_URL"],
+        subscription_name=f"inttest-{uuid.uuid4().hex[:8]}",
+    )
+    backend = PulsarBackend(settings)
+    backend.connect()
+    try:
+        topic = f"inttest-{uuid.uuid4().hex[:8]}"
+        payload = b'{"v":1}'
+        backend.push(topic, payload)
+        # pop blocks on the timeout param for up to 10s for the message to arrive.
+        popped = backend.pop(topic, timeout=10.0)
+        assert popped == payload
+    finally:
+        backend.disconnect()

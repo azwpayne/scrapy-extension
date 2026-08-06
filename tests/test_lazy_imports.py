@@ -175,9 +175,7 @@ class TestAllSettingsClassesLazy:
     ]
 
     @pytest.mark.parametrize("settings_cls,mode_cls", SETTINGS_PAIRS)
-    def test_settings_pair_importable(
-        self, settings_cls: str, mode_cls: str
-    ) -> None:
+    def test_settings_pair_importable(self, settings_cls: str, mode_cls: str) -> None:
         """Each (Settings, Mode) pair should be importable."""
         s_cls = getattr(scrapy_extension, settings_cls)
         m_cls = getattr(scrapy_extension, mode_cls)
@@ -421,19 +419,47 @@ class TestBackendImportErrorMessage:
     """
 
     BACKEND_MODULES = [
-        ("scrapy_extension.backends.redis", "redis", "pip install scrapy-extension[redis]"),
-        ("scrapy_extension.backends.mongodb", "pymongo", "pip install scrapy-extension[mongodb]"),
-        ("scrapy_extension.backends.kafka", "kafka", "pip install scrapy-extension[kafka]"),
-        ("scrapy_extension.backends.rabbitmq", "pika", "pip install scrapy-extension[rabbitmq]"),
+        (
+            "scrapy_extension.backends.redis",
+            "redis",
+            "pip install scrapy-extension[redis]",
+        ),
+        (
+            "scrapy_extension.backends.mongodb",
+            "pymongo",
+            "pip install scrapy-extension[mongodb]",
+        ),
+        (
+            "scrapy_extension.backends.kafka",
+            "kafka",
+            "pip install scrapy-extension[kafka]",
+        ),
+        (
+            "scrapy_extension.backends.rabbitmq",
+            "pika",
+            "pip install scrapy-extension[rabbitmq]",
+        ),
         (
             "scrapy_extension.backends.elasticsearch",
             "elasticsearch",
             "pip install scrapy-extension[elasticsearch]",
         ),
-        ("scrapy_extension.backends.pulsar", "pulsar", "pip install scrapy-extension[pulsar]"),
-        ("scrapy_extension.backends.memcached", "pymemcache", "pip install scrapy-extension[memcached]"),
+        (
+            "scrapy_extension.backends.pulsar",
+            "pulsar",
+            "pip install scrapy-extension[pulsar]",
+        ),
+        (
+            "scrapy_extension.backends.memcached",
+            "pymemcache",
+            "pip install scrapy-extension[memcached]",
+        ),
         ("scrapy_extension.backends.sqs", "boto3", "pip install scrapy-extension[sqs]"),
-        ("scrapy_extension.backends.dynamodb", "boto3", "pip install scrapy-extension[dynamodb]"),
+        (
+            "scrapy_extension.backends.dynamodb",
+            "boto3",
+            "pip install scrapy-extension[dynamodb]",
+        ),
         # Note: RocketMQ uses deferred imports inside connect(), not a
         # module-level guard. Its ImportError path is tested in
         # test_rocketmq_backend.py::test_connect_*_error.
@@ -482,399 +508,394 @@ class TestBackendImportErrorMessage:
 
 
 class TestVersionFromPackageMetadata:
-  """R26-D1: __version__ must come from package metadata, not hardcoded.
+    """R26-D1: __version__ must come from package metadata, not hardcoded.
 
-  Previously ``__version__ = "0.1.0"`` was hardcoded in ``__init__.py``.
-  Bumping the version in ``pyproject.toml`` without bumping ``__init__.py``
-  produced a silent drift — ``scrapy_extension.__version__`` said one
-  thing, ``pip show scrapy-extension`` said another. The fix reads from
-  ``importlib.metadata`` so there's a single source of truth.
-  """
+    Previously ``__version__ = "0.1.0"`` was hardcoded in ``__init__.py``.
+    Bumping the version in ``pyproject.toml`` without bumping ``__init__.py``
+    produced a silent drift — ``scrapy_extension.__version__`` said one
+    thing, ``pip show scrapy-extension`` said another. The fix reads from
+    ``importlib.metadata`` so there's a single source of truth.
+    """
 
-  def test_version_is_non_empty_string(self):
-    """__version__ resolves to a non-empty string in all environments."""
-    assert isinstance(scrapy_extension.__version__, str)
-    assert scrapy_extension.__version__, "version must not be empty"
+    def test_version_is_non_empty_string(self):
+        """__version__ resolves to a non-empty string in all environments."""
+        assert isinstance(scrapy_extension.__version__, str)
+        assert scrapy_extension.__version__, "version must not be empty"
 
-  def test_version_matches_installed_metadata(self):
-    """When installed, __version__ matches the package's recorded version."""
-    from importlib.metadata import PackageNotFoundError, version
+    def test_version_matches_installed_metadata(self):
+        """When installed, __version__ matches the package's recorded version."""
+        from importlib.metadata import PackageNotFoundError, version
 
-    try:
-      expected = version("scrapy-extension")
-    except PackageNotFoundError:
-      pytest.skip("package not installed; dev fallback path")
-    assert scrapy_extension.__version__ == expected
+        try:
+            expected = version("scrapy-extension")
+        except PackageNotFoundError:
+            pytest.skip("package not installed; dev fallback path")
+        assert scrapy_extension.__version__ == expected
 
 
 class TestBackendsWildcardImport:
-  """R36-A1: scrapy_extension.backends.__all__ must list every backend.
+    """R36-A1: scrapy_extension.backends.__all__ must list every backend.
 
-  Previously __all__ listed 3 of 6 backend classes (omitted
-  MongoDBBackend, KafkaBackend, ElasticSearchBackend) while
-  _BACKEND_MODULES had all 6. ``from scrapy_extension.backends import *``
-  silently missed the 3 unlisted names; users had to know to use
-  explicit imports. The fix makes __all__ match _BACKEND_MODULES.
-  """
+    Previously __all__ listed 3 of 6 backend classes (omitted
+    MongoDBBackend, KafkaBackend, ElasticSearchBackend) while
+    _BACKEND_MODULES had all 6. ``from scrapy_extension.backends import *``
+    silently missed the 3 unlisted names; users had to know to use
+    explicit imports. The fix makes __all__ match _BACKEND_MODULES.
+    """
 
-  def test_all_lists_every_backend_module(self):
-    """__all__ must include every key from _BACKEND_MODULES."""
-    from scrapy_extension.backends import _BACKEND_MODULES, __all__
+    def test_all_lists_every_backend_module(self):
+        """__all__ must include every key from _BACKEND_MODULES."""
+        from scrapy_extension.backends import _BACKEND_MODULES, __all__
 
-    missing = set(_BACKEND_MODULES) - set(__all__)
-    assert not missing, f"__all__ missing backend names: {sorted(missing)}"
+        missing = set(_BACKEND_MODULES) - set(__all__)
+        assert not missing, f"__all__ missing backend names: {sorted(missing)}"
 
-  def test_wildcard_import_resolves_all_backend_names(self):
-    """All backend names in __all__ must resolve via PEP 562 __getattr__."""
-    import scrapy_extension.backends as backends
+    def test_wildcard_import_resolves_all_backend_names(self):
+        """All backend names in __all__ must resolve via PEP 562 __getattr__."""
+        import scrapy_extension.backends as backends
 
-    for name in (
-      "RedisBackend",
-      "MongoDBBackend",
-      "KafkaBackend",
-      "RabbitMQBackend",
-      "ElasticSearchBackend",
-      "RocketMQBackend",
-    ):
-      assert name in backends.__all__, name
-      cls = getattr(backends, name)
-      assert isinstance(cls, type), f"{name} did not resolve to a class"
+        for name in (
+            "RedisBackend",
+            "MongoDBBackend",
+            "KafkaBackend",
+            "RabbitMQBackend",
+            "ElasticSearchBackend",
+            "RocketMQBackend",
+        ):
+            assert name in backends.__all__, name
+            cls = getattr(backends, name)
+            assert isinstance(cls, type), f"{name} did not resolve to a class"
 
 
 class TestBaseModuleAll:
-  """R23-D3: scrapy_extension.backends.base must declare __all__.
+    """R23-D3: scrapy_extension.backends.base must declare __all__.
 
-  Without __all__, ``from scrapy_extension.backends.base import *`` leaks
-  every non-underscored symbol including package-internal helpers like
-  ``secret_value`` and ``KEY_NAME_PATTERN``. The fix lists only the 7
-  user-facing ABCs / serializer / enum as the public surface.
-  """
+    Without __all__, ``from scrapy_extension.backends.base import *`` leaks
+    every non-underscored symbol including package-internal helpers like
+    ``secret_value`` and ``KEY_NAME_PATTERN``. The fix lists only the 7
+    user-facing ABCs / serializer / enum as the public surface.
+    """
 
-  def test_all_lists_public_surface(self):
-    """__all__ must list the 7 public ABCs / serializer / enum."""
-    from scrapy_extension.backends import base
+    def test_all_lists_public_surface(self):
+        """__all__ must list the 7 public ABCs / serializer / enum."""
+        from scrapy_extension.backends import base
 
-    expected = {
-      "Backend",
-      "BackendType",
-      "JSONSerializer",
-      "QueueBackend",
-      "Serializer",
-      "SetBackend",
-      "StorageBackend",
-    }
-    assert set(base.__all__) == expected
+        expected = {
+            "Backend",
+            "BackendType",
+            "JSONSerializer",
+            "QueueBackend",
+            "Serializer",
+            "SetBackend",
+            "StorageBackend",
+        }
+        assert set(base.__all__) == expected
 
-  def test_all_names_resolve_to_objects(self):
-    """Every name in __all__ must resolve to an attribute on the module."""
-    from scrapy_extension.backends import base
+    def test_all_names_resolve_to_objects(self):
+        """Every name in __all__ must resolve to an attribute on the module."""
+        from scrapy_extension.backends import base
 
-    for name in base.__all__:
-      assert hasattr(base, name), f"__all__ lists {name!r} but module has no such attr"
+        for name in base.__all__:
+            assert hasattr(base, name), (
+                f"__all__ lists {name!r} but module has no such attr"
+            )
 
-  def test_helpers_not_in_all(self):
-    """Package-internal helpers must not be in __all__ even if non-underscored.
+    def test_helpers_not_in_all(self):
+        """Package-internal helpers must not be in __all__ even if non-underscored.
 
-  ``secret_value`` and ``KEY_NAME_PATTERN`` lack leading underscores but
-  are package-internal (used by backends to unwrap SecretStr / share
-  validation). End users should not depend on them — they're not in
-  __all__ and may be renamed in a future refactor.
-  """
-    from scrapy_extension.backends import base
+        ``secret_value`` and ``KEY_NAME_PATTERN`` lack leading underscores but
+        are package-internal (used by backends to unwrap SecretStr / share
+        validation). End users should not depend on them — they're not in
+        __all__ and may be renamed in a future refactor.
+        """
+        from scrapy_extension.backends import base
 
-    assert "secret_value" not in base.__all__
-    assert "KEY_NAME_PATTERN" not in base.__all__
+        assert "secret_value" not in base.__all__
+        assert "KEY_NAME_PATTERN" not in base.__all__
 
 
 class TestLazyImportRealBugSurfacesChain:
-  """R14-H: a real bug inside a backend module must surface its real chain, NOT
-  the misleading "Install with: pip install scrapy-extension[X]" hint.
+    """R14-H: a real bug inside a backend module must surface its real chain, NOT
+    the misleading "Install with: pip install scrapy-extension[X]" hint.
 
-  Background: ``__getattr__`` in scrapy_extension/__init__.py and
-  scrapy_extension/backends/__init__.py previously wrapped ANY ImportError as
-  the install hint — even when the optional dep WAS installed but a genuine
-  bug inside the backend module raised ImportError. That hid the real
-  traceback from the user, who was told to ``pip install`` a dep they already
-  had. The fix narrows the wrap: only re-wrap when the failure is a genuine
-  missing-optional-dep (``ModuleNotFoundError`` whose ``name`` is the
-  backend's documented optional-dep module); otherwise re-raise the original
-  so the real chain surfaces.
-  """
-
-  def _force_non_dep_import_error(self, mocker, module_path: str):
-    """Patch ``importlib.import_module`` so that *only* ``module_path`` raises
-    a non-ModuleNotFoundError ImportError (simulating a real bug inside the
-    backend module). Other modules import normally.
-
-    Returns the (real) ImportError instance that will be raised so the test
-    can assert on its identity / message.
+    Background: ``__getattr__`` in scrapy_extension/__init__.py and
+    scrapy_extension/backends/__init__.py previously wrapped ANY ImportError as
+    the install hint — even when the optional dep WAS installed but a genuine
+    bug inside the backend module raised ImportError. That hid the real
+    traceback from the user, who was told to ``pip install`` a dep they already
+    had. The fix narrows the wrap: only re-wrap when the failure is a genuine
+    missing-optional-dep (``ModuleNotFoundError`` whose ``name`` is the
+    backend's documented optional-dep module); otherwise re-raise the original
+    so the real chain surfaces.
     """
-    import importlib
 
-    real_import = importlib.import_module
-    real_bug = ImportError("real bug inside the backend module")
+    def _force_non_dep_import_error(self, mocker, module_path: str):
+        """Patch ``importlib.import_module`` so that *only* ``module_path`` raises
+        a non-ModuleNotFoundError ImportError (simulating a real bug inside the
+        backend module). Other modules import normally.
 
-    def fake_import(name, package=None):
-      if name == module_path:
-        raise real_bug
-      return real_import(name, package)
+        Returns the (real) ImportError instance that will be raised so the test
+        can assert on its identity / message.
+        """
+        import importlib
 
-    mocker.patch.object(importlib, "import_module", side_effect=fake_import)
-    return real_bug
+        real_import = importlib.import_module
+        real_bug = ImportError("real bug inside the backend module")
 
-  @pytest.mark.parametrize(
-    "attr_name,module_path",
-    [
-      # Top-level package __getattr__ path
-      ("RedisBackend", "scrapy_extension.backends.redis"),
-      ("MongoDBBackend", "scrapy_extension.backends.mongodb"),
-      ("KafkaBackend", "scrapy_extension.backends.kafka"),
-      ("RabbitMQBackend", "scrapy_extension.backends.rabbitmq"),
-      ("ElasticSearchBackend", "scrapy_extension.backends.elasticsearch"),
-      ("PulsarBackend", "scrapy_extension.backends.pulsar"),
-      ("SqsBackend", "scrapy_extension.backends.sqs"),
-      ("DynamoDBBackend", "scrapy_extension.backends.dynamodb"),
-      ("MemcachedBackend", "scrapy_extension.backends.memcached"),
-    ],
-  )
-  def test_top_level_real_bug_surfaces_not_install_hint(
-    self, mocker, attr_name: str, module_path: str
-  ):
-    """A non-ModuleNotFoundError from the backend module must surface the real
-    chain, NOT be re-wrapped as the install hint.
-    """
-    import sys
+        def fake_import(name, package=None):
+            if name == module_path:
+                raise real_bug
+            return real_import(name, package)
 
-    # Ensure the backend module isn't cached so importlib.import_module runs.
-    # R14-G flake fix: RESTORE the popped module in finally — leaving it absent
-    # from sys.modules breaks later tests that ``mocker.patch`` the backend
-    # module's client class (the patch re-imports a FRESH module object while
-    # the ``MongoDBBackend``/``KafkaBackend`` classes bound at those tests'
-    # import time still reference the OLD module's client, so the patch never
-    # applies and the real backend connects — the order-dependent flake).
-    cached = sys.modules.pop(module_path, None)
-    try:
-      real_bug = self._force_non_dep_import_error(mocker, module_path)
+        mocker.patch.object(importlib, "import_module", side_effect=fake_import)
+        return real_bug
 
-      import scrapy_extension
+    @pytest.mark.parametrize(
+        "attr_name,module_path",
+        [
+            # Top-level package __getattr__ path
+            ("RedisBackend", "scrapy_extension.backends.redis"),
+            ("MongoDBBackend", "scrapy_extension.backends.mongodb"),
+            ("KafkaBackend", "scrapy_extension.backends.kafka"),
+            ("RabbitMQBackend", "scrapy_extension.backends.rabbitmq"),
+            ("ElasticSearchBackend", "scrapy_extension.backends.elasticsearch"),
+            ("PulsarBackend", "scrapy_extension.backends.pulsar"),
+            ("SqsBackend", "scrapy_extension.backends.sqs"),
+            ("DynamoDBBackend", "scrapy_extension.backends.dynamodb"),
+            ("MemcachedBackend", "scrapy_extension.backends.memcached"),
+        ],
+    )
+    def test_top_level_real_bug_surfaces_not_install_hint(
+        self, mocker, attr_name: str, module_path: str
+    ):
+        """A non-ModuleNotFoundError from the backend module must surface the real
+        chain, NOT be re-wrapped as the install hint.
+        """
+        import sys
 
-      with pytest.raises(ImportError) as exc_info:
-        getattr(scrapy_extension, attr_name)
+        # Ensure the backend module isn't cached so importlib.import_module runs.
+        # R14-G flake fix: RESTORE the popped module in finally — leaving it absent
+        # from sys.modules breaks later tests that ``mocker.patch`` the backend
+        # module's client class (the patch re-imports a FRESH module object while
+        # the ``MongoDBBackend``/``KafkaBackend`` classes bound at those tests'
+        # import time still reference the OLD module's client, so the patch never
+        # applies and the real backend connects — the order-dependent flake).
+        cached = sys.modules.pop(module_path, None)
+        try:
+            real_bug = self._force_non_dep_import_error(mocker, module_path)
 
-      # The surfaced error must be the ORIGINAL ImportError, not the install hint.
-      assert exc_info.value is real_bug, (
-        f"Expected the original ImportError to surface (chain preserved), "
-        f"but got: {exc_info.value!r}"
-      )
-      assert "pip install scrapy-extension" not in str(exc_info.value), (
-        f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
-      )
-    finally:
-      if cached is not None:
-        sys.modules[module_path] = cached
+            import scrapy_extension
 
-  @pytest.mark.parametrize(
-    "attr_name,module_path",
-    [
-      ("RedisBackend", "scrapy_extension.backends.redis"),
-      ("MongoDBBackend", "scrapy_extension.backends.mongodb"),
-      ("KafkaBackend", "scrapy_extension.backends.kafka"),
-    ],
-  )
-  def test_backends_pkg_real_bug_surfaces_not_install_hint(
-    self, mocker, attr_name: str, module_path: str
-  ):
-    """Same invariant for scrapy_extension.backends.__getattr__."""
-    import sys
+            with pytest.raises(ImportError) as exc_info:
+                getattr(scrapy_extension, attr_name)
 
-    # R14-G flake fix: restore the popped module in finally (see
-    # test_top_level_real_bug_surfaces_not_install_hint for the rationale).
-    cached = sys.modules.pop(module_path, None)
-    try:
-      real_bug = self._force_non_dep_import_error(mocker, module_path)
+            # The surfaced error must be the ORIGINAL ImportError, not the install hint.
+            assert exc_info.value is real_bug, (
+                f"Expected the original ImportError to surface (chain preserved), "
+                f"but got: {exc_info.value!r}"
+            )
+            assert "pip install scrapy-extension" not in str(exc_info.value), (
+                f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
+            )
+        finally:
+            if cached is not None:
+                sys.modules[module_path] = cached
 
-      import scrapy_extension.backends as backends_pkg
+    @pytest.mark.parametrize(
+        "attr_name,module_path",
+        [
+            ("RedisBackend", "scrapy_extension.backends.redis"),
+            ("MongoDBBackend", "scrapy_extension.backends.mongodb"),
+            ("KafkaBackend", "scrapy_extension.backends.kafka"),
+        ],
+    )
+    def test_backends_pkg_real_bug_surfaces_not_install_hint(
+        self, mocker, attr_name: str, module_path: str
+    ):
+        """Same invariant for scrapy_extension.backends.__getattr__."""
+        import sys
 
-      with pytest.raises(ImportError) as exc_info:
-        getattr(backends_pkg, attr_name)
+        # R14-G flake fix: restore the popped module in finally (see
+        # test_top_level_real_bug_surfaces_not_install_hint for the rationale).
+        cached = sys.modules.pop(module_path, None)
+        try:
+            real_bug = self._force_non_dep_import_error(mocker, module_path)
 
-      assert exc_info.value is real_bug, (
-        f"Expected original ImportError to surface, got: {exc_info.value!r}"
-      )
-      assert "pip install scrapy-extension" not in str(exc_info.value), (
-        f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
-      )
-    finally:
-      if cached is not None:
-        sys.modules[module_path] = cached
+            import scrapy_extension.backends as backends_pkg
 
-  def test_missing_optional_dep_still_gives_install_hint_top_level(
-    self, mocker
-  ):
-    """Sanity: when the optional dep is genuinely missing, the install hint IS
-    still produced (regression guard — we must not break the helpful path).
-    """
-    import importlib
-    import sys
+            with pytest.raises(ImportError) as exc_info:
+                getattr(backends_pkg, attr_name)
 
-    module_path = "scrapy_extension.backends.redis"
-    # R14-G flake fix: restore the popped module in finally (see
-    # test_top_level_real_bug_surfaces_not_install_hint for the rationale).
-    cached = sys.modules.pop(module_path, None)
-    try:
-      real_import = importlib.import_module
-      missing = ModuleNotFoundError("No module named 'redis'", name="redis")
+            assert exc_info.value is real_bug, (
+                f"Expected original ImportError to surface, got: {exc_info.value!r}"
+            )
+            assert "pip install scrapy-extension" not in str(exc_info.value), (
+                f"Real bug was misleadingly wrapped as install hint: {exc_info.value}"
+            )
+        finally:
+            if cached is not None:
+                sys.modules[module_path] = cached
 
-      def fake_import(name, package=None):
-        if name == module_path:
-          raise missing
-        return real_import(name, package)
+    def test_missing_optional_dep_still_gives_install_hint_top_level(self, mocker):
+        """Sanity: when the optional dep is genuinely missing, the install hint IS
+        still produced (regression guard — we must not break the helpful path).
+        """
+        import importlib
+        import sys
 
-      mocker.patch.object(importlib, "import_module", side_effect=fake_import)
+        module_path = "scrapy_extension.backends.redis"
+        # R14-G flake fix: restore the popped module in finally (see
+        # test_top_level_real_bug_surfaces_not_install_hint for the rationale).
+        cached = sys.modules.pop(module_path, None)
+        try:
+            real_import = importlib.import_module
+            missing = ModuleNotFoundError("No module named 'redis'", name="redis")
 
-      import scrapy_extension
+            def fake_import(name, package=None):
+                if name == module_path:
+                    raise missing
+                return real_import(name, package)
 
-      with pytest.raises(ImportError) as exc_info:
-        getattr(scrapy_extension, "RedisBackend")
+            mocker.patch.object(importlib, "import_module", side_effect=fake_import)
 
-      assert "pip install scrapy-extension[redis]" in str(exc_info.value)
-      # And the original is preserved in the chain.
-      assert exc_info.value.__cause__ is missing or exc_info.value.__cause__ is None
-    finally:
-      if cached is not None:
-        sys.modules[module_path] = cached
+            import scrapy_extension
+
+            with pytest.raises(ImportError) as exc_info:
+                getattr(scrapy_extension, "RedisBackend")
+
+            assert "pip install scrapy-extension[redis]" in str(exc_info.value)
+            # And the original is preserved in the chain.
+            assert (
+                exc_info.value.__cause__ is missing or exc_info.value.__cause__ is None
+            )
+        finally:
+            if cached is not None:
+                sys.modules[module_path] = cached
 
 
 class TestAllModulesInvariants:
-  """R39-A1: every module with __all__ must have its names actually resolve.
+    """R39-A1: every module with __all__ must have its names actually resolve.
 
-  R36 closed backends/__init__.py drift; R37 closed base.py. R39 sweeps
-  the remaining 4 modules (scrapy_extension/__init__, settings/__init__,
-  exceptions/__init__, utils/__init__) with the same invariant: every
-  name in __all__ must resolve to a real attribute on the module. This
-  catches drift the moment a contributor adds a name to __all__ without
-  the corresponding import (or vice versa).
-  """
+    R36 closed backends/__init__.py drift; R37 closed base.py. R39 sweeps
+    the remaining 4 modules (scrapy_extension/__init__, settings/__init__,
+    exceptions/__init__, utils/__init__) with the same invariant: every
+    name in __all__ must resolve to a real attribute on the module. This
+    catches drift the moment a contributor adds a name to __all__ without
+    the corresponding import (or vice versa).
+    """
 
-  @pytest.mark.parametrize(
-    "module_path",
-    [
-      "scrapy_extension",
-      "scrapy_extension.settings",
-      "scrapy_extension.exceptions",
-      "scrapy_extension.utils",
-    ],
-  )
-  def test_all_names_resolve(self, module_path):
-    """Every name in __all__ must resolve to an attribute on the module."""
-    import importlib
+    @pytest.mark.parametrize(
+        "module_path",
+        [
+            "scrapy_extension",
+            "scrapy_extension.settings",
+            "scrapy_extension.exceptions",
+            "scrapy_extension.utils",
+        ],
+    )
+    def test_all_names_resolve(self, module_path):
+        """Every name in __all__ must resolve to an attribute on the module."""
+        import importlib
 
-    mod = importlib.import_module(module_path)
-    for name in mod.__all__:
-      assert hasattr(mod, name), (
-        f"{module_path}.__all__ lists {name!r} but module has no such attribute"
-      )
+        mod = importlib.import_module(module_path)
+        for name in mod.__all__:
+            assert hasattr(mod, name), (
+                f"{module_path}.__all__ lists {name!r} but module has no such attribute"
+            )
 
 
 class TestBackendsGetattrInstallHint:
-  """#7: backends/__init__.py __getattr__ install-hint path (lines 109-114).
+    """#7: backends/__init__.py __getattr__ install-hint path (lines 109-114).
 
-  The existing suite covers the real-bug path (a non-ModuleNotFoundError
-  surfaces the original via ``backends_pkg.__getattr__``) but NOT the
-  genuine-missing-dep path through the BACKENDS package __getattr__ — only
-  the top-level package path
-  (``test_missing_optional_dep_still_gives_install_hint_top_level``) exercises
-  the install hint. This closes that gap and lifts ``backends/__init__.py``
-  off 61.54% (the repo's lowest-coverage file).
-  """
-
-  def test_backends_getattr_missing_dep_gives_install_hint(self, mocker):
-    """Accessing ``backends.RedisBackend`` with redis missing -> install hint.
-
-    Covers ``__getattr__`` lines 109-114 (the install-hint construction) and
-    the True branch of ``_is_missing_optional_dep`` for a direct name match
-    (lines 87, 90, 93-94).
+    The existing suite covers the real-bug path (a non-ModuleNotFoundError
+    surfaces the original via ``backends_pkg.__getattr__``) but NOT the
+    genuine-missing-dep path through the BACKENDS package __getattr__ — only
+    the top-level package path
+    (``test_missing_optional_dep_still_gives_install_hint_top_level``) exercises
+    the install hint. This closes that gap and lifts ``backends/__init__.py``
+    off 61.54% (the repo's lowest-coverage file).
     """
-    import importlib
-    import sys
 
-    module_path = "scrapy_extension.backends.redis"
-    # R14-G flake fix: restore the popped module in finally so later tests
-    # that patch the backend module's client class still find the right
-    # module object (see TestLazyImportRealBugSurfacesChain rationale).
-    cached = sys.modules.pop(module_path, None)
-    try:
-      real_import = importlib.import_module
-      missing = ModuleNotFoundError("No module named 'redis'", name="redis")
+    def test_backends_getattr_missing_dep_gives_install_hint(self, mocker):
+        """Accessing ``backends.RedisBackend`` with redis missing -> install hint.
 
-      def fake_import(name, package=None):
-        if name == module_path:
-          raise missing
-        return real_import(name, package)
+        Covers ``__getattr__`` lines 109-114 (the install-hint construction) and
+        the True branch of ``_is_missing_optional_dep`` for a direct name match
+        (lines 87, 90, 93-94).
+        """
+        import importlib
+        import sys
 
-      mocker.patch.object(importlib, "import_module", side_effect=fake_import)
-      import scrapy_extension.backends as backends_pkg
+        module_path = "scrapy_extension.backends.redis"
+        # R14-G flake fix: restore the popped module in finally so later tests
+        # that patch the backend module's client class still find the right
+        # module object (see TestLazyImportRealBugSurfacesChain rationale).
+        cached = sys.modules.pop(module_path, None)
+        try:
+            real_import = importlib.import_module
+            missing = ModuleNotFoundError("No module named 'redis'", name="redis")
 
-      with pytest.raises(ImportError) as exc_info:
-        getattr(backends_pkg, "RedisBackend")
+            def fake_import(name, package=None):
+                if name == module_path:
+                    raise missing
+                return real_import(name, package)
 
-      assert "pip install scrapy-extension[redis]" in str(exc_info.value)
-    finally:
-      if cached is not None:
-        sys.modules[module_path] = cached
+            mocker.patch.object(importlib, "import_module", side_effect=fake_import)
+            import scrapy_extension.backends as backends_pkg
+
+            with pytest.raises(ImportError) as exc_info:
+                getattr(backends_pkg, "RedisBackend")
+
+            assert "pip install scrapy-extension[redis]" in str(exc_info.value)
+        finally:
+            if cached is not None:
+                sys.modules[module_path] = cached
 
 
 class TestIsMissingOptionalDepBranches:
-  """#7: direct unit tests for ``_is_missing_optional_dep`` branch coverage.
+    """#7: direct unit tests for ``_is_missing_optional_dep`` branch coverage.
 
-  Closes the 87-93 line gap the backends-package __getattr__ tests don't
-  reach: falsy ``.name``, empty ``dep_modules`` (RocketMQ), submodule name
-  match, and non-matching name.
-  """
-
-  def test_name_falsy_returns_false(self):
-    """A ModuleNotFoundError with no ``.name`` -> can't classify -> False (88-89)."""
-    from scrapy_extension.backends import _is_missing_optional_dep
-
-    exc = ModuleNotFoundError()  # no args -> .name is None
-    assert (
-      _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is False
-    )
-
-  def test_empty_dep_modules_returns_false(self):
-    """RocketMQ declares no module-level dep (frozenset()) -> always False (91-92).
-
-    RocketMQ's optional dep (rocketmq-client-python) is imported inside
-    ``connect()``, not at module level, so a module-level
-    ModuleNotFoundError is never a "missing dep" signal for it.
+    Closes the 87-93 line gap the backends-package __getattr__ tests don't
+    reach: falsy ``.name``, empty ``dep_modules`` (RocketMQ), submodule name
+    match, and non-matching name.
     """
-    from scrapy_extension.backends import _is_missing_optional_dep
 
-    exc = ModuleNotFoundError("No module named 'rocketmq'", name="rocketmq")
-    assert (
-      _is_missing_optional_dep(exc, "scrapy_extension.backends.rocketmq")
-      is False
-    )
+    def test_name_falsy_returns_false(self):
+        """A ModuleNotFoundError with no ``.name`` -> can't classify -> False (88-89)."""
+        from scrapy_extension.backends import _is_missing_optional_dep
 
-  def test_submodule_name_returns_true(self):
-    """Submodule match: name 'redis.connection' -> split[0]='redis' in {redis} (95)."""
-    from scrapy_extension.backends import _is_missing_optional_dep
+        exc = ModuleNotFoundError()  # no args -> .name is None
+        assert _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is False
 
-    exc = ModuleNotFoundError(
-      "No module named 'redis.connection'", name="redis.connection"
-    )
-    assert (
-      _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is True
-    )
+    def test_empty_dep_modules_returns_false(self):
+        """RocketMQ declares no module-level dep (frozenset()) -> always False (91-92).
 
-  def test_unrelated_name_returns_false(self):
-    """Name not in dep_modules -> False (real-bug-not-missing-dep case at 93-95)."""
-    from scrapy_extension.backends import _is_missing_optional_dep
+        RocketMQ's optional dep (rocketmq-client-python) is imported inside
+        ``connect()``, not at module level, so a module-level
+        ModuleNotFoundError is never a "missing dep" signal for it.
+        """
+        from scrapy_extension.backends import _is_missing_optional_dep
 
-    exc = ModuleNotFoundError("No module named 'typo'", name="typo")
-    assert (
-      _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is False
-    )
+        exc = ModuleNotFoundError("No module named 'rocketmq'", name="rocketmq")
+        assert (
+            _is_missing_optional_dep(exc, "scrapy_extension.backends.rocketmq") is False
+        )
+
+    def test_submodule_name_returns_true(self):
+        """Submodule match: name 'redis.connection' -> split[0]='redis' in {redis} (95)."""
+        from scrapy_extension.backends import _is_missing_optional_dep
+
+        exc = ModuleNotFoundError(
+            "No module named 'redis.connection'", name="redis.connection"
+        )
+        assert _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is True
+
+    def test_unrelated_name_returns_false(self):
+        """Name not in dep_modules -> False (real-bug-not-missing-dep case at 93-95)."""
+        from scrapy_extension.backends import _is_missing_optional_dep
+
+        exc = ModuleNotFoundError("No module named 'typo'", name="typo")
+        assert _is_missing_optional_dep(exc, "scrapy_extension.backends.redis") is False
 
 
 # ---------------------------------------------------------------------------
@@ -897,9 +918,16 @@ class TestDirCompanionExposesLazyImports:
         """dir(scrapy_extension) includes all 10 lazily-imported backend classes."""
         dir_names = set(dir(scrapy_extension))
         lazy_backends = {
-            "RedisBackend", "MongoDBBackend", "KafkaBackend",
-            "RabbitMQBackend", "ElasticSearchBackend", "RocketMQBackend",
-            "PulsarBackend", "SqsBackend", "MemcachedBackend", "DynamoDBBackend",
+            "RedisBackend",
+            "MongoDBBackend",
+            "KafkaBackend",
+            "RabbitMQBackend",
+            "ElasticSearchBackend",
+            "RocketMQBackend",
+            "PulsarBackend",
+            "SqsBackend",
+            "MemcachedBackend",
+            "DynamoDBBackend",
         }
         missing = lazy_backends - dir_names
         assert not missing, (
@@ -910,9 +938,16 @@ class TestDirCompanionExposesLazyImports:
         """dir(scrapy_extension) includes lazily-imported Settings + Mode names."""
         dir_names = set(dir(scrapy_extension))
         lazy_settings = {
-            "RedisSettings", "RedisMode", "SqsSettings", "SqsMode",
-            "DynamoDBSettings", "DynamoDBMode", "MemcachedSettings",
-            "MemcachedMode", "PulsarSettings", "PulsarMode",
+            "RedisSettings",
+            "RedisMode",
+            "SqsSettings",
+            "SqsMode",
+            "DynamoDBSettings",
+            "DynamoDBMode",
+            "MemcachedSettings",
+            "MemcachedMode",
+            "PulsarSettings",
+            "PulsarMode",
         }
         missing = lazy_settings - dir_names
         assert not missing, (
@@ -934,5 +969,3 @@ class TestDirCompanionExposesLazyImports:
         assert not missing, (
             f"Lazy backends missing from dir(scrapy_extension.backends): {sorted(missing)}"
         )
-
-

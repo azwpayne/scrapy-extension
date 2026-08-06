@@ -20,49 +20,49 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-  from scrapy_extension.backends.base import StorageBackend
+    from scrapy_extension.backends.base import StorageBackend
 
 
 class StorageStrategy(ABC):
-  """Strategy interface for item-storage semantics.
+    """Strategy interface for item-storage semantics.
 
-  A strategy owns how serialized items are persisted: direct writes
-  (passthrough), buffered batched writes, etc. It is backend-agnostic — each
-  ``store`` call receives the ``StorageBackend`` to delegate to, so the
-  pipeline retains ownership of the backend lifecycle. Buffered entries remain
-  bound to the exact backend capability supplied with their call.
-  """
-
-  #: True when the strategy emits ``Monitor.on_store`` at its actual durable
-  #: write boundary. Buffering strategies override this so the pipeline does
-  #: not report volatile acceptance as persistence.
-  emits_store_events = False
-
-  @abstractmethod
-  def store(
-    self,
-    storage_backend: StorageBackend,
-    key: str,
-    value: bytes,
-    ttl: int | None = None,
-  ) -> None:
-    """Persist one serialized item via the given backend.
-
-    Args:
-        storage_backend: The exact StorageBackend capability to delegate this
-            item to. It remains owned by the caller.
-        key: The storage key.
-        value: The serialized item bytes.
-        ttl: Optional time-to-live in seconds.
+    A strategy owns how serialized items are persisted: direct writes
+    (passthrough), buffered batched writes, etc. It is backend-agnostic — each
+    ``store`` call receives the ``StorageBackend`` to delegate to, so the
+    pipeline retains ownership of the backend lifecycle. Buffered entries remain
+    bound to the exact backend capability supplied with their call.
     """
 
-  @abstractmethod
-  def flush(self) -> None:
-    """Flush any buffered items to their backend. No-op for non-buffering strategies."""
+    #: True when the strategy emits ``Monitor.on_store`` at its actual durable
+    #: write boundary. Buffering strategies override this so the pipeline does
+    #: not report volatile acceptance as persistence.
+    emits_store_events = False
 
-  @abstractmethod
-  def close(self) -> None:
-    """Release resources and flush any remaining buffered items."""
+    @abstractmethod
+    def store(
+        self,
+        storage_backend: StorageBackend,
+        key: str,
+        value: bytes,
+        ttl: int | None = None,
+    ) -> None:
+        """Persist one serialized item via the given backend.
 
-  def open(self) -> None:  # noqa: B027
-    """Lifecycle hook — prepare the strategy. Default no-op."""
+        Args:
+            storage_backend: The exact StorageBackend capability to delegate this
+                item to. It remains owned by the caller.
+            key: The storage key.
+            value: The serialized item bytes.
+            ttl: Optional time-to-live in seconds.
+        """
+
+    @abstractmethod
+    def flush(self) -> None:
+        """Flush any buffered items to their backend. No-op for non-buffering strategies."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release resources and flush any remaining buffered items."""
+
+    def open(self) -> None:  # noqa: B027
+        """Lifecycle hook — prepare the strategy. Default no-op."""

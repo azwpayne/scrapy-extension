@@ -22,146 +22,152 @@ from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
 
 @pytest.fixture(params=[RuntimeError, KeyboardInterrupt, SystemExit])
 def diagnostic_error(request: pytest.FixtureRequest) -> BaseException:
-  """Construct each error class custom logging handlers can raise."""
-  error_type = cast(type[BaseException], request.param)
-  return error_type("diagnostic handler failed")
+    """Construct each error class custom logging handlers can raise."""
+    error_type = cast(type[BaseException], request.param)
+    return error_type("diagnostic handler failed")
 
 
 def test_ring_buffer_restore_fallback_diagnostic_preserves_live_state(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = RingBufferQueueStrategy(MagicMock(), capacity=2)
-  strategy.push("q", b"live")
-  mocker.patch.object(ring_buffer_module.logger, "warning", side_effect=diagnostic_error)
+    strategy = RingBufferQueueStrategy(MagicMock(), capacity=2)
+    strategy.push("q", b"live")
+    mocker.patch.object(
+        ring_buffer_module.logger, "warning", side_effect=diagnostic_error
+    )
 
-  strategy.restore(b"\xff")
+    strategy.restore(b"\xff")
 
-  assert strategy.pop("q") == b"live"
+    assert strategy.pop("q") == b"live"
 
 
 def test_ring_buffer_restore_commit_diagnostic_preserves_recovery(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = RingBufferQueueStrategy(MagicMock(), capacity=2)
-  state = json.dumps(
-    {
-      "version": 1,
-      "strategy": "ring_buffer",
-      "capacity": 2,
-      "items": [base64.b64encode(b"recovered").decode()],
-      "dropped": 0,
-    }
-  ).encode()
-  mocker.patch.object(ring_buffer_module.logger, "info", side_effect=diagnostic_error)
+    strategy = RingBufferQueueStrategy(MagicMock(), capacity=2)
+    state = json.dumps(
+        {
+            "version": 1,
+            "strategy": "ring_buffer",
+            "capacity": 2,
+            "items": [base64.b64encode(b"recovered").decode()],
+            "dropped": 0,
+        }
+    ).encode()
+    mocker.patch.object(ring_buffer_module.logger, "info", side_effect=diagnostic_error)
 
-  strategy.restore(state)
+    strategy.restore(state)
 
-  assert strategy.pop("q") == b"recovered"
+    assert strategy.pop("q") == b"recovered"
 
 
 def test_delay_restore_fallback_diagnostic_preserves_live_state(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = DelayQueueStrategy(MagicMock(), clock=lambda: 100.0)
-  strategy.push("q", b"live", delay=10.0)
-  mocker.patch.object(delay_module.logger, "warning", side_effect=diagnostic_error)
+    strategy = DelayQueueStrategy(MagicMock(), clock=lambda: 100.0)
+    strategy.push("q", b"live", delay=10.0)
+    mocker.patch.object(delay_module.logger, "warning", side_effect=diagnostic_error)
 
-  strategy.restore(b"\xff")
+    strategy.restore(b"\xff")
 
-  assert [entry[2] for entry in strategy._holding] == [b"live"]
+    assert [entry[2] for entry in strategy._holding] == [b"live"]
 
 
 def test_delay_restore_commit_diagnostic_preserves_recovery(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = DelayQueueStrategy(MagicMock(), clock=lambda: 100.0)
-  state = json.dumps(
-    {
-      "version": 1,
-      "strategy": "delay",
-      "items": [
+    strategy = DelayQueueStrategy(MagicMock(), clock=lambda: 100.0)
+    state = json.dumps(
         {
-          "ready_at": 1.0,
-          "item_b64": base64.b64encode(b"recovered").decode(),
-          "priority": 0.0,
+            "version": 1,
+            "strategy": "delay",
+            "items": [
+                {
+                    "ready_at": 1.0,
+                    "item_b64": base64.b64encode(b"recovered").decode(),
+                    "priority": 0.0,
+                }
+            ],
         }
-      ],
-    }
-  ).encode()
-  mocker.patch.object(delay_module.logger, "info", side_effect=diagnostic_error)
+    ).encode()
+    mocker.patch.object(delay_module.logger, "info", side_effect=diagnostic_error)
 
-  strategy.restore(state)
+    strategy.restore(state)
 
-  assert [entry[2] for entry in strategy._holding] == [b"recovered"]
+    assert [entry[2] for entry in strategy._holding] == [b"recovered"]
 
 
 def test_round_robin_restore_fallback_diagnostic_preserves_live_state(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = RoundRobinQueueStrategy(MagicMock())
-  strategy.push("q", b"live", source="live")
-  mocker.patch.object(round_robin_module.logger, "warning", side_effect=diagnostic_error)
+    strategy = RoundRobinQueueStrategy(MagicMock())
+    strategy.push("q", b"live", source="live")
+    mocker.patch.object(
+        round_robin_module.logger, "warning", side_effect=diagnostic_error
+    )
 
-  strategy.restore(b"\xff")
+    strategy.restore(b"\xff")
 
-  assert strategy.pop("q") == b"live"
+    assert strategy.pop("q") == b"live"
 
 
 def test_round_robin_restore_commit_diagnostic_preserves_recovery(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = RoundRobinQueueStrategy(MagicMock())
-  state = json.dumps(
-    {
-      "version": 1,
-      "strategy": "round_robin",
-      "sources": [
+    strategy = RoundRobinQueueStrategy(MagicMock())
+    state = json.dumps(
         {
-          "source": "recovered",
-          "items": [base64.b64encode(b"recovered").decode()],
+            "version": 1,
+            "strategy": "round_robin",
+            "sources": [
+                {
+                    "source": "recovered",
+                    "items": [base64.b64encode(b"recovered").decode()],
+                }
+            ],
         }
-      ],
-    }
-  ).encode()
-  mocker.patch.object(round_robin_module.logger, "info", side_effect=diagnostic_error)
+    ).encode()
+    mocker.patch.object(round_robin_module.logger, "info", side_effect=diagnostic_error)
 
-  strategy.restore(state)
+    strategy.restore(state)
 
-  assert strategy.pop("q") == b"recovered"
+    assert strategy.pop("q") == b"recovered"
 
 
 def test_time_wheel_restore_fallback_diagnostic_preserves_live_state(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = TimeWheelQueueStrategy(MagicMock(), clock=lambda: 100.0)
-  strategy.push("q", b"live", delay=10.0)
-  mocker.patch.object(time_wheel_module.logger, "warning", side_effect=diagnostic_error)
+    strategy = TimeWheelQueueStrategy(MagicMock(), clock=lambda: 100.0)
+    strategy.push("q", b"live", delay=10.0)
+    mocker.patch.object(
+        time_wheel_module.logger, "warning", side_effect=diagnostic_error
+    )
 
-  strategy.restore(b"\xff")
+    strategy.restore(b"\xff")
 
-  assert sum(len(slot) for slot in strategy._wheel) + len(strategy._overflow) == 1
+    assert sum(len(slot) for slot in strategy._wheel) + len(strategy._overflow) == 1
 
 
 def test_time_wheel_restore_commit_diagnostic_preserves_recovery(
-  mocker: MockerFixture, diagnostic_error: BaseException
+    mocker: MockerFixture, diagnostic_error: BaseException
 ) -> None:
-  strategy = TimeWheelQueueStrategy(MagicMock(), clock=lambda: 100.0)
-  state = json.dumps(
-    {
-      "version": 1,
-      "strategy": "time_wheel",
-      "slots_flat": [
+    strategy = TimeWheelQueueStrategy(MagicMock(), clock=lambda: 100.0)
+    state = json.dumps(
         {
-          "ready_at": 1.0,
-          "item_b64": base64.b64encode(b"recovered").decode(),
-          "priority": 0.0,
+            "version": 1,
+            "strategy": "time_wheel",
+            "slots_flat": [
+                {
+                    "ready_at": 1.0,
+                    "item_b64": base64.b64encode(b"recovered").decode(),
+                    "priority": 0.0,
+                }
+            ],
+            "overflow": [],
         }
-      ],
-      "overflow": [],
-    }
-  ).encode()
-  mocker.patch.object(time_wheel_module.logger, "info", side_effect=diagnostic_error)
+    ).encode()
+    mocker.patch.object(time_wheel_module.logger, "info", side_effect=diagnostic_error)
 
-  strategy.restore(state)
+    strategy.restore(state)
 
-  assert sum(len(slot) for slot in strategy._wheel) + len(strategy._overflow) == 1
+    assert sum(len(slot) for slot in strategy._wheel) + len(strategy._overflow) == 1

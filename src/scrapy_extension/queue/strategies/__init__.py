@@ -8,15 +8,15 @@ Exports the strategy interface and concrete strategies. The
 from __future__ import annotations
 
 __all__ = [
-  "DelayQueueStrategy",
-  "PassthroughQueueStrategy",
-  "PriorityQueueStrategy",
-  "QueueStrategy",
-  "RingBufferQueueStrategy",
-  "RoundRobinQueueStrategy",
-  "ThrottleQueueStrategy",
-  "TimeWheelQueueStrategy",
-  "WorkStealingQueueStrategy",
+    "DelayQueueStrategy",
+    "PassthroughQueueStrategy",
+    "PriorityQueueStrategy",
+    "QueueStrategy",
+    "RingBufferQueueStrategy",
+    "RoundRobinQueueStrategy",
+    "ThrottleQueueStrategy",
+    "TimeWheelQueueStrategy",
+    "WorkStealingQueueStrategy",
 ]
 
 from scrapy_extension.queue.strategies.base import QueueStrategy

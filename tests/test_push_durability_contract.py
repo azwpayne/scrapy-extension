@@ -15,6 +15,7 @@ covered by tests/test_rabbitmq_backend.py and is intentionally excluded here.
 The classification method itself is shared base code; the per-backend risk is
 the flag, which this pins directly against the real classes.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -29,26 +30,26 @@ from scrapy_extension.backends.rocketmq import RocketMQBackend
 from scrapy_extension.backends.sqs import SqsBackend
 
 DURABLE_BACKEND_CLASSES = [
-  RedisBackend,
-  MongoDBBackend,
-  ElasticSearchBackend,
-  KafkaBackend,
-  PulsarBackend,
-  RocketMQBackend,
-  SqsBackend,
+    RedisBackend,
+    MongoDBBackend,
+    ElasticSearchBackend,
+    KafkaBackend,
+    PulsarBackend,
+    RocketMQBackend,
+    SqsBackend,
 ]
 
 
 @pytest.mark.parametrize(
-  "backend_cls", DURABLE_BACKEND_CLASSES, ids=lambda cls: cls.__name__
+    "backend_cls", DURABLE_BACKEND_CLASSES, ids=lambda cls: cls.__name__
 )
 def test_real_durable_backend_pinned(backend_cls: type[QueueBackend]) -> None:
-  # Production durability gate: `self._push_is_durable is True` (base.py:590).
-  assert backend_cls._push_is_durable is True
+    # Production durability gate: `self._push_is_durable is True` (base.py:590).
+    assert backend_cls._push_is_durable is True
 
 
 def test_base_default_is_not_durable() -> None:
-  """Discrimination proof: the QueueBackend base default is False, so only an
-  explicit ``_push_is_durable = True`` declaration passes the pin above — a
-  backend that dropped the ClassVar would inherit False and fail."""
-  assert QueueBackend._push_is_durable is False
+    """Discrimination proof: the QueueBackend base default is False, so only an
+    explicit ``_push_is_durable = True`` declaration passes the pin above — a
+    backend that dropped the ClassVar would inherit False and fail."""
+    assert QueueBackend._push_is_durable is False

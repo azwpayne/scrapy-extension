@@ -101,9 +101,6 @@ test = [
     "pytest-socket",
     "mypy",
     "bandit[toml]",
-    "pytest-mypy",
-    "pytest-ruff",
-    "pytest-bandit",
     "hypothesis>=6.165.0,<7",
     # Backend deps — tests import backend modules directly, which triggers
     # the module-level lazy-import guard. All backends must be installable
@@ -141,14 +138,30 @@ source-exclude = [
     # workstation state, local databases, and internal scratch plans out of a
     # release even when a maintainer builds from a dirty checkout.
     "**/.omc/**",
+    "**/.env*",
+    "**/.secrets/**",
+    "**/credentials/**",
+    "**/secrets/**",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.crt",
+    "**/*.cer",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.jks",
+    "**/*.keystore",
     "**/*.db",
     "**/.DS_Store",
+    # Historical working notes are useful in Git but are not user-facing
+    # package documentation.
+    "docs/insight/**",
     "docs/superpowers/**",
 ]
 
 [tool.poe]
 executor.type = "uv"
-tasks.full = ["clean", "format"]
+tasks.full = ["check"]
+tasks.check = ["format-check", "lint-check", "type-check", "security-check"]
 tasks.test = [
     "clean",
     "test-py310",
@@ -159,8 +172,18 @@ tasks.test = [
     "test-py314t"
 ]
 
-tasks.format = "ruff format"
-tasks.lint = "ruff check --fix --unsafe-fixes"
+# Verification tasks never edit the worktree. Use the explicit *-fix tasks to
+# apply mechanical changes locally.
+tasks.format-check = "ruff format --check src tests conftest.py"
+tasks.format-fix = "ruff format src tests conftest.py"
+tasks.lint-check = "ruff check"
+tasks.lint-fix = "ruff check --fix --unsafe-fixes"
+tasks.type-check = "mypy --strict src"
+tasks.security-check = "bandit -r src -c pyproject.toml"
+
+# Keep the existing entry points, but make them safe read-only aliases.
+tasks.format = ["format-check"]
+tasks.lint = ["lint-check"]
 
 tasks.test-py310 = { shell = "uv run --python 3.10 --group test pytest" }
 tasks.test-py311 = { shell = "uv run --python 3.11 --group test pytest" }
@@ -221,6 +244,10 @@ addopts = [
 ]
 filterwarnings = [
     "error::UserWarning", # 将警告视为错误
+    # Remote plaintext compatibility warnings are exercised explicitly in
+    # test_remote_plaintext_transition.py. Suppress duplicate expected warnings
+    # from unrelated backend fixtures so new warning classes remain visible.
+    "ignore:Remote unauthenticated plaintext .* connections are deprecated:FutureWarning:scrapy_extension\\.settings\\._transport_security",
     # itemadapter 0.13.1 imports pydantic.v1 only to recognise legacy item
     # models. Pydantic emits this warning on 3.14 even when the application
     # exclusively uses Pydantic v2. Keep the exemption exact by message and

@@ -89,7 +89,10 @@ except PackageNotFoundError:
 _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     # Backend classes
     "DynamoDBBackend": ("scrapy_extension.backends.dynamodb", "DynamoDBBackend"),
-    "ElasticSearchBackend": ("scrapy_extension.backends.elasticsearch", "ElasticSearchBackend"),
+    "ElasticSearchBackend": (
+        "scrapy_extension.backends.elasticsearch",
+        "ElasticSearchBackend",
+    ),
     "KafkaBackend": ("scrapy_extension.backends.kafka", "KafkaBackend"),
     "MemcachedBackend": ("scrapy_extension.backends.memcached", "MemcachedBackend"),
     "MongoDBBackend": ("scrapy_extension.backends.mongodb", "MongoDBBackend"),
@@ -101,8 +104,14 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     # Settings classes
     "DynamoDBMode": ("scrapy_extension.settings.dynamodb", "DynamoDBMode"),
     "DynamoDBSettings": ("scrapy_extension.settings.dynamodb", "DynamoDBSettings"),
-    "ElasticSearchMode": ("scrapy_extension.settings.elasticsearch", "ElasticSearchMode"),
-    "ElasticSearchSettings": ("scrapy_extension.settings.elasticsearch", "ElasticSearchSettings"),
+    "ElasticSearchMode": (
+        "scrapy_extension.settings.elasticsearch",
+        "ElasticSearchMode",
+    ),
+    "ElasticSearchSettings": (
+        "scrapy_extension.settings.elasticsearch",
+        "ElasticSearchSettings",
+    ),
     "KafkaMode": ("scrapy_extension.settings.kafka", "KafkaMode"),
     "KafkaSettings": ("scrapy_extension.settings.kafka", "KafkaSettings"),
     "MemcachedMode": ("scrapy_extension.settings.memcached", "MemcachedMode"),
@@ -202,8 +211,7 @@ def _is_missing_optional_dep(exc: ImportError, module_path: str) -> bool:
     """
     dep_modules = _OPTIONAL_DEP_MODULES.get(module_path, frozenset())
     return any(
-        _is_missing_optional_dependency(exc, dependency)
-        for dependency in dep_modules
+        _is_missing_optional_dependency(exc, dependency) for dependency in dep_modules
     )
 
 

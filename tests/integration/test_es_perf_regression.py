@@ -24,15 +24,15 @@ import uuid
 import pytest
 
 pytestmark = [
-  pytest.mark.integration,
-  pytest.mark.skipif(
-    not os.environ.get("SCRAPY_TEST_INTEGRATION"),
-    reason="integration opt-in: set SCRAPY_TEST_INTEGRATION=1",
-  ),
-  pytest.mark.skipif(
-    not os.environ.get("SCRAPY_TEST_ES_HOSTS"),
-    reason="Set SCRAPY_TEST_ES_HOSTS (e.g. http://localhost:9200) to run ES perf gate.",
-  ),
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("SCRAPY_TEST_INTEGRATION"),
+        reason="integration opt-in: set SCRAPY_TEST_INTEGRATION=1",
+    ),
+    pytest.mark.skipif(
+        not os.environ.get("SCRAPY_TEST_ES_HOSTS"),
+        reason="Set SCRAPY_TEST_ES_HOSTS (e.g. http://localhost:9200) to run ES perf gate.",
+    ),
 ]
 
 # Per-push budget. See module docstring for the threshold rationale.
@@ -43,51 +43,53 @@ _N = 20
 
 @pytest.fixture(scope="module")
 def es_backend():  # type: ignore[no-untyped-def]
-  """Connect an ElasticSearchBackend once per module; disconnect on teardown.
+    """Connect an ElasticSearchBackend once per module; disconnect on teardown.
 
-  Mirrors the fixture in test_elasticsearch_integration.py — kept local (not
-  in a conftest) to match the per-file integration-test pattern.
-  """
-  from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-  from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
+    Mirrors the fixture in test_elasticsearch_integration.py — kept local (not
+    in a conftest) to match the per-file integration-test pattern.
+    """
+    from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+    from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
-  hosts = [h.strip() for h in os.environ["SCRAPY_TEST_ES_HOSTS"].split(",") if h.strip()]
-  backend = ElasticSearchBackend(
-    ElasticSearchSettings(hosts=hosts, request_timeout=10.0, max_retries=1)
-  )
-  backend.connect()
-  yield backend
-  backend.disconnect()
+    hosts = [
+        h.strip() for h in os.environ["SCRAPY_TEST_ES_HOSTS"].split(",") if h.strip()
+    ]
+    backend = ElasticSearchBackend(
+        ElasticSearchSettings(hosts=hosts, request_timeout=10.0, max_retries=1)
+    )
+    backend.connect()
+    yield backend
+    backend.disconnect()
 
 
 def test_push_does_not_regress_to_wait_for_latency(es_backend):  # type: ignore[no-untyped-def]
-  """Each push must stay well under the refresh='wait_for' regression cost.
+    """Each push must stay well under the refresh='wait_for' regression cost.
 
-  The #43 fix removed ``refresh="wait_for"`` from push (it was ~1010ms/push;
-  ES doesn't amortize ``wait_for`` across consecutive pushes). If a future
-  change re-adds it (or otherwise makes push block on the ES refresh cycle),
-  mean per-push latency jumps ~250x and this gate fires.
-  """
-  queue = f"perf-{uuid.uuid4().hex}"
-  per_push: list[float] = []
-  for i in range(_N):
-    t0 = time.monotonic()
-    es_backend.push(queue, f"item-{i:03d}".encode(), priority=1.0)
-    per_push.append(time.monotonic() - t0)
+    The #43 fix removed ``refresh="wait_for"`` from push (it was ~1010ms/push;
+    ES doesn't amortize ``wait_for`` across consecutive pushes). If a future
+    change re-adds it (or otherwise makes push block on the ES refresh cycle),
+    mean per-push latency jumps ~250x and this gate fires.
+    """
+    queue = f"perf-{uuid.uuid4().hex}"
+    per_push: list[float] = []
+    for i in range(_N):
+        t0 = time.monotonic()
+        es_backend.push(queue, f"item-{i:03d}".encode(), priority=1.0)
+        per_push.append(time.monotonic() - t0)
 
-  mean_ms = statistics.mean(per_push) * 1000
-  max_ms = max(per_push) * 1000
-  # Assert on BOTH mean (steady-state) and max (no single push stalls).
-  # CI runners vary, so the headroom is intentionally wide (see module
-  # docstring) — the regression is ~5x over budget, the fast path ~50x under.
-  assert mean_ms < _PER_PUSH_BUDGET_MS, (
-    f"ES push mean latency {mean_ms:.1f}ms/push exceeds "
-    f"{_PER_PUSH_BUDGET_MS}ms budget — likely a refresh='wait_for' "
-    "regression on the push path (see #43). "
-    f"(max={max_ms:.1f}ms, n={_N})"
-  )
-  assert max_ms < _PER_PUSH_BUDGET_MS * 2, (
-    f"ES push max latency {max_ms:.1f}ms exceeds "
-    f"{_PER_PUSH_BUDGET_MS * 2}ms — a single push stalled near the "
-    "refresh-interval (1s), suggesting per-push refresh. (see #43)"
-  )
+    mean_ms = statistics.mean(per_push) * 1000
+    max_ms = max(per_push) * 1000
+    # Assert on BOTH mean (steady-state) and max (no single push stalls).
+    # CI runners vary, so the headroom is intentionally wide (see module
+    # docstring) — the regression is ~5x over budget, the fast path ~50x under.
+    assert mean_ms < _PER_PUSH_BUDGET_MS, (
+        f"ES push mean latency {mean_ms:.1f}ms/push exceeds "
+        f"{_PER_PUSH_BUDGET_MS}ms budget — likely a refresh='wait_for' "
+        "regression on the push path (see #43). "
+        f"(max={max_ms:.1f}ms, n={_N})"
+    )
+    assert max_ms < _PER_PUSH_BUDGET_MS * 2, (
+        f"ES push max latency {max_ms:.1f}ms exceeds "
+        f"{_PER_PUSH_BUDGET_MS * 2}ms — a single push stalled near the "
+        "refresh-interval (1s), suggesting per-push refresh. (see #43)"
+    )

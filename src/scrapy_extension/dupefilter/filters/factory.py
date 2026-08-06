@@ -17,14 +17,14 @@ from scrapy_extension.dupefilter.filters.base import MembershipFilter
 from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 from scrapy_extension.dupefilter.filters.memory_filter import (
-  DEFAULT_MEMORY_MAXSIZE,
-  MemoryMembershipFilter,
+    DEFAULT_MEMORY_MAXSIZE,
+    MemoryMembershipFilter,
 )
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import ConfigurationError
 
 if TYPE_CHECKING:
-  from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.connectors import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -35,24 +35,24 @@ _warned: set[DedupeStrategy] = set()
 
 
 class DedupeStrategy(str, Enum):
-  """Selectable dedup strategies.
+    """Selectable dedup strategies.
 
-  Attributes:
-      SET: Exact, cross-worker, backend-backed (default).
-      MEMORY: Exact, in-process, optional LRU cap.
-      BLOOM: Probabilistic, in-process, no deletion.
-      CUCKOO: Probabilistic, in-process, supports deletion.
-  """
+    Attributes:
+        SET: Exact, cross-worker, backend-backed (default).
+        MEMORY: Exact, in-process, optional LRU cap.
+        BLOOM: Probabilistic, in-process, no deletion.
+        CUCKOO: Probabilistic, in-process, supports deletion.
+    """
 
-  SET = "set"
-  MEMORY = "memory"
-  BLOOM = "bloom"
-  CUCKOO = "cuckoo"
+    SET = "set"
+    MEMORY = "memory"
+    BLOOM = "bloom"
+    CUCKOO = "cuckoo"
 
-  @classmethod
-  def _missing_(cls, value: object) -> DedupeStrategy:
-    valid = ", ".join(repr(m.value) for m in cls)
-    raise ValueError(f"{value!r} is not a valid {cls.__name__}. Valid: {valid}.")
+    @classmethod
+    def _missing_(cls, value: object) -> DedupeStrategy:
+        valid = ", ".join(repr(m.value) for m in cls)
+        raise ValueError(f"{value!r} is not a valid {cls.__name__}. Valid: {valid}.")
 
 
 # Per-process strategies whose state is invisible to other workers. The library
@@ -61,102 +61,104 @@ class DedupeStrategy(str, Enum):
 # (idempotent) to surface the limitation at selection time — class docstrings
 # alone were not enough (INSIGHTS-2026-06-25 Theme C).
 _PER_PROCESS_STRATEGIES: frozenset[DedupeStrategy] = frozenset(
-  {DedupeStrategy.MEMORY, DedupeStrategy.BLOOM, DedupeStrategy.CUCKOO}
+    {DedupeStrategy.MEMORY, DedupeStrategy.BLOOM, DedupeStrategy.CUCKOO}
 )
 
 
 def _warn_per_process_scope(strategy: DedupeStrategy) -> None:
-  """Emit a one-time per-process warning when ``strategy`` is per-process.
+    """Emit a one-time per-process warning when ``strategy`` is per-process.
 
-  Bloom / cuckoo / memory filters live in-process: cross-worker duplicates
-  pass silently. Operators assuming distributed dedup need a loud signal at
-  selection time. Idempotent via the module-level ``_warned`` set so a
-  multi-spider process does not spam the log.
+    Bloom / cuckoo / memory filters live in-process: cross-worker duplicates
+    pass silently. Operators assuming distributed dedup need a loud signal at
+    selection time. Idempotent via the module-level ``_warned`` set so a
+    multi-spider process does not spam the log.
 
-  Args:
-      strategy: The selected dedup strategy.
-  """
-  if strategy not in _PER_PROCESS_STRATEGIES:
-    return
-  if strategy in _warned:
-    return
-  _warned.add(strategy)
-  # This is an advisory after the warn-once state transition. A broken log
-  # handler must not prevent a valid filter from being constructed.
-  try:
-    logger.warning(
-      "Dedup strategy %r is per-process — its state is not shared across "
-      "workers, so cross-worker duplicate requests will pass undetected. "
-      "For cross-worker dedup, use the default 'set' strategy (or a "
-      "MemoryMembershipFilter backed by a shared backend).",
-      strategy.value,
-    )
-  except BaseException:
-    pass
+    Args:
+        strategy: The selected dedup strategy.
+    """
+    if strategy not in _PER_PROCESS_STRATEGIES:
+        return
+    if strategy in _warned:
+        return
+    _warned.add(strategy)
+    # This is an advisory after the warn-once state transition. A broken log
+    # handler must not prevent a valid filter from being constructed.
+    try:
+        logger.warning(
+            "Dedup strategy %r is per-process — its state is not shared across "
+            "workers, so cross-worker duplicate requests will pass undetected. "
+            "For cross-worker dedup, use the default 'set' strategy (or a "
+            "MemoryMembershipFilter backed by a shared backend).",
+            strategy.value,
+        )
+    except BaseException:
+        pass
 
 
 def build_membership_filter(
-  strategy: DedupeStrategy,
-  connection_manager: ConnectionManager,
-  *,
-  key: str = "dupefilter",
-  memory_maxsize: int | None = DEFAULT_MEMORY_MAXSIZE,
-  bloom_capacity: int = 1_000_000,
-  bloom_error_rate: float = 0.001,
-  cuckoo_capacity: int = 1_000_000,
-  cuckoo_error_rate: float = 0.001,
-  strict: bool = False,
+    strategy: DedupeStrategy,
+    connection_manager: ConnectionManager,
+    *,
+    key: str = "dupefilter",
+    memory_maxsize: int | None = DEFAULT_MEMORY_MAXSIZE,
+    bloom_capacity: int = 1_000_000,
+    bloom_error_rate: float = 0.001,
+    cuckoo_capacity: int = 1_000_000,
+    cuckoo_error_rate: float = 0.001,
+    strict: bool = False,
 ) -> MembershipFilter:
-  """Build the membership filter for ``strategy``.
+    """Build the membership filter for ``strategy``.
 
-  Args:
-      strategy: Which dedup strategy to instantiate.
-      connection_manager: Connection manager (used only by the ``set``
-          strategy; in-memory strategies ignore it).
-      key: Backend set name for the ``set`` strategy.
-      memory_maxsize: LRU cap for the ``memory`` strategy. Defaults to
-          :data:`DEFAULT_MEMORY_MAXSIZE`; explicit ``None`` opts out.
-      bloom_capacity: Expected item count for the ``bloom`` strategy.
-      bloom_error_rate: Target false-positive rate for ``bloom``.
-      cuckoo_capacity: Expected item count for the ``cuckoo`` strategy.
-      cuckoo_error_rate: Target false-positive rate for ``cuckoo``.
-      strict: Risk 3 — fail-loud at factory time when a per-process strategy
-          (``memory``/``bloom``/``cuckoo``) is selected. Per-process filters
-          lose ALL state on crash and cannot prevent cross-worker duplicates
-          in a distributed fleet. The default (``False``) preserves the
-          warn-once behavior; ``True`` (set via ``SCRAPY_DEDUP_STRICT=1``)
-          upgrades the warning to a :class:`ConfigurationError` so a
-          multi-worker misconfig is caught at startup. No effect on the
-          ``set`` strategy (distributed-exact).
+    Args:
+        strategy: Which dedup strategy to instantiate.
+        connection_manager: Connection manager (used only by the ``set``
+            strategy; in-memory strategies ignore it).
+        key: Backend set name for the ``set`` strategy.
+        memory_maxsize: LRU cap for the ``memory`` strategy. Defaults to
+            :data:`DEFAULT_MEMORY_MAXSIZE`; explicit ``None`` opts out.
+        bloom_capacity: Expected item count for the ``bloom`` strategy.
+        bloom_error_rate: Target false-positive rate for ``bloom``.
+        cuckoo_capacity: Expected item count for the ``cuckoo`` strategy.
+        cuckoo_error_rate: Target false-positive rate for ``cuckoo``.
+        strict: Risk 3 — fail-loud at factory time when a per-process strategy
+            (``memory``/``bloom``/``cuckoo``) is selected. Per-process filters
+            lose ALL state on crash and cannot prevent cross-worker duplicates
+            in a distributed fleet. The default (``False``) preserves the
+            warn-once behavior; ``True`` (set via ``SCRAPY_DEDUP_STRICT=1``)
+            upgrades the warning to a :class:`ConfigurationError` so a
+            multi-worker misconfig is caught at startup. No effect on the
+            ``set`` strategy (distributed-exact).
 
-  Returns:
-      A concrete MembershipFilter instance.
+    Returns:
+        A concrete MembershipFilter instance.
 
-  Raises:
-      ConfigurationError: If ``strategy`` is not a known DedupeStrategy, or
-          if ``strict`` is True and ``strategy`` is per-process.
-  """
-  if strict and strategy in _PER_PROCESS_STRATEGIES:
+    Raises:
+        ConfigurationError: If ``strategy`` is not a known DedupeStrategy, or
+            if ``strict`` is True and ``strategy`` is per-process.
+    """
+    if strict and strategy in _PER_PROCESS_STRATEGIES:
+        raise ConfigurationError(
+            f"Dedup strategy {strategy.value!r} is per-process — its state is not "
+            f"shared across workers, so cross-worker duplicate requests will pass "
+            f"undetected in a distributed fleet. SCRAPY_DEDUP_STRICT=1 rejects "
+            f"this at config time. For cross-worker dedup use "
+            f"SCRAPY_DEDUP_STRATEGY=set (distributed-exact).",
+            setting_name="SCRAPY_DEDUP_STRATEGY",
+            setting_value=strategy.value,
+        )
+    _warn_per_process_scope(strategy)
+    if strategy is DedupeStrategy.SET:
+        return SetMembershipFilter(connection_manager, key)
+    if strategy is DedupeStrategy.MEMORY:
+        return MemoryMembershipFilter(maxsize=memory_maxsize)
+    if strategy is DedupeStrategy.BLOOM:
+        return BloomMembershipFilter(
+            capacity=bloom_capacity, error_rate=bloom_error_rate
+        )
+    if strategy is DedupeStrategy.CUCKOO:
+        return CuckooMembershipFilter(
+            capacity=cuckoo_capacity, error_rate=cuckoo_error_rate
+        )
     raise ConfigurationError(
-      f"Dedup strategy {strategy.value!r} is per-process — its state is not "
-      f"shared across workers, so cross-worker duplicate requests will pass "
-      f"undetected in a distributed fleet. SCRAPY_DEDUP_STRICT=1 rejects "
-      f"this at config time. For cross-worker dedup use "
-      f"SCRAPY_DEDUP_STRATEGY=set (distributed-exact).",
-      setting_name="SCRAPY_DEDUP_STRATEGY",
-      setting_value=strategy.value,
-    )
-  _warn_per_process_scope(strategy)
-  if strategy is DedupeStrategy.SET:
-    return SetMembershipFilter(connection_manager, key)
-  if strategy is DedupeStrategy.MEMORY:
-    return MemoryMembershipFilter(maxsize=memory_maxsize)
-  if strategy is DedupeStrategy.BLOOM:
-    return BloomMembershipFilter(
-      capacity=bloom_capacity, error_rate=bloom_error_rate
-    )
-  if strategy is DedupeStrategy.CUCKOO:
-    return CuckooMembershipFilter(
-      capacity=cuckoo_capacity, error_rate=cuckoo_error_rate
-    )
-  raise ConfigurationError(f"Unknown dedup strategy: {strategy!r}")  # pragma: no cover
+        f"Unknown dedup strategy: {strategy!r}"
+    )  # pragma: no cover

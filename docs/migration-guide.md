@@ -76,6 +76,33 @@ previous plaintext default, but should be limited to trusted local networks.
 The TLS flag targets the RocketMQ 5.x gRPC proxy and is propagated separately
 to both SDK client constructors; it is not a `ClientConfiguration` option.
 
+## Remote Plaintext Transition
+
+Unauthenticated connections to a non-loopback endpoint remain accepted in this
+release for backwards compatibility, but now emit a `FutureWarning` unless an
+operator makes the trusted-network exception explicit. Loopback defaults
+(`localhost` and literal loopback IP addresses) remain unchanged and do not
+warn. A future release will reject these remote plaintext configurations.
+
+Set the matching environment variable to `true` only when the network boundary
+is intentionally private and controlled:
+
+| Backend | Explicit acknowledgement setting | Plaintext condition |
+|---|---|---|
+| Redis | `SCRAPY_REDIS_ALLOW_REMOTE_PLAINTEXT` | `ssl_enabled=False` with no Redis or Sentinel credentials |
+| MongoDB | `SCRAPY_MONGO_ALLOW_REMOTE_PLAINTEXT` | no effective TLS and no MongoDB authentication |
+| Elasticsearch | `SCRAPY_ELASTICSEARCH_ALLOW_REMOTE_PLAINTEXT` | unauthenticated remote `http://` host |
+| Kafka | `SCRAPY_KAFKA_ALLOW_REMOTE_PLAINTEXT` | unauthenticated `PLAINTEXT` brokers |
+| Pulsar | `SCRAPY_PULSAR_ALLOW_REMOTE_PLAINTEXT` | unauthenticated `pulsar://` endpoint |
+| RocketMQ | `SCRAPY_ROCKETMQ_ALLOW_REMOTE_PLAINTEXT` | `tls_enabled=False` with no access/secret key pair |
+
+These flags suppress only the transition warning; they never weaken existing
+credential or TLS validation. For example, authenticated Redis or MongoDB
+connections still require their verified TLS settings, Elasticsearch credentials
+over `http://` still fail, Kafka `SASL_PLAINTEXT` still fails, Pulsar tokens
+still require `pulsar+ssl://`, and authenticated RocketMQ connections still
+require `tls_enabled=True`.
+
 ## SQS Private boto3 Sessions
 
 Every new SQS connection generation now creates a private
@@ -343,10 +370,13 @@ or application-layer encryption before copying a backlog or snapshot.
 
 ## Strategy Snapshots
 
-Only strategies with in-process state produce snapshots, and persistence is
-available only when the queue's own `ConnectionManager` also exposes Storage.
-Configuring a separate storage backend for the item pipeline does not give a
-Kafka/RabbitMQ/Pulsar/SQS/RocketMQ queue manager snapshot capability.
+Only strategies with in-process state produce snapshots. Redis, MongoDB, and
+Elasticsearch queues use their own storage capability. A Kafka, RabbitMQ,
+Pulsar, SQS, or RocketMQ queue can instead use the configured
+`SCRAPY_STORAGE_BACKEND_*` component for snapshots; this scheduler-owned
+acquire is independent of whether the item pipeline is enabled. A legacy
+queue-only global configuration with no storage component continues to skip
+snapshots best-effort.
 
 Without an owner, the logical snapshot key remains:
 

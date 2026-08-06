@@ -4,7 +4,7 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/azwpayne/scrapy-extension/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://pypi.org/project/scrapy-extension/)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://github.com/azwpayne/scrapy-extension/releases)
 
 ## Contents
 
@@ -33,6 +33,21 @@ Distributed crawling for Scrapy with pluggable backends (**Redis**, **MongoDB**,
 
 ## Installation
 
+### Source checkout (currently available)
+
+The project has not published a PyPI release yet. Clone the repository and
+install the extra for the backend you intend to use:
+
+```bash
+git clone https://github.com/azwpayne/scrapy-extension.git
+cd scrapy-extension
+pip install -e ".[redis]"
+```
+
+### PyPI (after the first public release)
+
+Once a tagged release is published to PyPI, install the same extras with:
+
 ```bash
 pip install scrapy-extension                  # Core (no backend deps required)
 pip install scrapy-extension[redis]           # Redis backend
@@ -51,6 +66,18 @@ pip install scrapy-extension[all]             # All backends
 Backends are loaded lazily via PEP 562 — the core package works without any backend deps installed. Backend-specific dependencies are only loaded when a backend class is first accessed.
 
 ## Quick Start
+
+This example uses Redis for scheduling, duplicate filtering, and item storage.
+From a source checkout, install the Redis extra and start a Redis server that is
+reachable at `localhost:6379` before starting the crawl:
+
+```bash
+pip install -e ".[redis]"
+docker run -d --rm --name scrapy-extension-redis -p 127.0.0.1:6379:6379 redis:7-alpine
+```
+
+> **Local development only:** This Docker command binds Redis to loopback; do
+> not use it on shared, cloud, or production hosts.
 
 ```python
 import scrapy
@@ -365,7 +392,7 @@ usually unreachable from the host.
 
 ```python
 SCRAPY_BACKEND_TYPE = "pulsar"
-SCRAPY_PULSAR_SERVICE_URL = "pulsar://localhost:6655"
+SCRAPY_PULSAR_SERVICE_URL = "pulsar://localhost:6650"
 ```
 
 Token-authenticated deployments must use fully verified TLS:
@@ -576,7 +603,7 @@ What the library contractually promises — and just as importantly, what it doe
 | Layer | Strategy | Cross-worker safe? | Notes |
 |---|---|---|---|
 | Queue | `passthrough` (default) | Yes | Items remain in the backend queue. Redis/MongoDB/ElasticSearch remove atomically; Kafka/RabbitMQ/RocketMQ/Pulsar/SQS lease or deliver with a per-message ack token. |
-| Queue | `delay` | Per-process | In-process `heapq`; a clean-close snapshot is available only when the **queue backend itself** also implements `StorageBackend`. Queue-only backends cannot persist it. Hard crashes lose unsnapshotted state. In multi-worker deployments set a stable, unique `SCRAPY_QUEUE_SNAPSHOT_OWNER` (or `SCRAPY_QUEUE_WORKER_ID` fallback) to prevent workers from sharing a snapshot key. |
+| Queue | `delay` | Per-process | In-process `heapq`; clean-close state snapshots use the queue backend's storage capability, or the configured storage component when the queue is queue-only. Hard crashes lose state since the last clean checkpoint. In multi-worker deployments set a stable, unique `SCRAPY_QUEUE_SNAPSHOT_OWNER` (or `SCRAPY_QUEUE_WORKER_ID` fallback) to prevent workers from sharing a snapshot key. |
 | Queue | `round_robin` | Per-process | Fair dispatch across `request.meta['source']` using a per-worker index. |
 | Queue | `throttle` | Per-process | Effective rate under N workers = `N × (1 / min_interval)`. |
 | Queue | `priority` | Yes | Items live in backend-side priority buckets; Kafka and RocketMQ are rejected because their consumers cannot isolate a scan across strategy-created topics. |
@@ -608,7 +635,7 @@ are **per-process opt-in**. `priority` and correctly configured
 | **Input names are validated.** Queue / set / index / topic names match the documented safe subsets; injection-shaped inputs are rejected before use. | `backends.base._validate_key_name` and backend topic validators |
 | **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) carry a per-message ack token so the *specific* popped message is acked. Kafka additionally fences tokens by consumer generation, assignment epoch, and unique delivery attempt, preventing a late completion from committing a same-offset redelivery after nack/rebalance. Retry/redirect replacements transfer the token through their queue commit; user errbacks returning one or many requests use child tokens and settle the source only after every replacement is accepted. The scheduler's `from_settings` gate refuses a backend/plugin that declares single-slot ack unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py` (`QueueBackend` ack contract), `backends/kafka.py`, `schedule/scheduler.py` |
 | **Queue-before-marker publication.** On the bundled atomic scheduler/dupefilter path, a persistent dedup marker is published only after a crash-durable queue push. Failed pushes discard local intent without deleting a competing worker's marker. Volatile queue strategies use a bounded lifecycle-local shadow; broker-token replacements are rejected before volatile acceptance. | `schedule/scheduler.py`, `dupefilter/dupefilter.py`, `queue/queue.py` |
-| **Lazy optional deps.** `pip install scrapy-extension` works with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | package and backends `__getattr__` implementations |
+| **Lazy optional deps.** The core distribution installs with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | package and backends `__getattr__` implementations |
 | **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
 | **Backend capability honesty.** A backend never silently no-ops on an unsupported interface: queue-only backends omit `SetBackend`/`StorageBackend` entirely; RocketMQ set/storage are rejected at config time (`ConfigurationError` guard). The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
 | **`py.typed` marker shipped.** Full type annotations on the public surface; downstream type-checkers consume the shipped typing. | `scrapy_extension/py.typed` in the wheel |
@@ -733,8 +760,12 @@ evicts it or the queue lifecycle ends; the drop is therefore terminal for that
 worker lifecycle rather than an automatic retry signal.
 
 `delay`, `round_robin`, `time_wheel`, and `ring_buffer` implement clean-close
-snapshots. Persistence is available only when the queue's connection manager
-also exposes storage. In a multi-worker deployment, configure a stable unique
+snapshots. Redis, MongoDB, and Elasticsearch queues use their own storage
+capability. For a queue-only backend, set `SCRAPY_STORAGE_BACKEND_TYPE` (and
+its settings) to a storage-capable backend; the scheduler independently uses
+that manager for snapshots even when no item pipeline is enabled. A legacy
+queue-only global configuration with no storage component keeps its best-effort
+no-snapshot behavior. In a multi-worker deployment, configure a stable unique
 `SCRAPY_QUEUE_SNAPSHOT_OWNER` per worker; when omitted,
 `SCRAPY_QUEUE_WORKER_ID` is the fallback. A restored checkpoint remains stored
 until the next clean close replaces it with current state or deletes it after a
@@ -999,7 +1030,7 @@ uv run pytest --cov=scrapy_extension --cov-report=term-missing
 uv run poe test
 ```
 
-Test infrastructure includes: pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage with `fail_under = 95`), pytest-ruff (lint), pytest-socket (unit tests run with sockets disabled by default), and more. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and `--force-enable-socket`.
+Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage with `fail_under = 95`), and pytest-socket (unit tests run with sockets disabled by default). Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and `--force-enable-socket`.
 
 ## License
 

@@ -52,13 +52,13 @@ comes from this document; being exported does not automatically make it Stable.
 | Dedup `bloom` | Stable | Pure-stdlib; configurable FP rate; never false-negatives. |
 | Dedup `cuckoo` | Stable | Pure-stdlib; raises `FilterFull` at capacity → degrades to passthrough + warn-once. |
 | Queue `passthrough` | Stable | Default; delegates to `QueueBackend`. |
-| Queue `delay` | Experimental | In-process `heapq`; hard crashes lose unsnapshotted state. Clean-close snapshot requires the queue backend itself to support storage and a unique owner in multi-worker deployments. |
-| Queue `round_robin` | Experimental | Fully in-process per-worker queues/fairness cursor; same snapshot capability limits as `delay`; bypasses an MQ broker when paired with one. |
+| Queue `delay` | Experimental | In-process `heapq`; hard crashes lose state since the last clean checkpoint. Clean-close snapshot uses queue storage, or `SCRAPY_STORAGE_BACKEND_*` for a queue-only backend; requires a unique owner in multi-worker deployments. |
+| Queue `round_robin` | Experimental | Fully in-process per-worker queues/fairness cursor; same snapshot capability and ownership rules as `delay`; bypasses an MQ broker when paired with one. |
 | Queue `throttle` | Experimental | In-process rate limiter; effective rate scales with worker count. |
 | Queue `priority` | Experimental | Backend-side physical buckets; rejected with Kafka/RocketMQ because their consumers cannot isolate physical-topic scans. |
-| Queue `time_wheel` | Experimental | In-process timing wheel + overflow heap; same snapshot capability limits as `delay`. |
+| Queue `time_wheel` | Experimental | In-process timing wheel + overflow heap; same snapshot capability and ownership rules as `delay`. |
 | Queue `work_stealing` | Experimental | Backend-side worker queues; requires stable worker IDs and an explicit peer list; rejected with Kafka/RocketMQ. |
-| Queue `ring_buffer` | Experimental | Bounded fully in-process storage; bypasses an MQ broker; hard crashes lose unsnapshotted items. |
+| Queue `ring_buffer` | Experimental | Bounded fully in-process storage; bypasses an MQ broker; snapshot uses queue or configured storage; hard crashes lose state since the last clean checkpoint. |
 | Storage `passthrough` | Stable | Default; writes directly to `StorageBackend`. |
 | Storage `batched` | Experimental | In-process buffer; hard crashes can lose an unflushed batch. |
 

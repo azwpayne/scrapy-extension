@@ -9,17 +9,17 @@ its own pluggable strategy layer.
 from __future__ import annotations
 
 __all__ = [
-  "BatchedStorageStrategy",
-  "PassthroughStorageStrategy",
-  "StorageStrategy",
-  "StorageStrategyType",
-  "create_storage_strategy",
+    "BatchedStorageStrategy",
+    "PassthroughStorageStrategy",
+    "StorageStrategy",
+    "StorageStrategyType",
+    "create_storage_strategy",
 ]
 
 from scrapy_extension.storage.strategies import (
-  BatchedStorageStrategy,
-  PassthroughStorageStrategy,
-  StorageStrategy,
-  StorageStrategyType,
-  create_storage_strategy,
+    BatchedStorageStrategy,
+    PassthroughStorageStrategy,
+    StorageStrategy,
+    StorageStrategyType,
+    create_storage_strategy,
 )

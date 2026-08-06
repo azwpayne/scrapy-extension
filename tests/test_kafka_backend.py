@@ -15,1965 +15,1973 @@ from kafka.errors import KafkaError, TopicAlreadyExistsError
 from scrapy_extension.backends import kafka as kafka_module
 from scrapy_extension.backends.kafka import KafkaBackend
 from scrapy_extension.exceptions import (
-  BackendConnectionError,
-  ConfigurationError,
-  QueueError,
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
 )
 from scrapy_extension.settings import KafkaMode, KafkaSettings
 
 
 class TestKafkaBackendConnect:
-  """Tests for connect() method and its helper methods."""
+    """Tests for connect() method and its helper methods."""
 
-  @staticmethod
-  def _settings_for_connect_diagnostic_mode(mode: KafkaMode) -> KafkaSettings:
-    """Return a valid configuration for each mode-specific connect helper."""
-    if mode == KafkaMode.CLUSTER:
-      return KafkaSettings(mode=mode, cluster_brokers=["broker:9092"])
-    if mode == KafkaMode.CONFLUENT:
-      return KafkaSettings(
-        mode=mode,
-        confluent_api_key="key",
-        confluent_api_secret="secret",
-        confluent_bootstrap_servers="broker:9092",
-      )
-    return KafkaSettings(mode=mode)
+    @staticmethod
+    def _settings_for_connect_diagnostic_mode(mode: KafkaMode) -> KafkaSettings:
+        """Return a valid configuration for each mode-specific connect helper."""
+        if mode == KafkaMode.CLUSTER:
+            return KafkaSettings(mode=mode, cluster_brokers=["broker:9092"])
+        if mode == KafkaMode.CONFLUENT:
+            return KafkaSettings(
+                mode=mode,
+                confluent_api_key="key",
+                confluent_api_secret="secret",
+                confluent_bootstrap_servers="broker:9092",
+            )
+        return KafkaSettings(mode=mode)
 
-  @pytest.mark.parametrize(
-    ("mode", "diagnostic_error"),
-    [
-      (mode, error)
-      for mode in KafkaMode
-      for error in (
-        RuntimeError("diagnostic failed"),
-        KeyboardInterrupt("diagnostic interrupted"),
-        SystemExit("diagnostic exited"),
-      )
-    ],
-  )
-  @pytest.mark.parametrize("diagnostic_position", ["helper", "outer"])
-  def test_connect_success_diagnostics_cannot_abort_published_generation(
-    self, mocker, mode, diagnostic_error, diagnostic_position
-  ):
-    """Every mode keeps its complete graph despite success-log failures."""
-    backend = KafkaBackend(self._settings_for_connect_diagnostic_mode(mode))
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+    @pytest.mark.parametrize(
+        ("mode", "diagnostic_error"),
+        [
+            (mode, error)
+            for mode in KafkaMode
+            for error in (
+                RuntimeError("diagnostic failed"),
+                KeyboardInterrupt("diagnostic interrupted"),
+                SystemExit("diagnostic exited"),
+            )
+        ],
     )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
-    )
-    logger_debug = mocker.patch("scrapy_extension.backends.kafka.logger.debug")
-    logger_debug.side_effect = (
-      [diagnostic_error, None]
-      if diagnostic_position == "helper"
-      else [None, diagnostic_error]
-    )
+    @pytest.mark.parametrize("diagnostic_position", ["helper", "outer"])
+    def test_connect_success_diagnostics_cannot_abort_published_generation(
+        self, mocker, mode, diagnostic_error, diagnostic_position
+    ):
+        """Every mode keeps its complete graph despite success-log failures."""
+        backend = KafkaBackend(self._settings_for_connect_diagnostic_mode(mode))
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+        )
+        logger_debug = mocker.patch("scrapy_extension.backends.kafka.logger.debug")
+        logger_debug.side_effect = (
+            [diagnostic_error, None]
+            if diagnostic_position == "helper"
+            else [None, diagnostic_error]
+        )
 
-    backend.connect()
-
-    assert backend._producer is producer
-    assert backend._admin_client is admin
-    assert backend.is_connected() is True
-    assert logger_debug.call_count == 2
-    producer.close.assert_not_called()
-    admin.close.assert_not_called()
-
-  def test_backend_rejects_auto_commit_with_explicit_ack_contract(self):
-    """KafkaBackend requires application-level ack, so auto-commit is unsafe."""
-    config = KafkaSettings(enable_auto_commit=True)
-
-    with pytest.raises(ConfigurationError, match="enable_auto_commit") as exc_info:
-      KafkaBackend(config)
-
-    assert exc_info.value.setting_name == "enable_auto_commit"
-
-  def test_connect_unsupported_mode(self):
-    """Test connect raises ConfigurationError for unsupported mode."""
-    from unittest.mock import MagicMock
-
-    # Create mock config with invalid mode
-    mock_config = MagicMock()
-    mock_config.mode = "invalid_mode"
-    mock_config.sasl_mechanism = "PLAIN"
-    mock_config.security_protocol = "PLAINTEXT"
-
-    backend = KafkaBackend(mock_config)
-    with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
-    assert "Unsupported Kafka mode" in str(exc_info.value)
-    assert exc_info.value.setting_name == "mode"
-
-  def test_connect_standalone_success(self, mocker):
-    """Test successful connection in standalone mode."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-
-    mock_producer_instance = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer_instance,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      return_value=mocker.MagicMock(),
-    )
-
-    backend.connect()
-
-    assert backend.is_connected()
-    mock_producer_instance.send.assert_not_called()
-
-  def test_connect_is_idempotent_for_a_complete_client_graph(self, mocker):
-    """A second connect must retain the established producer/admin pair."""
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    producer_factory = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
-    )
-    admin_factory = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
-    )
-
-    backend.connect()
-    backend.connect()
-
-    assert backend._producer is producer
-    assert backend._admin_client is admin
-    producer_factory.assert_called_once()
-    admin_factory.assert_called_once()
-    producer.close.assert_not_called()
-    admin.close.assert_not_called()
-
-  def test_connect_retires_one_sided_residual_before_new_generation(self, mocker):
-    """An interrupted prior generation cannot be overwritten and leaked."""
-    backend = KafkaBackend(KafkaSettings())
-    residual_producer = mocker.MagicMock()
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    backend._producer = residual_producer
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
-    )
-
-    backend.connect()
-
-    residual_producer.close.assert_called_once_with()
-    assert backend._producer is producer
-    assert backend._admin_client is admin
-
-  def test_overlapping_connects_create_one_complete_generation(self, mocker):
-    """The second connect waits for the first and reuses its completed graph."""
-    backend = KafkaBackend(KafkaSettings())
-    producer_started = Event()
-    release_producer = Event()
-    second_finished = Event()
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-
-    def make_producer(**_kwargs):
-      producer_started.set()
-      assert release_producer.wait(timeout=1.0)
-      return producer
-
-    producer_factory = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", side_effect=make_producer
-    )
-    admin_factory = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
-    )
-    first = Thread(target=backend.connect)
-    second = Thread(target=lambda: (backend.connect(), second_finished.set()))
-
-    first.start()
-    assert producer_started.wait(timeout=1.0)
-    second.start()
-    assert second_finished.wait(timeout=0.05) is False
-    assert producer_factory.call_count == 1
-
-    release_producer.set()
-    first.join(timeout=1.0)
-    second.join(timeout=1.0)
-
-    assert first.is_alive() is False
-    assert second.is_alive() is False
-    assert second_finished.is_set()
-    assert backend._producer is producer
-    assert backend._admin_client is admin
-    producer_factory.assert_called_once()
-    admin_factory.assert_called_once()
-
-  def test_disconnect_waits_for_connect_generation_then_detaches_it(self, mocker):
-    """Disconnect cannot observe or close a half-published connect graph."""
-    backend = KafkaBackend(KafkaSettings())
-    producer_started = Event()
-    release_producer = Event()
-    disconnect_finished = Event()
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-
-    def make_producer(**_kwargs):
-      producer_started.set()
-      assert release_producer.wait(timeout=1.0)
-      return producer
-
-    producer_factory = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", side_effect=make_producer
-    )
-    admin_factory = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
-    )
-    connect_thread = Thread(target=backend.connect)
-    disconnect_thread = Thread(
-      target=lambda: (backend.disconnect(), disconnect_finished.set())
-    )
-
-    connect_thread.start()
-    assert producer_started.wait(timeout=1.0)
-    disconnect_thread.start()
-    assert disconnect_finished.wait(timeout=0.05) is False
-
-    release_producer.set()
-    connect_thread.join(timeout=1.0)
-    disconnect_thread.join(timeout=1.0)
-
-    assert connect_thread.is_alive() is False
-    assert disconnect_thread.is_alive() is False
-    assert disconnect_finished.is_set()
-    producer_factory.assert_called_once()
-    admin_factory.assert_called_once()
-    producer.close.assert_called_once_with()
-    admin.close.assert_called_once_with()
-    assert backend._producer is None
-    assert backend._admin_client is None
-
-  def test_connect_standalone_kafka_error(self, mocker):
-    """Test connect raises BackendConnectionError on KafkaError."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      side_effect=KafkaError("Connection failed"),
-    )
-
-    with pytest.raises(BackendConnectionError) as exc_info:
-      backend.connect()
-    assert "Failed to connect to Kafka" in str(exc_info.value)
-    assert exc_info.value.backend_type == "kafka"
-
-  def test_connect_standalone_generic_error(self, mocker):
-    """Test connect raises BackendConnectionError on generic Exception."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    marker = "kafka-driver-secret"
-
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      side_effect=RuntimeError(f"Unexpected error included {marker}"),
-    )
-
-    with pytest.raises(BackendConnectionError) as exc_info:
-      backend.connect()
-    assert "Failed to connect to Kafka" in str(exc_info.value)
-    assert marker not in str(exc_info.value)
-    assert marker not in repr(exc_info.value.__dict__)
-    assert marker not in "".join(traceback.format_exception(exc_info.value))
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-
-  def test_connect_admin_client_failure_nulls_producer_no_wedge(self, mocker):
-    """R-kacc: admin-client failure AFTER producer assigned must not wedge.
-
-    ``KafkaAdminClient`` construction runs after ``self._producer`` is
-    assigned in each ``_connect_*`` path. If admin construction raises, the
-    producer must be closed and nulled so ``is_connected()`` reports False
-    truthfully (no silent wedge) and the producer is not leaked under the
-    ConnectionManager retry loop. Mirrors the R-mcc memcached connect-cleanup
-    (PR #60).
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-
-    mock_producer = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      side_effect=KafkaError("admin init failed"),
-    )
-
-    with pytest.raises(BackendConnectionError):
-      backend.connect()
-
-    # No wedge: is_connected() must be truthful False, not lie True.
-    assert backend.is_connected() is False
-    assert backend._producer is None
-    # No leak: the partially-assigned producer was closed before nulling.
-    mock_producer.close.assert_called_once()
-
-  def test_failed_connect_cleanup_log_has_no_active_driver_exception(
-    self, mocker
-  ) -> None:
-    """A cleanup handler runs only after the failed-connect suite has exited."""
-
-    class _ExceptionContextHandler(logging.Handler):
-      def __init__(self) -> None:
-        super().__init__()
-        self.contexts: list[tuple[object, object, object]] = []
-
-      def emit(self, record: logging.LogRecord) -> None:
-        del record
-        self.contexts.append(sys.exc_info())
-
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    producer.close.side_effect = RuntimeError("close failure marker")
-
-    def fail_after_assigning_producer(_snapshot: object) -> None:
-      backend._producer = producer
-      raise RuntimeError("connect failure marker")
-
-    mocker.patch.object(
-      backend, "_connect_standalone", side_effect=fail_after_assigning_producer
-    )
-    handler = _ExceptionContextHandler()
-    original_level = kafka_module.logger.level
-    kafka_module.logger.setLevel(logging.DEBUG)
-    kafka_module.logger.addHandler(handler)
-    try:
-      with pytest.raises(BackendConnectionError):
         backend.connect()
-    finally:
-      kafka_module.logger.removeHandler(handler)
-      kafka_module.logger.setLevel(original_level)
 
-    assert handler.contexts == [(None, None, None)]
+        assert backend._producer is producer
+        assert backend._admin_client is admin
+        assert backend.is_connected() is True
+        assert logger_debug.call_count == 2
+        producer.close.assert_not_called()
+        admin.close.assert_not_called()
 
-  def test_connect_admin_client_baseexception_nulls_producer_no_wedge(self, mocker):
-    """R16-A: a BaseException mid-construction must not skip the abort arm.
+    def test_backend_rejects_auto_commit_with_explicit_ack_contract(self):
+        """KafkaBackend requires application-level ack, so auto-commit is unsafe."""
+        config = KafkaSettings(enable_auto_commit=True)
 
-    A ``KeyboardInterrupt`` / ``SystemExit`` raised by ``KafkaAdminClient``
-    (after ``self._producer`` is assigned) is NOT an ``Exception`` subclass, so
-    the ``except KafkaError`` / ``except Exception`` arms cannot catch it.
-    Without an ``except BaseException`` arm the producer leaks and
-    ``is_connected()`` lies True — the R-mcc#60 / R-kacc#67 wedge class, the
-    BaseException variant. mongodb/es/dynamodb/redis all carry the BaseException
-    cleanup arm; kafka must too.
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+        with pytest.raises(ConfigurationError, match="enable_auto_commit") as exc_info:
+            KafkaBackend(config)
 
-    mock_producer = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      side_effect=KeyboardInterrupt,
-    )
+        assert exc_info.value.setting_name == "enable_auto_commit"
 
-    # The BaseException must propagate, not be swallowed into BackendConnectionError.
-    with pytest.raises(KeyboardInterrupt):
-      backend.connect()
+    def test_connect_unsupported_mode(self):
+        """Test connect raises ConfigurationError for unsupported mode."""
+        from unittest.mock import MagicMock
 
-    # No wedge: abort ran, so the producer is closed+nulled and is_connected() is truthful.
-    assert backend.is_connected() is False
-    assert backend._producer is None
-    mock_producer.close.assert_called_once()
+        # Create mock config with invalid mode
+        mock_config = MagicMock()
+        mock_config.mode = "invalid_mode"
+        mock_config.sasl_mechanism = "PLAIN"
+        mock_config.security_protocol = "PLAINTEXT"
 
-  def test_abort_partial_connect_nulls_before_close_so_second_interrupt_cannot_rewedge(
-    self, mocker
-  ):
-    """R17-A: a second BaseException during ``close()`` must not leave state set.
+        backend = KafkaBackend(mock_config)
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend.connect()
+        assert "Unsupported Kafka mode" in str(exc_info.value)
+        assert exc_info.value.setting_name == "mode"
 
-    R16-A routes ``BaseException`` into ``_abort_partial_connect()`` while an
-    interrupt is already in flight. If the helper nulls AFTER ``close()`` under
-    ``contextlib.suppress(Exception)`` (which cannot catch ``BaseException``),
-    a second ``Ctrl+C`` raised by the blocking ``KafkaProducer.close()`` escapes
-    before ``self._producer = None`` runs — leaving ``_producer`` set so
-    ``is_connected()`` lies True and the producer leaks (the R-kacc wedge, re-opened
-    by R16-A's own arm). Nulling FIRST (mirror rocketmq ``_abort_partial_connect`` /
-    mongodb ``_discard_client``) makes ``is_connected()`` truthful the instant the
-    abort is entered, regardless of what ``close()`` raises.
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    backend._producer = mocker.MagicMock()
-    backend._admin_client = mocker.MagicMock()
-    backend._producer.close.side_effect = KeyboardInterrupt
+    def test_connect_standalone_success(self, mocker):
+        """Test successful connection in standalone mode."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    # The close-time interrupt propagates (it is not masked)…
-    with pytest.raises(KeyboardInterrupt):
-      backend._abort_partial_connect()
+        mock_producer_instance = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer_instance,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            return_value=mocker.MagicMock(),
+        )
 
-    # …but state was nulled BEFORE the close, so no wedge on either handle.
-    assert backend._producer is None
-    assert backend._admin_client is None
+        backend.connect()
 
-  def test_abort_partial_connect_closes_all_siblings_then_raises_first_control_error(
-    self, mocker
-  ):
-    """Direct cleanup preserves its first control error after full teardown."""
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    first_error = KeyboardInterrupt("producer close interrupted")
-    producer.close.side_effect = first_error
-    admin.close.side_effect = SystemExit("admin close interrupted")
-    backend._producer = producer
-    backend._admin_client = admin
+        assert backend.is_connected()
+        mock_producer_instance.send.assert_not_called()
 
-    with pytest.raises(KeyboardInterrupt) as exc_info:
-      backend._abort_partial_connect()
+    def test_connect_is_idempotent_for_a_complete_client_graph(self, mocker):
+        """A second connect must retain the established producer/admin pair."""
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        producer_factory = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+        )
+        admin_factory = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+        )
 
-    assert exc_info.value is first_error
-    producer.close.assert_called_once_with()
-    admin.close.assert_called_once_with()
-    assert backend._producer is None
-    assert backend._admin_client is None
+        backend.connect()
+        backend.connect()
 
-  def test_failed_connect_preserves_original_control_error_over_cleanup_error(
-    self, mocker
-  ):
-    """A candidate close interrupt must not replace construction's interrupt."""
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    connect_error = KeyboardInterrupt("admin construction interrupted")
-    producer.close.side_effect = SystemExit("producer close interrupted")
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", side_effect=connect_error
-    )
+        assert backend._producer is producer
+        assert backend._admin_client is admin
+        producer_factory.assert_called_once()
+        admin_factory.assert_called_once()
+        producer.close.assert_not_called()
+        admin.close.assert_not_called()
 
-    with pytest.raises(KeyboardInterrupt) as exc_info:
-      backend.connect()
+    def test_connect_retires_one_sided_residual_before_new_generation(self, mocker):
+        """An interrupted prior generation cannot be overwritten and leaked."""
+        backend = KafkaBackend(KafkaSettings())
+        residual_producer = mocker.MagicMock()
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        backend._producer = residual_producer
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+        )
 
-    assert exc_info.value is connect_error
-    producer.close.assert_called_once_with()
-    assert backend._producer is None
-    assert backend._admin_client is None
+        backend.connect()
 
-  def test_failed_connect_ignores_abort_diagnostic_control_error_and_closes_siblings(
-    self, mocker
-  ):
-    """Abort diagnostics cannot replace the causal connect interrupt.
+        residual_producer.close.assert_called_once_with()
+        assert backend._producer is producer
+        assert backend._admin_client is admin
 
-    An ordinary producer-close error is diagnostic-only.  If a custom logging
-    handler raises while reporting it, teardown must still offer ``close()`` to
-    the admin sibling and re-raise the original failed-connect interrupt.
-    """
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    connect_error = KeyboardInterrupt("connect interrupted")
-    producer.close.side_effect = RuntimeError("producer close failed")
+    def test_overlapping_connects_create_one_complete_generation(self, mocker):
+        """The second connect waits for the first and reuses its completed graph."""
+        backend = KafkaBackend(KafkaSettings())
+        producer_started = Event()
+        release_producer = Event()
+        second_finished = Event()
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
 
-    def fail_after_assigning_both_clients(_snapshot: object) -> None:
-      backend._producer = producer
-      backend._admin_client = admin
-      raise connect_error
+        def make_producer(**_kwargs):
+            producer_started.set()
+            assert release_producer.wait(timeout=1.0)
+            return producer
 
-    mocker.patch.object(
-      backend, "_connect_standalone", side_effect=fail_after_assigning_both_clients
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.logger.debug", side_effect=SystemExit("log")
-    )
+        producer_factory = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", side_effect=make_producer
+        )
+        admin_factory = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+        )
+        first = Thread(target=backend.connect)
+        second = Thread(target=lambda: (backend.connect(), second_finished.set()))
 
-    with pytest.raises(KeyboardInterrupt) as exc_info:
-      backend.connect()
+        first.start()
+        assert producer_started.wait(timeout=1.0)
+        second.start()
+        assert second_finished.wait(timeout=0.05) is False
+        assert producer_factory.call_count == 1
 
-    assert exc_info.value is connect_error
-    producer.close.assert_called_once_with()
-    admin.close.assert_called_once_with()
-    assert backend._producer is None
-    assert backend._admin_client is None
+        release_producer.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
 
-  def test_residual_cleanup_control_error_does_not_prevent_new_generation(
-    self, mocker
-  ):
-    """A stale client's close interrupt is best-effort before a fresh connect."""
-    backend = KafkaBackend(KafkaSettings())
-    residual_producer = mocker.MagicMock()
-    residual_producer.close.side_effect = KeyboardInterrupt("residual close")
-    producer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    backend._producer = residual_producer
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
-    )
+        assert first.is_alive() is False
+        assert second.is_alive() is False
+        assert second_finished.is_set()
+        assert backend._producer is producer
+        assert backend._admin_client is admin
+        producer_factory.assert_called_once()
+        admin_factory.assert_called_once()
 
-    backend.connect()
+    def test_disconnect_waits_for_connect_generation_then_detaches_it(self, mocker):
+        """Disconnect cannot observe or close a half-published connect graph."""
+        backend = KafkaBackend(KafkaSettings())
+        producer_started = Event()
+        release_producer = Event()
+        disconnect_finished = Event()
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
 
-    residual_producer.close.assert_called_once_with()
-    assert backend._producer is producer
-    assert backend._admin_client is admin
+        def make_producer(**_kwargs):
+            producer_started.set()
+            assert release_producer.wait(timeout=1.0)
+            return producer
 
-  def test_abort_partial_connect_nulls_admin_first_when_producer_close_succeeds(
-    self, mocker
-  ):
-    """R17-A companion: a close-time interrupt on the admin client still nulls both."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    backend._producer = mocker.MagicMock()
-    backend._admin_client = mocker.MagicMock()
-    backend._admin_client.close.side_effect = SystemExit
+        producer_factory = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", side_effect=make_producer
+        )
+        admin_factory = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+        )
+        connect_thread = Thread(target=backend.connect)
+        disconnect_thread = Thread(
+            target=lambda: (backend.disconnect(), disconnect_finished.set())
+        )
 
-    with pytest.raises(SystemExit):
-      backend._abort_partial_connect()
+        connect_thread.start()
+        assert producer_started.wait(timeout=1.0)
+        disconnect_thread.start()
+        assert disconnect_finished.wait(timeout=0.05) is False
 
-    assert backend._producer is None
-    assert backend._admin_client is None
+        release_producer.set()
+        connect_thread.join(timeout=1.0)
+        disconnect_thread.join(timeout=1.0)
 
-  def test_connect_rejects_mutated_unconfirmed_acks_before_sdk_io(self, mocker):
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    config.acks = 0
-    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
-    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+        assert connect_thread.is_alive() is False
+        assert disconnect_thread.is_alive() is False
+        assert disconnect_finished.is_set()
+        producer_factory.assert_called_once()
+        admin_factory.assert_called_once()
+        producer.close.assert_called_once_with()
+        admin.close.assert_called_once_with()
+        assert backend._producer is None
+        assert backend._admin_client is None
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
+    def test_connect_standalone_kafka_error(self, mocker):
+        """Test connect raises BackendConnectionError on KafkaError."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    assert exc_info.value.setting_name == "acks"
-    producer.assert_not_called()
-    admin.assert_not_called()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            side_effect=KafkaError("Connection failed"),
+        )
+
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.connect()
+        assert "Failed to connect to Kafka" in str(exc_info.value)
+        assert exc_info.value.backend_type == "kafka"
+
+    def test_connect_standalone_generic_error(self, mocker):
+        """Test connect raises BackendConnectionError on generic Exception."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        marker = "kafka-driver-secret"
+
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            side_effect=RuntimeError(f"Unexpected error included {marker}"),
+        )
+
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.connect()
+        assert "Failed to connect to Kafka" in str(exc_info.value)
+        assert marker not in str(exc_info.value)
+        assert marker not in repr(exc_info.value.__dict__)
+        assert marker not in "".join(traceback.format_exception(exc_info.value))
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_connect_admin_client_failure_nulls_producer_no_wedge(self, mocker):
+        """R-kacc: admin-client failure AFTER producer assigned must not wedge.
+
+        ``KafkaAdminClient`` construction runs after ``self._producer`` is
+        assigned in each ``_connect_*`` path. If admin construction raises, the
+        producer must be closed and nulled so ``is_connected()`` reports False
+        truthfully (no silent wedge) and the producer is not leaked under the
+        ConnectionManager retry loop. Mirrors the R-mcc memcached connect-cleanup
+        (PR #60).
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+
+        mock_producer = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            side_effect=KafkaError("admin init failed"),
+        )
+
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
+
+        # No wedge: is_connected() must be truthful False, not lie True.
+        assert backend.is_connected() is False
+        assert backend._producer is None
+        # No leak: the partially-assigned producer was closed before nulling.
+        mock_producer.close.assert_called_once()
+
+    def test_failed_connect_cleanup_log_has_no_active_driver_exception(
+        self, mocker
+    ) -> None:
+        """A cleanup handler runs only after the failed-connect suite has exited."""
+
+        class _ExceptionContextHandler(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.contexts: list[tuple[object, object, object]] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                del record
+                self.contexts.append(sys.exc_info())
+
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        producer.close.side_effect = RuntimeError("close failure marker")
+
+        def fail_after_assigning_producer(_snapshot: object) -> None:
+            backend._producer = producer
+            raise RuntimeError("connect failure marker")
+
+        mocker.patch.object(
+            backend, "_connect_standalone", side_effect=fail_after_assigning_producer
+        )
+        handler = _ExceptionContextHandler()
+        original_level = kafka_module.logger.level
+        kafka_module.logger.setLevel(logging.DEBUG)
+        kafka_module.logger.addHandler(handler)
+        try:
+            with pytest.raises(BackendConnectionError):
+                backend.connect()
+        finally:
+            kafka_module.logger.removeHandler(handler)
+            kafka_module.logger.setLevel(original_level)
+
+        assert handler.contexts == [(None, None, None)]
+
+    def test_connect_admin_client_baseexception_nulls_producer_no_wedge(self, mocker):
+        """R16-A: a BaseException mid-construction must not skip the abort arm.
+
+        A ``KeyboardInterrupt`` / ``SystemExit`` raised by ``KafkaAdminClient``
+        (after ``self._producer`` is assigned) is NOT an ``Exception`` subclass, so
+        the ``except KafkaError`` / ``except Exception`` arms cannot catch it.
+        Without an ``except BaseException`` arm the producer leaks and
+        ``is_connected()`` lies True — the R-mcc#60 / R-kacc#67 wedge class, the
+        BaseException variant. mongodb/es/dynamodb/redis all carry the BaseException
+        cleanup arm; kafka must too.
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+
+        mock_producer = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            side_effect=KeyboardInterrupt,
+        )
+
+        # The BaseException must propagate, not be swallowed into BackendConnectionError.
+        with pytest.raises(KeyboardInterrupt):
+            backend.connect()
+
+        # No wedge: abort ran, so the producer is closed+nulled and is_connected() is truthful.
+        assert backend.is_connected() is False
+        assert backend._producer is None
+        mock_producer.close.assert_called_once()
+
+    def test_abort_partial_connect_nulls_before_close_so_second_interrupt_cannot_rewedge(
+        self, mocker
+    ):
+        """R17-A: a second BaseException during ``close()`` must not leave state set.
+
+        R16-A routes ``BaseException`` into ``_abort_partial_connect()`` while an
+        interrupt is already in flight. If the helper nulls AFTER ``close()`` under
+        ``contextlib.suppress(Exception)`` (which cannot catch ``BaseException``),
+        a second ``Ctrl+C`` raised by the blocking ``KafkaProducer.close()`` escapes
+        before ``self._producer = None`` runs — leaving ``_producer`` set so
+        ``is_connected()`` lies True and the producer leaks (the R-kacc wedge, re-opened
+        by R16-A's own arm). Nulling FIRST (mirror rocketmq ``_abort_partial_connect`` /
+        mongodb ``_discard_client``) makes ``is_connected()`` truthful the instant the
+        abort is entered, regardless of what ``close()`` raises.
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        backend._producer = mocker.MagicMock()
+        backend._admin_client = mocker.MagicMock()
+        backend._producer.close.side_effect = KeyboardInterrupt
+
+        # The close-time interrupt propagates (it is not masked)…
+        with pytest.raises(KeyboardInterrupt):
+            backend._abort_partial_connect()
+
+        # …but state was nulled BEFORE the close, so no wedge on either handle.
+        assert backend._producer is None
+        assert backend._admin_client is None
+
+    def test_abort_partial_connect_closes_all_siblings_then_raises_first_control_error(
+        self, mocker
+    ):
+        """Direct cleanup preserves its first control error after full teardown."""
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        first_error = KeyboardInterrupt("producer close interrupted")
+        producer.close.side_effect = first_error
+        admin.close.side_effect = SystemExit("admin close interrupted")
+        backend._producer = producer
+        backend._admin_client = admin
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            backend._abort_partial_connect()
+
+        assert exc_info.value is first_error
+        producer.close.assert_called_once_with()
+        admin.close.assert_called_once_with()
+        assert backend._producer is None
+        assert backend._admin_client is None
+
+    def test_failed_connect_preserves_original_control_error_over_cleanup_error(
+        self, mocker
+    ):
+        """A candidate close interrupt must not replace construction's interrupt."""
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        connect_error = KeyboardInterrupt("admin construction interrupted")
+        producer.close.side_effect = SystemExit("producer close interrupted")
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            side_effect=connect_error,
+        )
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            backend.connect()
+
+        assert exc_info.value is connect_error
+        producer.close.assert_called_once_with()
+        assert backend._producer is None
+        assert backend._admin_client is None
+
+    def test_failed_connect_ignores_abort_diagnostic_control_error_and_closes_siblings(
+        self, mocker
+    ):
+        """Abort diagnostics cannot replace the causal connect interrupt.
+
+        An ordinary producer-close error is diagnostic-only.  If a custom logging
+        handler raises while reporting it, teardown must still offer ``close()`` to
+        the admin sibling and re-raise the original failed-connect interrupt.
+        """
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        connect_error = KeyboardInterrupt("connect interrupted")
+        producer.close.side_effect = RuntimeError("producer close failed")
+
+        def fail_after_assigning_both_clients(_snapshot: object) -> None:
+            backend._producer = producer
+            backend._admin_client = admin
+            raise connect_error
+
+        mocker.patch.object(
+            backend,
+            "_connect_standalone",
+            side_effect=fail_after_assigning_both_clients,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.logger.debug",
+            side_effect=SystemExit("log"),
+        )
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            backend.connect()
+
+        assert exc_info.value is connect_error
+        producer.close.assert_called_once_with()
+        admin.close.assert_called_once_with()
+        assert backend._producer is None
+        assert backend._admin_client is None
+
+    def test_residual_cleanup_control_error_does_not_prevent_new_generation(
+        self, mocker
+    ):
+        """A stale client's close interrupt is best-effort before a fresh connect."""
+        backend = KafkaBackend(KafkaSettings())
+        residual_producer = mocker.MagicMock()
+        residual_producer.close.side_effect = KeyboardInterrupt("residual close")
+        producer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        backend._producer = residual_producer
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer", return_value=producer
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient", return_value=admin
+        )
+
+        backend.connect()
+
+        residual_producer.close.assert_called_once_with()
+        assert backend._producer is producer
+        assert backend._admin_client is admin
+
+    def test_abort_partial_connect_nulls_admin_first_when_producer_close_succeeds(
+        self, mocker
+    ):
+        """R17-A companion: a close-time interrupt on the admin client still nulls both."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        backend._producer = mocker.MagicMock()
+        backend._admin_client = mocker.MagicMock()
+        backend._admin_client.close.side_effect = SystemExit
+
+        with pytest.raises(SystemExit):
+            backend._abort_partial_connect()
+
+        assert backend._producer is None
+        assert backend._admin_client is None
+
+    def test_connect_rejects_mutated_unconfirmed_acks_before_sdk_io(self, mocker):
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        config.acks = 0
+        producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+        admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend.connect()
+
+        assert exc_info.value.setting_name == "acks"
+        producer.assert_not_called()
+        admin.assert_not_called()
 
 
 class TestKafkaBackendBuildCommonConfig:
-  """Tests for _build_common_config method."""
+    """Tests for _build_common_config method."""
 
-  def test_build_common_config_basic(self):
-    """Test basic config building without security."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_build_common_config_basic(self):
+        """Test basic config building without security."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    result = backend._build_common_config()
+        result = backend._build_common_config()
 
-    assert result["acks"] == config.acks
-    assert result["retries"] == config.retries
-    assert result["batch_size"] == config.batch_size
-    assert result["linger_ms"] == config.linger_ms
-    assert result["compression_type"] == config.compression_type
-    assert (
-      result["max_in_flight_requests_per_connection"]
-      == config.max_in_flight_requests_per_connection
-    )
-    assert result["request_timeout_ms"] == config.request_timeout_ms
+        assert result["acks"] == config.acks
+        assert result["retries"] == config.retries
+        assert result["batch_size"] == config.batch_size
+        assert result["linger_ms"] == config.linger_ms
+        assert result["compression_type"] == config.compression_type
+        assert (
+            result["max_in_flight_requests_per_connection"]
+            == config.max_in_flight_requests_per_connection
+        )
+        assert result["request_timeout_ms"] == config.request_timeout_ms
 
-  def test_build_common_config_with_sasl_ssl(self):
-    """Test config building with SASL/SSL settings."""
-    config = KafkaSettings(
-      security_protocol="SASL_SSL",
-      sasl_mechanism="PLAIN",
-      sasl_username="myuser",
-      sasl_password="mypass",
-      ssl_cafile="/path/to/cafile",
-      ssl_certfile="/path/to/certfile",
-      ssl_keyfile="/path/to/keyfile",
-      ssl_check_hostname=True,
-    )
-    backend = KafkaBackend(config)
+    def test_build_common_config_with_sasl_ssl(self):
+        """Test config building with SASL/SSL settings."""
+        config = KafkaSettings(
+            security_protocol="SASL_SSL",
+            sasl_mechanism="PLAIN",
+            sasl_username="myuser",
+            sasl_password="mypass",
+            ssl_cafile="/path/to/cafile",
+            ssl_certfile="/path/to/certfile",
+            ssl_keyfile="/path/to/keyfile",
+            ssl_check_hostname=True,
+        )
+        backend = KafkaBackend(config)
 
-    result = backend._build_common_config()
+        result = backend._build_common_config()
 
-    assert result["security_protocol"] == "SASL_SSL"
-    assert result["sasl_mechanism"] == "PLAIN"
-    assert result["sasl_plain_username"] == "myuser"
-    assert result["sasl_plain_password"] == "mypass"
-    assert result["ssl_cafile"] == "/path/to/cafile"
-    assert result["ssl_certfile"] == "/path/to/certfile"
-    assert result["ssl_keyfile"] == "/path/to/keyfile"
-    assert result["ssl_check_hostname"] is True
+        assert result["security_protocol"] == "SASL_SSL"
+        assert result["sasl_mechanism"] == "PLAIN"
+        assert result["sasl_plain_username"] == "myuser"
+        assert result["sasl_plain_password"] == "mypass"
+        assert result["ssl_cafile"] == "/path/to/cafile"
+        assert result["ssl_certfile"] == "/path/to/certfile"
+        assert result["ssl_keyfile"] == "/path/to/keyfile"
+        assert result["ssl_check_hostname"] is True
 
-  def test_build_common_config_with_gssapi(self):
-    """Ambient Kerberos auth still emits the selected SDK mechanism."""
-    config = KafkaSettings(
-      security_protocol="SASL_SSL",
-      sasl_mechanism="GSSAPI",
-    )
-    backend = KafkaBackend(config)
+    def test_build_common_config_with_gssapi(self):
+        """Ambient Kerberos auth still emits the selected SDK mechanism."""
+        config = KafkaSettings(
+            security_protocol="SASL_SSL",
+            sasl_mechanism="GSSAPI",
+        )
+        backend = KafkaBackend(config)
 
-    result = backend._build_common_config()
+        result = backend._build_common_config()
 
-    assert result["security_protocol"] == "SASL_SSL"
-    assert result["sasl_mechanism"] == "GSSAPI"
-    assert "sasl_plain_username" not in result
-    assert "sasl_plain_password" not in result
+        assert result["security_protocol"] == "SASL_SSL"
+        assert result["sasl_mechanism"] == "GSSAPI"
+        assert "sasl_plain_username" not in result
+        assert "sasl_plain_password" not in result
 
-  def test_connect_revalidates_mutated_sasl_password_before_sdk_io(self, mocker):
-    """A valid model cannot be downgraded after backend construction."""
-    config = KafkaSettings(
-      security_protocol="SASL_SSL",
-      sasl_mechanism="PLAIN",
-      sasl_username="user",
-      sasl_password="secret",
-    )
-    backend = KafkaBackend(config)
-    config.sasl_password = " "  # type: ignore[assignment]
-    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
-    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+    def test_connect_revalidates_mutated_sasl_password_before_sdk_io(self, mocker):
+        """A valid model cannot be downgraded after backend construction."""
+        config = KafkaSettings(
+            security_protocol="SASL_SSL",
+            sasl_mechanism="PLAIN",
+            sasl_username="user",
+            sasl_password="secret",
+        )
+        backend = KafkaBackend(config)
+        config.sasl_password = " "  # type: ignore[assignment]
+        producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+        admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend.connect()
 
-    assert exc_info.value.setting_name == "sasl_password"
-    producer.assert_not_called()
-    admin.assert_not_called()
+        assert exc_info.value.setting_name == "sasl_password"
+        producer.assert_not_called()
+        admin.assert_not_called()
 
-  def test_connect_revalidates_mutated_confluent_secret_before_sdk_io(
-    self, mocker
-  ):
-    """A blank post-construction cloud secret cannot select PLAINTEXT."""
-    config = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
-      confluent_api_key="key",
-      confluent_api_secret="secret",
-      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
-    )
-    backend = KafkaBackend(config)
-    config.confluent_api_secret = ""  # type: ignore[assignment]
-    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
-    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+    def test_connect_revalidates_mutated_confluent_secret_before_sdk_io(self, mocker):
+        """A blank post-construction cloud secret cannot select PLAINTEXT."""
+        config = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            confluent_api_key="key",
+            confluent_api_secret="secret",
+            confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+        )
+        backend = KafkaBackend(config)
+        config.confluent_api_secret = ""  # type: ignore[assignment]
+        producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+        admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      backend.connect()
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend.connect()
 
-    assert exc_info.value.setting_name == "confluent_api_secret"
-    producer.assert_not_called()
-    admin.assert_not_called()
+        assert exc_info.value.setting_name == "confluent_api_secret"
+        producer.assert_not_called()
+        admin.assert_not_called()
 
-  def test_ssl_hostname_verification_cannot_be_disabled(self):
-    with pytest.raises(ConfigurationError, match="ssl_check_hostname"):
-      KafkaSettings(security_protocol="SSL", ssl_check_hostname=False)
+    def test_ssl_hostname_verification_cannot_be_disabled(self):
+        with pytest.raises(ConfigurationError, match="ssl_check_hostname"):
+            KafkaSettings(security_protocol="SSL", ssl_check_hostname=False)
 
 
 class TestKafkaBackendClusterMode:
-  """Tests for _connect_cluster method."""
+    """Tests for _connect_cluster method."""
 
-  def test_connect_cluster_with_cluster_brokers(self, mocker):
-    """Test _connect_cluster uses cluster_brokers when available."""
-    config = KafkaSettings(
-      mode=KafkaMode.CLUSTER,
-      cluster_brokers=["broker1:9092", "broker2:9092"],
-    )
-    backend = KafkaBackend(config)
+    def test_connect_cluster_with_cluster_brokers(self, mocker):
+        """Test _connect_cluster uses cluster_brokers when available."""
+        config = KafkaSettings(
+            mode=KafkaMode.CLUSTER,
+            cluster_brokers=["broker1:9092", "broker2:9092"],
+        )
+        backend = KafkaBackend(config)
 
-    mock_producer_instance = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer_instance,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      return_value=mocker.MagicMock(),
-    )
+        mock_producer_instance = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer_instance,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            return_value=mocker.MagicMock(),
+        )
 
-    backend.connect()
+        backend.connect()
 
-    # Verify KafkaProducer was called - the mock returns mock_producer_instance
-    # which gets stored in backend._producer
-    assert backend._producer is mock_producer_instance
+        # Verify KafkaProducer was called - the mock returns mock_producer_instance
+        # which gets stored in backend._producer
+        assert backend._producer is mock_producer_instance
 
-  def test_connect_cluster_without_cluster_brokers(self, mocker):
-    """Test _connect_cluster falls back to bootstrap_servers."""
-    config = KafkaSettings(
-      mode=KafkaMode.CLUSTER,
-      cluster_brokers=[],  # empty
-      bootstrap_servers="fallback:9092",
-    )
-    backend = KafkaBackend(config)
+    def test_connect_cluster_without_cluster_brokers(self, mocker):
+        """Test _connect_cluster falls back to bootstrap_servers."""
+        config = KafkaSettings(
+            mode=KafkaMode.CLUSTER,
+            cluster_brokers=[],  # empty
+            bootstrap_servers="fallback:9092",
+        )
+        backend = KafkaBackend(config)
 
-    mock_producer_instance = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer_instance,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      return_value=mocker.MagicMock(),
-    )
+        mock_producer_instance = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer_instance,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            return_value=mocker.MagicMock(),
+        )
 
-    backend.connect()
+        backend.connect()
 
-    # Should use bootstrap_servers as fallback
-    assert backend.is_connected()
+        # Should use bootstrap_servers as fallback
+        assert backend.is_connected()
 
 
 class TestKafkaBackendConfluentMode:
-  """Tests for _connect_confluent method."""
+    """Tests for _connect_confluent method."""
 
-  def test_bootstrap_servers_strips_whitespace_confluent(self):
-    """R28-C-1: a whitespace ``confluent_bootstrap_servers`` must fall back to
-    ``bootstrap_servers`` at RUNTIME, matching the R28-C validator's ``.strip()``
-    semantics.
+    def test_bootstrap_servers_strips_whitespace_confluent(self):
+        """R28-C-1: a whitespace ``confluent_bootstrap_servers`` must fall back to
+        ``bootstrap_servers`` at RUNTIME, matching the R28-C validator's ``.strip()``
+        semantics.
 
-    R28-C made the *validator* treat whitespace confluent as "no real endpoint"
-    (accepting the config when bootstrap_servers holds a real endpoint), but the
-    *runtime* resolver ``_bootstrap_servers`` used bare ``or`` — so the whitespace
-    string was returned to kafka-python and connect() failed with the exact opaque
-    error R28-C exists to prevent. Validator-runtime mismatch; this completes R28-C.
-    """
-    config = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
-      confluent_api_key="K",  # type: ignore[arg-type]
-      confluent_api_secret="S",  # type: ignore[arg-type]
-      confluent_bootstrap_servers="   ",
-      bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
-    )
-    backend = KafkaBackend(config)
-    # Runtime must skip the whitespace confluent value and use the real endpoint.
-    assert (
-      backend._bootstrap_servers()
-      == "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
-    )
+        R28-C made the *validator* treat whitespace confluent as "no real endpoint"
+        (accepting the config when bootstrap_servers holds a real endpoint), but the
+        *runtime* resolver ``_bootstrap_servers`` used bare ``or`` — so the whitespace
+        string was returned to kafka-python and connect() failed with the exact opaque
+        error R28-C exists to prevent. Validator-runtime mismatch; this completes R28-C.
+        """
+        config = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            confluent_api_key="K",  # type: ignore[arg-type]
+            confluent_api_secret="S",  # type: ignore[arg-type]
+            confluent_bootstrap_servers="   ",
+            bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+        )
+        backend = KafkaBackend(config)
+        # Runtime must skip the whitespace confluent value and use the real endpoint.
+        assert (
+            backend._bootstrap_servers() == "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+        )
 
-  def test_connect_confluent_with_api_key_secret(self, mocker):
-    """Test _connect_confluent uses API key/secret when provided."""
-    config = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
-      confluent_api_key="api_key_123",
-      confluent_api_secret="api_secret_456",
-      confluent_bootstrap_servers="abc.xyz.confluent.cloud:9092",
-    )
-    backend = KafkaBackend(config)
+    def test_connect_confluent_with_api_key_secret(self, mocker):
+        """Test _connect_confluent uses API key/secret when provided."""
+        config = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            confluent_api_key="api_key_123",
+            confluent_api_secret="api_secret_456",
+            confluent_bootstrap_servers="abc.xyz.confluent.cloud:9092",
+        )
+        backend = KafkaBackend(config)
 
-    mock_producer_instance = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer_instance,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      return_value=mocker.MagicMock(),
-    )
+        mock_producer_instance = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer_instance,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            return_value=mocker.MagicMock(),
+        )
 
-    backend.connect()
+        backend.connect()
 
-    assert backend.is_connected()
+        assert backend.is_connected()
 
-  def test_connect_confluent_without_api_key_falls_back_to_sasl(self, mocker):
-    """SASL config without Confluent API key uses STANDALONE mode (R9-b SV2).
+    def test_connect_confluent_without_api_key_falls_back_to_sasl(self, mocker):
+        """SASL config without Confluent API key uses STANDALONE mode (R9-b SV2).
 
-    R9-b SV2: ``KafkaMode.CONFLUENT`` now requires ``confluent_api_key`` +
-    ``confluent_api_secret`` (the silent PLAINTEXT-localhost fallback was a
-    HIGH footgun). The legitimate "SASL against a custom broker" path is
-    exercised under STANDALONE mode — the backend's ``_build_client_security_
-    config`` applies SASL settings regardless of mode. This test was renamed
-    in intent but kept in name to preserve coverage; it now pins the
-    correct (SASL-via-STANDALONE) path.
-    """
-    config = KafkaSettings(
-      mode=KafkaMode.STANDALONE,
-      confluent_api_key=None,
-      confluent_api_secret=None,
-      bootstrap_servers="custom:9092",
-      security_protocol="SASL_SSL",
-      sasl_mechanism="PLAIN",
-      sasl_username="user",
-      sasl_password="pass",
-    )
-    backend = KafkaBackend(config)
+        R9-b SV2: ``KafkaMode.CONFLUENT`` now requires ``confluent_api_key`` +
+        ``confluent_api_secret`` (the silent PLAINTEXT-localhost fallback was a
+        HIGH footgun). The legitimate "SASL against a custom broker" path is
+        exercised under STANDALONE mode — the backend's ``_build_client_security_
+        config`` applies SASL settings regardless of mode. This test was renamed
+        in intent but kept in name to preserve coverage; it now pins the
+        correct (SASL-via-STANDALONE) path.
+        """
+        config = KafkaSettings(
+            mode=KafkaMode.STANDALONE,
+            confluent_api_key=None,
+            confluent_api_secret=None,
+            bootstrap_servers="custom:9092",
+            security_protocol="SASL_SSL",
+            sasl_mechanism="PLAIN",
+            sasl_username="user",
+            sasl_password="pass",
+        )
+        backend = KafkaBackend(config)
 
-    mock_producer_instance = mocker.MagicMock()
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaProducer",
-      return_value=mock_producer_instance,
-    )
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaAdminClient",
-      return_value=mocker.MagicMock(),
-    )
+        mock_producer_instance = mocker.MagicMock()
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaProducer",
+            return_value=mock_producer_instance,
+        )
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaAdminClient",
+            return_value=mocker.MagicMock(),
+        )
 
-    backend.connect()
+        backend.connect()
 
-    assert backend.is_connected()
+        assert backend.is_connected()
 
 
 class TestKafkaBackendPushPriorityMapping:
-  """Tests for push() priority mapping."""
+    """Tests for push() priority mapping."""
 
-  def test_push_clamps_negative_priority_to_partition_zero(self, mocker):
-    """Negative priorities must map to the lowest valid partition."""
-    config = KafkaSettings(max_priority_partitions=10)
-    backend = KafkaBackend(config)
+    def test_push_clamps_negative_priority_to_partition_zero(self, mocker):
+        """Negative priorities must map to the lowest valid partition."""
+        config = KafkaSettings(max_priority_partitions=10)
+        backend = KafkaBackend(config)
 
-    mock_future = mocker.MagicMock()
-    mock_producer = mocker.MagicMock()
-    mock_producer.send.return_value = mock_future
-    backend._producer = mock_producer
-    backend._admin_client = mocker.MagicMock()
-    backend._admin_client.create_topics.return_value.topic_errors = [
-      ("scrapy-test-queue", 0, None)
-    ]
+        mock_future = mocker.MagicMock()
+        mock_producer = mocker.MagicMock()
+        mock_producer.send.return_value = mock_future
+        backend._producer = mock_producer
+        backend._admin_client = mocker.MagicMock()
+        backend._admin_client.create_topics.return_value.topic_errors = [
+            ("scrapy-test-queue", 0, None)
+        ]
 
-    backend.push("test-queue", b"item", priority=-3)
+        backend.push("test-queue", b"item", priority=-3)
 
-    mock_producer.send.assert_called_once_with(
-      "scrapy-test-queue",
-      value=b"item",
-      partition=0,
-    )
-    mock_future.get.assert_called_once_with(timeout=10)
+        mock_producer.send.assert_called_once_with(
+            "scrapy-test-queue",
+            value=b"item",
+            partition=0,
+        )
+        mock_future.get.assert_called_once_with(timeout=10)
 
 
 class TestKafkaBackendDisconnect:
-  """Tests for disconnect method."""
+    """Tests for disconnect method."""
 
-  def test_disconnect_closes_all_clients(self, mocker):
-    """Test disconnect closes producer, consumer, and admin_client."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_disconnect_closes_all_clients(self, mocker):
+        """Test disconnect closes producer, consumer, and admin_client."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_producer = mocker.MagicMock()
-    mock_consumer = mocker.MagicMock()
-    mock_admin = mocker.MagicMock()
+        mock_producer = mocker.MagicMock()
+        mock_consumer = mocker.MagicMock()
+        mock_admin = mocker.MagicMock()
 
-    backend._producer = mock_producer
-    backend._consumer = mock_consumer
-    backend._admin_client = mock_admin
+        backend._producer = mock_producer
+        backend._consumer = mock_consumer
+        backend._admin_client = mock_admin
 
-    backend.disconnect()
+        backend.disconnect()
 
-    mock_producer.close.assert_called_once()
-    mock_consumer.close.assert_called_once()
-    mock_admin.close.assert_called_once()
-    assert backend._producer is None
-    assert backend._consumer is None
-    assert backend._admin_client is None
+        mock_producer.close.assert_called_once()
+        mock_consumer.close.assert_called_once()
+        mock_admin.close.assert_called_once()
+        assert backend._producer is None
+        assert backend._consumer is None
+        assert backend._admin_client is None
 
-  def test_disconnect_handles_none_clients(self):
-    """Test disconnect handles None clients gracefully."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_disconnect_handles_none_clients(self):
+        """Test disconnect handles None clients gracefully."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    # All are None initially
-    backend.disconnect()  # Should not raise
+        # All are None initially
+        backend.disconnect()  # Should not raise
 
-  def test_disconnect_releases_all_clients_when_one_close_fails(self, mocker):
-    """A producer close failure must not leak the consumer or admin client."""
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    consumer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    producer.close.side_effect = RuntimeError("producer close failed")
-    backend._producer = producer
-    backend._consumer = consumer
-    backend._admin_client = admin
+    def test_disconnect_releases_all_clients_when_one_close_fails(self, mocker):
+        """A producer close failure must not leak the consumer or admin client."""
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        consumer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        producer.close.side_effect = RuntimeError("producer close failed")
+        backend._producer = producer
+        backend._consumer = consumer
+        backend._admin_client = admin
 
-    backend.disconnect()
+        backend.disconnect()
 
-    producer.close.assert_called_once()
-    consumer.close.assert_called_once()
-    admin.close.assert_called_once()
-    assert backend._producer is None
-    assert backend._consumer is None
-    assert backend._admin_client is None
+        producer.close.assert_called_once()
+        consumer.close.assert_called_once()
+        admin.close.assert_called_once()
+        assert backend._producer is None
+        assert backend._consumer is None
+        assert backend._admin_client is None
 
-  def test_disconnect_closes_all_clients_after_baseexception(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    consumer = mocker.MagicMock()
-    admin = mocker.MagicMock()
-    first = KeyboardInterrupt()
-    producer.close.side_effect = first
-    consumer.close.side_effect = SystemExit(2)
-    backend._producer = producer
-    backend._consumer = consumer
-    backend._admin_client = admin
+    def test_disconnect_closes_all_clients_after_baseexception(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        consumer = mocker.MagicMock()
+        admin = mocker.MagicMock()
+        first = KeyboardInterrupt()
+        producer.close.side_effect = first
+        consumer.close.side_effect = SystemExit(2)
+        backend._producer = producer
+        backend._consumer = consumer
+        backend._admin_client = admin
 
-    with pytest.raises(KeyboardInterrupt) as raised:
-      backend.disconnect()
+        with pytest.raises(KeyboardInterrupt) as raised:
+            backend.disconnect()
 
-    assert raised.value is first
-    for client in (producer, consumer, admin):
-      client.close.assert_called_once_with()
-    assert backend._producer is None
-    assert backend._consumer is None
-    assert backend._admin_client is None
+        assert raised.value is first
+        for client in (producer, consumer, admin):
+            client.close.assert_called_once_with()
+        assert backend._producer is None
+        assert backend._consumer is None
+        assert backend._admin_client is None
 
 
 class TestKafkaBackendPing:
-  """Tests for ping method."""
+    """Tests for ping method."""
 
-  def test_ping_returns_true_when_admin_client_available(self, mocker):
-    """Test ping returns True when admin_client can list topics."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ping_returns_true_when_admin_client_available(self, mocker):
+        """Test ping returns True when admin_client can list topics."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.list_topics.return_value = ["topic1", "topic2"]
-    backend._admin_client = mock_admin
+        mock_admin = mocker.MagicMock()
+        mock_admin.list_topics.return_value = ["topic1", "topic2"]
+        backend._admin_client = mock_admin
 
-    result = backend.ping()
+        result = backend.ping()
 
-    assert result is True
-    mock_admin.list_topics.assert_called_once()
+        assert result is True
+        mock_admin.list_topics.assert_called_once()
 
-  def test_ping_returns_false_on_kafka_error(self, mocker):
-    """Test ping returns False when admin_client raises KafkaError."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ping_returns_false_on_kafka_error(self, mocker):
+        """Test ping returns False when admin_client raises KafkaError."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.list_topics.side_effect = KafkaError("Network error")
-    backend._admin_client = mock_admin
+        mock_admin = mocker.MagicMock()
+        mock_admin.list_topics.side_effect = KafkaError("Network error")
+        backend._admin_client = mock_admin
 
-    result = backend.ping()
+        result = backend.ping()
 
-    assert result is False
+        assert result is False
 
-  @pytest.mark.parametrize(
-    "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
-  )
-  def test_ping_returns_false_on_unexpected_exception(self, mocker, error):
-    """Test ping stays a boolean API for ordinary driver failures."""
-    backend = KafkaBackend(KafkaSettings())
-    mock_admin = mocker.MagicMock()
-    mock_admin.list_topics.side_effect = error
-    backend._admin_client = mock_admin
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("unexpected failure"), ValueError("invalid state")]
+    )
+    def test_ping_returns_false_on_unexpected_exception(self, mocker, error):
+        """Test ping stays a boolean API for ordinary driver failures."""
+        backend = KafkaBackend(KafkaSettings())
+        mock_admin = mocker.MagicMock()
+        mock_admin.list_topics.side_effect = error
+        backend._admin_client = mock_admin
 
-    assert backend.ping() is False
+        assert backend.ping() is False
 
-  @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
-  def test_ping_propagates_control_flow(self, mocker, error_type):
-    """Test ping does not convert terminal control flow into False."""
-    backend = KafkaBackend(KafkaSettings())
-    mock_admin = mocker.MagicMock()
-    mock_admin.list_topics.side_effect = error_type("stop")
-    backend._admin_client = mock_admin
+    @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+    def test_ping_propagates_control_flow(self, mocker, error_type):
+        """Test ping does not convert terminal control flow into False."""
+        backend = KafkaBackend(KafkaSettings())
+        mock_admin = mocker.MagicMock()
+        mock_admin.list_topics.side_effect = error_type("stop")
+        backend._admin_client = mock_admin
 
-    with pytest.raises(error_type):
-      backend.ping()
+        with pytest.raises(error_type):
+            backend.ping()
 
-  def test_ping_returns_false_when_admin_client_is_none(self):
-    """Test ping returns False when admin_client is None."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ping_returns_false_when_admin_client_is_none(self):
+        """Test ping returns False when admin_client is None."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    backend._admin_client = None
+        backend._admin_client = None
 
-    result = backend.ping()
+        result = backend.ping()
 
-    assert result is False
+        assert result is False
 
 
 class TestKafkaBackendEnsureTopicExists:
-  """Tests for _ensure_topic_exists method."""
+    """Tests for _ensure_topic_exists method."""
 
-  def test_ensure_topic_exists_skips_known_topic(self, mocker):
-    """Test _ensure_topic_exists skips topics in cache."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ensure_topic_exists_skips_known_topic(self, mocker):
+        """Test _ensure_topic_exists skips topics in cache."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    # Pre-populate known topics
-    backend._known_topics.add("scrapy-myqueue")
+        # Pre-populate known topics
+        backend._known_topics.add("scrapy-myqueue")
 
-    # Should not call admin client
-    mock_admin = mocker.MagicMock()
-    backend._admin_client = mock_admin
+        # Should not call admin client
+        mock_admin = mocker.MagicMock()
+        backend._admin_client = mock_admin
 
-    backend._ensure_topic_exists("myqueue")
+        backend._ensure_topic_exists("myqueue")
 
-    mock_admin.create_topics.assert_not_called()
+        mock_admin.create_topics.assert_not_called()
 
-  def test_ensure_topic_exists_creates_new_topic(self, mocker):
-    """Test _ensure_topic_exists creates topic when not known."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ensure_topic_exists_creates_new_topic(self, mocker):
+        """Test _ensure_topic_exists creates topic when not known."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.create_topics.return_value.topic_errors = [
-      ("scrapy-newqueue", 0, None)
-    ]
-    backend._admin_client = mock_admin
+        mock_admin = mocker.MagicMock()
+        mock_admin.create_topics.return_value.topic_errors = [
+            ("scrapy-newqueue", 0, None)
+        ]
+        backend._admin_client = mock_admin
 
-    backend._ensure_topic_exists("newqueue")
+        backend._ensure_topic_exists("newqueue")
 
-    mock_admin.create_topics.assert_called_once()
-    call_args = mock_admin.create_topics.call_args
-    new_topic = call_args[0][0][0]
-    assert isinstance(new_topic, NewTopic)
-    assert new_topic.name == "scrapy-newqueue"
-    assert "scrapy-newqueue" in backend._known_topics
+        mock_admin.create_topics.assert_called_once()
+        call_args = mock_admin.create_topics.call_args
+        new_topic = call_args[0][0][0]
+        assert isinstance(new_topic, NewTopic)
+        assert new_topic.name == "scrapy-newqueue"
+        assert "scrapy-newqueue" in backend._known_topics
 
-  def test_ensure_topic_exists_applies_configured_durability(self, mocker):
-    config = KafkaSettings(
-      max_priority_partitions=7,
-      num_partitions=7,
-      replication_factor=3,
-      min_insync_replicas=2,
-      retention_ms=123456,
-    )
-    backend = KafkaBackend(config)
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [("scrapy-durable", 0, None)]
-    backend._admin_client = admin
+    def test_ensure_topic_exists_applies_configured_durability(self, mocker):
+        config = KafkaSettings(
+            max_priority_partitions=7,
+            num_partitions=7,
+            replication_factor=3,
+            min_insync_replicas=2,
+            retention_ms=123456,
+        )
+        backend = KafkaBackend(config)
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [("scrapy-durable", 0, None)]
+        backend._admin_client = admin
 
-    backend._ensure_topic_exists("durable")
+        backend._ensure_topic_exists("durable")
 
-    new_topic = admin.create_topics.call_args.args[0][0]
-    assert new_topic.num_partitions == 7
-    assert new_topic.replication_factor == 3
-    assert new_topic.topic_configs == {
-      "min.insync.replicas": "2",
-      "retention.ms": "123456",
-    }
+        new_topic = admin.create_topics.call_args.args[0][0]
+        assert new_topic.num_partitions == 7
+        assert new_topic.replication_factor == 3
+        assert new_topic.topic_configs == {
+            "min.insync.replicas": "2",
+            "retention.ms": "123456",
+        }
 
-  def test_known_topic_still_revalidates_mutated_policy(self, mocker):
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    backend._known_topics.add("scrapy-known")
-    config.min_insync_replicas = 2
-    admin = mocker.MagicMock()
-    backend._admin_client = admin
+    def test_known_topic_still_revalidates_mutated_policy(self, mocker):
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        backend._known_topics.add("scrapy-known")
+        config.min_insync_replicas = 2
+        admin = mocker.MagicMock()
+        backend._admin_client = admin
 
-    with pytest.raises(ConfigurationError) as exc_info:
-      backend._ensure_topic_exists("known")
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend._ensure_topic_exists("known")
 
-    assert exc_info.value.setting_name == "min_insync_replicas"
-    admin.create_topics.assert_not_called()
+        assert exc_info.value.setting_name == "min_insync_replicas"
+        admin.create_topics.assert_not_called()
 
-  def test_known_topic_rechecks_valid_policy_change(self, mocker):
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [("scrapy-known", 0, None)]
-    backend._admin_client = admin
-    backend._ensure_topic_exists("known")
+    def test_known_topic_rechecks_valid_policy_change(self, mocker):
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [("scrapy-known", 0, None)]
+        backend._admin_client = admin
+        backend._ensure_topic_exists("known")
 
-    config.retention_ms = 123
-    admin.describe_topics.return_value = [
-      {
-        "error_code": 0,
-        "topic": "scrapy-known",
-        "partitions": [
-          {"partition": partition, "replicas": [0]} for partition in range(10)
-        ],
-      }
-    ]
-    config_response = mocker.MagicMock()
-    config_response.resources = [
-      (
-        0,
-        None,
-        2,
-        "scrapy-known",
-        [
-          ("retention.ms", "123", False, False, False),
-          ("min.insync.replicas", "1", False, False, False),
-        ],
-      )
-    ]
-    admin.describe_configs.return_value = [config_response]
+        config.retention_ms = 123
+        admin.describe_topics.return_value = [
+            {
+                "error_code": 0,
+                "topic": "scrapy-known",
+                "partitions": [
+                    {"partition": partition, "replicas": [0]} for partition in range(10)
+                ],
+            }
+        ]
+        config_response = mocker.MagicMock()
+        config_response.resources = [
+            (
+                0,
+                None,
+                2,
+                "scrapy-known",
+                [
+                    ("retention.ms", "123", False, False, False),
+                    ("min.insync.replicas", "1", False, False, False),
+                ],
+            )
+        ]
+        admin.describe_configs.return_value = [config_response]
 
-    backend._ensure_topic_exists("known")
+        backend._ensure_topic_exists("known")
 
-    admin.create_topics.assert_called_once()
-    admin.describe_topics.assert_called_once_with(["scrapy-known"])
+        admin.create_topics.assert_called_once()
+        admin.describe_topics.assert_called_once_with(["scrapy-known"])
 
-  def test_ensure_topic_exists_handles_topic_already_exists(self, mocker):
-    """Test _ensure_topic_exists handles TopicAlreadyExistsError gracefully."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ensure_topic_exists_handles_topic_already_exists(self, mocker):
+        """Test _ensure_topic_exists handles TopicAlreadyExistsError gracefully."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.create_topics.side_effect = TopicAlreadyExistsError(
-      "Topic already exists"
-    )
-    backend._admin_client = mock_admin
-    validate_policy = mocker.patch.object(
-      backend, "_validate_existing_topic_policy"
-    )
+        mock_admin = mocker.MagicMock()
+        mock_admin.create_topics.side_effect = TopicAlreadyExistsError(
+            "Topic already exists"
+        )
+        backend._admin_client = mock_admin
+        validate_policy = mocker.patch.object(
+            backend, "_validate_existing_topic_policy"
+        )
 
-    backend._ensure_topic_exists("existingqueue")
+        backend._ensure_topic_exists("existingqueue")
 
-    # Should still add to known topics
-    assert "scrapy-existingqueue" in backend._known_topics
-    validate_policy.assert_called_once()
+        # Should still add to known topics
+        assert "scrapy-existingqueue" in backend._known_topics
+        validate_policy.assert_called_once()
 
-  def test_ensure_topic_exists_surfaces_kafka_error_on_create(self, mocker):
-    """A thrown admin failure must prevent a success-shaped push path."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_ensure_topic_exists_surfaces_kafka_error_on_create(self, mocker):
+        """A thrown admin failure must prevent a success-shaped push path."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    mock_admin.create_topics.side_effect = KafkaError("Create failed")
-    backend._admin_client = mock_admin
+        mock_admin = mocker.MagicMock()
+        mock_admin.create_topics.side_effect = KafkaError("Create failed")
+        backend._admin_client = mock_admin
 
-    with pytest.raises(QueueError) as exc_info:
-      backend._ensure_topic_exists("failedqueue")
+        with pytest.raises(QueueError) as exc_info:
+            backend._ensure_topic_exists("failedqueue")
 
-    assert exc_info.value.operation == "push"
-    assert "scrapy-failedqueue" not in backend._known_topics
+        assert exc_info.value.operation == "push"
+        assert "scrapy-failedqueue" not in backend._known_topics
 
-  def test_ensure_topic_exists_rejects_per_topic_error_response(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [
-      ("scrapy-denied", 29, "authorization failed")
-    ]
-    backend._admin_client = admin
+    def test_ensure_topic_exists_rejects_per_topic_error_response(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [
+            ("scrapy-denied", 29, "authorization failed")
+        ]
+        backend._admin_client = admin
 
-    with pytest.raises(QueueError) as exc_info:
-      backend._ensure_topic_exists("denied")
+        with pytest.raises(QueueError) as exc_info:
+            backend._ensure_topic_exists("denied")
 
-    assert exc_info.value.operation == "push"
-    assert "scrapy-denied" not in backend._known_topics
+        assert exc_info.value.operation == "push"
+        assert "scrapy-denied" not in backend._known_topics
 
-  def test_ensure_topic_exists_accepts_already_exists_response(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [
-      ("scrapy-existing", 36, "already exists")
-    ]
-    backend._admin_client = admin
-    validate_policy = mocker.patch.object(
-      backend, "_validate_existing_topic_policy"
-    )
+    def test_ensure_topic_exists_accepts_already_exists_response(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [
+            ("scrapy-existing", 36, "already exists")
+        ]
+        backend._admin_client = admin
+        validate_policy = mocker.patch.object(
+            backend, "_validate_existing_topic_policy"
+        )
 
-    backend._ensure_topic_exists("existing")
+        backend._ensure_topic_exists("existing")
 
-    assert "scrapy-existing" in backend._known_topics
-    validate_policy.assert_called_once()
+        assert "scrapy-existing" in backend._known_topics
+        validate_policy.assert_called_once()
 
-  def test_existing_topic_matching_policy_is_accepted(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [
-      ("scrapy-existing", 36, "already exists")
-    ]
-    admin.describe_topics.return_value = [
-      {
-        "error_code": 0,
-        "topic": "scrapy-existing",
-        "partitions": [
-          {"partition": partition, "replicas": [0]} for partition in range(10)
-        ],
-      }
-    ]
-    config_response = mocker.MagicMock()
-    config_response.resources = [
-      (
-        0,
-        None,
-        2,
-        "scrapy-existing",
-        [
-          ("retention.ms", "604800000", False, False, False),
-          ("min.insync.replicas", "1", False, False, False),
-        ],
-      )
-    ]
-    admin.describe_configs.return_value = [config_response]
-    backend._admin_client = admin
+    def test_existing_topic_matching_policy_is_accepted(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [
+            ("scrapy-existing", 36, "already exists")
+        ]
+        admin.describe_topics.return_value = [
+            {
+                "error_code": 0,
+                "topic": "scrapy-existing",
+                "partitions": [
+                    {"partition": partition, "replicas": [0]} for partition in range(10)
+                ],
+            }
+        ]
+        config_response = mocker.MagicMock()
+        config_response.resources = [
+            (
+                0,
+                None,
+                2,
+                "scrapy-existing",
+                [
+                    ("retention.ms", "604800000", False, False, False),
+                    ("min.insync.replicas", "1", False, False, False),
+                ],
+            )
+        ]
+        admin.describe_configs.return_value = [config_response]
+        backend._admin_client = admin
 
-    backend._ensure_topic_exists("existing")
+        backend._ensure_topic_exists("existing")
 
-    assert "scrapy-existing" in backend._known_topics
-    admin.describe_topics.assert_called_once_with(["scrapy-existing"])
-    admin.describe_configs.assert_called_once()
+        assert "scrapy-existing" in backend._known_topics
+        admin.describe_topics.assert_called_once_with(["scrapy-existing"])
+        admin.describe_configs.assert_called_once()
 
-  def test_existing_topic_policy_mismatch_fails_before_cache(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [
-      ("scrapy-drifted", 36, "already exists")
-    ]
-    admin.describe_topics.return_value = [
-      {
-        "error_code": 0,
-        "topic": "scrapy-drifted",
-        "partitions": [
-          {"partition": partition, "replicas": [0]} for partition in range(10)
-        ],
-      }
-    ]
-    config_response = mocker.MagicMock()
-    config_response.resources = [
-      (
-        0,
-        None,
-        2,
-        "scrapy-drifted",
-        [
-          ("retention.ms", "604800000", False, False, False),
-          ("min.insync.replicas", "2", False, False, False),
-        ],
-      )
-    ]
-    admin.describe_configs.return_value = [config_response]
-    backend._admin_client = admin
+    def test_existing_topic_policy_mismatch_fails_before_cache(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [
+            ("scrapy-drifted", 36, "already exists")
+        ]
+        admin.describe_topics.return_value = [
+            {
+                "error_code": 0,
+                "topic": "scrapy-drifted",
+                "partitions": [
+                    {"partition": partition, "replicas": [0]} for partition in range(10)
+                ],
+            }
+        ]
+        config_response = mocker.MagicMock()
+        config_response.resources = [
+            (
+                0,
+                None,
+                2,
+                "scrapy-drifted",
+                [
+                    ("retention.ms", "604800000", False, False, False),
+                    ("min.insync.replicas", "2", False, False, False),
+                ],
+            )
+        ]
+        admin.describe_configs.return_value = [config_response]
+        backend._admin_client = admin
 
-    with pytest.raises(QueueError, match="policy"):
-      backend._ensure_topic_exists("drifted")
+        with pytest.raises(QueueError, match="policy"):
+            backend._ensure_topic_exists("drifted")
 
-    assert "scrapy-drifted" not in backend._known_topics
+        assert "scrapy-drifted" not in backend._known_topics
 
-  def test_ensure_topic_exists_rejects_malformed_response(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = []
-    backend._admin_client = admin
+    def test_ensure_topic_exists_rejects_malformed_response(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = []
+        backend._admin_client = admin
 
-    with pytest.raises(QueueError, match="response"):
-      backend._ensure_topic_exists("missing")
+        with pytest.raises(QueueError, match="response"):
+            backend._ensure_topic_exists("missing")
 
-    assert "scrapy-missing" not in backend._known_topics
+        assert "scrapy-missing" not in backend._known_topics
 
 
 class TestKafkaBackendPush:
-  """Tests for push method."""
+    """Tests for push method."""
 
-  @pytest.mark.parametrize(
-    "diagnostic_error",
-    [
-      RuntimeError("diagnostic failed"),
-      KeyboardInterrupt("diagnostic interrupted"),
-      SystemExit("diagnostic exited"),
-    ],
-  )
-  def test_first_push_survives_topic_ready_diagnostic_failure(
-    self, mocker, diagnostic_error
-  ):
-    """A committed topic cache makes the first push independent of logging."""
-    backend = KafkaBackend(KafkaSettings())
-    producer = mocker.MagicMock()
-    future = mocker.MagicMock()
-    producer.send.return_value = future
-    backend._producer = producer
-    admin = mocker.MagicMock()
-    admin.create_topics.return_value.topic_errors = [("scrapy-first", 0, None)]
-    backend._admin_client = admin
-    mocker.patch(
-      "scrapy_extension.backends.kafka.logger.debug", side_effect=diagnostic_error
+    @pytest.mark.parametrize(
+        "diagnostic_error",
+        [
+            RuntimeError("diagnostic failed"),
+            KeyboardInterrupt("diagnostic interrupted"),
+            SystemExit("diagnostic exited"),
+        ],
     )
+    def test_first_push_survives_topic_ready_diagnostic_failure(
+        self, mocker, diagnostic_error
+    ):
+        """A committed topic cache makes the first push independent of logging."""
+        backend = KafkaBackend(KafkaSettings())
+        producer = mocker.MagicMock()
+        future = mocker.MagicMock()
+        producer.send.return_value = future
+        backend._producer = producer
+        admin = mocker.MagicMock()
+        admin.create_topics.return_value.topic_errors = [("scrapy-first", 0, None)]
+        backend._admin_client = admin
+        mocker.patch(
+            "scrapy_extension.backends.kafka.logger.debug", side_effect=diagnostic_error
+        )
 
-    backend.push("first", b"item")
+        backend.push("first", b"item")
 
-    assert "scrapy-first" in backend._known_topics
-    producer.send.assert_called_once_with(
-      "scrapy-first", value=b"item", partition=0
-    )
-    future.get.assert_called_once_with(timeout=10)
+        assert "scrapy-first" in backend._known_topics
+        producer.send.assert_called_once_with(
+            "scrapy-first", value=b"item", partition=0
+        )
+        future.get.assert_called_once_with(timeout=10)
 
-  def test_push_success(self, mocker):
-    """Test successful push to queue."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_push_success(self, mocker):
+        """Test successful push to queue."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_producer = mocker.MagicMock()
-    mock_future = mocker.MagicMock()
-    mock_producer.send.return_value = mock_future
-    backend._producer = mock_producer
+        mock_producer = mocker.MagicMock()
+        mock_future = mocker.MagicMock()
+        mock_producer.send.return_value = mock_future
+        backend._producer = mock_producer
 
-    mock_admin = mocker.MagicMock()
-    backend._admin_client = mock_admin
-    backend._known_topics.add("scrapy-testq")
+        mock_admin = mocker.MagicMock()
+        backend._admin_client = mock_admin
+        backend._known_topics.add("scrapy-testq")
 
-    backend.push("testq", b"item_data", priority=5.0)
+        backend.push("testq", b"item_data", priority=5.0)
 
-    call_args = mock_producer.send.call_args
-    assert call_args[0][0] == "scrapy-testq"
-    assert call_args[1]["value"] == b"item_data"
-    assert call_args[1]["partition"] == 5
-    mock_future.get.assert_called_once_with(timeout=10)
+        call_args = mock_producer.send.call_args
+        assert call_args[0][0] == "scrapy-testq"
+        assert call_args[1]["value"] == b"item_data"
+        assert call_args[1]["partition"] == 5
+        mock_future.get.assert_called_once_with(timeout=10)
 
-  def test_push_with_priority_clamped_to_max(self, mocker):
-    """Test priority is clamped to max_priority_partitions - 1."""
-    config = KafkaSettings(max_priority_partitions=10)
-    backend = KafkaBackend(config)
+    def test_push_with_priority_clamped_to_max(self, mocker):
+        """Test priority is clamped to max_priority_partitions - 1."""
+        config = KafkaSettings(max_priority_partitions=10)
+        backend = KafkaBackend(config)
 
-    mock_producer = mocker.MagicMock()
-    mock_future = mocker.MagicMock()
-    mock_producer.send.return_value = mock_future
-    backend._producer = mock_producer
+        mock_producer = mocker.MagicMock()
+        mock_future = mocker.MagicMock()
+        mock_producer.send.return_value = mock_future
+        backend._producer = mock_producer
 
-    mock_admin = mocker.MagicMock()
-    backend._admin_client = mock_admin
-    backend._known_topics.add("scrapy-testq")
+        mock_admin = mocker.MagicMock()
+        backend._admin_client = mock_admin
+        backend._known_topics.add("scrapy-testq")
 
-    # Priority 255 should be clamped to 9 (max_priority_partitions - 1)
-    backend.push("testq", b"item", priority=255.0)
+        # Priority 255 should be clamped to 9 (max_priority_partitions - 1)
+        backend.push("testq", b"item", priority=255.0)
 
-    call_args = mock_producer.send.call_args
-    assert call_args[1]["partition"] == 9
+        call_args = mock_producer.send.call_args
+        assert call_args[1]["partition"] == 9
 
-  def test_push_raises_queue_error_on_kafka_error(self, mocker):
-    """Test push raises QueueError on KafkaError."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_push_raises_queue_error_on_kafka_error(self, mocker):
+        """Test push raises QueueError on KafkaError."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_producer = mocker.MagicMock()
-    mock_producer.send.side_effect = KafkaError("Send failed")
-    backend._producer = mock_producer
+        mock_producer = mocker.MagicMock()
+        mock_producer.send.side_effect = KafkaError("Send failed")
+        backend._producer = mock_producer
 
-    mock_admin = mocker.MagicMock()
-    backend._admin_client = mock_admin
-    backend._known_topics.add("scrapy-testq")
+        mock_admin = mocker.MagicMock()
+        backend._admin_client = mock_admin
+        backend._known_topics.add("scrapy-testq")
 
-    with pytest.raises(QueueError) as exc_info:
-      backend.push("testq", b"item")
-    assert str(exc_info.value) == "Failed to push Kafka message."
-    assert exc_info.value.queue_name is None
-    assert exc_info.value.operation == "push"
+        with pytest.raises(QueueError) as exc_info:
+            backend.push("testq", b"item")
+        assert str(exc_info.value) == "Failed to push Kafka message."
+        assert exc_info.value.queue_name is None
+        assert exc_info.value.operation == "push"
 
 
 class TestKafkaBackendPop:
-  """Tests for pop method."""
+    """Tests for pop method."""
 
-  def test_pop_returns_message(self, mocker):
-    """Test pop returns message value."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_pop_returns_message(self, mocker):
+        """Test pop returns message value."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_record = mocker.MagicMock()
-    mock_record.value = b"popped_data"
-    mock_consumer.poll.return_value = {
-      TopicPartition("scrapy-testq", 0): [mock_record],
-    }
-    backend._consumer = mock_consumer
+        mock_consumer = mocker.MagicMock()
+        mock_record = mocker.MagicMock()
+        mock_record.value = b"popped_data"
+        mock_consumer.poll.return_value = {
+            TopicPartition("scrapy-testq", 0): [mock_record],
+        }
+        backend._consumer = mock_consumer
 
-    result = backend.pop("testq", timeout=1.0)
+        result = backend.pop("testq", timeout=1.0)
 
-    assert result == b"popped_data"
+        assert result == b"popped_data"
 
-  def test_pop_returns_none_when_queue_empty(self, mocker):
-    """Test pop returns None when no messages."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_pop_returns_none_when_queue_empty(self, mocker):
+        """Test pop returns None when no messages."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.poll.return_value = {}  # No messages
-    backend._consumer = mock_consumer
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.poll.return_value = {}  # No messages
+        backend._consumer = mock_consumer
 
-    result = backend.pop("testq", timeout=1.0)
+        result = backend.pop("testq", timeout=1.0)
 
-    assert result is None
+        assert result is None
 
-  def test_pop_subscribes_once_per_topic_not_every_call(self, mocker):
-    """R57: pop() re-subscribes only when the topic changes, not every call.
+    def test_pop_subscribes_once_per_topic_not_every_call(self, mocker):
+        """R57: pop() re-subscribes only when the topic changes, not every call.
 
-    Mirrors RocketMQ's ``_ensure_subscribed`` (R7). Pre-R57, pop() called
-    ``subscribe([topic])`` unconditionally on every pop — wasteful on
-    Scrapy's hot path (``next_request`` pops the same queue every tick).
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+        Mirrors RocketMQ's ``_ensure_subscribed`` (R7). Pre-R57, pop() called
+        ``subscribe([topic])`` unconditionally on every pop — wasteful on
+        Scrapy's hot path (``next_request`` pops the same queue every tick).
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.poll.return_value = {}  # empty → pop returns None cleanly
-    backend._consumer = mock_consumer
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.poll.return_value = {}  # empty → pop returns None cleanly
+        backend._consumer = mock_consumer
 
-    backend.pop("queue_a", timeout=0.0)
-    backend.pop("queue_a", timeout=0.0)  # same topic → no re-subscribe
-    backend.pop("queue_b", timeout=0.0)  # different topic → re-subscribe
+        backend.pop("queue_a", timeout=0.0)
+        backend.pop("queue_a", timeout=0.0)  # same topic → no re-subscribe
+        backend.pop("queue_b", timeout=0.0)  # different topic → re-subscribe
 
-    # subscribe called exactly twice (once per distinct topic), not 3 times.
-    assert mock_consumer.subscribe.call_count == 2
-    mock_consumer.subscribe.assert_any_call(
-      ["scrapy-queue_a"], listener=backend._rebalance_listener
-    )
-    mock_consumer.subscribe.assert_any_call(
-      ["scrapy-queue_b"], listener=backend._rebalance_listener
-    )
+        # subscribe called exactly twice (once per distinct topic), not 3 times.
+        assert mock_consumer.subscribe.call_count == 2
+        mock_consumer.subscribe.assert_any_call(
+            ["scrapy-queue_a"], listener=backend._rebalance_listener
+        )
+        mock_consumer.subscribe.assert_any_call(
+            ["scrapy-queue_b"], listener=backend._rebalance_listener
+        )
 
-  def test_pop_does_not_warn_on_concurrent_pops(self, mocker, caplog):
-    """Tier-2 Unit H: the single-slot defect warning is GONE.
+    def test_pop_does_not_warn_on_concurrent_pops(self, mocker, caplog):
+        """Tier-2 Unit H: the single-slot defect warning is GONE.
 
-    Previously pop() warned about CONCURRENT_REQUESTS>1 because the single
-    _last_record slot would be overwritten. With the in-flight-set fix
-    (pop_with_ack tracks every popped offset), concurrent pops no longer
-    warn — they're correct. This test pins the warning's absence so a
-    regression to the single-slot path is caught.
-    """
-    import logging
+        Previously pop() warned about CONCURRENT_REQUESTS>1 because the single
+        _last_record slot would be overwritten. With the in-flight-set fix
+        (pop_with_ack tracks every popped offset), concurrent pops no longer
+        warn — they're correct. This test pins the warning's absence so a
+        regression to the single-slot path is caught.
+        """
+        import logging
 
-    from kafka import TopicPartition
+        from kafka import TopicPartition
 
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_record = mocker.MagicMock()
-    mock_record.value = b"data"
-    # Two polls, each yielding a record (second pop happens before any ack).
-    mock_consumer.poll.side_effect = [
-      {TopicPartition("scrapy-testq", 0): [mock_record]},
-      {TopicPartition("scrapy-testq", 0): [mock_record]},
-    ]
-    backend._consumer = mock_consumer
+        mock_consumer = mocker.MagicMock()
+        mock_record = mocker.MagicMock()
+        mock_record.value = b"data"
+        # Two polls, each yielding a record (second pop happens before any ack).
+        mock_consumer.poll.side_effect = [
+            {TopicPartition("scrapy-testq", 0): [mock_record]},
+            {TopicPartition("scrapy-testq", 0): [mock_record]},
+        ]
+        backend._consumer = mock_consumer
 
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-      backend.pop("testq", timeout=0.0)
-      backend.pop("testq", timeout=0.0)  # concurrent pop — no longer a defect
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            backend.pop("testq", timeout=0.0)
+            backend.pop("testq", timeout=0.0)  # concurrent pop — no longer a defect
 
-    assert "pop() called while previous message is unacked" not in caplog.text
-    assert "CONCURRENT_REQUESTS>1" not in caplog.text
+        assert "pop() called while previous message is unacked" not in caplog.text
+        assert "CONCURRENT_REQUESTS>1" not in caplog.text
 
-  def test_nack_is_in_session_noop_that_clears_record(self, mocker):
-    """R11/R12: nack() is an in-session no-op — clears the tracked record, does NOT commit.
+    def test_nack_is_in_session_noop_that_clears_record(self, mocker):
+        """R11/R12: nack() is an in-session no-op — clears the tracked record, does NOT commit.
 
-    The offset stays uncommitted so the message re-delivers on the next
-    consumer restart (at-least-once retry). Within a running session nack
-    can't re-deliver, so it just drops the tracked record (so a subsequent
-    pop doesn't spuriously warn).
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    backend._consumer = mock_consumer
-    backend._last_record = mocker.MagicMock()
+        The offset stays uncommitted so the message re-delivers on the next
+        consumer restart (at-least-once retry). Within a running session nack
+        can't re-deliver, so it just drops the tracked record (so a subsequent
+        pop doesn't spuriously warn).
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        backend._consumer = mock_consumer
+        backend._last_record = mocker.MagicMock()
 
-    backend.nack("testq")
+        backend.nack("testq")
 
-    assert backend._last_record is None
-    # The whole point of nack: do NOT commit — the offset must stay uncommitted.
-    mock_consumer.commit.assert_not_called()
+        assert backend._last_record is None
+        # The whole point of nack: do NOT commit — the offset must stay uncommitted.
+        mock_consumer.commit.assert_not_called()
 
-  def test_pop_creates_consumer_if_none(self, mocker):
-    """Test pop creates consumer if not already created."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_pop_creates_consumer_if_none(self, mocker):
+        """Test pop creates consumer if not already created."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_record = mocker.MagicMock()
-    mock_record.value = b"data"
-    mock_consumer.poll.return_value = {
-      TopicPartition("scrapy-testq", 0): [mock_record],
-    }
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=mock_consumer,
-    )
+        mock_consumer = mocker.MagicMock()
+        mock_record = mocker.MagicMock()
+        mock_record.value = b"data"
+        mock_consumer.poll.return_value = {
+            TopicPartition("scrapy-testq", 0): [mock_record],
+        }
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=mock_consumer,
+        )
 
-    result = backend.pop("testq", timeout=0.0)
+        result = backend.pop("testq", timeout=0.0)
 
-    assert result == b"data"
+        assert result == b"data"
 
-  def test_pop_cluster_mode_uses_cluster_bootstrap_servers(self, mocker):
-    """Test pop creates consumer with cluster brokers in cluster mode."""
-    config = KafkaSettings(
-      mode=KafkaMode.CLUSTER,
-      bootstrap_servers="fallback:9092",
-      cluster_brokers=["broker1:9092", "broker2:9092"],
-    )
-    backend = KafkaBackend(config)
+    def test_pop_cluster_mode_uses_cluster_bootstrap_servers(self, mocker):
+        """Test pop creates consumer with cluster brokers in cluster mode."""
+        config = KafkaSettings(
+            mode=KafkaMode.CLUSTER,
+            bootstrap_servers="fallback:9092",
+            cluster_brokers=["broker1:9092", "broker2:9092"],
+        )
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_record = mocker.MagicMock()
-    mock_record.value = b"data"
-    mock_consumer.poll.return_value = {
-      TopicPartition("scrapy-testq", 0): [mock_record],
-    }
-    consumer_cls = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=mock_consumer,
-    )
+        mock_consumer = mocker.MagicMock()
+        mock_record = mocker.MagicMock()
+        mock_record.value = b"data"
+        mock_consumer.poll.return_value = {
+            TopicPartition("scrapy-testq", 0): [mock_record],
+        }
+        consumer_cls = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=mock_consumer,
+        )
 
-    result = backend.pop("testq", timeout=0.0)
+        result = backend.pop("testq", timeout=0.0)
 
-    assert result == b"data"
-    assert consumer_cls.call_args.kwargs["bootstrap_servers"] == "broker1:9092,broker2:9092"
+        assert result == b"data"
+        assert (
+            consumer_cls.call_args.kwargs["bootstrap_servers"]
+            == "broker1:9092,broker2:9092"
+        )
 
-  def test_pop_confluent_mode_uses_security_config(self, mocker):
-    """Test pop creates consumer with Confluent SASL/SSL settings."""
-    config = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
-      bootstrap_servers="fallback:9092",
-      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
-      confluent_api_key="test_key",
-      confluent_api_secret="test_secret",
-    )
-    backend = KafkaBackend(config)
+    def test_pop_confluent_mode_uses_security_config(self, mocker):
+        """Test pop creates consumer with Confluent SASL/SSL settings."""
+        config = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            bootstrap_servers="fallback:9092",
+            confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+            confluent_api_key="test_key",
+            confluent_api_secret="test_secret",
+        )
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_record = mocker.MagicMock()
-    mock_record.value = b"data"
-    mock_consumer.poll.return_value = {
-      TopicPartition("scrapy-testq", 0): [mock_record],
-    }
-    consumer_cls = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=mock_consumer,
-    )
+        mock_consumer = mocker.MagicMock()
+        mock_record = mocker.MagicMock()
+        mock_record.value = b"data"
+        mock_consumer.poll.return_value = {
+            TopicPartition("scrapy-testq", 0): [mock_record],
+        }
+        consumer_cls = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=mock_consumer,
+        )
 
-    result = backend.pop("testq", timeout=0.0)
+        result = backend.pop("testq", timeout=0.0)
 
-    assert result == b"data"
-    assert consumer_cls.call_args.kwargs["bootstrap_servers"] == (
-      "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
-    )
-    assert consumer_cls.call_args.kwargs["security_protocol"] == "SASL_SSL"
-    assert consumer_cls.call_args.kwargs["sasl_mechanism"] == "PLAIN"
-    assert consumer_cls.call_args.kwargs["sasl_plain_username"] == "test_key"
-    assert consumer_cls.call_args.kwargs["sasl_plain_password"] == "test_secret"
+        assert result == b"data"
+        assert consumer_cls.call_args.kwargs["bootstrap_servers"] == (
+            "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+        )
+        assert consumer_cls.call_args.kwargs["security_protocol"] == "SASL_SSL"
+        assert consumer_cls.call_args.kwargs["sasl_mechanism"] == "PLAIN"
+        assert consumer_cls.call_args.kwargs["sasl_plain_username"] == "test_key"
+        assert consumer_cls.call_args.kwargs["sasl_plain_password"] == "test_secret"
 
-  def test_pop_raises_queue_error_on_kafka_error(self, mocker):
-    """Test pop raises QueueError on KafkaError."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_pop_raises_queue_error_on_kafka_error(self, mocker):
+        """Test pop raises QueueError on KafkaError."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.poll.side_effect = KafkaError("Poll failed")
-    backend._consumer = mock_consumer
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.poll.side_effect = KafkaError("Poll failed")
+        backend._consumer = mock_consumer
 
-    with pytest.raises(QueueError) as exc_info:
-      backend.pop("testq")
-    assert str(exc_info.value) == "Failed to pop Kafka message."
-    assert exc_info.value.queue_name is None
-    assert exc_info.value.operation == "pop"
+        with pytest.raises(QueueError) as exc_info:
+            backend.pop("testq")
+        assert str(exc_info.value) == "Failed to pop Kafka message."
+        assert exc_info.value.queue_name is None
+        assert exc_info.value.operation == "pop"
 
-  def test_pop_does_not_auto_ack_after_round_12(self, mocker):
-    """Round 12: pop no longer auto-commits — ack is driven by Scrapy signals.
+    def test_pop_does_not_auto_ack_after_round_12(self, mocker):
+        """Round 12: pop no longer auto-commits — ack is driven by Scrapy signals.
 
-    This preserves at-least-once semantics: if the worker crashes before
-    the signal fires, the offset isn't committed and the message
-    re-delivers on consumer restart.
-    """
-    from kafka.structs import TopicPartition
+        This preserves at-least-once semantics: if the worker crashes before
+        the signal fires, the offset isn't committed and the message
+        re-delivers on consumer restart.
+        """
+        from kafka.structs import TopicPartition
 
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    mock_record = mocker.MagicMock()
-    mock_record.value = b"payload"
-    tp = TopicPartition("test_topic", 0)
-    mock_consumer.poll.return_value = {tp: [mock_record]}
-    backend._consumer = mock_consumer
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        mock_record = mocker.MagicMock()
+        mock_record.value = b"payload"
+        tp = TopicPartition("test_topic", 0)
+        mock_consumer.poll.return_value = {tp: [mock_record]}
+        backend._consumer = mock_consumer
 
-    result = backend.pop("testq")
+        result = backend.pop("testq")
 
-    assert result == b"payload"
-    # The record is tracked for signal-driven ack, but NOT committed yet.
-    assert backend._last_record is mock_record
-    mock_consumer.commit.assert_not_called()
+        assert result == b"payload"
+        # The record is tracked for signal-driven ack, but NOT committed yet.
+        assert backend._last_record is mock_record
+        mock_consumer.commit.assert_not_called()
 
-  def test_ack_commits_tracked_record(self, mocker):
-    """ack() commits the offset after the signal fires."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    backend._consumer = mock_consumer
-    backend._last_record = mocker.MagicMock()
+    def test_ack_commits_tracked_record(self, mocker):
+        """ack() commits the offset after the signal fires."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        backend._consumer = mock_consumer
+        backend._last_record = mocker.MagicMock()
 
-    backend.ack("testq")
+        backend.ack("testq")
 
-    mock_consumer.commit.assert_called_once()
-    assert backend._last_record is None
+        mock_consumer.commit.assert_called_once()
+        assert backend._last_record is None
 
-  def test_ack_is_idempotent(self, mocker):
-    """Calling ack twice is safe — second call is a no-op (no tracked record)."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    backend._consumer = mock_consumer
+    def test_ack_is_idempotent(self, mocker):
+        """Calling ack twice is safe — second call is a no-op (no tracked record)."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        backend._consumer = mock_consumer
 
-    backend.ack("testq")
-    backend.ack("testq")
+        backend.ack("testq")
+        backend.ack("testq")
 
-    assert mock_consumer.commit.call_count == 0
+        assert mock_consumer.commit.call_count == 0
 
-  def test_ack_raises_on_commit_failure(self, mocker):
-    """ack() wraps commit errors as QueueError."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.commit.side_effect = KafkaError("commit failed")
-    backend._consumer = mock_consumer
-    backend._last_record = mocker.MagicMock()
+    def test_ack_raises_on_commit_failure(self, mocker):
+        """ack() wraps commit errors as QueueError."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.commit.side_effect = KafkaError("commit failed")
+        backend._consumer = mock_consumer
+        backend._last_record = mocker.MagicMock()
 
-    with pytest.raises(QueueError, match="ack"):
-      backend.ack("testq")
+        with pytest.raises(QueueError, match="ack"):
+            backend.ack("testq")
 
-  def test_legacy_ack_commit_failure_keeps_record_retryable(self, mocker):
-    """A failed legacy commit must not turn a retry into an idempotent no-op."""
-    backend = KafkaBackend(KafkaSettings())
-    consumer = mocker.MagicMock()
-    consumer.commit.side_effect = [KafkaError("commit failed"), None]
-    record = mocker.MagicMock()
-    backend._consumer = consumer
-    backend._last_record = record
+    def test_legacy_ack_commit_failure_keeps_record_retryable(self, mocker):
+        """A failed legacy commit must not turn a retry into an idempotent no-op."""
+        backend = KafkaBackend(KafkaSettings())
+        consumer = mocker.MagicMock()
+        consumer.commit.side_effect = [KafkaError("commit failed"), None]
+        record = mocker.MagicMock()
+        backend._consumer = consumer
+        backend._last_record = record
 
-    with pytest.raises(QueueError, match="ack"):
-      backend.ack("testq")
+        with pytest.raises(QueueError, match="ack"):
+            backend.ack("testq")
 
-    assert backend._last_record is record
-    backend.ack("testq")
-    assert consumer.commit.call_count == 2
-    assert backend._last_record is None
+        assert backend._last_record is record
+        backend.ack("testq")
+        assert consumer.commit.call_count == 2
+        assert backend._last_record is None
 
-  def test_ack_with_foreign_token_is_idempotent_noop(self, mocker):
-    """The public Any token boundary rejects foreign token shapes safely."""
-    backend = KafkaBackend(KafkaSettings())
-    backend._consumer = mocker.MagicMock()
+    def test_ack_with_foreign_token_is_idempotent_noop(self, mocker):
+        """The public Any token boundary rejects foreign token shapes safely."""
+        backend = KafkaBackend(KafkaSettings())
+        backend._consumer = mocker.MagicMock()
 
-    backend.ack("testq", token=object())
+        backend.ack("testq", token=object())
 
-    backend._consumer.commit.assert_not_called()
+        backend._consumer.commit.assert_not_called()
 
 
 class TestKafkaBackendQueueLen:
-  """Tests for queue_len method.
+    """Tests for queue_len method.
 
-  R3-G4: queue_len now reuses the existing consumer instead of creating a
-  temporary one per call. Uses end offsets minus committed group offsets.
-  """
-
-  @pytest.mark.parametrize(
-    ("auto_offset_reset", "expected"), [("earliest", 7), ("latest", 0)]
-  )
-  def test_fresh_group_uses_configured_offset_reset_for_backlog(
-    self, mocker, auto_offset_reset: str, expected: int
-  ) -> None:
-    backend = KafkaBackend(
-      KafkaSettings(auto_offset_reset=auto_offset_reset)  # type: ignore[arg-type]
-    )
-    tp = TopicPartition("scrapy-cold", 0)
-    consumer = mocker.MagicMock()
-    consumer.partitions_for_topic.return_value = {0}
-    consumer.end_offsets.return_value = {tp: 10}
-    consumer.beginning_offsets.return_value = {tp: 3}
-    consumer.committed.return_value = None
-    # Pin the pre-fix false-zero path: SDK default latest initializes position
-    # at end when auto_offset_reset is omitted from the temporary consumer.
-    consumer.position.return_value = 10
-    consumer_cls = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
-    )
-
-    assert backend.queue_len("cold") == expected
-    assert consumer_cls.call_args.kwargs["auto_offset_reset"] == auto_offset_reset
-
-  def test_fresh_group_with_none_offset_policy_fails_closed(self, mocker) -> None:
-    backend = KafkaBackend(KafkaSettings(auto_offset_reset="none"))
-    tp = TopicPartition("scrapy-cold", 0)
-    consumer = mocker.MagicMock()
-    consumer.partitions_for_topic.return_value = {0}
-    consumer.end_offsets.return_value = {tp: 10}
-    consumer.beginning_offsets.return_value = {tp: 3}
-    consumer.committed.return_value = None
-    consumer.position.return_value = 10
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
-    )
-
-    with pytest.raises(QueueError) as exc_info:
-      backend.queue_len("cold")
-
-    assert exc_info.value.queue_name is None
-    assert exc_info.value.operation == "queue_len"
-
-  def test_live_consumer_depth_uses_committed_not_fetched_position(self, mocker):
-    backend = KafkaBackend(KafkaSettings())
-    tp = TopicPartition("scrapy-testq", 0)
-    consumer = mocker.MagicMock()
-    consumer.assignment.return_value = {tp}
-    consumer.end_offsets.return_value = {tp: 10}
-    consumer.beginning_offsets.return_value = {tp: 0}
-    consumer.committed.return_value = 3
-    consumer.position.return_value = 8
-    backend._consumer = consumer
-
-    assert backend.queue_len("testq") == 7
-
-  def test_live_consumer_depth_keeps_its_creation_offset_policy(self, mocker):
-    config = KafkaSettings(auto_offset_reset="earliest")
-    backend = KafkaBackend(config)
-    tp = TopicPartition("scrapy-testq", 0)
-    consumer = mocker.MagicMock()
-    consumer.poll.return_value = {}
-    consumer.assignment.return_value = {tp}
-    consumer.end_offsets.return_value = {tp: 10}
-    consumer.beginning_offsets.return_value = {tp: 3}
-    consumer.committed.return_value = None
-    consumer_cls = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
-    )
-
-    assert backend.pop("testq") is None
-    config.auto_offset_reset = "latest"
-
-    assert backend.queue_len("testq") == 7
-    assert consumer_cls.call_args.kwargs["auto_offset_reset"] == "earliest"
-
-  def test_queue_len_serializes_with_consumer_poll(self, mocker) -> None:
-    backend = KafkaBackend(KafkaSettings())
-    topic = "scrapy-testq"
-    tp = TopicPartition(topic, 0)
-    consumer = mocker.MagicMock()
-    poll_entered = Event()
-    release_poll = Event()
-    assignment_entered = Event()
-
-    def blocking_poll(**_kwargs):
-      poll_entered.set()
-      assert release_poll.wait(timeout=2.0)
-      return {}
-
-    def observed_assignment():
-      assignment_entered.set()
-      return {tp}
-
-    consumer.poll.side_effect = blocking_poll
-    consumer.assignment.side_effect = observed_assignment
-    consumer.end_offsets.return_value = {tp: 5}
-    consumer.beginning_offsets.return_value = {tp: 0}
-    consumer.committed.return_value = 0
-    backend._consumer = consumer
-    backend._subscribed_topic = topic
-    results: list[int] = []
-
-    pop_thread = Thread(target=lambda: backend.pop("testq", timeout=1.0))
-    len_thread = Thread(target=lambda: results.append(backend.queue_len("testq")))
-    pop_thread.start()
-    assert poll_entered.wait(timeout=2.0)
-    len_thread.start()
-    overlapped = assignment_entered.wait(timeout=0.2)
-    release_poll.set()
-    pop_thread.join(timeout=2.0)
-    len_thread.join(timeout=2.0)
-
-    assert overlapped is False
-    assert results == [5]
-
-  def test_queue_len_returns_lag_from_consumer(self, mocker):
-    """queue_len returns sum(end_offset - position) across assigned partitions."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-
-    tp0 = TopicPartition("scrapy-testq", 0)
-    tp1 = TopicPartition("scrapy-testq", 1)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.assignment.return_value = {tp0, tp1}
-    mock_consumer.end_offsets.return_value = {tp0: 10, tp1: 5}
-    mock_consumer.beginning_offsets.return_value = {tp0: 0, tp1: 0}
-    mock_consumer.committed.side_effect = lambda tp: {tp0: 3, tp1: 1}[tp]
-    backend._consumer = mock_consumer
-
-    result = backend.queue_len("testq")
-
-    assert result == 11  # (10-3) + (5-1) = 11
-
-  def test_queue_len_filters_foreign_topics_from_current_assignment(self, mocker):
-    """A rebalance overlap must not add another topic's lag to this queue."""
-    backend = KafkaBackend(KafkaSettings())
-    requested = TopicPartition("scrapy-testq", 0)
-    foreign = TopicPartition("scrapy-other", 0)
-    consumer = mocker.MagicMock()
-    consumer.assignment.return_value = {requested, foreign}
-    consumer.end_offsets.return_value = {requested: 10}
-    consumer.beginning_offsets.return_value = {requested: 0}
-    consumer.committed.return_value = 4
-    backend._consumer = consumer
-
-    assert backend.queue_len("testq") == 6
-    consumer.end_offsets.assert_called_once_with({requested})
-    consumer.committed.assert_called_once_with(requested)
-
-  def test_queue_len_uses_requested_topic_when_consumer_is_on_other_topic(
-    self, mocker
-  ):
-    """queue_len(B) must not report the currently subscribed topic A's lag."""
-    backend = KafkaBackend(KafkaSettings(group_id="lag-checker"))
-    current = TopicPartition("scrapy-current", 0)
-    requested = TopicPartition("scrapy-requested", 0)
-    active_consumer = mocker.MagicMock()
-    active_consumer.assignment.return_value = {current}
-    backend._consumer = active_consumer
-
-    temp_consumer = mocker.MagicMock()
-    temp_consumer.partitions_for_topic.return_value = {0}
-    temp_consumer.end_offsets.return_value = {requested: 12}
-    temp_consumer.beginning_offsets.return_value = {requested: 0}
-    temp_consumer.committed.return_value = 5
-    consumer_cls = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=temp_consumer,
-    )
-
-    assert backend.queue_len("requested") == 7
-    active_consumer.end_offsets.assert_not_called()
-    consumer_cls.assert_called_once()
-    temp_consumer.close.assert_called_once()
-
-  def test_queue_len_creates_temp_consumer_with_confluent_security_config(self, mocker):
-    """queue_len temporary consumer reuses Confluent bootstrap and security settings."""
-    config = KafkaSettings(
-      mode=KafkaMode.CONFLUENT,
-      bootstrap_servers="fallback:9092",
-      confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
-      confluent_api_key="test_key",
-      confluent_api_secret="test_secret",
-      group_id="lag-checker",
-    )
-    backend = KafkaBackend(config)
-
-    tp = TopicPartition("scrapy-testq", 0)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.partitions_for_topic.return_value = {0}
-    mock_consumer.end_offsets.return_value = {tp: 8}
-    mock_consumer.beginning_offsets.return_value = {tp: 0}
-    mock_consumer.committed.return_value = 3
-    consumer_cls = mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=mock_consumer,
-    )
-
-    result = backend.queue_len("testq")
-
-    assert result == 5
-    assert consumer_cls.call_args.kwargs["bootstrap_servers"] == (
-      "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
-    )
-    assert consumer_cls.call_args.kwargs["security_protocol"] == "SASL_SSL"
-    assert consumer_cls.call_args.kwargs["sasl_mechanism"] == "PLAIN"
-    assert consumer_cls.call_args.kwargs["sasl_plain_username"] == "test_key"
-    assert consumer_cls.call_args.kwargs["sasl_plain_password"] == "test_secret"
-    mock_consumer.close.assert_called_once()
-
-  def test_queue_len_returns_zero_when_no_consumer(self, mocker):
-    """queue_len returns 0 before consumer is created (no pop called yet)."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    backend._consumer = None
-    consumer = mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
-    consumer.return_value.partitions_for_topic.return_value = None
-
-    assert backend.queue_len("testq") == 0
-
-  def test_queue_len_returns_zero_when_no_assignment(self, mocker):
-    """A rebalance gap must fall back to a metadata consumer, not fake empty."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    active_consumer = mocker.MagicMock()
-    active_consumer.assignment.return_value = set()
-    backend._consumer = active_consumer
-    tp = TopicPartition("scrapy-testq", 0)
-    probe_consumer = mocker.MagicMock()
-    probe_consumer.partitions_for_topic.return_value = {0}
-    probe_consumer.end_offsets.return_value = {tp: 12}
-    probe_consumer.beginning_offsets.return_value = {tp: 0}
-    probe_consumer.committed.return_value = 5
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=probe_consumer,
-    )
-
-    assert backend.queue_len("testq") == 7
-    probe_consumer.close.assert_called_once()
-
-  def test_queue_len_raises_on_kafka_error(self, mocker):
-    """R-kqlen: queue_len must raise QueueError on KafkaError (not swallow to 0).
-
-    A broker failure during end_offsets/position must NOT look like an empty
-    queue — otherwise the scheduler mistakes outage for idle and drops the
-    backpressure signal (parity with R-sqs-qlen #62 / R-es-qlen #65 / redis).
+    R3-G4: queue_len now reuses the existing consumer instead of creating a
+    temporary one per call. Uses end offsets minus committed group offsets.
     """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.assignment.return_value = {TopicPartition("scrapy-testq", 0)}
-    mock_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
-    backend._consumer = mock_consumer
 
-    with pytest.raises(QueueError) as exc_info:
-      backend.queue_len("testq")
-    assert str(exc_info.value) == "Failed to inspect Kafka queue."
-    assert exc_info.value.queue_name is None
-    assert exc_info.value.operation == "queue_len"
-
-  def test_queue_len_raises_on_kafka_error_temp_consumer(self, mocker):
-    """R-kqlen: temp-consumer branch must also raise (and still close it)."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    backend._consumer = None  # force the temp-consumer branch
-
-    mock_temp_consumer = mocker.MagicMock()
-    mock_temp_consumer.partitions_for_topic.return_value = {0}
-    mock_temp_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      return_value=mock_temp_consumer,
+    @pytest.mark.parametrize(
+        ("auto_offset_reset", "expected"), [("earliest", 7), ("latest", 0)]
     )
+    def test_fresh_group_uses_configured_offset_reset_for_backlog(
+        self, mocker, auto_offset_reset: str, expected: int
+    ) -> None:
+        backend = KafkaBackend(
+            KafkaSettings(auto_offset_reset=auto_offset_reset)  # type: ignore[arg-type]
+        )
+        tp = TopicPartition("scrapy-cold", 0)
+        consumer = mocker.MagicMock()
+        consumer.partitions_for_topic.return_value = {0}
+        consumer.end_offsets.return_value = {tp: 10}
+        consumer.beginning_offsets.return_value = {tp: 3}
+        consumer.committed.return_value = None
+        # Pin the pre-fix false-zero path: SDK default latest initializes position
+        # at end when auto_offset_reset is omitted from the temporary consumer.
+        consumer.position.return_value = 10
+        consumer_cls = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+        )
 
-    with pytest.raises(QueueError) as exc_info:
-      backend.queue_len("testq")
-    assert exc_info.value.operation == "queue_len"
-    # finally arm must still close the temp consumer (no leak).
-    mock_temp_consumer.close.assert_called_once()
+        assert backend.queue_len("cold") == expected
+        assert consumer_cls.call_args.kwargs["auto_offset_reset"] == auto_offset_reset
+
+    def test_fresh_group_with_none_offset_policy_fails_closed(self, mocker) -> None:
+        backend = KafkaBackend(KafkaSettings(auto_offset_reset="none"))
+        tp = TopicPartition("scrapy-cold", 0)
+        consumer = mocker.MagicMock()
+        consumer.partitions_for_topic.return_value = {0}
+        consumer.end_offsets.return_value = {tp: 10}
+        consumer.beginning_offsets.return_value = {tp: 3}
+        consumer.committed.return_value = None
+        consumer.position.return_value = 10
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+        )
+
+        with pytest.raises(QueueError) as exc_info:
+            backend.queue_len("cold")
+
+        assert exc_info.value.queue_name is None
+        assert exc_info.value.operation == "queue_len"
+
+    def test_live_consumer_depth_uses_committed_not_fetched_position(self, mocker):
+        backend = KafkaBackend(KafkaSettings())
+        tp = TopicPartition("scrapy-testq", 0)
+        consumer = mocker.MagicMock()
+        consumer.assignment.return_value = {tp}
+        consumer.end_offsets.return_value = {tp: 10}
+        consumer.beginning_offsets.return_value = {tp: 0}
+        consumer.committed.return_value = 3
+        consumer.position.return_value = 8
+        backend._consumer = consumer
+
+        assert backend.queue_len("testq") == 7
+
+    def test_live_consumer_depth_keeps_its_creation_offset_policy(self, mocker):
+        config = KafkaSettings(auto_offset_reset="earliest")
+        backend = KafkaBackend(config)
+        tp = TopicPartition("scrapy-testq", 0)
+        consumer = mocker.MagicMock()
+        consumer.poll.return_value = {}
+        consumer.assignment.return_value = {tp}
+        consumer.end_offsets.return_value = {tp: 10}
+        consumer.beginning_offsets.return_value = {tp: 3}
+        consumer.committed.return_value = None
+        consumer_cls = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+        )
+
+        assert backend.pop("testq") is None
+        config.auto_offset_reset = "latest"
+
+        assert backend.queue_len("testq") == 7
+        assert consumer_cls.call_args.kwargs["auto_offset_reset"] == "earliest"
+
+    def test_queue_len_serializes_with_consumer_poll(self, mocker) -> None:
+        backend = KafkaBackend(KafkaSettings())
+        topic = "scrapy-testq"
+        tp = TopicPartition(topic, 0)
+        consumer = mocker.MagicMock()
+        poll_entered = Event()
+        release_poll = Event()
+        assignment_entered = Event()
+
+        def blocking_poll(**_kwargs):
+            poll_entered.set()
+            assert release_poll.wait(timeout=2.0)
+            return {}
+
+        def observed_assignment():
+            assignment_entered.set()
+            return {tp}
+
+        consumer.poll.side_effect = blocking_poll
+        consumer.assignment.side_effect = observed_assignment
+        consumer.end_offsets.return_value = {tp: 5}
+        consumer.beginning_offsets.return_value = {tp: 0}
+        consumer.committed.return_value = 0
+        backend._consumer = consumer
+        backend._subscribed_topic = topic
+        results: list[int] = []
+
+        pop_thread = Thread(target=lambda: backend.pop("testq", timeout=1.0))
+        len_thread = Thread(target=lambda: results.append(backend.queue_len("testq")))
+        pop_thread.start()
+        assert poll_entered.wait(timeout=2.0)
+        len_thread.start()
+        overlapped = assignment_entered.wait(timeout=0.2)
+        release_poll.set()
+        pop_thread.join(timeout=2.0)
+        len_thread.join(timeout=2.0)
+
+        assert overlapped is False
+        assert results == [5]
+
+    def test_queue_len_returns_lag_from_consumer(self, mocker):
+        """queue_len returns sum(end_offset - position) across assigned partitions."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+
+        tp0 = TopicPartition("scrapy-testq", 0)
+        tp1 = TopicPartition("scrapy-testq", 1)
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.assignment.return_value = {tp0, tp1}
+        mock_consumer.end_offsets.return_value = {tp0: 10, tp1: 5}
+        mock_consumer.beginning_offsets.return_value = {tp0: 0, tp1: 0}
+        mock_consumer.committed.side_effect = lambda tp: {tp0: 3, tp1: 1}[tp]
+        backend._consumer = mock_consumer
+
+        result = backend.queue_len("testq")
+
+        assert result == 11  # (10-3) + (5-1) = 11
+
+    def test_queue_len_filters_foreign_topics_from_current_assignment(self, mocker):
+        """A rebalance overlap must not add another topic's lag to this queue."""
+        backend = KafkaBackend(KafkaSettings())
+        requested = TopicPartition("scrapy-testq", 0)
+        foreign = TopicPartition("scrapy-other", 0)
+        consumer = mocker.MagicMock()
+        consumer.assignment.return_value = {requested, foreign}
+        consumer.end_offsets.return_value = {requested: 10}
+        consumer.beginning_offsets.return_value = {requested: 0}
+        consumer.committed.return_value = 4
+        backend._consumer = consumer
+
+        assert backend.queue_len("testq") == 6
+        consumer.end_offsets.assert_called_once_with({requested})
+        consumer.committed.assert_called_once_with(requested)
+
+    def test_queue_len_uses_requested_topic_when_consumer_is_on_other_topic(
+        self, mocker
+    ):
+        """queue_len(B) must not report the currently subscribed topic A's lag."""
+        backend = KafkaBackend(KafkaSettings(group_id="lag-checker"))
+        current = TopicPartition("scrapy-current", 0)
+        requested = TopicPartition("scrapy-requested", 0)
+        active_consumer = mocker.MagicMock()
+        active_consumer.assignment.return_value = {current}
+        backend._consumer = active_consumer
+
+        temp_consumer = mocker.MagicMock()
+        temp_consumer.partitions_for_topic.return_value = {0}
+        temp_consumer.end_offsets.return_value = {requested: 12}
+        temp_consumer.beginning_offsets.return_value = {requested: 0}
+        temp_consumer.committed.return_value = 5
+        consumer_cls = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=temp_consumer,
+        )
+
+        assert backend.queue_len("requested") == 7
+        active_consumer.end_offsets.assert_not_called()
+        consumer_cls.assert_called_once()
+        temp_consumer.close.assert_called_once()
+
+    def test_queue_len_creates_temp_consumer_with_confluent_security_config(
+        self, mocker
+    ):
+        """queue_len temporary consumer reuses Confluent bootstrap and security settings."""
+        config = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            bootstrap_servers="fallback:9092",
+            confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+            confluent_api_key="test_key",
+            confluent_api_secret="test_secret",
+            group_id="lag-checker",
+        )
+        backend = KafkaBackend(config)
+
+        tp = TopicPartition("scrapy-testq", 0)
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.partitions_for_topic.return_value = {0}
+        mock_consumer.end_offsets.return_value = {tp: 8}
+        mock_consumer.beginning_offsets.return_value = {tp: 0}
+        mock_consumer.committed.return_value = 3
+        consumer_cls = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=mock_consumer,
+        )
+
+        result = backend.queue_len("testq")
+
+        assert result == 5
+        assert consumer_cls.call_args.kwargs["bootstrap_servers"] == (
+            "pkc-xxx.us-east-1.aws.confluent.cloud:9092"
+        )
+        assert consumer_cls.call_args.kwargs["security_protocol"] == "SASL_SSL"
+        assert consumer_cls.call_args.kwargs["sasl_mechanism"] == "PLAIN"
+        assert consumer_cls.call_args.kwargs["sasl_plain_username"] == "test_key"
+        assert consumer_cls.call_args.kwargs["sasl_plain_password"] == "test_secret"
+        mock_consumer.close.assert_called_once()
+
+    def test_queue_len_returns_zero_when_no_consumer(self, mocker):
+        """queue_len returns 0 before consumer is created (no pop called yet)."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        backend._consumer = None
+        consumer = mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
+        consumer.return_value.partitions_for_topic.return_value = None
+
+        assert backend.queue_len("testq") == 0
+
+    def test_queue_len_returns_zero_when_no_assignment(self, mocker):
+        """A rebalance gap must fall back to a metadata consumer, not fake empty."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        active_consumer = mocker.MagicMock()
+        active_consumer.assignment.return_value = set()
+        backend._consumer = active_consumer
+        tp = TopicPartition("scrapy-testq", 0)
+        probe_consumer = mocker.MagicMock()
+        probe_consumer.partitions_for_topic.return_value = {0}
+        probe_consumer.end_offsets.return_value = {tp: 12}
+        probe_consumer.beginning_offsets.return_value = {tp: 0}
+        probe_consumer.committed.return_value = 5
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=probe_consumer,
+        )
+
+        assert backend.queue_len("testq") == 7
+        probe_consumer.close.assert_called_once()
+
+    def test_queue_len_raises_on_kafka_error(self, mocker):
+        """R-kqlen: queue_len must raise QueueError on KafkaError (not swallow to 0).
+
+        A broker failure during end_offsets/position must NOT look like an empty
+        queue — otherwise the scheduler mistakes outage for idle and drops the
+        backpressure signal (parity with R-sqs-qlen #62 / R-es-qlen #65 / redis).
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.assignment.return_value = {TopicPartition("scrapy-testq", 0)}
+        mock_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
+        backend._consumer = mock_consumer
+
+        with pytest.raises(QueueError) as exc_info:
+            backend.queue_len("testq")
+        assert str(exc_info.value) == "Failed to inspect Kafka queue."
+        assert exc_info.value.queue_name is None
+        assert exc_info.value.operation == "queue_len"
+
+    def test_queue_len_raises_on_kafka_error_temp_consumer(self, mocker):
+        """R-kqlen: temp-consumer branch must also raise (and still close it)."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        backend._consumer = None  # force the temp-consumer branch
+
+        mock_temp_consumer = mocker.MagicMock()
+        mock_temp_consumer.partitions_for_topic.return_value = {0}
+        mock_temp_consumer.end_offsets.side_effect = KafkaError("Broker unavailable")
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=mock_temp_consumer,
+        )
+
+        with pytest.raises(QueueError) as exc_info:
+            backend.queue_len("testq")
+        assert exc_info.value.operation == "queue_len"
+        # finally arm must still close the temp consumer (no leak).
+        mock_temp_consumer.close.assert_called_once()
 
 
 class TestKafkaBackendClearQueue:
-  """Tests for clear_queue method."""
+    """Tests for clear_queue method."""
 
-  def test_clear_queue_is_explicitly_unsupported_without_admin_io(self, mocker):
-    """Delete/recreate cannot satisfy a linearizable distributed clear."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+    def test_clear_queue_is_explicitly_unsupported_without_admin_io(self, mocker):
+        """Delete/recreate cannot satisfy a linearizable distributed clear."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    mock_admin = mocker.MagicMock()
-    backend._admin_client = mock_admin
+        mock_admin = mocker.MagicMock()
+        backend._admin_client = mock_admin
 
-    with pytest.raises(QueueError, match="Kafka clear_queue is unsupported"):
-      backend.clear_queue("testq")
+        with pytest.raises(QueueError, match="Kafka clear_queue is unsupported"):
+            backend.clear_queue("testq")
 
-    mock_admin.delete_topics.assert_not_called()
-    mock_admin.create_topics.assert_not_called()
+        mock_admin.delete_topics.assert_not_called()
+        mock_admin.create_topics.assert_not_called()
 
-  def test_clear_queue_still_validates_name_before_unsupported(self):
-    backend = KafkaBackend(KafkaSettings())
+    def test_clear_queue_still_validates_name_before_unsupported(self):
+        backend = KafkaBackend(KafkaSettings())
 
-    with pytest.raises(ValueError, match="Invalid topic"):
-      backend.clear_queue("bad queue")
+        with pytest.raises(ValueError, match="Invalid topic"):
+            backend.clear_queue("bad queue")
 
-  def test_clear_queue_raises_queue_error_for_unsupported_purge(self, mocker):
-    """U3: clear_queue raises QueueError, parity with pulsar/rocketmq.
+    def test_clear_queue_raises_queue_error_for_unsupported_purge(self, mocker):
+        """U3: clear_queue raises QueueError, parity with pulsar/rocketmq.
 
-    A caller using ``except QueueError`` to handle the unsupported-clear
-    contract (which pulsar.py and rocketmq.py already honor) must catch
-    Kafka's rejection too. A bare ``NotImplementedError`` escapes that
-    ``except QueueError`` arm uncaught.
-    """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    backend._admin_client = mocker.MagicMock()
+        A caller using ``except QueueError`` to handle the unsupported-clear
+        contract (which pulsar.py and rocketmq.py already honor) must catch
+        Kafka's rejection too. A bare ``NotImplementedError`` escapes that
+        ``except QueueError`` arm uncaught.
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        backend._admin_client = mocker.MagicMock()
 
-    with pytest.raises(QueueError, match="Kafka clear_queue is unsupported") as exc_info:
-      backend.clear_queue("testq")
+        with pytest.raises(
+            QueueError, match="Kafka clear_queue is unsupported"
+        ) as exc_info:
+            backend.clear_queue("testq")
 
-    assert exc_info.value.queue_name is None
-    assert exc_info.value.operation == "clear_queue"
+        assert exc_info.value.queue_name is None
+        assert exc_info.value.operation == "clear_queue"
 
 
 class TestKafkaBackendBackendType:
-  """Tests for backend_type property."""
+    """Tests for backend_type property."""
 
-  def test_backend_type_returns_kafka(self):
-    """Test backend_type returns BackendType.KAFKA."""
-    from scrapy_extension.backends.base import BackendType
+    def test_backend_type_returns_kafka(self):
+        """Test backend_type returns BackendType.KAFKA."""
+        from scrapy_extension.backends.base import BackendType
 
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
 
-    assert backend.backend_type == BackendType.KAFKA
+        assert backend.backend_type == BackendType.KAFKA
 
 
 # ============================================================================
@@ -1982,391 +1990,390 @@ class TestKafkaBackendBackendType:
 
 
 def test_kafka_backend_connect(mocker):
-  """Test Kafka backend connection."""
-  config = KafkaSettings()
-  backend = KafkaBackend(config)
+    """Test Kafka backend connection."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
 
-  mock_producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
-  mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
-  mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+    mock_producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+    mocker.patch("scrapy_extension.backends.kafka.KafkaConsumer")
+    mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
 
-  mock_producer.return_value = mocker.MagicMock()
+    mock_producer.return_value = mocker.MagicMock()
 
-  backend.connect()
+    backend.connect()
 
-  mock_producer.assert_called_once()
-  assert backend.is_connected()
+    mock_producer.assert_called_once()
+    assert backend.is_connected()
 
 
 def test_kafka_backend_push(mocker):
-  """Test Kafka backend push."""
-  config = KafkaSettings()
-  backend = KafkaBackend(config)
+    """Test Kafka backend push."""
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
 
-  mock_producer_instance = mocker.MagicMock()
-  mocker.patch(
-    "scrapy_extension.backends.kafka.KafkaProducer",
-    return_value=mock_producer_instance,
-  )
-  mock_admin_client_instance = mocker.MagicMock()
-  mocker.patch(
-    "scrapy_extension.backends.kafka.KafkaAdminClient",
-    return_value=mock_admin_client_instance,
-  )
-  mock_admin_client_instance.list_topics.return_value = []
-  mock_admin_client_instance.create_topics.return_value.topic_errors = [
-    ("scrapy-test_queue", 0, None)
-  ]
-  mock_future = mocker.MagicMock()
-  mock_producer_instance.send.return_value = mock_future
+    mock_producer_instance = mocker.MagicMock()
+    mocker.patch(
+        "scrapy_extension.backends.kafka.KafkaProducer",
+        return_value=mock_producer_instance,
+    )
+    mock_admin_client_instance = mocker.MagicMock()
+    mocker.patch(
+        "scrapy_extension.backends.kafka.KafkaAdminClient",
+        return_value=mock_admin_client_instance,
+    )
+    mock_admin_client_instance.list_topics.return_value = []
+    mock_admin_client_instance.create_topics.return_value.topic_errors = [
+        ("scrapy-test_queue", 0, None)
+    ]
+    mock_future = mocker.MagicMock()
+    mock_producer_instance.send.return_value = mock_future
 
-  backend.connect()
-  backend.push("test_queue", b"test_item", priority=1.0)
+    backend.connect()
+    backend.push("test_queue", b"test_item", priority=1.0)
 
-  mock_producer_instance.send.assert_called_once()
-  call_args = mock_producer_instance.send.call_args
-  assert call_args[0][0] == "scrapy-test_queue"
-  assert call_args[1]["value"] == b"test_item"
-  assert call_args[1]["partition"] == 1
+    mock_producer_instance.send.assert_called_once()
+    call_args = mock_producer_instance.send.call_args
+    assert call_args[0][0] == "scrapy-test_queue"
+    assert call_args[1]["value"] == b"test_item"
+    assert call_args[1]["partition"] == 1
 
 
 def test_kafka_backend_only_implements_queuebackend():
-  """Test that KafkaBackend only implements QueueBackend protocol."""
-  from scrapy_extension.backends.base import Backend, QueueBackend
+    """Test that KafkaBackend only implements QueueBackend protocol."""
+    from scrapy_extension.backends.base import Backend, QueueBackend
 
-  config = KafkaSettings()
-  backend = KafkaBackend(config)
+    config = KafkaSettings()
+    backend = KafkaBackend(config)
 
-  assert isinstance(backend, Backend)
-  assert isinstance(backend, QueueBackend)
+    assert isinstance(backend, Backend)
+    assert isinstance(backend, QueueBackend)
 
 
 def test_kafka_sasl_password_repr_does_not_leak():
-  """R2-B2: SASL password in producer config must be redacted in repr().
+    """R2-B2: SASL password in producer config must be redacted in repr().
 
-  Without _RedactedStr wrapping, ``repr(config)`` (e.g., in a Sentry
-  traceback capturing locals) would show the raw password. The wrapper
-  keeps the value usable as a str for kafka-python while hiding it from
-  repr-based introspection.
-  """
-  from scrapy_extension.backends.kafka import _RedactedStr
+    Without _RedactedStr wrapping, ``repr(config)`` (e.g., in a Sentry
+    traceback capturing locals) would show the raw password. The wrapper
+    keeps the value usable as a str for kafka-python while hiding it from
+    repr-based introspection.
+    """
+    from scrapy_extension.backends.kafka import _RedactedStr
 
-  secret = _RedactedStr("hunter2-secret-password")
-  assert str(secret) == "hunter2-secret-password"  # value intact for client lib
-  assert "hunter2" not in repr(secret)
-  assert "<redacted>" in repr(secret)
+    secret = _RedactedStr("hunter2-secret-password")
+    assert str(secret) == "hunter2-secret-password"  # value intact for client lib
+    assert "hunter2" not in repr(secret)
+    assert "<redacted>" in repr(secret)
 
 
 def test_kafka_build_common_config_redacts_sasl_password(mocker):
-  """R2-B2: _build_common_config returns dict whose repr doesn't leak SASL password."""
-  from scrapy_extension.backends.kafka import KafkaBackend
-  from scrapy_extension.settings.kafka import KafkaSettings
+    """R2-B2: _build_common_config returns dict whose repr doesn't leak SASL password."""
+    from scrapy_extension.backends.kafka import KafkaBackend
+    from scrapy_extension.settings.kafka import KafkaSettings
 
-  config = KafkaSettings(
-    security_protocol="SASL_SSL",
-    sasl_mechanism="PLAIN",
-    sasl_username="alice",
-    sasl_password="super-secret-pwd",
-  )
-  backend = KafkaBackend(config)
-  built = backend._build_common_config()
+    config = KafkaSettings(
+        security_protocol="SASL_SSL",
+        sasl_mechanism="PLAIN",
+        sasl_username="alice",
+        sasl_password="super-secret-pwd",
+    )
+    backend = KafkaBackend(config)
+    built = backend._build_common_config()
 
-  assert built["sasl_plain_username"] == "alice"
-  # Value is usable as a normal string
-  assert str(built["sasl_plain_password"]) == "super-secret-pwd"
-  # But repr of the dict (the leak vector for Sentry / debug logs) hides it
-  assert "super-secret-pwd" not in repr(built)
-  assert "<redacted>" in repr(built)
+    assert built["sasl_plain_username"] == "alice"
+    # Value is usable as a normal string
+    assert str(built["sasl_plain_password"]) == "super-secret-pwd"
+    # But repr of the dict (the leak vector for Sentry / debug logs) hides it
+    assert "super-secret-pwd" not in repr(built)
+    assert "<redacted>" in repr(built)
 
 
 def test_kafka_build_client_security_config_redacts_confluent_credentials():
-  """E2: Confluent api_key/secret must be redacted in repr of the client config.
+    """E2: Confluent api_key/secret must be redacted in repr of the client config.
 
-  SASL password is already wrapped in ``_RedactedStr``, but Confluent Cloud
-  credentials (``confluent_api_key`` / ``confluent_api_secret``) are plumbed
-  into ``sasl_plain_username`` / ``sasl_plain_password`` without redaction,
-  so ``repr(config)`` and traceback dumps of locals leak them.
-  """
-  from scrapy_extension.backends.kafka import KafkaBackend
-  from scrapy_extension.settings.kafka import KafkaSettings
+    SASL password is already wrapped in ``_RedactedStr``, but Confluent Cloud
+    credentials (``confluent_api_key`` / ``confluent_api_secret``) are plumbed
+    into ``sasl_plain_username`` / ``sasl_plain_password`` without redaction,
+    so ``repr(config)`` and traceback dumps of locals leak them.
+    """
+    from scrapy_extension.backends.kafka import KafkaBackend
+    from scrapy_extension.settings.kafka import KafkaSettings
 
-  config = KafkaSettings(
-    mode=KafkaMode.CONFLUENT,
-    confluent_bootstrap_servers="pkc-xxx.confluent.cloud:9092",
-    confluent_api_key="CKEY_TOP_SECRET_123",
-    confluent_api_secret="CSECRET_TOP_SECRET_456",
-  )
-  backend = KafkaBackend(config)
-  client_config = backend._build_client_security_config()
+    config = KafkaSettings(
+        mode=KafkaMode.CONFLUENT,
+        confluent_bootstrap_servers="pkc-xxx.confluent.cloud:9092",
+        confluent_api_key="CKEY_TOP_SECRET_123",
+        confluent_api_secret="CSECRET_TOP_SECRET_456",
+    )
+    backend = KafkaBackend(config)
+    client_config = backend._build_client_security_config()
 
-  # Values remain usable as normal strings for kafka-python.
-  assert str(client_config["sasl_plain_username"]) == "CKEY_TOP_SECRET_123"
-  assert str(client_config["sasl_plain_password"]) == "CSECRET_TOP_SECRET_456"
-  # But repr of the config dict (Sentry / debug-log leak vector) hides both.
-  assert "CKEY_TOP_SECRET_123" not in repr(client_config)
-  assert "CSECRET_TOP_SECRET_456" not in repr(client_config)
-  assert "<redacted>" in repr(client_config)
-
+    # Values remain usable as normal strings for kafka-python.
+    assert str(client_config["sasl_plain_username"]) == "CKEY_TOP_SECRET_123"
+    assert str(client_config["sasl_plain_password"]) == "CSECRET_TOP_SECRET_456"
+    # But repr of the config dict (Sentry / debug-log leak vector) hides both.
+    assert "CKEY_TOP_SECRET_123" not in repr(client_config)
+    assert "CSECRET_TOP_SECRET_456" not in repr(client_config)
+    assert "<redacted>" in repr(client_config)
 
 
 class TestKafkaBackendPopWithAckConcurrency:
-  """Tier-2 Unit H: pop_with_ack + ack(token) correctness under CONCURRENT_REQUESTS>1.
+    """Tier-2 Unit H: pop_with_ack + ack(token) correctness under CONCURRENT_REQUESTS>1.
 
-  These tests prove no message is lost or skipped when N messages are popped
-  before any is acked, and that acking out of order commits only the contiguous
-  low-watermark (no unprocessed record ever skipped).
-  """
-
-  @staticmethod
-  def _make_backend_with_records(mocker, records):
-    """Build a KafkaBackend whose consumer.poll yields the given records in order.
-
-    Each record is a MagicMock with .value/.partition/.offset/.topic set.
+    These tests prove no message is lost or skipped when N messages are popped
+    before any is acked, and that acking out of order commits only the contiguous
+    low-watermark (no unprocessed record ever skipped).
     """
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.poll.side_effect = [
-      {TopicPartition(r.topic, r.partition): [r]} for r in records
-    ] + [{}] * 5  # subsequent polls return empty
-    # Kafka position() is the NEXT offset to fetch, not the first in-flight
-    # record. The backend must seed its ack watermark from records as they are
-    # popped; using this realistic position would skip/no-op every pending ack.
-    mock_consumer.position.return_value = max(r.offset for r in records) + 1
-    backend._consumer = mock_consumer
-    return backend, mock_consumer
 
-  @staticmethod
-  def _record(mocker, partition, offset, value=b"x", topic="scrapy-testq"):
-    r = mocker.MagicMock()
-    r.partition = partition
-    r.offset = offset
-    r.value = value
-    r.topic = topic
-    return r
+    @staticmethod
+    def _make_backend_with_records(mocker, records):
+        """Build a KafkaBackend whose consumer.poll yields the given records in order.
 
-  def test_concurrent_pops_return_distinct_tokens(self, mocker):
-    """(a) N concurrent pop_with_ack calls return N distinct (partition, offset) tokens."""
-    records = [
-      self._record(mocker, 0, 0, b"a"),
-      self._record(mocker, 0, 1, b"b"),
-      self._record(mocker, 0, 2, b"c"),
-    ]
-    backend, _consumer = self._make_backend_with_records(mocker, records)
+        Each record is a MagicMock with .value/.partition/.offset/.topic set.
+        """
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.poll.side_effect = [
+            {TopicPartition(r.topic, r.partition): [r]} for r in records
+        ] + [{}] * 5  # subsequent polls return empty
+        # Kafka position() is the NEXT offset to fetch, not the first in-flight
+        # record. The backend must seed its ack watermark from records as they are
+        # popped; using this realistic position would skip/no-op every pending ack.
+        mock_consumer.position.return_value = max(r.offset for r in records) + 1
+        backend._consumer = mock_consumer
+        return backend, mock_consumer
 
-    tokens = []
-    for _ in range(3):
-      _value, token = backend.pop_with_ack("testq", timeout=0.0)
-      tokens.append(token)
+    @staticmethod
+    def _record(mocker, partition, offset, value=b"x", topic="scrapy-testq"):
+        r = mocker.MagicMock()
+        r.partition = partition
+        r.offset = offset
+        r.value = value
+        r.topic = topic
+        return r
 
-    # Three distinct tokens, each correlating to its specific offset.
-    assert all(t is not None for t in tokens)
-    assert len({(t.partition, t.offset) for t in tokens}) == 3
-    assert [t.offset for t in tokens] == [0, 1, 2]
+    def test_concurrent_pops_return_distinct_tokens(self, mocker):
+        """(a) N concurrent pop_with_ack calls return N distinct (partition, offset) tokens."""
+        records = [
+            self._record(mocker, 0, 0, b"a"),
+            self._record(mocker, 0, 1, b"b"),
+            self._record(mocker, 0, 2, b"c"),
+        ]
+        backend, _consumer = self._make_backend_with_records(mocker, records)
 
-  def test_reverse_order_ack_commits_only_contiguous_watermark(self, mocker):
-    """(b) ack offsets 0,1,2 in REVERSE order; watermark advances only contiguously.
+        tokens = []
+        for _ in range(3):
+            _value, token = backend.pop_with_ack("testq", timeout=0.0)
+            tokens.append(token)
 
-    pop offsets 0,1,2 ; ack 2 then 1 → no commit yet (gap at 0);
-    ack 0 → commit advances to watermark 3 (all three processed).
-    """
-    records = [
-      self._record(mocker, 0, 0),
-      self._record(mocker, 0, 1),
-      self._record(mocker, 0, 2),
-    ]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        # Three distinct tokens, each correlating to its specific offset.
+        assert all(t is not None for t in tokens)
+        assert len({(t.partition, t.offset) for t in tokens}) == 3
+        assert [t.offset for t in tokens] == [0, 1, 2]
 
-    _v0, t0 = backend.pop_with_ack("testq")
-    _v1, t1 = backend.pop_with_ack("testq")
-    _v2, t2 = backend.pop_with_ack("testq")
+    def test_reverse_order_ack_commits_only_contiguous_watermark(self, mocker):
+        """(b) ack offsets 0,1,2 in REVERSE order; watermark advances only contiguously.
 
-    # ack offset 2 → no contiguous run from base 0 (0,1 still in-flight)
-    backend.ack("testq", token=t2)
-    mock_consumer.commit.assert_not_called()
+        pop offsets 0,1,2 ; ack 2 then 1 → no commit yet (gap at 0);
+        ack 0 → commit advances to watermark 3 (all three processed).
+        """
+        records = [
+            self._record(mocker, 0, 0),
+            self._record(mocker, 0, 1),
+            self._record(mocker, 0, 2),
+        ]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
 
-    # ack offset 1 → still gap at 0, no commit
-    backend.ack("testq", token=t1)
-    mock_consumer.commit.assert_not_called()
+        _v0, t0 = backend.pop_with_ack("testq")
+        _v1, t1 = backend.pop_with_ack("testq")
+        _v2, t2 = backend.pop_with_ack("testq")
 
-    # ack offset 0 → contiguous run complete, commit advances to 3
-    backend.ack("testq", token=t0)
-    mock_consumer.commit.assert_called_once()
-    committed_map = mock_consumer.commit.call_args.args[0]
-    tp, oam = next(iter(committed_map.items()))
-    assert tp == TopicPartition("scrapy-testq", 0)
-    assert oam.offset == 3
-    mock_consumer.position.assert_not_called()
+        # ack offset 2 → no contiguous run from base 0 (0,1 still in-flight)
+        backend.ack("testq", token=t2)
+        mock_consumer.commit.assert_not_called()
 
-  def test_no_offset_skipped_under_concurrency(self, mocker):
-    """(c) Interleaved pop/ack never skips an unprocessed offset.
+        # ack offset 1 → still gap at 0, no commit
+        backend.ack("testq", token=t1)
+        mock_consumer.commit.assert_not_called()
 
-    pop 0, pop 1, ack 1 (no commit — 0 unacked), pop 2, ack 0 → commit to 2.
-    Offset 1 was acked out of order but the watermark only advances to 2
-    (offset 2 still in-flight). Then ack 2 → commit to 3.
-    """
-    records = [
-      self._record(mocker, 0, 0),
-      self._record(mocker, 0, 1),
-      self._record(mocker, 0, 2),
-    ]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        # ack offset 0 → contiguous run complete, commit advances to 3
+        backend.ack("testq", token=t0)
+        mock_consumer.commit.assert_called_once()
+        committed_map = mock_consumer.commit.call_args.args[0]
+        tp, oam = next(iter(committed_map.items()))
+        assert tp == TopicPartition("scrapy-testq", 0)
+        assert oam.offset == 3
+        mock_consumer.position.assert_not_called()
 
-    _v0, t0 = backend.pop_with_ack("testq")
-    _v1, t1 = backend.pop_with_ack("testq")
-    backend.ack("testq", token=t1)  # ack 1 — gap at 0
-    mock_consumer.commit.assert_not_called()
-    _v2, t2 = backend.pop_with_ack("testq")
-    backend.ack("testq", token=t0)  # ack 0 — contiguous 0,1 done → commit to 2
+    def test_no_offset_skipped_under_concurrency(self, mocker):
+        """(c) Interleaved pop/ack never skips an unprocessed offset.
 
-    committed_map = mock_consumer.commit.call_args.args[0]
-    _tp, oam = next(iter(committed_map.items()))
-    assert oam.offset == 2  # offset 2 not yet acked — NOT skipped
+        pop 0, pop 1, ack 1 (no commit — 0 unacked), pop 2, ack 0 → commit to 2.
+        Offset 1 was acked out of order but the watermark only advances to 2
+        (offset 2 still in-flight). Then ack 2 → commit to 3.
+        """
+        records = [
+            self._record(mocker, 0, 0),
+            self._record(mocker, 0, 1),
+            self._record(mocker, 0, 2),
+        ]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
 
-    backend.ack("testq", token=t2)  # ack 2 → commit to 3
-    final_map = mock_consumer.commit.call_args.args[0]
-    _tp2, oam2 = next(iter(final_map.items()))
-    assert oam2.offset == 3
+        _v0, t0 = backend.pop_with_ack("testq")
+        _v1, t1 = backend.pop_with_ack("testq")
+        backend.ack("testq", token=t1)  # ack 1 — gap at 0
+        mock_consumer.commit.assert_not_called()
+        _v2, t2 = backend.pop_with_ack("testq")
+        backend.ack("testq", token=t0)  # ack 0 — contiguous 0,1 done → commit to 2
 
-  def test_ack_token_none_legacy_fallback_commits_last_record(self, mocker):
-    """(d) ack(token=None) legacy fallback commits the last-popped record wholesale."""
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    backend._consumer = mock_consumer
-    backend._last_record = mocker.MagicMock()
+        committed_map = mock_consumer.commit.call_args.args[0]
+        _tp, oam = next(iter(committed_map.items()))
+        assert oam.offset == 2  # offset 2 not yet acked — NOT skipped
 
-    backend.ack("testq", token=None)  # legacy path
+        backend.ack("testq", token=t2)  # ack 2 → commit to 3
+        final_map = mock_consumer.commit.call_args.args[0]
+        _tp2, oam2 = next(iter(final_map.items()))
+        assert oam2.offset == 3
 
-    mock_consumer.commit.assert_called_once_with()  # bare commit, no offset map
+    def test_ack_token_none_legacy_fallback_commits_last_record(self, mocker):
+        """(d) ack(token=None) legacy fallback commits the last-popped record wholesale."""
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        backend._consumer = mock_consumer
+        backend._last_record = mocker.MagicMock()
 
-  def test_nack_does_not_commit_redeliver_semantics(self, mocker):
-    """(e) nack(token) rewinds an assigned partition for in-session retry."""
-    records = [self._record(mocker, 0, 0)]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
-    topic_partition = TopicPartition("scrapy-testq", 0)
-    mock_consumer.assignment.return_value = {topic_partition}
-    _value, token = backend.pop_with_ack("testq")
+        backend.ack("testq", token=None)  # legacy path
 
-    backend.nack("testq", token=token)
+        mock_consumer.commit.assert_called_once_with()  # bare commit, no offset map
 
-    mock_consumer.commit.assert_not_called()
-    mock_consumer.seek.assert_called_once_with(topic_partition, 0)
-    # The offset stays in-flight so the watermark can never advance past it.
-    assert 0 in backend._in_flight[("scrapy-testq", 0)]
+    def test_nack_does_not_commit_redeliver_semantics(self, mocker):
+        """(e) nack(token) rewinds an assigned partition for in-session retry."""
+        records = [self._record(mocker, 0, 0)]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        topic_partition = TopicPartition("scrapy-testq", 0)
+        mock_consumer.assignment.return_value = {topic_partition}
+        _value, token = backend.pop_with_ack("testq")
 
-  def test_nack_keeps_offset_uncommitted_when_partition_is_not_assigned(self, mocker):
-    """A revoked partition cannot be sought; restart redelivery remains the fallback."""
-    records = [self._record(mocker, 0, 7)]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
-    mock_consumer.assignment.return_value = set()
-    _value, token = backend.pop_with_ack("testq")
+        backend.nack("testq", token=token)
 
-    backend.nack("testq", token=token)
+        mock_consumer.commit.assert_not_called()
+        mock_consumer.seek.assert_called_once_with(topic_partition, 0)
+        # The offset stays in-flight so the watermark can never advance past it.
+        assert 0 in backend._in_flight[("scrapy-testq", 0)]
 
-    mock_consumer.seek.assert_not_called()
-    assert 7 in backend._in_flight[("scrapy-testq", 0)]
+    def test_nack_keeps_offset_uncommitted_when_partition_is_not_assigned(self, mocker):
+        """A revoked partition cannot be sought; restart redelivery remains the fallback."""
+        records = [self._record(mocker, 0, 7)]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        mock_consumer.assignment.return_value = set()
+        _value, token = backend.pop_with_ack("testq")
 
-  def test_nack_seek_failure_is_retryable(self, mocker):
-    """A broker/client seek failure surfaces while preserving in-flight state."""
-    records = [self._record(mocker, 0, 7)]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
-    topic_partition = TopicPartition("scrapy-testq", 0)
-    mock_consumer.assignment.return_value = {topic_partition}
-    mock_consumer.seek.side_effect = KafkaError("seek failed")
-    _value, token = backend.pop_with_ack("testq")
+        backend.nack("testq", token=token)
 
-    with pytest.raises(QueueError, match="Failed to nack Kafka message"):
-      backend.nack("testq", token=token)
+        mock_consumer.seek.assert_not_called()
+        assert 7 in backend._in_flight[("scrapy-testq", 0)]
 
-    assert 7 in backend._in_flight[("scrapy-testq", 0)]
+    def test_nack_seek_failure_is_retryable(self, mocker):
+        """A broker/client seek failure surfaces while preserving in-flight state."""
+        records = [self._record(mocker, 0, 7)]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        topic_partition = TopicPartition("scrapy-testq", 0)
+        mock_consumer.assignment.return_value = {topic_partition}
+        mock_consumer.seek.side_effect = KafkaError("seek failed")
+        _value, token = backend.pop_with_ack("testq")
 
-  def test_stale_token_cannot_ack_redelivery_after_reconnect(self, mocker):
-    """An old consumer generation cannot commit a same-offset redelivery."""
-    old_record = self._record(mocker, 0, 0)
-    new_record = self._record(mocker, 0, 0)
-    old_consumer = mocker.MagicMock()
-    old_consumer.poll.return_value = {
-      TopicPartition("scrapy-testq", 0): [old_record]
-    }
-    new_consumer = mocker.MagicMock()
-    new_consumer.poll.return_value = {
-      TopicPartition("scrapy-testq", 0): [new_record]
-    }
-    mocker.patch(
-      "scrapy_extension.backends.kafka.KafkaConsumer",
-      side_effect=[old_consumer, new_consumer],
-    )
-    backend = KafkaBackend(KafkaSettings())
+        with pytest.raises(QueueError, match="Failed to nack Kafka message"):
+            backend.nack("testq", token=token)
 
-    _old_value, old_token = backend.pop_with_ack("testq")
-    backend.disconnect()
-    _new_value, new_token = backend.pop_with_ack("testq")
+        assert 7 in backend._in_flight[("scrapy-testq", 0)]
 
-    backend.ack("testq", token=old_token)
+    def test_stale_token_cannot_ack_redelivery_after_reconnect(self, mocker):
+        """An old consumer generation cannot commit a same-offset redelivery."""
+        old_record = self._record(mocker, 0, 0)
+        new_record = self._record(mocker, 0, 0)
+        old_consumer = mocker.MagicMock()
+        old_consumer.poll.return_value = {
+            TopicPartition("scrapy-testq", 0): [old_record]
+        }
+        new_consumer = mocker.MagicMock()
+        new_consumer.poll.return_value = {
+            TopicPartition("scrapy-testq", 0): [new_record]
+        }
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            side_effect=[old_consumer, new_consumer],
+        )
+        backend = KafkaBackend(KafkaSettings())
 
-    new_consumer.commit.assert_not_called()
-    assert old_token != new_token
-    assert 0 in backend._in_flight[("scrapy-testq", 0)]
+        _old_value, old_token = backend.pop_with_ack("testq")
+        backend.disconnect()
+        _new_value, new_token = backend.pop_with_ack("testq")
 
-  def test_ack_idempotent_on_duplicate_token(self, mocker):
-    """Acking the same token twice does not double-commit or advance past the run."""
-    records = [self._record(mocker, 0, 0), self._record(mocker, 0, 1)]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
-    _v0, t0 = backend.pop_with_ack("testq")
-    _v1, t1 = backend.pop_with_ack("testq")
+        backend.ack("testq", token=old_token)
 
-    backend.ack("testq", token=t0)  # commit to 1 (0 done, 1 in-flight)
-    first_commit_count = mock_consumer.commit.call_count
-    backend.ack("testq", token=t0)  # duplicate — no-op (already discarded)
+        new_consumer.commit.assert_not_called()
+        assert old_token != new_token
+        assert 0 in backend._in_flight[("scrapy-testq", 0)]
 
-    assert mock_consumer.commit.call_count == first_commit_count
+    def test_ack_idempotent_on_duplicate_token(self, mocker):
+        """Acking the same token twice does not double-commit or advance past the run."""
+        records = [self._record(mocker, 0, 0), self._record(mocker, 0, 1)]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        _v0, t0 = backend.pop_with_ack("testq")
+        _v1, t1 = backend.pop_with_ack("testq")
 
-  def test_subscription_switch_fences_prior_topic_token(self, mocker):
-    """A single consumer cannot settle a token from its revoked topic."""
-    records = [
-      self._record(mocker, 0, 0, topic="scrapy-first"),
-      self._record(mocker, 0, 0, topic="scrapy-second"),
-    ]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        backend.ack("testq", token=t0)  # commit to 1 (0 done, 1 in-flight)
+        first_commit_count = mock_consumer.commit.call_count
+        backend.ack("testq", token=t0)  # duplicate — no-op (already discarded)
 
-    _first_value, first_token = backend.pop_with_ack("first")
-    _second_value, second_token = backend.pop_with_ack("second")
+        assert mock_consumer.commit.call_count == first_commit_count
 
-    backend.ack("first", token=first_token)
-    backend.ack("second", token=second_token)
+    def test_subscription_switch_fences_prior_topic_token(self, mocker):
+        """A single consumer cannot settle a token from its revoked topic."""
+        records = [
+            self._record(mocker, 0, 0, topic="scrapy-first"),
+            self._record(mocker, 0, 0, topic="scrapy-second"),
+        ]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
 
-    assert mock_consumer.commit.call_count == 1
-    committed_partitions = [
-      next(iter(call.args[0])) for call in mock_consumer.commit.call_args_list
-    ]
-    assert committed_partitions == [TopicPartition("scrapy-second", 0)]
-    assert [
-      next(iter(call.args[0].values())).offset
-      for call in mock_consumer.commit.call_args_list
-    ] == [1]
+        _first_value, first_token = backend.pop_with_ack("first")
+        _second_value, second_token = backend.pop_with_ack("second")
 
-  def test_ack_retries_same_token_after_commit_failure(self, mocker):
-    """A failed broker commit must leave the token retryable."""
-    records = [self._record(mocker, 0, 0)]
-    backend, mock_consumer = self._make_backend_with_records(mocker, records)
-    mock_consumer.commit.side_effect = [KafkaError("commit failed"), None]
-    _value, token = backend.pop_with_ack("testq")
+        backend.ack("first", token=first_token)
+        backend.ack("second", token=second_token)
 
-    with pytest.raises(QueueError, match="Failed to ack Kafka message"):
-      backend.ack("testq", token=token)
+        assert mock_consumer.commit.call_count == 1
+        committed_partitions = [
+            next(iter(call.args[0])) for call in mock_consumer.commit.call_args_list
+        ]
+        assert committed_partitions == [TopicPartition("scrapy-second", 0)]
+        assert [
+            next(iter(call.args[0].values())).offset
+            for call in mock_consumer.commit.call_args_list
+        ] == [1]
 
-    backend.ack("testq", token=token)
-    backend.ack("testq", token=token)
+    def test_ack_retries_same_token_after_commit_failure(self, mocker):
+        """A failed broker commit must leave the token retryable."""
+        records = [self._record(mocker, 0, 0)]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+        mock_consumer.commit.side_effect = [KafkaError("commit failed"), None]
+        _value, token = backend.pop_with_ack("testq")
 
-    assert mock_consumer.commit.call_count == 2
-    first_commit = mock_consumer.commit.call_args_list[0].args[0]
-    retry_commit = mock_consumer.commit.call_args_list[1].args[0]
-    assert first_commit == retry_commit
-    topic_partition = ("scrapy-testq", 0)
-    assert topic_partition not in backend._in_flight
-    assert topic_partition not in backend._watermarks
-    assert topic_partition not in backend._high_water
+        with pytest.raises(QueueError, match="Failed to ack Kafka message"):
+            backend.ack("testq", token=token)
+
+        backend.ack("testq", token=token)
+        backend.ack("testq", token=token)
+
+        assert mock_consumer.commit.call_count == 2
+        first_commit = mock_consumer.commit.call_args_list[0].args[0]
+        retry_commit = mock_consumer.commit.call_args_list[1].args[0]
+        assert first_commit == retry_commit
+        topic_partition = ("scrapy-testq", 0)
+        assert topic_partition not in backend._in_flight
+        assert topic_partition not in backend._watermarks
+        assert topic_partition not in backend._high_water
 
 
 # ---------------------------------------------------------------------------
@@ -2375,19 +2382,19 @@ class TestKafkaBackendPopWithAckConcurrency:
 
 
 def test_redaction_module_is_shared_helper():
-  """SEC-1: _RedactedStr is now defined once in backends/_redaction.py and
-  re-imported by kafka. The kafka module re-exports it for backward compat.
-  """
-  from scrapy_extension.backends._redaction import _RedactedStr as SharedRedacted
-  from scrapy_extension.backends.kafka import _RedactedStr as KafkaRedacted
+    """SEC-1: _RedactedStr is now defined once in backends/_redaction.py and
+    re-imported by kafka. The kafka module re-exports it for backward compat.
+    """
+    from scrapy_extension.backends._redaction import _RedactedStr as SharedRedacted
+    from scrapy_extension.backends.kafka import _RedactedStr as KafkaRedacted
 
-  assert SharedRedacted is KafkaRedacted  # same class object (re-exported)
-  # str-subclass semantics preserved: client libs get the real value.
-  s = SharedRedacted("hunter2")
-  assert str(s) == "hunter2"
-  assert s == "hunter2"  # equality works
-  assert "hunter2" not in repr(s)
-  assert repr(s) == "<redacted>"
+    assert SharedRedacted is KafkaRedacted  # same class object (re-exported)
+    # str-subclass semantics preserved: client libs get the real value.
+    s = SharedRedacted("hunter2")
+    assert str(s) == "hunter2"
+    assert s == "hunter2"  # equality works
+    assert "hunter2" not in repr(s)
+    assert repr(s) == "<redacted>"
 
 
 # ===========================================================================
@@ -2396,87 +2403,87 @@ def test_redaction_module_is_shared_helper():
 
 
 class TestKafkaBackendPartitionPruning:
-  """R14-E MED: ack bookkeeping prunes per-topic-partition keys.
+    """R14-E MED: ack bookkeeping prunes per-topic-partition keys.
 
-  These dicts grow one key per topic-partition ever popped; without pruning,
-  topic or partition churn grows them unbounded. When a topic-partition's
-  in-flight set empties (its watermark has caught up to the popped frontier),
-  its keys are stale and safe to drop. A fresh pop on the same topic-partition
-  re-seeds them lazily.
-  """
+    These dicts grow one key per topic-partition ever popped; without pruning,
+    topic or partition churn grows them unbounded. When a topic-partition's
+    in-flight set empties (its watermark has caught up to the popped frontier),
+    its keys are stale and safe to drop. A fresh pop on the same topic-partition
+    re-seeds them lazily.
+    """
 
-  @staticmethod
-  def _make_backend(mocker):
-    from scrapy_extension.settings import KafkaSettings
+    @staticmethod
+    def _make_backend(mocker):
+        from scrapy_extension.settings import KafkaSettings
 
-    config = KafkaSettings()
-    backend = KafkaBackend(config)
-    mock_consumer = mocker.MagicMock()
-    mock_consumer.position.return_value = 0
-    backend._consumer = mock_consumer
-    return backend, mock_consumer
+        config = KafkaSettings()
+        backend = KafkaBackend(config)
+        mock_consumer = mocker.MagicMock()
+        mock_consumer.position.return_value = 0
+        backend._consumer = mock_consumer
+        return backend, mock_consumer
 
-  def test_prunes_empty_partition_keys_on_ack(self, mocker):
-    """When the last in-flight offset for a partition is acked, its keys are pruned."""
-    backend, mock_consumer = self._make_backend(mocker)
-    topic_partition = ("scrapy-testq", 5)
-    # Simulate one pop on partition 5 (a non-default partition to prove the
-    # key is genuinely removed, not just the default 0).
-    backend._in_flight[topic_partition].add(100)
-    backend._high_water[topic_partition] = 101
-    backend._watermarks[topic_partition] = 100  # base == popped offset
+    def test_prunes_empty_partition_keys_on_ack(self, mocker):
+        """When the last in-flight offset for a partition is acked, its keys are pruned."""
+        backend, mock_consumer = self._make_backend(mocker)
+        topic_partition = ("scrapy-testq", 5)
+        # Simulate one pop on partition 5 (a non-default partition to prove the
+        # key is genuinely removed, not just the default 0).
+        backend._in_flight[topic_partition].add(100)
+        backend._high_water[topic_partition] = 101
+        backend._watermarks[topic_partition] = 100  # base == popped offset
 
-    from scrapy_extension.backends.kafka import _KafkaAckToken
+        from scrapy_extension.backends.kafka import _KafkaAckToken
 
-    token = _KafkaAckToken(partition=5, offset=100, topic="scrapy-testq")
-    backend.ack("testq", token=token)
+        token = _KafkaAckToken(partition=5, offset=100, topic="scrapy-testq")
+        backend.ack("testq", token=token)
 
-    # The watermark advanced to 101 (high_water), so commit fired.
-    mock_consumer.commit.assert_called_once()
-    # All three per-topic-partition keys are now pruned.
-    assert topic_partition not in backend._in_flight, (
-      "topic-partition not pruned after drain — partition-churn leak"
-    )
-    assert topic_partition not in backend._watermarks
-    assert topic_partition not in backend._high_water
+        # The watermark advanced to 101 (high_water), so commit fired.
+        mock_consumer.commit.assert_called_once()
+        # All three per-topic-partition keys are now pruned.
+        assert topic_partition not in backend._in_flight, (
+            "topic-partition not pruned after drain — partition-churn leak"
+        )
+        assert topic_partition not in backend._watermarks
+        assert topic_partition not in backend._high_water
 
-  def test_keeps_keys_when_partition_still_has_in_flight(self, mocker):
-    """If a partition still has unacked offsets, its keys are retained."""
-    backend, _mock_consumer = self._make_backend(mocker)
-    topic_partition = ("scrapy-testq", 5)
-    backend._in_flight[topic_partition].update({100, 101})
-    backend._high_water[topic_partition] = 102
-    backend._watermarks[topic_partition] = 100
+    def test_keeps_keys_when_partition_still_has_in_flight(self, mocker):
+        """If a partition still has unacked offsets, its keys are retained."""
+        backend, _mock_consumer = self._make_backend(mocker)
+        topic_partition = ("scrapy-testq", 5)
+        backend._in_flight[topic_partition].update({100, 101})
+        backend._high_water[topic_partition] = 102
+        backend._watermarks[topic_partition] = 100
 
-    from scrapy_extension.backends.kafka import _KafkaAckToken
+        from scrapy_extension.backends.kafka import _KafkaAckToken
 
-    token = _KafkaAckToken(partition=5, offset=100, topic="scrapy-testq")
-    backend.ack("testq", token=token)
+        token = _KafkaAckToken(partition=5, offset=100, topic="scrapy-testq")
+        backend.ack("testq", token=token)
 
-    # Partition 5 still has offset 101 in-flight → keys retained.
-    assert topic_partition in backend._in_flight
-    assert 101 in backend._in_flight[topic_partition]
-    assert topic_partition in backend._watermarks
-    assert topic_partition in backend._high_water
+        # Partition 5 still has offset 101 in-flight → keys retained.
+        assert topic_partition in backend._in_flight
+        assert 101 in backend._in_flight[topic_partition]
+        assert topic_partition in backend._watermarks
+        assert topic_partition in backend._high_water
 
-  def test_multiple_partitions_prune_independently(self, mocker):
-    """Partition churn across many partitions prunes each independently."""
-    from scrapy_extension.backends.kafka import _KafkaAckToken
+    def test_multiple_partitions_prune_independently(self, mocker):
+        """Partition churn across many partitions prunes each independently."""
+        from scrapy_extension.backends.kafka import _KafkaAckToken
 
-    backend, _mock_consumer = self._make_backend(mocker)
-    # Seed 8 partitions, each with one in-flight offset, all at the same base.
-    for p in range(8):
-      topic_partition = ("scrapy-testq", p)
-      backend._in_flight[topic_partition].add(10)
-      backend._high_water[topic_partition] = 11
-      backend._watermarks[topic_partition] = 10
+        backend, _mock_consumer = self._make_backend(mocker)
+        # Seed 8 partitions, each with one in-flight offset, all at the same base.
+        for p in range(8):
+            topic_partition = ("scrapy-testq", p)
+            backend._in_flight[topic_partition].add(10)
+            backend._high_water[topic_partition] = 11
+            backend._watermarks[topic_partition] = 10
 
-    # Ack each — each partition drains and prunes.
-    for p in range(8):
-      token = _KafkaAckToken(partition=p, offset=10, topic="scrapy-testq")
-      backend.ack("testq", token=token)
+        # Ack each — each partition drains and prunes.
+        for p in range(8):
+            token = _KafkaAckToken(partition=p, offset=10, topic="scrapy-testq")
+            backend.ack("testq", token=token)
 
-    # All 8 partitions pruned — no unbounded growth under partition churn.
-    assert len(backend._in_flight) == 0
-    assert len(backend._watermarks) == 0
-    assert len(backend._high_water) == 0
+        # All 8 partitions pruned — no unbounded growth under partition churn.
+        assert len(backend._in_flight) == 0
+        assert len(backend._watermarks) == 0
+        assert len(backend._high_water) == 0

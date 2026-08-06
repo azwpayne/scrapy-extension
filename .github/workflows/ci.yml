@@ -40,6 +40,9 @@ jobs:
           assert sys.version_info[:2] == expected, (sys.version, expected)"
       - name: Ruff
         run: uv run --no-sync ruff check
+      - name: Ruff format
+        if: matrix.python-version == '3.10'
+        run: uv run --no-sync ruff format --check src tests conftest.py
       - name: Mypy (strict)
         if: matrix.python-version == '3.10'
         run: uv run --no-sync mypy --strict src
@@ -60,6 +63,26 @@ jobs:
       - name: Build package artifacts
         if: matrix.python-version == '3.10'
         run: uv build --clear --python ${{ matrix.python-version }}
+      - name: Verify package artifact contents
+        if: matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          artifacts=(dist/*.whl dist/*.tar.gz)
+          test "${#artifacts[@]}" -eq 2
+          forbidden='(^|/)(\.env[^/]*|\.secrets/|credentials/|secrets/)|\.(pem|key|crt|cer|p12|pfx|jks|keystore)$|(^|/)docs/insight/'
+          for artifact in "${artifacts[@]}"; do
+            if [[ "$artifact" == *.whl ]]; then
+              contents=$(unzip -Z1 "$artifact")
+            else
+              contents=$(tar -tzf "$artifact")
+            fi
+            if grep -Ei --quiet "$forbidden" <<<"$contents"; then
+              printf 'Forbidden file in %s:\n' "$artifact" >&2
+              grep -Ei "$forbidden" <<<"$contents" >&2
+              exit 1
+            fi
+          done
       - name: Smoke-test package artifacts
         if: matrix.python-version == '3.10'
         shell: bash

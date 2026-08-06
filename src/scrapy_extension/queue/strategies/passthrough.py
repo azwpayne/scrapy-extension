@@ -12,100 +12,100 @@ __all__ = ["PassthroughQueueStrategy"]
 from typing import Any
 
 from scrapy_extension.queue.strategies.base import (
-  QueueStrategy,
-  _PreparedQueuePush,
-  normalize_queue_timeout,
+    QueueStrategy,
+    _PreparedQueuePush,
+    normalize_queue_timeout,
 )
 
 
 class PassthroughQueueStrategy(QueueStrategy):
-  """Push/pop/len/clear pass straight through to the QueueBackend.
+    """Push/pop/len/clear pass straight through to the QueueBackend.
 
-  This preserves the exact pre-strategy ``BackendQueue`` behavior, so it is
-  the default and is fully backward-compatible. ``delay`` is ignored.
-  """
-
-  def is_push_durable(self, *, delay: float, source: str) -> bool:
-    """Report that every accepted item is stored by the queue backend."""
-    del delay, source
-    return True
-
-  def _prepare_push(
-    self,
-    queue_name: str,
-    *,
-    priority: float = 0.0,
-    delay: float = 0.0,
-    source: str = "default",
-  ) -> _PreparedQueuePush:
-    """Freeze the passthrough route; durability comes from the exact push."""
-    del delay, source
-    return self._prepare_backend_push(queue_name, priority=priority)
-
-  def push(
-    self,
-    queue_name: str,
-    item: bytes,
-    *,
-    priority: float = 0.0,
-    delay: float = 0.0,
-    source: str = "default",
-  ) -> None:
-    """Push straight to the QueueBackend (delay/source ignored).
-
-    Args:
-        queue_name: The queue name.
-        item: Serialized item bytes.
-        priority: Priority passed through to the backend.
-        delay: Ignored (passthrough is not a delay queue).
-        source: Ignored (passthrough does no fairness routing).
+    This preserves the exact pre-strategy ``BackendQueue`` behavior, so it is
+    the default and is fully backward-compatible. ``delay`` is ignored.
     """
-    del delay, source
-    self._connection_manager.get_queue_backend().push(queue_name, item, priority)
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-    """Pop from the QueueBackend.
+    def is_push_durable(self, *, delay: float, source: str) -> bool:
+        """Report that every accepted item is stored by the queue backend."""
+        del delay, source
+        return True
 
-    Args:
-        queue_name: The queue name.
-        timeout: Seconds to block (0 = non-blocking).
+    def _prepare_push(
+        self,
+        queue_name: str,
+        *,
+        priority: float = 0.0,
+        delay: float = 0.0,
+        source: str = "default",
+    ) -> _PreparedQueuePush:
+        """Freeze the passthrough route; durability comes from the exact push."""
+        del delay, source
+        return self._prepare_backend_push(queue_name, priority=priority)
 
-    Returns:
-        The next item, or None if empty.
-    """
-    timeout = normalize_queue_timeout(timeout)
-    return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
+    def push(
+        self,
+        queue_name: str,
+        item: bytes,
+        *,
+        priority: float = 0.0,
+        delay: float = 0.0,
+        source: str = "default",
+    ) -> None:
+        """Push straight to the QueueBackend (delay/source ignored).
 
-  def pop_with_ack(
-    self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, Any | None]:
-    """Pop from the QueueBackend, carrying the per-message ack token when the
-    backend provides one (#28 -- consolidates BackendQueue._pop_with_ack's
-    passthrough branch into the strategy).
+        Args:
+            queue_name: The queue name.
+            item: Serialized item bytes.
+            priority: Priority passed through to the backend.
+            delay: Ignored (passthrough is not a delay queue).
+            source: Ignored (passthrough does no fairness routing).
+        """
+        del delay, source
+        self._connection_manager.get_queue_backend().push(queue_name, item, priority)
 
-    Delegates to :meth:`QueueStrategy._pop_backend_with_ack` (shared with the
-    delay / throttle strategies). Only backends that genuinely override
-    ``pop_with_ack`` (the MQ backends) take the token-correlated path;
-    atomic-pop backends keep the plain ``pop()`` roundtrip.
-    """
-    timeout = normalize_queue_timeout(timeout)
-    return self._pop_backend_with_ack(queue_name, timeout)
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        """Pop from the QueueBackend.
 
-  def queue_len(self, queue_name: str) -> int:
-    """Return the QueueBackend length.
+        Args:
+            queue_name: The queue name.
+            timeout: Seconds to block (0 = non-blocking).
 
-    Args:
-        queue_name: The queue name.
+        Returns:
+            The next item, or None if empty.
+        """
+        timeout = normalize_queue_timeout(timeout)
+        return self._connection_manager.get_queue_backend().pop(queue_name, timeout)
 
-    Returns:
-        Number of items in the backend queue.
-    """
-    return self._connection_manager.get_queue_backend().queue_len(queue_name)
+    def pop_with_ack(
+        self, queue_name: str, timeout: float = 0.0
+    ) -> tuple[bytes | None, Any | None]:
+        """Pop from the QueueBackend, carrying the per-message ack token when the
+        backend provides one (#28 -- consolidates BackendQueue._pop_with_ack's
+        passthrough branch into the strategy).
 
-  def clear(self, queue_name: str) -> None:
-    """Clear the QueueBackend queue.
+        Delegates to :meth:`QueueStrategy._pop_backend_with_ack` (shared with the
+        delay / throttle strategies). Only backends that genuinely override
+        ``pop_with_ack`` (the MQ backends) take the token-correlated path;
+        atomic-pop backends keep the plain ``pop()`` roundtrip.
+        """
+        timeout = normalize_queue_timeout(timeout)
+        return self._pop_backend_with_ack(queue_name, timeout)
 
-    Args:
-        queue_name: The queue name.
-    """
-    self._connection_manager.get_queue_backend().clear_queue(queue_name)
+    def queue_len(self, queue_name: str) -> int:
+        """Return the QueueBackend length.
+
+        Args:
+            queue_name: The queue name.
+
+        Returns:
+            Number of items in the backend queue.
+        """
+        return self._connection_manager.get_queue_backend().queue_len(queue_name)
+
+    def clear(self, queue_name: str) -> None:
+        """Clear the QueueBackend queue.
+
+        Args:
+            queue_name: The queue name.
+        """
+        self._connection_manager.get_queue_backend().clear_queue(queue_name)

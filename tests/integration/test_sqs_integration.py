@@ -29,35 +29,35 @@ import uuid
 import pytest
 
 pytestmark = [
-  pytest.mark.integration,
-  pytest.mark.skipif(
-    not os.environ.get("SCRAPY_TEST_SQS_ENDPOINT"),
-    reason=(
-      "Set SCRAPY_TEST_SQS_ENDPOINT (e.g. http://localhost:4566 for "
-      "LocalStack) to run SQS integration tests against a live instance."
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("SCRAPY_TEST_SQS_ENDPOINT"),
+        reason=(
+            "Set SCRAPY_TEST_SQS_ENDPOINT (e.g. http://localhost:4566 for "
+            "LocalStack) to run SQS integration tests against a live instance."
+        ),
     ),
-  ),
 ]
 
 
 def test_push_pop_round_trip() -> None:
-  """Real-broker round-trip: push → pop (queue ABC contract, base64 MessageBody)."""
-  from scrapy_extension.backends.sqs import SqsBackend
-  from scrapy_extension.settings.sqs import SqsMode, SqsSettings
+    """Real-broker round-trip: push → pop (queue ABC contract, base64 MessageBody)."""
+    from scrapy_extension.backends.sqs import SqsBackend
+    from scrapy_extension.settings.sqs import SqsMode, SqsSettings
 
-  settings = SqsSettings(
-    mode=SqsMode.STANDALONE,
-    endpoint_url=os.environ["SCRAPY_TEST_SQS_ENDPOINT"],
-  )
-  backend = SqsBackend(settings)
-  backend.connect()
-  try:
-    queue_name = f"inttest-{uuid.uuid4().hex[:8]}"
-    payload = b'{"v":1}'
-    backend.push(queue_name, payload)
-    # SQS visibility/propagation is eventually consistent — pop blocks on the
-    # timeout param for up to 10s for the message to become visible.
-    popped = backend.pop(queue_name, timeout=10.0)
-    assert popped == payload
-  finally:
-    backend.disconnect()
+    settings = SqsSettings(
+        mode=SqsMode.STANDALONE,
+        endpoint_url=os.environ["SCRAPY_TEST_SQS_ENDPOINT"],
+    )
+    backend = SqsBackend(settings)
+    backend.connect()
+    try:
+        queue_name = f"inttest-{uuid.uuid4().hex[:8]}"
+        payload = b'{"v":1}'
+        backend.push(queue_name, payload)
+        # SQS visibility/propagation is eventually consistent — pop blocks on the
+        # timeout param for up to 10s for the message to become visible.
+        popped = backend.pop(queue_name, timeout=10.0)
+        assert popped == payload
+    finally:
+        backend.disconnect()

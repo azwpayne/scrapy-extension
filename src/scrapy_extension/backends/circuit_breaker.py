@@ -40,13 +40,13 @@ from scrapy_extension.exceptions import BackendError
 from scrapy_extension.exceptions._redaction import sanitize_backend_error
 
 __all__ = [
-  "CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S",
-  "BreakerState",
-  "CircuitBreaker",
-  "CircuitBreakerOpenError",
-  "wrap_queue_backend",
-  "wrap_set_backend",
-  "wrap_storage_backend",
+    "CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S",
+    "BreakerState",
+    "CircuitBreaker",
+    "CircuitBreakerOpenError",
+    "wrap_queue_backend",
+    "wrap_set_backend",
+    "wrap_storage_backend",
 ]
 
 # R21-A: upper bound on reset_timeout. An OPEN breaker recovers via
@@ -57,359 +57,361 @@ __all__ = [
 CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S: float = 3600.0
 
 _SAFE_QUEUE_OPERATIONS = frozenset(
-  {"push", "pop", "ack", "nack", "queue_len", "clear_queue"}
+    {"push", "pop", "ack", "nack", "queue_len", "clear_queue"}
 )
 _SAFE_STORAGE_OPERATIONS = frozenset(
-  {"store", "retrieve", "delete", "exists", "ttl", "clear_storage"}
+    {"store", "retrieve", "delete", "exists", "ttl", "clear_storage"}
 )
 _QUEUE_METHOD_OPERATIONS = {
-  "push": "push",
-  "_push_with_durability": "push",
-  "pop": "pop",
-  "pop_with_ack": "pop",
-  "ack": "ack",
-  "nack": "nack",
-  "queue_len": "queue_len",
-  "clear_queue": "clear_queue",
+    "push": "push",
+    "_push_with_durability": "push",
+    "pop": "pop",
+    "pop_with_ack": "pop",
+    "ack": "ack",
+    "nack": "nack",
+    "queue_len": "queue_len",
+    "clear_queue": "clear_queue",
 }
 _STORAGE_METHOD_OPERATIONS = {
-  "store": "store",
-  "retrieve": "retrieve",
-  "delete": "delete",
-  "exists": "exists",
-  "ttl": "ttl",
-  "clear_storage": "clear_storage",
+    "store": "store",
+    "retrieve": "retrieve",
+    "delete": "delete",
+    "exists": "exists",
+    "ttl": "ttl",
+    "clear_storage": "clear_storage",
 }
 
 
 class BreakerState(str, Enum):
-  """Circuit-breaker operating state.
+    """Circuit-breaker operating state.
 
-  Attributes:
-      CLOSED: Normal operation — calls are delegated to the backend.
-      OPEN: Tripped — calls fail-fast without touching the backend.
-      HALF_OPEN: Probe mode — a single trial call is allowed through to
-          test whether the backend has recovered.
-  """
+    Attributes:
+        CLOSED: Normal operation — calls are delegated to the backend.
+        OPEN: Tripped — calls fail-fast without touching the backend.
+        HALF_OPEN: Probe mode — a single trial call is allowed through to
+            test whether the backend has recovered.
+    """
 
-  CLOSED = "closed"
-  OPEN = "open"
-  HALF_OPEN = "half_open"
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
 class _CallAdmission(NamedTuple):
-  """State generation under which one backend call was admitted."""
+    """State generation under which one backend call was admitted."""
 
-  state: BreakerState
-  epoch: int
+    state: BreakerState
+    epoch: int
 
 
 class CircuitBreakerOpenError(BackendError):
-  """Raised when a call is rejected because the breaker is OPEN.
+    """Raised when a call is rejected because the breaker is OPEN.
 
-  Subclasses :class:`~scrapy_extension.exceptions.BackendError` so every
-  existing ``except BackendError`` site (scheduler / pipeline / dupefilter)
-  continues to handle the rejection uniformly — no new exception plumbing
-  required upstream.
+    Subclasses :class:`~scrapy_extension.exceptions.BackendError` so every
+    existing ``except BackendError`` site (scheduler / pipeline / dupefilter)
+    continues to handle the rejection uniformly — no new exception plumbing
+    required upstream.
 
-  Attributes:
-      name: The breaker's human-readable name (e.g. ``"redis-queue"``).
-  """
+    Attributes:
+        name: The breaker's human-readable name (e.g. ``"redis-queue"``).
+    """
 
-  def __init__(self, name: str) -> None:
-    self.name = name
-    super().__init__(f"Circuit breaker open for {name!r}")
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"Circuit breaker open for {name!r}")
 
 
 class CircuitBreaker:
-  """Thread-safe three-state circuit breaker.
+    """Thread-safe three-state circuit breaker.
 
-  The breaker counts **consecutive** failures: a single success resets the
-  count to zero. This matches the semantics operators expect — a flapping
-  backend that fails intermittently with occasional successes should not trip
-  as readily as one that has gone hard-down, and recovery (a single clean
-  probe in HALF_OPEN) restores full availability immediately.
+    The breaker counts **consecutive** failures: a single success resets the
+    count to zero. This matches the semantics operators expect — a flapping
+    backend that fails intermittently with occasional successes should not trip
+    as readily as one that has gone hard-down, and recovery (a single clean
+    probe in HALF_OPEN) restores full availability immediately.
 
-  Attributes:
-      name: Human-readable identifier used in error messages and logs.
-      failure_threshold: Consecutive failures required to trip CLOSED→OPEN.
-          Must be >= 1.
-      reset_timeout: Seconds the breaker stays OPEN before allowing a
-          HALF_OPEN probe. Must be >= 0.
-      time_fn: Monotonic clock callable; defaults to :func:`time.monotonic`.
-      failure_exceptions: Exception classes that represent backend failures.
-          Other exceptions propagate without changing breaker state.
-  """
-
-  def __init__(
-    self,
-    name: str,
-    *,
-    failure_threshold: int = 5,
-    reset_timeout: float = 30.0,
-    time_fn: Callable[[], float] | None = None,
-    failure_exceptions: tuple[type[BaseException], ...] = (BaseException,),
-  ) -> None:
-    if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int):
-      msg = f"failure_threshold must be an int >= 1, got {failure_threshold!r}"
-      raise ValueError(msg)
-    if failure_threshold < 1:
-      msg = f"failure_threshold must be >= 1, got {failure_threshold}"
-      raise ValueError(msg)
-    # R34-B: reject bool — ``math.isfinite(True)`` is True and ``True < 0`` is
-    # False, so without this guard ``reset_timeout=True`` is silently accepted
-    # and stored as boolean ``True`` (the OPEN breaker then waits ~1s). Mirror
-    # the R21-A failure_threshold bool guard. Production is neutralized by
-    # pydantic float-coercion on the settings field, but direct construction
-    # (plugins / YAML bools / test doubles) must still reject it.
-    if isinstance(reset_timeout, bool):
-      msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
-      raise ValueError(msg)
-    if not math.isfinite(reset_timeout) or reset_timeout < 0:
-      msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
-      raise ValueError(msg)
-    if reset_timeout > CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S:
-      msg = (
-        f"reset_timeout must be <= {CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S}s "
-        f"(an OPEN breaker must be able to recover), got {reset_timeout!r}"
-      )
-      raise ValueError(msg)
-    self.name = name
-    self.failure_threshold = failure_threshold
-    self.reset_timeout = reset_timeout
-    self.failure_exceptions = failure_exceptions
-    self._time_fn: Callable[[], float] = time_fn or time.monotonic
-    self._lock = threading.Lock()
-    self._state = BreakerState.CLOSED
-    self._failure_count = 0
-    self._last_failure_time: float | None = None
-    # Incremented on every state transition and explicit reset. Calls execute
-    # outside ``_lock``; their result may only mutate the generation under
-    # which it was admitted. This fences late old-socket failures after a
-    # complete OPEN → HALF_OPEN → CLOSED recovery cycle.
-    self._epoch = 0
-    # Guards the HALF_OPEN window so only ONE thread issues the probe call.
-    # Set in _allow_call() on the OPEN→HALF_OPEN transition; cleared under the
-    # lock once the probe's outcome is recorded. Without this, the lock is
-    # released between _allow_call() (which flips OPEN→HALF_OPEN) and func(),
-    # so N threads in the reset-timeout window all observe HALF_OPEN and call
-    # the backend concurrently — defeating the "single probe" contract.
-    self._probe_in_flight: bool = False
-
-  # --- introspection (lock-protected reads for test determinism) ---
-
-  @property
-  def state(self) -> BreakerState:
-    """Current breaker state (under the lock)."""
-    with self._lock:
-      return self._state
-
-  @property
-  def failure_count(self) -> int:
-    """Current consecutive-failure count (under the lock)."""
-    with self._lock:
-      return self._failure_count
-
-  @property
-  def last_failure_time(self) -> float | None:
-    """Monotonic timestamp of the last recorded failure, or ``None``."""
-    with self._lock:
-      return self._last_failure_time
-
-  def reset(self) -> None:
-    """Force the breaker back to CLOSED and clear failure bookkeeping.
-
-    Useful for tests and for explicit operator-driven recovery (e.g. after a
-    manual reconnect). Does not invoke any backend.
+    Attributes:
+        name: Human-readable identifier used in error messages and logs.
+        failure_threshold: Consecutive failures required to trip CLOSED→OPEN.
+            Must be >= 1.
+        reset_timeout: Seconds the breaker stays OPEN before allowing a
+            HALF_OPEN probe. Must be >= 0.
+        time_fn: Monotonic clock callable; defaults to :func:`time.monotonic`.
+        failure_exceptions: Exception classes that represent backend failures.
+            Other exceptions propagate without changing breaker state.
     """
-    with self._lock:
-      self._state = BreakerState.CLOSED
-      self._epoch += 1
-      self._failure_count = 0
-      self._last_failure_time = None
-      self._probe_in_flight = False
 
-  def new_generation(self) -> CircuitBreaker:
-    """Return a CLOSED breaker with the same immutable configuration.
+    def __init__(
+        self,
+        name: str,
+        *,
+        failure_threshold: int = 5,
+        reset_timeout: float = 30.0,
+        time_fn: Callable[[], float] | None = None,
+        failure_exceptions: tuple[type[BaseException], ...] = (BaseException,),
+    ) -> None:
+        if isinstance(failure_threshold, bool) or not isinstance(
+            failure_threshold, int
+        ):
+            msg = f"failure_threshold must be an int >= 1, got {failure_threshold!r}"
+            raise ValueError(msg)
+        if failure_threshold < 1:
+            msg = f"failure_threshold must be >= 1, got {failure_threshold}"
+            raise ValueError(msg)
+        # R34-B: reject bool — ``math.isfinite(True)`` is True and ``True < 0`` is
+        # False, so without this guard ``reset_timeout=True`` is silently accepted
+        # and stored as boolean ``True`` (the OPEN breaker then waits ~1s). Mirror
+        # the R21-A failure_threshold bool guard. Production is neutralized by
+        # pydantic float-coercion on the settings field, but direct construction
+        # (plugins / YAML bools / test doubles) must still reject it.
+        if isinstance(reset_timeout, bool):
+            msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
+            raise ValueError(msg)
+        if not math.isfinite(reset_timeout) or reset_timeout < 0:
+            msg = f"reset_timeout must be a finite float >= 0, got {reset_timeout!r}"
+            raise ValueError(msg)
+        if reset_timeout > CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S:
+            msg = (
+                f"reset_timeout must be <= {CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S}s "
+                f"(an OPEN breaker must be able to recover), got {reset_timeout!r}"
+            )
+            raise ValueError(msg)
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_exceptions = failure_exceptions
+        self._time_fn: Callable[[], float] = time_fn or time.monotonic
+        self._lock = threading.Lock()
+        self._state = BreakerState.CLOSED
+        self._failure_count = 0
+        self._last_failure_time: float | None = None
+        # Incremented on every state transition and explicit reset. Calls execute
+        # outside ``_lock``; their result may only mutate the generation under
+        # which it was admitted. This fences late old-socket failures after a
+        # complete OPEN → HALF_OPEN → CLOSED recovery cycle.
+        self._epoch = 0
+        # Guards the HALF_OPEN window so only ONE thread issues the probe call.
+        # Set in _allow_call() on the OPEN→HALF_OPEN transition; cleared under the
+        # lock once the probe's outcome is recorded. Without this, the lock is
+        # released between _allow_call() (which flips OPEN→HALF_OPEN) and func(),
+        # so N threads in the reset-timeout window all observe HALF_OPEN and call
+        # the backend concurrently — defeating the "single probe" contract.
+        self._probe_in_flight: bool = False
 
-    Backend reconnect replaces one connection generation with another. A
-    retained proxy can still finish an old in-flight call after that point;
-    giving the replacement backend a distinct breaker prevents that late
-    outcome from mutating the new generation's availability state.
+    # --- introspection (lock-protected reads for test determinism) ---
 
-    Returns:
-        A fresh breaker with identical name, thresholds, clock, and failure
-        exception policy.
-    """
-    return CircuitBreaker(
-      self.name,
-      failure_threshold=self.failure_threshold,
-      reset_timeout=self.reset_timeout,
-      time_fn=self._time_fn,
-      failure_exceptions=self.failure_exceptions,
-    )
+    @property
+    def state(self) -> BreakerState:
+        """Current breaker state (under the lock)."""
+        with self._lock:
+            return self._state
 
-  def _now(self) -> float:
-    """Read the current monotonic time via the injected clock."""
-    return self._time_fn()
+    @property
+    def failure_count(self) -> int:
+        """Current consecutive-failure count (under the lock)."""
+        with self._lock:
+            return self._failure_count
 
-  def _allow_call(self) -> _CallAdmission:
-    """Decide whether a call may proceed and return its state generation.
+    @property
+    def last_failure_time(self) -> float | None:
+        """Monotonic timestamp of the last recorded failure, or ``None``."""
+        with self._lock:
+            return self._last_failure_time
 
-    Called under ``self._lock``. Returns the state and transition epoch the
-    caller should operate under:
+    def reset(self) -> None:
+        """Force the breaker back to CLOSED and clear failure bookkeeping.
 
-    - ``OPEN`` → reject without touching the backend.
-    - ``CLOSED`` or ``HALF_OPEN`` → invoke the backend; the caller records
-      the outcome via :meth:`_record_success` / :meth:`_record_failure`.
+        Useful for tests and for explicit operator-driven recovery (e.g. after a
+        manual reconnect). Does not invoke any backend.
+        """
+        with self._lock:
+            self._state = BreakerState.CLOSED
+            self._epoch += 1
+            self._failure_count = 0
+            self._last_failure_time = None
+            self._probe_in_flight = False
 
-    If the breaker is OPEN but ``reset_timeout`` has elapsed, it transitions
-    to ``HALF_OPEN`` here (lazy transition on the next call — no background
-    thread required) and claims the single-probe slot via
-    ``_probe_in_flight``. While a probe is in flight, any other caller that
-    observes HALF_OPEN is rejected as if OPEN, so only ONE thread issues the
-    probe call (the documented contract).
-    """
-    if self._state is BreakerState.OPEN:
-      now = self._now()
-      opened_at = self._last_failure_time
-      if opened_at is not None and (now - opened_at) >= self.reset_timeout:
-        # Cool-down elapsed — allow a single probe. Claim the probe slot; no
-        # other thread can enter func() in HALF_OPEN until this probe settles.
-        self._state = BreakerState.HALF_OPEN
-        self._epoch += 1
-        self._probe_in_flight = True
-      else:
-        return _CallAdmission(BreakerState.OPEN, self._epoch)
-    elif self._state is BreakerState.HALF_OPEN:
-      if self._probe_in_flight:
-        # A probe is already in flight (another thread claimed the slot in this
-        # HALF_OPEN window). Fail fast without issuing a second concurrent probe.
-        return _CallAdmission(BreakerState.OPEN, self._epoch)
-      # A prior non-counted exception or process signal released the probe
-      # slot while deliberately leaving the breaker HALF_OPEN. Re-claim it for
-      # this call so concurrent callers still observe the single-probe rule.
-      self._probe_in_flight = True
-    return _CallAdmission(self._state, self._epoch)
+    def new_generation(self) -> CircuitBreaker:
+        """Return a CLOSED breaker with the same immutable configuration.
 
-  def _record_success(self, admission: _CallAdmission) -> None:
-    """Record a successful call, possibly closing the breaker.
+        Backend reconnect replaces one connection generation with another. A
+        retained proxy can still finish an old in-flight call after that point;
+        giving the replacement backend a distinct breaker prevents that late
+        outcome from mutating the new generation's availability state.
 
-    On any success the consecutive-failure count resets to zero. If the call
-    was a HALF_OPEN probe, the breaker closes fully and the probe slot is
-    released.
+        Returns:
+            A fresh breaker with identical name, thresholds, clock, and failure
+            exception policy.
+        """
+        return CircuitBreaker(
+            self.name,
+            failure_threshold=self.failure_threshold,
+            reset_timeout=self.reset_timeout,
+            time_fn=self._time_fn,
+            failure_exceptions=self.failure_exceptions,
+        )
 
-    ``call()`` captures an admission epoch under the lock, releases it for
-    ``func()``, then re-acquires the lock here. Any intervening state
-    transition makes the result stale: neither a late success nor failure may
-    mutate the newer generation's bookkeeping.
-    """
-    if admission.epoch != self._epoch or admission.state is not self._state:
-      return
-    self._failure_count = 0
-    self._last_failure_time = None
-    if admission.state is BreakerState.HALF_OPEN:
-      self._state = BreakerState.CLOSED
-      self._epoch += 1
-      self._probe_in_flight = False
+    def _now(self) -> float:
+        """Read the current monotonic time via the injected clock."""
+        return self._time_fn()
 
-  def _record_failure(self, admission: _CallAdmission) -> None:
-    """Record a failed call, possibly tripping / re-opening the breaker.
+    def _allow_call(self) -> _CallAdmission:
+        """Decide whether a call may proceed and return its state generation.
 
-    A HALF_OPEN probe failure re-opens immediately (one strike and the
-    backend is considered still-broken) and the probe slot is released so the
-    next cool-down window can issue a fresh probe. A CLOSED failure increments
-    the consecutive count and trips when the threshold is reached.
-    """
-    if admission.epoch != self._epoch or admission.state is not self._state:
-      return
-    self._last_failure_time = self._now()
-    if admission.state is BreakerState.HALF_OPEN:
-      self._state = BreakerState.OPEN
-      self._epoch += 1
-      self._failure_count = 0
-      self._probe_in_flight = False
-      return
-    self._failure_count += 1
-    if self._failure_count >= self.failure_threshold:
-      self._state = BreakerState.OPEN
-      self._epoch += 1
+        Called under ``self._lock``. Returns the state and transition epoch the
+        caller should operate under:
 
-  def _release_probe(self, admission: _CallAdmission) -> None:
-    """Release a non-counted HALF_OPEN call only in its admission epoch."""
-    if (
-      admission.state is BreakerState.HALF_OPEN
-      and admission.epoch == self._epoch
-      and self._state is BreakerState.HALF_OPEN
-    ):
-      self._probe_in_flight = False
+        - ``OPEN`` → reject without touching the backend.
+        - ``CLOSED`` or ``HALF_OPEN`` → invoke the backend; the caller records
+          the outcome via :meth:`_record_success` / :meth:`_record_failure`.
 
-  def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Invoke ``func(*args, **kwargs)`` under the breaker's protection.
+        If the breaker is OPEN but ``reset_timeout`` has elapsed, it transitions
+        to ``HALF_OPEN`` here (lazy transition on the next call — no background
+        thread required) and claims the single-probe slot via
+        ``_probe_in_flight``. While a probe is in flight, any other caller that
+        observes HALF_OPEN is rejected as if OPEN, so only ONE thread issues the
+        probe call (the documented contract).
+        """
+        if self._state is BreakerState.OPEN:
+            now = self._now()
+            opened_at = self._last_failure_time
+            if opened_at is not None and (now - opened_at) >= self.reset_timeout:
+                # Cool-down elapsed — allow a single probe. Claim the probe slot; no
+                # other thread can enter func() in HALF_OPEN until this probe settles.
+                self._state = BreakerState.HALF_OPEN
+                self._epoch += 1
+                self._probe_in_flight = True
+            else:
+                return _CallAdmission(BreakerState.OPEN, self._epoch)
+        elif self._state is BreakerState.HALF_OPEN:
+            if self._probe_in_flight:
+                # A probe is already in flight (another thread claimed the slot in this
+                # HALF_OPEN window). Fail fast without issuing a second concurrent probe.
+                return _CallAdmission(BreakerState.OPEN, self._epoch)
+            # A prior non-counted exception or process signal released the probe
+            # slot while deliberately leaving the breaker HALF_OPEN. Re-claim it for
+            # this call so concurrent callers still observe the single-probe rule.
+            self._probe_in_flight = True
+        return _CallAdmission(self._state, self._epoch)
 
-    Behavior by state:
+    def _record_success(self, admission: _CallAdmission) -> None:
+        """Record a successful call, possibly closing the breaker.
 
-    - ``CLOSED`` / ``HALF_OPEN``: delegate to ``func``. On success the
-      failure count resets (and HALF_OPEN closes); on failure the count
-      increments (or the breaker trips / re-opens).
-    - ``OPEN``: raise :class:`CircuitBreakerOpenError` **without** calling
-      ``func`` — fail-fast so callers and the network are spared while the
-      backend is known-broken.
+        On any success the consecutive-failure count resets to zero. If the call
+        was a HALF_OPEN probe, the breaker closes fully and the probe slot is
+        released.
 
-    Args:
-        func: The callable to invoke (typically a bound backend method).
-        *args: Positional arguments forwarded to ``func``.
-        **kwargs: Keyword arguments forwarded to ``func``.
-
-    Returns:
-        Whatever ``func`` returns.
-
-    Raises:
-        CircuitBreakerOpenError: If the breaker is OPEN.
-        Exception: Any exception raised by ``func`` is re-raised unchanged
-            after the failure is recorded.
-
-    .. note::
-        ``KeyboardInterrupt`` / ``SystemExit`` are **not** treated as backend
-        failures — they propagate immediately without touching breaker state,
-        matching the connect-path's broad-except discipline elsewhere in the
-        package.
-    """
-    with self._lock:
-      admission = self._allow_call()
-      if admission.state is BreakerState.OPEN:
-        raise CircuitBreakerOpenError(self.name)
-
-    try:
-      result = func(*args, **kwargs)
-    except BaseException as exc:
-      # Do not let Ctrl-C / interpreter shutdown perturb breaker bookkeeping.
-      if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-        # Regression fix: _allow_call() claimed the single HALF_OPEN probe
-        # slot (_probe_in_flight=True) before func ran. If the signal arrives
-        # mid-probe we must release it — otherwise the breaker wedges
-        # HALF_OPEN forever (no timer releases the slot; only _record_success
-        # / _record_failure do, and we deliberately skip both for signals).
+        ``call()`` captures an admission epoch under the lock, releases it for
+        ``func()``, then re-acquires the lock here. Any intervening state
+        transition makes the result stale: neither a late success nor failure may
+        mutate the newer generation's bookkeeping.
+        """
+        if admission.epoch != self._epoch or admission.state is not self._state:
+            return
+        self._failure_count = 0
+        self._last_failure_time = None
         if admission.state is BreakerState.HALF_OPEN:
-          with self._lock:
-            self._release_probe(admission)
-        raise
-      if not isinstance(exc, self.failure_exceptions):
-        # Caller/input errors are neither a backend success nor a backend
-        # failure. A HALF_OPEN call already claimed the sole probe slot, so
-        # release it without closing or re-opening the breaker; the next
-        # eligible call can perform the real recovery probe.
+            self._state = BreakerState.CLOSED
+            self._epoch += 1
+            self._probe_in_flight = False
+
+    def _record_failure(self, admission: _CallAdmission) -> None:
+        """Record a failed call, possibly tripping / re-opening the breaker.
+
+        A HALF_OPEN probe failure re-opens immediately (one strike and the
+        backend is considered still-broken) and the probe slot is released so the
+        next cool-down window can issue a fresh probe. A CLOSED failure increments
+        the consecutive count and trips when the threshold is reached.
+        """
+        if admission.epoch != self._epoch or admission.state is not self._state:
+            return
+        self._last_failure_time = self._now()
         if admission.state is BreakerState.HALF_OPEN:
-          with self._lock:
-            self._release_probe(admission)
-        raise
-      with self._lock:
-        self._record_failure(admission)
-      raise
-    else:
-      with self._lock:
-        self._record_success(admission)
-      return result
+            self._state = BreakerState.OPEN
+            self._epoch += 1
+            self._failure_count = 0
+            self._probe_in_flight = False
+            return
+        self._failure_count += 1
+        if self._failure_count >= self.failure_threshold:
+            self._state = BreakerState.OPEN
+            self._epoch += 1
+
+    def _release_probe(self, admission: _CallAdmission) -> None:
+        """Release a non-counted HALF_OPEN call only in its admission epoch."""
+        if (
+            admission.state is BreakerState.HALF_OPEN
+            and admission.epoch == self._epoch
+            and self._state is BreakerState.HALF_OPEN
+        ):
+            self._probe_in_flight = False
+
+    def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Invoke ``func(*args, **kwargs)`` under the breaker's protection.
+
+        Behavior by state:
+
+        - ``CLOSED`` / ``HALF_OPEN``: delegate to ``func``. On success the
+          failure count resets (and HALF_OPEN closes); on failure the count
+          increments (or the breaker trips / re-opens).
+        - ``OPEN``: raise :class:`CircuitBreakerOpenError` **without** calling
+          ``func`` — fail-fast so callers and the network are spared while the
+          backend is known-broken.
+
+        Args:
+            func: The callable to invoke (typically a bound backend method).
+            *args: Positional arguments forwarded to ``func``.
+            **kwargs: Keyword arguments forwarded to ``func``.
+
+        Returns:
+            Whatever ``func`` returns.
+
+        Raises:
+            CircuitBreakerOpenError: If the breaker is OPEN.
+            Exception: Any exception raised by ``func`` is re-raised unchanged
+                after the failure is recorded.
+
+        .. note::
+            ``KeyboardInterrupt`` / ``SystemExit`` are **not** treated as backend
+            failures — they propagate immediately without touching breaker state,
+            matching the connect-path's broad-except discipline elsewhere in the
+            package.
+        """
+        with self._lock:
+            admission = self._allow_call()
+            if admission.state is BreakerState.OPEN:
+                raise CircuitBreakerOpenError(self.name)
+
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as exc:
+            # Do not let Ctrl-C / interpreter shutdown perturb breaker bookkeeping.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                # Regression fix: _allow_call() claimed the single HALF_OPEN probe
+                # slot (_probe_in_flight=True) before func ran. If the signal arrives
+                # mid-probe we must release it — otherwise the breaker wedges
+                # HALF_OPEN forever (no timer releases the slot; only _record_success
+                # / _record_failure do, and we deliberately skip both for signals).
+                if admission.state is BreakerState.HALF_OPEN:
+                    with self._lock:
+                        self._release_probe(admission)
+                raise
+            if not isinstance(exc, self.failure_exceptions):
+                # Caller/input errors are neither a backend success nor a backend
+                # failure. A HALF_OPEN call already claimed the sole probe slot, so
+                # release it without closing or re-opening the breaker; the next
+                # eligible call can perform the real recovery probe.
+                if admission.state is BreakerState.HALF_OPEN:
+                    with self._lock:
+                        self._release_probe(admission)
+                raise
+            with self._lock:
+                self._record_failure(admission)
+            raise
+        else:
+            with self._lock:
+                self._record_success(admission)
+            return result
 
 
 # ---------------------------------------------------------------------------
@@ -432,343 +434,364 @@ class CircuitBreaker:
 
 
 class _BackendProxyBase:
-  """Common proxy machinery: bind interface methods to wrapped-or-forwarded callables.
+    """Common proxy machinery: bind interface methods to wrapped-or-forwarded callables.
 
-  The proxy subclasses the interface ABC purely so ``isinstance(proxy,
-  QueueBackend)`` etc. continue to hold. But because the ABCs define every
-  interface method on the class, ``__getattr__`` (which fires only when normal
-  lookup FAILS) would never forward non-hot-path methods — Python would
-  resolve ``proxy.clear_queue`` to the ABC's abstract stub and silently
-  no-op instead of delegating to the wrapped backend.
+    The proxy subclasses the interface ABC purely so ``isinstance(proxy,
+    QueueBackend)`` etc. continue to hold. But because the ABCs define every
+    interface method on the class, ``__getattr__`` (which fires only when normal
+    lookup FAILS) would never forward non-hot-path methods — Python would
+    resolve ``proxy.clear_queue`` to the ABC's abstract stub and silently
+    no-op instead of delegating to the wrapped backend.
 
-  To avoid that, the constructor binds EVERY interface method as an INSTANCE
-  attribute (which shadows the class-level ABC stub):
+    To avoid that, the constructor binds EVERY interface method as an INSTANCE
+    attribute (which shadows the class-level ABC stub):
 
-  - hot-path methods → ``breaker.call``-wrapped bound method
-  - protected administrative I/O methods → non-counting error-safe wrapper
-  - lifecycle/other interface methods → backend's own bound method, unchanged
+    - hot-path methods → ``breaker.call``-wrapped bound method
+    - protected administrative I/O methods → non-counting error-safe wrapper
+    - lifecycle/other interface methods → backend's own bound method, unchanged
 
-  Non-method attributes (``backend_type``, ``_backend`` internals) keep
-  resolving via ``__getattr__`` → the wrapped backend, since they aren't on
-  the class MRO as shadowing descriptors.
-  """
+    Non-method attributes (``backend_type``, ``_backend`` internals) keep
+    resolving via ``__getattr__`` → the wrapped backend, since they aren't on
+    the class MRO as shadowing descriptors.
+    """
 
-  # Subclasses override: names wrapped under the breaker.
-  _HOT_PATH: tuple[str, ...] = ()
-  # Subclasses override: every other method the interface ABC declares, so we
-  # bind them as forwarded instance attributes and bypass the ABC stub.
-  _FORWARDED: tuple[str, ...] = ()
-  # A strict subset of ``_FORWARDED`` whose methods perform backend I/O but
-  # intentionally do not affect breaker state.  These need the same terminal
-  # BackendError reconstruction as hot-path operations, without routing
-  # through ``breaker.call``.  Lifecycle methods stay raw forwards so their
-  # established exception behavior remains unchanged.
-  _PROTECTED_FORWARDED: tuple[str, ...] = ()
+    # Subclasses override: names wrapped under the breaker.
+    _HOT_PATH: tuple[str, ...] = ()
+    # Subclasses override: every other method the interface ABC declares, so we
+    # bind them as forwarded instance attributes and bypass the ABC stub.
+    _FORWARDED: tuple[str, ...] = ()
+    # A strict subset of ``_FORWARDED`` whose methods perform backend I/O but
+    # intentionally do not affect breaker state.  These need the same terminal
+    # BackendError reconstruction as hot-path operations, without routing
+    # through ``breaker.call``.  Lifecycle methods stay raw forwards so their
+    # established exception behavior remains unchanged.
+    _PROTECTED_FORWARDED: tuple[str, ...] = ()
 
-  def __init__(self, backend: Any, breaker: CircuitBreaker) -> None:
-    # Use object.__setattr__ to avoid recursing through our own __setattr__.
-    object.__setattr__(self, "_backend", backend)
-    object.__setattr__(self, "_breaker", breaker)
-    for method_name in self._HOT_PATH:
-      try:
-        bound = getattr(backend, method_name)
-      except AttributeError:
-        continue
-      object.__setattr__(
-        self,
-        method_name,
-        _wrap_bound(breaker, backend, method_name, bound),
-      )
-    for method_name in self._FORWARDED:
-      try:
-        forwarded = getattr(backend, method_name)
-      except AttributeError:
-        continue
-      if method_name in self._PROTECTED_FORWARDED:
-        forwarded = _wrap_forwarded_bound(backend, method_name, forwarded)
-      object.__setattr__(self, method_name, forwarded)
+    def __init__(self, backend: Any, breaker: CircuitBreaker) -> None:
+        # Use object.__setattr__ to avoid recursing through our own __setattr__.
+        object.__setattr__(self, "_backend", backend)
+        object.__setattr__(self, "_breaker", breaker)
+        for method_name in self._HOT_PATH:
+            try:
+                bound = getattr(backend, method_name)
+            except AttributeError:
+                continue
+            object.__setattr__(
+                self,
+                method_name,
+                _wrap_bound(breaker, backend, method_name, bound),
+            )
+        for method_name in self._FORWARDED:
+            try:
+                forwarded = getattr(backend, method_name)
+            except AttributeError:
+                continue
+            if method_name in self._PROTECTED_FORWARDED:
+                forwarded = _wrap_forwarded_bound(backend, method_name, forwarded)
+            object.__setattr__(self, method_name, forwarded)
 
-  def __getattr__(self, name: str) -> Any:
-    # Fires only for attributes NOT on the class MRO and NOT bound in __init__
-    # — e.g. ``backend_type`` property, backend-specific attributes. Forwards
-    # to the wrapped backend. Non-interface attributes have zero overhead on
-    # the hot path because those are bound as instance attributes above.
-    return getattr(self._backend, name)
+    def __getattr__(self, name: str) -> Any:
+        # Fires only for attributes NOT on the class MRO and NOT bound in __init__
+        # — e.g. ``backend_type`` property, backend-specific attributes. Forwards
+        # to the wrapped backend. Non-interface attributes have zero overhead on
+        # the hot path because those are bound as instance attributes above.
+        return getattr(self._backend, name)
 
 
 class _ProtectedBoundOperation:
-  """Call one captured backend operation without publishing its reference graph.
+    """Call one captured backend operation without publishing its reference graph.
 
-  A closure over a bound method keeps ``method.__self__`` in every escaped
-  traceback.  That object can expose live endpoint and credential settings
-  even when a breaker is already OPEN and never calls the backend.  This
-  wrapper keeps only weak references, drops resolved locals before raising,
-  and reconstructs public ``BackendError`` instances after ``breaker.call``
-  has unwound.
-  """
+    A closure over a bound method keeps ``method.__self__`` in every escaped
+    traceback.  That object can expose live endpoint and credential settings
+    even when a breaker is already OPEN and never calls the backend.  This
+    wrapper keeps only weak references, drops resolved locals before raising,
+    and reconstructs public ``BackendError`` instances after ``breaker.call``
+    has unwound.
+    """
 
-  __slots__ = (
-    "__name__",
-    "_backend_ref",
-    "_breaker",
-    "_method_name",
-    "_snapshot_ref",
-  )
+    __slots__ = (
+        "__name__",
+        "_backend_ref",
+        "_breaker",
+        "_method_name",
+        "_snapshot_ref",
+    )
 
-  def __init__(
-    self,
+    def __init__(
+        self,
+        breaker: CircuitBreaker,
+        backend: Any,
+        method_name: str,
+        func: Callable[..., Any],
+    ) -> None:
+        self._breaker = breaker
+        self._backend_ref = weakref.ref(backend)
+        self._method_name = method_name
+        self.__name__ = getattr(func, "__name__", method_name)
+        snapshot_ref: Callable[[], Callable[..., Any] | None] | None
+        try:
+            if getattr(func, "__self__", None) is not None:
+                snapshot_ref = weakref.WeakMethod(func)
+            else:
+                snapshot_ref = weakref.ref(func)
+        except TypeError:
+            # The production backends expose Python methods, which support weak
+            # references.  A non-weakrefable plugin callable remains operational by
+            # resolving it through the proxy's already-owned backend on each call.
+            snapshot_ref = None
+        self._snapshot_ref = snapshot_ref
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        backend = self._backend_ref()
+        method = self._snapshot_ref() if self._snapshot_ref is not None else None
+        if method is None and backend is not None:
+            method = getattr(backend, self._method_name)
+        if method is None:
+            unavailable = BackendError("Backend operation is unavailable.")
+            del args
+            del kwargs
+            del backend
+            del method
+            del self
+            raise unavailable
+
+        breaker = self._breaker
+        caught_error: BackendError | None = None
+        try:
+            return breaker.call(method, *args, **kwargs)
+        except BackendError as error:
+            caught_error = error
+        except BaseException:
+            del args
+            del kwargs
+            del backend
+            del method
+            del breaker
+            del self
+            raise
+
+        assert caught_error is not None
+        if type(caught_error) is CircuitBreakerOpenError:
+            sanitized_error: BackendError = CircuitBreakerOpenError("backend-operation")
+        else:
+            sanitized_error = sanitize_backend_error(
+                caught_error,
+                message="Backend operation failed.",
+                safe_queue_operations=_SAFE_QUEUE_OPERATIONS,
+                safe_storage_operations=_SAFE_STORAGE_OPERATIONS,
+                fallback_queue_operation=_QUEUE_METHOD_OPERATIONS.get(
+                    self._method_name
+                ),
+                fallback_storage_operation=_STORAGE_METHOD_OPERATIONS.get(
+                    self._method_name
+                ),
+            )
+        del args
+        del kwargs
+        del backend
+        del method
+        del breaker
+        del caught_error
+        del self
+        raise sanitized_error
+
+
+def _wrap_bound(
     breaker: CircuitBreaker,
     backend: Any,
     method_name: str,
     func: Callable[..., Any],
-  ) -> None:
-    self._breaker = breaker
-    self._backend_ref = weakref.ref(backend)
-    self._method_name = method_name
-    self.__name__ = getattr(func, "__name__", method_name)
-    snapshot_ref: Callable[[], Callable[..., Any] | None] | None
-    try:
-      if getattr(func, "__self__", None) is not None:
-        snapshot_ref = weakref.WeakMethod(func)
-      else:
-        snapshot_ref = weakref.ref(func)
-    except TypeError:
-      # The production backends expose Python methods, which support weak
-      # references.  A non-weakrefable plugin callable remains operational by
-      # resolving it through the proxy's already-owned backend on each call.
-      snapshot_ref = None
-    self._snapshot_ref = snapshot_ref
-
-  def __call__(self, *args: Any, **kwargs: Any) -> Any:
-    backend = self._backend_ref()
-    method = self._snapshot_ref() if self._snapshot_ref is not None else None
-    if method is None and backend is not None:
-      method = getattr(backend, self._method_name)
-    if method is None:
-      unavailable = BackendError("Backend operation is unavailable.")
-      del args
-      del kwargs
-      del backend
-      del method
-      del self
-      raise unavailable
-
-    breaker = self._breaker
-    caught_error: BackendError | None = None
-    try:
-      return breaker.call(method, *args, **kwargs)
-    except BackendError as error:
-      caught_error = error
-    except BaseException:
-      del args
-      del kwargs
-      del backend
-      del method
-      del breaker
-      del self
-      raise
-
-    assert caught_error is not None
-    if type(caught_error) is CircuitBreakerOpenError:
-      sanitized_error: BackendError = CircuitBreakerOpenError("backend-operation")
-    else:
-      sanitized_error = sanitize_backend_error(
-        caught_error,
-        message="Backend operation failed.",
-        safe_queue_operations=_SAFE_QUEUE_OPERATIONS,
-        safe_storage_operations=_SAFE_STORAGE_OPERATIONS,
-        fallback_queue_operation=_QUEUE_METHOD_OPERATIONS.get(self._method_name),
-        fallback_storage_operation=_STORAGE_METHOD_OPERATIONS.get(self._method_name),
-      )
-    del args
-    del kwargs
-    del backend
-    del method
-    del breaker
-    del caught_error
-    del self
-    raise sanitized_error
-
-
-def _wrap_bound(
-  breaker: CircuitBreaker,
-  backend: Any,
-  method_name: str,
-  func: Callable[..., Any],
 ) -> Callable[..., Any]:
-  """Return a protected snapshot wrapper for one backend operation."""
-  return _ProtectedBoundOperation(breaker, backend, method_name, func)
+    """Return a protected snapshot wrapper for one backend operation."""
+    return _ProtectedBoundOperation(breaker, backend, method_name, func)
 
 
 class _ProtectedForwardedOperation:
-  """Forward a non-counting I/O operation without exposing backend state.
+    """Forward a non-counting I/O operation without exposing backend state.
 
-  Administrative probes and clear operations must continue to bypass a
-  circuit breaker: their failures should not trip or reset traffic admission.
-  They can still raise package ``BackendError`` instances, whose traceback can
-  retain a bound backend, endpoint, queue name, or storage key.  This wrapper
-  only reconstructs those package errors after the backend frames unwind;
-  unknown plugin exceptions deliberately retain their raw compatibility
-  contract.
-  """
+    Administrative probes and clear operations must continue to bypass a
+    circuit breaker: their failures should not trip or reset traffic admission.
+    They can still raise package ``BackendError`` instances, whose traceback can
+    retain a bound backend, endpoint, queue name, or storage key.  This wrapper
+    only reconstructs those package errors after the backend frames unwind;
+    unknown plugin exceptions deliberately retain their raw compatibility
+    contract.
+    """
 
-  __slots__ = (
-    "__name__",
-    "_backend_ref",
-    "_method_name",
-    "_snapshot_ref",
-  )
-
-  def __init__(
-    self,
-    backend: Any,
-    method_name: str,
-    func: Callable[..., Any],
-  ) -> None:
-    self._backend_ref = weakref.ref(backend)
-    self._method_name = method_name
-    self.__name__ = getattr(func, "__name__", method_name)
-    snapshot_ref: Callable[[], Callable[..., Any] | None] | None
-    try:
-      if getattr(func, "__self__", None) is not None:
-        snapshot_ref = weakref.WeakMethod(func)
-      else:
-        snapshot_ref = weakref.ref(func)
-    except TypeError:
-      # Plugin callables need not support weak references.  The owning proxy
-      # already retains its backend, so resolve such a callable afresh only at
-      # call time rather than retaining it in an escaped traceback frame.
-      snapshot_ref = None
-    self._snapshot_ref = snapshot_ref
-
-  def __call__(self, *args: Any, **kwargs: Any) -> Any:
-    backend = self._backend_ref()
-    method = self._snapshot_ref() if self._snapshot_ref is not None else None
-    if method is None and backend is not None:
-      method = getattr(backend, self._method_name)
-    if method is None:
-      unavailable = BackendError("Backend operation is unavailable.")
-      del args
-      del kwargs
-      del backend
-      del method
-      del self
-      raise unavailable
-
-    caught_error: BackendError | None = None
-    try:
-      return method(*args, **kwargs)
-    except BackendError as error:
-      caught_error = error
-    except BaseException:
-      # Unknown plugin errors and process-control exceptions retain their
-      # historical raw behavior.  Do not count this administrative call or
-      # alter the breaker state.
-      del args
-      del kwargs
-      del backend
-      del method
-      del self
-      raise
-
-    assert caught_error is not None
-    queue_operation = _QUEUE_METHOD_OPERATIONS.get(self._method_name)
-    storage_operation = _STORAGE_METHOD_OPERATIONS.get(self._method_name)
-    safe_queue_operations = (queue_operation,) if queue_operation is not None else ()
-    safe_storage_operations = (
-      (storage_operation,) if storage_operation is not None else ()
+    __slots__ = (
+        "__name__",
+        "_backend_ref",
+        "_method_name",
+        "_snapshot_ref",
     )
-    sanitized_error = sanitize_backend_error(
-      caught_error,
-      message="Backend operation failed.",
-      safe_queue_operations=safe_queue_operations,
-      safe_storage_operations=safe_storage_operations,
-      fallback_queue_operation=queue_operation,
-      fallback_storage_operation=storage_operation,
-    )
-    del args
-    del kwargs
-    del backend
-    del method
-    del caught_error
-    del queue_operation
-    del storage_operation
-    del safe_queue_operations
-    del safe_storage_operations
-    del self
-    raise sanitized_error
+
+    def __init__(
+        self,
+        backend: Any,
+        method_name: str,
+        func: Callable[..., Any],
+    ) -> None:
+        self._backend_ref = weakref.ref(backend)
+        self._method_name = method_name
+        self.__name__ = getattr(func, "__name__", method_name)
+        snapshot_ref: Callable[[], Callable[..., Any] | None] | None
+        try:
+            if getattr(func, "__self__", None) is not None:
+                snapshot_ref = weakref.WeakMethod(func)
+            else:
+                snapshot_ref = weakref.ref(func)
+        except TypeError:
+            # Plugin callables need not support weak references.  The owning proxy
+            # already retains its backend, so resolve such a callable afresh only at
+            # call time rather than retaining it in an escaped traceback frame.
+            snapshot_ref = None
+        self._snapshot_ref = snapshot_ref
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        backend = self._backend_ref()
+        method = self._snapshot_ref() if self._snapshot_ref is not None else None
+        if method is None and backend is not None:
+            method = getattr(backend, self._method_name)
+        if method is None:
+            unavailable = BackendError("Backend operation is unavailable.")
+            del args
+            del kwargs
+            del backend
+            del method
+            del self
+            raise unavailable
+
+        caught_error: BackendError | None = None
+        try:
+            return method(*args, **kwargs)
+        except BackendError as error:
+            caught_error = error
+        except BaseException:
+            # Unknown plugin errors and process-control exceptions retain their
+            # historical raw behavior.  Do not count this administrative call or
+            # alter the breaker state.
+            del args
+            del kwargs
+            del backend
+            del method
+            del self
+            raise
+
+        assert caught_error is not None
+        queue_operation = _QUEUE_METHOD_OPERATIONS.get(self._method_name)
+        storage_operation = _STORAGE_METHOD_OPERATIONS.get(self._method_name)
+        safe_queue_operations = (
+            (queue_operation,) if queue_operation is not None else ()
+        )
+        safe_storage_operations = (
+            (storage_operation,) if storage_operation is not None else ()
+        )
+        sanitized_error = sanitize_backend_error(
+            caught_error,
+            message="Backend operation failed.",
+            safe_queue_operations=safe_queue_operations,
+            safe_storage_operations=safe_storage_operations,
+            fallback_queue_operation=queue_operation,
+            fallback_storage_operation=storage_operation,
+        )
+        del args
+        del kwargs
+        del backend
+        del method
+        del caught_error
+        del queue_operation
+        del storage_operation
+        del safe_queue_operations
+        del safe_storage_operations
+        del self
+        raise sanitized_error
 
 
 def _wrap_forwarded_bound(
-  backend: Any,
-  method_name: str,
-  func: Callable[..., Any],
+    backend: Any,
+    method_name: str,
+    func: Callable[..., Any],
 ) -> Callable[..., Any]:
-  """Return a non-counting protected wrapper for one forwarded I/O operation."""
-  return _ProtectedForwardedOperation(backend, method_name, func)
+    """Return a non-counting protected wrapper for one forwarded I/O operation."""
+    return _ProtectedForwardedOperation(backend, method_name, func)
 
 
 class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
-  """Wrap a :class:`QueueBackend`'s hot-path ops under a breaker.
+    """Wrap a :class:`QueueBackend`'s hot-path ops under a breaker.
 
-  ``queue_len`` is deliberately NOT in the hot path: it is an admin /
-  observability probe (stats queries, ``has_pending_requests`` health checks).
-  A transient failure in the length query (e.g. a momentary ``CLUSTER DOWN``
-  during a stats scrape) must not cascade into a full traffic shutdown by
-  tripping the breaker. Traffic-bearing ops (``push``/``pop``/
-  ``pop_with_ack``) are breaker-wrapped; ``queue_len`` uses a non-counting
-  protected forward, so its package errors cannot expose backend state.
+    ``queue_len`` is deliberately NOT in the hot path: it is an admin /
+    observability probe (stats queries, ``has_pending_requests`` health checks).
+    A transient failure in the length query (e.g. a momentary ``CLUSTER DOWN``
+    during a stats scrape) must not cascade into a full traffic shutdown by
+    tripping the breaker. Traffic-bearing ops (``push``/``pop``/
+    ``pop_with_ack``) are breaker-wrapped; ``queue_len`` uses a non-counting
+    protected forward, so its package errors cannot expose backend state.
 
-  ``pop_with_ack`` (2026-07-10 fix) must be in the hot path so that (a) a
-  broker degradation on the MQ ack-pop path trips the breaker, and (b) the
-  proxy dispatches to the backend's ``pop_with_ack`` *override* (the
-  per-message token path) rather than the ``QueueBackend`` ABC default. Without
-  this the override is shadowed by the ABC default ``pop_with_ack → (self.pop,
-  None)`` and MQ tokens silently become ``None`` under
-  ``SCRAPY_CIRCUIT_BREAKER_ENABLED``.
+    ``pop_with_ack`` (2026-07-10 fix) must be in the hot path so that (a) a
+    broker degradation on the MQ ack-pop path trips the breaker, and (b) the
+    proxy dispatches to the backend's ``pop_with_ack`` *override* (the
+    per-message token path) rather than the ``QueueBackend`` ABC default. Without
+    this the override is shadowed by the ABC default ``pop_with_ack → (self.pop,
+    None)`` and MQ tokens silently become ``None`` under
+    ``SCRAPY_CIRCUIT_BREAKER_ENABLED``.
 
-  ``ack``/``nack`` (R34-C) are in the hot path for the same reason
-  ``pop_with_ack`` is: on the 5 MQ backends they are real network ops
-  (``consumer.commit`` / ``basic_ack`` / ``delete_message`` / broker ack) that
-  raise ``QueueError`` (a ``BackendError``). The 2026-07-10 rationale applies
-  identically — an ack-path-only broker degradation (e.g. a Kafka
-  group-coordinator partitioned while partition leaders keep serving push) must
-  trip the breaker, and once OPEN, ack must fail fast with
-  ``CircuitBreakerOpenError`` instead of blocking on the broker commit
-  timeout. Atomic-pop backends (Redis/MongoDB/ES) inherit the ABC no-op ack, so
-  wrapping them is a no-op for breaker state. ``CircuitBreakerOpenError``
-  subclasses ``BackendError``, so the scheduler's existing
-  ``(QueueError, BackendError)`` ack-error handling covers the fail-fast path.
-  """
+    ``ack``/``nack`` (R34-C) are in the hot path for the same reason
+    ``pop_with_ack`` is: on the 5 MQ backends they are real network ops
+    (``consumer.commit`` / ``basic_ack`` / ``delete_message`` / broker ack) that
+    raise ``QueueError`` (a ``BackendError``). The 2026-07-10 rationale applies
+    identically — an ack-path-only broker degradation (e.g. a Kafka
+    group-coordinator partitioned while partition leaders keep serving push) must
+    trip the breaker, and once OPEN, ack must fail fast with
+    ``CircuitBreakerOpenError`` instead of blocking on the broker commit
+    timeout. Atomic-pop backends (Redis/MongoDB/ES) inherit the ABC no-op ack, so
+    wrapping them is a no-op for breaker state. ``CircuitBreakerOpenError``
+    subclasses ``BackendError``, so the scheduler's existing
+    ``(QueueError, BackendError)`` ack-error handling covers the fail-fast path.
+    """
 
-  _HOT_PATH = ("push", "_push_with_durability", "pop", "pop_with_ack", "ack", "nack")
-  _FORWARDED = (
-    "requires_ack",
-    "supports_concurrent_ack",
-    "queue_len",
-    "clear_queue",
-    "connect",
-    "disconnect",
-    "is_connected",
-    "ping",
-  )
-  _PROTECTED_FORWARDED = ("queue_len", "clear_queue")
+    _HOT_PATH = ("push", "_push_with_durability", "pop", "pop_with_ack", "ack", "nack")
+    _FORWARDED = (
+        "requires_ack",
+        "supports_concurrent_ack",
+        "queue_len",
+        "clear_queue",
+        "connect",
+        "disconnect",
+        "is_connected",
+        "ping",
+    )
+    _PROTECTED_FORWARDED = ("queue_len", "clear_queue")
 
 
 class _SetBackendProxy(_BackendProxyBase, SetBackend):
-  """Wrap a :class:`SetBackend`'s hot-path ops under a breaker."""
+    """Wrap a :class:`SetBackend`'s hot-path ops under a breaker."""
 
-  _HOT_PATH = ("add", "contains", "remove")
-  _FORWARDED = ("set_len", "clear_set", "connect", "disconnect", "is_connected", "ping")
-  _PROTECTED_FORWARDED = ("set_len", "clear_set")
+    _HOT_PATH = ("add", "contains", "remove")
+    _FORWARDED = (
+        "set_len",
+        "clear_set",
+        "connect",
+        "disconnect",
+        "is_connected",
+        "ping",
+    )
+    _PROTECTED_FORWARDED = ("set_len", "clear_set")
 
 
 class _StorageBackendProxy(_BackendProxyBase, StorageBackend):
-  """Wrap a :class:`StorageBackend`'s hot-path ops under a breaker."""
+    """Wrap a :class:`StorageBackend`'s hot-path ops under a breaker."""
 
-  _HOT_PATH = ("store", "retrieve", "delete")
-  _FORWARDED = ("exists", "ttl", "clear_storage", "connect", "disconnect", "is_connected", "ping")
-  _PROTECTED_FORWARDED = ("exists", "ttl", "clear_storage")
+    _HOT_PATH = ("store", "retrieve", "delete")
+    _FORWARDED = (
+        "exists",
+        "ttl",
+        "clear_storage",
+        "connect",
+        "disconnect",
+        "is_connected",
+        "ping",
+    )
+    _PROTECTED_FORWARDED = ("exists", "ttl", "clear_storage")
 
 
 # The proxies are pure forwarders: hot-path methods are installed on each
@@ -786,32 +809,32 @@ class _StorageBackendProxy(_BackendProxyBase, StorageBackend):
 # — so this does not weaken the type contract, it only satisfies ABCMeta's
 # static, class-body-only check.
 for _proxy_cls in (_QueueBackendProxy, _SetBackendProxy, _StorageBackendProxy):
-  _proxy_cls.__abstractmethods__ = frozenset()
+    _proxy_cls.__abstractmethods__ = frozenset()
 
 
 def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueBackend:
-  """Wrap queue traffic operations under ``breaker``.
+    """Wrap queue traffic operations under ``breaker``.
 
-  ``queue_len`` is a non-counting protected forward: it is an admin /
-  observability probe, and a transient stats-query failure must not cascade
-  into a full traffic shutdown by tripping the breaker. ``clear_queue`` uses
-  the same package-error privacy boundary; lifecycle attributes (including
-  ``is_connected``) forward unchanged. ``push``, ``_push_with_durability``,
-  ``pop``, ``pop_with_ack``, ``ack``, and ``nack`` are breaker-wrapped: MQ
-  implementations perform broker I/O for all of them, so their failures must
-  trip the breaker and fail fast while it is OPEN. Atomic-pop backends inherit
-  no-op ack/nack methods, for which wrapping has no observable breaker effect.
-  """
-  return _QueueBackendProxy(backend, breaker)  # type: ignore[abstract]
+    ``queue_len`` is a non-counting protected forward: it is an admin /
+    observability probe, and a transient stats-query failure must not cascade
+    into a full traffic shutdown by tripping the breaker. ``clear_queue`` uses
+    the same package-error privacy boundary; lifecycle attributes (including
+    ``is_connected``) forward unchanged. ``push``, ``_push_with_durability``,
+    ``pop``, ``pop_with_ack``, ``ack``, and ``nack`` are breaker-wrapped: MQ
+    implementations perform broker I/O for all of them, so their failures must
+    trip the breaker and fail fast while it is OPEN. Atomic-pop backends inherit
+    no-op ack/nack methods, for which wrapping has no observable breaker effect.
+    """
+    return _QueueBackendProxy(backend, breaker)  # type: ignore[abstract]
 
 
 def wrap_set_backend(backend: SetBackend, breaker: CircuitBreaker) -> SetBackend:
-  """Wrap ``backend``'s add/contains/remove under ``breaker``."""
-  return _SetBackendProxy(backend, breaker)  # type: ignore[abstract]
+    """Wrap ``backend``'s add/contains/remove under ``breaker``."""
+    return _SetBackendProxy(backend, breaker)  # type: ignore[abstract]
 
 
 def wrap_storage_backend(
-  backend: StorageBackend, breaker: CircuitBreaker
+    backend: StorageBackend, breaker: CircuitBreaker
 ) -> StorageBackend:
-  """Wrap ``backend``'s store/retrieve/delete under ``breaker``."""
-  return _StorageBackendProxy(backend, breaker)  # type: ignore[abstract]
+    """Wrap ``backend``'s store/retrieve/delete under ``breaker``."""
+    return _StorageBackendProxy(backend, breaker)  # type: ignore[abstract]

@@ -67,16 +67,16 @@ pytestmark = [
 
 
 def _e2e_callback(*args: object, **kwargs: object) -> None:
-  """Named callback for e2e requests.
+    """Named callback for e2e requests.
 
-  Scrapy serializes a Request's callback by NAME and resolves it on the
-  spider during deserialize (``request_from_dict`` → ``getattr(spider, name)``).
-  A lambda's name is ``'<lambda>'`` — unresolvable, so a round-tripped request
-  raises ``ValueError: Method '<lambda>' not found``. Each test binds this
-  function as a bound method on its spider instance so Scrapy can discover its
-  method name during serialization and resolve it again during deserialization.
-  """
-  return None
+    Scrapy serializes a Request's callback by NAME and resolves it on the
+    spider during deserialize (``request_from_dict`` → ``getattr(spider, name)``).
+    A lambda's name is ``'<lambda>'`` — unresolvable, so a round-tripped request
+    raises ``ValueError: Method '<lambda>' not found``. Each test binds this
+    function as a bound method on its spider instance so Scrapy can discover its
+    method name during serialization and resolve it again during deserialization.
+    """
+    return None
 
 
 def _redis_settings():  # type: ignore[no-untyped-def]

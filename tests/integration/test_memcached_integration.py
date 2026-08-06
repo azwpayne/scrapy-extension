@@ -34,37 +34,37 @@ import uuid
 import pytest
 
 pytestmark = [
-  pytest.mark.integration,
-  pytest.mark.skipif(
-    not os.environ.get("SCRAPY_TEST_MEMCACHED_HOST"),
-    reason=(
-      "Set SCRAPY_TEST_MEMCACHED_HOST (e.g. localhost) to run Memcached "
-      "integration tests against a live instance."
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("SCRAPY_TEST_MEMCACHED_HOST"),
+        reason=(
+            "Set SCRAPY_TEST_MEMCACHED_HOST (e.g. localhost) to run Memcached "
+            "integration tests against a live instance."
+        ),
     ),
-  ),
 ]
 
 
 def test_store_retrieve_round_trip() -> None:
-  """Real-broker round-trip: store → retrieve → delete (storage ABC contract)."""
-  from scrapy_extension.backends.memcached import MemcachedBackend
-  from scrapy_extension.settings.memcached import MemcachedMode, MemcachedSettings
+    """Real-broker round-trip: store → retrieve → delete (storage ABC contract)."""
+    from scrapy_extension.backends.memcached import MemcachedBackend
+    from scrapy_extension.settings.memcached import MemcachedMode, MemcachedSettings
 
-  settings = MemcachedSettings(
-    mode=MemcachedMode.STANDALONE,
-    host=os.environ["SCRAPY_TEST_MEMCACHED_HOST"],
-    allow_remote_plaintext=(
-      os.environ.get("SCRAPY_TEST_MEMCACHED_ALLOW_REMOTE_PLAINTEXT") == "1"
-    ),
-  )
-  backend = MemcachedBackend(settings)
-  backend.connect()
-  try:
-    key = f"inttest:{uuid.uuid4().hex}"
-    payload = b'{"v":1}'
-    backend.store(key, payload)
-    assert backend.retrieve(key) == payload
-    backend.delete(key)
-    assert backend.retrieve(key) is None
-  finally:
-    backend.disconnect()
+    settings = MemcachedSettings(
+        mode=MemcachedMode.STANDALONE,
+        host=os.environ["SCRAPY_TEST_MEMCACHED_HOST"],
+        allow_remote_plaintext=(
+            os.environ.get("SCRAPY_TEST_MEMCACHED_ALLOW_REMOTE_PLAINTEXT") == "1"
+        ),
+    )
+    backend = MemcachedBackend(settings)
+    backend.connect()
+    try:
+        key = f"inttest:{uuid.uuid4().hex}"
+        payload = b'{"v":1}'
+        backend.store(key, payload)
+        assert backend.retrieve(key) == payload
+        backend.delete(key)
+        assert backend.retrieve(key) is None
+    finally:
+        backend.disconnect()

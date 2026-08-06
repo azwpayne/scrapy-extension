@@ -1811,19 +1811,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pytest-bandit"
-version = "0.6.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "bandit" },
-    { name = "pytest" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3a/0f/09b4fe2276fc922dbe2ab6970455473b3796336c1afb32c0a8bae73e6f85/pytest-bandit-0.6.1.tar.gz", hash = "sha256:9eee170e4ce4e2fe71b1e14c41f7579daf02db253c863a6093ba64de9f878ab4", size = 6041, upload-time = "2021-02-23T22:31:39.034Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d2/5a/adb256fe1fe7f93c8d54de2ae01a039e57a7b144f52fa168788782a579a6/pytest_bandit-0.6.1-py3-none-any.whl", hash = "sha256:9612d299ff32c6b6c74fd149ea0444fa65cb2da5918cbeb6616adba631505dd3", size = 6601, upload-time = "2021-02-23T22:31:37.372Z" },
-]
-
-[[package]]
 name = "pytest-benchmark"
 version = "5.2.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1875,20 +1862,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pytest-mypy"
-version = "1.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "filelock" },
-    { name = "mypy" },
-    { name = "pytest" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b0/50/3ce149b469e27848c1dc354553b17774f9dde0140625f5a4130bd21e1052/pytest_mypy-1.0.1.tar.gz", hash = "sha256:3f5fcaff75c80dccc6b68cf5ecc28e1bbe71e95309469eb7a28bf408ce55c074", size = 15975, upload-time = "2025-04-02T19:31:16.151Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/93/25ed3c02e15c4ef1b04cbda7c708ffc5da755986aaacfb48db1f9e84a996/pytest_mypy-1.0.1-py3-none-any.whl", hash = "sha256:ad7133c9b92c802e032f2596590ebede7eea7c418e61d60d5cdd571b55c72056", size = 8701, upload-time = "2025-04-02T19:31:14.914Z" },
-]
-
-[[package]]
 name = "pytest-randomly"
 version = "4.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1898,19 +1871,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/27/b3/36192dacc0f470ac2cc516f73e01739c9a48a8224f76beada4f85e1c8a89/pytest_randomly-4.1.0.tar.gz", hash = "sha256:47f1d9746c3bc3efabd53ae1ebfb8bb385cf3d4df4b505b6d58d9c97a3dfe70f", size = 14302, upload-time = "2026-04-20T13:01:51.831Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9a/db/2df9a1fca597a273f957a559c20c2d95d629928384507b2afa43ba6909d1/pytest_randomly-4.1.0-py3-none-any.whl", hash = "sha256:f55e89e53367b090c0c053697d7f9d77595543d0e0516c93978b50c0f6b252f9", size = 8353, upload-time = "2026-04-20T13:01:50.382Z" },
-]
-
-[[package]]
-name = "pytest-ruff"
-version = "0.5"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/32/5a/bee55130757fb4a14e0ac5d2c6558323275b5dccfa2f5353f3893299ff7d/pytest_ruff-0.5.tar.gz", hash = "sha256:f611c780fc2b9b8d7041fa0e7589f0a9f352b288d0cfc330881101b35d382063", size = 3854, upload-time = "2025-06-19T07:26:24.607Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/ca/abfce6de0bb0f017ed05ef9f2330596235cc5a3341b4d8d40895682b3814/pytest_ruff-0.5-py3-none-any.whl", hash = "sha256:d9db170d86fb167008e6702b4d79e2cccd8287f069c3a57f9261831cebdc4a31", size = 4680, upload-time = "2025-06-19T07:26:23.897Z" },
 ]
 
 [[package]]
@@ -2271,13 +2231,10 @@ test = [
     { name = "pymemcache" },
     { name = "pymongo" },
     { name = "pytest" },
-    { name = "pytest-bandit" },
     { name = "pytest-cov" },
     { name = "pytest-instafail" },
     { name = "pytest-mock" },
-    { name = "pytest-mypy" },
     { name = "pytest-randomly" },
-    { name = "pytest-ruff" },
     { name = "pytest-socket" },
     { name = "pytest-sugar" },
     { name = "pytest-timeout" },
@@ -2334,13 +2291,10 @@ test = [
     { name = "pymemcache", specifier = ">=4.0,<5" },
     { name = "pymongo", specifier = ">=4.8.0,<5" },
     { name = "pytest" },
-    { name = "pytest-bandit" },
     { name = "pytest-cov" },
     { name = "pytest-instafail" },
     { name = "pytest-mock" },
-    { name = "pytest-mypy" },
     { name = "pytest-randomly" },
-    { name = "pytest-ruff" },
     { name = "pytest-socket" },
     { name = "pytest-sugar" },
     { name = "pytest-timeout" },

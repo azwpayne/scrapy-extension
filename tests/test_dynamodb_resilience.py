@@ -26,43 +26,43 @@ from typing import Any
 import pytest
 
 from scrapy_extension.backends.dynamodb import (
-  DynamoDBBackend,
-  _is_resource_not_found,
+    DynamoDBBackend,
+    _is_resource_not_found,
 )
 from scrapy_extension.exceptions import ConfigurationError, StorageError
 from scrapy_extension.settings import DynamoDBSettings
 
 
 class _FakeClientError(Exception):
-  """Mimics ``botocore.exceptions.ClientError`` for the ResourceNotFound paths
-  (``_is_resource_not_found`` reads ``exc.response["Error"]["Code"]``)."""
+    """Mimics ``botocore.exceptions.ClientError`` for the ResourceNotFound paths
+    (``_is_resource_not_found`` reads ``exc.response["Error"]["Code"]``)."""
 
-  def __init__(self, code: str) -> None:
-    super().__init__(code)
-    self.response: dict[str, Any] = {"Error": {"Code": code}}
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.response: dict[str, Any] = {"Error": {"Code": code}}
 
 
 def _backend() -> DynamoDBBackend:
-  """Constructed-but-not-connected backend (_resource / _table are None)."""
-  return DynamoDBBackend(DynamoDBSettings())
+    """Constructed-but-not-connected backend (_resource / _table are None)."""
+    return DynamoDBBackend(DynamoDBSettings())
 
 
 def _connected_backend(mocker) -> tuple[DynamoDBBackend, Any]:
-  """Publish a complete mocked generation through the production connect path."""
-  backend = _backend()
-  resource = mocker.MagicMock()
-  table = mocker.MagicMock()
-  table.load.return_value = None
-  table.table_status = "ACTIVE"
-  resource.Table.return_value = table
-  session = mocker.MagicMock()
-  session.resource.return_value = resource
-  mocker.patch(
-    "scrapy_extension.backends.dynamodb.boto3.session.Session",
-    return_value=session,
-  )
-  backend.connect()
-  return backend, table
+    """Publish a complete mocked generation through the production connect path."""
+    backend = _backend()
+    resource = mocker.MagicMock()
+    table = mocker.MagicMock()
+    table.load.return_value = None
+    table.table_status = "ACTIVE"
+    resource.Table.return_value = table
+    session = mocker.MagicMock()
+    session.resource.return_value = resource
+    mocker.patch(
+        "scrapy_extension.backends.dynamodb.boto3.session.Session",
+        return_value=session,
+    )
+    backend.connect()
+    return backend, table
 
 
 # ---------------------------------------------------------------------------
@@ -71,15 +71,16 @@ def _connected_backend(mocker) -> tuple[DynamoDBBackend, Any]:
 
 
 def test_is_resource_not_found_false_when_error_is_not_a_dict() -> None:
-  """Line 67: a ``response`` whose ``Error`` value is not a dict returns False
-  (defensive type-narrowing — a malformed ClientError must not be mistaken
-  for a ResourceNotFound signal and silently treated as 'missing')."""
-  class _WeirdError(Exception):
-    response = {"Error": "not-a-dict"}  # Error value is a string, not dict
+    """Line 67: a ``response`` whose ``Error`` value is not a dict returns False
+    (defensive type-narrowing — a malformed ClientError must not be mistaken
+    for a ResourceNotFound signal and silently treated as 'missing')."""
 
-  assert _is_resource_not_found(_WeirdError()) is False
-  # Sanity contrast — a well-formed ResourceNotFound IS detected:
-  assert _is_resource_not_found(_FakeClientError("ResourceNotFoundException")) is True
+    class _WeirdError(Exception):
+        response = {"Error": "not-a-dict"}  # Error value is a string, not dict
+
+    assert _is_resource_not_found(_WeirdError()) is False
+    # Sanity contrast — a well-formed ResourceNotFound IS detected:
+    assert _is_resource_not_found(_FakeClientError("ResourceNotFoundException")) is True
 
 
 # ---------------------------------------------------------------------------
@@ -88,18 +89,18 @@ def test_is_resource_not_found_false_when_error_is_not_a_dict() -> None:
 
 
 def test_connect_rejects_partial_credentials_access_key_only() -> None:
-  """Lines 106-108 (SEC-7, defense-in-depth): connect() re-checks the
-  both-or-neither credential invariant even though DynamoDBSettings already
-  validates it at construction — so a backend whose config is mutated
-  post-construction still fails fast rather than silently using boto3's
-  default credential chain. Reached by mutating the config."""
-  from pydantic import SecretStr
+    """Lines 106-108 (SEC-7, defense-in-depth): connect() re-checks the
+    both-or-neither credential invariant even though DynamoDBSettings already
+    validates it at construction — so a backend whose config is mutated
+    post-construction still fails fast rather than silently using boto3's
+    default credential chain. Reached by mutating the config."""
+    from pydantic import SecretStr
 
-  backend = _backend()
-  backend.config.aws_access_key_id = SecretStr("ak")  # bypass settings validation
-  with pytest.raises(ConfigurationError) as exc:
-    backend.connect()
-  assert "aws_secret_access_key" in str(exc.value)
+    backend = _backend()
+    backend.config.aws_access_key_id = SecretStr("ak")  # bypass settings validation
+    with pytest.raises(ConfigurationError) as exc:
+        backend.connect()
+    assert "aws_secret_access_key" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +109,16 @@ def test_connect_rejects_partial_credentials_access_key_only() -> None:
 
 
 def test_connect_passes_endpoint_url_into_private_session_resource(mocker) -> None:
-  """Line 118: when ``endpoint_url`` is set (LocalStack), it is forwarded to
-  the candidate Session's ``resource`` call so local dev routes correctly."""
-  mock_boto3 = mocker.patch("scrapy_extension.backends.dynamodb.boto3")
-  # Table.load() succeeds (no raise) -> existing-table path, connect completes:
-  resource_factory = mock_boto3.session.Session.return_value.resource
-  resource_factory.return_value.Table.return_value.load.return_value = None
-  backend = DynamoDBBackend(DynamoDBSettings(endpoint_url="http://localhost:4566"))
-  backend.connect()
-  kwargs = resource_factory.call_args.kwargs
-  assert kwargs["endpoint_url"] == "http://localhost:4566"
+    """Line 118: when ``endpoint_url`` is set (LocalStack), it is forwarded to
+    the candidate Session's ``resource`` call so local dev routes correctly."""
+    mock_boto3 = mocker.patch("scrapy_extension.backends.dynamodb.boto3")
+    # Table.load() succeeds (no raise) -> existing-table path, connect completes:
+    resource_factory = mock_boto3.session.Session.return_value.resource
+    resource_factory.return_value.Table.return_value.load.return_value = None
+    backend = DynamoDBBackend(DynamoDBSettings(endpoint_url="http://localhost:4566"))
+    backend.connect()
+    kwargs = resource_factory.call_args.kwargs
+    assert kwargs["endpoint_url"] == "http://localhost:4566"
 
 
 # ---------------------------------------------------------------------------
@@ -126,20 +127,20 @@ def test_connect_passes_endpoint_url_into_private_session_resource(mocker) -> No
 
 
 def test_ping_returns_false_when_table_handle_is_none() -> None:
-  """Line 154: ping() with no table handle returns False without attempting
-  ``table.load()`` (no AttributeError on None)."""
-  backend = _backend()
-  backend._table = None
-  assert backend.ping() is False
+    """Line 154: ping() with no table handle returns False without attempting
+    ``table.load()`` (no AttributeError on None)."""
+    backend = _backend()
+    backend._table = None
+    assert backend.ping() is False
 
 
 def test_ping_returns_true_on_successful_load(mocker) -> None:
-  """Line 157: ping() returns True when ``table.load()`` succeeds — the
-  health-check contract for a connected backend."""
-  backend, table = _connected_backend(mocker)
-  table.load.reset_mock()
-  assert backend.ping() is True
-  table.load.assert_called_once()
+    """Line 157: ping() returns True when ``table.load()`` succeeds — the
+    health-check contract for a connected backend."""
+    backend, table = _connected_backend(mocker)
+    table.load.reset_mock()
+    assert backend.ping() is True
+    table.load.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -148,13 +149,13 @@ def test_ping_returns_true_on_successful_load(mocker) -> None:
 
 
 def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
-  """Line 196: a vanished table mid-``put_item`` (ResourceNotFoundException)
-  is a StorageError (NOT silently swallowed) — preserves at-least-once: the
-  caller (item pipeline) must see the failure, not a silent data loss."""
-  backend, table = _connected_backend(mocker)
-  table.put_item.side_effect = _FakeClientError("ResourceNotFoundException")
-  with pytest.raises(StorageError, match="^DynamoDB storage store failed\\.$"):
-    backend.store("k", b"v")
+    """Line 196: a vanished table mid-``put_item`` (ResourceNotFoundException)
+    is a StorageError (NOT silently swallowed) — preserves at-least-once: the
+    caller (item pipeline) must see the failure, not a silent data loss."""
+    backend, table = _connected_backend(mocker)
+    table.put_item.side_effect = _FakeClientError("ResourceNotFoundException")
+    with pytest.raises(StorageError, match="^DynamoDB storage store failed\\.$"):
+        backend.store("k", b"v")
 
 
 # ---------------------------------------------------------------------------
@@ -163,21 +164,21 @@ def test_store_raises_storage_error_when_table_vanishes(mocker) -> None:
 
 
 def test_exists_raises_storage_error_when_table_vanishes(mocker) -> None:
-  backend, table = _connected_backend(mocker)
-  error = _FakeClientError("ResourceNotFoundException")
-  table.get_item.side_effect = error
-  with pytest.raises(StorageError) as exc_info:
-    backend.exists("k")
-  assert exc_info.value.operation == "exists"
-  assert exc_info.value.__cause__ is None
-  assert exc_info.value.__context__ is None
+    backend, table = _connected_backend(mocker)
+    error = _FakeClientError("ResourceNotFoundException")
+    table.get_item.side_effect = error
+    with pytest.raises(StorageError) as exc_info:
+        backend.exists("k")
+    assert exc_info.value.operation == "exists"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 def test_exists_returns_false_when_item_is_absent(mocker) -> None:
-  """Line 285: a get_item response with no ``Item`` → False (key not present)."""
-  backend, table = _connected_backend(mocker)
-  table.get_item.return_value = {}  # no "Item"
-  assert backend.exists("k") is False
+    """Line 285: a get_item response with no ``Item`` → False (key not present)."""
+    backend, table = _connected_backend(mocker)
+    table.get_item.return_value = {}  # no "Item"
+    assert backend.exists("k") is False
 
 
 # ---------------------------------------------------------------------------
@@ -186,11 +187,11 @@ def test_exists_returns_false_when_item_is_absent(mocker) -> None:
 
 
 def test_ttl_raises_storage_error_when_table_vanishes(mocker) -> None:
-  backend, table = _connected_backend(mocker)
-  error = _FakeClientError("ResourceNotFoundException")
-  table.get_item.side_effect = error
-  with pytest.raises(StorageError) as exc_info:
-    backend.ttl("k")
-  assert exc_info.value.operation == "ttl"
-  assert exc_info.value.__cause__ is None
-  assert exc_info.value.__context__ is None
+    backend, table = _connected_backend(mocker)
+    error = _FakeClientError("ResourceNotFoundException")
+    table.get_item.side_effect = error
+    with pytest.raises(StorageError) as exc_info:
+        backend.ttl("k")
+    assert exc_info.value.operation == "ttl"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None

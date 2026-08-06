@@ -2,9 +2,11 @@
 #
 # Brings up the three live brokers the multi-backend e2e test
 # (tests/integration/test_multi_backend_e2e.py) needs, plus Kafka + RabbitMQ
-# for the per-backend integration suites. Each service exposes the canonical
-# port and ships a healthcheck so `docker compose up --wait` blocks until the
-# brokers are actually ready to accept connections, not just TCP-open.
+# for the per-backend integration suites. Every service exposes its canonical
+# port; services with a reliable in-image readiness probe ship a healthcheck,
+# so `docker compose up --wait` blocks for those probes rather than only a
+# TCP-open port. Published host ports bind to loopback only: these fixtures
+# disable authentication/TLS and must not be reachable from the local network.
 #
 # Usage (from repo root):
 #
@@ -16,13 +18,18 @@
 #   uv run pytest tests/integration -q --force-enable-socket
 #
 #   docker compose -f tests/integration/docker-compose.yml down -v
+#
+# The CI-only fixtures below are opt-in so the default command keeps its
+# existing, lighter broker set. Start every local integration fixture with:
+#
+#   docker compose --profile optional -f tests/integration/docker-compose.yml up -d --wait
 
 services:
   redis:
     image: redis:7
     container_name: scrapy-ext-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -35,7 +42,7 @@ services:
     image: mongo:7
     container_name: scrapy-ext-mongo
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: ""
       MONGO_INITDB_ROOT_PASSWORD: ""
@@ -60,7 +67,7 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.4.1
     container_name: scrapy-ext-es
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -82,7 +89,7 @@ services:
     image: confluentinc/cp-kafka:7.6.1
     container_name: scrapy-ext-kafka
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: "broker,controller"
@@ -114,8 +121,8 @@ services:
     image: rabbitmq:3.13-management
     container_name: scrapy-ext-rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
@@ -138,7 +145,7 @@ services:
     image: apache/rocketmq:5.3.3
     container_name: scrapy-ext-rocketmq-namesrv
     ports:
-      - "9876:9876"
+      - "127.0.0.1:9876:9876"
     command: sh mqnamesrv
     healthcheck:
       # apache/rocketmq ships no nc/curl — use a process liveness check.
@@ -155,10 +162,10 @@ services:
     ports:
       # 8081 = gRPC proxy (what the apache python client connects to)
       # 10909/10911/10912 = remoting broker ports (kept for completeness)
-      - "8081:8081"
-      - "10909:10909"
-      - "10911:10911"
-      - "10912:10912"
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:10909:10909"
+      - "127.0.0.1:10911:10911"
+      - "127.0.0.1:10912:10912"
     depends_on:
       rocketmq-namesrv:
         condition: service_healthy
@@ -189,3 +196,54 @@ services:
       timeout: 10s
       retries: 15
       start_period: 40s
+
+  # Optional CI-parity fixtures. The `optional` profile keeps their heavier
+  # images out of the default local broker set while making all integration
+  # backends reproducible from this one Compose file.
+  pulsar:
+    profiles: ["optional"]
+    image: apachepulsar/pulsar:4.1.2
+    container_name: scrapy-ext-pulsar
+    ports:
+      - "127.0.0.1:6650:6650"
+      - "127.0.0.1:8080:8080"
+    environment:
+      PULSAR_MEM: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=512m"
+    command: ["bin/pulsar", "standalone"]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl --fail --silent
+          http://localhost:8080/admin/v2/brokers/health >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  memcached:
+    profiles: ["optional"]
+    image: memcached:1.6
+    container_name: scrapy-ext-memcached
+    ports:
+      - "127.0.0.1:11211:11211"
+    # The official image has no protocol client for a meaningful in-container
+    # health probe. It starts synchronously; the live integration test then
+    # verifies the Memcached protocol itself.
+
+  localstack:
+    profiles: ["optional"]
+    image: localstack/localstack:4.11.1
+    container_name: scrapy-ext-localstack
+    environment:
+      SERVICES: sqs,dynamodb
+    ports:
+      - "127.0.0.1:4566:4566"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - curl -sf http://localhost:4566/_localstack/init/ready
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s

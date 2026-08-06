@@ -60,127 +60,127 @@ from kafka.errors import NotLeaderForPartitionError
 from scrapy_extension.exceptions import QueueError
 
 pytestmark = [
-  pytest.mark.integration,
-  pytest.mark.skipif(
-    not os.environ.get("SCRAPY_TEST_KAFKA_BOOTSTRAP"),
-    reason=(
-      "Set SCRAPY_TEST_KAFKA_BOOTSTRAP (e.g. localhost:9092) to run Kafka "
-      "integration tests against a live broker."
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.environ.get("SCRAPY_TEST_KAFKA_BOOTSTRAP"),
+        reason=(
+            "Set SCRAPY_TEST_KAFKA_BOOTSTRAP (e.g. localhost:9092) to run Kafka "
+            "integration tests against a live broker."
+        ),
     ),
-  ),
 ]
 
 
 def _drain(backend, queue: str, n: int, deadline_s: float = 15.0) -> list:  # type: ignore[no-untyped-def]
-  """Poll until ``n`` records consumed or deadline; ack each.
+    """Poll until ``n`` records consumed or deadline; ack each.
 
-  Handles Kafka consumer-group join + partition-assignment latency: the
-  first poll(s) after subscribe routinely return empty until assignment
-  completes, so a single ``pop`` would spuriously return None.
-  """
-  received: list[bytes] = []
-  deadline = time.time() + deadline_s
-  while len(received) < n and time.time() < deadline:
-    item = backend.pop(queue, timeout=1.0)  # 1s poll gives the broker time
-    if item is not None:
-      received.append(item)
-      backend.ack(queue)  # commit the offset (pop does NOT auto-ack, R12)
-  return received
+    Handles Kafka consumer-group join + partition-assignment latency: the
+    first poll(s) after subscribe routinely return empty until assignment
+    completes, so a single ``pop`` would spuriously return None.
+    """
+    received: list[bytes] = []
+    deadline = time.time() + deadline_s
+    while len(received) < n and time.time() < deadline:
+        item = backend.pop(queue, timeout=1.0)  # 1s poll gives the broker time
+        if item is not None:
+            received.append(item)
+            backend.ack(queue)  # commit the offset (pop does NOT auto-ack, R12)
+    return received
 
 
 def _push_after_leader_election(backend, queue: str, item: bytes) -> None:  # type: ignore[no-untyped-def]
-  """Push after a newly auto-created topic has elected its partition leader.
+    """Push after a newly auto-created topic has elected its partition leader.
 
-  Kafka's CreateTopics response can arrive before metadata has converged on a
-  leader for every new partition. A ``NotLeaderForPartitionError`` is a known,
-  non-ambiguous retry signal in that narrow window; any other QueueError still
-  fails the test immediately.
-  """
-  deadline = time.monotonic() + 10.0
-  while True:
-    try:
-      backend.push(queue, item, priority=0.0)
-      return
-    except QueueError as exc:
-      if (
-        not isinstance(exc.__cause__, NotLeaderForPartitionError)
-        or time.monotonic() >= deadline
-      ):
-        raise
-      time.sleep(0.25)
+    Kafka's CreateTopics response can arrive before metadata has converged on a
+    leader for every new partition. A ``NotLeaderForPartitionError`` is a known,
+    non-ambiguous retry signal in that narrow window; any other QueueError still
+    fails the test immediately.
+    """
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            backend.push(queue, item, priority=0.0)
+            return
+        except QueueError as exc:
+            if (
+                not isinstance(exc.__cause__, NotLeaderForPartitionError)
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(0.25)
 
 
 @pytest.fixture(scope="module")
 def kafka_backend():  # type: ignore[no-untyped-def]
-  """Connect a KafkaBackend once per module; disconnect on teardown.
+    """Connect a KafkaBackend once per module; disconnect on teardown.
 
-  Uses a unique consumer ``group_id`` per module run so test offsets don't
-  cross-talk with any real ``scrapy-extension`` group or prior runs.
-  """
-  from scrapy_extension.backends.kafka import KafkaBackend
-  from scrapy_extension.settings.kafka import KafkaSettings
+    Uses a unique consumer ``group_id`` per module run so test offsets don't
+    cross-talk with any real ``scrapy-extension`` group or prior runs.
+    """
+    from scrapy_extension.backends.kafka import KafkaBackend
+    from scrapy_extension.settings.kafka import KafkaSettings
 
-  config = KafkaSettings(
-    bootstrap_servers=os.environ["SCRAPY_TEST_KAFKA_BOOTSTRAP"],
-    group_id=f"inttest-{uuid.uuid4().hex[:8]}",
-    session_timeout_ms=10000,
-    request_timeout_ms=10000,
-  )
-  backend = KafkaBackend(config)
-  backend.connect()
-  yield backend
-  backend.disconnect()
+    config = KafkaSettings(
+        bootstrap_servers=os.environ["SCRAPY_TEST_KAFKA_BOOTSTRAP"],
+        group_id=f"inttest-{uuid.uuid4().hex[:8]}",
+        session_timeout_ms=10000,
+        request_timeout_ms=10000,
+    )
+    backend = KafkaBackend(config)
+    backend.connect()
+    yield backend
+    backend.disconnect()
 
 
 @pytest.fixture
 def unique_prefix() -> str:
-  """UUID-suffixed namespace → unique topic (scrapy-{prefix}-...) per test.
+    """UUID-suffixed namespace → unique topic (scrapy-{prefix}-...) per test.
 
-  Hyphen-delimited (NOT colon): Kafka topic names allow only ``[a-zA-Z0-9._-]``
-  (``_validate_topic_name``), so the topic ``scrapy-{queue_name}`` rejects the
-  ``inttest:`` colon style the other suites use. Matches R56's RocketMQ fix.
-  """
-  return f"inttest-{uuid.uuid4().hex}"
+    Hyphen-delimited (NOT colon): Kafka topic names allow only ``[a-zA-Z0-9._-]``
+    (``_validate_topic_name``), so the topic ``scrapy-{queue_name}`` rejects the
+    ``inttest:`` colon style the other suites use. Matches R56's RocketMQ fix.
+    """
+    return f"inttest-{uuid.uuid4().hex}"
 
 
 def test_push_pop_round_trip_with_ack(kafka_backend, unique_prefix):
-  """N in → N out, no loss. ack commits each offset (pop does NOT auto-ack, R12).
+    """N in → N out, no loss. ack commits each offset (pop does NOT auto-ack, R12).
 
-  The poll-loop (``_drain``) handles the consumer-group join + partition-
-  assignment latency that makes a single pop spuriously return None. Kafka
-  preserves order within a partition; with priority=0 all messages land in
-  partition 0, but we compare as sets to stay robust to poll batching.
-  """
-  queue = f"{unique_prefix}-rt"
-  n = 5
-  sent = [f"item-{i:03d}".encode() for i in range(n)]
-  for item in sent:
-    _push_after_leader_election(kafka_backend, queue, item)
+    The poll-loop (``_drain``) handles the consumer-group join + partition-
+    assignment latency that makes a single pop spuriously return None. Kafka
+    preserves order within a partition; with priority=0 all messages land in
+    partition 0, but we compare as sets to stay robust to poll batching.
+    """
+    queue = f"{unique_prefix}-rt"
+    n = 5
+    sent = [f"item-{i:03d}".encode() for i in range(n)]
+    for item in sent:
+        _push_after_leader_election(kafka_backend, queue, item)
 
-  received = _drain(kafka_backend, queue, n)
+    received = _drain(kafka_backend, queue, n)
 
-  assert len(received) == n
-  assert set(received) == set(sent)
+    assert len(received) == n
+    assert set(received) == set(sent)
 
 
 def test_cold_start_depth_sees_existing_backlog(kafka_backend, unique_prefix):
-  """Fresh earliest groups must not turn a pre-existing backlog into false 0."""
-  queue = f"{unique_prefix}-cold-depth"
-  sent = [b"cold-0", b"cold-1", b"cold-2"]
-  for item in sent:
-    _push_after_leader_election(kafka_backend, queue, item)
+    """Fresh earliest groups must not turn a pre-existing backlog into false 0."""
+    queue = f"{unique_prefix}-cold-depth"
+    sent = [b"cold-0", b"cold-1", b"cold-2"]
+    for item in sent:
+        _push_after_leader_election(kafka_backend, queue, item)
 
-  assert kafka_backend.queue_len(queue) == len(sent)
+    assert kafka_backend.queue_len(queue) == len(sent)
 
 
 def test_ack_idempotent_when_no_pending(kafka_backend, unique_prefix):
-  """R11: ack()/nack() with no tracked record are safe no-ops.
+    """R11: ack()/nack() with no tracked record are safe no-ops.
 
-  Guards against committing with no consumed offset (the backend
-  short-circuits when ``_last_record is None``). Kafka's nack is always an
-  in-session no-op; ack with nothing pending must not raise.
-  """
-  queue = f"{unique_prefix}-ackidem"
-  # No record polled on this topic → no tracked record → must not raise.
-  kafka_backend.ack(queue)
-  kafka_backend.nack(queue)
+    Guards against committing with no consumed offset (the backend
+    short-circuits when ``_last_record is None``). Kafka's nack is always an
+    in-session no-op; ack with nothing pending must not raise.
+    """
+    queue = f"{unique_prefix}-ackidem"
+    # No record polled on this topic → no tracked record → must not raise.
+    kafka_backend.ack(queue)
+    kafka_backend.nack(queue)

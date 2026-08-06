@@ -13,6 +13,11 @@ from scrapy_extension.settings._broker_endpoints import (
     normalize_rocketmq_namesrv_endpoints,
 )
 from scrapy_extension.settings._redacted import RedactedBaseSettings
+from scrapy_extension.settings._transport_security import (
+    is_loopback_host,
+    validate_allow_remote_plaintext,
+    warn_remote_unauthenticated_plaintext,
+)
 
 
 class RocketMQMode(str, Enum):
@@ -23,9 +28,7 @@ class RocketMQMode(str, Enum):
     CLOUD = "cloud"  # Alibaba Cloud RocketMQ
 
 
-def _credential_value(
-    value: SecretStr | str | None, setting_name: str
-) -> str | None:
+def _credential_value(value: SecretStr | str | None, setting_name: str) -> str | None:
     """Extract a credential without retaining or echoing invalid values."""
     if value is None:
         return None
@@ -46,12 +49,19 @@ def _credential_value(
     return text
 
 
+def _rocketmq_namesrv_endpoints_are_loopback(endpoints: str) -> bool:
+    """Return whether every normalized RocketMQ proxy endpoint is local."""
+    hosts = [endpoint.rsplit(":", 1)[0] for endpoint in endpoints.split(";")]
+    return bool(hosts) and all(is_loopback_host(host) for host in hosts)
+
+
 def validate_rocketmq_connection(
     mode: RocketMQMode,
     namesrv_address: str,
     access_key: SecretStr | str | None,
     secret_key: SecretStr | str | None,
     tls_enabled: bool,
+    allow_remote_plaintext: object = False,
 ) -> tuple[RocketMQMode, str, str | None, str | None, bool]:
     """Validate and return one coherent RocketMQ connection snapshot."""
     if mode not in (
@@ -70,6 +80,9 @@ def validate_rocketmq_connection(
             "tls_enabled must be a boolean.",
             setting_name="tls_enabled",
         )
+    normalized_allow_remote_plaintext = validate_allow_remote_plaintext(
+        allow_remote_plaintext
+    )
 
     key_text = _credential_value(access_key, "access_key")
     secret_text = _credential_value(secret_key, "secret_key")
@@ -92,6 +105,14 @@ def validate_rocketmq_connection(
         raise ConfigurationError(
             "Authenticated RocketMQ connections require tls_enabled=True.",
             setting_name="tls_enabled",
+        )
+    if (
+        key_text is None
+        and not tls_enabled
+        and not _rocketmq_namesrv_endpoints_are_loopback(namesrv_address)
+    ):
+        warn_remote_unauthenticated_plaintext(
+            "RocketMQ", normalized_allow_remote_plaintext
         )
     return mode, namesrv_address, key_text, secret_text, tls_enabled
 
@@ -120,6 +141,13 @@ class RocketMQSettings(RedactedBaseSettings):
     tls_enabled: bool = Field(
         default=False,
         description="Use TLS for the RocketMQ 5.x gRPC proxy connection",
+    )
+    allow_remote_plaintext: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge an unauthenticated plaintext connection to a non-loopback "
+            "RocketMQ proxy on a trusted private network"
+        ),
     )
 
     # === Consumer Group ===
@@ -195,5 +223,6 @@ class RocketMQSettings(RedactedBaseSettings):
             self.access_key,
             self.secret_key,
             self.tls_enabled,
+            self.allow_remote_plaintext,
         )
         return self

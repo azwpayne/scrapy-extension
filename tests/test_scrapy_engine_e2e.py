@@ -200,7 +200,7 @@ def test_unhandled_download_failure_nacks(engine_probe: dict[str, Any]) -> None:
 
 
 def test_duplicate_redirect_replacement_is_durable_before_ack(
-  engine_probe: dict[str, Any],
+    engine_probe: dict[str, Any],
 ) -> None:
     popped = _only_event(engine_probe, "pop", url="/redirect-duplicate")
     assert _terminal_events(engine_probe, popped["token"]) == [
@@ -213,9 +213,9 @@ def test_duplicate_redirect_replacement_is_durable_before_ack(
     assert not _events(engine_probe, "request_dropped", url="/already-seen")
     assert len(_events(engine_probe, "push", url="/already-seen")) == 2
     assert engine_probe["http_attempts"]["/already-seen"] == 2
-    replacement_push = list(
-        _event_indexes(engine_probe, "push", url="/already-seen")
-    )[1]
+    replacement_push = list(_event_indexes(engine_probe, "push", url="/already-seen"))[
+        1
+    ]
     source_ack = next(
         index
         for index in _event_indexes(engine_probe, "ack", url="/redirect-duplicate")

@@ -8,11 +8,11 @@ Exports the strategy interface and all concrete filters. The
 from __future__ import annotations
 
 __all__ = [
-  "BloomMembershipFilter",
-  "CuckooMembershipFilter",
-  "MembershipFilter",
-  "MemoryMembershipFilter",
-  "SetMembershipFilter",
+    "BloomMembershipFilter",
+    "CuckooMembershipFilter",
+    "MembershipFilter",
+    "MemoryMembershipFilter",
+    "SetMembershipFilter",
 ]
 
 from scrapy_extension.dupefilter.filters.base import MembershipFilter

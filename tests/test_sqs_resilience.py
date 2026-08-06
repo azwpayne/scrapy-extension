@@ -26,33 +26,33 @@ from unittest.mock import MagicMock
 import pytest
 
 from scrapy_extension.backends.sqs import (
-  _MAX_IN_FLIGHT,
-  SqsBackend,
-  _SqsAckToken,
-  _swallow,
+    _MAX_IN_FLIGHT,
+    SqsBackend,
+    _SqsAckToken,
+    _swallow,
 )
 from scrapy_extension.exceptions import ConfigurationError, QueueError
 from scrapy_extension.settings import SqsSettings
 
 
 def _backend() -> SqsBackend:
-  """A constructed-but-not-connected backend (client is None)."""
-  return SqsBackend(SqsSettings())
+    """A constructed-but-not-connected backend (client is None)."""
+    return SqsBackend(SqsSettings())
 
 
 def _patch_client(mocker, client):
-  """Patch one private SQS Session and guard the shared default alias."""
-  session = mocker.MagicMock(name="private-sqs-session")
-  session.client.return_value = client
-  session_factory = mocker.patch(
-    "scrapy_extension.backends.sqs.boto3.session.Session",
-    return_value=session,
-  )
-  mocker.patch(
-    "scrapy_extension.backends.sqs.boto3.client",
-    side_effect=AssertionError("shared default Session must not be used"),
-  )
-  return session_factory, session.client
+    """Patch one private SQS Session and guard the shared default alias."""
+    session = mocker.MagicMock(name="private-sqs-session")
+    session.client.return_value = client
+    session_factory = mocker.patch(
+        "scrapy_extension.backends.sqs.boto3.session.Session",
+        return_value=session,
+    )
+    mocker.patch(
+        "scrapy_extension.backends.sqs.boto3.client",
+        side_effect=AssertionError("shared default Session must not be used"),
+    )
+    return session_factory, session.client
 
 
 # ---------------------------------------------------------------------------
@@ -61,15 +61,15 @@ def _patch_client(mocker, client):
 
 
 def test_ack_token_eq_returns_not_implemented_for_other_types() -> None:
-  """Line 96: comparing to a non-_SqsAckToken returns NotImplemented (Python's
-  __eq__ protocol — lets the other side's __eq__ be tried, falls back to
-  identity). Pinned so a future refactor doesn't silently return False and
-  break dict/set membership semantics for tokens."""
-  token = _SqsAckToken("u", "r")
-  assert token.__eq__("not-a-token") is NotImplemented
-  assert token.__eq__(42) is NotImplemented
-  # Token equality still works for real tokens:
-  assert token == _SqsAckToken("u", "r")
+    """Line 96: comparing to a non-_SqsAckToken returns NotImplemented (Python's
+    __eq__ protocol — lets the other side's __eq__ be tried, falls back to
+    identity). Pinned so a future refactor doesn't silently return False and
+    break dict/set membership semantics for tokens."""
+    token = _SqsAckToken("u", "r")
+    assert token.__eq__("not-a-token") is NotImplemented
+    assert token.__eq__(42) is NotImplemented
+    # Token equality still works for real tokens:
+    assert token == _SqsAckToken("u", "r")
 
 
 # ---------------------------------------------------------------------------
@@ -78,36 +78,36 @@ def test_ack_token_eq_returns_not_implemented_for_other_types() -> None:
 
 
 def test_connect_rejects_partial_aws_credentials_access_key_only(mocker) -> None:
-  """Lines 172-174 (SEC-7, defense-in-depth): connect() re-checks the
-  both-or-neither credential invariant even though ``SqsSettings`` already
-  validates it at construction — so a backend whose config is mutated
-  post-construction (bypassing settings validation) still fails fast rather
-  than silently running under boto3's default credential chain (an
-  unintended identity). Reached by mutating the config after construction."""
-  from pydantic import SecretStr
+    """Lines 172-174 (SEC-7, defense-in-depth): connect() re-checks the
+    both-or-neither credential invariant even though ``SqsSettings`` already
+    validates it at construction — so a backend whose config is mutated
+    post-construction (bypassing settings validation) still fails fast rather
+    than silently running under boto3's default credential chain (an
+    unintended identity). Reached by mutating the config after construction."""
+    from pydantic import SecretStr
 
-  backend = _backend()
-  backend.config.aws_access_key_id = SecretStr("ak")  # bypass settings validation
-  session_factory, _client_factory = _patch_client(mocker, MagicMock())
-  with pytest.raises(ConfigurationError) as exc:
-    backend.connect()
-  assert "aws_secret_access_key" in str(exc.value)
-  session_factory.assert_not_called()
+    backend = _backend()
+    backend.config.aws_access_key_id = SecretStr("ak")  # bypass settings validation
+    session_factory, _client_factory = _patch_client(mocker, MagicMock())
+    with pytest.raises(ConfigurationError) as exc:
+        backend.connect()
+    assert "aws_secret_access_key" in str(exc.value)
+    session_factory.assert_not_called()
 
 
 def test_connect_rejects_partial_aws_credentials_secret_only(mocker) -> None:
-  """Lines 172-174 (SEC-7, defense-in-depth): the reverse mismatch — secret
-  set, key missing — also caught at connect() when settings validation is
-  bypassed by post-construction mutation."""
-  from pydantic import SecretStr
+    """Lines 172-174 (SEC-7, defense-in-depth): the reverse mismatch — secret
+    set, key missing — also caught at connect() when settings validation is
+    bypassed by post-construction mutation."""
+    from pydantic import SecretStr
 
-  backend = _backend()
-  backend.config.aws_secret_access_key = SecretStr("sk")  # bypass settings validation
-  session_factory, _client_factory = _patch_client(mocker, MagicMock())
-  with pytest.raises(ConfigurationError) as exc:
-    backend.connect()
-  assert "aws_access_key_id" in str(exc.value)
-  session_factory.assert_not_called()
+    backend = _backend()
+    backend.config.aws_secret_access_key = SecretStr("sk")  # bypass settings validation
+    session_factory, _client_factory = _patch_client(mocker, MagicMock())
+    with pytest.raises(ConfigurationError) as exc:
+        backend.connect()
+    assert "aws_access_key_id" in str(exc.value)
+    session_factory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -116,14 +116,14 @@ def test_connect_rejects_partial_aws_credentials_secret_only(mocker) -> None:
 
 
 def test_connect_passes_endpoint_url_into_boto3_client(mocker) -> None:
-  """Line 184: when ``endpoint_url`` is set (LocalStack), it is forwarded to
-  the private Session client so LocalStack tests route correctly."""
-  session_factory, client_factory = _patch_client(mocker, MagicMock())
-  backend = SqsBackend(SqsSettings(endpoint_url="http://localhost:4566"))
-  backend.connect()
-  session_factory.assert_called_once_with()
-  _, kwargs = client_factory.call_args
-  assert kwargs["endpoint_url"] == "http://localhost:4566"
+    """Line 184: when ``endpoint_url`` is set (LocalStack), it is forwarded to
+    the private Session client so LocalStack tests route correctly."""
+    session_factory, client_factory = _patch_client(mocker, MagicMock())
+    backend = SqsBackend(SqsSettings(endpoint_url="http://localhost:4566"))
+    backend.connect()
+    session_factory.assert_called_once_with()
+    _, kwargs = client_factory.call_args
+    assert kwargs["endpoint_url"] == "http://localhost:4566"
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +132,12 @@ def test_connect_passes_endpoint_url_into_boto3_client(mocker) -> None:
 
 
 def test_disconnect_before_connect_is_a_silent_noop() -> None:
-  """Line 197->201 (false branch): disconnect() with no client must not raise
-  (no ``None.close()``) — idempotent teardown for callers that didn't connect."""
-  backend = _backend()
-  backend.disconnect()  # _client is None — must not raise
-  assert backend._client is None
-  assert backend._in_flight == set()
+    """Line 197->201 (false branch): disconnect() with no client must not raise
+    (no ``None.close()``) — idempotent teardown for callers that didn't connect."""
+    backend = _backend()
+    backend.disconnect()  # _client is None — must not raise
+    assert backend._client is None
+    assert backend._in_flight == set()
 
 
 # ---------------------------------------------------------------------------
@@ -146,24 +146,24 @@ def test_disconnect_before_connect_is_a_silent_noop() -> None:
 
 
 def test_track_in_flight_warns_once_on_overflow(caplog) -> None:
-  """Line 357->exit: once the diagnostic in-flight set reaches ``_MAX_IN_FLIGHT``,
-  further unacked pops emit a single warning (not one per pop) — the broker
-  still tracks receipt handles, so ack correctness is unaffected."""
-  backend = _backend()
-  for i in range(_MAX_IN_FLIGHT):
-    backend._track_in_flight(_SqsAckToken(f"u{i}", f"r{i}"))
-  assert len(backend._in_flight) == _MAX_IN_FLIGHT
+    """Line 357->exit: once the diagnostic in-flight set reaches ``_MAX_IN_FLIGHT``,
+    further unacked pops emit a single warning (not one per pop) — the broker
+    still tracks receipt handles, so ack correctness is unaffected."""
+    backend = _backend()
+    for i in range(_MAX_IN_FLIGHT):
+        backend._track_in_flight(_SqsAckToken(f"u{i}", f"r{i}"))
+    assert len(backend._in_flight) == _MAX_IN_FLIGHT
 
-  with caplog.at_level(logging.WARNING):
-    backend._track_in_flight(_SqsAckToken("overflow-1", "ro-1"))
-    backend._track_in_flight(_SqsAckToken("overflow-2", "ro-2"))
+    with caplog.at_level(logging.WARNING):
+        backend._track_in_flight(_SqsAckToken("overflow-1", "ro-1"))
+        backend._track_in_flight(_SqsAckToken("overflow-2", "ro-2"))
 
-  overflow_warnings = [r for r in caplog.records if "at cap" in r.message]
-  assert len(overflow_warnings) == 1  # warn-once
-  assert backend._in_flight_overflow_warned is True
-  # Cap held — overflow tokens NOT added (the pop itself isn't dropped; only
-  # the diagnostic set is bounded):
-  assert len(backend._in_flight) == _MAX_IN_FLIGHT
+    overflow_warnings = [r for r in caplog.records if "at cap" in r.message]
+    assert len(overflow_warnings) == 1  # warn-once
+    assert backend._in_flight_overflow_warned is True
+    # Cap held — overflow tokens NOT added (the pop itself isn't dropped; only
+    # the diagnostic set is bounded):
+    assert len(backend._in_flight) == _MAX_IN_FLIGHT
 
 
 # ---------------------------------------------------------------------------
@@ -172,20 +172,20 @@ def test_track_in_flight_warns_once_on_overflow(caplog) -> None:
 
 
 def test_receive_raises_for_message_without_receipt_handle(mocker) -> None:
-  """A malformed delivery must not masquerade as an empty queue."""
-  backend = _backend()
-  client = mocker.MagicMock()
-  client.get_queue_url.return_value = {"QueueUrl": "http://q-url"}
-  client.receive_message.return_value = {
-    "Messages": [{"Body": base64.b64encode(b"x").decode()}]  # no ReceiptHandle
-  }
-  _patch_client(mocker, client)
-  backend.connect()
-  with pytest.raises(QueueError) as exc_info:
-    backend._receive("q", 0.0)
+    """A malformed delivery must not masquerade as an empty queue."""
+    backend = _backend()
+    client = mocker.MagicMock()
+    client.get_queue_url.return_value = {"QueueUrl": "http://q-url"}
+    client.receive_message.return_value = {
+        "Messages": [{"Body": base64.b64encode(b"x").decode()}]  # no ReceiptHandle
+    }
+    _patch_client(mocker, client)
+    backend.connect()
+    with pytest.raises(QueueError) as exc_info:
+        backend._receive("q", 0.0)
 
-  assert exc_info.value.operation == "pop"
-  assert "ReceiptHandle" in str(exc_info.value)
+    assert exc_info.value.operation == "pop"
+    assert "ReceiptHandle" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -194,29 +194,29 @@ def test_receive_raises_for_message_without_receipt_handle(mocker) -> None:
 
 
 def test_ack_with_token_client_none_raises_and_remains_retryable() -> None:
-  """A disconnect is transient, not proof that broker settlement succeeded."""
-  backend = _backend()
-  backend._client = None
-  token = _SqsAckToken("u", "r")
-  backend._track_in_flight(token)
+    """A disconnect is transient, not proof that broker settlement succeeded."""
+    backend = _backend()
+    backend._client = None
+    token = _SqsAckToken("u", "r")
+    backend._track_in_flight(token)
 
-  with pytest.raises(QueueError) as exc_info:
-    backend.ack("q", token=token)
+    with pytest.raises(QueueError) as exc_info:
+        backend.ack("q", token=token)
 
-  assert exc_info.value.operation == "ack"
-  assert token in backend._in_flight
+    assert exc_info.value.operation == "ack"
+    assert token in backend._in_flight
 
 
 def test_nack_with_token_client_none_raises_and_remains_retryable() -> None:
-  backend = _backend()
-  token = _SqsAckToken("u", "r")
-  backend._track_in_flight(token)
+    backend = _backend()
+    token = _SqsAckToken("u", "r")
+    backend._track_in_flight(token)
 
-  with pytest.raises(QueueError) as exc_info:
-    backend.nack("q", token=token)
+    with pytest.raises(QueueError) as exc_info:
+        backend.nack("q", token=token)
 
-  assert exc_info.value.operation == "nack"
-  assert token in backend._in_flight
+    assert exc_info.value.operation == "nack"
+    assert token in backend._in_flight
 
 
 # ---------------------------------------------------------------------------
@@ -225,32 +225,32 @@ def test_nack_with_token_client_none_raises_and_remains_retryable() -> None:
 
 
 def test_nack_with_token_clears_matching_legacy_last_receipt(mocker) -> None:
-  """Line 483 (true branch): nack(token=...) clears ``_last_receipt`` when it
-  points at the same handle — keeps the legacy single-pop slot coherent with
-  the per-message token path (single-process sanity)."""
-  backend = _backend()
-  _patch_client(mocker, MagicMock())
-  backend.connect()
-  token = _SqsAckToken("u-1", "rh-1")
-  backend._last_receipt = ("u-1", "rh-1")  # legacy slot matches the token
-  backend.nack("q", token=token)
-  assert backend._last_receipt is None  # cleared
-  assert token not in backend._in_flight
+    """Line 483 (true branch): nack(token=...) clears ``_last_receipt`` when it
+    points at the same handle — keeps the legacy single-pop slot coherent with
+    the per-message token path (single-process sanity)."""
+    backend = _backend()
+    _patch_client(mocker, MagicMock())
+    backend.connect()
+    token = _SqsAckToken("u-1", "rh-1")
+    backend._last_receipt = ("u-1", "rh-1")  # legacy slot matches the token
+    backend.nack("q", token=token)
+    assert backend._last_receipt is None  # cleared
+    assert token not in backend._in_flight
 
 
 def test_nack_with_token_keeps_nonmatching_legacy_last_receipt(mocker) -> None:
-  """Line 483->485 (false branch): nack(token=...) where ``_last_receipt``
-  points at a DIFFERENT handle leaves it intact — only the matching case
-  clears the legacy slot (the token path and legacy path are independent
-  except for the single-process coherence optimization)."""
-  backend = _backend()
-  _patch_client(mocker, MagicMock())
-  backend.connect()
-  token = _SqsAckToken("u-new", "rh-new")
-  backend._last_receipt = ("u-other", "rh-other")  # different handle
-  backend.nack("q", token=token)
-  assert backend._last_receipt == ("u-other", "rh-other")  # unchanged
-  assert token not in backend._in_flight  # still discarded from in-flight
+    """Line 483->485 (false branch): nack(token=...) where ``_last_receipt``
+    points at a DIFFERENT handle leaves it intact — only the matching case
+    clears the legacy slot (the token path and legacy path are independent
+    except for the single-process coherence optimization)."""
+    backend = _backend()
+    _patch_client(mocker, MagicMock())
+    backend.connect()
+    token = _SqsAckToken("u-new", "rh-new")
+    backend._last_receipt = ("u-other", "rh-other")  # different handle
+    backend.nack("q", token=token)
+    assert backend._last_receipt == ("u-other", "rh-other")  # unchanged
+    assert token not in backend._in_flight  # still discarded from in-flight
 
 
 # ---------------------------------------------------------------------------
@@ -259,28 +259,28 @@ def test_nack_with_token_keeps_nonmatching_legacy_last_receipt(mocker) -> None:
 
 
 def test_swallow_suppresses_and_records_cleanup_exception() -> None:
-  """``_swallow`` leaves diagnostics to its outer caller after unwinding."""
-  cleanup = _swallow()
-  with cleanup:
-    raise RuntimeError("cleanup boom")
-  # Propagation suppressed (we reached this assert without the raise escaping).
-  assert cleanup.did_suppress is True
+    """``_swallow`` leaves diagnostics to its outer caller after unwinding."""
+    cleanup = _swallow()
+    with cleanup:
+        raise RuntimeError("cleanup boom")
+    # Propagation suppressed (we reached this assert without the raise escaping).
+    assert cleanup.did_suppress is True
 
 
 def test_swallow_does_not_suppress_base_exception() -> None:
-  """R-swallow: _swallow must NOT suppress BaseException (Ctrl+C / SystemExit).
+    """R-swallow: _swallow must NOT suppress BaseException (Ctrl+C / SystemExit).
 
-  Pre-fix ``__exit__`` returned True for any non-None ``exc_type``, so a
-  KeyboardInterrupt raised inside a ``with _swallow():`` cleanup block was
-  trapped -- the operator's shutdown signal disappeared into a debug log. Now
-  only regular Exceptions are suppressed; BaseException propagates.
-  """
-  sw = _swallow()
-  sw.__enter__()
-  # Regular Exception is suppressed (returns True).
-  assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
-  assert sw.did_suppress is True
-  # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
-  assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
-  # No exception (exc_type None) -> False (normal exit, propagate nothing).
-  assert sw.__exit__(None, None, None) is False
+    Pre-fix ``__exit__`` returned True for any non-None ``exc_type``, so a
+    KeyboardInterrupt raised inside a ``with _swallow():`` cleanup block was
+    trapped -- the operator's shutdown signal disappeared into a debug log. Now
+    only regular Exceptions are suppressed; BaseException propagates.
+    """
+    sw = _swallow()
+    sw.__enter__()
+    # Regular Exception is suppressed (returns True).
+    assert sw.__exit__(RuntimeError, RuntimeError("cleanup"), None) is True
+    assert sw.did_suppress is True
+    # BaseException (KeyboardInterrupt) is NOT suppressed (returns False).
+    assert sw.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None) is False
+    # No exception (exc_type None) -> False (normal exit, propagate nothing).
+    assert sw.__exit__(None, None, None) is False

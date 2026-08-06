@@ -22,16 +22,16 @@ from elasticsearch import TransportError
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import (
-  BackendConnectionError,
-  ConfigurationError,
-  QueueError,
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
 )
 from scrapy_extension.settings import ElasticSearchMode, ElasticSearchSettings
 
 
 def _backend() -> ElasticSearchBackend:
-  """Constructed-but-not-connected backend (_client is None)."""
-  return ElasticSearchBackend(ElasticSearchSettings())
+    """Constructed-but-not-connected backend (_client is None)."""
+    return ElasticSearchBackend(ElasticSearchSettings())
 
 
 # ---------------------------------------------------------------------------
@@ -40,21 +40,21 @@ def _backend() -> ElasticSearchBackend:
 
 
 def test_connect_cloud_mode_requires_cloud_id() -> None:
-  """Lines 93-94 (defense-in-depth): connect() re-checks the CLOUD-mode
-  cloud_id requirement even though ElasticSearchSettings already validates
-  it at construction — so a backend whose config is mutated post-construction
-  (bypassing settings validation) still fails fast rather than building a
-  broken client. Reached by constructing with cloud_id then clearing it."""
-  backend = ElasticSearchBackend(
-    ElasticSearchSettings(
-      mode=ElasticSearchMode.CLOUD,
-      cloud_id="dummy-cloud-id",
-      api_key="dummy-cloud-key",  # type: ignore[arg-type]
+    """Lines 93-94 (defense-in-depth): connect() re-checks the CLOUD-mode
+    cloud_id requirement even though ElasticSearchSettings already validates
+    it at construction — so a backend whose config is mutated post-construction
+    (bypassing settings validation) still fails fast rather than building a
+    broken client. Reached by constructing with cloud_id then clearing it."""
+    backend = ElasticSearchBackend(
+        ElasticSearchSettings(
+            mode=ElasticSearchMode.CLOUD,
+            cloud_id="dummy-cloud-id",
+            api_key="dummy-cloud-key",  # type: ignore[arg-type]
+        )
     )
-  )
-  backend.config.cloud_id = None  # bypass settings validation
-  with pytest.raises(ConfigurationError):
-    backend.connect()
+    backend.config.cloud_id = None  # bypass settings validation
+    with pytest.raises(ConfigurationError):
+        backend.connect()
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +63,13 @@ def test_connect_cloud_mode_requires_cloud_id() -> None:
 
 
 def test_ensure_indices_raises_when_client_is_none() -> None:
-  """Lines 112-113: ``_ensure_indices`` with no client (never connected /
-  concurrent disconnect) raises BackendConnectionError rather than
-  ``None.indices.exists()``."""
-  backend = _backend()
-  backend._client = None
-  with pytest.raises(BackendConnectionError, match="client is None"):
-    backend._ensure_indices()
+    """Lines 112-113: ``_ensure_indices`` with no client (never connected /
+    concurrent disconnect) raises BackendConnectionError rather than
+    ``None.indices.exists()``."""
+    backend = _backend()
+    backend._client = None
+    with pytest.raises(BackendConnectionError, match="client is None"):
+        backend._ensure_indices()
 
 
 # ---------------------------------------------------------------------------
@@ -78,13 +78,13 @@ def test_ensure_indices_raises_when_client_is_none() -> None:
 
 
 def test_disconnect_before_connect_is_a_silent_noop() -> None:
-  """Line 124->exit (false branch): disconnect() with no client must not
-  raise (no ``None.close()``) — idempotent teardown for callers that
-  didn't connect."""
-  backend = _backend()
-  backend._client = None
-  backend.disconnect()  # must not raise
-  assert backend._client is None
+    """Line 124->exit (false branch): disconnect() with no client must not
+    raise (no ``None.close()``) — idempotent teardown for callers that
+    didn't connect."""
+    backend = _backend()
+    backend._client = None
+    backend.disconnect()  # must not raise
+    assert backend._client is None
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +93,15 @@ def test_disconnect_before_connect_is_a_silent_noop() -> None:
 
 
 def test_client_property_raises_when_connect_does_not_set_client(mocker) -> None:
-  """Lines 169-170: the ``client`` property calls connect() when _client is
-  None, then re-checks — if connect() returned WITHOUT setting _client
-  (a future-regression scenario), the property raises rather than silently
-  returning None to a caller that would then AttributeError on it."""
-  backend = _backend()
-  backend._client = None
-  mocker.patch.object(backend, "connect")  # no-op: does NOT set _client
-  with pytest.raises(BackendConnectionError, match="client is None after connect"):
-    _ = backend.client
+    """Lines 169-170: the ``client`` property calls connect() when _client is
+    None, then re-checks — if connect() returned WITHOUT setting _client
+    (a future-regression scenario), the property raises rather than silently
+    returning None to a caller that would then AttributeError on it."""
+    backend = _backend()
+    backend._client = None
+    mocker.patch.object(backend, "connect")  # no-op: does NOT set _client
+    with pytest.raises(BackendConnectionError, match="client is None after connect"):
+        _ = backend.client
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +110,13 @@ def test_client_property_raises_when_connect_does_not_set_client(mocker) -> None
 
 
 def test_queue_len_raises_queue_error_on_transport_error(mocker) -> None:
-  """Lines 268-269: a TransportError during the queue-depth count surfaces
-  as a QueueError tagged operation='queue_len' — raise-on-failure so the
-  caller sees the broker error rather than a silent 0 (which would mask
-  backpressure / monitoring signals)."""
-  backend = _backend()
-  backend._client = mocker.MagicMock()
-  mocker.patch.object(backend, "_count", side_effect=TransportError("boom"))
-  with pytest.raises(QueueError) as exc:
-    backend.queue_len("valid-queue")
-  assert exc.value.operation == "queue_len"
+    """Lines 268-269: a TransportError during the queue-depth count surfaces
+    as a QueueError tagged operation='queue_len' — raise-on-failure so the
+    caller sees the broker error rather than a silent 0 (which would mask
+    backpressure / monitoring signals)."""
+    backend = _backend()
+    backend._client = mocker.MagicMock()
+    mocker.patch.object(backend, "_count", side_effect=TransportError("boom"))
+    with pytest.raises(QueueError) as exc:
+        backend.queue_len("valid-queue")
+    assert exc.value.operation == "queue_len"

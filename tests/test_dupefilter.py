@@ -14,1299 +14,1303 @@ from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFi
 
 
 class TestBackendDupeFilterInit:
-  """Test BackendDupeFilter __init__ method."""
+    """Test BackendDupeFilter __init__ method."""
 
-  def test_init_with_defaults(self, mock_connection_manager):
-    """Test initialization with default values."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_init_with_defaults(self, mock_connection_manager):
+        """Test initialization with default values."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    assert dupefilter.connection_manager is mock_connection_manager
-    assert dupefilter.key == "dupefilter"
-    assert dupefilter.debug is False
+        assert dupefilter.connection_manager is mock_connection_manager
+        assert dupefilter.key == "dupefilter"
+        assert dupefilter.debug is False
 
-  def test_init_with_custom_key(self, mock_connection_manager):
-    """Test initialization with custom key."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="custom:dupefilter",
-    )
+    def test_init_with_custom_key(self, mock_connection_manager):
+        """Test initialization with custom key."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="custom:dupefilter",
+        )
 
-    assert dupefilter.key == "custom:dupefilter"
+        assert dupefilter.key == "custom:dupefilter"
 
-  def test_init_with_debug_true(self, mock_connection_manager):
-    """Test initialization with debug=True."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      debug=True,
-    )
+    def test_init_with_debug_true(self, mock_connection_manager):
+        """Test initialization with debug=True."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            debug=True,
+        )
 
-    assert dupefilter.debug is True
+        assert dupefilter.debug is True
 
-  def test_init_with_all_params(self, mock_connection_manager):
-    """Test initialization with all parameters."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="my:filter",
-      debug=True,
-    )
+    def test_init_with_all_params(self, mock_connection_manager):
+        """Test initialization with all parameters."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="my:filter",
+            debug=True,
+        )
 
-    assert dupefilter.connection_manager is mock_connection_manager
-    assert dupefilter.key == "my:filter"
-    assert dupefilter.debug is True
+        assert dupefilter.connection_manager is mock_connection_manager
+        assert dupefilter.key == "my:filter"
+        assert dupefilter.debug is True
 
 
 class TestBackendDupeFilterClassMethods:
-  """Test BackendDupeFilter class methods."""
+    """Test BackendDupeFilter class methods."""
 
-  def test_from_settings_defaults(self, mocker):
-    """Test from_settings with default values."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_settings_defaults(self, mocker):
+        """Test from_settings with default values."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
 
-    assert dupefilter.connection_manager is mock_manager
-    assert dupefilter.key == "dupefilter"
-    assert dupefilter.debug is False
+        assert dupefilter.connection_manager is mock_manager
+        assert dupefilter.key == "dupefilter"
+        assert dupefilter.debug is False
 
-  def test_from_settings_custom_values(self, mocker):
-    """Test from_settings with custom values."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_settings_custom_values(self, mocker):
+        """Test from_settings with custom values."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "mongodb",
-      "SCRAPY_DUPEFILTER_KEY": "my:filter",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": True,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {"uri": "mongodb://localhost:27017"}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "mongodb",
+            "SCRAPY_DUPEFILTER_KEY": "my:filter",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": True,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {"uri": "mongodb://localhost:27017"}
 
-    mock_manager = mocker.Mock()
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
 
-    assert dupefilter.connection_manager is mock_manager
-    assert dupefilter.key == "my:filter"
-    assert dupefilter.debug is True
+        assert dupefilter.connection_manager is mock_manager
+        assert dupefilter.key == "my:filter"
+        assert dupefilter.debug is True
 
-  def test_from_settings_redis_backend_type(self, mocker):
-    """Test from_settings infers Redis backend type."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_settings_redis_backend_type(self, mocker):
+        """Test from_settings infers Redis backend type."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    BackendDupeFilter.from_settings(mock_settings)
+        BackendDupeFilter.from_settings(mock_settings)
 
-    # Verify the manager was created
-    assert mock_manager is not None
+        # Verify the manager was created
+        assert mock_manager is not None
 
-  def test_from_crawler(self, mocker):
-    """Test from_crawler delegates to from_settings."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_crawler(self, mocker):
+        """Test from_crawler delegates to from_settings."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_crawler = mocker.Mock()
-    mock_crawler.settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "crawler:filter",
-    }.get(key, default)
-    mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": True,
-    }.get(key, default)
-    mock_crawler.settings.getdict.return_value = {}
+        mock_crawler = mocker.Mock()
+        mock_crawler.settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "crawler:filter",
+        }.get(key, default)
+        mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": True,
+        }.get(key, default)
+        mock_crawler.settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
+        dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
 
-    assert dupefilter.key == "crawler:filter"
-    assert dupefilter.debug is True
+        assert dupefilter.key == "crawler:filter"
+        assert dupefilter.debug is True
 
-  def test_from_crawler_threads_request_fingerprinter(self, mocker):
-    """R45: from_crawler wires crawler.request_fingerprinter into the dupefilter."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_crawler_threads_request_fingerprinter(self, mocker):
+        """R45: from_crawler wires crawler.request_fingerprinter into the dupefilter."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    sentinel_fp = mocker.MagicMock(name="custom-fingerprinter")
-    mock_crawler = mocker.Mock()
-    mock_crawler.request_fingerprinter = sentinel_fp
-    mock_crawler.settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
-    }.get(key, default)
-    mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_crawler.settings.getdict.return_value = {}
+        sentinel_fp = mocker.MagicMock(name="custom-fingerprinter")
+        mock_crawler = mocker.Mock()
+        mock_crawler.request_fingerprinter = sentinel_fp
+        mock_crawler.settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+        }.get(key, default)
+        mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_crawler.settings.getdict.return_value = {}
 
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+        mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=mocker.Mock()
+        )
 
-    dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
-    assert dupefilter._fingerprinter is sentinel_fp
+        dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
+        assert dupefilter._fingerprinter is sentinel_fp
 
-  def test_from_crawler_falls_back_when_no_fingerprinter(self, mocker):
-    """R45: a crawler without request_fingerprinter degrades to the default fn."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_crawler_falls_back_when_no_fingerprinter(self, mocker):
+        """R45: a crawler without request_fingerprinter degrades to the default fn."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_crawler = mocker.Mock(spec=["settings"])  # no request_fingerprinter attr
-    mock_crawler.settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
-    }.get(key, default)
-    mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_crawler.settings.getdict.return_value = {}
+        mock_crawler = mocker.Mock(spec=["settings"])  # no request_fingerprinter attr
+        mock_crawler.settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+        }.get(key, default)
+        mock_crawler.settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_crawler.settings.getdict.return_value = {}
 
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+        mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=mocker.Mock()
+        )
 
-    dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
-    assert dupefilter._fingerprinter is None
+        dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
+        assert dupefilter._fingerprinter is None
 
 
 class TestBackendDupeFilterOpenClose:
-  """Test BackendDupeFilter open and close methods."""
+    """Test BackendDupeFilter open and close methods."""
 
-  def test_open_is_noop(self, mock_connection_manager):
-    """Test open method does nothing."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_open_is_noop(self, mock_connection_manager):
+        """Test open method does nothing."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    # Should not raise
-    dupefilter.open()
+        # Should not raise
+        dupefilter.open()
 
-  def test_close_is_noop(self, mock_connection_manager):
-    """Test close method does nothing."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_close_is_noop(self, mock_connection_manager):
+        """Test close method does nothing."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    # Should not raise
-    dupefilter.close("finished")
-    dupefilter.close("closed")
-    dupefilter.close("")
+        # Should not raise
+        dupefilter.close("finished")
+        dupefilter.close("closed")
+        dupefilter.close("")
 
-  def test_close_calls_connection_manager_close(self, mock_connection_manager):
-    """Test close shuts down the connection manager."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_close_calls_connection_manager_close(self, mock_connection_manager):
+        """Test close shuts down the connection manager."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    dupefilter.close("finished")
+        dupefilter.close("finished")
 
-    mock_connection_manager.close.assert_called_once_with()
+        mock_connection_manager.close.assert_called_once_with()
 
-  def test_close_releases_connection_manager_only_once(self, mock_connection_manager):
-    """Duplicate close notifications must not over-release a shared manager."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_close_releases_connection_manager_only_once(self, mock_connection_manager):
+        """Duplicate close notifications must not over-release a shared manager."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    dupefilter.close("finished")
-    dupefilter.close("duplicate")
+        dupefilter.close("finished")
+        dupefilter.close("duplicate")
 
-    mock_connection_manager.close.assert_called_once_with()
+        mock_connection_manager.close.assert_called_once_with()
 
-  def test_duplicate_close_closes_membership_filter_once(
-    self, mock_connection_manager, mocker
-  ):
-    membership_filter = mocker.MagicMock()
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
+    def test_duplicate_close_closes_membership_filter_once(
+        self, mock_connection_manager, mocker
+    ):
+        membership_filter = mocker.MagicMock()
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
 
-    dupefilter.close("finished")
-    dupefilter.close("duplicate")
+        dupefilter.close("finished")
+        dupefilter.close("duplicate")
 
-    membership_filter.close.assert_called_once_with()
+        membership_filter.close.assert_called_once_with()
 
-  def test_duplicate_open_is_idempotent(self, mock_connection_manager, mocker):
-    membership_filter = mocker.MagicMock()
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-      clear_on_open=True,
-    )
-    spider = mocker.Mock(name="spider")
-    spider.name = "test_spider"
+    def test_duplicate_open_is_idempotent(self, mock_connection_manager, mocker):
+        membership_filter = mocker.MagicMock()
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+            clear_on_open=True,
+        )
+        spider = mocker.Mock(name="spider")
+        spider.name = "test_spider"
 
-    dupefilter.open(spider)
-    dupefilter.open(spider)
+        dupefilter.open(spider)
+        dupefilter.open(spider)
 
-    membership_filter.open.assert_called_once_with()
-    membership_filter.clear.assert_called_once_with()
+        membership_filter.open.assert_called_once_with()
+        membership_filter.clear.assert_called_once_with()
 
-  def test_open_for_different_spider_is_rejected(
-    self, mock_connection_manager, mocker
-  ):
-    membership_filter = mocker.MagicMock()
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
-    first = mocker.Mock(name="first")
-    first.name = "first"
-    second = mocker.Mock(name="second")
-    second.name = "second"
-    dupefilter.open(first)
+    def test_open_for_different_spider_is_rejected(
+        self, mock_connection_manager, mocker
+    ):
+        membership_filter = mocker.MagicMock()
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        first = mocker.Mock(name="first")
+        first.name = "first"
+        second = mocker.Mock(name="second")
+        second.name = "second"
+        dupefilter.open(first)
 
-    with pytest.raises(RuntimeError, match="different spider"):
-      dupefilter.open(second)
+        with pytest.raises(RuntimeError, match="different spider"):
+            dupefilter.open(second)
 
-    membership_filter.open.assert_called_once_with()
+        membership_filter.open.assert_called_once_with()
 
-  def test_open_failure_closes_filter_and_manager(
-    self, mock_connection_manager, mocker
-  ):
-    membership_filter = mocker.MagicMock()
-    membership_filter.open.side_effect = RuntimeError("filter open failed")
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
+    def test_open_failure_closes_filter_and_manager(
+        self, mock_connection_manager, mocker
+    ):
+        membership_filter = mocker.MagicMock()
+        membership_filter.open.side_effect = RuntimeError("filter open failed")
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
 
-    with pytest.raises(RuntimeError, match="filter open failed"):
-      dupefilter.open()
+        with pytest.raises(RuntimeError, match="filter open failed"):
+            dupefilter.open()
 
-    membership_filter.close.assert_called_once_with()
-    mock_connection_manager.close.assert_called_once_with()
-    with pytest.raises(RuntimeError, match="closed"):
-      dupefilter.open()
+        membership_filter.close.assert_called_once_with()
+        mock_connection_manager.close.assert_called_once_with()
+        with pytest.raises(RuntimeError, match="closed"):
+            dupefilter.open()
 
-  @pytest.mark.parametrize("operation", ["open", "clear", "request_seen", "forget"])
-  def test_operations_after_close_are_rejected(
-    self, operation, mock_connection_manager
-  ):
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
-    dupefilter.close("finished")
-    request = Request("https://example.com")
+    @pytest.mark.parametrize("operation", ["open", "clear", "request_seen", "forget"])
+    def test_operations_after_close_are_rejected(
+        self, operation, mock_connection_manager
+    ):
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+        dupefilter.close("finished")
+        request = Request("https://example.com")
 
-    with pytest.raises(RuntimeError, match="closed"):
-      if operation in {"request_seen", "forget"}:
-        getattr(dupefilter, operation)(request)
-      else:
-        getattr(dupefilter, operation)()
+        with pytest.raises(RuntimeError, match="closed"):
+            if operation in {"request_seen", "forget"}:
+                getattr(dupefilter, operation)(request)
+            else:
+                getattr(dupefilter, operation)()
 
-  def test_filter_close_error_defers_manager_release_until_filter_retry(
-    self, mock_connection_manager, mocker
-  ):
-    membership_filter = mocker.MagicMock()
-    membership_filter.close.side_effect = RuntimeError("filter close failed")
-    mock_connection_manager.close.side_effect = ConnectionError(
-      "manager close failed"
-    )
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
+    def test_filter_close_error_defers_manager_release_until_filter_retry(
+        self, mock_connection_manager, mocker
+    ):
+        membership_filter = mocker.MagicMock()
+        membership_filter.close.side_effect = RuntimeError("filter close failed")
+        mock_connection_manager.close.side_effect = ConnectionError(
+            "manager close failed"
+        )
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
 
-    with pytest.raises(RuntimeError, match="filter close failed"):
-      dupefilter.close("finished")
+        with pytest.raises(RuntimeError, match="filter close failed"):
+            dupefilter.close("finished")
 
-    membership_filter.close.assert_called_once_with()
-    mock_connection_manager.close.assert_not_called()
+        membership_filter.close.assert_called_once_with()
+        mock_connection_manager.close.assert_not_called()
 
-    membership_filter.close.side_effect = None
-    with pytest.raises(ConnectionError, match="manager close failed"):
-      dupefilter.close("filter-retry")
+        membership_filter.close.side_effect = None
+        with pytest.raises(ConnectionError, match="manager close failed"):
+            dupefilter.close("filter-retry")
 
-    assert membership_filter.close.call_count == 2
-    mock_connection_manager.close.assert_called_once_with()
+        assert membership_filter.close.call_count == 2
+        mock_connection_manager.close.assert_called_once_with()
 
-  def test_open_primary_signal_survives_cleanup_and_diagnostic_failures(
-    self, mock_connection_manager, mocker
-  ):
-    signal = KeyboardInterrupt("open interrupted")
-    membership_filter = mocker.MagicMock()
-    membership_filter.open.side_effect = signal
-    membership_filter.close.side_effect = RuntimeError("cleanup failed")
-    diagnostic = mocker.patch(
-      "scrapy_extension.dupefilter.dupefilter.logger.exception",
-      side_effect=SystemExit("logger failed"),
-    )
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
+    def test_open_primary_signal_survives_cleanup_and_diagnostic_failures(
+        self, mock_connection_manager, mocker
+    ):
+        signal = KeyboardInterrupt("open interrupted")
+        membership_filter = mocker.MagicMock()
+        membership_filter.open.side_effect = signal
+        membership_filter.close.side_effect = RuntimeError("cleanup failed")
+        diagnostic = mocker.patch(
+            "scrapy_extension.dupefilter.dupefilter.logger.exception",
+            side_effect=SystemExit("logger failed"),
+        )
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
 
-    with pytest.raises(KeyboardInterrupt) as raised:
-      dupefilter.open()
+        with pytest.raises(KeyboardInterrupt) as raised:
+            dupefilter.open()
 
-    assert raised.value is signal
-    diagnostic.assert_called_once()
-    mock_connection_manager.close.assert_not_called()
+        assert raised.value is signal
+        diagnostic.assert_called_once()
+        mock_connection_manager.close.assert_not_called()
 
-  def test_failed_filter_close_can_be_retried(
-    self,
-    mock_connection_manager,
-    mocker,
-  ):
-    membership_filter = mocker.MagicMock()
-    membership_filter.close.side_effect = [RuntimeError("close failed"), None]
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
+    def test_failed_filter_close_can_be_retried(
+        self,
+        mock_connection_manager,
+        mocker,
+    ):
+        membership_filter = mocker.MagicMock()
+        membership_filter.close.side_effect = [RuntimeError("close failed"), None]
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
 
-    with pytest.raises(RuntimeError, match="close failed"):
-      dupefilter.close("first")
-    with pytest.raises(RuntimeError, match="closing"):
-      dupefilter.request_seen(Request("https://example.com/closing"))
+        with pytest.raises(RuntimeError, match="close failed"):
+            dupefilter.close("first")
+        with pytest.raises(RuntimeError, match="closing"):
+            dupefilter.request_seen(Request("https://example.com/closing"))
 
-    dupefilter.close("retry")
-    assert membership_filter.close.call_count == 2
-    mock_connection_manager.close.assert_called_once_with()
+        dupefilter.close("retry")
+        assert membership_filter.close.call_count == 2
+        mock_connection_manager.close.assert_called_once_with()
 
-  def test_failed_manager_close_can_be_retried_without_reclosing_filter(
-    self,
-    mock_connection_manager,
-    mocker,
-  ):
-    membership_filter = mocker.MagicMock()
-    mock_connection_manager.close.side_effect = [
-      ConnectionError("manager close failed"),
-      None,
-    ]
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
+    def test_failed_manager_close_can_be_retried_without_reclosing_filter(
+        self,
+        mock_connection_manager,
+        mocker,
+    ):
+        membership_filter = mocker.MagicMock()
+        mock_connection_manager.close.side_effect = [
+            ConnectionError("manager close failed"),
+            None,
+        ]
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
 
-    with pytest.raises(ConnectionError, match="manager close failed"):
-      dupefilter.close("first")
-    dupefilter.close("retry")
+        with pytest.raises(ConnectionError, match="manager close failed"):
+            dupefilter.close("first")
+        dupefilter.close("retry")
 
-    membership_filter.close.assert_called_once_with()
-    assert mock_connection_manager.close.call_count == 2
+        membership_filter.close.assert_called_once_with()
+        assert mock_connection_manager.close.call_count == 2
 
-  def test_from_crawler_keeps_memory_callback_inside_safe_local_sink(
-    self, mock_connection_manager, mocker
-  ):
-    from scrapy_extension.dupefilter.filters.memory_filter import (
-      MemoryMembershipFilter,
-    )
-    from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
+    def test_from_crawler_keeps_memory_callback_inside_safe_local_sink(
+        self, mock_connection_manager, mocker
+    ):
+        from scrapy_extension.dupefilter.filters.memory_filter import (
+            MemoryMembershipFilter,
+        )
+        from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 
-    membership_filter = MemoryMembershipFilter(maxsize=1)
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
-    mocker.patch.object(BackendDupeFilter, "from_settings", return_value=dupefilter)
-    crawler = mocker.MagicMock()
-    crawler.stats = mocker.MagicMock()
-    crawler.request_fingerprinter = None
+        membership_filter = MemoryMembershipFilter(maxsize=1)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        mocker.patch.object(BackendDupeFilter, "from_settings", return_value=dupefilter)
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.request_fingerprinter = None
 
-    resolved = BackendDupeFilter.from_crawler(crawler)
+        resolved = BackendDupeFilter.from_crawler(crawler)
 
-    assert isinstance(resolved._monitor, ScrapyStatsMonitor)
-    assert isinstance(membership_filter._monitor, NullMonitor)
+        assert isinstance(resolved._monitor, ScrapyStatsMonitor)
+        assert isinstance(membership_filter._monitor, NullMonitor)
 
 
 class TestBackendDupeFilterLog:
-  """Test BackendDupeFilter log method."""
+    """Test BackendDupeFilter log method."""
 
-  def test_log_does_nothing_when_debug_false(self, mock_connection_manager, caplog):
-    """Test log does nothing when debug is False."""
-    caplog.clear()
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      debug=False,
+    def test_log_does_nothing_when_debug_false(self, mock_connection_manager, caplog):
+        """Test log does nothing when debug is False."""
+        caplog.clear()
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            debug=False,
+        )
+
+        request = Request(url="https://example.com")
+        mock_spider = mock_connection_manager.get_queue_backend()
+        mock_spider.name = "test_spider"
+
+        dupefilter.log(request, mock_spider)
+
+        # No debug log should be emitted
+        assert "Filtered duplicate request" not in caplog.text
+
+    def test_log_emits_debug_message_when_debug_true(
+        self, mock_connection_manager, caplog
+    ):
+        """Test log emits debug message when debug is True."""
+        import logging
+
+        caplog.clear()
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            debug=True,
+        )
+
+        request = Request(url="https://example.com")
+        mock_spider = mock_connection_manager.get_queue_backend()
+        mock_spider.name = "test_spider"
+
+        with caplog.at_level(logging.DEBUG):
+            dupefilter.log(request, mock_spider)
+
+        assert "Filtered duplicate request: https://example.com" in caplog.text
+        # spider in extra dict appears in record, not in text
+        assert len(caplog.records) == 1
+        assert caplog.records[0].spider is mock_spider
+
+    @pytest.mark.parametrize(
+        "diagnostic_error",
+        [
+            RuntimeError("logging unavailable"),
+            KeyboardInterrupt(),
+            SystemExit(),
+        ],
     )
+    def test_log_failure_preserves_completed_duplicate_decision(
+        self, mock_connection_manager, mocker, diagnostic_error
+    ):
+        """Duplicate logging is advisory after the duplicate result is known."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            debug=True,
+        )
+        mock_connection_manager.get_set_backend().add.return_value = False
+        request = Request(url="https://example.com")
+        spider = mock_connection_manager.get_queue_backend()
 
-    request = Request(url="https://example.com")
-    mock_spider = mock_connection_manager.get_queue_backend()
-    mock_spider.name = "test_spider"
+        assert dupefilter.request_seen(request) is True
+        mocker.patch(
+            "scrapy_extension.dupefilter.dupefilter.logger.debug",
+            side_effect=diagnostic_error,
+        )
 
-    dupefilter.log(request, mock_spider)
-
-    # No debug log should be emitted
-    assert "Filtered duplicate request" not in caplog.text
-
-  def test_log_emits_debug_message_when_debug_true(
-    self, mock_connection_manager, caplog
-  ):
-    """Test log emits debug message when debug is True."""
-    import logging
-
-    caplog.clear()
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      debug=True,
-    )
-
-    request = Request(url="https://example.com")
-    mock_spider = mock_connection_manager.get_queue_backend()
-    mock_spider.name = "test_spider"
-
-    with caplog.at_level(logging.DEBUG):
-      dupefilter.log(request, mock_spider)
-
-    assert "Filtered duplicate request: https://example.com" in caplog.text
-    # spider in extra dict appears in record, not in text
-    assert len(caplog.records) == 1
-    assert caplog.records[0].spider is mock_spider
-
-  @pytest.mark.parametrize(
-    "diagnostic_error",
-    [
-      RuntimeError("logging unavailable"),
-      KeyboardInterrupt(),
-      SystemExit(),
-    ],
-  )
-  def test_log_failure_preserves_completed_duplicate_decision(
-    self, mock_connection_manager, mocker, diagnostic_error
-  ):
-    """Duplicate logging is advisory after the duplicate result is known."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      debug=True,
-    )
-    mock_connection_manager.get_set_backend().add.return_value = False
-    request = Request(url="https://example.com")
-    spider = mock_connection_manager.get_queue_backend()
-
-    assert dupefilter.request_seen(request) is True
-    mocker.patch(
-      "scrapy_extension.dupefilter.dupefilter.logger.debug",
-      side_effect=diagnostic_error,
-    )
-
-    dupefilter.log(request, spider)
-    mock_connection_manager.get_set_backend().add.assert_called_once()
+        dupefilter.log(request, spider)
+        mock_connection_manager.get_set_backend().add.assert_called_once()
 
 
 class TestBackendDupeFilterRequestSeen:
-  """Test BackendDupeFilter request_seen method."""
+    """Test BackendDupeFilter request_seen method."""
 
-  def test_request_seen_new_request(self, mock_connection_manager):
-    """Test seeing a new request that was not seen before."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="test:dupefilter",
-    )
+    def test_request_seen_new_request(self, mock_connection_manager):
+        """Test seeing a new request that was not seen before."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="test:dupefilter",
+        )
 
-    mock_set_backend = mock_connection_manager.get_set_backend()
-    mock_set_backend.add.return_value = True  # Item was newly added (not duplicate)
+        mock_set_backend = mock_connection_manager.get_set_backend()
+        mock_set_backend.add.return_value = True  # Item was newly added (not duplicate)
 
-    request = Request(url="https://example.com")
-    result = dupefilter.request_seen(request)
+        request = Request(url="https://example.com")
+        result = dupefilter.request_seen(request)
 
-    assert result is False  # Not a duplicate
-    mock_set_backend.add.assert_called_once()
-    # Verify the key and encoded fingerprint were passed
-    call_args = mock_set_backend.add.call_args
-    assert call_args[0][0] == "test:dupefilter"
-    assert isinstance(call_args[0][1], bytes)
+        assert result is False  # Not a duplicate
+        mock_set_backend.add.assert_called_once()
+        # Verify the key and encoded fingerprint were passed
+        call_args = mock_set_backend.add.call_args
+        assert call_args[0][0] == "test:dupefilter"
+        assert isinstance(call_args[0][1], bytes)
 
-  def test_request_seen_duplicate_request(self, mock_connection_manager):
-    """Test seeing a request that was already seen."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="test:dupefilter",
-    )
+    def test_request_seen_duplicate_request(self, mock_connection_manager):
+        """Test seeing a request that was already seen."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="test:dupefilter",
+        )
 
-    mock_set_backend = mock_connection_manager.get_set_backend()
-    mock_set_backend.add.return_value = False  # Item already existed (duplicate)
+        mock_set_backend = mock_connection_manager.get_set_backend()
+        mock_set_backend.add.return_value = False  # Item already existed (duplicate)
 
-    request = Request(url="https://example.com")
-    result = dupefilter.request_seen(request)
+        request = Request(url="https://example.com")
+        result = dupefilter.request_seen(request)
 
-    assert result is True  # Is a duplicate
-    mock_set_backend.add.assert_called_once()
+        assert result is True  # Is a duplicate
+        mock_set_backend.add.assert_called_once()
 
-  def test_request_seen_backend_not_implemented(self, mock_connection_manager):
-    """Test request_seen raises when backend does not support sets."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="test:dupefilter",
-    )
+    def test_request_seen_backend_not_implemented(self, mock_connection_manager):
+        """Test request_seen raises when backend does not support sets."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="test:dupefilter",
+        )
 
-    mock_connection_manager.get_set_backend.side_effect = NotImplementedError(
-      "Backend does not support set operations"
-    )
+        mock_connection_manager.get_set_backend.side_effect = NotImplementedError(
+            "Backend does not support set operations"
+        )
 
-    request = Request(url="https://example.com")
+        request = Request(url="https://example.com")
 
-    with pytest.raises(RuntimeError, match="does not support set/duplicate filtering"):
-      dupefilter.request_seen(request)
+        with pytest.raises(
+            RuntimeError, match="does not support set/duplicate filtering"
+        ):
+            dupefilter.request_seen(request)
 
-    mock_connection_manager.get_set_backend.assert_called_once()
+        mock_connection_manager.get_set_backend.assert_called_once()
 
-  def test_request_seen_get_set_backend_raises_not_implemented_error(
-    self, mock_connection_manager
-  ):
-    """Test request_seen raises clear guidance when set operations unsupported."""
+    def test_request_seen_get_set_backend_raises_not_implemented_error(
+        self, mock_connection_manager
+    ):
+        """Test request_seen raises clear guidance when set operations unsupported."""
 
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="test:dupefilter",
-    )
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="test:dupefilter",
+        )
 
-    mock_connection_manager.get_set_backend.side_effect = NotImplementedError(
-      "Backend does not support set operations"
-    )
+        mock_connection_manager.get_set_backend.side_effect = NotImplementedError(
+            "Backend does not support set operations"
+        )
 
-    request = Request(url="https://example.com")
+        request = Request(url="https://example.com")
 
-    with pytest.raises(RuntimeError) as exc_info:
-      dupefilter.request_seen(request)
+        with pytest.raises(RuntimeError) as exc_info:
+            dupefilter.request_seen(request)
 
-    message = str(exc_info.value)
-    assert "does not support set/duplicate filtering" in message
-    assert "use a backend with SetBackend" in message
-    assert "disable BackendDupeFilter" in message
+        message = str(exc_info.value)
+        assert "does not support set/duplicate filtering" in message
+        assert "use a backend with SetBackend" in message
+        assert "disable BackendDupeFilter" in message
 
-  def test_request_seen_uses_fingerprint(self, mock_connection_manager):
-    """Test request_seen uses request_fingerprint for fingerprinting."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="test:dupefilter",
-    )
+    def test_request_seen_uses_fingerprint(self, mock_connection_manager):
+        """Test request_seen uses request_fingerprint for fingerprinting."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="test:dupefilter",
+        )
 
-    mock_set_backend = mock_connection_manager.get_set_backend()
-    mock_set_backend.add.return_value = True
+        mock_set_backend = mock_connection_manager.get_set_backend()
+        mock_set_backend.add.return_value = True
 
-    request = Request(url="https://unique-url.com")
-    dupefilter.request_seen(request)
+        request = Request(url="https://unique-url.com")
+        dupefilter.request_seen(request)
 
-    # Verify add was called with bytes of fingerprint
-    call_args = mock_set_backend.add.call_args
-    fingerprint_bytes = call_args[0][1]
-    assert isinstance(fingerprint_bytes, bytes)
-    # Fingerprint should be hex string encoded to bytes
-    assert len(fingerprint_bytes) > 0
+        # Verify add was called with bytes of fingerprint
+        call_args = mock_set_backend.add.call_args
+        fingerprint_bytes = call_args[0][1]
+        assert isinstance(fingerprint_bytes, bytes)
+        # Fingerprint should be hex string encoded to bytes
+        assert len(fingerprint_bytes) > 0
 
 
 class TestBackendDupeFilterForget:
-  """Compensate request_seen reservations when the later queue push fails."""
+    """Compensate request_seen reservations when the later queue push fails."""
 
-  def test_removable_filter_forgets_reservation(self, mock_connection_manager):
-    membership_filter = MemoryMembershipFilter(maxsize=None)
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
-    request = Request("https://example.com/removable")
+    def test_removable_filter_forgets_reservation(self, mock_connection_manager):
+        membership_filter = MemoryMembershipFilter(maxsize=None)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        request = Request("https://example.com/removable")
 
-    assert dupefilter.request_seen(request) is False
-    assert len(membership_filter) == 1
+        assert dupefilter.request_seen(request) is False
+        assert len(membership_filter) == 1
 
-    dupefilter.forget(request)
+        dupefilter.forget(request)
 
-    assert len(membership_filter) == 0
-    assert dupefilter.request_seen(request) is False
+        assert len(membership_filter) == 0
+        assert dupefilter.request_seen(request) is False
 
-  def test_bloom_filter_grants_exactly_one_retry_allowance(
-    self, mock_connection_manager
-  ):
-    membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
-    request = Request("https://example.com/bloom")
+    def test_bloom_filter_grants_exactly_one_retry_allowance(
+        self, mock_connection_manager
+    ):
+        membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        request = Request("https://example.com/bloom")
 
-    assert dupefilter.request_seen(request) is False
-    dupefilter.forget(request)
+        assert dupefilter.request_seen(request) is False
+        dupefilter.forget(request)
 
-    assert dupefilter.request_seen(request) is False
-    assert dupefilter.request_seen(request) is True
+        assert dupefilter.request_seen(request) is False
+        assert dupefilter.request_seen(request) is True
 
-  def test_retry_allowance_has_single_linearized_concurrent_consumer(
-    self, mock_connection_manager
-  ):
-    membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
-    request = Request("https://example.com/concurrent-allowance")
-    assert dupefilter.request_seen(request) is False
-    dupefilter.forget(request)
-    worker_count = 8
-    barrier = threading.Barrier(worker_count)
+    def test_retry_allowance_has_single_linearized_concurrent_consumer(
+        self, mock_connection_manager
+    ):
+        membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        request = Request("https://example.com/concurrent-allowance")
+        assert dupefilter.request_seen(request) is False
+        dupefilter.forget(request)
+        worker_count = 8
+        barrier = threading.Barrier(worker_count)
 
-    def request_seen_together() -> bool:
-      barrier.wait()
-      return dupefilter.request_seen(request)
+        def request_seen_together() -> bool:
+            barrier.wait()
+            return dupefilter.request_seen(request)
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-      results = list(executor.map(lambda _: request_seen_together(), range(worker_count)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(
+                executor.map(lambda _: request_seen_together(), range(worker_count))
+            )
 
-    assert results.count(False) == 1
-    assert results.count(True) == worker_count - 1
+        assert results.count(False) == 1
+        assert results.count(True) == worker_count - 1
 
-  def test_retry_allowances_evict_oldest_at_fixed_bound(
-    self, mock_connection_manager
-  ):
-    membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      membership_filter=membership_filter,
-    )
-    dupefilter._retry_allowance_limit = 2
-    requests = [Request(f"https://example.com/bounded/{i}") for i in range(3)]
+    def test_retry_allowances_evict_oldest_at_fixed_bound(
+        self, mock_connection_manager
+    ):
+        membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        dupefilter._retry_allowance_limit = 2
+        requests = [Request(f"https://example.com/bounded/{i}") for i in range(3)]
 
-    for request in requests:
-      assert dupefilter.request_seen(request) is False
-      dupefilter.forget(request)
+        for request in requests:
+            assert dupefilter.request_seen(request) is False
+            dupefilter.forget(request)
 
-    assert len(dupefilter._retry_allowances) == 2
-    assert dupefilter.request_seen(requests[0]) is True
-    assert dupefilter.request_seen(requests[1]) is False
-    assert dupefilter.request_seen(requests[2]) is False
+        assert len(dupefilter._retry_allowances) == 2
+        assert dupefilter.request_seen(requests[0]) is True
+        assert dupefilter.request_seen(requests[1]) is False
+        assert dupefilter.request_seen(requests[2]) is False
 
 
 class TestBackendDupeFilterRequestFingerprint:
-  """Test BackendDupeFilter request_fingerprint method."""
+    """Test BackendDupeFilter request_fingerprint method."""
 
-  def test_request_fingerprint_returns_string(self, mock_connection_manager):
-    """Test request_fingerprint returns a string."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_request_fingerprint_returns_string(self, mock_connection_manager):
+        """Test request_fingerprint returns a string."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    request = Request(url="https://example.com")
-    result = dupefilter.request_fingerprint(request)
+        request = Request(url="https://example.com")
+        result = dupefilter.request_fingerprint(request)
 
-    assert isinstance(result, str)
-    assert len(result) > 0
+        assert isinstance(result, str)
+        assert len(result) > 0
 
-  def test_request_fingerprint_same_request_same_fingerprint(
-    self, mock_connection_manager
-  ):
-    """Test same request produces same fingerprint."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_request_fingerprint_same_request_same_fingerprint(
+        self, mock_connection_manager
+    ):
+        """Test same request produces same fingerprint."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    request1 = Request(url="https://example.com")
-    request2 = Request(url="https://example.com")
+        request1 = Request(url="https://example.com")
+        request2 = Request(url="https://example.com")
 
-    fp1 = dupefilter.request_fingerprint(request1)
-    fp2 = dupefilter.request_fingerprint(request2)
+        fp1 = dupefilter.request_fingerprint(request1)
+        fp2 = dupefilter.request_fingerprint(request2)
 
-    assert fp1 == fp2
+        assert fp1 == fp2
 
-  def test_request_fingerprint_different_urls_different_fingerprints(
-    self, mock_connection_manager
-  ):
-    """Test different URLs produce different fingerprints."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_request_fingerprint_different_urls_different_fingerprints(
+        self, mock_connection_manager
+    ):
+        """Test different URLs produce different fingerprints."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    request1 = Request(url="https://example.com/page1")
-    request2 = Request(url="https://example.com/page2")
+        request1 = Request(url="https://example.com/page1")
+        request2 = Request(url="https://example.com/page2")
 
-    fp1 = dupefilter.request_fingerprint(request1)
-    fp2 = dupefilter.request_fingerprint(request2)
+        fp1 = dupefilter.request_fingerprint(request1)
+        fp2 = dupefilter.request_fingerprint(request2)
 
-    assert fp1 != fp2
+        assert fp1 != fp2
 
-  def test_request_fingerprint_is_hex_string(self, mock_connection_manager):
-    """Test fingerprint is a valid hex string."""
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+    def test_request_fingerprint_is_hex_string(self, mock_connection_manager):
+        """Test fingerprint is a valid hex string."""
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
-    request = Request(url="https://example.com")
-    fp = dupefilter.request_fingerprint(request)
+        request = Request(url="https://example.com")
+        fp = dupefilter.request_fingerprint(request)
 
-    # Should be valid hex
-    int(fp, 16)
+        # Should be valid hex
+        int(fp, 16)
 
-  def test_request_fingerprint_uses_injected_fingerprinter(
-    self, mock_connection_manager, mocker
-  ):
-    """R45: an injected fingerprinter is used instead of the default module function.
+    def test_request_fingerprint_uses_injected_fingerprinter(
+        self, mock_connection_manager, mocker
+    ):
+        """R45: an injected fingerprinter is used instead of the default module function.
 
-    BackendDupeFilter previously hardcoded ``scrapy.utils.request.fingerprint``,
-    silently ignoring any configured ``REQUEST_FINGERPRINTER_CLASS``. Now it
-    delegates to the injected fingerprinter (threaded from
-    ``crawler.request_fingerprinter`` via ``from_crawler``) when present.
-    """
-    mock_fp = mocker.MagicMock()
-    mock_fp.fingerprint.return_value = b"\xde\xad\xbe\xef"
+        BackendDupeFilter previously hardcoded ``scrapy.utils.request.fingerprint``,
+        silently ignoring any configured ``REQUEST_FINGERPRINTER_CLASS``. Now it
+        delegates to the injected fingerprinter (threaded from
+        ``crawler.request_fingerprinter`` via ``from_crawler``) when present.
+        """
+        mock_fp = mocker.MagicMock()
+        mock_fp.fingerprint.return_value = b"\xde\xad\xbe\xef"
 
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      fingerprinter=mock_fp,
-    )
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            fingerprinter=mock_fp,
+        )
 
-    request = Request(url="https://example.com")
-    result = dupefilter.request_fingerprint(request)
+        request = Request(url="https://example.com")
+        result = dupefilter.request_fingerprint(request)
 
-    mock_fp.fingerprint.assert_called_once_with(request)
-    assert result == b"\xde\xad\xbe\xef".hex()  # "deadbeef"
+        mock_fp.fingerprint.assert_called_once_with(request)
+        assert result == b"\xde\xad\xbe\xef".hex()  # "deadbeef"
 
-  def test_request_fingerprint_falls_back_when_no_fingerprinter(
-    self, mock_connection_manager
-  ):
-    """R45: without an injected fingerprinter, behavior is unchanged (default fn)."""
-    from scrapy.utils.request import fingerprint as scrapy_fingerprint
+    def test_request_fingerprint_falls_back_when_no_fingerprinter(
+        self, mock_connection_manager
+    ):
+        """R45: without an injected fingerprinter, behavior is unchanged (default fn)."""
+        from scrapy.utils.request import fingerprint as scrapy_fingerprint
 
-    dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
-    assert dupefilter._fingerprinter is None
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+        assert dupefilter._fingerprinter is None
 
-    request = Request(url="https://example.com")
-    assert (
-      dupefilter.request_fingerprint(request) == scrapy_fingerprint(request).hex()
-    )
+        request = Request(url="https://example.com")
+        assert (
+            dupefilter.request_fingerprint(request) == scrapy_fingerprint(request).hex()
+        )
 
 
 class TestBackendDupeFilterIntegration:
-  """Integration tests for BackendDupeFilter."""
+    """Integration tests for BackendDupeFilter."""
 
-  def test_full_dupefilter_lifecycle(self, mock_connection_manager):
-    """Test full lifecycle: new request, duplicate request, open, close."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="lifecycle:filter",
-      debug=True,
-    )
+    def test_full_dupefilter_lifecycle(self, mock_connection_manager):
+        """Test full lifecycle: new request, duplicate request, open, close."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="lifecycle:filter",
+            debug=True,
+        )
 
-    # open and close should not raise
-    dupefilter.open()
-    dupefilter.close("finished")
+        # open and close should not raise
+        dupefilter.open()
+        dupefilter.close("finished")
 
-  def test_multiple_unique_requests(self, mock_connection_manager):
-    """Test multiple unique requests are all not filtered."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="multi:filter",
-    )
+    def test_multiple_unique_requests(self, mock_connection_manager):
+        """Test multiple unique requests are all not filtered."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="multi:filter",
+        )
 
-    mock_set_backend = mock_connection_manager.get_set_backend()
-    mock_set_backend.add.return_value = True  # All new
+        mock_set_backend = mock_connection_manager.get_set_backend()
+        mock_set_backend.add.return_value = True  # All new
 
-    urls = [
-      "https://example.com/1",
-      "https://example.com/2",
-      "https://example.com/3",
-    ]
+        urls = [
+            "https://example.com/1",
+            "https://example.com/2",
+            "https://example.com/3",
+        ]
 
-    for url in urls:
-      request = Request(url=url)
-      result = dupefilter.request_seen(request)
-      assert result is False
+        for url in urls:
+            request = Request(url=url)
+            result = dupefilter.request_seen(request)
+            assert result is False
 
-    # Should have 3 add calls
-    assert mock_set_backend.add.call_count == 3
+        # Should have 3 add calls
+        assert mock_set_backend.add.call_count == 3
 
-  def test_mixed_unique_and_duplicate_requests(self, mock_connection_manager):
-    """Test mix of unique and duplicate requests."""
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="mixed:filter",
-    )
+    def test_mixed_unique_and_duplicate_requests(self, mock_connection_manager):
+        """Test mix of unique and duplicate requests."""
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="mixed:filter",
+        )
 
-    mock_set_backend = mock_connection_manager.get_set_backend()
-    # First call returns True (new), second returns False (duplicate)
-    mock_set_backend.add.side_effect = [True, False, True]
+        mock_set_backend = mock_connection_manager.get_set_backend()
+        # First call returns True (new), second returns False (duplicate)
+        mock_set_backend.add.side_effect = [True, False, True]
 
-    request1 = Request(url="https://example.com/page1")
-    request2 = Request(url="https://example.com/page1")  # Duplicate
-    request3 = Request(url="https://example.com/page2")
+        request1 = Request(url="https://example.com/page1")
+        request2 = Request(url="https://example.com/page1")  # Duplicate
+        request3 = Request(url="https://example.com/page2")
 
-    assert dupefilter.request_seen(request1) is False
-    assert dupefilter.request_seen(request2) is True  # Duplicate
-    assert dupefilter.request_seen(request3) is False
+        assert dupefilter.request_seen(request1) is False
+        assert dupefilter.request_seen(request2) is True  # Duplicate
+        assert dupefilter.request_seen(request3) is False
 
-  def test_from_settings_then_request_seen(self, mocker):
-    """Test creating via from_settings and then using request_seen."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_from_settings_then_request_seen(self, mocker):
+        """Test creating via from_settings and then using request_seen."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "settings:filter",
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "settings:filter",
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mock_set_backend = mocker.Mock()
-    mock_set_backend.add.return_value = True
-    mock_manager.get_set_backend.return_value = mock_set_backend
+        mock_manager = mocker.Mock()
+        mock_set_backend = mocker.Mock()
+        mock_set_backend.add.return_value = True
+        mock_manager.get_set_backend.return_value = mock_set_backend
 
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
 
-    request = Request(url="https://example.com")
-    result = dupefilter.request_seen(request)
+        request = Request(url="https://example.com")
+        result = dupefilter.request_seen(request)
 
-    assert result is False
-    mock_set_backend.add.assert_called_once()
+        assert result is False
+        mock_set_backend.add.assert_called_once()
 
 
 class TestBackendDupeFilterClearOnOpen:
-  """D1 (C5 HIGH): SCRAPY_DUPEFILTER_CLEAR_ON_OPEN resets the dedup set at open()."""
+    """D1 (C5 HIGH): SCRAPY_DUPEFILTER_CLEAR_ON_OPEN resets the dedup set at open()."""
 
-  def test_clear_on_open_resets_seen_fingerprints(self, mocker):
-    """clear_on_open=True: add fp → seen True → open(spider) → same request seen False.
+    def test_clear_on_open_resets_seen_fingerprints(self, mocker):
+        """clear_on_open=True: add fp → seen True → open(spider) → same request seen False.
 
-    Pre-fix (RED): ``open(spider)`` is a no-op for the set filter, so the
-    previously-seen fingerprint stays and the same request is reported
-    seen=True on the second ``request_seen`` call. Post-fix (GREEN):
-    ``open(spider)`` calls ``self.clear()`` and the second call returns False.
-    """
-    from scrapy_extension.backends.connectors import ConnectionManager
+        Pre-fix (RED): ``open(spider)`` is a no-op for the set filter, so the
+        previously-seen fingerprint stays and the same request is reported
+        seen=True on the second ``request_seen`` call. Post-fix (GREEN):
+        ``open(spider)`` calls ``self.clear()`` and the second call returns False.
+        """
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
-      "SCRAPY_DEDUP_STRATEGY": "set",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-      "SCRAPY_DUPEFILTER_CLEAR_ON_OPEN": True,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+            "SCRAPY_DEDUP_STRATEGY": "set",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+            "SCRAPY_DUPEFILTER_CLEAR_ON_OPEN": True,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mock_set_backend = mocker.Mock()
-    # First add → newly added (True); after clear, the second add must also be
-    # newly added (True) — proving the set was cleared.
-    mock_set_backend.add.side_effect = [True, True]
-    mock_manager.get_set_backend.return_value = mock_set_backend
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mock_set_backend = mocker.Mock()
+        # First add → newly added (True); after clear, the second add must also be
+        # newly added (True) — proving the set was cleared.
+        mock_set_backend.add.side_effect = [True, True]
+        mock_manager.get_set_backend.return_value = mock_set_backend
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
-    spider = mocker.Mock(name="spider")
-    spider.name = "test_spider"
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        spider = mocker.Mock(name="spider")
+        spider.name = "test_spider"
 
-    request = Request(url="https://example.com/page")
-    # First sighting: newly added → not a duplicate.
-    assert dupefilter.request_seen(request) is False
-    # Same request again: backend side_effect returns True on the 2nd call,
-    # but without clear-on-open the dupefilter's own dedup state would still
-    # consider it seen. After the fix, open(spider) clears the backend set.
-    dupefilter.open(spider)
-    mock_set_backend.clear_set.assert_called_once()
-    # After clear, the same request must be newly added again (not seen).
-    assert dupefilter.request_seen(request) is False
+        request = Request(url="https://example.com/page")
+        # First sighting: newly added → not a duplicate.
+        assert dupefilter.request_seen(request) is False
+        # Same request again: backend side_effect returns True on the 2nd call,
+        # but without clear-on-open the dupefilter's own dedup state would still
+        # consider it seen. After the fix, open(spider) clears the backend set.
+        dupefilter.open(spider)
+        mock_set_backend.clear_set.assert_called_once()
+        # After clear, the same request must be newly added again (not seen).
+        assert dupefilter.request_seen(request) is False
 
-  def test_clear_on_open_default_is_false_preserves_behavior(self, mocker):
-    """Default (clear_on_open=False): open(spider) does NOT clear the set.
+    def test_clear_on_open_default_is_false_preserves_behavior(self, mocker):
+        """Default (clear_on_open=False): open(spider) does NOT clear the set.
 
-    Ensures the new opt-in is additive — zero compat break when the setting
-    is not explicitly enabled.
-    """
-    from scrapy_extension.backends.connectors import ConnectionManager
+        Ensures the new opt-in is additive — zero compat break when the setting
+        is not explicitly enabled.
+        """
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter",
-      "SCRAPY_DEDUP_STRATEGY": "set",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter",
+            "SCRAPY_DEDUP_STRATEGY": "set",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mock_set_backend = mocker.Mock()
-    mock_manager.get_set_backend.return_value = mock_set_backend
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mock_set_backend = mocker.Mock()
+        mock_manager.get_set_backend.return_value = mock_set_backend
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
-    spider = mocker.Mock(name="spider")
-    spider.name = "test_spider"
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        spider = mocker.Mock(name="spider")
+        spider.name = "test_spider"
 
-    dupefilter.open(spider)
-    mock_set_backend.clear_set.assert_not_called()
+        dupefilter.open(spider)
+        mock_set_backend.clear_set.assert_not_called()
 
 
 class TestBackendDupeFilterSpiderKeyTemplating:
-  """D2 (C8 HIGH): {spider} placeholder substituted in the dedup key at open()."""
+    """D2 (C8 HIGH): {spider} placeholder substituted in the dedup key at open()."""
 
-  def test_spider_placeholder_substituted_in_key(self, mocker):
-    """Key 'dupefilter:{spider}' + spider.name 'foo' → backend key 'dupefilter:foo'.
+    def test_spider_placeholder_substituted_in_key(self, mocker):
+        """Key 'dupefilter:{spider}' + spider.name 'foo' → backend key 'dupefilter:foo'.
 
-    Pre-fix (RED): the key is passed verbatim ('dupefilter:{spider}') to the
-    backend — the literal placeholder is sent as the set name. Post-fix
-    (GREEN): ``open(spider)`` substitutes ``spider.name`` so the resolved
-    backend key contains 'foo'.
-    """
-    from scrapy_extension.backends.connectors import ConnectionManager
+        Pre-fix (RED): the key is passed verbatim ('dupefilter:{spider}') to the
+        backend — the literal placeholder is sent as the set name. Post-fix
+        (GREEN): ``open(spider)`` substitutes ``spider.name`` so the resolved
+        backend key contains 'foo'.
+        """
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "dupefilter:{spider}",
-      "SCRAPY_DEDUP_STRATEGY": "set",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "dupefilter:{spider}",
+            "SCRAPY_DEDUP_STRATEGY": "set",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mock_set_backend = mocker.Mock()
-    mock_set_backend.add.return_value = True
-    mock_manager.get_set_backend.return_value = mock_set_backend
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mock_set_backend = mocker.Mock()
+        mock_set_backend.add.return_value = True
+        mock_manager.get_set_backend.return_value = mock_set_backend
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
-    spider = mocker.Mock(name="spider")
-    spider.name = "foo"
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        spider = mocker.Mock(name="spider")
+        spider.name = "foo"
 
-    dupefilter.open(spider)
+        dupefilter.open(spider)
 
-    request = Request(url="https://example.com/page")
-    dupefilter.request_seen(request)
+        request = Request(url="https://example.com/page")
+        dupefilter.request_seen(request)
 
-    # The resolved backend key passed to SetBackend.add must contain the
-    # substituted spider name, not the literal placeholder.
-    call_args = mock_set_backend.add.call_args
-    resolved_key = call_args[0][0]
-    assert "foo" in resolved_key
-    assert "{spider}" not in resolved_key
+        # The resolved backend key passed to SetBackend.add must contain the
+        # substituted spider name, not the literal placeholder.
+        call_args = mock_set_backend.add.call_args
+        resolved_key = call_args[0][0]
+        assert "foo" in resolved_key
+        assert "{spider}" not in resolved_key
 
-  def test_no_placeholder_keeps_key_verbatim(self, mocker):
-    """Keys without '{spider}' are passed through unchanged at open(spider)."""
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_no_placeholder_keeps_key_verbatim(self, mocker):
+        """Keys without '{spider}' are passed through unchanged at open(spider)."""
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mock_settings = mocker.Mock()
-    mock_settings.get.side_effect = lambda key, default=None: {
-      "SCRAPY_BACKEND_TYPE": "redis",
-      "SCRAPY_DUPEFILTER_KEY": "static:dupefilter",
-      "SCRAPY_DEDUP_STRATEGY": "set",
-    }.get(key, default)
-    mock_settings.getbool.side_effect = lambda key, default=False: {
-      "DUPEFILTER_DEBUG": False,
-    }.get(key, default)
-    mock_settings.getdict.return_value = {}
+        mock_settings = mocker.Mock()
+        mock_settings.get.side_effect = lambda key, default=None: {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DUPEFILTER_KEY": "static:dupefilter",
+            "SCRAPY_DEDUP_STRATEGY": "set",
+        }.get(key, default)
+        mock_settings.getbool.side_effect = lambda key, default=False: {
+            "DUPEFILTER_DEBUG": False,
+        }.get(key, default)
+        mock_settings.getdict.return_value = {}
 
-    mock_manager = mocker.Mock()
-    mock_set_backend = mocker.Mock()
-    mock_set_backend.add.return_value = True
-    mock_manager.get_set_backend.return_value = mock_set_backend
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        mock_manager = mocker.Mock()
+        mock_set_backend = mocker.Mock()
+        mock_set_backend.add.return_value = True
+        mock_manager.get_set_backend.return_value = mock_set_backend
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
 
-    dupefilter = BackendDupeFilter.from_settings(mock_settings)
-    spider = mocker.Mock(name="spider")
-    spider.name = "irrelevant"
+        dupefilter = BackendDupeFilter.from_settings(mock_settings)
+        spider = mocker.Mock(name="spider")
+        spider.name = "irrelevant"
 
-    dupefilter.open(spider)
+        dupefilter.open(spider)
 
-    request = Request(url="https://example.com/page")
-    dupefilter.request_seen(request)
+        request = Request(url="https://example.com/page")
+        dupefilter.request_seen(request)
 
-    call_args = mock_set_backend.add.call_args
-    assert call_args[0][0] == "static:dupefilter"
+        call_args = mock_set_backend.add.call_args
+        assert call_args[0][0] == "static:dupefilter"
 
 
 class TestBackendDupeFilterCuckooFilterFullDegradation:
-  """R7-A (Theme C HIGH): cuckoo filter full → graceful degradation, no crash.
+    """R7-A (Theme C HIGH): cuckoo filter full → graceful degradation, no crash.
 
-  Pre-fix (RED): ``CuckooMembershipFilter.add`` raises ``RuntimeError`` once
-  the filter exhausts ``_MAX_KICKS`` (filter full). The dupefilter layer only
-  caught ``NotImplementedError``, so the ``RuntimeError`` propagated through
-  ``scheduler.enqueue_request``'s hot path and crashed the spider the first
-  time the filter filled past capacity. Post-fix (GREEN): the dupefilter
-  catches ``RuntimeError`` in a separate arm, logs a warn-once, bumps
-  ``dupefilter/filter_full``, and treats the item as NOT-seen (degrade by
-  allowing the enqueue — dedup stays effective within capacity, overflow
-  items pass through).
-  """
-
-  @pytest.fixture(autouse=True)
-  def _reset_filter_full_warned(self):
-    """Reset the module-level warn-once flag before each test (isolation).
-
-    ``_filter_full_warned`` is process-global (mirrors factory.py ``_warned``);
-    without a reset, the first test to trip it would pre-arm the rest and
-    hide a broken warn-once contract.
+    Pre-fix (RED): ``CuckooMembershipFilter.add`` raises ``RuntimeError`` once
+    the filter exhausts ``_MAX_KICKS`` (filter full). The dupefilter layer only
+    caught ``NotImplementedError``, so the ``RuntimeError`` propagated through
+    ``scheduler.enqueue_request``'s hot path and crashed the spider the first
+    time the filter filled past capacity. Post-fix (GREEN): the dupefilter
+    catches ``RuntimeError`` in a separate arm, logs a warn-once, bumps
+    ``dupefilter/filter_full``, and treats the item as NOT-seen (degrade by
+    allowing the enqueue — dedup stays effective within capacity, overflow
+    items pass through).
     """
-    from scrapy_extension.dupefilter import dupefilter as dupefilter_module
 
-    original = dupefilter_module._filter_full_warned
-    dupefilter_module._filter_full_warned = False
-    yield
-    dupefilter_module._filter_full_warned = original
+    @pytest.fixture(autouse=True)
+    def _reset_filter_full_warned(self):
+        """Reset the module-level warn-once flag before each test (isolation).
 
-  def _make_tiny_cuckoo_dupefilter(self, mock_connection_manager, mocker):
-    """Build a dupefilter wrapping a TINY cuckoo filter (capacity=4).
+        ``_filter_full_warned`` is process-global (mirrors factory.py ``_warned``);
+        without a reset, the first test to trip it would pre-arm the rest and
+        hide a broken warn-once contract.
+        """
+        from scrapy_extension.dupefilter import dupefilter as dupefilter_module
 
-    Tuned so ``_MAX_KICKS`` exhausts after a handful of distinct inserts past
-    capacity — reproduces the filter-full ``FilterFull`` signal reliably
-    without a huge insert loop. Returns ``(dupefilter, monitor)``; the monitor
-    is a Mock so ``monitor.on_filter_full`` is assertable.
-    """
-    cuckoo = CuckooMembershipFilter(capacity=4, error_rate=0.01)
-    monitor = mocker.Mock(name="monitor")
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="cuckoo:full",
-      membership_filter=cuckoo,
-      monitor=monitor,
-    )
-    return dupefilter, monitor
+        original = dupefilter_module._filter_full_warned
+        dupefilter_module._filter_full_warned = False
+        yield
+        dupefilter_module._filter_full_warned = original
 
-  def test_filter_full_does_not_crash(self, mock_connection_manager, mocker):
-    """RED/GREEN: distinct inserts past capacity must not raise.
+    def _make_tiny_cuckoo_dupefilter(self, mock_connection_manager, mocker):
+        """Build a dupefilter wrapping a TINY cuckoo filter (capacity=4).
 
-    Pre-fix: the cuckoo ``RuntimeError`` propagates → test fails RED.
-    Post-fix: dupefilter swallows it and treats the request as not-seen.
-    """
-    dupefilter, _monitor = self._make_tiny_cuckoo_dupefilter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
+        Tuned so ``_MAX_KICKS`` exhausts after a handful of distinct inserts past
+        capacity — reproduces the filter-full ``FilterFull`` signal reliably
+        without a huge insert loop. Returns ``(dupefilter, monitor)``; the monitor
+        is a Mock so ``monitor.on_filter_full`` is assertable.
+        """
+        cuckoo = CuckooMembershipFilter(capacity=4, error_rate=0.01)
+        monitor = mocker.Mock(name="monitor")
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="cuckoo:full",
+            membership_filter=cuckoo,
+            monitor=monitor,
+        )
+        return dupefilter, monitor
 
-    # Insert well past capacity (capacity=4, bucket=4, ~85% load target →
-    # _MAX_KICKS exhausts after a modest number of distinct items).
-    for i in range(50):
-      request = Request(url=f"https://example.com/page/{i}")
-      # Must not raise — degradation treats overflow as not-seen.
-      result = dupefilter.request_seen(request)
-      assert isinstance(result, bool)
+    def test_filter_full_does_not_crash(self, mock_connection_manager, mocker):
+        """RED/GREEN: distinct inserts past capacity must not raise.
 
-  def test_filter_full_increments_stat(self, mock_connection_manager, mocker):
-    """The monitor's ``on_filter_full`` hook fires when degradation triggers.
+        Pre-fix: the cuckoo ``RuntimeError`` propagates → test fails RED.
+        Post-fix: dupefilter swallows it and treats the request as not-seen.
+        """
+        dupefilter, _monitor = self._make_tiny_cuckoo_dupefilter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
 
-    The dupefilter emits ``monitor.on_filter_full()`` (the monitor contract),
-    not a private-attribute stat bump — ``ScrapyStatsMonitor`` translates it
-    to ``dupefilter/filter_full`` (covered in ``test_monitor.py``).
-    """
-    dupefilter, monitor = self._make_tiny_cuckoo_dupefilter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
+        # Insert well past capacity (capacity=4, bucket=4, ~85% load target →
+        # _MAX_KICKS exhausts after a modest number of distinct items).
+        for i in range(50):
+            request = Request(url=f"https://example.com/page/{i}")
+            # Must not raise — degradation treats overflow as not-seen.
+            result = dupefilter.request_seen(request)
+            assert isinstance(result, bool)
 
-    # Force the filter past capacity so the FilterFull signal fires.
-    for i in range(50):
-      dupefilter.request_seen(Request(url=f"https://example.com/page/{i}"))
+    def test_filter_full_increments_stat(self, mock_connection_manager, mocker):
+        """The monitor's ``on_filter_full`` hook fires when degradation triggers.
 
-    # The monitor hook fired at least once — proving the degradation path ran.
-    monitor.on_filter_full.assert_called()
+        The dupefilter emits ``monitor.on_filter_full()`` (the monitor contract),
+        not a private-attribute stat bump — ``ScrapyStatsMonitor`` translates it
+        to ``dupefilter/filter_full`` (covered in ``test_monitor.py``).
+        """
+        dupefilter, monitor = self._make_tiny_cuckoo_dupefilter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
 
-  def test_filter_full_warns_once(self, mock_connection_manager, mocker, caplog):
-    """Warn-once contract: filter-full triggered twice logs exactly once.
+        # Force the filter past capacity so the FilterFull signal fires.
+        for i in range(50):
+            dupefilter.request_seen(Request(url=f"https://example.com/page/{i}"))
 
-    Mirrors the factory ``_warned`` pattern — a long-running crawl must not
-    have its log spammed by per-request filter-full signals.
-    """
-    dupefilter, _monitor = self._make_tiny_cuckoo_dupefilter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
+        # The monitor hook fired at least once — proving the degradation path ran.
+        monitor.on_filter_full.assert_called()
 
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-      for i in range(100):
-        dupefilter.request_seen(Request(url=f"https://example.com/p/{i}"))
+    def test_filter_full_warns_once(self, mock_connection_manager, mocker, caplog):
+        """Warn-once contract: filter-full triggered twice logs exactly once.
 
-    warning_records = [
-      r for r in caplog.records if r.levelno == logging.WARNING
-    ]
-    filter_full_warnings = [
-      r for r in warning_records if "filter_full" in r.getMessage()
-    ]
-    assert len(filter_full_warnings) == 1, (
-      f"expected exactly one filter_full warning, got {len(filter_full_warnings)}"
-    )
+        Mirrors the factory ``_warned`` pattern — a long-running crawl must not
+        have its log spammed by per-request filter-full signals.
+        """
+        dupefilter, _monitor = self._make_tiny_cuckoo_dupefilter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
 
-  def test_no_false_negative_within_capacity(self, mock_connection_manager, mocker):
-    """Green-path sanity: within capacity, dedup still works (seen=True on repeat).
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            for i in range(100):
+                dupefilter.request_seen(Request(url=f"https://example.com/p/{i}"))
 
-    Ensures the degradation does not accidentally fire early — cuckoo's
-    never-false-negative-within-capacity contract is preserved.
-    """
-    cuckoo = CuckooMembershipFilter(capacity=200, error_rate=0.01)
-    monitor = mocker.Mock(name="monitor")
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="cuckoo:green",
-      membership_filter=cuckoo,
-      monitor=monitor,
-    )
-    dupefilter.open()
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        filter_full_warnings = [
+            r for r in warning_records if "filter_full" in r.getMessage()
+        ]
+        assert len(filter_full_warnings) == 1, (
+            f"expected exactly one filter_full warning, got {len(filter_full_warnings)}"
+        )
 
-    # Within capacity — first sight is not-seen, second is seen.
-    request = Request(url="https://example.com/within-cap")
-    assert dupefilter.request_seen(request) is False
-    assert dupefilter.request_seen(request) is True
-    # filter_full hook must NOT have fired in the green path.
-    monitor.on_filter_full.assert_not_called()
+    def test_no_false_negative_within_capacity(self, mock_connection_manager, mocker):
+        """Green-path sanity: within capacity, dedup still works (seen=True on repeat).
 
-  def test_filter_full_treats_item_as_not_seen(self, mock_connection_manager, mocker):
-    """On filter-full, the overflowing request is treated as NOT-seen.
+        Ensures the degradation does not accidentally fire early — cuckoo's
+        never-false-negative-within-capacity contract is preserved.
+        """
+        cuckoo = CuckooMembershipFilter(capacity=200, error_rate=0.01)
+        monitor = mocker.Mock(name="monitor")
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="cuckoo:green",
+            membership_filter=cuckoo,
+            monitor=monitor,
+        )
+        dupefilter.open()
 
-    Dedup stays effective within capacity; overflow items are allowed
-    through (may re-fetch) — strictly better than crashing the crawl.
-    """
-    dupefilter, monitor = self._make_tiny_cuckoo_dupefilter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
+        # Within capacity — first sight is not-seen, second is seen.
+        request = Request(url="https://example.com/within-cap")
+        assert dupefilter.request_seen(request) is False
+        assert dupefilter.request_seen(request) is True
+        # filter_full hook must NOT have fired in the green path.
+        monitor.on_filter_full.assert_not_called()
 
-    # Drive the filter decisively past capacity so the FilterFull arm fires.
-    for i in range(50):
-      req = Request(url=f"https://example.com/seed/{i}")
-      dupefilter.request_seen(req)
+    def test_filter_full_treats_item_as_not_seen(self, mock_connection_manager, mocker):
+        """On filter-full, the overflowing request is treated as NOT-seen.
 
-    # An overflow request must be reported as NOT-seen (allowed through) —
-    # AND monitor.on_filter_full must have fired at least once along the way,
-    # proving the degradation path actually fired before we got here.
-    overflow_req = Request(url="https://example.com/overflow/unique")
-    result = dupefilter.request_seen(overflow_req)
-    assert result is False
-    monitor.on_filter_full.assert_called()
+        Dedup stays effective within capacity; overflow items are allowed
+        through (may re-fetch) — strictly better than crashing the crawl.
+        """
+        dupefilter, monitor = self._make_tiny_cuckoo_dupefilter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
+
+        # Drive the filter decisively past capacity so the FilterFull arm fires.
+        for i in range(50):
+            req = Request(url=f"https://example.com/seed/{i}")
+            dupefilter.request_seen(req)
+
+        # An overflow request must be reported as NOT-seen (allowed through) —
+        # AND monitor.on_filter_full must have fired at least once along the way,
+        # proving the degradation path actually fired before we got here.
+        overflow_req = Request(url="https://example.com/overflow/unique")
+        result = dupefilter.request_seen(overflow_req)
+        assert result is False
+        monitor.on_filter_full.assert_called()
 
 
 class TestBackendDupeFilterTransientBackendError:
-  """Risk 4: a transient BackendConnectionError from the SetBackend degrades.
+    """Risk 4: a transient BackendConnectionError from the SetBackend degrades.
 
-  Pre-fix (RED): ``request_seen`` caught only ``NotImplementedError`` and
-  ``FilterFull`` — a transient ``BackendConnectionError`` (Redis/MongoDB/ES
-  outage during dedup) propagated to the Scrapy engine and crashed the crawl,
-  contradicting the codebase's "a dead spider is worse than a duplicate fetch"
-  philosophy. Post-fix (GREEN): a dedicated arm catches it, warns once per
-  process, emits ``monitor.on_error("dedup", exc)``, and degrades to not-seen.
-  """
-
-  @pytest.fixture(autouse=True)
-  def _reset_backend_error_warned(self):
-    """Reset the module-level warn-once flag (Risk 4) before each test."""
-    from scrapy_extension.dupefilter import dupefilter as dupefilter_module
-
-    original = dupefilter_module._backend_error_warned
-    dupefilter_module._backend_error_warned = False
-    yield
-    dupefilter_module._backend_error_warned = original
-
-  def _make_dupefilter_with_raising_filter(self, mock_connection_manager, mocker):
-    """Build a dupefilter whose membership filter raises BackendConnectionError.
-
-    Returns ``(dupefilter, monitor)``; the monitor is a Mock so
-    ``monitor.on_error`` is assertable. The membership filter's ``add`` raises
-    a transient ``BackendConnectionError`` on every call (simulating a
-    sustained backend outage).
+    Pre-fix (RED): ``request_seen`` caught only ``NotImplementedError`` and
+    ``FilterFull`` — a transient ``BackendConnectionError`` (Redis/MongoDB/ES
+    outage during dedup) propagated to the Scrapy engine and crashed the crawl,
+    contradicting the codebase's "a dead spider is worse than a duplicate fetch"
+    philosophy. Post-fix (GREEN): a dedicated arm catches it, warns once per
+    process, emits ``monitor.on_error("dedup", exc)``, and degrades to not-seen.
     """
-    from scrapy_extension.exceptions.base import BackendConnectionError
 
-    membership_filter = mocker.Mock(name="membership_filter")
-    membership_filter.add.side_effect = BackendConnectionError(
-      "transient redis outage"
-    )
-    # saturation is read via getattr in request_seen — set to None so the
-    # saturation hook is skipped (keeps the test focused on the error arm).
-    membership_filter.saturation = None
-    monitor = mocker.Mock(name="monitor")
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="transient",
-      membership_filter=membership_filter,
-      monitor=monitor,
-    )
-    return dupefilter, monitor
+    @pytest.fixture(autouse=True)
+    def _reset_backend_error_warned(self):
+        """Reset the module-level warn-once flag (Risk 4) before each test."""
+        from scrapy_extension.dupefilter import dupefilter as dupefilter_module
 
-  def test_open_circuit_degrades_to_not_seen(
-    self,
-    mock_connection_manager,
-    mocker,
-  ):
-    """A circuit-breaker rejection follows the transient-outage envelope."""
-    from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
+        original = dupefilter_module._backend_error_warned
+        dupefilter_module._backend_error_warned = False
+        yield
+        dupefilter_module._backend_error_warned = original
 
-    membership_filter = mocker.Mock(name="membership_filter")
-    membership_filter.add.side_effect = CircuitBreakerOpenError("redis-set")
-    membership_filter.saturation = None
-    monitor = mocker.Mock(name="monitor")
-    dupefilter = BackendDupeFilter(
-      connection_manager=mock_connection_manager,
-      key="open-circuit",
-      membership_filter=membership_filter,
-      monitor=monitor,
-    )
-    dupefilter.open()
+    def _make_dupefilter_with_raising_filter(self, mock_connection_manager, mocker):
+        """Build a dupefilter whose membership filter raises BackendConnectionError.
 
-    assert dupefilter.request_seen(Request("https://example.com/circuit")) is False
-    monitor.on_error.assert_called_once()
-    assert monitor.on_error.call_args.args[0] == "dedup"
+        Returns ``(dupefilter, monitor)``; the monitor is a Mock so
+        ``monitor.on_error`` is assertable. The membership filter's ``add`` raises
+        a transient ``BackendConnectionError`` on every call (simulating a
+        sustained backend outage).
+        """
+        from scrapy_extension.exceptions.base import BackendConnectionError
 
-  def test_transient_error_does_not_crash(self, mock_connection_manager, mocker):
-    """RED/GREEN: a transient backend error must not propagate.
+        membership_filter = mocker.Mock(name="membership_filter")
+        membership_filter.add.side_effect = BackendConnectionError(
+            "transient redis outage"
+        )
+        # saturation is read via getattr in request_seen — set to None so the
+        # saturation hook is skipped (keeps the test focused on the error arm).
+        membership_filter.saturation = None
+        monitor = mocker.Mock(name="monitor")
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="transient",
+            membership_filter=membership_filter,
+            monitor=monitor,
+        )
+        return dupefilter, monitor
 
-    Pre-fix: the BackendConnectionError propagated and crashed the crawl.
-    Post-fix: the dupefilter degrades and treats the request as not-seen.
-    """
-    dupefilter, _monitor = self._make_dupefilter_with_raising_filter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
-    result = dupefilter.request_seen(Request(url="https://example.com/x"))
-    assert result is False  # degrade to not-seen (allow the request through)
-
-  def test_transient_error_emits_on_error(self, mock_connection_manager, mocker):
-    """The monitor's ``on_error("dedup", exc)`` hook fires on degradation.
-
-    A wired ScrapyStatsMonitor translates this to ``errors/dedup`` — the
-    operability signal that distinguishes a transient outage from silence.
-    """
-    dupefilter, monitor = self._make_dupefilter_with_raising_filter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
-    dupefilter.request_seen(Request(url="https://example.com/x"))
-    monitor.on_error.assert_called_once()
-    assert monitor.on_error.call_args[0][0] == "dedup"
-
-  def test_transient_error_warns_once(self, mock_connection_manager, mocker, caplog):
-    """Warn-once contract: two transient errors log exactly one WARNING.
-
-    Mirrors the FilterFull warn-once — a long-running crawl must not have its
-    log spammed by per-request outage signals.
-    """
-    dupefilter, _monitor = self._make_dupefilter_with_raising_filter(
-      mock_connection_manager, mocker
-    )
-    dupefilter.open()
-    with caplog.at_level(
-      logging.WARNING, logger="scrapy_extension.dupefilter.dupefilter"
+    def test_open_circuit_degrades_to_not_seen(
+        self,
+        mock_connection_manager,
+        mocker,
     ):
-      dupefilter.request_seen(Request(url="https://example.com/x"))
-      dupefilter.request_seen(Request(url="https://example.com/y"))
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "transiently unavailable" in warnings[0].message
+        """A circuit-breaker rejection follows the transient-outage envelope."""
+        from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
+
+        membership_filter = mocker.Mock(name="membership_filter")
+        membership_filter.add.side_effect = CircuitBreakerOpenError("redis-set")
+        membership_filter.saturation = None
+        monitor = mocker.Mock(name="monitor")
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            key="open-circuit",
+            membership_filter=membership_filter,
+            monitor=monitor,
+        )
+        dupefilter.open()
+
+        assert dupefilter.request_seen(Request("https://example.com/circuit")) is False
+        monitor.on_error.assert_called_once()
+        assert monitor.on_error.call_args.args[0] == "dedup"
+
+    def test_transient_error_does_not_crash(self, mock_connection_manager, mocker):
+        """RED/GREEN: a transient backend error must not propagate.
+
+        Pre-fix: the BackendConnectionError propagated and crashed the crawl.
+        Post-fix: the dupefilter degrades and treats the request as not-seen.
+        """
+        dupefilter, _monitor = self._make_dupefilter_with_raising_filter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
+        result = dupefilter.request_seen(Request(url="https://example.com/x"))
+        assert result is False  # degrade to not-seen (allow the request through)
+
+    def test_transient_error_emits_on_error(self, mock_connection_manager, mocker):
+        """The monitor's ``on_error("dedup", exc)`` hook fires on degradation.
+
+        A wired ScrapyStatsMonitor translates this to ``errors/dedup`` — the
+        operability signal that distinguishes a transient outage from silence.
+        """
+        dupefilter, monitor = self._make_dupefilter_with_raising_filter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
+        dupefilter.request_seen(Request(url="https://example.com/x"))
+        monitor.on_error.assert_called_once()
+        assert monitor.on_error.call_args[0][0] == "dedup"
+
+    def test_transient_error_warns_once(self, mock_connection_manager, mocker, caplog):
+        """Warn-once contract: two transient errors log exactly one WARNING.
+
+        Mirrors the FilterFull warn-once — a long-running crawl must not have its
+        log spammed by per-request outage signals.
+        """
+        dupefilter, _monitor = self._make_dupefilter_with_raising_filter(
+            mock_connection_manager, mocker
+        )
+        dupefilter.open()
+        with caplog.at_level(
+            logging.WARNING, logger="scrapy_extension.dupefilter.dupefilter"
+        ):
+            dupefilter.request_seen(Request(url="https://example.com/x"))
+            dupefilter.request_seen(Request(url="https://example.com/y"))
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "transiently unavailable" in warnings[0].message
 
 
 def test_from_crawler_wires_monitor_into_connection_manager(mocker) -> None:
-  """R25-F: from_crawler threads the ScrapyStatsMonitor into the dedup
-  ConnectionManager so backend/{connect,disconnect,retry}_count cover the set
-  backend in multi-backend deployments (queue!=dedup). Pre-fix only the
-  scheduler's (queue) manager was wired; the dedup manager stayed NullMonitor."""
-  mock_cm = mocker.MagicMock()
-  dupefilter = BackendDupeFilter(connection_manager=mock_cm)
-  mocker.patch.object(BackendDupeFilter, "from_settings", return_value=dupefilter)
-  crawler = mocker.MagicMock()
-  result = BackendDupeFilter.from_crawler(crawler)
-  assert result is dupefilter
-  mock_cm.set_monitor.assert_called_once()
-  # R26-C: assert the wired monitor is a ScrapyStatsMonitor (not a NullMonitor
-  # left by a refactor mistake) — assert_called_once() alone would pass either.
-  from scrapy_extension.monitor import ScrapyStatsMonitor
+    """R25-F: from_crawler threads the ScrapyStatsMonitor into the dedup
+    ConnectionManager so backend/{connect,disconnect,retry}_count cover the set
+    backend in multi-backend deployments (queue!=dedup). Pre-fix only the
+    scheduler's (queue) manager was wired; the dedup manager stayed NullMonitor."""
+    mock_cm = mocker.MagicMock()
+    dupefilter = BackendDupeFilter(connection_manager=mock_cm)
+    mocker.patch.object(BackendDupeFilter, "from_settings", return_value=dupefilter)
+    crawler = mocker.MagicMock()
+    result = BackendDupeFilter.from_crawler(crawler)
+    assert result is dupefilter
+    mock_cm.set_monitor.assert_called_once()
+    # R26-C: assert the wired monitor is a ScrapyStatsMonitor (not a NullMonitor
+    # left by a refactor mistake) — assert_called_once() alone would pass either.
+    from scrapy_extension.monitor import ScrapyStatsMonitor
 
-  assert isinstance(
-    mock_cm.set_monitor.call_args[0][0], ScrapyStatsMonitor
-  )
+    assert isinstance(mock_cm.set_monitor.call_args[0][0], ScrapyStatsMonitor)

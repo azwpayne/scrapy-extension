@@ -16,12 +16,15 @@ topology is required.
 ```bash
 # From the repository root
 uv sync
-docker run -d --name scrapy-redis -p 6379:6379 redis:7-alpine
+docker run -d --name scrapy-redis -p 127.0.0.1:6379:6379 redis:7-alpine
 
 cd examples
 scrapy list
 scrapy crawl quotes_redis
 ```
+
+> **Local development only:** The Docker commands in this guide bind services
+> to loopback; do not use them on shared, cloud, or production hosts.
 
 ## How Configuration Is Split
 
@@ -162,7 +165,7 @@ class QuotesRedisSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
 ## MongoDB (`quotes_mongodb`)
 
 ```bash
-docker run -d --name scrapy-mongo -p 27017:27017 mongo:7
+docker run -d --name scrapy-mongo -p 127.0.0.1:27017:27017 mongo:7
 scrapy crawl quotes_mongodb
 ```
 
@@ -228,7 +231,7 @@ consumer cannot isolate safely.
 RabbitMQ is queue-only. The example uses its queue with Redis Set/Storage:
 
 ```bash
-docker run -d --name scrapy-rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker run -d --name scrapy-rabbit -p 127.0.0.1:5672:5672 -p 127.0.0.1:15672:15672 rabbitmq:3-management
 scrapy crawl quotes_rabbitmq
 ```
 
@@ -281,10 +284,10 @@ Kafka.
 ## ElasticSearch (`quotes_elasticsearch`)
 
 ```bash
-docker run -d --name scrapy-elastic -p 9200:9200 \
+docker run -d --name scrapy-elastic -p 127.0.0.1:9200:9200 \
   -e discovery.type=single-node \
   -e xpack.security.enabled=false \
-  elasticsearch:8.12.0
+  docker.elastic.co/elasticsearch/elasticsearch:9.4.1
 scrapy crawl quotes_elasticsearch
 ```
 

@@ -20,10 +20,10 @@ interface with a no-op default that preserves prior behavior exactly.
 from __future__ import annotations
 
 __all__ = [
-  "DEFAULT_BACKPRESSURE_THRESHOLD",
-  "DEFAULT_POP_RATE_WINDOW_S",
-  "Monitor",
-  "NullMonitor",
+    "DEFAULT_BACKPRESSURE_THRESHOLD",
+    "DEFAULT_POP_RATE_WINDOW_S",
+    "Monitor",
+    "NullMonitor",
 ]
 
 #: Default depth at which ``on_queue_depth`` flips ``queue/backpressure`` on.
@@ -47,290 +47,290 @@ DEFAULT_POP_RATE_WINDOW_S = 60.0
 
 
 class Monitor:
-  """Structural base class for observability hooks.
+    """Structural base class for observability hooks.
 
-  Subclass and override the hooks you care about. The default
-  implementation of every hook is a no-op, so a bare ``Monitor()``
-  (or :class:`NullMonitor`) is always safe to call from any component.
+    Subclass and override the hooks you care about. The default
+    implementation of every hook is a no-op, so a bare ``Monitor()``
+    (or :class:`NullMonitor`) is always safe to call from any component.
 
-  Duplicate-filter hooks are best-effort and serialized through one
-  event-enqueue-ordered FIFO outside the duplicate-filter lifecycle lock. A peer
-  ``request_seen`` call never waits for the elected drainer, so its hook may
-  finish after that call (or a concurrent ``close``) returns; ``close`` does
-  not provide a telemetry-flush barrier. The backlog is bounded and drops
-  complete event batches when full. A callback may call ``request_seen``
-  re-entrantly, but must not wait for that nested call's later telemetry. If a
-  callback delegates ``request_seen`` for the originating ``Request`` to
-  another thread, that call must finish before the hook returns; detached work
-  runs outside the identity fence and is treated as an ordinary dedup attempt.
-  A process-control exception from a deferred peer event necessarily surfaces
-  on the elected drainer's caller rather than on the peer that already returned.
+    Duplicate-filter hooks are best-effort and serialized through one
+    event-enqueue-ordered FIFO outside the duplicate-filter lifecycle lock. A peer
+    ``request_seen`` call never waits for the elected drainer, so its hook may
+    finish after that call (or a concurrent ``close``) returns; ``close`` does
+    not provide a telemetry-flush barrier. The backlog is bounded and drops
+    complete event batches when full. A callback may call ``request_seen``
+    re-entrantly, but must not wait for that nested call's later telemetry. If a
+    callback delegates ``request_seen`` for the originating ``Request`` to
+    another thread, that call must finish before the hook returns; detached work
+    runs outside the identity fence and is treated as an ordinary dedup attempt.
+    A process-control exception from a deferred peer event necessarily surfaces
+    on the elected drainer's caller rather than on the peer that already returned.
 
-  Why a concrete base class (not ``typing.Protocol``):
+    Why a concrete base class (not ``typing.Protocol``):
 
-  - ``Protocol`` with ``runtime_checkable`` would let us duck-type, but
-    the components hold a ``Monitor`` instance, not a class — they need a
-    real object whose hook methods exist and are no-ops by default.
-  - A base class gives us that default behavior, plus ``isinstance`` works
-    for the "is this the null default?" checks tests rely on.
+    - ``Protocol`` with ``runtime_checkable`` would let us duck-type, but
+      the components hold a ``Monitor`` instance, not a class — they need a
+      real object whose hook methods exist and are no-ops by default.
+    - A base class gives us that default behavior, plus ``isinstance`` works
+      for the "is this the null default?" checks tests rely on.
 
-  Hooks (all no-ops by default):
+    Hooks (all no-ops by default):
 
-  - ``on_push(queue_name, priority)`` — after a successful queue push.
-  - ``on_pop(queue_name)`` — per pop ATTEMPT (R14-D semantics fix).
-    Emitted by ``BackendQueue.pop`` on every call — including empty pops —
-    because the consumer-liveness signal ("is the worker popping at all?")
-    is independent of whether an item was returned. The matching stat is
-    ``queue/pop_attempt_count`` (renamed from ``queue/pop_count`` in R14-D so
-    the key matches behavior).
-  - ``on_dedup_hit(key)`` — request fingerprint was already seen.
-  - ``on_dedup_miss(key)`` — a membership check admitted the request. On the
-    bundled scheduler's two-phase path this is settled after queue success or
-    failure and does not imply that a persistent marker was written.
-  - ``on_queue_depth(queue_name, depth)`` — current pending depth (gauge).
-  - ``on_store(key)`` — after a successful storage write (pipeline lane).
-  - ``on_filter_full()`` — membership filter at capacity; caller degrades.
-  - ``on_pop_rate(window_s, rate)`` — rolling pop rate (U2 operability).
-    Emitted by ``BackendQueue.pop`` on a sampling cadence (NOT every pop);
-    ``rate`` is pops per second over the trailing ``window_s`` window.
-  - ``on_filter_saturation(used, capacity)`` — membership-filter fill ratio
-    (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` after the
-    deduplication decision when the underlying filter exposes saturation.
-    Cuckoo and Bloom filters report continuously; bounded Memory filters report
-    only after a successful insert reaches the capacity ceiling and during
-    later insert-and-evict cycles. Lets operators see a filter APPROACHING full
-    (e.g. >0.9) before the ``on_filter_full`` overflow signal fires.
-  - ``on_error(operation, error)`` — an operation raised; record per-op.
-    Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
-    arms so serialization failures surface as ``errors/push`` /
-    ``errors/pop`` instead of being dead observability.
-  - ``on_connect(backend_type)`` — a backend connection was established.
-    Wired (R14-D) from ``ConnectionManager.connect`` on the success path.
-  - ``on_disconnect(backend_type, reason)`` — a backend was disconnected.
-    Wired (R14-D) from ``ConnectionManager.close``; ``reason`` is the Scrapy
-    close reason (may be ``None`` in non-engine teardown paths).
-  - ``on_disconnect_result(backend_type, succeeded)`` — outcome of an attempted
-    backend disconnect. ``succeeded`` is a bounded boolean; no settings,
-    connection strings, or error details are exposed.
-  - ``on_retry(backend_type, attempt)`` — a connection retry fired.
-    Wired (R14-D) from ``ConnectionManager.connect`` before each backoff
-    sleep; ``attempt`` is 1-based (1 = first retry).
-  """
-
-  def on_push(self, queue_name: str, priority: float) -> None:
-    """Record a successful queue push.
-
-    Args:
-        queue_name: The queue the item was pushed to.
-        priority: The push priority (higher = more urgent).
+    - ``on_push(queue_name, priority)`` — after a successful queue push.
+    - ``on_pop(queue_name)`` — per pop ATTEMPT (R14-D semantics fix).
+      Emitted by ``BackendQueue.pop`` on every call — including empty pops —
+      because the consumer-liveness signal ("is the worker popping at all?")
+      is independent of whether an item was returned. The matching stat is
+      ``queue/pop_attempt_count`` (renamed from ``queue/pop_count`` in R14-D so
+      the key matches behavior).
+    - ``on_dedup_hit(key)`` — request fingerprint was already seen.
+    - ``on_dedup_miss(key)`` — a membership check admitted the request. On the
+      bundled scheduler's two-phase path this is settled after queue success or
+      failure and does not imply that a persistent marker was written.
+    - ``on_queue_depth(queue_name, depth)`` — current pending depth (gauge).
+    - ``on_store(key)`` — after a successful storage write (pipeline lane).
+    - ``on_filter_full()`` — membership filter at capacity; caller degrades.
+    - ``on_pop_rate(window_s, rate)`` — rolling pop rate (U2 operability).
+      Emitted by ``BackendQueue.pop`` on a sampling cadence (NOT every pop);
+      ``rate`` is pops per second over the trailing ``window_s`` window.
+    - ``on_filter_saturation(used, capacity)`` — membership-filter fill ratio
+      (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` after the
+      deduplication decision when the underlying filter exposes saturation.
+      Cuckoo and Bloom filters report continuously; bounded Memory filters report
+      only after a successful insert reaches the capacity ceiling and during
+      later insert-and-evict cycles. Lets operators see a filter APPROACHING full
+      (e.g. >0.9) before the ``on_filter_full`` overflow signal fires.
+    - ``on_error(operation, error)`` — an operation raised; record per-op.
+      Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
+      arms so serialization failures surface as ``errors/push`` /
+      ``errors/pop`` instead of being dead observability.
+    - ``on_connect(backend_type)`` — a backend connection was established.
+      Wired (R14-D) from ``ConnectionManager.connect`` on the success path.
+    - ``on_disconnect(backend_type, reason)`` — a backend was disconnected.
+      Wired (R14-D) from ``ConnectionManager.close``; ``reason`` is the Scrapy
+      close reason (may be ``None`` in non-engine teardown paths).
+    - ``on_disconnect_result(backend_type, succeeded)`` — outcome of an attempted
+      backend disconnect. ``succeeded`` is a bounded boolean; no settings,
+      connection strings, or error details are exposed.
+    - ``on_retry(backend_type, attempt)`` — a connection retry fired.
+      Wired (R14-D) from ``ConnectionManager.connect`` before each backoff
+      sleep; ``attempt`` is 1-based (1 = first retry).
     """
 
-  def on_pop(self, queue_name: str) -> None:
-    """Record a pop ATTEMPT (R14-D semantics fix — per attempt, not per success).
+    def on_push(self, queue_name: str, priority: float) -> None:
+        """Record a successful queue push.
 
-    Emitted by :meth:`BackendQueue.pop
-    <scrapy_extension.queue.queue.BackendQueue.pop>` on EVERY pop call —
-    including empty pops. The consumer-liveness signal ("is the worker
-    popping at all?") is independent of whether an item was returned, so the
-    matching stat is ``queue/pop_attempt_count`` (renamed from
-    ``queue/pop_count`` in R14-D so the key matches the per-attempt
-    behavior). For per-success push accounting see :meth:`on_push`.
+        Args:
+            queue_name: The queue the item was pushed to.
+            priority: The push priority (higher = more urgent).
+        """
 
-    Args:
-        queue_name: The queue the item was popped from.
-    """
+    def on_pop(self, queue_name: str) -> None:
+        """Record a pop ATTEMPT (R14-D semantics fix — per attempt, not per success).
 
-  def on_dedup_hit(self, key: str) -> None:
-    """Record a dedup hit (request already seen).
+        Emitted by :meth:`BackendQueue.pop
+        <scrapy_extension.queue.queue.BackendQueue.pop>` on EVERY pop call —
+        including empty pops. The consumer-liveness signal ("is the worker
+        popping at all?") is independent of whether an item was returned, so the
+        matching stat is ``queue/pop_attempt_count`` (renamed from
+        ``queue/pop_count`` in R14-D so the key matches the per-attempt
+        behavior). For per-success push accounting see :meth:`on_push`.
 
-    Args:
-        key: The request fingerprint that was already present.
-    """
+        Args:
+            queue_name: The queue the item was popped from.
+        """
 
-  def on_dedup_miss(self, key: str) -> None:
-    """Record a dedup miss (membership check admitted the request).
+    def on_dedup_hit(self, key: str) -> None:
+        """Record a dedup hit (request already seen).
 
-    Args:
-        key: The request fingerprint that was absent or admitted in degraded
-            mode. A later queue failure or volatile strategy may leave it
-            without a persistent membership marker.
-    """
+        Args:
+            key: The request fingerprint that was already present.
+        """
 
-  def on_queue_depth(self, queue_name: str, depth: int) -> None:
-    """Record the current queue depth (a gauge, not a counter).
+    def on_dedup_miss(self, key: str) -> None:
+        """Record a dedup miss (membership check admitted the request).
 
-    Args:
-        queue_name: The queue whose depth was sampled.
-        depth: The number of pending items at sample time.
-    """
+        Args:
+            key: The request fingerprint that was absent or admitted in degraded
+                mode. A later queue failure or volatile strategy may leave it
+                without a persistent membership marker.
+        """
 
-  def on_store(self, key: str) -> None:
-    """Record a successful storage write.
+    def on_queue_depth(self, queue_name: str, depth: int) -> None:
+        """Record the current queue depth (a gauge, not a counter).
 
-    Emitted by the item pipeline (another lane); defined here so the
-    protocol is complete and the pipeline can drop in unchanged.
+        Args:
+            queue_name: The queue whose depth was sampled.
+            depth: The number of pending items at sample time.
+        """
 
-    Args:
-        key: The storage key that was written.
-    """
+    def on_store(self, key: str) -> None:
+        """Record a successful storage write.
 
-  def on_filter_full(self) -> None:
-    """Record that the membership filter reported it is at capacity.
+        Emitted by the item pipeline (another lane); defined here so the
+        protocol is complete and the pipeline can drop in unchanged.
 
-    Emitted by the dupefilter when a bounded-capacity filter (cuckoo)
-    raises :class:`~scrapy_extension.dupefilter.filters.base.FilterFull` and
-    the dupefilter degrades by treating the overflow request as not-seen.
-    Lets a stats monitor count ``dupefilter/filter_full`` occurrences via the
-    monitor contract — without the dupefilter reaching into its private
-    stats attribute.
-    """
+        Args:
+            key: The storage key that was written.
+        """
 
-  def on_pop_rate(self, window_s: float, rate: float) -> None:
-    """Record the rolling queue pop rate (U2 operability signal).
+    def on_filter_full(self) -> None:
+        """Record that the membership filter reported it is at capacity.
 
-    Emitted by :meth:`BackendQueue.pop
-    <scrapy_extension.queue.queue.BackendQueue.pop>` on a sampling cadence
-    (NOT every pop — derived alongside the depth sample to keep the hot path
-    cheap). ``rate`` is pops per second over the trailing ``window_s``
-    seconds. The default window is :data:`DEFAULT_POP_RATE_WINDOW_S` (60s).
+        Emitted by the dupefilter when a bounded-capacity filter (cuckoo)
+        raises :class:`~scrapy_extension.dupefilter.filters.base.FilterFull` and
+        the dupefilter degrades by treating the overflow request as not-seen.
+        Lets a stats monitor count ``dupefilter/filter_full`` occurrences via the
+        monitor contract — without the dupefilter reaching into its private
+        stats attribute.
+        """
 
-    Why a rate, not a counter: ``queue/pop_count`` already counts pops; the
-    operability question is "is the consumer alive *lately*?" — a rolling
-    rate answers that without forcing the operator to do wall-clock math
-    against a monotonic counter. A stalled crawler shows up as a falling-edge
-    to ~0 within one window.
+    def on_pop_rate(self, window_s: float, rate: float) -> None:
+        """Record the rolling queue pop rate (U2 operability signal).
 
-    Args:
-        window_s: The trailing window the rate was computed over (seconds).
-        rate: Pops per second over that window.
-    """
+        Emitted by :meth:`BackendQueue.pop
+        <scrapy_extension.queue.queue.BackendQueue.pop>` on a sampling cadence
+        (NOT every pop — derived alongside the depth sample to keep the hot path
+        cheap). ``rate`` is pops per second over the trailing ``window_s``
+        seconds. The default window is :data:`DEFAULT_POP_RATE_WINDOW_S` (60s).
 
-  def on_filter_saturation(self, used: int, capacity: int | None) -> None:
-    """Record membership-filter saturation (U2 operability signal).
+        Why a rate, not a counter: ``queue/pop_count`` already counts pops; the
+        operability question is "is the consumer alive *lately*?" — a rolling
+        rate answers that without forcing the operator to do wall-clock math
+        against a monotonic counter. A stalled crawler shows up as a falling-edge
+        to ~0 within one window.
 
-    Emitted by :meth:`BackendDupeFilter.request_seen
-    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
-    when the underlying filter exposes a ``saturation`` property (Cuckoo and
-    Bloom after every decision; bounded Memory only after successful inserts
-    at its cap). Set filters stay silent. This is the APPROACHING-full signal:
-    it rises through 0.9 before :meth:`on_filter_full` ever fires, giving
-    operators a leading indicator to raise the configured probabilistic-filter
-    capacity before the filter overflows and degrades to passthrough.
+        Args:
+            window_s: The trailing window the rate was computed over (seconds).
+            rate: Pops per second over that window.
+        """
 
-    Args:
-        used: Number of items currently recorded in the filter.
-        capacity: Filter capacity in items, or ``None`` if the filter is
-            unbounded (in which case saturation is reported as ``0.0`` —
-            an unbounded filter cannot be saturated).
-    """
+    def on_filter_saturation(self, used: int, capacity: int | None) -> None:
+        """Record membership-filter saturation (U2 operability signal).
 
-  def on_error(self, operation: str, error: BaseException) -> None:
-    """Record an operation error.
+        Emitted by :meth:`BackendDupeFilter.request_seen
+        <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
+        when the underlying filter exposes a ``saturation`` property (Cuckoo and
+        Bloom after every decision; bounded Memory only after successful inserts
+        at its cap). Set filters stay silent. This is the APPROACHING-full signal:
+        it rises through 0.9 before :meth:`on_filter_full` ever fires, giving
+        operators a leading indicator to raise the configured probabilistic-filter
+        capacity before the filter overflows and degrades to passthrough.
 
-    Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
-    arms so serialization failures surface as ``errors/push`` /
-    ``errors/pop`` instead of being dead observability (the hook previously
-    had zero call sites).
+        Args:
+            used: Number of items currently recorded in the filter.
+            capacity: Filter capacity in items, or ``None`` if the filter is
+                unbounded (in which case saturation is reported as ``0.0`` —
+                an unbounded filter cannot be saturated).
+        """
 
-    Args:
-        operation: The operation name (e.g. ``"push"``, ``"pop"``).
-        error: The exception that was raised.
-    """
+    def on_error(self, operation: str, error: BaseException) -> None:
+        """Record an operation error.
 
-  def on_connect(self, backend_type: str) -> None:
-    """Record a successful backend connection (R14-D connection-lifecycle hook).
+        Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
+        arms so serialization failures surface as ``errors/push`` /
+        ``errors/pop`` instead of being dead observability (the hook previously
+        had zero call sites).
 
-    Wired from :meth:`ConnectionManager.connect
-    <scrapy_extension.backends.connectors.ConnectionManager.connect>` on the
-    success path. ``backend_type`` is the registry-key string (e.g.
-    ``"redis"``, ``"mongodb"``). Default no-op so existing subclasses and
-    :class:`NullMonitor` keep working unchanged.
+        Args:
+            operation: The operation name (e.g. ``"push"``, ``"pop"``).
+            error: The exception that was raised.
+        """
 
-    Args:
-        backend_type: The backend-type registry string that connected.
-    """
+    def on_connect(self, backend_type: str) -> None:
+        """Record a successful backend connection (R14-D connection-lifecycle hook).
 
-  def on_disconnect(self, backend_type: str, reason: str | None) -> None:
-    """Record a backend disconnect (R14-D connection-lifecycle hook).
+        Wired from :meth:`ConnectionManager.connect
+        <scrapy_extension.backends.connectors.ConnectionManager.connect>` on the
+        success path. ``backend_type`` is the registry-key string (e.g.
+        ``"redis"``, ``"mongodb"``). Default no-op so existing subclasses and
+        :class:`NullMonitor` keep working unchanged.
 
-    Wired from :meth:`ConnectionManager.close
-    <scrapy_extension.backends.connectors.ConnectionManager.close>` when the
-    last holder releases the shared manager. ``reason`` is the Scrapy
-    engine close reason (may be ``None`` in non-engine teardown paths — e.g.
-    orphan-eviction under registry pressure). Default no-op so existing
-    subclasses and :class:`NullMonitor` keep working unchanged.
+        Args:
+            backend_type: The backend-type registry string that connected.
+        """
 
-    Args:
-        backend_type: The backend-type registry string that disconnected.
-        reason: Scrapy engine close reason (or ``None``).
-    """
+    def on_disconnect(self, backend_type: str, reason: str | None) -> None:
+        """Record a backend disconnect (R14-D connection-lifecycle hook).
 
-  def on_disconnect_result(self, backend_type: str, succeeded: bool) -> None:
-    """Record a bounded backend-disconnect outcome.
+        Wired from :meth:`ConnectionManager.close
+        <scrapy_extension.backends.connectors.ConnectionManager.close>` when the
+        last holder releases the shared manager. ``reason`` is the Scrapy
+        engine close reason (may be ``None`` in non-engine teardown paths — e.g.
+        orphan-eviction under registry pressure). Default no-op so existing
+        subclasses and :class:`NullMonitor` keep working unchanged.
 
-    Emitted by :meth:`ConnectionManager.close
-    <scrapy_extension.backends.connectors.ConnectionManager.close>` after it
-    attempts the final backend disconnect. ``succeeded`` is deliberately the
-    only outcome detail so telemetry cannot expose backend settings,
-    connection strings, or exception content.
+        Args:
+            backend_type: The backend-type registry string that disconnected.
+            reason: Scrapy engine close reason (or ``None``).
+        """
 
-    Args:
-        backend_type: The backend-type registry string that disconnected.
-        succeeded: Whether ``backend.disconnect()`` returned successfully.
-    """
+    def on_disconnect_result(self, backend_type: str, succeeded: bool) -> None:
+        """Record a bounded backend-disconnect outcome.
 
-  def on_retry(self, backend_type: str, attempt: int) -> None:
-    """Record a connection retry (R14-D connection-lifecycle hook).
+        Emitted by :meth:`ConnectionManager.close
+        <scrapy_extension.backends.connectors.ConnectionManager.close>` after it
+        attempts the final backend disconnect. ``succeeded`` is deliberately the
+        only outcome detail so telemetry cannot expose backend settings,
+        connection strings, or exception content.
 
-    Wired from :meth:`ConnectionManager.connect
-    <scrapy_extension.backends.connectors.ConnectionManager.connect>` before
-    each exponential-backoff sleep. ``attempt`` is 1-based (1 = first retry,
-    i.e. the second overall attempt). Default no-op so existing subclasses
-    and :class:`NullMonitor` keep working unchanged.
+        Args:
+            backend_type: The backend-type registry string that disconnected.
+            succeeded: Whether ``backend.disconnect()`` returned successfully.
+        """
 
-    Args:
-        backend_type: The backend-type registry string being retried.
-        attempt: 1-based retry index (1 = first retry).
-    """
+    def on_retry(self, backend_type: str, attempt: int) -> None:
+        """Record a connection retry (R14-D connection-lifecycle hook).
 
-  def on_buffer_depth(self, depth: int) -> None:
-    """Record BatchedStorageStrategy's outstanding-work gauge.
+        Wired from :meth:`ConnectionManager.connect
+        <scrapy_extension.backends.connectors.ConnectionManager.connect>` before
+        each exponential-backoff sleep. ``attempt`` is 1-based (1 = first retry,
+        i.e. the second overall attempt). Default no-op so existing subclasses
+        and :class:`NullMonitor` keep working unchanged.
 
-    Emitted by :meth:`BatchedStorageStrategy.store
-    <scrapy_extension.storage.strategies.batched.BatchedStorageStrategy.store>`
-    after each buffered item so operators can alert before the crash-before-
-    flush loss window grows (the batch is at-least-once on store *exceptions*
-    but a crash mid-batch loses the in-flight buffer — a documented failure
-    mode). ``depth`` includes both buffered records and any snapshot currently
-    being written to a backend, so it matches the strategy's bounded admission
-    count. Default no-op so existing subclasses and :class:`NullMonitor` keep
-    working unchanged.
+        Args:
+            backend_type: The backend-type registry string being retried.
+            attempt: 1-based retry index (1 = first retry).
+        """
 
-    Args:
-        depth: Number of accepted-but-not-yet-persisted items.
-    """
+    def on_buffer_depth(self, depth: int) -> None:
+        """Record BatchedStorageStrategy's outstanding-work gauge.
 
-  def on_delay_depth(self, depth: int) -> None:
-    """Record the DelayQueueStrategy held-item count (gauge).
+        Emitted by :meth:`BatchedStorageStrategy.store
+        <scrapy_extension.storage.strategies.batched.BatchedStorageStrategy.store>`
+        after each buffered item so operators can alert before the crash-before-
+        flush loss window grows (the batch is at-least-once on store *exceptions*
+        but a crash mid-batch loses the in-flight buffer — a documented failure
+        mode). ``depth`` includes both buffered records and any snapshot currently
+        being written to a backend, so it matches the strategy's bounded admission
+        count. Default no-op so existing subclasses and :class:`NullMonitor` keep
+        working unchanged.
 
-    Emitted by :meth:`DelayQueueStrategy.push
-    <scrapy_extension.queue.strategies.delay.DelayQueueStrategy.push>` after
-    each held item so operators can alert before the in-process delay heap
-    grows unbounded (the held-delay state is in-process — a crash loses it
-    and re-delivers items with delay semantics reset; the snapshot path
-    silently no-ops when the backend is storage-incapable). ``depth`` is the
-    number of items currently held in the delay heap. Default no-op so
-    existing subclasses and :class:`NullMonitor` keep working unchanged.
+        Args:
+            depth: Number of accepted-but-not-yet-persisted items.
+        """
 
-    Args:
-        depth: Number of items currently held in the delay heap.
-    """
+    def on_delay_depth(self, depth: int) -> None:
+        """Record the DelayQueueStrategy held-item count (gauge).
+
+        Emitted by :meth:`DelayQueueStrategy.push
+        <scrapy_extension.queue.strategies.delay.DelayQueueStrategy.push>` after
+        each held item so operators can alert before the in-process delay heap
+        grows unbounded (the held-delay state is in-process — a crash loses it
+        and re-delivers items with delay semantics reset; the snapshot path
+        silently no-ops when the backend is storage-incapable). ``depth`` is the
+        number of items currently held in the delay heap. Default no-op so
+        existing subclasses and :class:`NullMonitor` keep working unchanged.
+
+        Args:
+            depth: Number of items currently held in the delay heap.
+        """
 
 
 class NullMonitor(Monitor):
-  """No-op monitor — the safe default.
+    """No-op monitor — the safe default.
 
-  Inherits every no-op hook from :class:`Monitor`. Exists as a named
-  sentinel so components can distinguish "no monitor wired" from "a real
-  monitor that happens to record nothing" via ``isinstance(m, NullMonitor)``.
-  """
+    Inherits every no-op hook from :class:`Monitor`. Exists as a named
+    sentinel so components can distinguish "no monitor wired" from "a real
+    monitor that happens to record nothing" via ``isinstance(m, NullMonitor)``.
+    """

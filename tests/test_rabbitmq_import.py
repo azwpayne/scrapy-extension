@@ -36,7 +36,9 @@ def test_rabbitmq_import_error_pika_not_installed():
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, f"subprocess failed: {result.stderr}\n{result.stdout}"
+    assert result.returncode == 0, (
+        f"subprocess failed: {result.stderr}\n{result.stdout}"
+    )
     assert "PASS" in result.stdout
 
 
@@ -68,5 +70,7 @@ def test_rabbitmq_import_error_cause_is_original_import_error():
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, f"subprocess failed: {result.stderr}\n{result.stdout}"
+    assert result.returncode == 0, (
+        f"subprocess failed: {result.stderr}\n{result.stdout}"
+    )
     assert "PASS" in result.stdout

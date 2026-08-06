@@ -14,442 +14,455 @@ from scrapy_extension.dupefilter.filters.base import MembershipFilter
 from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 from scrapy_extension.dupefilter.filters.factory import (
-  DedupeStrategy,
-  build_membership_filter,
+    DedupeStrategy,
+    build_membership_filter,
 )
 from scrapy_extension.dupefilter.filters.memory_filter import (
-  DEFAULT_MEMORY_MAXSIZE,
-  MemoryMembershipFilter,
+    DEFAULT_MEMORY_MAXSIZE,
+    MemoryMembershipFilter,
 )
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import ConfigurationError
 
 
 def _make_settings(mocker, overrides=None):
-  """Build a mock Scrapy settings object + patched ConnectionManager."""
-  from scrapy_extension.backends.connectors import ConnectionManager
+    """Build a mock Scrapy settings object + patched ConnectionManager."""
+    from scrapy_extension.backends.connectors import ConnectionManager
 
-  mock_manager = mocker.Mock()
-  mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
-  base = {"SCRAPY_BACKEND_TYPE": "redis", "SCRAPY_DUPEFILTER_KEY": "dupefilter"}
-  if overrides:
-    base.update(overrides)
-  mock_settings = mocker.Mock()
-  mock_settings.get.side_effect = lambda k, default=None: base.get(k, default)
-  mock_settings.getbool.side_effect = lambda k, default=False: base.get(k, default)
-  mock_settings.getdict.return_value = {}
-  mock_settings.getpriority.side_effect = lambda k: 20 if k in base else None
-  return mock_settings, mock_manager
+    mock_manager = mocker.Mock()
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+    base = {"SCRAPY_BACKEND_TYPE": "redis", "SCRAPY_DUPEFILTER_KEY": "dupefilter"}
+    if overrides:
+        base.update(overrides)
+    mock_settings = mocker.Mock()
+    mock_settings.get.side_effect = lambda k, default=None: base.get(k, default)
+    mock_settings.getbool.side_effect = lambda k, default=False: base.get(k, default)
+    mock_settings.getdict.return_value = {}
+    mock_settings.getpriority.side_effect = lambda k: 20 if k in base else None
+    return mock_settings, mock_manager
 
 
 class TestBuildMembershipFilter:
-  """The factory maps each strategy to the right concrete filter."""
+    """The factory maps each strategy to the right concrete filter."""
 
-  def test_set_strategy(self, mock_connection_manager) -> None:
-    flt = build_membership_filter(
-      DedupeStrategy.SET, mock_connection_manager, key="k"
-    )
-    assert isinstance(flt, SetMembershipFilter)
-    assert flt.key == "k"
+    def test_set_strategy(self, mock_connection_manager) -> None:
+        flt = build_membership_filter(
+            DedupeStrategy.SET, mock_connection_manager, key="k"
+        )
+        assert isinstance(flt, SetMembershipFilter)
+        assert flt.key == "k"
 
-  def test_memory_strategy(self, mock_connection_manager) -> None:
-    flt = build_membership_filter(
-      DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
-    )
-    assert isinstance(flt, MemoryMembershipFilter)
-    assert flt._maxsize == 10
+    def test_memory_strategy(self, mock_connection_manager) -> None:
+        flt = build_membership_filter(
+            DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
+        )
+        assert isinstance(flt, MemoryMembershipFilter)
+        assert flt._maxsize == 10
 
-  def test_memory_strategy_uses_default_cap_when_maxsize_is_omitted(
-    self, mock_connection_manager
-  ) -> None:
-    flt = build_membership_filter(DedupeStrategy.MEMORY, mock_connection_manager)
+    def test_memory_strategy_uses_default_cap_when_maxsize_is_omitted(
+        self, mock_connection_manager
+    ) -> None:
+        flt = build_membership_filter(DedupeStrategy.MEMORY, mock_connection_manager)
 
-    assert isinstance(flt, MemoryMembershipFilter)
-    assert flt._maxsize == DEFAULT_MEMORY_MAXSIZE
+        assert isinstance(flt, MemoryMembershipFilter)
+        assert flt._maxsize == DEFAULT_MEMORY_MAXSIZE
 
-  def test_bloom_strategy(self, mock_connection_manager) -> None:
-    flt = build_membership_filter(
-      DedupeStrategy.BLOOM,
-      mock_connection_manager,
-      bloom_capacity=100,
-      bloom_error_rate=0.01,
-    )
-    assert isinstance(flt, BloomMembershipFilter)
+    def test_bloom_strategy(self, mock_connection_manager) -> None:
+        flt = build_membership_filter(
+            DedupeStrategy.BLOOM,
+            mock_connection_manager,
+            bloom_capacity=100,
+            bloom_error_rate=0.01,
+        )
+        assert isinstance(flt, BloomMembershipFilter)
 
-  def test_cuckoo_strategy(self, mock_connection_manager) -> None:
-    flt = build_membership_filter(
-      DedupeStrategy.CUCKOO,
-      mock_connection_manager,
-      cuckoo_capacity=100,
-      cuckoo_error_rate=0.01,
-    )
-    assert isinstance(flt, CuckooMembershipFilter)
+    def test_cuckoo_strategy(self, mock_connection_manager) -> None:
+        flt = build_membership_filter(
+            DedupeStrategy.CUCKOO,
+            mock_connection_manager,
+            cuckoo_capacity=100,
+            cuckoo_error_rate=0.01,
+        )
+        assert isinstance(flt, CuckooMembershipFilter)
 
-  def test_every_strategy_returns_membership_filter(
-    self, mock_connection_manager
-  ) -> None:
-    for strat in DedupeStrategy:
-      assert isinstance(
-        build_membership_filter(strat, mock_connection_manager), MembershipFilter
-      )
+    def test_every_strategy_returns_membership_filter(
+        self, mock_connection_manager
+    ) -> None:
+        for strat in DedupeStrategy:
+            assert isinstance(
+                build_membership_filter(strat, mock_connection_manager),
+                MembershipFilter,
+            )
 
-  def test_invalid_strategy_string_raises(self) -> None:
-    with pytest.raises(ValueError, match="not a valid DedupeStrategy"):
-      DedupeStrategy("bogus")
+    def test_invalid_strategy_string_raises(self) -> None:
+        with pytest.raises(ValueError, match="not a valid DedupeStrategy"):
+            DedupeStrategy("bogus")
 
 
 class TestFromSettingsStrategyWiring:
-  """from_settings selects the strategy from SCRAPY_DEDUP_STRATEGY."""
+    """from_settings selects the strategy from SCRAPY_DEDUP_STRATEGY."""
 
-  def test_default_is_set(self, mocker) -> None:
-    settings, _ = _make_settings(mocker)
-    df = BackendDupeFilter.from_settings(settings)
-    assert isinstance(df._filter, SetMembershipFilter)
+    def test_default_is_set(self, mocker) -> None:
+        settings, _ = _make_settings(mocker)
+        df = BackendDupeFilter.from_settings(settings)
+        assert isinstance(df._filter, SetMembershipFilter)
 
-  def test_memory_strategy(self, mocker) -> None:
-    settings, _ = _make_settings(mocker, {"SCRAPY_DEDUP_STRATEGY": "memory"})
-    df = BackendDupeFilter.from_settings(settings)
-    assert isinstance(df._filter, MemoryMembershipFilter)
+    def test_memory_strategy(self, mocker) -> None:
+        settings, _ = _make_settings(mocker, {"SCRAPY_DEDUP_STRATEGY": "memory"})
+        df = BackendDupeFilter.from_settings(settings)
+        assert isinstance(df._filter, MemoryMembershipFilter)
 
-  def test_memory_strategy_uses_default_cap_when_maxsize_is_absent(
-    self, mocker
-  ) -> None:
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_memory_strategy_uses_default_cap_when_maxsize_is_absent(
+        self, mocker
+    ) -> None:
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
-    settings = Settings(
-      {"SCRAPY_BACKEND_TYPE": "redis", "SCRAPY_DEDUP_STRATEGY": "memory"}
-    )
+        mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=mocker.Mock()
+        )
+        settings = Settings(
+            {"SCRAPY_BACKEND_TYPE": "redis", "SCRAPY_DEDUP_STRATEGY": "memory"}
+        )
 
-    df = BackendDupeFilter.from_settings(settings)
+        df = BackendDupeFilter.from_settings(settings)
 
-    assert isinstance(df._filter, MemoryMembershipFilter)
-    assert df._filter._maxsize == DEFAULT_MEMORY_MAXSIZE
+        assert isinstance(df._filter, MemoryMembershipFilter)
+        assert df._filter._maxsize == DEFAULT_MEMORY_MAXSIZE
 
-  def test_memory_strategy_preserves_explicit_unbounded_opt_out(self, mocker) -> None:
-    from scrapy_extension.backends.connectors import ConnectionManager
+    def test_memory_strategy_preserves_explicit_unbounded_opt_out(self, mocker) -> None:
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
-    settings = Settings(
-      {
-        "SCRAPY_BACKEND_TYPE": "redis",
-        "SCRAPY_DEDUP_STRATEGY": "memory",
-        "SCRAPY_DEDUP_MEMORY_MAXSIZE": None,
-      }
-    )
+        mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=mocker.Mock()
+        )
+        settings = Settings(
+            {
+                "SCRAPY_BACKEND_TYPE": "redis",
+                "SCRAPY_DEDUP_STRATEGY": "memory",
+                "SCRAPY_DEDUP_MEMORY_MAXSIZE": None,
+            }
+        )
 
-    df = BackendDupeFilter.from_settings(settings)
+        df = BackendDupeFilter.from_settings(settings)
 
-    assert isinstance(df._filter, MemoryMembershipFilter)
-    assert df._filter._maxsize is None
+        assert isinstance(df._filter, MemoryMembershipFilter)
+        assert df._filter._maxsize is None
 
-  def test_bloom_strategy(self, mocker) -> None:
-    settings, _ = _make_settings(
-      mocker,
-      {
-        "SCRAPY_DEDUP_STRATEGY": "bloom",
-        "SCRAPY_DEDUP_BLOOM_CAPACITY": 100,
-        "SCRAPY_DEDUP_BLOOM_ERROR_RATE": 0.01,
-      },
-    )
-    df = BackendDupeFilter.from_settings(settings)
-    assert isinstance(df._filter, BloomMembershipFilter)
+    def test_bloom_strategy(self, mocker) -> None:
+        settings, _ = _make_settings(
+            mocker,
+            {
+                "SCRAPY_DEDUP_STRATEGY": "bloom",
+                "SCRAPY_DEDUP_BLOOM_CAPACITY": 100,
+                "SCRAPY_DEDUP_BLOOM_ERROR_RATE": 0.01,
+            },
+        )
+        df = BackendDupeFilter.from_settings(settings)
+        assert isinstance(df._filter, BloomMembershipFilter)
 
-  def test_cuckoo_strategy(self, mocker) -> None:
-    settings, _ = _make_settings(
-      mocker,
-      {
-        "SCRAPY_DEDUP_STRATEGY": "cuckoo",
-        "SCRAPY_DEDUP_CUCKOO_CAPACITY": 100,
-        "SCRAPY_DEDUP_CUCKOO_ERROR_RATE": 0.01,
-      },
-    )
-    df = BackendDupeFilter.from_settings(settings)
-    assert isinstance(df._filter, CuckooMembershipFilter)
+    def test_cuckoo_strategy(self, mocker) -> None:
+        settings, _ = _make_settings(
+            mocker,
+            {
+                "SCRAPY_DEDUP_STRATEGY": "cuckoo",
+                "SCRAPY_DEDUP_CUCKOO_CAPACITY": 100,
+                "SCRAPY_DEDUP_CUCKOO_ERROR_RATE": 0.01,
+            },
+        )
+        df = BackendDupeFilter.from_settings(settings)
+        assert isinstance(df._filter, CuckooMembershipFilter)
 
-  @pytest.mark.parametrize("strategy", ["memory", "bloom", "cuckoo"])
-  def test_local_strategy_does_not_require_set_capable_backend(
-    self, mocker, strategy: str
-  ) -> None:
-    """Per-process filters may coexist with a queue-only global backend."""
-    from scrapy.settings import Settings
+    @pytest.mark.parametrize("strategy", ["memory", "bloom", "cuckoo"])
+    def test_local_strategy_does_not_require_set_capable_backend(
+        self, mocker, strategy: str
+    ) -> None:
+        """Per-process filters may coexist with a queue-only global backend."""
+        from scrapy.settings import Settings
 
-    from scrapy_extension.backends.connectors import ConnectionManager
+        from scrapy_extension.backends.connectors import ConnectionManager
 
-    manager = mocker.Mock()
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
-    settings = Settings(
-      {
-        "SCRAPY_BACKEND_TYPE": "kafka",
-        "SCRAPY_DEDUP_STRATEGY": strategy,
-        "SCRAPY_DEDUP_BLOOM_CAPACITY": 100,
-        "SCRAPY_DEDUP_CUCKOO_CAPACITY": 100,
-      }
-    )
+        manager = mocker.Mock()
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+        settings = Settings(
+            {
+                "SCRAPY_BACKEND_TYPE": "kafka",
+                "SCRAPY_DEDUP_STRATEGY": strategy,
+                "SCRAPY_DEDUP_BLOOM_CAPACITY": 100,
+                "SCRAPY_DEDUP_CUCKOO_CAPACITY": 100,
+            }
+        )
 
-    dupefilter = BackendDupeFilter.from_settings(settings)
+        dupefilter = BackendDupeFilter.from_settings(settings)
 
-    assert not isinstance(dupefilter._filter, SetMembershipFilter)
+        assert not isinstance(dupefilter._filter, SetMembershipFilter)
 
-  def test_set_strategy_still_requires_set_capable_backend(self) -> None:
-    from scrapy.settings import Settings
+    def test_set_strategy_still_requires_set_capable_backend(self) -> None:
+        from scrapy.settings import Settings
 
-    settings = Settings(
-      {"SCRAPY_BACKEND_TYPE": "kafka", "SCRAPY_DEDUP_STRATEGY": "set"}
-    )
+        settings = Settings(
+            {"SCRAPY_BACKEND_TYPE": "kafka", "SCRAPY_DEDUP_STRATEGY": "set"}
+        )
 
-    with pytest.raises(ConfigurationError, match="missing capabilities"):
-      BackendDupeFilter.from_settings(settings)
+        with pytest.raises(ConfigurationError, match="missing capabilities"):
+            BackendDupeFilter.from_settings(settings)
 
-  def test_invalid_strategy_raises(self, mocker) -> None:
-    """R-dedup-cfg: an invalid SCRAPY_DEDUP_STRATEGY raises ConfigurationError
-    (not the raw ValueError from enum coercion) — matching the storage-strategy
-    factory contract (create_storage_strategy("bogus") → ConfigurationError)
-    so callers catching ConfigurationError for config mistakes handle BOTH
-    factories uniformly. The enum itself still raises ValueError (tested at
-    line 81 — ``DedupeStrategy("bogus")``); the config boundary in
-    from_settings translates it to the domain config error.
-    """
-    settings, _ = _make_settings(mocker, {"SCRAPY_DEDUP_STRATEGY": "bogus"})
-    with pytest.raises(ConfigurationError) as exc_info:
-      BackendDupeFilter.from_settings(settings)
-    assert exc_info.value.setting_name == "SCRAPY_DEDUP_STRATEGY"
-    assert "bogus" in str(exc_info.value.setting_value)
+    def test_invalid_strategy_raises(self, mocker) -> None:
+        """R-dedup-cfg: an invalid SCRAPY_DEDUP_STRATEGY raises ConfigurationError
+        (not the raw ValueError from enum coercion) — matching the storage-strategy
+        factory contract (create_storage_strategy("bogus") → ConfigurationError)
+        so callers catching ConfigurationError for config mistakes handle BOTH
+        factories uniformly. The enum itself still raises ValueError (tested at
+        line 81 — ``DedupeStrategy("bogus")``); the config boundary in
+        from_settings translates it to the domain config error.
+        """
+        settings, _ = _make_settings(mocker, {"SCRAPY_DEDUP_STRATEGY": "bogus"})
+        with pytest.raises(ConfigurationError) as exc_info:
+            BackendDupeFilter.from_settings(settings)
+        assert exc_info.value.setting_name == "SCRAPY_DEDUP_STRATEGY"
+        assert "bogus" in str(exc_info.value.setting_value)
 
-  def test_preserves_key_and_debug(self, mocker) -> None:
-    settings, _ = _make_settings(
-      mocker,
-      {"SCRAPY_DUPEFILTER_KEY": "my:filter", "DUPEFILTER_DEBUG": True},
-    )
-    df = BackendDupeFilter.from_settings(settings)
-    assert df.key == "my:filter"
-    assert df.debug is True
+    def test_preserves_key_and_debug(self, mocker) -> None:
+        settings, _ = _make_settings(
+            mocker,
+            {"SCRAPY_DUPEFILTER_KEY": "my:filter", "DUPEFILTER_DEBUG": True},
+        )
+        df = BackendDupeFilter.from_settings(settings)
+        assert df.key == "my:filter"
+        assert df.debug is True
 
 
 class TestDupeFilterWithProbabilisticStrategy:
-  """End-to-end: a bloom-strategy dupefilter dedups real Scrapy requests."""
+    """End-to-end: a bloom-strategy dupefilter dedups real Scrapy requests."""
 
-  def test_new_then_duplicate_bloom(self, mock_connection_manager) -> None:
-    flt = BloomMembershipFilter(capacity=100, error_rate=0.01)
-    df = BackendDupeFilter(
-      connection_manager=mock_connection_manager, membership_filter=flt
-    )
-    req = Request(url="https://example.com/page")
-    assert df.request_seen(req) is False  # new
-    assert df.request_seen(req) is True  # duplicate (no false negatives)
+    def test_new_then_duplicate_bloom(self, mock_connection_manager) -> None:
+        flt = BloomMembershipFilter(capacity=100, error_rate=0.01)
+        df = BackendDupeFilter(
+            connection_manager=mock_connection_manager, membership_filter=flt
+        )
+        req = Request(url="https://example.com/page")
+        assert df.request_seen(req) is False  # new
+        assert df.request_seen(req) is True  # duplicate (no false negatives)
 
-  def test_distinct_requests_not_dupes_bloom(
-    self, mock_connection_manager
-  ) -> None:
-    flt = BloomMembershipFilter(capacity=100, error_rate=0.01)
-    df = BackendDupeFilter(
-      connection_manager=mock_connection_manager, membership_filter=flt
-    )
-    assert df.request_seen(Request(url="https://example.com/a")) is False
-    assert df.request_seen(Request(url="https://example.com/b")) is False
+    def test_distinct_requests_not_dupes_bloom(self, mock_connection_manager) -> None:
+        flt = BloomMembershipFilter(capacity=100, error_rate=0.01)
+        df = BackendDupeFilter(
+            connection_manager=mock_connection_manager, membership_filter=flt
+        )
+        assert df.request_seen(Request(url="https://example.com/a")) is False
+        assert df.request_seen(Request(url="https://example.com/b")) is False
 
-  def test_new_then_duplicate_cuckoo(self, mock_connection_manager) -> None:
-    flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
-    df = BackendDupeFilter(
-      connection_manager=mock_connection_manager, membership_filter=flt
-    )
-    req = Request(url="https://example.com/page")
-    assert df.request_seen(req) is False
-    assert df.request_seen(req) is True
+    def test_new_then_duplicate_cuckoo(self, mock_connection_manager) -> None:
+        flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
+        df = BackendDupeFilter(
+            connection_manager=mock_connection_manager, membership_filter=flt
+        )
+        req = Request(url="https://example.com/page")
+        assert df.request_seen(req) is False
+        assert df.request_seen(req) is True
 
 
 class TestPerProcessStrategyWarning:
-  """D3 (Theme C): factory warns once when a per-process dedup strategy is selected.
+    """D3 (Theme C): factory warns once when a per-process dedup strategy is selected.
 
-  Bloom / cuckoo / memory filters are in-process — cross-worker duplicates pass
-  silently. Operators assuming distributed dedup need a loud signal at selection
-  time, not just in class docstrings. The warning is emitted exactly once per
-  process per strategy (idempotent via a module-level ``_warned`` set).
-  """
-
-  @pytest.fixture(autouse=True)
-  def _reset_factory_warning_cache(self):
-    """Reset the module-level warning cache so each test re-triggers the check.
-
-    ``_warned`` is process-global; without reset the second test in this
-    class would observe zero warnings purely because the first already fired
-    one — masking regressions. This is test isolation, not gaming: the
-    production behavior we assert (warn-once per process) is verified by
-    ``test_warning_emitted_only_once_per_process``.
+    Bloom / cuckoo / memory filters are in-process — cross-worker duplicates pass
+    silently. Operators assuming distributed dedup need a loud signal at selection
+    time, not just in class docstrings. The warning is emitted exactly once per
+    process per strategy (idempotent via a module-level ``_warned`` set).
     """
-    factory_module._warned.clear()
-    yield
-    factory_module._warned.clear()
 
-  def test_bloom_strategy_emits_exactly_one_warning(
-    self, mock_connection_manager, caplog
-  ) -> None:
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
-      build_membership_filter(
-        DedupeStrategy.BLOOM,
-        mock_connection_manager,
-        bloom_capacity=100,
-        bloom_error_rate=0.01,
-      )
-    warnings = [
-      r
-      for r in caplog.records
-      if r.levelno == logging.WARNING and r.name == factory_module.__name__
-    ]
-    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"
-    msg = warnings[0].getMessage()
-    # Must state the per-process scope and point at the distributed alternative.
-    assert "per-process" in msg.lower() or "in-process" in msg.lower()
-    assert "set" in msg.lower()
+    @pytest.fixture(autouse=True)
+    def _reset_factory_warning_cache(self):
+        """Reset the module-level warning cache so each test re-triggers the check.
 
-  def test_cuckoo_strategy_emits_warning(self, mock_connection_manager, caplog) -> None:
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
-      build_membership_filter(
-        DedupeStrategy.CUCKOO,
-        mock_connection_manager,
-        cuckoo_capacity=100,
-        cuckoo_error_rate=0.01,
-      )
-    warnings = [
-      r
-      for r in caplog.records
-      if r.levelno == logging.WARNING and r.name == factory_module.__name__
-    ]
-    assert len(warnings) == 1
+        ``_warned`` is process-global; without reset the second test in this
+        class would observe zero warnings purely because the first already fired
+        one — masking regressions. This is test isolation, not gaming: the
+        production behavior we assert (warn-once per process) is verified by
+        ``test_warning_emitted_only_once_per_process``.
+        """
+        factory_module._warned.clear()
+        yield
+        factory_module._warned.clear()
 
-  def test_memory_strategy_emits_warning(self, mock_connection_manager, caplog) -> None:
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
-      build_membership_filter(
-        DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
-      )
-    warnings = [
-      r
-      for r in caplog.records
-      if r.levelno == logging.WARNING and r.name == factory_module.__name__
-    ]
-    assert len(warnings) == 1
+    def test_bloom_strategy_emits_exactly_one_warning(
+        self, mock_connection_manager, caplog
+    ) -> None:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+            build_membership_filter(
+                DedupeStrategy.BLOOM,
+                mock_connection_manager,
+                bloom_capacity=100,
+                bloom_error_rate=0.01,
+            )
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == factory_module.__name__
+        ]
+        assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"
+        msg = warnings[0].getMessage()
+        # Must state the per-process scope and point at the distributed alternative.
+        assert "per-process" in msg.lower() or "in-process" in msg.lower()
+        assert "set" in msg.lower()
 
-  def test_set_strategy_emits_no_warning(self, mock_connection_manager, caplog) -> None:
-    """The default set strategy is cross-worker (backend-backed) → no warning."""
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
-      build_membership_filter(DedupeStrategy.SET, mock_connection_manager, key="k")
-    warnings = [
-      r
-      for r in caplog.records
-      if r.levelno == logging.WARNING and r.name == factory_module.__name__
-    ]
-    assert len(warnings) == 0
+    def test_cuckoo_strategy_emits_warning(
+        self, mock_connection_manager, caplog
+    ) -> None:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+            build_membership_filter(
+                DedupeStrategy.CUCKOO,
+                mock_connection_manager,
+                cuckoo_capacity=100,
+                cuckoo_error_rate=0.01,
+            )
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == factory_module.__name__
+        ]
+        assert len(warnings) == 1
 
-  def test_warning_emitted_only_once_per_process(
-    self, mock_connection_manager, caplog
-  ) -> None:
-    """Building a per-process strategy twice in the same process warns once.
+    def test_memory_strategy_emits_warning(
+        self, mock_connection_manager, caplog
+    ) -> None:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+            build_membership_filter(
+                DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
+            )
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == factory_module.__name__
+        ]
+        assert len(warnings) == 1
 
-    Guards against log spam when many dupefilters are constructed (e.g. one
-    per spider in a multi-spider process).
-    """
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
-      build_membership_filter(
-        DedupeStrategy.BLOOM,
-        mock_connection_manager,
-        bloom_capacity=100,
-        bloom_error_rate=0.01,
-      )
-      build_membership_filter(
-        DedupeStrategy.BLOOM,
-        mock_connection_manager,
-        bloom_capacity=200,
-        bloom_error_rate=0.02,
-      )
-    warnings = [
-      r
-      for r in caplog.records
-      if r.levelno == logging.WARNING and r.name == factory_module.__name__
-    ]
-    assert len(warnings) == 1
+    def test_set_strategy_emits_no_warning(
+        self, mock_connection_manager, caplog
+    ) -> None:
+        """The default set strategy is cross-worker (backend-backed) → no warning."""
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+            build_membership_filter(
+                DedupeStrategy.SET, mock_connection_manager, key="k"
+            )
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == factory_module.__name__
+        ]
+        assert len(warnings) == 0
 
-  @pytest.mark.parametrize(
-    "diagnostic_error",
-    [
-      RuntimeError("warning handler failed"),
-      KeyboardInterrupt("warning handler interrupted"),
-      SystemExit("warning handler exited"),
-    ],
-  )
-  def test_warning_failure_preserves_non_strict_construction(
-    self, mock_connection_manager, mocker, diagnostic_error: BaseException
-  ) -> None:
-    """A per-process advisory cannot block a valid filter construction."""
-    warning = mocker.patch.object(
-      factory_module.logger, "warning", side_effect=diagnostic_error
+    def test_warning_emitted_only_once_per_process(
+        self, mock_connection_manager, caplog
+    ) -> None:
+        """Building a per-process strategy twice in the same process warns once.
+
+        Guards against log spam when many dupefilters are constructed (e.g. one
+        per spider in a multi-spider process).
+        """
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=factory_module.__name__):
+            build_membership_filter(
+                DedupeStrategy.BLOOM,
+                mock_connection_manager,
+                bloom_capacity=100,
+                bloom_error_rate=0.01,
+            )
+            build_membership_filter(
+                DedupeStrategy.BLOOM,
+                mock_connection_manager,
+                bloom_capacity=200,
+                bloom_error_rate=0.02,
+            )
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == factory_module.__name__
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.parametrize(
+        "diagnostic_error",
+        [
+            RuntimeError("warning handler failed"),
+            KeyboardInterrupt("warning handler interrupted"),
+            SystemExit("warning handler exited"),
+        ],
     )
+    def test_warning_failure_preserves_non_strict_construction(
+        self, mock_connection_manager, mocker, diagnostic_error: BaseException
+    ) -> None:
+        """A per-process advisory cannot block a valid filter construction."""
+        warning = mocker.patch.object(
+            factory_module.logger, "warning", side_effect=diagnostic_error
+        )
 
-    result = build_membership_filter(
-      DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
+        result = build_membership_filter(
+            DedupeStrategy.MEMORY, mock_connection_manager, memory_maxsize=10
+        )
+
+        assert isinstance(result, MemoryMembershipFilter)
+        assert DedupeStrategy.MEMORY in factory_module._warned
+        warning.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "diagnostic_error",
+        [RuntimeError("warning handler failed"), KeyboardInterrupt(), SystemExit()],
     )
+    def test_warning_failure_does_not_suppress_filter_construction_error(
+        self, mock_connection_manager, mocker, diagnostic_error: BaseException
+    ) -> None:
+        """Only the advisory is isolated; real constructor failures still escape."""
+        mocker.patch.object(
+            factory_module.logger, "warning", side_effect=diagnostic_error
+        )
+        mocker.patch.object(
+            factory_module,
+            "MemoryMembershipFilter",
+            side_effect=ValueError("invalid memory filter"),
+        )
 
-    assert isinstance(result, MemoryMembershipFilter)
-    assert DedupeStrategy.MEMORY in factory_module._warned
-    warning.assert_called_once()
-
-  @pytest.mark.parametrize(
-    "diagnostic_error",
-    [RuntimeError("warning handler failed"), KeyboardInterrupt(), SystemExit()],
-  )
-  def test_warning_failure_does_not_suppress_filter_construction_error(
-    self, mock_connection_manager, mocker, diagnostic_error: BaseException
-  ) -> None:
-    """Only the advisory is isolated; real constructor failures still escape."""
-    mocker.patch.object(factory_module.logger, "warning", side_effect=diagnostic_error)
-    mocker.patch.object(
-      factory_module,
-      "MemoryMembershipFilter",
-      side_effect=ValueError("invalid memory filter"),
-    )
-
-    with pytest.raises(ValueError, match="invalid memory filter"):
-      build_membership_filter(DedupeStrategy.MEMORY, mock_connection_manager)
+        with pytest.raises(ValueError, match="invalid memory filter"):
+            build_membership_filter(DedupeStrategy.MEMORY, mock_connection_manager)
 
 
 class TestStrictDedupFailLoud:
-  """Risk 3: SCRAPY_DEDUP_STRICT fails loud on per-process strategies."""
+    """Risk 3: SCRAPY_DEDUP_STRICT fails loud on per-process strategies."""
 
-  def test_strict_rejects_memory(self, mocker) -> None:
-    """strict=True + memory → ConfigurationError at factory time."""
-    from scrapy_extension.exceptions import ConfigurationError
+    def test_strict_rejects_memory(self, mocker) -> None:
+        """strict=True + memory → ConfigurationError at factory time."""
+        from scrapy_extension.exceptions import ConfigurationError
 
-    mock_manager = mocker.Mock()
-    with pytest.raises(ConfigurationError) as exc_info:
-      build_membership_filter(DedupeStrategy.MEMORY, mock_manager, strict=True)
-    assert exc_info.value.setting_name == "SCRAPY_DEDUP_STRATEGY"
+        mock_manager = mocker.Mock()
+        with pytest.raises(ConfigurationError) as exc_info:
+            build_membership_filter(DedupeStrategy.MEMORY, mock_manager, strict=True)
+        assert exc_info.value.setting_name == "SCRAPY_DEDUP_STRATEGY"
 
-  def test_strict_rejects_bloom(self, mocker) -> None:
-    from scrapy_extension.exceptions import ConfigurationError
+    def test_strict_rejects_bloom(self, mocker) -> None:
+        from scrapy_extension.exceptions import ConfigurationError
 
-    mock_manager = mocker.Mock()
-    with pytest.raises(ConfigurationError):
-      build_membership_filter(DedupeStrategy.BLOOM, mock_manager, strict=True)
+        mock_manager = mocker.Mock()
+        with pytest.raises(ConfigurationError):
+            build_membership_filter(DedupeStrategy.BLOOM, mock_manager, strict=True)
 
-  def test_strict_rejects_cuckoo(self, mocker) -> None:
-    from scrapy_extension.exceptions import ConfigurationError
+    def test_strict_rejects_cuckoo(self, mocker) -> None:
+        from scrapy_extension.exceptions import ConfigurationError
 
-    mock_manager = mocker.Mock()
-    with pytest.raises(ConfigurationError):
-      build_membership_filter(DedupeStrategy.CUCKOO, mock_manager, strict=True)
+        mock_manager = mocker.Mock()
+        with pytest.raises(ConfigurationError):
+            build_membership_filter(DedupeStrategy.CUCKOO, mock_manager, strict=True)
 
-  def test_strict_allows_set(self, mocker) -> None:
-    """set is distributed-exact → strict must NOT reject it."""
-    mock_manager = mocker.Mock()
-    result = build_membership_filter(DedupeStrategy.SET, mock_manager, strict=True)
-    assert isinstance(result, MembershipFilter)
+    def test_strict_allows_set(self, mocker) -> None:
+        """set is distributed-exact → strict must NOT reject it."""
+        mock_manager = mocker.Mock()
+        result = build_membership_filter(DedupeStrategy.SET, mock_manager, strict=True)
+        assert isinstance(result, MembershipFilter)
 
-  def test_default_non_strict_memory_does_not_raise(self, mocker) -> None:
-    """Default (strict=False) preserves the warn-once behavior — no raise."""
-    mock_manager = mocker.Mock()
-    result = build_membership_filter(DedupeStrategy.MEMORY, mock_manager)
-    assert isinstance(result, MembershipFilter)
+    def test_default_non_strict_memory_does_not_raise(self, mocker) -> None:
+        """Default (strict=False) preserves the warn-once behavior — no raise."""
+        mock_manager = mocker.Mock()
+        result = build_membership_filter(DedupeStrategy.MEMORY, mock_manager)
+        assert isinstance(result, MembershipFilter)

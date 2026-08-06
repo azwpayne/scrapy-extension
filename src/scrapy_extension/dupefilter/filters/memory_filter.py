@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
 
 if TYPE_CHECKING:
-  from scrapy_extension.monitor.base import Monitor
+    from scrapy_extension.monitor.base import Monitor
 
 logger = logging.getLogger(__name__)
 
@@ -35,195 +35,195 @@ _evicted_warned: bool = False
 
 
 class MemoryMembershipFilter(MembershipFilter):
-  """Exact, in-process membership filter with an optional LRU bound.
+    """Exact, in-process membership filter with an optional LRU bound.
 
-  Stores fingerprints in an :class:`~collections.OrderedDict`; re-adding an
-  item marks it most-recently-used. When ``maxsize`` is set and the filter
-  is full, the least-recently-used item is evicted on the next insert.
+    Stores fingerprints in an :class:`~collections.OrderedDict`; re-adding an
+    item marks it most-recently-used. When ``maxsize`` is set and the filter
+    is full, the least-recently-used item is evicted on the next insert.
 
-  State is local to the process — not shared across distributed workers.
-  For multi-worker exact dedup, use the ``set`` strategy.
+    State is local to the process — not shared across distributed workers.
+    For multi-worker exact dedup, use the ``set`` strategy.
 
-  Eviction tradeoff (SPEC U5): an evicted fingerprint is forgotten, so a
-  re-crawl of that URL becomes possible (false-negative on dedup). This is
-  surfaced via a one-time per-process WARNING at first eviction so operators
-  can choose a higher ``maxsize`` or switch to the backend-backed ``set``
-  strategy for exact cross-process dedup.
+    Eviction tradeoff (SPEC U5): an evicted fingerprint is forgotten, so a
+    re-crawl of that URL becomes possible (false-negative on dedup). This is
+    surfaced via a one-time per-process WARNING at first eviction so operators
+    can choose a higher ``maxsize`` or switch to the backend-backed ``set``
+    strategy for exact cross-process dedup.
 
-  Attributes:
-      _maxsize: Capacity cap; None = unbounded (advanced opt-out).
-          Defaults to :data:`DEFAULT_MEMORY_MAXSIZE` (1_000_000).
-      _data: Insertion/access-ordered mapping of fingerprints.
-      _monitor: Optional standalone observability monitor. A containing
-          :class:`~scrapy_extension.dupefilter.dupefilter.BackendDupeFilter`
-          installs a ``NullMonitor`` here and records the equivalent event for
-          ordered dispatch after its lock is released. ``None`` (default)
-          means capacity events stay silent (the eviction warning still logs).
-  """
-
-  def __init__(self, *, maxsize: int | None = DEFAULT_MEMORY_MAXSIZE) -> None:
-    """Initialize the memory filter.
-
-    Args:
-        maxsize: Maximum items to retain before evicting the
-            least-recently-used. Defaults to :data:`DEFAULT_MEMORY_MAXSIZE`
-            (1_000_000) to prevent silent OOM on long crawls. Pass ``None``
-            for unbounded growth (advanced opt-out — accepts the OOM risk).
-
-    Raises:
-        ValueError: If maxsize is a non-positive integer.
+    Attributes:
+        _maxsize: Capacity cap; None = unbounded (advanced opt-out).
+            Defaults to :data:`DEFAULT_MEMORY_MAXSIZE` (1_000_000).
+        _data: Insertion/access-ordered mapping of fingerprints.
+        _monitor: Optional standalone observability monitor. A containing
+            :class:`~scrapy_extension.dupefilter.dupefilter.BackendDupeFilter`
+            installs a ``NullMonitor`` here and records the equivalent event for
+            ordered dispatch after its lock is released. ``None`` (default)
+            means capacity events stay silent (the eviction warning still logs).
     """
-    if maxsize is not None and maxsize <= 0:
-      raise ValueError(
-        f"maxsize must be a positive integer or None, got {maxsize}"
-      )
-    self._maxsize = maxsize
-    self._data: OrderedDict[bytes, None] = OrderedDict()
-    # Standalone filters may opt into direct saturation telemetry. A containing
-    # dupefilter installs NullMonitor and publishes its recorded equivalent
-    # outside the lifecycle lock instead.
-    self._monitor: Monitor | None = None
 
-  def set_monitor(self, monitor: Monitor) -> None:
-    """Thread a monitor so finite-capacity saturation can be emitted (R14-D).
+    def __init__(self, *, maxsize: int | None = DEFAULT_MEMORY_MAXSIZE) -> None:
+        """Initialize the memory filter.
 
-    A containing :class:`BackendDupeFilter
-    <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter>` installs a
-    ``NullMonitor`` because it dispatches the equivalent recorded event after
-    releasing its own lock. Standalone callers may provide a real monitor.
-    Idempotent; safe before or after the first capacity event. The eviction
-    warning log is independent of this hook.
+        Args:
+            maxsize: Maximum items to retain before evicting the
+                least-recently-used. Defaults to :data:`DEFAULT_MEMORY_MAXSIZE`
+                (1_000_000) to prevent silent OOM on long crawls. Pass ``None``
+                for unbounded growth (advanced opt-out — accepts the OOM risk).
 
-    Args:
-        monitor: The monitor to emit ``on_filter_saturation`` through.
-    """
-    self._monitor = monitor
+        Raises:
+            ValueError: If maxsize is a non-positive integer.
+        """
+        if maxsize is not None and maxsize <= 0:
+            raise ValueError(
+                f"maxsize must be a positive integer or None, got {maxsize}"
+            )
+        self._maxsize = maxsize
+        self._data: OrderedDict[bytes, None] = OrderedDict()
+        # Standalone filters may opt into direct saturation telemetry. A containing
+        # dupefilter installs NullMonitor and publishes its recorded equivalent
+        # outside the lifecycle lock instead.
+        self._monitor: Monitor | None = None
 
-  def _emit_saturation(self, used: int, capacity: int) -> None:
-    """Publish saturation without letting telemetry reject an insertion."""
-    if self._monitor is None:
-      return
-    monitor_failed = False
-    try:
-      self._monitor.on_filter_saturation(used, capacity)
-    except Exception:  # noqa: BLE001 - telemetry must not alter filter state
-      monitor_failed = True
-    if monitor_failed:
-      try:
-        logger.debug("Memory filter saturation monitor hook raised; ignored")
-      except BaseException:  # noqa: BLE001 - diagnostics are best effort too
-        # The monitor exception is the authored control boundary: only this
-        # fallback diagnostic is advisory.  A broken logging handler must not
-        # replace the already-successful insertion, including when it raises a
-        # process-control signal.
-        return
+    def set_monitor(self, monitor: Monitor) -> None:
+        """Thread a monitor so finite-capacity saturation can be emitted (R14-D).
 
-  @property
-  def saturation(self) -> float | None:
-    """Return the finite-cap signal only once the filter is full."""
-    if self._maxsize is None or len(self._data) < self._maxsize:
-      return None
-    return 1.0
+        A containing :class:`BackendDupeFilter
+        <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter>` installs a
+        ``NullMonitor`` because it dispatches the equivalent recorded event after
+        releasing its own lock. Standalone callers may provide a real monitor.
+        Idempotent; safe before or after the first capacity event. The eviction
+        warning log is independent of this hook.
 
-  @property
-  def capacity(self) -> int | None:
-    """Return the configured finite item cap, or ``None`` when unbounded."""
-    return self._maxsize
+        Args:
+            monitor: The monitor to emit ``on_filter_saturation`` through.
+        """
+        self._monitor = monitor
 
-  def _warn_evicted_once(self) -> None:
-    """Emit a one-time per-process warning when LRU eviction first fires.
+    def _emit_saturation(self, used: int, capacity: int) -> None:
+        """Publish saturation without letting telemetry reject an insertion."""
+        if self._monitor is None:
+            return
+        monitor_failed = False
+        try:
+            self._monitor.on_filter_saturation(used, capacity)
+        except Exception:  # noqa: BLE001 - telemetry must not alter filter state
+            monitor_failed = True
+        if monitor_failed:
+            try:
+                logger.debug("Memory filter saturation monitor hook raised; ignored")
+            except BaseException:  # noqa: BLE001 - diagnostics are best effort too
+                # The monitor exception is the authored control boundary: only this
+                # fallback diagnostic is advisory.  A broken logging handler must not
+                # replace the already-successful insertion, including when it raises a
+                # process-control signal.
+                return
 
-    Eviction means an already-seen URL can be re-admitted (dedup
-    false-negative → re-crawl). Make that tradeoff non-silent once per
-    process. Idempotent via the module-level ``_evicted_warned`` flag so a
-    multi-spider process does not spam the log.
-    """
-    global _evicted_warned
-    if _evicted_warned:
-      return
-    _evicted_warned = True
-    try:
-      logger.warning(
-        "MemoryMembershipFilter reached its maxsize cap (%s) and is now "
-        "evicting least-recently-used fingerprints. Evicted entries are "
-        "forgotten, so their URLs may be re-crawled (dedup false-negative). "
-        "Raise maxsize, pass maxsize=None for unbounded growth (OOM risk), "
-        "or switch to the backend-backed 'set' strategy for exact cross-"
-        "process dedup.",
-        f"{self._maxsize:,}" if self._maxsize is not None else "None",
-      )
-    except BaseException:
-      # LRU eviction is already linearized before this advisory warning. A
-      # custom handler may raise RuntimeError or a process-control signal, but
-      # it cannot make the incoming fingerprint disappear from the bounded
-      # filter.
-      pass
+    @property
+    def saturation(self) -> float | None:
+        """Return the finite-cap signal only once the filter is full."""
+        if self._maxsize is None or len(self._data) < self._maxsize:
+            return None
+        return 1.0
 
-  def add(self, item: bytes) -> bool:
-    """Record an item; True if new, False if already present.
+    @property
+    def capacity(self) -> int | None:
+        """Return the configured finite item cap, or ``None`` when unbounded."""
+        return self._maxsize
 
-    Re-adding an existing item updates its LRU position so frequently-seen
-    fingerprints are not evicted.
+    def _warn_evicted_once(self) -> None:
+        """Emit a one-time per-process warning when LRU eviction first fires.
 
-    Args:
-        item: Fingerprint bytes.
+        Eviction means an already-seen URL can be re-admitted (dedup
+        false-negative → re-crawl). Make that tradeoff non-silent once per
+        process. Idempotent via the module-level ``_evicted_warned`` flag so a
+        multi-spider process does not spam the log.
+        """
+        global _evicted_warned
+        if _evicted_warned:
+            return
+        _evicted_warned = True
+        try:
+            logger.warning(
+                "MemoryMembershipFilter reached its maxsize cap (%s) and is now "
+                "evicting least-recently-used fingerprints. Evicted entries are "
+                "forgotten, so their URLs may be re-crawled (dedup false-negative). "
+                "Raise maxsize, pass maxsize=None for unbounded growth (OOM risk), "
+                "or switch to the backend-backed 'set' strategy for exact cross-"
+                "process dedup.",
+                f"{self._maxsize:,}" if self._maxsize is not None else "None",
+            )
+        except BaseException:
+            # LRU eviction is already linearized before this advisory warning. A
+            # custom handler may raise RuntimeError or a process-control signal, but
+            # it cannot make the incoming fingerprint disappear from the bounded
+            # filter.
+            pass
 
-    Returns:
-        True if newly added, False if already present.
-    """
-    if item in self._data:
-      self._data.move_to_end(item)
-      return False
-    if self._maxsize is not None and len(self._data) >= self._maxsize:
-      self._data.popitem(last=False)  # evict least-recently-used
-      self._warn_evicted_once()
-    self._data[item] = None
-    # R14-D: emit after a successful insert first reaches or remains at cap,
-    # with or without an eviction (len == maxsize). This is the saturation
-    # ceiling the operator cares about. Sustained eviction keeps the gauge
-    # pinned at 1.0 (matching the cuckoo/bloom ``used/capacity`` contract).
-    # No-op when no monitor was threaded (standalone filter use).
-    if (
-      self._monitor is not None
-      and self._maxsize is not None
-      and len(self._data) >= self._maxsize
-    ):
-      self._emit_saturation(len(self._data), self._maxsize)
-    return True
+    def add(self, item: bytes) -> bool:
+        """Record an item; True if new, False if already present.
 
-  def __contains__(self, item: bytes) -> bool:
-    """Check membership (read-only — does not affect LRU order).
+        Re-adding an existing item updates its LRU position so frequently-seen
+        fingerprints are not evicted.
 
-    Args:
-        item: Fingerprint bytes.
+        Args:
+            item: Fingerprint bytes.
 
-    Returns:
-        True if the item is tracked.
-    """
-    return item in self._data
+        Returns:
+            True if newly added, False if already present.
+        """
+        if item in self._data:
+            self._data.move_to_end(item)
+            return False
+        if self._maxsize is not None and len(self._data) >= self._maxsize:
+            self._data.popitem(last=False)  # evict least-recently-used
+            self._warn_evicted_once()
+        self._data[item] = None
+        # R14-D: emit after a successful insert first reaches or remains at cap,
+        # with or without an eviction (len == maxsize). This is the saturation
+        # ceiling the operator cares about. Sustained eviction keeps the gauge
+        # pinned at 1.0 (matching the cuckoo/bloom ``used/capacity`` contract).
+        # No-op when no monitor was threaded (standalone filter use).
+        if (
+            self._monitor is not None
+            and self._maxsize is not None
+            and len(self._data) >= self._maxsize
+        ):
+            self._emit_saturation(len(self._data), self._maxsize)
+        return True
 
-  def __len__(self) -> int:
-    """Return the number of tracked items.
+    def __contains__(self, item: bytes) -> bool:
+        """Check membership (read-only — does not affect LRU order).
 
-    Returns:
-        Current item count.
-    """
-    return len(self._data)
+        Args:
+            item: Fingerprint bytes.
 
-  def clear(self) -> None:
-    """Remove all tracked items."""
-    self._data.clear()
+        Returns:
+            True if the item is tracked.
+        """
+        return item in self._data
 
-  def remove(self, item: bytes) -> bool:
-    """Remove an item.
+    def __len__(self) -> int:
+        """Return the number of tracked items.
 
-    Args:
-        item: Fingerprint bytes.
+        Returns:
+            Current item count.
+        """
+        return len(self._data)
 
-    Returns:
-        True if the item was present and removed, False otherwise.
-    """
-    if item in self._data:
-      del self._data[item]
-      return True
-    return False
+    def clear(self) -> None:
+        """Remove all tracked items."""
+        self._data.clear()
+
+    def remove(self, item: bytes) -> bool:
+        """Remove an item.
+
+        Args:
+            item: Fingerprint bytes.
+
+        Returns:
+            True if the item was present and removed, False otherwise.
+        """
+        if item in self._data:
+            del self._data[item]
+            return True
+        return False

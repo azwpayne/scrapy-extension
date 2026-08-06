@@ -8,16 +8,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from scrapy_extension.backends.base import (
-  BackendType,
-  QueueBackend,
-  SetBackend,
-  StorageBackend,
+    BackendType,
+    QueueBackend,
+    SetBackend,
+    StorageBackend,
 )
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import (
-  BackendConnectionError,
-  ConfigurationError,
-  QueueError,
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
 )
 
 # Expected concrete class name per BackendType. Asserting ``type(backend).__name__``
@@ -26,1613 +26,1630 @@ from scrapy_extension.exceptions import (
 # ``backend_type is PULSAR`` (a hardcoded property) but the constructed class name
 # would mismatch. This pins the per-case wiring, not just dispatch success.
 _EXPECTED_BACKEND_CLASS: dict[BackendType, str] = {
-  BackendType.REDIS: "RedisBackend",
-  BackendType.MONGODB: "MongoDBBackend",
-  BackendType.KAFKA: "KafkaBackend",
-  BackendType.RABBITMQ: "RabbitMQBackend",
-  BackendType.ELASTICSEARCH: "ElasticSearchBackend",
-  BackendType.ROCKETMQ: "RocketMQBackend",
-  BackendType.PULSAR: "PulsarBackend",
-  BackendType.SQS: "SqsBackend",
-  BackendType.MEMCACHED: "MemcachedBackend",
-  BackendType.DYNAMODB: "DynamoDBBackend",
+    BackendType.REDIS: "RedisBackend",
+    BackendType.MONGODB: "MongoDBBackend",
+    BackendType.KAFKA: "KafkaBackend",
+    BackendType.RABBITMQ: "RabbitMQBackend",
+    BackendType.ELASTICSEARCH: "ElasticSearchBackend",
+    BackendType.ROCKETMQ: "RocketMQBackend",
+    BackendType.PULSAR: "PulsarBackend",
+    BackendType.SQS: "SqsBackend",
+    BackendType.MEMCACHED: "MemcachedBackend",
+    BackendType.DYNAMODB: "DynamoDBBackend",
 }
 
 
 def _assert_package_traceback_locals_are_redacted(
-  error: BaseException,
-  marker: str,
+    error: BaseException,
+    marker: str,
 ) -> None:
-  """Check a sanitizing wrapper does not retain its rejected input."""
-  trace = error.__traceback__
-  while trace is not None:
-    frame = trace.tb_frame
-    if "/src/scrapy_extension/" in frame.f_code.co_filename:
-      locals_snapshot = frame.f_locals
-      assert marker not in repr(locals_snapshot)
-      for local in locals_snapshot.values():
-        if type(local) is ConnectionManager:
-          settings = vars(local).get("settings")
-          if settings is not None:
-            assert marker not in repr(settings)
-        if type(local) is tuple:
-          for argument in local:
-            if type(argument) is ConnectionManager:
-              settings = vars(argument).get("settings")
-              if settings is not None:
-                assert marker not in repr(settings)
-    trace = trace.tb_next
+    """Check a sanitizing wrapper does not retain its rejected input."""
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            locals_snapshot = frame.f_locals
+            assert marker not in repr(locals_snapshot)
+            for local in locals_snapshot.values():
+                if type(local) is ConnectionManager:
+                    settings = vars(local).get("settings")
+                    if settings is not None:
+                        assert marker not in repr(settings)
+                if type(local) is tuple:
+                    for argument in local:
+                        if type(argument) is ConnectionManager:
+                            settings = vars(argument).get("settings")
+                            if settings is not None:
+                                assert marker not in repr(settings)
+        trace = trace.tb_next
 
 
 def test_resolve_boundary_rejects_hostile_configuration_error_subclass():
-  """A plugin error subclass must not run code while the boundary sanitizes it."""
-  from scrapy_extension.backends.connectors import resolve_backend_config
-
-  marker = "hostile-configuration-error-marker"
-
-  class _HostileConfigurationError(ConfigurationError):
-    def __getattribute__(self, name: str) -> object:
-      if name in {"args", "setting_name"}:
-        raise RuntimeError(marker)
-      return super().__getattribute__(name)
-
-  class _Settings:
-    def get(self, key: str, default: object = None) -> object:
-      del key, default
-      raise _HostileConfigurationError(marker)
-
-    def getdict(self, key: str, default: object = None) -> object:
-      del key, default
-      raise AssertionError("getdict must not run after the rejected error")
-
-  with pytest.raises(ConfigurationError) as exc_info:
-    resolve_backend_config(
-      _Settings(),
-      "SCRAPY_QUEUE_BACKEND_TYPE",
-      "SCRAPY_QUEUE_BACKEND_SETTINGS",
-    )
-
-  error = exc_info.value
-  assert str(error) == "Backend configuration is invalid."
-  assert error.setting_name == "configuration"
-  assert marker not in repr(error.__dict__)
-  assert marker not in "".join(traceback.format_exception(error))
-  assert error.__cause__ is None
-  assert error.__context__ is None
-  _assert_package_traceback_locals_are_redacted(error, marker)
-
-
-def test_resolve_boundary_rebuilds_bundled_import_error_without_loader_frames(
-  monkeypatch: pytest.MonkeyPatch,
-):
-  """Resolver keeps ImportError semantics without retaining Scrapy settings."""
-  from scrapy_extension.backends import connectors
-
-  marker = "resolver-bundled-import-secret-marker"
-
-  class _Settings:
-    def get(self, key: str, default: object = None) -> object:
-      if key == "SCRAPY_QUEUE_BACKEND_TYPE":
-        return "redis"
-      return default
-
-    def getdict(self, key: str, default: object = None) -> object:
-      del key
-      return {} if default is None else default
-
-  monkeypatch.setattr(
-    connectors,
-    "_load_object",
-    lambda _: (_ for _ in ()).throw(ImportError(marker)),
-  )
-
-  with pytest.raises(ImportError) as exc_info:
-    connectors.resolve_backend_config(
-      _Settings(),
-      "SCRAPY_QUEUE_BACKEND_TYPE",
-      "SCRAPY_QUEUE_BACKEND_SETTINGS",
-    )
-
-  error = exc_info.value
-  assert str(error) == "A bundled backend optional dependency is unavailable."
-  assert marker not in "".join(traceback.format_exception(error))
-  assert error.__cause__ is None
-  assert error.__context__ is None
-  _assert_package_traceback_locals_are_redacted(error, marker)
-
-
-def test_capability_message_parser_accepts_only_bundled_structures():
-  """The message whitelist is structural, not a plugin-controlled format."""
-  from scrapy_extension.backends import connectors
-
-  valid = (
-    "Selected redis does not support the queue interface and is missing capabilities. "
-    "Capable bundled backends: ['elasticsearch', 'mongodb', 'redis']."
-  )
-  assert connectors._is_safe_capability_message(valid) is True
-  assert connectors._is_safe_capability_message("x" * 513) is False
-  assert (
-    connectors._is_safe_capability_message(
-      "Selected untrusted does not support the queue interface and is missing "
-      "capabilities. Capable bundled backends: ['redis']."
-    )
-    is False
-  )
-  assert (
-    connectors._is_safe_capability_message(
-      "Selected redis does not support the secret interface and is missing "
-      "capabilities. Capable bundled backends: ['redis']."
-    )
-    is False
-  )
-  assert (
-    connectors._is_safe_capability_message(
-      "Selected redis does not support the queue interface and is missing "
-      "capabilities. Capable bundled backends: [not-a-python-list]."
-    )
-    is False
-  )
-  assert (
-    connectors._is_safe_capability_message(
-      "Selected redis interface and is missing capabilities. Capable bundled "
-      "backends: ['redis']. does not support the queue"
-    )
-    is False
-  )
-
-
-def test_manager_connection_message_parser_rejects_untrusted_variants():
-  """Only bounded manager retry grammar survives a rebuilt connection error."""
-  from scrapy_extension.backends import connectors
-
-  fallback = "Connection manager failed to connect to the selected backend."
-
-  class _SubclassedConnectionError(BackendConnectionError):
-    pass
-
-  assert (
-    connectors._safe_manager_connection_message(
-      _SubclassedConnectionError("Failed to connect after 1 attempt.")
-    )
-    == fallback
-  )
-
-  malformed_args = BackendConnectionError("ignored")
-  malformed_args.args = ("first", "second")
-  assert connectors._safe_manager_connection_message(malformed_args) == fallback
-  assert (
-    connectors._safe_manager_connection_message(
-      BackendConnectionError("Failed to connect after invalid attempts.")
-    )
-    == fallback
-  )
-  assert (
-    connectors._safe_manager_connection_message(
-      BackendConnectionError("Failed to connect after 999 attempts.")
-    )
-    == fallback
-  )
-  assert (
-    connectors._safe_manager_connection_message(
-      BackendConnectionError("Failed to connect after 22 attempts.")
-    )
-    == fallback
-  )
-  assert (
-    connectors._safe_manager_connection_message(
-      BackendConnectionError("Failed to connect after 1 attempt.")
-    )
-    == "Failed to connect after 1 attempt."
-  )
-
-  assert (
-    connectors._safe_manager_connection_backend_type(
-      BackendConnectionError("failed", backend_type="redis")
-    )
-    == "redis"
-  )
-  assert (
-    connectors._safe_manager_connection_backend_type(
-      BackendConnectionError("failed", backend_type="BackendType.REDIS")
-    )
-    == "redis"
-  )
-  assert (
-    connectors._safe_manager_connection_backend_type(
-      BackendConnectionError("failed", backend_type="untrusted-plugin")
-    )
-    == "connection-manager"
-  )
-
-
-def test_manager_configuration_message_parser_rejects_unknown_descriptor():
-  """A plugin-controlled descriptor name cannot enter a preserved error."""
-  from scrapy_extension.backends import connectors
-
-  assert (
-    connectors._is_safe_manager_configuration_message(
-      "Selected endpoint-secret does not implement its declared contract: missing "
-      "Backend."
-    )
-    is False
-  )
-
-
-def test_manager_setting_name_uses_only_verified_bundled_fields():
-  """A static field label may survive only when it is actually declared."""
-  from scrapy_extension.backends import connectors
-
-  fields = frozenset({"host"})
-  assert (
-    connectors._safe_manager_setting_name(
-      ConfigurationError("invalid", setting_name="host"), "redis", fields
-    )
-    == "host"
-  )
-  assert (
-    connectors._safe_manager_setting_name(
-      ConfigurationError("invalid", setting_name="endpoint-secret"), "redis", fields
-    )
-    == "backend_settings"
-  )
-  assert (
-    connectors._safe_manager_setting_name(RuntimeError("invalid"), "redis", fields)
-    == "backend_settings"
-  )
-
-
-def test_configuration_boundary_fails_closed_when_message_predicate_crashes():
-  """An allowlist predicate is untrusted code and must not publish its input."""
-  from scrapy_extension.exceptions._redaction import configuration_error_boundary
-
-  marker = "predicate-redaction-secret-marker"
-
-  def _raising_predicate(_: str) -> bool:
-    raise RuntimeError(marker)
-
-  @configuration_error_boundary(
-    "Configuration is invalid.",
-    {"host"},
-    preserve_static_message=True,
-    safe_message_predicate=_raising_predicate,
-  )
-  def _raise_configuration_error() -> None:
-    raise ConfigurationError("potentially-safe-message", setting_name="host")
-
-  with pytest.raises(ConfigurationError) as exc_info:
-    _raise_configuration_error()
-
-  error = exc_info.value
-  assert str(error) == "Configuration is invalid."
-  assert error.setting_name == "host"
-  assert marker not in "".join(traceback.format_exception(error))
-  assert error.__cause__ is None
-  assert error.__context__ is None
-  _assert_package_traceback_locals_are_redacted(error, marker)
-
-
-def test_create_backend_rebuilds_bundled_loader_runtime_failures(
-  monkeypatch: pytest.MonkeyPatch,
-):
-  """A bundled loader fault cannot retain manager settings at the API boundary."""
-  from scrapy_extension.backends import connectors
-
-  marker = "bundled-loader-runtime-secret-marker"
-
-  def _raise_loader_error(_: str) -> object:
-    raise RuntimeError(marker)
-
-  monkeypatch.setattr(connectors, "_load_object", _raise_loader_error)
-  manager = ConnectionManager(BackendType.REDIS, {"password": marker})
-
-  with pytest.raises(ConfigurationError) as exc_info:
-    manager._create_backend()
-
-  error = exc_info.value
-  assert str(error) == "Connection manager configuration is invalid."
-  assert error.setting_name == "configuration"
-  assert marker not in "".join(traceback.format_exception(error))
-  assert error.__cause__ is None
-  assert error.__context__ is None
-  _assert_package_traceback_locals_are_redacted(error, marker)
-
-
-def test_rebuild_connect_attempt_error_fails_closed_when_message_check_crashes(
-  monkeypatch: pytest.MonkeyPatch,
-):
-  """A defensive manager-message check must not publish its candidate text."""
-  from scrapy_extension.backends import connectors
-
-  def _raise_from_message_check(_: str) -> bool:
-    raise RuntimeError("message-check-secret-marker")
-
-  monkeypatch.setattr(
-    connectors,
-    "_is_safe_manager_configuration_message",
-    _raise_from_message_check,
-  )
-
-  rebuilt = connectors._rebuild_connect_attempt_error(
-    ConfigurationError("candidate-manager-message", setting_name="configuration")
-  )
-
-  assert type(rebuilt) is ConfigurationError
-  assert str(rebuilt) == "Connection manager configuration is invalid."
-  assert rebuilt.setting_name == "configuration"
-
-
-
-class TestConnectionManagerCreateBackend:
-  """Tests for _create_backend method."""
-
-  def test_create_backend_redis(self, mocker):
-    """Test _create_backend creates RedisBackend correctly."""
-    mock_backend = mocker.MagicMock()
-    mock_redis_backend = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
-    mock_redis_backend.return_value = mock_backend
-
-    manager = ConnectionManager(BackendType.REDIS)
-    backend = manager._create_backend()
-
-    mock_redis_backend.assert_called_once()
-    assert backend == mock_backend
-
-  def test_create_backend_mongodb(self, mocker):
-    """Test _create_backend creates MongoDBBackend correctly."""
-    mock_backend = mocker.MagicMock()
-    mock_mongo_backend = mocker.patch(
-      "scrapy_extension.backends.mongodb.MongoDBBackend"
-    )
-    mock_mongo_backend.return_value = mock_backend
-
-    manager = ConnectionManager(BackendType.MONGODB)
-    backend = manager._create_backend()
-
-    mock_mongo_backend.assert_called_once()
-    assert backend == mock_backend
-
-  def test_create_backend_kafka(self, mocker):
-    """Test _create_backend creates KafkaBackend correctly."""
-    mock_backend = mocker.MagicMock()
-    mock_kafka_backend = mocker.patch("scrapy_extension.backends.kafka.KafkaBackend")
-    mock_kafka_backend.return_value = mock_backend
-
-    manager = ConnectionManager(BackendType.KAFKA)
-    backend = manager._create_backend()
-
-    mock_kafka_backend.assert_called_once()
-    assert backend == mock_backend
-
-  def test_create_backend_strips_internal_queue_scope(self, mocker):
-    """Registry-only queue scope must never reach backend settings models."""
-    from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
-
-    settings_cls = mocker.patch("scrapy_extension.settings.KafkaSettings")
-    settings_obj = mocker.MagicMock(name="KafkaSettings")
-    settings_cls.return_value = settings_obj
-    backend_cls = mocker.patch("scrapy_extension.backends.kafka.KafkaBackend")
-    manager = ConnectionManager(
-      BackendType.KAFKA,
-      {
-        "bootstrap_servers": "broker:9092",
-        _CONNECTION_MANAGER_SCOPE_KEY: "queue-a",
-      },
-    )
-
-    manager._create_backend()
-
-    settings_cls.assert_called_once_with(bootstrap_servers="broker:9092")
-    backend_cls.assert_called_once_with(settings_obj)
-
-  def test_create_backend_strips_direct_manager_retry_controls(self, mocker):
-    """Public manager retry controls must not enter strict backend models."""
-    settings_cls = mocker.patch("scrapy_extension.settings.RedisSettings")
-    settings_obj = mocker.MagicMock(name="RedisSettings")
-    settings_cls.return_value = settings_obj
-    backend_cls = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
-    manager = ConnectionManager(
-      BackendType.REDIS,
-      {
-        "host": "redis.internal",
-        "retry_attempts": 0,
-        "retry_delay": 0.25,
-      },
-    )
-
-    manager._create_backend()
-
-    settings_cls.assert_called_once_with(host="redis.internal")
-    backend_cls.assert_called_once_with(settings_obj)
-
-  def test_direct_rabbit_retry_delay_remains_backend_specific(self, mocker):
-    """Rabbit's colliding retry_delay field must not drive manager backoff."""
-    settings_cls = mocker.patch("scrapy_extension.settings.RabbitMQSettings")
-    settings_cls.model_fields = {
-      "username": object(),
-      "password": object(),
-      "retry_delay": object(),
-    }
-    settings_obj = mocker.MagicMock(name="RabbitMQSettings")
-    settings_cls.return_value = settings_obj
-    backend_cls = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
-    manager = ConnectionManager(
-      BackendType.RABBITMQ,
-      {
-        "username": "crawler",
-        "password": "secret",
-        "retry_attempts": 0,
-        "retry_delay": 7,
-      },
-    )
-
-    manager._create_backend()
-
-    settings_cls.assert_called_once_with(
-      username="crawler",
-      password="secret",
-      retry_delay=7,
-    )
-    backend_cls.assert_called_once_with(settings_obj)
-    assert manager._retry_policy() == (0, 1.0)
-
-  def test_direct_rabbit_manager_retry_aliases_are_independent(self, mocker):
-    """Direct callers can configure outer retries despite Rabbit collisions."""
-    settings_cls = mocker.patch("scrapy_extension.settings.RabbitMQSettings")
-    settings_cls.model_fields = {
-      "username": object(),
-      "password": object(),
-      "retry_delay": object(),
-    }
-    settings_obj = mocker.MagicMock(name="RabbitMQSettings")
-    settings_cls.return_value = settings_obj
-    backend_cls = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
-    manager = ConnectionManager(
-      BackendType.RABBITMQ,
-      {
-        "username": "crawler",
-        "password": "secret",
-        "retry_delay": 7,
-        "manager_retry_attempts": 2,
-        "manager_retry_delay": 0.25,
-      },
-    )
-
-    manager._create_backend()
-
-    settings_cls.assert_called_once_with(
-      username="crawler",
-      password="secret",
-      retry_delay=7,
-    )
-    backend_cls.assert_called_once_with(settings_obj)
-    assert manager._retry_policy() == (2, 0.25)
-
-  def test_create_backend_rabbitmq(self, mocker):
-    """Test _create_backend creates RabbitMQBackend correctly."""
-    mock_backend = mocker.MagicMock()
-    mock_rabbitmq_backend = mocker.patch(
-      "scrapy_extension.backends.rabbitmq.RabbitMQBackend"
-    )
-    mock_rabbitmq_backend.return_value = mock_backend
-
-    manager = ConnectionManager(BackendType.RABBITMQ)
-    backend = manager._create_backend()
-
-    mock_rabbitmq_backend.assert_called_once()
-    assert backend == mock_backend
-
-  def test_create_backend_elasticsearch(self, mocker):
-    """Test _create_backend creates ElasticSearchBackend correctly."""
-    mock_backend = mocker.MagicMock()
-    mock_es_backend = mocker.patch(
-      "scrapy_extension.backends.elasticsearch.ElasticSearchBackend"
-    )
-    mock_es_backend.return_value = mock_backend
-
-    manager = ConnectionManager(BackendType.ELASTICSEARCH)
-    backend = manager._create_backend()
-
-    mock_es_backend.assert_called_once()
-    assert backend == mock_backend
-
-  def test_create_backend_unsupported_type(self):
-    """Test _create_backend raises ConfigurationError for unregistered type.
-
-    Round-5 R5-1: dispatch now routes through the registry's
-    ``get_descriptor``; an unregistered backend type raises
-    ``ConfigurationError`` (was ``ValueError``) — typed + carries the
-    setting name, surfaceable by ``from_settings`` error handling.
-    """
-    from scrapy_extension.exceptions import ConfigurationError
-
-    manager = ConnectionManager(BackendType.REDIS)
-    # Deliberately set invalid type to test error handling
-    manager.backend_type = "INVALID"  # type: ignore[assignment]
-
-    with pytest.raises(ConfigurationError, match="not a registered backend"):
-      manager._create_backend()
-
-  def test_create_backend_rocketmq(self, mocker):
-    """Test _create_backend creates RocketMQBackend correctly."""
-    mock_backend = mocker.MagicMock()
-    mock_rocketmq_backend = mocker.patch(
-      "scrapy_extension.backends.rocketmq.RocketMQBackend"
-    )
-    mock_rocketmq_backend.return_value = mock_backend
-
-    manager = ConnectionManager(BackendType.ROCKETMQ)
-    backend = manager._create_backend()
-
-    mock_rocketmq_backend.assert_called_once()
-    assert backend == mock_backend
-
-
-class TestConnectionManagerSettingsKey:
-  """Tests for settings key generation in get_manager."""
-
-  def test_settings_key_json_fallback(self):
-    """Test JSON serialization falls back to string sorting for non-serializable settings."""
-
-    # Create a settings object that cannot be JSON serialized
-    # Use an object with __slots__ and no __dict__ so json.dumps can't serialize it
-    class NonSerializable:
-      __slots__ = ()
-
-    settings = {"func": NonSerializable()}
-    manager1 = ConnectionManager.get_manager(BackendType.REDIS, settings)
-    manager2 = ConnectionManager.get_manager(BackendType.REDIS, settings)
-    assert manager1 is manager2
-
-  def test_settings_key_json_fallback_with_value_error(self, mocker):
-    """Test JSON serialization falls back to str() sorting when json.dumps raises ValueError."""
-    # Mock json.dumps to raise ValueError
-    mock_json = mocker.patch("scrapy_extension.backends.connectors.json")
-    mock_json.dumps.side_effect = ValueError("Object is not JSON serializable")
-
-    settings = {"key": "value"}
-    manager1 = ConnectionManager.get_manager(BackendType.REDIS, settings)
-    manager2 = ConnectionManager.get_manager(BackendType.REDIS, settings)
-
-    assert manager1 is manager2
-    assert mock_json.dumps.call_count >= 1
-
-  def test_settings_key_json_fallback_with_type_error(self, mocker):
-    """Test JSON serialization falls back to str() sorting when json.dumps raises TypeError."""
-    # Mock json.dumps to raise TypeError
-    mock_json = mocker.patch("scrapy_extension.backends.connectors.json")
-    mock_json.dumps.side_effect = TypeError("Object of type is not JSON serializable")
-
-    settings = {"key": "value"}
-    manager1 = ConnectionManager.get_manager(BackendType.REDIS, settings)
-    manager2 = ConnectionManager.get_manager(BackendType.REDIS, settings)
-
-    assert manager1 is manager2
-    assert mock_json.dumps.call_count >= 1
-
-
-class TestConnectionManagerRetryLogic:
-  """Tests for retry logic with exponential backoff."""
-
-  def test_connect_retry_exhausted(self, mocker):
-    """Test connect raises BackendConnectionError after max retries."""
-    mock_create_backend = mocker.patch.object(
-      ConnectionManager,
-      "_create_backend",
-      side_effect=ConnectionError("Connection failed"),
-    )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
-
-    manager = ConnectionManager(
-      BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.1}
-    )
-
-    with pytest.raises(BackendConnectionError) as exc_info:
-      manager.connect()
-
-    assert "Failed to connect after 4 attempts" in str(exc_info.value)
-    assert mock_create_backend.call_count == 4
-
-  def test_connect_retry_does_not_retain_driver_diagnostics(self, mocker, caplog):
-    marker = "manager-driver-secret"
-    mock_create_backend = mocker.patch.object(
-      ConnectionManager,
-      "_create_backend",
-      side_effect=RuntimeError(f"driver dump included {marker}"),
-    )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
-    manager = ConnectionManager(
-      BackendType.REDIS, {"retry_attempts": 1, "retry_delay": 0}
-    )
-
-    with pytest.raises(BackendConnectionError) as exc_info:
-      manager.connect()
+    """A plugin error subclass must not run code while the boundary sanitizes it."""
+    from scrapy_extension.backends.connectors import resolve_backend_config
+
+    marker = "hostile-configuration-error-marker"
+
+    class _HostileConfigurationError(ConfigurationError):
+        def __getattribute__(self, name: str) -> object:
+            if name in {"args", "setting_name"}:
+                raise RuntimeError(marker)
+            return super().__getattribute__(name)
+
+    class _Settings:
+        def get(self, key: str, default: object = None) -> object:
+            del key, default
+            raise _HostileConfigurationError(marker)
+
+        def getdict(self, key: str, default: object = None) -> object:
+            del key, default
+            raise AssertionError("getdict must not run after the rejected error")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        resolve_backend_config(
+            _Settings(),
+            "SCRAPY_QUEUE_BACKEND_TYPE",
+            "SCRAPY_QUEUE_BACKEND_SETTINGS",
+        )
 
     error = exc_info.value
-    assert mock_create_backend.call_count == 2
-    assert marker not in str(error)
+    assert str(error) == "Backend configuration is invalid."
+    assert error.setting_name == "configuration"
     assert marker not in repr(error.__dict__)
     assert marker not in "".join(traceback.format_exception(error))
     assert error.__cause__ is None
     assert error.__context__ is None
-    for record in caplog.records:
-      assert marker not in record.getMessage()
-      assert marker not in repr(record.args)
+    _assert_package_traceback_locals_are_redacted(error, marker)
 
-  def test_connect_retry_success_on_first_attempt(self, mocker):
-    """Test connect succeeds on first attempt without retries."""
-    mock_create_backend = mocker.patch.object(ConnectionManager, "_create_backend")
-    mock_backend = mocker.MagicMock()
-    mock_create_backend.return_value = mock_backend
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager.connect()
+def test_resolve_boundary_rebuilds_bundled_import_error_without_loader_frames(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Resolver keeps ImportError semantics without retaining Scrapy settings."""
+    from scrapy_extension.backends import connectors
 
-    assert manager._backend == mock_backend
-    assert mock_create_backend.call_count == 1
+    marker = "resolver-bundled-import-secret-marker"
 
-  def test_connect_retry_success_on_second_attempt(self, mocker):
-    """Test connect succeeds on second attempt after initial failure."""
-    mock_create_backend = mocker.patch.object(ConnectionManager, "_create_backend")
-    mock_backend = mocker.MagicMock()
+    class _Settings:
+        def get(self, key: str, default: object = None) -> object:
+            if key == "SCRAPY_QUEUE_BACKEND_TYPE":
+                return "redis"
+            return default
 
-    # First call raises, second succeeds
-    mock_create_backend.side_effect = [ConnectionError("Failed"), mock_backend]
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        def getdict(self, key: str, default: object = None) -> object:
+            del key
+            return {} if default is None else default
 
-    manager = ConnectionManager(
-      BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.1}
+    monkeypatch.setattr(
+        connectors,
+        "_load_object",
+        lambda _: (_ for _ in ()).throw(ImportError(marker)),
     )
-    manager.connect()
 
-    assert manager._backend == mock_backend
-    assert mock_create_backend.call_count == 2
+    with pytest.raises(ImportError) as exc_info:
+        connectors.resolve_backend_config(
+            _Settings(),
+            "SCRAPY_QUEUE_BACKEND_TYPE",
+            "SCRAPY_QUEUE_BACKEND_SETTINGS",
+        )
 
-  def test_connect_keyboard_interrupt_not_caught(self, mocker):
-    """Test that KeyboardInterrupt is re-raised immediately."""
-    mocker.patch.object(
-      ConnectionManager, "_create_backend", side_effect=KeyboardInterrupt
+    error = exc_info.value
+    assert str(error) == "A bundled backend optional dependency is unavailable."
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_capability_message_parser_accepts_only_bundled_structures():
+    """The message whitelist is structural, not a plugin-controlled format."""
+    from scrapy_extension.backends import connectors
+
+    valid = (
+        "Selected redis does not support the queue interface and is missing capabilities. "
+        "Capable bundled backends: ['elasticsearch', 'mongodb', 'redis']."
     )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    assert connectors._is_safe_capability_message(valid) is True
+    assert connectors._is_safe_capability_message("x" * 513) is False
+    assert (
+        connectors._is_safe_capability_message(
+            "Selected untrusted does not support the queue interface and is missing "
+            "capabilities. Capable bundled backends: ['redis']."
+        )
+        is False
+    )
+    assert (
+        connectors._is_safe_capability_message(
+            "Selected redis does not support the secret interface and is missing "
+            "capabilities. Capable bundled backends: ['redis']."
+        )
+        is False
+    )
+    assert (
+        connectors._is_safe_capability_message(
+            "Selected redis does not support the queue interface and is missing "
+            "capabilities. Capable bundled backends: [not-a-python-list]."
+        )
+        is False
+    )
+    assert (
+        connectors._is_safe_capability_message(
+            "Selected redis interface and is missing capabilities. Capable bundled "
+            "backends: ['redis']. does not support the queue"
+        )
+        is False
+    )
 
-    manager = ConnectionManager(BackendType.REDIS)
 
-    with pytest.raises(KeyboardInterrupt):
-      manager.connect()
+def test_manager_connection_message_parser_rejects_untrusted_variants():
+    """Only bounded manager retry grammar survives a rebuilt connection error."""
+    from scrapy_extension.backends import connectors
 
-  def test_connect_system_exit_not_caught(self, mocker):
-    """Test that SystemExit is re-raised immediately."""
-    mocker.patch.object(ConnectionManager, "_create_backend", side_effect=SystemExit)
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    fallback = "Connection manager failed to connect to the selected backend."
 
-    manager = ConnectionManager(BackendType.REDIS)
+    class _SubclassedConnectionError(BackendConnectionError):
+        pass
 
-    with pytest.raises(SystemExit):
-      manager.connect()
+    assert (
+        connectors._safe_manager_connection_message(
+            _SubclassedConnectionError("Failed to connect after 1 attempt.")
+        )
+        == fallback
+    )
+
+    malformed_args = BackendConnectionError("ignored")
+    malformed_args.args = ("first", "second")
+    assert connectors._safe_manager_connection_message(malformed_args) == fallback
+    assert (
+        connectors._safe_manager_connection_message(
+            BackendConnectionError("Failed to connect after invalid attempts.")
+        )
+        == fallback
+    )
+    assert (
+        connectors._safe_manager_connection_message(
+            BackendConnectionError("Failed to connect after 999 attempts.")
+        )
+        == fallback
+    )
+    assert (
+        connectors._safe_manager_connection_message(
+            BackendConnectionError("Failed to connect after 22 attempts.")
+        )
+        == fallback
+    )
+    assert (
+        connectors._safe_manager_connection_message(
+            BackendConnectionError("Failed to connect after 1 attempt.")
+        )
+        == "Failed to connect after 1 attempt."
+    )
+
+    assert (
+        connectors._safe_manager_connection_backend_type(
+            BackendConnectionError("failed", backend_type="redis")
+        )
+        == "redis"
+    )
+    assert (
+        connectors._safe_manager_connection_backend_type(
+            BackendConnectionError("failed", backend_type="BackendType.REDIS")
+        )
+        == "redis"
+    )
+    assert (
+        connectors._safe_manager_connection_backend_type(
+            BackendConnectionError("failed", backend_type="untrusted-plugin")
+        )
+        == "connection-manager"
+    )
+
+
+def test_manager_configuration_message_parser_rejects_unknown_descriptor():
+    """A plugin-controlled descriptor name cannot enter a preserved error."""
+    from scrapy_extension.backends import connectors
+
+    assert (
+        connectors._is_safe_manager_configuration_message(
+            "Selected endpoint-secret does not implement its declared contract: missing "
+            "Backend."
+        )
+        is False
+    )
+
+
+def test_manager_setting_name_uses_only_verified_bundled_fields():
+    """A static field label may survive only when it is actually declared."""
+    from scrapy_extension.backends import connectors
+
+    fields = frozenset({"host"})
+    assert (
+        connectors._safe_manager_setting_name(
+            ConfigurationError("invalid", setting_name="host"), "redis", fields
+        )
+        == "host"
+    )
+    assert (
+        connectors._safe_manager_setting_name(
+            ConfigurationError("invalid", setting_name="endpoint-secret"),
+            "redis",
+            fields,
+        )
+        == "backend_settings"
+    )
+    assert (
+        connectors._safe_manager_setting_name(RuntimeError("invalid"), "redis", fields)
+        == "backend_settings"
+    )
+
+
+def test_configuration_boundary_fails_closed_when_message_predicate_crashes():
+    """An allowlist predicate is untrusted code and must not publish its input."""
+    from scrapy_extension.exceptions._redaction import configuration_error_boundary
+
+    marker = "predicate-redaction-secret-marker"
+
+    def _raising_predicate(_: str) -> bool:
+        raise RuntimeError(marker)
+
+    @configuration_error_boundary(
+        "Configuration is invalid.",
+        {"host"},
+        preserve_static_message=True,
+        safe_message_predicate=_raising_predicate,
+    )
+    def _raise_configuration_error() -> None:
+        raise ConfigurationError("potentially-safe-message", setting_name="host")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        _raise_configuration_error()
+
+    error = exc_info.value
+    assert str(error) == "Configuration is invalid."
+    assert error.setting_name == "host"
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_create_backend_rebuilds_bundled_loader_runtime_failures(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A bundled loader fault cannot retain manager settings at the API boundary."""
+    from scrapy_extension.backends import connectors
+
+    marker = "bundled-loader-runtime-secret-marker"
+
+    def _raise_loader_error(_: str) -> object:
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(connectors, "_load_object", _raise_loader_error)
+    manager = ConnectionManager(BackendType.REDIS, {"password": marker})
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        manager._create_backend()
+
+    error = exc_info.value
+    assert str(error) == "Connection manager configuration is invalid."
+    assert error.setting_name == "configuration"
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_package_traceback_locals_are_redacted(error, marker)
+
+
+def test_rebuild_connect_attempt_error_fails_closed_when_message_check_crashes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A defensive manager-message check must not publish its candidate text."""
+    from scrapy_extension.backends import connectors
+
+    def _raise_from_message_check(_: str) -> bool:
+        raise RuntimeError("message-check-secret-marker")
+
+    monkeypatch.setattr(
+        connectors,
+        "_is_safe_manager_configuration_message",
+        _raise_from_message_check,
+    )
+
+    rebuilt = connectors._rebuild_connect_attempt_error(
+        ConfigurationError("candidate-manager-message", setting_name="configuration")
+    )
+
+    assert type(rebuilt) is ConfigurationError
+    assert str(rebuilt) == "Connection manager configuration is invalid."
+    assert rebuilt.setting_name == "configuration"
+
+
+class TestConnectionManagerCreateBackend:
+    """Tests for _create_backend method."""
+
+    def test_create_backend_redis(self, mocker):
+        """Test _create_backend creates RedisBackend correctly."""
+        mock_backend = mocker.MagicMock()
+        mock_redis_backend = mocker.patch(
+            "scrapy_extension.backends.redis.RedisBackend"
+        )
+        mock_redis_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.REDIS)
+        backend = manager._create_backend()
+
+        mock_redis_backend.assert_called_once()
+        assert backend == mock_backend
+
+    def test_create_backend_mongodb(self, mocker):
+        """Test _create_backend creates MongoDBBackend correctly."""
+        mock_backend = mocker.MagicMock()
+        mock_mongo_backend = mocker.patch(
+            "scrapy_extension.backends.mongodb.MongoDBBackend"
+        )
+        mock_mongo_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.MONGODB)
+        backend = manager._create_backend()
+
+        mock_mongo_backend.assert_called_once()
+        assert backend == mock_backend
+
+    def test_create_backend_kafka(self, mocker):
+        """Test _create_backend creates KafkaBackend correctly."""
+        mock_backend = mocker.MagicMock()
+        mock_kafka_backend = mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaBackend"
+        )
+        mock_kafka_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.KAFKA)
+        backend = manager._create_backend()
+
+        mock_kafka_backend.assert_called_once()
+        assert backend == mock_backend
+
+    def test_create_backend_strips_internal_queue_scope(self, mocker):
+        """Registry-only queue scope must never reach backend settings models."""
+        from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
+
+        settings_cls = mocker.patch("scrapy_extension.settings.KafkaSettings")
+        settings_obj = mocker.MagicMock(name="KafkaSettings")
+        settings_cls.return_value = settings_obj
+        backend_cls = mocker.patch("scrapy_extension.backends.kafka.KafkaBackend")
+        manager = ConnectionManager(
+            BackendType.KAFKA,
+            {
+                "bootstrap_servers": "broker:9092",
+                _CONNECTION_MANAGER_SCOPE_KEY: "queue-a",
+            },
+        )
+
+        manager._create_backend()
+
+        settings_cls.assert_called_once_with(bootstrap_servers="broker:9092")
+        backend_cls.assert_called_once_with(settings_obj)
+
+    def test_create_backend_strips_direct_manager_retry_controls(self, mocker):
+        """Public manager retry controls must not enter strict backend models."""
+        settings_cls = mocker.patch("scrapy_extension.settings.RedisSettings")
+        settings_obj = mocker.MagicMock(name="RedisSettings")
+        settings_cls.return_value = settings_obj
+        backend_cls = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
+        manager = ConnectionManager(
+            BackendType.REDIS,
+            {
+                "host": "redis.internal",
+                "retry_attempts": 0,
+                "retry_delay": 0.25,
+            },
+        )
+
+        manager._create_backend()
+
+        settings_cls.assert_called_once_with(host="redis.internal")
+        backend_cls.assert_called_once_with(settings_obj)
+
+    def test_direct_rabbit_retry_delay_remains_backend_specific(self, mocker):
+        """Rabbit's colliding retry_delay field must not drive manager backoff."""
+        settings_cls = mocker.patch("scrapy_extension.settings.RabbitMQSettings")
+        settings_cls.model_fields = {
+            "username": object(),
+            "password": object(),
+            "retry_delay": object(),
+        }
+        settings_obj = mocker.MagicMock(name="RabbitMQSettings")
+        settings_cls.return_value = settings_obj
+        backend_cls = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
+        manager = ConnectionManager(
+            BackendType.RABBITMQ,
+            {
+                "username": "crawler",
+                "password": "secret",
+                "retry_attempts": 0,
+                "retry_delay": 7,
+            },
+        )
+
+        manager._create_backend()
+
+        settings_cls.assert_called_once_with(
+            username="crawler",
+            password="secret",
+            retry_delay=7,
+        )
+        backend_cls.assert_called_once_with(settings_obj)
+        assert manager._retry_policy() == (0, 1.0)
+
+    def test_direct_rabbit_manager_retry_aliases_are_independent(self, mocker):
+        """Direct callers can configure outer retries despite Rabbit collisions."""
+        settings_cls = mocker.patch("scrapy_extension.settings.RabbitMQSettings")
+        settings_cls.model_fields = {
+            "username": object(),
+            "password": object(),
+            "retry_delay": object(),
+        }
+        settings_obj = mocker.MagicMock(name="RabbitMQSettings")
+        settings_cls.return_value = settings_obj
+        backend_cls = mocker.patch("scrapy_extension.backends.rabbitmq.RabbitMQBackend")
+        manager = ConnectionManager(
+            BackendType.RABBITMQ,
+            {
+                "username": "crawler",
+                "password": "secret",
+                "retry_delay": 7,
+                "manager_retry_attempts": 2,
+                "manager_retry_delay": 0.25,
+            },
+        )
+
+        manager._create_backend()
+
+        settings_cls.assert_called_once_with(
+            username="crawler",
+            password="secret",
+            retry_delay=7,
+        )
+        backend_cls.assert_called_once_with(settings_obj)
+        assert manager._retry_policy() == (2, 0.25)
+
+    def test_create_backend_rabbitmq(self, mocker):
+        """Test _create_backend creates RabbitMQBackend correctly."""
+        mock_backend = mocker.MagicMock()
+        mock_rabbitmq_backend = mocker.patch(
+            "scrapy_extension.backends.rabbitmq.RabbitMQBackend"
+        )
+        mock_rabbitmq_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.RABBITMQ)
+        backend = manager._create_backend()
+
+        mock_rabbitmq_backend.assert_called_once()
+        assert backend == mock_backend
+
+    def test_create_backend_elasticsearch(self, mocker):
+        """Test _create_backend creates ElasticSearchBackend correctly."""
+        mock_backend = mocker.MagicMock()
+        mock_es_backend = mocker.patch(
+            "scrapy_extension.backends.elasticsearch.ElasticSearchBackend"
+        )
+        mock_es_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.ELASTICSEARCH)
+        backend = manager._create_backend()
+
+        mock_es_backend.assert_called_once()
+        assert backend == mock_backend
+
+    def test_create_backend_unsupported_type(self):
+        """Test _create_backend raises ConfigurationError for unregistered type.
+
+        Round-5 R5-1: dispatch now routes through the registry's
+        ``get_descriptor``; an unregistered backend type raises
+        ``ConfigurationError`` (was ``ValueError``) — typed + carries the
+        setting name, surfaceable by ``from_settings`` error handling.
+        """
+        from scrapy_extension.exceptions import ConfigurationError
+
+        manager = ConnectionManager(BackendType.REDIS)
+        # Deliberately set invalid type to test error handling
+        manager.backend_type = "INVALID"  # type: ignore[assignment]
+
+        with pytest.raises(ConfigurationError, match="not a registered backend"):
+            manager._create_backend()
+
+    def test_create_backend_rocketmq(self, mocker):
+        """Test _create_backend creates RocketMQBackend correctly."""
+        mock_backend = mocker.MagicMock()
+        mock_rocketmq_backend = mocker.patch(
+            "scrapy_extension.backends.rocketmq.RocketMQBackend"
+        )
+        mock_rocketmq_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.ROCKETMQ)
+        backend = manager._create_backend()
+
+        mock_rocketmq_backend.assert_called_once()
+        assert backend == mock_backend
+
+
+class TestConnectionManagerSettingsKey:
+    """Tests for settings key generation in get_manager."""
+
+    def test_settings_key_json_fallback(self):
+        """Test JSON serialization falls back to string sorting for non-serializable settings."""
+
+        # Create a settings object that cannot be JSON serialized
+        # Use an object with __slots__ and no __dict__ so json.dumps can't serialize it
+        class NonSerializable:
+            __slots__ = ()
+
+        settings = {"func": NonSerializable()}
+        manager1 = ConnectionManager.get_manager(BackendType.REDIS, settings)
+        manager2 = ConnectionManager.get_manager(BackendType.REDIS, settings)
+        assert manager1 is manager2
+
+    def test_settings_key_json_fallback_with_value_error(self, mocker):
+        """Test JSON serialization falls back to str() sorting when json.dumps raises ValueError."""
+        # Mock json.dumps to raise ValueError
+        mock_json = mocker.patch("scrapy_extension.backends.connectors.json")
+        mock_json.dumps.side_effect = ValueError("Object is not JSON serializable")
+
+        settings = {"key": "value"}
+        manager1 = ConnectionManager.get_manager(BackendType.REDIS, settings)
+        manager2 = ConnectionManager.get_manager(BackendType.REDIS, settings)
+
+        assert manager1 is manager2
+        assert mock_json.dumps.call_count >= 1
+
+    def test_settings_key_json_fallback_with_type_error(self, mocker):
+        """Test JSON serialization falls back to str() sorting when json.dumps raises TypeError."""
+        # Mock json.dumps to raise TypeError
+        mock_json = mocker.patch("scrapy_extension.backends.connectors.json")
+        mock_json.dumps.side_effect = TypeError(
+            "Object of type is not JSON serializable"
+        )
+
+        settings = {"key": "value"}
+        manager1 = ConnectionManager.get_manager(BackendType.REDIS, settings)
+        manager2 = ConnectionManager.get_manager(BackendType.REDIS, settings)
+
+        assert manager1 is manager2
+        assert mock_json.dumps.call_count >= 1
+
+
+class TestConnectionManagerRetryLogic:
+    """Tests for retry logic with exponential backoff."""
+
+    def test_connect_retry_exhausted(self, mocker):
+        """Test connect raises BackendConnectionError after max retries."""
+        mock_create_backend = mocker.patch.object(
+            ConnectionManager,
+            "_create_backend",
+            side_effect=ConnectionError("Connection failed"),
+        )
+        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+        manager = ConnectionManager(
+            BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.1}
+        )
+
+        with pytest.raises(BackendConnectionError) as exc_info:
+            manager.connect()
+
+        assert "Failed to connect after 4 attempts" in str(exc_info.value)
+        assert mock_create_backend.call_count == 4
+
+    def test_connect_retry_does_not_retain_driver_diagnostics(self, mocker, caplog):
+        marker = "manager-driver-secret"
+        mock_create_backend = mocker.patch.object(
+            ConnectionManager,
+            "_create_backend",
+            side_effect=RuntimeError(f"driver dump included {marker}"),
+        )
+        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        manager = ConnectionManager(
+            BackendType.REDIS, {"retry_attempts": 1, "retry_delay": 0}
+        )
+
+        with pytest.raises(BackendConnectionError) as exc_info:
+            manager.connect()
+
+        error = exc_info.value
+        assert mock_create_backend.call_count == 2
+        assert marker not in str(error)
+        assert marker not in repr(error.__dict__)
+        assert marker not in "".join(traceback.format_exception(error))
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        for record in caplog.records:
+            assert marker not in record.getMessage()
+            assert marker not in repr(record.args)
+
+    def test_connect_retry_success_on_first_attempt(self, mocker):
+        """Test connect succeeds on first attempt without retries."""
+        mock_create_backend = mocker.patch.object(ConnectionManager, "_create_backend")
+        mock_backend = mocker.MagicMock()
+        mock_create_backend.return_value = mock_backend
+
+        manager = ConnectionManager(BackendType.REDIS)
+        manager.connect()
+
+        assert manager._backend == mock_backend
+        assert mock_create_backend.call_count == 1
+
+    def test_connect_retry_success_on_second_attempt(self, mocker):
+        """Test connect succeeds on second attempt after initial failure."""
+        mock_create_backend = mocker.patch.object(ConnectionManager, "_create_backend")
+        mock_backend = mocker.MagicMock()
+
+        # First call raises, second succeeds
+        mock_create_backend.side_effect = [ConnectionError("Failed"), mock_backend]
+        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+        manager = ConnectionManager(
+            BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.1}
+        )
+        manager.connect()
+
+        assert manager._backend == mock_backend
+        assert mock_create_backend.call_count == 2
+
+    def test_connect_keyboard_interrupt_not_caught(self, mocker):
+        """Test that KeyboardInterrupt is re-raised immediately."""
+        mocker.patch.object(
+            ConnectionManager, "_create_backend", side_effect=KeyboardInterrupt
+        )
+        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+        manager = ConnectionManager(BackendType.REDIS)
+
+        with pytest.raises(KeyboardInterrupt):
+            manager.connect()
+
+    def test_connect_system_exit_not_caught(self, mocker):
+        """Test that SystemExit is re-raised immediately."""
+        mocker.patch.object(
+            ConnectionManager, "_create_backend", side_effect=SystemExit
+        )
+        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+
+        manager = ConnectionManager(BackendType.REDIS)
+
+        with pytest.raises(SystemExit):
+            manager.connect()
 
 
 class TestConnectionManagerClose:
-  """Tests for close method."""
+    """Tests for close method."""
 
-  def test_close_disconnects_backend(self, mocker):
-    """Test close calls disconnect on backend."""
-    mock_backend = mocker.MagicMock()
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+    def test_close_disconnects_backend(self, mocker):
+        """Test close calls disconnect on backend."""
+        mock_backend = mocker.MagicMock()
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    manager.close()
+        manager.close()
 
-    mock_backend.disconnect.assert_called_once()
-    assert manager._backend is None
+        mock_backend.disconnect.assert_called_once()
+        assert manager._backend is None
 
-  def test_close_handles_disconnect_error(self, mocker):
-    """Test close handles errors during disconnect gracefully."""
-    mock_backend = mocker.MagicMock()
-    mock_backend.disconnect.side_effect = RuntimeError("Disconnect error")
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+    def test_close_handles_disconnect_error(self, mocker):
+        """Test close handles errors during disconnect gracefully."""
+        mock_backend = mocker.MagicMock()
+        mock_backend.disconnect.side_effect = RuntimeError("Disconnect error")
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    # Should not raise
-    manager.close()
+        # Should not raise
+        manager.close()
 
-    assert manager._backend is None
+        assert manager._backend is None
 
-  def test_close_when_backend_is_none(self):
-    """Test close does nothing when backend is None."""
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = None
+    def test_close_when_backend_is_none(self):
+        """Test close does nothing when backend is None."""
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = None
 
-    # Should not raise
-    manager.close()
+        # Should not raise
+        manager.close()
 
-  def test_close_disconnects_falsey_third_party_backend(self, mocker):
-    """Backend truthiness must not decide whether a live handle is released."""
-    backend = mocker.MagicMock()
-    backend.__bool__.return_value = False
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = backend
+    def test_close_disconnects_falsey_third_party_backend(self, mocker):
+        """Backend truthiness must not decide whether a live handle is released."""
+        backend = mocker.MagicMock()
+        backend.__bool__.return_value = False
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = backend
 
-    manager.close()
+        manager.close()
 
-    backend.disconnect.assert_called_once_with()
-    assert manager._backend is None
+        backend.disconnect.assert_called_once_with()
+        assert manager._backend is None
 
 
 class TestConnectionManagerBackendProperty:
-  """Tests for backend property with double-checked locking."""
+    """Tests for backend property with double-checked locking."""
 
-  def test_backend_returns_existing_backend(self, mocker):
-    """Test backend property returns existing backend without connecting."""
-    mock_connect = mocker.patch.object(ConnectionManager, "connect")
-    mock_backend = mocker.MagicMock()
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+    def test_backend_returns_existing_backend(self, mocker):
+        """Test backend property returns existing backend without connecting."""
+        mock_connect = mocker.patch.object(ConnectionManager, "connect")
+        mock_backend = mocker.MagicMock()
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    result = manager.backend
+        result = manager.backend
 
-    assert result == mock_backend
-    mock_connect.assert_not_called()
+        assert result == mock_backend
+        mock_connect.assert_not_called()
 
-  def test_backend_calls_connect_when_none(self, mocker):
-    """Test backend property calls connect when _backend is None."""
-    mock_connect = mocker.patch.object(ConnectionManager, "connect")
-    mock_backend = mocker.MagicMock()
-    mocker.patch.object(ConnectionManager, "_create_backend", return_value=mock_backend)
+    def test_backend_calls_connect_when_none(self, mocker):
+        """Test backend property calls connect when _backend is None."""
+        mock_connect = mocker.patch.object(ConnectionManager, "connect")
+        mock_backend = mocker.MagicMock()
+        mocker.patch.object(
+            ConnectionManager, "_create_backend", return_value=mock_backend
+        )
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = None
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = None
 
-    # Simulate what connect() would do by setting _backend after connect is called
-    def setup_backend():
-      manager._backend = mock_backend
+        # Simulate what connect() would do by setting _backend after connect is called
+        def setup_backend():
+            manager._backend = mock_backend
 
-    mock_connect.side_effect = setup_backend
+        mock_connect.side_effect = setup_backend
 
-    result = manager.backend
+        result = manager.backend
 
-    assert result == mock_backend
-    mock_connect.assert_called_once()
+        assert result == mock_backend
+        mock_connect.assert_called_once()
 
-  def test_backend_double_checked_locking_sets_backend(self, mocker):
-    """Test backend property double-checked locking sets _backend via connect."""
-    mock_backend = mocker.MagicMock()
-    mocker.patch.object(ConnectionManager, "_create_backend", return_value=mock_backend)
+    def test_backend_double_checked_locking_sets_backend(self, mocker):
+        """Test backend property double-checked locking sets _backend via connect."""
+        mock_backend = mocker.MagicMock()
+        mocker.patch.object(
+            ConnectionManager, "_create_backend", return_value=mock_backend
+        )
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = None
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = None
 
-    # Access backend property - should trigger connect which sets _backend
-    result = manager.backend
+        # Access backend property - should trigger connect which sets _backend
+        result = manager.backend
 
-    assert result is mock_backend
-    assert manager._backend is mock_backend
+        assert result is mock_backend
+        assert manager._backend is mock_backend
 
-  def test_backend_double_checked_locking_assertion(self, mocker):
-    """Test backend property assert passes when connect sets _backend."""
-    mock_backend = mocker.MagicMock()
-    mocker.patch.object(ConnectionManager, "_create_backend", return_value=mock_backend)
+    def test_backend_double_checked_locking_assertion(self, mocker):
+        """Test backend property assert passes when connect sets _backend."""
+        mock_backend = mocker.MagicMock()
+        mocker.patch.object(
+            ConnectionManager, "_create_backend", return_value=mock_backend
+        )
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = None
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = None
 
-    # This should not raise AssertionError
-    result = manager.backend
+        # This should not raise AssertionError
+        result = manager.backend
 
-    assert result is mock_backend
+        assert result is mock_backend
 
-  def test_backend_raises_when_connect_returns_without_setting_backend(self, mocker):
-    """Defensive guard: if ``connect()`` returns without raising AND without
-    setting ``self._backend`` (a contract violation), the ``backend`` property
-    must raise ``BackendConnectionError`` rather than returning ``None``.
+    def test_backend_raises_when_connect_returns_without_setting_backend(self, mocker):
+        """Defensive guard: if ``connect()`` returns without raising AND without
+        setting ``self._backend`` (a contract violation), the ``backend`` property
+        must raise ``BackendConnectionError`` rather than returning ``None``.
 
-    Exercises the ``if self._backend is None: raise BackendConnectionError``
-    branch in the property (connectors.py ``backend`` getter). The mock makes
-    ``connect()`` a no-op that never assigns ``_backend``, simulating the
-    violation. The guard is the load-bearing safety net — ``assert`` would be
-    stripped under ``python -O``, and returning ``None`` would crash callers
-    downstream with a confusing ``AttributeError`` instead of a typed error.
-    """
-    # connect() returns normally but does NOT set self._backend — the
-    # contract violation the defensive guard exists to catch.
-    mocker.patch.object(ConnectionManager, "connect", return_value=None)
+        Exercises the ``if self._backend is None: raise BackendConnectionError``
+        branch in the property (connectors.py ``backend`` getter). The mock makes
+        ``connect()`` a no-op that never assigns ``_backend``, simulating the
+        violation. The guard is the load-bearing safety net — ``assert`` would be
+        stripped under ``python -O``, and returning ``None`` would crash callers
+        downstream with a confusing ``AttributeError`` instead of a typed error.
+        """
+        # connect() returns normally but does NOT set self._backend — the
+        # contract violation the defensive guard exists to catch.
+        mocker.patch.object(ConnectionManager, "connect", return_value=None)
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = None  # explicit: nothing wired the backend
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = None  # explicit: nothing wired the backend
 
-    with pytest.raises(BackendConnectionError) as exc_info:
-      _ = manager.backend  # property access triggers the defensive guard
+        with pytest.raises(BackendConnectionError) as exc_info:
+            _ = manager.backend  # property access triggers the defensive guard
 
-    msg = str(exc_info.value)
-    assert "connect()" in msg
-    assert "backend" in msg
+        msg = str(exc_info.value)
+        assert "connect()" in msg
+        assert "backend" in msg
 
-    # Registry hygiene: this test constructed a bare manager (not via
-    # get_manager), but clear anyway to match the file's isolation pattern.
-    ConnectionManager.clear_registry()
+        # Registry hygiene: this test constructed a bare manager (not via
+        # get_manager), but clear anyway to match the file's isolation pattern.
+        ConnectionManager.clear_registry()
 
-  def test_backend_returns_one_captured_post_connect_value(self, mocker):
-    """A state change between the final guard and return cannot publish None."""
+    def test_backend_returns_one_captured_post_connect_value(self, mocker):
+        """A state change between the final guard and return cannot publish None."""
 
-    class _ChangingReadManager(ConnectionManager):
-      def __init__(self) -> None:
-        self._race_armed = False
-        self._race_reads = 0
-        super().__init__(BackendType.REDIS)
+        class _ChangingReadManager(ConnectionManager):
+            def __init__(self) -> None:
+                self._race_armed = False
+                self._race_reads = 0
+                super().__init__(BackendType.REDIS)
 
-      def __getattribute__(self, name):
-        value = super().__getattribute__(name)
-        if name != "_backend":
-          return value
-        if not object.__getattribute__(self, "_race_armed"):
-          return value
-        reads = object.__getattribute__(self, "_race_reads") + 1
-        object.__setattr__(self, "_race_reads", reads)
-        # Model reconnect detaching the published generation after the final
-        # non-null guard but before a second expression reads it for return.
-        return None if reads >= 3 else value
+            def __getattribute__(self, name):
+                value = super().__getattribute__(name)
+                if name != "_backend":
+                    return value
+                if not object.__getattribute__(self, "_race_armed"):
+                    return value
+                reads = object.__getattribute__(self, "_race_reads") + 1
+                object.__setattr__(self, "_race_reads", reads)
+                # Model reconnect detaching the published generation after the final
+                # non-null guard but before a second expression reads it for return.
+                return None if reads >= 3 else value
 
-    manager = _ChangingReadManager()
-    backend = mocker.MagicMock(name="published-backend")
+        manager = _ChangingReadManager()
+        backend = mocker.MagicMock(name="published-backend")
 
-    def publish_backend() -> None:
-      manager._backend = backend
-      manager._race_reads = 0
-      manager._race_armed = True
+        def publish_backend() -> None:
+            manager._backend = backend
+            manager._race_reads = 0
+            manager._race_armed = True
 
-    mocker.patch.object(manager, "connect", side_effect=publish_backend)
+        mocker.patch.object(manager, "connect", side_effect=publish_backend)
 
-    assert manager.backend is backend
+        assert manager.backend is backend
 
-  def test_snapshot_rejects_null_backend_even_when_manager_state_matches(self):
-    """A violated backend-property contract must raise, never form a None proxy."""
+    def test_snapshot_rejects_null_backend_even_when_manager_state_matches(self):
+        """A violated backend-property contract must raise, never form a None proxy."""
 
-    class _NullBackendManager(ConnectionManager):
-      @property
-      def backend(self):
-        return None
+        class _NullBackendManager(ConnectionManager):
+            @property
+            def backend(self):
+                return None
 
-      def _get_breaker(self):
-        return None
+            def _get_breaker(self):
+                return None
 
-    manager = _NullBackendManager(BackendType.REDIS)
+        manager = _NullBackendManager(BackendType.REDIS)
 
-    with pytest.raises(BackendConnectionError, match="did not produce a backend"):
-      manager._get_backend_breaker_snapshot()
+        with pytest.raises(BackendConnectionError, match="did not produce a backend"):
+            manager._get_backend_breaker_snapshot()
 
 
 class TestConnectionManagerIsConnected:
-  """Tests for is_connected method."""
+    """Tests for is_connected method."""
 
-  def test_is_connected_returns_false_when_backend_none(self):
-    """Test is_connected returns False when _backend is None."""
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = None
+    def test_is_connected_returns_false_when_backend_none(self):
+        """Test is_connected returns False when _backend is None."""
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = None
 
-    assert manager.is_connected() is False
+        assert manager.is_connected() is False
 
-  def test_is_connected_returns_backend_status(self, mocker):
-    """Test is_connected returns result from backend.is_connected()."""
-    mock_backend = mocker.MagicMock()
-    mock_backend.is_connected.return_value = True
+    def test_is_connected_returns_backend_status(self, mocker):
+        """Test is_connected returns result from backend.is_connected()."""
+        mock_backend = mocker.MagicMock()
+        mock_backend.is_connected.return_value = True
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    assert manager.is_connected() is True
-    mock_backend.is_connected.assert_called_once()
+        assert manager.is_connected() is True
+        mock_backend.is_connected.assert_called_once()
 
-  def test_is_connected_uses_one_backend_read(self, mocker):
-    """Concurrent detach cannot turn the second attribute read into None."""
+    def test_is_connected_uses_one_backend_read(self, mocker):
+        """Concurrent detach cannot turn the second attribute read into None."""
 
-    class _ChangingReadManager(ConnectionManager):
-      def __init__(self) -> None:
-        self._backend_reads = 0
-        super().__init__(BackendType.REDIS)
+        class _ChangingReadManager(ConnectionManager):
+            def __init__(self) -> None:
+                self._backend_reads = 0
+                super().__init__(BackendType.REDIS)
 
-      def __getattribute__(self, name):
-        value = super().__getattribute__(name)
-        if name != "_backend":
-          return value
-        reads = object.__getattribute__(self, "_backend_reads") + 1
-        object.__setattr__(self, "_backend_reads", reads)
-        return None if reads >= 2 else value
+            def __getattribute__(self, name):
+                value = super().__getattribute__(name)
+                if name != "_backend":
+                    return value
+                reads = object.__getattribute__(self, "_backend_reads") + 1
+                object.__setattr__(self, "_backend_reads", reads)
+                return None if reads >= 2 else value
 
-    manager = _ChangingReadManager()
-    backend = mocker.MagicMock()
-    backend.is_connected.return_value = True
-    manager._backend = backend
+        manager = _ChangingReadManager()
+        backend = mocker.MagicMock()
+        backend.is_connected.return_value = True
+        manager._backend = backend
 
-    assert manager.is_connected() is True
-    backend.is_connected.assert_called_once_with()
+        assert manager.is_connected() is True
+        backend.is_connected.assert_called_once_with()
 
 
 class TestConnectionManagerMonitorReentrancy:
-  """Lifecycle callbacks are user code and must run outside manager locks."""
+    """Lifecycle callbacks are user code and must run outside manager locks."""
 
-  def test_on_connect_can_reenter_connect_without_connect_lock(self, mocker):
-    manager = ConnectionManager("redis", {"retry_attempts": 0})
-    backend = mocker.MagicMock(name="backend")
-    backend.is_connected.return_value = True
-    mocker.patch.object(manager, "_create_backend", return_value=backend)
-    lock_states: list[bool] = []
-    reentries: list[object] = []
+    def test_on_connect_can_reenter_connect_without_connect_lock(self, mocker):
+        manager = ConnectionManager("redis", {"retry_attempts": 0})
+        backend = mocker.MagicMock(name="backend")
+        backend.is_connected.return_value = True
+        mocker.patch.object(manager, "_create_backend", return_value=backend)
+        lock_states: list[bool] = []
+        reentries: list[object] = []
 
-    class _Monitor:
-      def on_connect(self, backend_type: str) -> None:
-        del backend_type
-        held = manager._connect_lock.locked()
-        lock_states.append(held)
-        if not held:
-          manager.connect()
-          reentries.append(manager._backend)
+        class _Monitor:
+            def on_connect(self, backend_type: str) -> None:
+                del backend_type
+                held = manager._connect_lock.locked()
+                lock_states.append(held)
+                if not held:
+                    manager.connect()
+                    reentries.append(manager._backend)
 
-      def on_disconnect(self, backend_type: str, reason: object) -> None:
-        del backend_type, reason
+            def on_disconnect(self, backend_type: str, reason: object) -> None:
+                del backend_type, reason
 
-      def on_retry(self, backend_type: str, attempt: int) -> None:
-        del backend_type, attempt
+            def on_retry(self, backend_type: str, attempt: int) -> None:
+                del backend_type, attempt
 
-    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+        manager.set_monitor(_Monitor())  # type: ignore[arg-type]
 
-    manager.connect()
+        manager.connect()
 
-    assert lock_states == [False]
-    assert reentries == [backend]
-    backend.connect.assert_called_once_with()
+        assert lock_states == [False]
+        assert reentries == [backend]
+        backend.connect.assert_called_once_with()
 
-  def test_on_retry_can_reenter_after_serialized_transaction(self, mocker):
-    manager = ConnectionManager(
-      "redis",
-      {"retry_attempts": 1, "retry_delay": 0},
-    )
-    failed = mocker.MagicMock(name="failed")
-    failed.connect.side_effect = OSError("temporary")
-    recovered = mocker.MagicMock(name="recovered")
-    recovered.is_connected.return_value = True
-    mocker.patch.object(manager, "_create_backend", side_effect=[failed, recovered])
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
-    lock_states: list[bool] = []
-    reentries: list[object] = []
+    def test_on_retry_can_reenter_after_serialized_transaction(self, mocker):
+        manager = ConnectionManager(
+            "redis",
+            {"retry_attempts": 1, "retry_delay": 0},
+        )
+        failed = mocker.MagicMock(name="failed")
+        failed.connect.side_effect = OSError("temporary")
+        recovered = mocker.MagicMock(name="recovered")
+        recovered.is_connected.return_value = True
+        mocker.patch.object(manager, "_create_backend", side_effect=[failed, recovered])
+        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        lock_states: list[bool] = []
+        reentries: list[object] = []
 
-    class _Monitor:
-      def on_connect(self, backend_type: str) -> None:
-        del backend_type
+        class _Monitor:
+            def on_connect(self, backend_type: str) -> None:
+                del backend_type
 
-      def on_disconnect(self, backend_type: str, reason: object) -> None:
-        del backend_type, reason
+            def on_disconnect(self, backend_type: str, reason: object) -> None:
+                del backend_type, reason
 
-      def on_retry(self, backend_type: str, attempt: int) -> None:
-        del backend_type, attempt
-        held = manager._connect_lock.locked()
-        lock_states.append(held)
-        if not held:
-          manager.connect()
-          reentries.append(manager._backend)
+            def on_retry(self, backend_type: str, attempt: int) -> None:
+                del backend_type, attempt
+                held = manager._connect_lock.locked()
+                lock_states.append(held)
+                if not held:
+                    manager.connect()
+                    reentries.append(manager._backend)
 
-    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+        manager.set_monitor(_Monitor())  # type: ignore[arg-type]
 
-    manager.connect()
+        manager.connect()
 
-    assert lock_states == [False]
-    assert reentries == [recovered]
-    assert failed.connect.call_count == recovered.connect.call_count == 1
+        assert lock_states == [False]
+        assert reentries == [recovered]
+        assert failed.connect.call_count == recovered.connect.call_count == 1
 
-  def test_reconnect_disconnect_hook_runs_after_connect_lock_release(self, mocker):
-    manager = ConnectionManager("redis", {"retry_attempts": 0})
-    stale = mocker.MagicMock(name="stale")
-    stale.is_connected.return_value = False
-    replacement = mocker.MagicMock(name="replacement")
-    replacement.is_connected.return_value = True
-    manager._backend = stale
-    mocker.patch.object(manager, "_create_backend", return_value=replacement)
-    lock_states: list[bool] = []
-    reentries: list[object] = []
+    def test_reconnect_disconnect_hook_runs_after_connect_lock_release(self, mocker):
+        manager = ConnectionManager("redis", {"retry_attempts": 0})
+        stale = mocker.MagicMock(name="stale")
+        stale.is_connected.return_value = False
+        replacement = mocker.MagicMock(name="replacement")
+        replacement.is_connected.return_value = True
+        manager._backend = stale
+        mocker.patch.object(manager, "_create_backend", return_value=replacement)
+        lock_states: list[bool] = []
+        reentries: list[object] = []
 
-    class _Monitor:
-      def on_connect(self, backend_type: str) -> None:
-        del backend_type
+        class _Monitor:
+            def on_connect(self, backend_type: str) -> None:
+                del backend_type
 
-      def on_disconnect(self, backend_type: str, reason: object) -> None:
-        del backend_type, reason
-        held = manager._connect_lock.locked()
-        lock_states.append(held)
-        if not held:
-          manager.connect()
-          reentries.append(manager._backend)
+            def on_disconnect(self, backend_type: str, reason: object) -> None:
+                del backend_type, reason
+                held = manager._connect_lock.locked()
+                lock_states.append(held)
+                if not held:
+                    manager.connect()
+                    reentries.append(manager._backend)
 
-      def on_retry(self, backend_type: str, attempt: int) -> None:
-        del backend_type, attempt
+            def on_retry(self, backend_type: str, attempt: int) -> None:
+                del backend_type, attempt
 
-    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+        manager.set_monitor(_Monitor())  # type: ignore[arg-type]
 
-    manager.connect()
+        manager.connect()
 
-    assert lock_states == [False]
-    assert reentries == [replacement]
-    stale.disconnect.assert_called_once_with()
-    replacement.connect.assert_called_once_with()
+        assert lock_states == [False]
+        assert reentries == [replacement]
+        stale.disconnect.assert_called_once_with()
+        replacement.connect.assert_called_once_with()
 
-  def test_close_disconnect_hook_can_reenter_backend_without_state_lock(self, mocker):
-    manager = ConnectionManager("redis")
-    backend = mocker.MagicMock(name="backend")
-    manager._backend = backend
-    lock_states: list[bool] = []
-    terminal_errors: list[BackendConnectionError] = []
+    def test_close_disconnect_hook_can_reenter_backend_without_state_lock(self, mocker):
+        manager = ConnectionManager("redis")
+        backend = mocker.MagicMock(name="backend")
+        manager._backend = backend
+        lock_states: list[bool] = []
+        terminal_errors: list[BackendConnectionError] = []
 
-    class _Monitor:
-      def on_connect(self, backend_type: str) -> None:
-        del backend_type
+        class _Monitor:
+            def on_connect(self, backend_type: str) -> None:
+                del backend_type
 
-      def on_disconnect(self, backend_type: str, reason: object) -> None:
-        del backend_type, reason
-        held = manager._lock.locked()
-        lock_states.append(held)
-        if not held:
-          try:
-            _ = manager.backend
-          except BackendConnectionError as exc:
-            terminal_errors.append(exc)
+            def on_disconnect(self, backend_type: str, reason: object) -> None:
+                del backend_type, reason
+                held = manager._lock.locked()
+                lock_states.append(held)
+                if not held:
+                    try:
+                        _ = manager.backend
+                    except BackendConnectionError as exc:
+                        terminal_errors.append(exc)
 
-      def on_retry(self, backend_type: str, attempt: int) -> None:
-        del backend_type, attempt
+            def on_retry(self, backend_type: str, attempt: int) -> None:
+                del backend_type, attempt
 
-    manager.set_monitor(_Monitor())  # type: ignore[arg-type]
+        manager.set_monitor(_Monitor())  # type: ignore[arg-type]
 
-    manager.close()
+        manager.close()
 
-    assert lock_states == [False]
-    assert len(terminal_errors) == 1
-    assert "released" in str(terminal_errors[0])
-    backend.disconnect.assert_called_once_with()
+        assert lock_states == [False]
+        assert len(terminal_errors) == 1
+        assert "released" in str(terminal_errors[0])
+        backend.disconnect.assert_called_once_with()
 
 
 class TestConnectionManagerGetBackendInterface:
-  """Tests for get_queue_backend, get_set_backend, get_storage_backend."""
+    """Tests for get_queue_backend, get_set_backend, get_storage_backend."""
 
-  def test_get_queue_backend_not_implemented(self, mocker):
-    """Test get_queue_backend raises NotImplementedError for non-QueueBackend."""
-    mock_backend = mocker.MagicMock()
-    mock_backend.is_connected.return_value = True
+    def test_get_queue_backend_not_implemented(self, mocker):
+        """Test get_queue_backend raises NotImplementedError for non-QueueBackend."""
+        mock_backend = mocker.MagicMock()
+        mock_backend.is_connected.return_value = True
 
-    manager = ConnectionManager(BackendType.KAFKA)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.KAFKA)
+        manager._backend = mock_backend
 
-    with pytest.raises(NotImplementedError) as exc_info:
-      manager.get_queue_backend()
+        with pytest.raises(NotImplementedError) as exc_info:
+            manager.get_queue_backend()
 
-    assert "does not support queue operations" in str(exc_info.value)
+        assert "does not support queue operations" in str(exc_info.value)
 
-  def test_get_queue_backend_returns_backend(self):
-    """Test get_queue_backend returns backend when it implements QueueBackend."""
-    from scrapy_extension.backends.base import Backend
+    def test_get_queue_backend_returns_backend(self):
+        """Test get_queue_backend returns backend when it implements QueueBackend."""
+        from scrapy_extension.backends.base import Backend
 
-    class MockQueueBackend(Backend, QueueBackend):
-      """Mock backend implementing QueueBackend."""
+        class MockQueueBackend(Backend, QueueBackend):
+            """Mock backend implementing QueueBackend."""
 
-      def __init__(self):
-        self._is_connected = True
+            def __init__(self):
+                self._is_connected = True
 
-      def connect(self):
-        pass
+            def connect(self):
+                pass
 
-      def disconnect(self):
-        pass
+            def disconnect(self):
+                pass
 
-      def is_connected(self):
-        return self._is_connected
+            def is_connected(self):
+                return self._is_connected
 
-      def ping(self):
-        return True
+            def ping(self):
+                return True
 
-      @property
-      def backend_type(self):
-        return BackendType.REDIS
+            @property
+            def backend_type(self):
+                return BackendType.REDIS
 
-      def push(self, queue_name, item, priority=0.0):
-        pass
+            def push(self, queue_name, item, priority=0.0):
+                pass
 
-      def pop(self, queue_name, timeout=0.0):
-        return None
+            def pop(self, queue_name, timeout=0.0):
+                return None
 
-      def queue_len(self, queue_name):
-        return 0
+            def queue_len(self, queue_name):
+                return 0
 
-      def clear_queue(self, queue_name):
-        pass
+            def clear_queue(self, queue_name):
+                pass
 
-    mock_backend = MockQueueBackend()
+        mock_backend = MockQueueBackend()
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    result = manager.get_queue_backend()
+        result = manager.get_queue_backend()
 
-    assert result is mock_backend
+        assert result is mock_backend
 
-  def test_get_set_backend_not_implemented(self, mocker):
-    """Test get_set_backend raises NotImplementedError for non-SetBackend."""
-    mock_backend = mocker.MagicMock()
-    mock_backend.is_connected.return_value = True
+    def test_get_set_backend_not_implemented(self, mocker):
+        """Test get_set_backend raises NotImplementedError for non-SetBackend."""
+        mock_backend = mocker.MagicMock()
+        mock_backend.is_connected.return_value = True
 
-    manager = ConnectionManager(BackendType.KAFKA)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.KAFKA)
+        manager._backend = mock_backend
 
-    with pytest.raises(NotImplementedError) as exc_info:
-      manager.get_set_backend()
+        with pytest.raises(NotImplementedError) as exc_info:
+            manager.get_set_backend()
 
-    assert "does not support set operations" in str(exc_info.value)
+        assert "does not support set operations" in str(exc_info.value)
 
-  def test_get_set_backend_returns_backend(self):
-    """Test get_set_backend returns backend when it implements SetBackend."""
-    from scrapy_extension.backends.base import Backend
+    def test_get_set_backend_returns_backend(self):
+        """Test get_set_backend returns backend when it implements SetBackend."""
+        from scrapy_extension.backends.base import Backend
 
-    class MockSetBackend(Backend, SetBackend):
-      """Mock backend implementing SetBackend."""
+        class MockSetBackend(Backend, SetBackend):
+            """Mock backend implementing SetBackend."""
 
-      def __init__(self):
-        self._is_connected = True
+            def __init__(self):
+                self._is_connected = True
 
-      def connect(self):
-        pass
+            def connect(self):
+                pass
 
-      def disconnect(self):
-        pass
+            def disconnect(self):
+                pass
 
-      def is_connected(self):
-        return self._is_connected
+            def is_connected(self):
+                return self._is_connected
 
-      def ping(self):
-        return True
+            def ping(self):
+                return True
 
-      @property
-      def backend_type(self):
-        return BackendType.REDIS
+            @property
+            def backend_type(self):
+                return BackendType.REDIS
 
-      def add(self, set_name, item):
-        return True
+            def add(self, set_name, item):
+                return True
 
-      def remove(self, set_name, item):
-        return True
+            def remove(self, set_name, item):
+                return True
 
-      def contains(self, set_name, item):
-        return True
+            def contains(self, set_name, item):
+                return True
 
-      def set_len(self, set_name):
-        return 0
+            def set_len(self, set_name):
+                return 0
 
-      def clear_set(self, set_name):
-        pass
+            def clear_set(self, set_name):
+                pass
 
-    mock_backend = MockSetBackend()
+        mock_backend = MockSetBackend()
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    result = manager.get_set_backend()
+        result = manager.get_set_backend()
 
-    assert result is mock_backend
+        assert result is mock_backend
 
-  def test_get_storage_backend_not_implemented(self, mocker):
-    """Test get_storage_backend raises NotImplementedError for non-StorageBackend."""
-    mock_backend = mocker.MagicMock()
-    mock_backend.is_connected.return_value = True
+    def test_get_storage_backend_not_implemented(self, mocker):
+        """Test get_storage_backend raises NotImplementedError for non-StorageBackend."""
+        mock_backend = mocker.MagicMock()
+        mock_backend.is_connected.return_value = True
 
-    manager = ConnectionManager(BackendType.KAFKA)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.KAFKA)
+        manager._backend = mock_backend
 
-    with pytest.raises(NotImplementedError) as exc_info:
-      manager.get_storage_backend()
+        with pytest.raises(NotImplementedError) as exc_info:
+            manager.get_storage_backend()
 
-    assert "does not support storage operations" in str(exc_info.value)
+        assert "does not support storage operations" in str(exc_info.value)
 
-  def test_get_storage_backend_returns_backend(self):
-    """Test get_storage_backend returns backend when it implements StorageBackend."""
-    from scrapy_extension.backends.base import Backend
+    def test_get_storage_backend_returns_backend(self):
+        """Test get_storage_backend returns backend when it implements StorageBackend."""
+        from scrapy_extension.backends.base import Backend
 
-    class MockStorageBackend(Backend, StorageBackend):
-      """Mock backend implementing StorageBackend."""
+        class MockStorageBackend(Backend, StorageBackend):
+            """Mock backend implementing StorageBackend."""
 
-      def __init__(self):
-        self._is_connected = True
+            def __init__(self):
+                self._is_connected = True
 
-      def connect(self):
-        pass
+            def connect(self):
+                pass
 
-      def disconnect(self):
-        pass
+            def disconnect(self):
+                pass
 
-      def is_connected(self):
-        return self._is_connected
+            def is_connected(self):
+                return self._is_connected
 
-      def ping(self):
-        return True
+            def ping(self):
+                return True
 
-      @property
-      def backend_type(self):
-        return BackendType.REDIS
+            @property
+            def backend_type(self):
+                return BackendType.REDIS
 
-      def store(self, key, data, ttl=None):
-        pass
+            def store(self, key, data, ttl=None):
+                pass
 
-      def retrieve(self, key):
-        return None
+            def retrieve(self, key):
+                return None
 
-      def delete(self, key):
-        return True
+            def delete(self, key):
+                return True
 
-      def exists(self, key):
-        return True
+            def exists(self, key):
+                return True
 
-      def ttl(self, key):
-        return None
+            def ttl(self, key):
+                return None
 
-      def clear_storage(self, prefix=None):
-        pass
+            def clear_storage(self, prefix=None):
+                pass
 
-    mock_backend = MockStorageBackend()
+        mock_backend = MockStorageBackend()
 
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = mock_backend
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = mock_backend
 
-    result = manager.get_storage_backend()
+        result = manager.get_storage_backend()
 
-    assert result is mock_backend
+        assert result is mock_backend
 
 
 class TestConnectionManagerSingleton:
-  """Tests for singleton pattern."""
+    """Tests for singleton pattern."""
 
-  def test_get_manager_same_instance_same_params(self):
-    """Test get_manager returns same instance for same backend_type and settings."""
-    manager1 = ConnectionManager.get_manager(BackendType.REDIS)
-    manager2 = ConnectionManager.get_manager(BackendType.REDIS)
+    def test_get_manager_same_instance_same_params(self):
+        """Test get_manager returns same instance for same backend_type and settings."""
+        manager1 = ConnectionManager.get_manager(BackendType.REDIS)
+        manager2 = ConnectionManager.get_manager(BackendType.REDIS)
 
-    assert manager1 is manager2
+        assert manager1 is manager2
 
-  def test_get_manager_different_instance_different_backend_type(self):
-    """Test get_manager returns different instance for different backend types."""
-    manager1 = ConnectionManager.get_manager(BackendType.REDIS)
-    manager2 = ConnectionManager.get_manager(BackendType.MONGODB)
+    def test_get_manager_different_instance_different_backend_type(self):
+        """Test get_manager returns different instance for different backend types."""
+        manager1 = ConnectionManager.get_manager(BackendType.REDIS)
+        manager2 = ConnectionManager.get_manager(BackendType.MONGODB)
 
-    assert manager1 is not manager2
+        assert manager1 is not manager2
 
-  def test_get_manager_different_instance_different_settings(self):
-    """Test get_manager returns different instance for different settings."""
-    manager1 = ConnectionManager.get_manager(BackendType.REDIS, {"host": "localhost"})
-    manager2 = ConnectionManager.get_manager(BackendType.REDIS, {"host": "otherhost"})
+    def test_get_manager_different_instance_different_settings(self):
+        """Test get_manager returns different instance for different settings."""
+        manager1 = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "localhost"}
+        )
+        manager2 = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "otherhost"}
+        )
 
-    assert manager1 is not manager2
+        assert manager1 is not manager2
 
 
 class TestConnectionManagerCreateBackendAllTypes:
-  """Regression: _create_backend must support ALL 10 BackendType values.
+    """Regression: _create_backend must support ALL 10 BackendType values.
 
-  Previously only 6 (REDIS, MONGODB, KAFKA, RABBITMQ, ELASTICSEARCH, ROCKETMQ)
-  were handled; PULSAR, SQS, MEMCACHED, DYNAMODB fell through to
-  ``case _: raise ValueError("Unsupported backend type")`` despite being
-  listed in the QUEUE_CAPABLE / STORAGE_CAPABLE sets and the README's
-  "10 Backends" claim. Configuring them via standard Scrapy settings routed
-  through ConnectionManager and crashed.
-  """
-
-  @pytest.fixture(autouse=True)
-  def _clear_registry_between_tests(self):
-    """Ensure managers do not leak across parametrized invocations."""
-    ConnectionManager.clear_registry()
-    yield
-    ConnectionManager.clear_registry()
-
-  @pytest.mark.parametrize(
-    "backend_type",
-    list(BackendType),
-    ids=[bt.name for bt in BackendType],
-  )
-  def test_create_backend_supports_all_backend_types(self, backend_type):
-    """Every BackendType must build via _create_backend without ValueError.
-
-    The test dependency group supplies every optional SDK. We only exercise
-    construction — connect() is never called (no real services).
+    Previously only 6 (REDIS, MONGODB, KAFKA, RABBITMQ, ELASTICSEARCH, ROCKETMQ)
+    were handled; PULSAR, SQS, MEMCACHED, DYNAMODB fell through to
+    ``case _: raise ValueError("Unsupported backend type")`` despite being
+    listed in the QUEUE_CAPABLE / STORAGE_CAPABLE sets and the README's
+    "10 Backends" claim. Configuring them via standard Scrapy settings routed
+    through ConnectionManager and crashed.
     """
-    manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})
-    backend = manager._create_backend()
 
-    assert backend.backend_type is backend_type
-    # Pin the per-case wiring: the right concrete class must be constructed,
-    # not merely one whose backend_type property matches (guards against a
-    # Backend/Settings swap inside a match arm).
-    assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
+    @pytest.fixture(autouse=True)
+    def _clear_registry_between_tests(self):
+        """Ensure managers do not leak across parametrized invocations."""
+        ConnectionManager.clear_registry()
+        yield
+        ConnectionManager.clear_registry()
 
-  @pytest.mark.parametrize(
-    "backend_type",
-    [
-      BackendType.PULSAR,
-      BackendType.SQS,
-      BackendType.MEMCACHED,
-      BackendType.DYNAMODB,
-    ],
-    ids=["pulsar", "sqs", "memcached", "dynamodb"],
-  )
-  def test_create_backend_regression_for_four_new_backends(self, backend_type):
-    """Direct regression for the P0 bug: each of the 4 newly-added backends
-    must build via _create_backend (previously raised ValueError)."""
-    manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})
-    backend = manager._create_backend()
+    @pytest.mark.parametrize(
+        "backend_type",
+        list(BackendType),
+        ids=[bt.name for bt in BackendType],
+    )
+    def test_create_backend_supports_all_backend_types(self, backend_type):
+        """Every BackendType must build via _create_backend without ValueError.
 
-    assert backend.backend_type is backend_type
-    # Pin the per-case wiring: the right concrete class must be constructed,
-    # not merely one whose backend_type property matches (guards against a
-    # Backend/Settings swap inside a match arm).
-    assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
+        The test dependency group supplies every optional SDK. We only exercise
+        construction — connect() is never called (no real services).
+        """
+        manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})
+        backend = manager._create_backend()
+
+        assert backend.backend_type is backend_type
+        # Pin the per-case wiring: the right concrete class must be constructed,
+        # not merely one whose backend_type property matches (guards against a
+        # Backend/Settings swap inside a match arm).
+        assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
+
+    @pytest.mark.parametrize(
+        "backend_type",
+        [
+            BackendType.PULSAR,
+            BackendType.SQS,
+            BackendType.MEMCACHED,
+            BackendType.DYNAMODB,
+        ],
+        ids=["pulsar", "sqs", "memcached", "dynamodb"],
+    )
+    def test_create_backend_regression_for_four_new_backends(self, backend_type):
+        """Direct regression for the P0 bug: each of the 4 newly-added backends
+        must build via _create_backend (previously raised ValueError)."""
+        manager = ConnectionManager.get_manager(backend_type=backend_type, settings={})
+        backend = manager._create_backend()
+
+        assert backend.backend_type is backend_type
+        # Pin the per-case wiring: the right concrete class must be constructed,
+        # not merely one whose backend_type property matches (guards against a
+        # Backend/Settings swap inside a match arm).
+        assert type(backend).__name__ == _EXPECTED_BACKEND_CLASS[backend_type]
 
 
 class TestResolveBackendConfigEnumNormalization:
-  """A3: ``resolve_backend_config`` must not crash on programmatic enum values.
+    """A3: ``resolve_backend_config`` must not crash on programmatic enum values.
 
-  Previously ``BackendType(per_component_type)`` raised ``ValueError`` if the
-  value was an invalid string OR a value that ``BackendType.__call__`` could
-  not coerce (e.g. an int passed by a programmatic caller). The crash
-  surfaced as an untyped ``ValueError`` deep in ``from_settings`` instead of
-  a ``ConfigurationError`` with the offending setting name + value attached.
-  """
-
-  @staticmethod
-  def _make_settings(values: dict[str, object]) -> MagicMock:
-    """Build a Scrapy-settings-like stub returning per-key values.
-
-    ``resolve_backend_config`` calls ``settings.get(key)`` and
-    ``settings.getdict(key, default)``; a ``MagicMock`` spec'd to a dict-like
-    gives predictable per-key behavior without dragging in scrapy.Settings.
+    Previously ``BackendType(per_component_type)`` raised ``ValueError`` if the
+    value was an invalid string OR a value that ``BackendType.__call__`` could
+    not coerce (e.g. an int passed by a programmatic caller). The crash
+    surfaced as an untyped ``ValueError`` deep in ``from_settings`` instead of
+    a ``ConfigurationError`` with the offending setting name + value attached.
     """
-    settings = MagicMock()
 
-    def _get(key, default=None):
-      return values.get(key, default)
+    @staticmethod
+    def _make_settings(values: dict[str, object]) -> MagicMock:
+        """Build a Scrapy-settings-like stub returning per-key values.
 
-    def _getdict(key, default=None):
-      v = values.get(key, default)
-      if v is None:
-        return {}
-      return dict(v)
+        ``resolve_backend_config`` calls ``settings.get(key)`` and
+        ``settings.getdict(key, default)``; a ``MagicMock`` spec'd to a dict-like
+        gives predictable per-key behavior without dragging in scrapy.Settings.
+        """
+        settings = MagicMock()
 
-    settings.get.side_effect = _get
-    settings.getdict.side_effect = _getdict
-    return settings
+        def _get(key, default=None):
+            return values.get(key, default)
 
-  def test_enum_instance_passthrough_per_component(self):
-    """A BackendType instance passed as the per-component value must resolve
-    to its registry-key string (no ValueError, no re-coercion crash).
+        def _getdict(key, default=None):
+            v = values.get(key, default)
+            if v is None:
+                return {}
+            return dict(v)
 
-    Round-5 R5-1: ``resolve_backend_config`` now returns the backend-type
-    STRING (was the ``BackendType`` member). ``BackendType.MONGODB`` →
-    ``"mongodb"`` — the same registry key the descriptor table uses.
-    """
-    from scrapy_extension.backends.connectors import resolve_backend_config
+        settings.get.side_effect = _get
+        settings.getdict.side_effect = _getdict
+        return settings
 
-    settings = self._make_settings(
-      {"SCRAPY_QUEUE_BACKEND_TYPE": BackendType.MONGODB}
-    )
-    backend_type, _ = resolve_backend_config(
-      settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
-    )
-    assert backend_type == "mongodb"
+    def test_enum_instance_passthrough_per_component(self):
+        """A BackendType instance passed as the per-component value must resolve
+        to its registry-key string (no ValueError, no re-coercion crash).
 
-  def test_string_value_resolves_per_component(self):
-    """A plain string (the typical Scrapy settings path) must still resolve
-    to the registry-key string unchanged."""
-    from scrapy_extension.backends.connectors import resolve_backend_config
+        Round-5 R5-1: ``resolve_backend_config`` now returns the backend-type
+        STRING (was the ``BackendType`` member). ``BackendType.MONGODB`` →
+        ``"mongodb"`` — the same registry key the descriptor table uses.
+        """
+        from scrapy_extension.backends.connectors import resolve_backend_config
 
-    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "kafka"})
-    backend_type, _ = resolve_backend_config(
-      settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
-    )
-    assert backend_type == "kafka"
+        settings = self._make_settings(
+            {"SCRAPY_QUEUE_BACKEND_TYPE": BackendType.MONGODB}
+        )
+        backend_type, _ = resolve_backend_config(
+            settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+        )
+        assert backend_type == "mongodb"
 
-  def test_invalid_string_raises_configuration_error(self):
-    """An invalid backend type string must raise ``ConfigurationError``
-    (not bare ``ValueError``) so the caller sees a typed static error without
-    retaining the untrusted setting value."""
-    from scrapy_extension.backends.connectors import resolve_backend_config
-    from scrapy_extension.exceptions import ConfigurationError
+    def test_string_value_resolves_per_component(self):
+        """A plain string (the typical Scrapy settings path) must still resolve
+        to the registry-key string unchanged."""
+        from scrapy_extension.backends.connectors import resolve_backend_config
 
-    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "not-a-backend"})
-    with pytest.raises(ConfigurationError) as exc_info:
-      resolve_backend_config(
-        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
-      )
-    assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
-    assert exc_info.value.setting_value is None
+        settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "kafka"})
+        backend_type, _ = resolve_backend_config(
+            settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+        )
+        assert backend_type == "kafka"
 
-  def test_invalid_global_raises_configuration_error(self):
-    """Same normalization on the GLOBAL fallback path
-    (``SCRAPY_BACKEND_TYPE``)."""
-    from scrapy_extension.backends.connectors import resolve_backend_config
-    from scrapy_extension.exceptions import ConfigurationError
+    def test_invalid_string_raises_configuration_error(self):
+        """An invalid backend type string must raise ``ConfigurationError``
+        (not bare ``ValueError``) so the caller sees a typed static error without
+        retaining the untrusted setting value."""
+        from scrapy_extension.backends.connectors import resolve_backend_config
+        from scrapy_extension.exceptions import ConfigurationError
 
-    settings = self._make_settings({"SCRAPY_BACKEND_TYPE": "bogus"})
-    with pytest.raises(ConfigurationError) as exc_info:
-      resolve_backend_config(
-        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
-      )
-    assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
-    assert exc_info.value.setting_value is None
+        settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": "not-a-backend"})
+        with pytest.raises(ConfigurationError) as exc_info:
+            resolve_backend_config(
+                settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+            )
+        assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
+        assert exc_info.value.setting_value is None
 
-  def test_non_string_value_raises_configuration_error(self):
-    """A non-string, non-enum value (e.g. an int from a programmatic caller)
-    must raise ``ConfigurationError`` rather than the raw ``ValueError``
-    that ``BackendType(123)`` produces internally."""
-    from scrapy_extension.backends.connectors import resolve_backend_config
-    from scrapy_extension.exceptions import ConfigurationError
+    def test_invalid_global_raises_configuration_error(self):
+        """Same normalization on the GLOBAL fallback path
+        (``SCRAPY_BACKEND_TYPE``)."""
+        from scrapy_extension.backends.connectors import resolve_backend_config
+        from scrapy_extension.exceptions import ConfigurationError
 
-    settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": 123})
-    with pytest.raises(ConfigurationError) as exc_info:
-      resolve_backend_config(
-        settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
-      )
-    assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
+        settings = self._make_settings({"SCRAPY_BACKEND_TYPE": "bogus"})
+        with pytest.raises(ConfigurationError) as exc_info:
+            resolve_backend_config(
+                settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+            )
+        assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
+        assert exc_info.value.setting_value is None
+
+    def test_non_string_value_raises_configuration_error(self):
+        """A non-string, non-enum value (e.g. an int from a programmatic caller)
+        must raise ``ConfigurationError`` rather than the raw ``ValueError``
+        that ``BackendType(123)`` produces internally."""
+        from scrapy_extension.backends.connectors import resolve_backend_config
+        from scrapy_extension.exceptions import ConfigurationError
+
+        settings = self._make_settings({"SCRAPY_QUEUE_BACKEND_TYPE": 123})
+        with pytest.raises(ConfigurationError) as exc_info:
+            resolve_backend_config(
+                settings, "SCRAPY_QUEUE_BACKEND_TYPE", "SCRAPY_QUEUE_BACKEND_SETTINGS"
+            )
+        assert exc_info.value.setting_name == "SCRAPY_QUEUE_BACKEND_TYPE"
 
 
 class TestConnectionManagerRefcount:
-  """A1: shared ConnectionManager.close() must refcount co-located holders.
+    """A1: shared ConnectionManager.close() must refcount co-located holders.
 
-  When two components (scheduler queue + dupefilter) resolve to the same
-  ``backend_type:settings_hash`` registry key, ``get_manager()`` returns the
-  SAME instance. The old ``close()`` unconditionally disconnected + evicted,
-  so the first component to close tore the connection out from under the
-  other during shutdown.
-  """
+    When two components (scheduler queue + dupefilter) resolve to the same
+    ``backend_type:settings_hash`` registry key, ``get_manager()`` returns the
+    SAME instance. The old ``close()`` unconditionally disconnected + evicted,
+    so the first component to close tore the connection out from under the
+    other during shutdown.
+    """
 
-  def test_get_manager_acquires_refcount(self):
-    """Each ``get_manager()`` call for the same key must increment the
-    shared manager's refcount (one acquire per get)."""
-    manager = ConnectionManager.get_manager(BackendType.REDIS)
-    assert manager._users == 1
-    manager2 = ConnectionManager.get_manager(BackendType.REDIS)
-    assert manager is manager2
-    assert manager._users == 2
+    def test_get_manager_acquires_refcount(self):
+        """Each ``get_manager()`` call for the same key must increment the
+        shared manager's refcount (one acquire per get)."""
+        manager = ConnectionManager.get_manager(BackendType.REDIS)
+        assert manager._users == 1
+        manager2 = ConnectionManager.get_manager(BackendType.REDIS)
+        assert manager is manager2
+        assert manager._users == 2
 
-  def test_close_last_holder_evicts_and_reconnects_fresh(self, mocker):
-    """Closing the LAST holder evicts the registry entry; a subsequent
-    ``get_manager(same key)`` returns a FRESH manager (different ``id``)
-    that reconnects from scratch."""
-    mocker.patch.object(ConnectionManager, "_create_backend")
-    mock_backend = mocker.MagicMock()
-    ConnectionManager._create_backend.return_value = mock_backend
+    def test_close_last_holder_evicts_and_reconnects_fresh(self, mocker):
+        """Closing the LAST holder evicts the registry entry; a subsequent
+        ``get_manager(same key)`` returns a FRESH manager (different ``id``)
+        that reconnects from scratch."""
+        mocker.patch.object(ConnectionManager, "_create_backend")
+        mock_backend = mocker.MagicMock()
+        ConnectionManager._create_backend.return_value = mock_backend
 
-    manager = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "reconnect-test"}
-    )
-    manager._backend = mock_backend
-    first_id = id(manager)
-
-    manager.close()
-
-    # Backend was disconnected and _backend cleared.
-    mock_backend.disconnect.assert_called_once()
-    assert manager._backend is None
-
-    # Registry evicted → fresh manager on next get.
-    manager_after = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "reconnect-test"}
-    )
-    assert id(manager_after) != first_id
-    assert manager_after is not manager
-
-  def test_colocated_close_one_keeps_backend_alive(self, mocker):
-    """Two holders share one manager. Closing ONE must NOT disconnect the
-    backend or evict the registry — the other holder still needs it."""
-    mocker.patch.object(ConnectionManager, "_create_backend")
-    mock_backend = mocker.MagicMock()
-    ConnectionManager._create_backend.return_value = mock_backend
-
-    holder_a = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "colocated"}
-    )
-    holder_b = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "colocated"}
-    )
-    assert holder_a is holder_b
-    assert holder_a._users == 2
-
-    holder_a._backend = mock_backend
-
-    # First close — must NOT tear down.
-    holder_a.close()
-
-    mock_backend.disconnect.assert_not_called()
-    assert holder_a._backend is mock_backend  # backend still wired
-    # Registry still holds the manager.
-    key = ConnectionManager._registry_key(
-      BackendType.REDIS, {"host": "colocated"}
-    )
-    assert key in ConnectionManager._managers
-    # Refcount decremented to the remaining holder.
-    assert holder_b._users == 1
-
-  def test_colocated_close_both_disconnects_and_evicts(self, mocker):
-    """Closing BOTH holders (last one out) disconnects the backend AND
-    evicts the registry entry."""
-    mocker.patch.object(ConnectionManager, "_create_backend")
-    mock_backend = mocker.MagicMock()
-    ConnectionManager._create_backend.return_value = mock_backend
-
-    holder_a = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "colocated-both"}
-    )
-    holder_b = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "colocated-both"}
-    )
-    holder_a._backend = mock_backend
-
-    holder_a.close()
-    holder_b.close()
-
-    mock_backend.disconnect.assert_called_once()
-    key = ConnectionManager._registry_key(
-      BackendType.REDIS, {"host": "colocated-both"}
-    )
-    assert key not in ConnectionManager._managers
-
-  def test_concurrent_get_manager_same_key_one_shared_instance(self):
-    """Under concurrency, N threads hitting the same registry key must
-    resolve to exactly ONE shared manager (no registry race creating
-    duplicates) with refcount == N."""
-    import threading
-
-    results: list[ConnectionManager] = []
-    errors: list[BaseException] = []
-    n = 20
-    barrier = threading.Barrier(n)
-
-    def worker():
-      try:
-        barrier.wait()
-        m = ConnectionManager.get_manager(
-          BackendType.REDIS, {"host": "concurrent-shared"}
+        manager = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "reconnect-test"}
         )
-        results.append(m)
-      except BaseException as e:  # noqa: BLE001 - surface any failure
-        errors.append(e)
+        manager._backend = mock_backend
+        first_id = id(manager)
 
-    threads = [threading.Thread(target=worker) for _ in range(n)]
-    for t in threads:
-      t.start()
-    for t in threads:
-      t.join()
+        manager.close()
 
-    assert errors == []
-    assert len(results) == n
-    first = results[0]
-    assert all(r is first for r in results)
-    assert first._users == n
+        # Backend was disconnected and _backend cleared.
+        mock_backend.disconnect.assert_called_once()
+        assert manager._backend is None
 
-  def test_concurrent_get_manager_distinct_keys_n_instances(self):
-    """N threads with distinct keys → N distinct managers, each refcount 1."""
-    import threading
-
-    results: list[ConnectionManager] = []
-    errors: list[BaseException] = []
-    n = 10
-    barrier = threading.Barrier(n)
-
-    def worker(i: int):
-      try:
-        barrier.wait()
-        m = ConnectionManager.get_manager(
-          BackendType.REDIS, {"host": f"concurrent-distinct-{i}"}
+        # Registry evicted → fresh manager on next get.
+        manager_after = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "reconnect-test"}
         )
-        results.append(m)
-      except BaseException as e:  # noqa: BLE001
-        errors.append(e)
+        assert id(manager_after) != first_id
+        assert manager_after is not manager
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-    for t in threads:
-      t.start()
-    for t in threads:
-      t.join()
+    def test_colocated_close_one_keeps_backend_alive(self, mocker):
+        """Two holders share one manager. Closing ONE must NOT disconnect the
+        backend or evict the registry — the other holder still needs it."""
+        mocker.patch.object(ConnectionManager, "_create_backend")
+        mock_backend = mocker.MagicMock()
+        ConnectionManager._create_backend.return_value = mock_backend
 
-    assert errors == []
-    assert len(results) == n
-    assert len({id(r) for r in results}) == n
-    assert all(r._users == 1 for r in results)
+        holder_a = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "colocated"}
+        )
+        holder_b = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "colocated"}
+        )
+        assert holder_a is holder_b
+        assert holder_a._users == 2
+
+        holder_a._backend = mock_backend
+
+        # First close — must NOT tear down.
+        holder_a.close()
+
+        mock_backend.disconnect.assert_not_called()
+        assert holder_a._backend is mock_backend  # backend still wired
+        # Registry still holds the manager.
+        key = ConnectionManager._registry_key(BackendType.REDIS, {"host": "colocated"})
+        assert key in ConnectionManager._managers
+        # Refcount decremented to the remaining holder.
+        assert holder_b._users == 1
+
+    def test_colocated_close_both_disconnects_and_evicts(self, mocker):
+        """Closing BOTH holders (last one out) disconnects the backend AND
+        evicts the registry entry."""
+        mocker.patch.object(ConnectionManager, "_create_backend")
+        mock_backend = mocker.MagicMock()
+        ConnectionManager._create_backend.return_value = mock_backend
+
+        holder_a = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "colocated-both"}
+        )
+        holder_b = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "colocated-both"}
+        )
+        holder_a._backend = mock_backend
+
+        holder_a.close()
+        holder_b.close()
+
+        mock_backend.disconnect.assert_called_once()
+        key = ConnectionManager._registry_key(
+            BackendType.REDIS, {"host": "colocated-both"}
+        )
+        assert key not in ConnectionManager._managers
+
+    def test_concurrent_get_manager_same_key_one_shared_instance(self):
+        """Under concurrency, N threads hitting the same registry key must
+        resolve to exactly ONE shared manager (no registry race creating
+        duplicates) with refcount == N."""
+        import threading
+
+        results: list[ConnectionManager] = []
+        errors: list[BaseException] = []
+        n = 20
+        barrier = threading.Barrier(n)
+
+        def worker():
+            try:
+                barrier.wait()
+                m = ConnectionManager.get_manager(
+                    BackendType.REDIS, {"host": "concurrent-shared"}
+                )
+                results.append(m)
+            except BaseException as e:  # noqa: BLE001 - surface any failure
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(results) == n
+        first = results[0]
+        assert all(r is first for r in results)
+        assert first._users == n
+
+    def test_concurrent_get_manager_distinct_keys_n_instances(self):
+        """N threads with distinct keys → N distinct managers, each refcount 1."""
+        import threading
+
+        results: list[ConnectionManager] = []
+        errors: list[BaseException] = []
+        n = 10
+        barrier = threading.Barrier(n)
+
+        def worker(i: int):
+            try:
+                barrier.wait()
+                m = ConnectionManager.get_manager(
+                    BackendType.REDIS, {"host": f"concurrent-distinct-{i}"}
+                )
+                results.append(m)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(results) == n
+        assert len({id(r) for r in results}) == n
+        assert all(r._users == 1 for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -1642,254 +1659,256 @@ class TestConnectionManagerRefcount:
 
 
 class TestCircuitBreakerWiringDefaultOff:
-  """When ``SCRAPY_CIRCUIT_BREAKER_ENABLED`` is unset, backends are unwrapped.
+    """When ``SCRAPY_CIRCUIT_BREAKER_ENABLED`` is unset, backends are unwrapped.
 
-  The default path must return the raw backend instance with zero overhead
-  and byte-identical behavior — no proxy, no breaker, no behavior change.
-  """
+    The default path must return the raw backend instance with zero overhead
+    and byte-identical behavior — no proxy, no breaker, no behavior change.
+    """
 
-  def test_default_returns_raw_backend_unwrapped(self, monkeypatch):
-    # Ensure the env var is unset so the lazy builder resolves to disabled.
-    monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
-    ConnectionManager.clear_registry()
+    def test_default_returns_raw_backend_unwrapped(self, monkeypatch):
+        # Ensure the env var is unset so the lazy builder resolves to disabled.
+        monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+        ConnectionManager.clear_registry()
 
-    manager = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "breaker-default-off"}
-    )
-    try:
-      # Force the lazy breaker resolution before touching .backend so we
-      # don't depend on a real Redis connection for this assertion.
-      assert manager._get_breaker() is None
-      # _breaker_configured is sticky-True after first resolution; the value
-      # is what matters — None means disabled.
-      assert manager._breaker is None
-    finally:
-      manager.close()
-      ConnectionManager.clear_registry()
+        manager = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "breaker-default-off"}
+        )
+        try:
+            # Force the lazy breaker resolution before touching .backend so we
+            # don't depend on a real Redis connection for this assertion.
+            assert manager._get_breaker() is None
+            # _breaker_configured is sticky-True after first resolution; the value
+            # is what matters — None means disabled.
+            assert manager._breaker is None
+        finally:
+            manager.close()
+            ConnectionManager.clear_registry()
 
 
 class TestOperationBoundQueueDurability:
-  """Durability proof stays attached to one backend/breaker operation."""
+    """Durability proof stays attached to one backend/breaker operation."""
 
-  @staticmethod
-  def _manager(backend: QueueBackend) -> ConnectionManager:
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = backend  # type: ignore[assignment]
-    manager._breaker_configured = True
-    manager._breaker = None
-    return manager
+    @staticmethod
+    def _manager(backend: QueueBackend) -> ConnectionManager:
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = backend  # type: ignore[assignment]
+        manager._breaker_configured = True
+        manager._breaker = None
+        return manager
 
-  def test_legacy_backend_is_volatile_and_rejects_required_push_before_mutation(
-    self,
-  ) -> None:
-    backend = _FakeRedisQueueBackend()
-    manager = self._manager(backend)
-    try:
-      receipt = manager._push_queue_with_durability("q", b"ordinary")
-
-      assert receipt.worker_crash_durable is False
-      assert backend.pushed == [("q", b"ordinary", 0.0)]
-
-      with pytest.raises(QueueError, match="worker-crash durable"):
-        manager._push_queue_with_durability(
-          "q",
-          b"replacement",
-          require_durable=True,
-        )
-      assert backend.pushed == [("q", b"ordinary", 0.0)]
-    finally:
-      manager.close()
-
-  def test_backend_replacement_after_snapshot_cannot_redirect_push(self, mocker) -> None:
-    first = _DurableFakeRedisQueueBackend()
-    replacement = _FakeRedisQueueBackend()
-    manager = self._manager(first)
-    original_snapshot = manager._get_backend_breaker_snapshot
-
-    def replace_after_snapshot():
-      snapshot = original_snapshot()
-      manager._backend = replacement
-      return snapshot
-
-    mocker.patch.object(
-      manager,
-      "_get_backend_breaker_snapshot",
-      side_effect=replace_after_snapshot,
-    )
-    try:
-      receipt = manager._push_queue_with_durability(
-        "q",
-        b"item",
-        require_durable=True,
-      )
-
-      assert receipt.worker_crash_durable is True
-      assert first.pushed == [("q", b"item", 0.0)]
-      assert replacement.pushed == []
-    finally:
-      manager.close()
-
-  def test_policy_rejection_does_not_trip_or_close_breaker(self, monkeypatch) -> None:
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
-    backend = _FakeRedisQueueBackend()
-    manager = ConnectionManager(BackendType.REDIS)
-    manager._backend = backend
-    try:
-      with pytest.raises(QueueError, match="worker-crash durable"):
-        manager._push_queue_with_durability(
-          "q",
-          b"item",
-          require_durable=True,
-        )
-
-      assert manager._breaker is not None
-      assert manager._breaker.state.value == "closed"
-      assert manager._breaker.failure_count == 0
-      assert backend.pushed == []
-    finally:
-      manager.close()
-
-  def test_malformed_truthy_receipt_is_rejected_after_safe_replay_boundary(
-    self,
-  ) -> None:
-    class MalformedReceiptBackend(_FakeRedisQueueBackend):
-      def _push_with_durability(  # type: ignore[override]
+    def test_legacy_backend_is_volatile_and_rejects_required_push_before_mutation(
         self,
-        queue_name,
-        item,
-        priority=0.0,
-        *,
-        require_durable=False,
-      ):
-        del require_durable
-        self.push(queue_name, item, priority)
-        return True
+    ) -> None:
+        backend = _FakeRedisQueueBackend()
+        manager = self._manager(backend)
+        try:
+            receipt = manager._push_queue_with_durability("q", b"ordinary")
 
-    backend = MalformedReceiptBackend()
-    manager = self._manager(backend)
-    try:
-      with pytest.raises(QueueError, match="no valid worker-crash"):
-        manager._push_queue_with_durability(
-          "q",
-          b"item",
-          require_durable=True,
+            assert receipt.worker_crash_durable is False
+            assert backend.pushed == [("q", b"ordinary", 0.0)]
+
+            with pytest.raises(QueueError, match="worker-crash durable"):
+                manager._push_queue_with_durability(
+                    "q",
+                    b"replacement",
+                    require_durable=True,
+                )
+            assert backend.pushed == [("q", b"ordinary", 0.0)]
+        finally:
+            manager.close()
+
+    def test_backend_replacement_after_snapshot_cannot_redirect_push(
+        self, mocker
+    ) -> None:
+        first = _DurableFakeRedisQueueBackend()
+        replacement = _FakeRedisQueueBackend()
+        manager = self._manager(first)
+        original_snapshot = manager._get_backend_breaker_snapshot
+
+        def replace_after_snapshot():
+            snapshot = original_snapshot()
+            manager._backend = replacement
+            return snapshot
+
+        mocker.patch.object(
+            manager,
+            "_get_backend_breaker_snapshot",
+            side_effect=replace_after_snapshot,
         )
-      # The source would remain unacked; replay is allowed, loss is not.
-      assert backend.pushed == [("q", b"item", 0.0)]
-    finally:
-      manager.close()
+        try:
+            receipt = manager._push_queue_with_durability(
+                "q",
+                b"item",
+                require_durable=True,
+            )
 
-  def test_disabled_get_queue_backend_returns_identity(self, monkeypatch):
-    """Disabled path returns the SAME object the backend property yields.
+            assert receipt.worker_crash_durable is True
+            assert first.pushed == [("q", b"item", 0.0)]
+            assert replacement.pushed == []
+        finally:
+            manager.close()
 
-    We bypass the real connect by stubbing ``backend`` to return a fake and
-    asserting ``get_queue_backend()`` returns it unchanged (``is``).
-    """
-    monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
-    ConnectionManager.clear_registry()
+    def test_policy_rejection_does_not_trip_or_close_breaker(self, monkeypatch) -> None:
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        backend = _FakeRedisQueueBackend()
+        manager = ConnectionManager(BackendType.REDIS)
+        manager._backend = backend
+        try:
+            with pytest.raises(QueueError, match="worker-crash durable"):
+                manager._push_queue_with_durability(
+                    "q",
+                    b"item",
+                    require_durable=True,
+                )
 
-    manager = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "breaker-identity"}
-    )
-    try:
-      fake_qb = _FakeRedisQueueBackend()
-      # Bypass connect: assign the backend directly.
-      manager._backend = fake_qb
-      assert manager.get_queue_backend() is fake_qb
-    finally:
-      manager.close()
-      ConnectionManager.clear_registry()
+            assert manager._breaker is not None
+            assert manager._breaker.state.value == "closed"
+            assert manager._breaker.failure_count == 0
+            assert backend.pushed == []
+        finally:
+            manager.close()
+
+    def test_malformed_truthy_receipt_is_rejected_after_safe_replay_boundary(
+        self,
+    ) -> None:
+        class MalformedReceiptBackend(_FakeRedisQueueBackend):
+            def _push_with_durability(  # type: ignore[override]
+                self,
+                queue_name,
+                item,
+                priority=0.0,
+                *,
+                require_durable=False,
+            ):
+                del require_durable
+                self.push(queue_name, item, priority)
+                return True
+
+        backend = MalformedReceiptBackend()
+        manager = self._manager(backend)
+        try:
+            with pytest.raises(QueueError, match="no valid worker-crash"):
+                manager._push_queue_with_durability(
+                    "q",
+                    b"item",
+                    require_durable=True,
+                )
+            # The source would remain unacked; replay is allowed, loss is not.
+            assert backend.pushed == [("q", b"item", 0.0)]
+        finally:
+            manager.close()
+
+    def test_disabled_get_queue_backend_returns_identity(self, monkeypatch):
+        """Disabled path returns the SAME object the backend property yields.
+
+        We bypass the real connect by stubbing ``backend`` to return a fake and
+        asserting ``get_queue_backend()`` returns it unchanged (``is``).
+        """
+        monkeypatch.delenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", raising=False)
+        ConnectionManager.clear_registry()
+
+        manager = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "breaker-identity"}
+        )
+        try:
+            fake_qb = _FakeRedisQueueBackend()
+            # Bypass connect: assign the backend directly.
+            manager._backend = fake_qb
+            assert manager.get_queue_backend() is fake_qb
+        finally:
+            manager.close()
+            ConnectionManager.clear_registry()
 
 
 class TestCircuitBreakerWiringEnabled:
-  """When the breaker is enabled, hot-path ops wrap + OPEN fail-fast."""
+    """When the breaker is enabled, hot-path ops wrap + OPEN fail-fast."""
 
-  def test_enabled_wraps_queue_hot_path_and_open_failfast(self, monkeypatch):
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
-    ConnectionManager.clear_registry()
+    def test_enabled_wraps_queue_hot_path_and_open_failfast(self, monkeypatch):
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        ConnectionManager.clear_registry()
 
-    manager = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "breaker-on"}
-    )
-    try:
-      fake_qb = _FailingRedisQueueBackend()
-      manager._backend = fake_qb
-      wrapped = manager.get_queue_backend()
-      # Wrapped is a proxy, NOT the raw backend.
-      assert wrapped is not fake_qb
+        manager = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "breaker-on"}
+        )
+        try:
+            fake_qb = _FailingRedisQueueBackend()
+            manager._backend = fake_qb
+            wrapped = manager.get_queue_backend()
+            # Wrapped is a proxy, NOT the raw backend.
+            assert wrapped is not fake_qb
 
-      # Trip the breaker via the wrapped hot-path op.
-      with pytest.raises(QueueError):
-        wrapped.push("q", b"x")
+            # Trip the breaker via the wrapped hot-path op.
+            with pytest.raises(QueueError):
+                wrapped.push("q", b"x")
 
-      from scrapy_extension.backends.circuit_breaker import (
-        CircuitBreakerOpenError,
-      )
+            from scrapy_extension.backends.circuit_breaker import (
+                CircuitBreakerOpenError,
+            )
 
-      # Now OPEN — a subsequent push must fail-fast with BackendError subclass.
-      with pytest.raises(CircuitBreakerOpenError):
-        wrapped.push("q", b"x")
-    finally:
-      manager.close()
-      ConnectionManager.clear_registry()
+            # Now OPEN — a subsequent push must fail-fast with BackendError subclass.
+            with pytest.raises(CircuitBreakerOpenError):
+                wrapped.push("q", b"x")
+        finally:
+            manager.close()
+            ConnectionManager.clear_registry()
 
-  def test_enabled_non_network_methods_not_blocked(self, monkeypatch):
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
-    ConnectionManager.clear_registry()
+    def test_enabled_non_network_methods_not_blocked(self, monkeypatch):
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        ConnectionManager.clear_registry()
 
-    manager = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "breaker-on-nonblock"}
-    )
-    try:
-      fake_qb = _FailingRedisQueueBackend()
-      manager._backend = fake_qb
-      wrapped = manager.get_queue_backend()
+        manager = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "breaker-on-nonblock"}
+        )
+        try:
+            fake_qb = _FailingRedisQueueBackend()
+            manager._backend = fake_qb
+            wrapped = manager.get_queue_backend()
 
-      # Trip via push.
-      with pytest.raises(QueueError):
-        wrapped.push("q", b"x")
+            # Trip via push.
+            with pytest.raises(QueueError):
+                wrapped.push("q", b"x")
 
-      # Non-network methods still work — they're forwarded, not breaker-wrapped.
-      wrapped.clear_queue("q")
-      assert fake_qb.clear_calls == 1
-      # is_connected forwards too.
-      assert wrapped.is_connected() is True
-    finally:
-      manager.close()
-      ConnectionManager.clear_registry()
+            # Non-network methods still work — they're forwarded, not breaker-wrapped.
+            wrapped.clear_queue("q")
+            assert fake_qb.clear_calls == 1
+            # is_connected forwards too.
+            assert wrapped.is_connected() is True
+        finally:
+            manager.close()
+            ConnectionManager.clear_registry()
 
-  def test_single_breaker_shared_across_interfaces(self, monkeypatch):
-    """Queue+set+storage on one manager share a single breaker instance.
+    def test_single_breaker_shared_across_interfaces(self, monkeypatch):
+        """Queue+set+storage on one manager share a single breaker instance.
 
-    A failure on the queue hot-path trips the shared breaker so the storage
-    interface also rejects — they share the failure signal.
-    """
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
-    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
-    ConnectionManager.clear_registry()
+        A failure on the queue hot-path trips the shared breaker so the storage
+        interface also rejects — they share the failure signal.
+        """
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        ConnectionManager.clear_registry()
 
-    manager = ConnectionManager.get_manager(
-      BackendType.REDIS, {"host": "breaker-shared"}
-    )
-    try:
-      fake = _FakeRedisAllBackend()
-      manager._backend = fake
-      qb = manager.get_queue_backend()
-      # Trip via queue.
-      fake.push = lambda *a, **k: (_ for _ in ()).throw(QueueError("x"))
-      # Re-wrap to capture the failing push (proxy snapshots at construction).
-      qb = manager.get_queue_backend()
-      with pytest.raises(QueueError):
-        qb.push("q", b"x")
-      # The shared breaker is now OPEN.
-      assert manager._breaker is not None
-      assert manager._breaker.state.value == "open"
-    finally:
-      manager.close()
-      ConnectionManager.clear_registry()
+        manager = ConnectionManager.get_manager(
+            BackendType.REDIS, {"host": "breaker-shared"}
+        )
+        try:
+            fake = _FakeRedisAllBackend()
+            manager._backend = fake
+            qb = manager.get_queue_backend()
+            # Trip via queue.
+            fake.push = lambda *a, **k: (_ for _ in ()).throw(QueueError("x"))
+            # Re-wrap to capture the failing push (proxy snapshots at construction).
+            qb = manager.get_queue_backend()
+            with pytest.raises(QueueError):
+                qb.push("q", b"x")
+            # The shared breaker is now OPEN.
+            assert manager._breaker is not None
+            assert manager._breaker.state.value == "open"
+        finally:
+            manager.close()
+            ConnectionManager.clear_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -1899,102 +1918,103 @@ class TestCircuitBreakerWiringEnabled:
 
 
 class _FakeRedisQueueBackend(QueueBackend):
-  def __init__(self) -> None:
-    self.clear_calls = 0
-    self.ack_calls = 0
-    self.pushed: list[tuple[str, bytes, float]] = []
+    def __init__(self) -> None:
+        self.clear_calls = 0
+        self.ack_calls = 0
+        self.pushed: list[tuple[str, bytes, float]] = []
 
-  def connect(self) -> None: ...
-  def disconnect(self) -> None: ...
-  def is_connected(self) -> bool:
-    return True
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def is_connected(self) -> bool:
+        return True
 
-  def ping(self) -> bool:
-    return True
+    def ping(self) -> bool:
+        return True
 
-  @property
-  def backend_type(self):
-    return BackendType.REDIS
+    @property
+    def backend_type(self):
+        return BackendType.REDIS
 
-  def push(self, queue_name, item, priority=0.0) -> None:
-    self.pushed.append((queue_name, item, priority))
-  def pop(self, queue_name, timeout=0.0):
-    return None
+    def push(self, queue_name, item, priority=0.0) -> None:
+        self.pushed.append((queue_name, item, priority))
 
-  def queue_len(self, queue_name) -> int:
-    return 0
+    def pop(self, queue_name, timeout=0.0):
+        return None
 
-  def clear_queue(self, queue_name) -> None:
-    self.clear_calls += 1
+    def queue_len(self, queue_name) -> int:
+        return 0
 
-  def ack(self, queue_name) -> None:
-    self.ack_calls += 1
+    def clear_queue(self, queue_name) -> None:
+        self.clear_calls += 1
+
+    def ack(self, queue_name) -> None:
+        self.ack_calls += 1
 
 
 class _DurableFakeRedisQueueBackend(_FakeRedisQueueBackend):
-  _push_is_durable = True
+    _push_is_durable = True
 
 
 class _FailingRedisQueueBackend(_FakeRedisQueueBackend):
-  def push(self, queue_name, item, priority=0.0) -> None:
-    raise QueueError("backend on fire", queue_name=queue_name, operation="push")
+    def push(self, queue_name, item, priority=0.0) -> None:
+        raise QueueError("backend on fire", queue_name=queue_name, operation="push")
 
 
 class _FakeRedisAllBackend(QueueBackend, SetBackend, StorageBackend):
-  def __init__(self) -> None:
-    self.clear_calls = 0
+    def __init__(self) -> None:
+        self.clear_calls = 0
 
-  def connect(self) -> None: ...
-  def disconnect(self) -> None: ...
-  def is_connected(self) -> bool:
-    return True
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def is_connected(self) -> bool:
+        return True
 
-  def ping(self) -> bool:
-    return True
+    def ping(self) -> bool:
+        return True
 
-  @property
-  def backend_type(self):
-    return BackendType.REDIS
+    @property
+    def backend_type(self):
+        return BackendType.REDIS
 
-  # Queue
-  def push(self, queue_name, item, priority=0.0) -> None: ...
-  def pop(self, queue_name, timeout=0.0):
-    return None
+    # Queue
+    def push(self, queue_name, item, priority=0.0) -> None: ...
+    def pop(self, queue_name, timeout=0.0):
+        return None
 
-  def queue_len(self, queue_name) -> int:
-    return 0
+    def queue_len(self, queue_name) -> int:
+        return 0
 
-  def clear_queue(self, queue_name) -> None:
-    self.clear_calls += 1
+    def clear_queue(self, queue_name) -> None:
+        self.clear_calls += 1
 
-  def ack(self, queue_name) -> None: ...
-  def nack(self, queue_name) -> None: ...
-  # Set
-  def add(self, set_name, item) -> bool:
-    return True
+    def ack(self, queue_name) -> None: ...
+    def nack(self, queue_name) -> None: ...
+    # Set
+    def add(self, set_name, item) -> bool:
+        return True
 
-  def remove(self, set_name, item) -> bool:
-    return False
+    def remove(self, set_name, item) -> bool:
+        return False
 
-  def contains(self, set_name, item) -> bool:
-    return False
+    def contains(self, set_name, item) -> bool:
+        return False
 
-  def set_len(self, set_name) -> int:
-    return 0
+    def set_len(self, set_name) -> int:
+        return 0
 
-  def clear_set(self, set_name) -> None: ...
-  # Storage
-  def store(self, key, data, ttl=None) -> None: ...
-  def retrieve(self, key):
-    return None
+    def clear_set(self, set_name) -> None: ...
+    # Storage
+    def store(self, key, data, ttl=None) -> None: ...
+    def retrieve(self, key):
+        return None
 
-  def delete(self, key) -> bool:
-    return False
+    def delete(self, key) -> bool:
+        return False
 
-  def exists(self, key) -> bool:
-    return False
+    def exists(self, key) -> bool:
+        return False
 
-  def ttl(self, key):
-    return None
+    def ttl(self, key):
+        return None
 
-  def clear_storage(self, prefix=None) -> None: ...
+    def clear_storage(self, prefix=None) -> None: ...

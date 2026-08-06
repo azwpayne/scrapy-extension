@@ -7,8 +7,8 @@ for all backend types.
 from scrapy_extension.settings.base import Settings
 from scrapy_extension.settings.dynamodb import DynamoDBMode, DynamoDBSettings
 from scrapy_extension.settings.elasticsearch import (
-  ElasticSearchMode,
-  ElasticSearchSettings,
+    ElasticSearchMode,
+    ElasticSearchSettings,
 )
 from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
 from scrapy_extension.settings.memcached import MemcachedMode, MemcachedSettings
@@ -20,25 +20,25 @@ from scrapy_extension.settings.rocketmq import RocketMQMode, RocketMQSettings
 from scrapy_extension.settings.sqs import SqsMode, SqsSettings
 
 __all__ = [
-  "DynamoDBMode",
-  "DynamoDBSettings",
-  "ElasticSearchMode",
-  "ElasticSearchSettings",
-  "KafkaMode",
-  "KafkaSettings",
-  "MemcachedMode",
-  "MemcachedSettings",
-  "MongoDBMode",
-  "MongoDBSettings",
-  "PulsarMode",
-  "PulsarSettings",
-  "RabbitMQMode",
-  "RabbitMQSettings",
-  "RedisMode",
-  "RedisSettings",
-  "RocketMQMode",
-  "RocketMQSettings",
-  "Settings",
-  "SqsMode",
-  "SqsSettings",
+    "DynamoDBMode",
+    "DynamoDBSettings",
+    "ElasticSearchMode",
+    "ElasticSearchSettings",
+    "KafkaMode",
+    "KafkaSettings",
+    "MemcachedMode",
+    "MemcachedSettings",
+    "MongoDBMode",
+    "MongoDBSettings",
+    "PulsarMode",
+    "PulsarSettings",
+    "RabbitMQMode",
+    "RabbitMQSettings",
+    "RedisMode",
+    "RedisSettings",
+    "RocketMQMode",
+    "RocketMQSettings",
+    "Settings",
+    "SqsMode",
+    "SqsSettings",
 ]

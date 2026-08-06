@@ -207,4 +207,3 @@ plugins, YAML `on`/`off` parsed as bool, test doubles) must still reject it.
 all TDD RED→GREEN, all 3 gates green (ruff / mypy --strict 76 files / pytest
 **3833 passed** = R33's 3830 + 3). The 4×-deferred SCHED-EXC-CATCH-1 debt is
 cleared, and the previously-un-audited `circuit_breaker.py` is now covered.
-

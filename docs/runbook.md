@@ -104,10 +104,12 @@ until the 65,536-entry shadow evicts it or the queue lifecycle ends. Choose
 ### Snapshot ownership
 
 `delay`, `round_robin`, `time_wheel`, and `ring_buffer` can snapshot local state
-on a clean close. This is best-effort and works only when the **queue backend's
-own connection manager** also implements `StorageBackend`; configuring a
-separate item-storage backend does not redirect queue snapshots. Kafka,
-RabbitMQ, RocketMQ, Pulsar, and SQS therefore cannot persist strategy snapshots.
+on a clean close. This is best-effort. A Redis, MongoDB, or Elasticsearch queue
+uses its own storage capability. For Kafka, RabbitMQ, RocketMQ, Pulsar, or SQS,
+configure `SCRAPY_STORAGE_BACKEND_TYPE` and its storage settings; the scheduler
+acquires that storage component specifically for strategy snapshots, even when
+the item pipeline is disabled. A legacy queue-only global configuration without
+a storage component still skips snapshots rather than failing startup.
 
 For multiple workers running the same spider, set a stable unique identity:
 
@@ -119,9 +121,11 @@ SCRAPY_QUEUE_SNAPSHOT_OWNER = "worker-a"
 
 An owner selects a length-prefixed v2 storage key and prevents workers from
 overwriting one another. Without an owner, the legacy spider+queue key remains
-for single-worker compatibility. A successful restore consumes and deletes the
-snapshot; the next clean close writes current state again. Hard crashes can
-still lose changes since the last close.
+for single-worker compatibility. A restored checkpoint remains stored until the
+next clean close replaces it with current state or deletes it after a clean
+drain. A crash after restore can therefore replay already-processed entries,
+but cannot lose the only copy of entries not yet processed. Hard crashes can
+still lose changes since the last clean checkpoint.
 
 Restored snapshots are capped at **128 MiB** (`_MAX_SNAPSHOT_BYTES`): a blob
 above the cap is dropped at restore time (warn + start clean) so a corrupt or

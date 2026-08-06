@@ -98,8 +98,7 @@ def _is_missing_optional_dep(exc: ImportError, module_path: str) -> bool:
     """
     dep_modules = _BACKEND_DEP_MODULES.get(module_path, frozenset())
     return any(
-        _is_missing_optional_dependency(exc, dependency)
-        for dependency in dep_modules
+        _is_missing_optional_dependency(exc, dependency) for dependency in dep_modules
     )
 
 

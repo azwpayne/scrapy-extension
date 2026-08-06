@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.queue.strategies.base import (
-  QueueStrategy,
-  _PreparedQueuePush,
-  normalize_queue_timeout,
+    QueueStrategy,
+    _PreparedQueuePush,
+    normalize_queue_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,631 +47,647 @@ _over_cap_warned: bool = False
 _over_cap_lock = threading.Lock()
 
 if TYPE_CHECKING:
-  from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.connectors import ConnectionManager
 
 
 def _require_finite(value: object, name: str) -> float:
-  """Return a finite numeric value or reject it before it enters queue state."""
-  if isinstance(value, bool) or not isinstance(value, (int, float)):
-    raise ValueError(f"{name} must be finite, got {value!r}")
-  try:
-    normalized = float(value)
-  except (OverflowError, TypeError, ValueError) as e:
-    raise ValueError(f"{name} must be finite, got {value!r}") from e
-  if not math.isfinite(normalized):
-    raise ValueError(f"{name} must be finite, got {value!r}")
-  return normalized
+    """Return a finite numeric value or reject it before it enters queue state."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as e:
+        raise ValueError(f"{name} must be finite, got {value!r}") from e
+    if not math.isfinite(normalized):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return normalized
 
 
 class DelayQueueStrategy(QueueStrategy):
-  """Holds items for a per-item delay, then enqueues them to the live queue.
+    """Holds items for a per-item delay, then enqueues them to the live queue.
 
-  Single-process holding (v1): a ``heapq`` of ``(ready_at, seq, item, priority)``.
-  ``push`` with ``delay > 0`` parks the item until ready; ``pop`` drains all
-  due held items into the live queue first, then pops the live queue.
-  ``delay == 0`` (or unset) goes straight to the live queue.
+    Single-process holding (v1): a ``heapq`` of ``(ready_at, seq, item, priority)``.
+    ``push`` with ``delay > 0`` parks the item until ready; ``pop`` drains all
+    due held items into the live queue first, then pops the live queue.
+    ``delay == 0`` (or unset) goes straight to the live queue.
 
-  The heap tuple stores the caller's ``priority`` so :meth:`_drain_ready`
-  can re-pass it to the live queue on drain — without it, every delayed
-  item would silently land at priority 0 (priority inversion for any user
-  mixing ``delay`` + ``priority``). R14-F.
+    The heap tuple stores the caller's ``priority`` so :meth:`_drain_ready`
+    can re-pass it to the live queue on drain — without it, every delayed
+    item would silently land at priority 0 (priority inversion for any user
+    mixing ``delay`` + ``priority``). R14-F.
 
-  Cross-worker holding is not supported in v1 — each process holds its own
-  delayed items. See ``docs/superpowers/specs/2026-06-19-queue-semantics-design.md``.
+    Cross-worker holding is not supported in v1 — each process holds its own
+    delayed items. See ``docs/superpowers/specs/2026-06-19-queue-semantics-design.md``.
 
-  Attributes:
-      _default_delay: Default delay when push omits an explicit delay.
-      _clock: Monotonic clock callable (injectable for tests).
-      _holding: Min-heap of ``(ready_at, seq, item, priority)``.
-      _seq: Tie-break counter for stable heap ordering.
-      _max_held: Soft cap on ``_holding`` size; non-positive disables the
-          warning. Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000).
-  """
-
-  def __init__(
-    self,
-    connection_manager: ConnectionManager,
-    *,
-    default_delay: float = 0.0,
-    clock: Callable[[], float] = time.monotonic,
-    wall_clock: Callable[[], float] = time.time,
-    max_held: int = DEFAULT_DELAY_MAX_HELD,
-    monitor: Monitor | None = None,
-  ) -> None:
-    """Initialize the delay strategy.
-
-    Args:
-        connection_manager: Connection manager providing the QueueBackend.
-        default_delay: Default delay seconds when push omits ``delay``.
-        clock: Monotonic clock callable returning seconds (injectable for tests).
-        wall_clock: Unix wall clock used only to account for downtime between
-            snapshot and restore. Deadlines themselves remain monotonic.
-        max_held: Soft cap on the in-process holding heap. When the heap
-            exceeds this size a one-time WARNING fires (warn-only — items are
-            never refused, since dropping a delayed item would silently lose
-            data). Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000) for
-            OOM prevention. Pass ``<= 0`` to disable the warning (advanced
-            opt-out — accepts the unbounded-growth risk).
-        monitor: Risk 3 — optional observability monitor. When ``None``
-            (default) :class:`~scrapy_extension.monitor.base.NullMonitor`.
-            Emits ``on_delay_depth(len(holding))`` after each held item so a
-            wired collector can alert before the in-process delay heap grows
-            unbounded (the held-delay state is in-process and lost on crash).
-
-    Raises:
-        ValueError: If default_delay is negative.
+    Attributes:
+        _default_delay: Default delay when push omits an explicit delay.
+        _clock: Monotonic clock callable (injectable for tests).
+        _holding: Min-heap of ``(ready_at, seq, item, priority)``.
+        _seq: Tie-break counter for stable heap ordering.
+        _max_held: Soft cap on ``_holding`` size; non-positive disables the
+            warning. Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000).
     """
-    super().__init__(connection_manager)
-    default_delay = _require_finite(default_delay, "default_delay")
-    if default_delay < 0:
-      raise ValueError(f"default_delay must be finite and >= 0, got {default_delay}")
-    self._default_delay = default_delay
-    self._clock = clock
-    self._wall_clock = wall_clock
-    # R14-F: heap tuple gains a `priority` slot so the drain path can re-pass
-    # the caller's priority to the live queue. Without it every delayed item
-    # would silently land at priority 0 (priority inversion for callers
-    # mixing delay + priority). Tuple order is (ready_at, seq, item, priority)
-    # — `ready_at` is still the heap key; `seq` is the FIFO tie-breaker; the
-    # trailing two slots are payload that never participate in ordering.
-    self._holding: list[tuple[float, int, bytes, float]] = []
-    self._seq = itertools.count()
-    # One lock protects every transition of the in-process state. In
-    # particular, draining must keep ``peek -> backend push -> heap pop``
-    # indivisible: two concurrent consumers must never transfer the same due
-    # item twice or pop a different item after racing on the same heap head.
-    self._state_lock = threading.RLock()
-    if isinstance(max_held, bool) or not isinstance(max_held, int):
-      raise ValueError(f"max_held must be an integer, got {max_held!r}")
-    self._max_held = max_held
-    self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
 
-  def bind(self, queue_name: str) -> None:
-    """Bind this in-process heap to one logical queue."""
-    self._bind_single_queue(queue_name)
+    def __init__(
+        self,
+        connection_manager: ConnectionManager,
+        *,
+        default_delay: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        max_held: int = DEFAULT_DELAY_MAX_HELD,
+        monitor: Monitor | None = None,
+    ) -> None:
+        """Initialize the delay strategy.
 
-  def set_monitor(self, monitor: Monitor) -> None:
-    """Inject a monitor after construction (R21-B wiring).
+        Args:
+            connection_manager: Connection manager providing the QueueBackend.
+            default_delay: Default delay seconds when push omits ``delay``.
+            clock: Monotonic clock callable returning seconds (injectable for tests).
+            wall_clock: Unix wall clock used only to account for downtime between
+                snapshot and restore. Deadlines themselves remain monotonic.
+            max_held: Soft cap on the in-process holding heap. When the heap
+                exceeds this size a one-time WARNING fires (warn-only — items are
+                never refused, since dropping a delayed item would silently lose
+                data). Defaults to :data:`DEFAULT_DELAY_MAX_HELD` (100_000) for
+                OOM prevention. Pass ``<= 0`` to disable the warning (advanced
+                opt-out — accepts the unbounded-growth risk).
+            monitor: Risk 3 — optional observability monitor. When ``None``
+                (default) :class:`~scrapy_extension.monitor.base.NullMonitor`.
+                Emits ``on_delay_depth(len(holding))`` after each held item so a
+                wired collector can alert before the in-process delay heap grows
+                unbounded (the held-delay state is in-process and lost on crash).
 
-    Lets :class:`~scrapy_extension.queue.queue.BackendQueue` share its
-    (possibly late-wired) :class:`~scrapy_extension.monitor.Monitor` with the
-    strategy so ``on_delay_depth`` (the ``queue/delay_depth`` gauge) actually
-    emits in production. Without this the strategy keeps its ``NullMonitor``
-    default and the delay-heap leading indicator is silently dead. Mirrors
-    ``BatchedStorageStrategy.set_monitor``.
-    """
-    self._monitor = monitor
+        Raises:
+            ValueError: If default_delay is negative.
+        """
+        super().__init__(connection_manager)
+        default_delay = _require_finite(default_delay, "default_delay")
+        if default_delay < 0:
+            raise ValueError(
+                f"default_delay must be finite and >= 0, got {default_delay}"
+            )
+        self._default_delay = default_delay
+        self._clock = clock
+        self._wall_clock = wall_clock
+        # R14-F: heap tuple gains a `priority` slot so the drain path can re-pass
+        # the caller's priority to the live queue. Without it every delayed item
+        # would silently land at priority 0 (priority inversion for callers
+        # mixing delay + priority). Tuple order is (ready_at, seq, item, priority)
+        # — `ready_at` is still the heap key; `seq` is the FIFO tie-breaker; the
+        # trailing two slots are payload that never participate in ordering.
+        self._holding: list[tuple[float, int, bytes, float]] = []
+        self._seq = itertools.count()
+        # One lock protects every transition of the in-process state. In
+        # particular, draining must keep ``peek -> backend push -> heap pop``
+        # indivisible: two concurrent consumers must never transfer the same due
+        # item twice or pop a different item after racing on the same heap head.
+        self._state_lock = threading.RLock()
+        if isinstance(max_held, bool) or not isinstance(max_held, int):
+            raise ValueError(f"max_held must be an integer, got {max_held!r}")
+        self._max_held = max_held
+        self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
 
-  def push(
-    self,
-    queue_name: str,
-    item: bytes,
-    *,
-    priority: float = 0.0,
-    delay: float = 0.0,
-    source: str = "default",
-  ) -> None:
-    """Push an item, holding it until ready if a delay is set.
+    def bind(self, queue_name: str) -> None:
+        """Bind this in-process heap to one logical queue."""
+        self._bind_single_queue(queue_name)
 
-    Args:
-        queue_name: The queue name.
-        item: Serialized item bytes.
-        priority: Priority for the live-queue push (used once drained).
-        delay: Delay seconds; 0 falls back to ``default_delay``.
-        source: Ignored (delay strategy holds by ready-time, not source).
-    """
-    del source
-    delay = _require_finite(delay, "delay")
-    priority = _require_finite(priority, "priority")
-    if delay < 0:
-      raise ValueError(f"delay must be >= 0, got {delay}")
-    self.bind(queue_name)
-    effective = delay if delay > 0 else self._default_delay
-    if effective <= 0:
-      with self._state_lock:
-        self._connection_manager.get_queue_backend().push(queue_name, item, priority)
-      return
-    with self._state_lock:
-      now = _require_finite(self._clock(), "clock value")
-      ready_at = _require_finite(now + effective, "ready_at")
-      # R14-F: stash priority in the heap tuple so _drain_ready re-passes it
-      # to the live queue (preserves caller priority across the delay hop).
-      heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
-      held = len(self._holding)
-    # Risk 3: emit the held-depth gauge so operators can alert before the
-    # in-process delay heap grows unbounded (held-delay state is lost on
-    # crash). No-op under NullMonitor; BLE001-guarded so a misbehaving
-    # monitor cannot crash the push path.
-    delay_depth_hook_failed = False
-    try:
-      self._monitor.on_delay_depth(held)
-    except Exception:  # noqa: BLE001 — monitor must never crash push
-      delay_depth_hook_failed = True
-    if delay_depth_hook_failed:
-      try:
-        logger.debug("on_delay_depth hook raised")
-      except BaseException:
-        # This is fallback telemetry after the held item is already published.
-        # A diagnostic handler must not turn the successful push into a failure.
-        pass
-    self._warn_over_cap_once(held)
+    def set_monitor(self, monitor: Monitor) -> None:
+        """Inject a monitor after construction (R21-B wiring).
 
-  def is_push_durable(self, *, delay: float, source: str) -> bool:
-    """Return false while a delayed item would live only in the local heap."""
-    del source
-    effective = delay if delay > 0 else self._default_delay
-    return effective <= 0
+        Lets :class:`~scrapy_extension.queue.queue.BackendQueue` share its
+        (possibly late-wired) :class:`~scrapy_extension.monitor.Monitor` with the
+        strategy so ``on_delay_depth`` (the ``queue/delay_depth`` gauge) actually
+        emits in production. Without this the strategy keeps its ``NullMonitor``
+        default and the delay-heap leading indicator is silently dead. Mirrors
+        ``BatchedStorageStrategy.set_monitor``.
+        """
+        self._monitor = monitor
 
-  def _prepare_push(
-    self,
-    queue_name: str,
-    *,
-    priority: float = 0.0,
-    delay: float = 0.0,
-    source: str = "default",
-  ) -> _PreparedQueuePush:
-    """Freeze the zero-delay/backend versus held/local route exactly once."""
-    del source
-    self.bind(queue_name)
-    effective = delay if delay > 0 else self._default_delay
+    def push(
+        self,
+        queue_name: str,
+        item: bytes,
+        *,
+        priority: float = 0.0,
+        delay: float = 0.0,
+        source: str = "default",
+    ) -> None:
+        """Push an item, holding it until ready if a delay is set.
 
-    if effective <= 0:
-
-      def commit(item: bytes, require_durable: bool) -> bool:
-        normalized_delay = _require_finite(delay, "delay")
-        normalized_priority = _require_finite(priority, "priority")
-        if normalized_delay < 0:
-          raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+        Args:
+            queue_name: The queue name.
+            item: Serialized item bytes.
+            priority: Priority for the live-queue push (used once drained).
+            delay: Delay seconds; 0 falls back to ``default_delay``.
+            source: Ignored (delay strategy holds by ready-time, not source).
+        """
+        del source
+        delay = _require_finite(delay, "delay")
+        priority = _require_finite(priority, "priority")
+        if delay < 0:
+            raise ValueError(f"delay must be >= 0, got {delay}")
+        self.bind(queue_name)
+        effective = delay if delay > 0 else self._default_delay
+        if effective <= 0:
+            with self._state_lock:
+                self._connection_manager.get_queue_backend().push(
+                    queue_name, item, priority
+                )
+            return
         with self._state_lock:
-          return self._push_backend_prepared(
-            queue_name,
-            item,
-            priority=normalized_priority,
-            require_durable=require_durable,
-          )
-
-      return _PreparedQueuePush(backend_route=True, _commit=commit)
-
-    def publish(item: bytes) -> None:
-      normalized_delay = _require_finite(delay, "delay")
-      normalized_priority = _require_finite(priority, "priority")
-      if normalized_delay < 0:
-        raise ValueError(f"delay must be >= 0, got {normalized_delay}")
-      with self._state_lock:
-        now = _require_finite(self._clock(), "clock value")
-        ready_at = _require_finite(now + effective, "ready_at")
-        heapq.heappush(
-          self._holding,
-          (ready_at, next(self._seq), item, normalized_priority),
-        )
-        held = len(self._holding)
-      delay_depth_hook_failed = False
-      try:
-        self._monitor.on_delay_depth(held)
-      except Exception:  # noqa: BLE001 — monitor must never crash push
-        delay_depth_hook_failed = True
-      if delay_depth_hook_failed:
+            now = _require_finite(self._clock(), "clock value")
+            ready_at = _require_finite(now + effective, "ready_at")
+            # R14-F: stash priority in the heap tuple so _drain_ready re-passes it
+            # to the live queue (preserves caller priority across the delay hop).
+            heapq.heappush(self._holding, (ready_at, next(self._seq), item, priority))
+            held = len(self._holding)
+        # Risk 3: emit the held-depth gauge so operators can alert before the
+        # in-process delay heap grows unbounded (held-delay state is lost on
+        # crash). No-op under NullMonitor; BLE001-guarded so a misbehaving
+        # monitor cannot crash the push path.
+        delay_depth_hook_failed = False
         try:
-          logger.debug("on_delay_depth hook raised")
+            self._monitor.on_delay_depth(held)
+        except Exception:  # noqa: BLE001 — monitor must never crash push
+            delay_depth_hook_failed = True
+        if delay_depth_hook_failed:
+            try:
+                logger.debug("on_delay_depth hook raised")
+            except BaseException:
+                # This is fallback telemetry after the held item is already published.
+                # A diagnostic handler must not turn the successful push into a failure.
+                pass
+        self._warn_over_cap_once(held)
+
+    def is_push_durable(self, *, delay: float, source: str) -> bool:
+        """Return false while a delayed item would live only in the local heap."""
+        del source
+        effective = delay if delay > 0 else self._default_delay
+        return effective <= 0
+
+    def _prepare_push(
+        self,
+        queue_name: str,
+        *,
+        priority: float = 0.0,
+        delay: float = 0.0,
+        source: str = "default",
+    ) -> _PreparedQueuePush:
+        """Freeze the zero-delay/backend versus held/local route exactly once."""
+        del source
+        self.bind(queue_name)
+        effective = delay if delay > 0 else self._default_delay
+
+        if effective <= 0:
+
+            def commit(item: bytes, require_durable: bool) -> bool:
+                normalized_delay = _require_finite(delay, "delay")
+                normalized_priority = _require_finite(priority, "priority")
+                if normalized_delay < 0:
+                    raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+                with self._state_lock:
+                    return self._push_backend_prepared(
+                        queue_name,
+                        item,
+                        priority=normalized_priority,
+                        require_durable=require_durable,
+                    )
+
+            return _PreparedQueuePush(backend_route=True, _commit=commit)
+
+        def publish(item: bytes) -> None:
+            normalized_delay = _require_finite(delay, "delay")
+            normalized_priority = _require_finite(priority, "priority")
+            if normalized_delay < 0:
+                raise ValueError(f"delay must be >= 0, got {normalized_delay}")
+            with self._state_lock:
+                now = _require_finite(self._clock(), "clock value")
+                ready_at = _require_finite(now + effective, "ready_at")
+                heapq.heappush(
+                    self._holding,
+                    (ready_at, next(self._seq), item, normalized_priority),
+                )
+                held = len(self._holding)
+            delay_depth_hook_failed = False
+            try:
+                self._monitor.on_delay_depth(held)
+            except Exception:  # noqa: BLE001 — monitor must never crash push
+                delay_depth_hook_failed = True
+            if delay_depth_hook_failed:
+                try:
+                    logger.debug("on_delay_depth hook raised")
+                except BaseException:
+                    # This is fallback telemetry after the held item is already published.
+                    # A diagnostic handler must not turn the successful push into a failure.
+                    pass
+            self._warn_over_cap_once(held)
+
+        return _PreparedQueuePush.local(
+            queue_name=queue_name,
+            strategy_name=type(self).__name__,
+            publish=publish,
+        )
+
+    def _warn_over_cap_once(self, held: int) -> None:
+        """Emit a one-time per-process WARNING when the holding heap exceeds cap.
+
+        The holding heap grows unboundedly whenever push-rate outpaces
+        ready-rate (e.g. a burst of long-delay items). The cap is SOFT: this
+        never refuses the push — dropping a delayed item would silently lose
+        data, which is worse than loud memory pressure. Idempotent via the
+        module-level ``_over_cap_warned`` flag so a multi-spider process does
+        not spam the log. Points at the distributed-delay roadmap (U10).
+        """
+        if self._max_held <= 0:
+            return
+        if held <= self._max_held:
+            return
+        global _over_cap_warned
+        with _over_cap_lock:
+            if _over_cap_warned:
+                return
+            _over_cap_warned = True
+        try:
+            logger.warning(
+                "DelayQueueStrategy holding heap exceeded max_held=%d items "
+                "(now=%d). The in-process heap grows unboundedly when push-rate "
+                "outpaces ready-rate; long bursts of long-delay items can exhaust "
+                "memory. This is a SOFT cap — items are NOT dropped. Raise "
+                "max_held, drain sooner, or wait for distributed-delay support "
+                "(roadmap U10).",
+                self._max_held,
+                held,
+            )
         except BaseException:
-          # This is fallback telemetry after the held item is already published.
-          # A diagnostic handler must not turn the successful push into a failure.
-          pass
-      self._warn_over_cap_once(held)
+            # The held item is already published and the soft-cap flag is already
+            # recorded. This warning is observability only, never a refusal signal.
+            pass
 
-    return _PreparedQueuePush.local(
-      queue_name=queue_name,
-      strategy_name=type(self).__name__,
-      publish=publish,
-    )
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        """Drain due held items, then pop the live queue.
 
-  def _warn_over_cap_once(self, held: int) -> None:
-    """Emit a one-time per-process WARNING when the holding heap exceeds cap.
+        Args:
+            queue_name: The queue name.
+            timeout: Seconds to block (0 = non-blocking).
 
-    The holding heap grows unboundedly whenever push-rate outpaces
-    ready-rate (e.g. a burst of long-delay items). The cap is SOFT: this
-    never refuses the push — dropping a delayed item would silently lose
-    data, which is worse than loud memory pressure. Idempotent via the
-    module-level ``_over_cap_warned`` flag so a multi-spider process does
-    not spam the log. Points at the distributed-delay roadmap (U10).
-    """
-    if self._max_held <= 0:
-      return
-    if held <= self._max_held:
-      return
-    global _over_cap_warned
-    with _over_cap_lock:
-      if _over_cap_warned:
-        return
-      _over_cap_warned = True
-    try:
-      logger.warning(
-        "DelayQueueStrategy holding heap exceeded max_held=%d items "
-        "(now=%d). The in-process heap grows unboundedly when push-rate "
-        "outpaces ready-rate; long bursts of long-delay items can exhaust "
-        "memory. This is a SOFT cap — items are NOT dropped. Raise "
-        "max_held, drain sooner, or wait for distributed-delay support "
-        "(roadmap U10).",
-        self._max_held,
-        held,
-      )
-    except BaseException:
-      # The held item is already published and the soft-cap flag is already
-      # recorded. This warning is observability only, never a refusal signal.
-      pass
-
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-    """Drain due held items, then pop the live queue.
-
-    Args:
-        queue_name: The queue name.
-        timeout: Seconds to block (0 = non-blocking).
-
-    Returns:
-        The next ready item, or None if empty.
-    """
-    timeout = normalize_queue_timeout(timeout)
-    self.bind(queue_name)
-    return cast(
-      bytes | None,
-      self._pop_until_deadline(
-        queue_name,
-        timeout,
-        lambda wait: self._connection_manager.get_queue_backend().pop(queue_name, wait),
-      ),
-    )
-
-  def pop_with_ack(
-    self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, Any | None]:
-    """Drain due held items, then pop the live queue (threads ack token, #28).
-
-    Same drain-then-pop flow as :meth:`pop`, but delegates the live pop to
-    :meth:`QueueStrategy._pop_backend_with_ack` so MQ backends keep their
-    deferred-ack token instead of silently falling back to atomic ``pop()``
-    (pre-fix the inherited base default dropped the token). Held items are
-    re-pushed (not popped), so no token is involved in the drain.
-    """
-    timeout = normalize_queue_timeout(timeout)
-    self.bind(queue_name)
-    return cast(
-      tuple[bytes | None, Any | None],
-      self._pop_until_deadline(
-        queue_name,
-        timeout,
-        lambda wait: self._pop_backend_with_ack(queue_name, wait),
-        has_item=lambda result: result[0] is not None,
-        empty=(None, None),
-      ),
-    )
-
-  def _next_ready_at(self) -> float | None:
-    """Return the next held deadline while keeping heap access synchronized."""
-    with self._state_lock:
-      return self._holding[0][0] if self._holding else None
-
-  def _pop_until_deadline(
-    self,
-    queue_name: str,
-    timeout: float,
-    backend_pop: Callable[[float], Any],
-    *,
-    has_item: Callable[[Any], bool] | None = None,
-    empty: Any = None,
-  ) -> Any:
-    """Drain at local deadlines without exceeding one caller timeout budget."""
-    is_item = has_item if has_item is not None else lambda item: item is not None
-    deadline: float | None = None
-    while True:
-      self._drain_ready(queue_name)
-      before = _require_finite(self._clock(), "clock value")
-      if deadline is None:
-        deadline = _require_finite(before + timeout, "deadline")
-      remaining = max(0.0, deadline - before)
-      next_ready = self._next_ready_at()
-      wait = remaining
-      if next_ready is not None:
-        wait = min(wait, max(0.0, next_ready - before))
-      result = backend_pop(wait)
-      if is_item(result):
-        return result
-      after = _require_finite(self._clock(), "clock value")
-      if timeout == 0.0 or after >= deadline or after <= before:
-        return empty
-
-  def _drain_ready(self, queue_name: str) -> None:
-    """Move all due held items into the live queue.
-
-    Each drained item is re-pushed with the priority the caller originally
-    passed to :meth:`push` (R14-F). Pre-fix this dropped priority on drain,
-    silently landing every delayed item at priority 0 — a priority inversion
-    for any user mixing ``delay`` + ``priority``. Priority is the 4th slot
-    of the heap tuple; the live push uses the keyword form so backend
-    ``push(queue_name, item, priority)`` signatures are honored either way.
-
-    Args:
-        queue_name: The queue name to drain into.
-    """
-    qb = self._connection_manager.get_queue_backend()
-    with self._state_lock:
-      now = _require_finite(self._clock(), "clock value")
-      while self._holding and self._holding[0][0] <= now:
-        _, _, item, priority = self._holding[0]
-        qb.push(queue_name, item, priority)
-        heapq.heappop(self._holding)
-      held = len(self._holding)  # R25-D: capture post-drain depth for the gauge
-    # R25-D: emit on drain so queue/delay_depth can fall — pre-fix the gauge was
-    # push-only and pegged at peak, unable to reflect a drained heap (so an
-    # operator's max-held alert could never clear).
-    delay_depth_hook_failed = False
-    try:
-      self._monitor.on_delay_depth(held)
-    except Exception:  # noqa: BLE001 - monitor must not break the drain path
-      delay_depth_hook_failed = True
-    if delay_depth_hook_failed:
-      try:
-        logger.debug("on_delay_depth hook raised")
-      except BaseException:
-        # The held-to-live transfer already completed; fallback telemetry must
-        # not report that successful drain as a failure.
-        pass
-
-  def queue_len(self, queue_name: str) -> int:
-    """Return live-queue length plus held-item count.
-
-    Args:
-        queue_name: The queue name.
-
-    Returns:
-        Number of pending live items plus held (delayed) items.
-    """
-    self.bind(queue_name)
-    with self._state_lock:
-      held = len(self._holding)
-    return self._connection_manager.get_queue_backend().queue_len(queue_name) + held
-
-  def clear(self, queue_name: str) -> None:
-    """Clear the live queue and all held items.
-
-    Unlike :meth:`close`, this does NOT warn about discarded held items:
-    ``clear`` is an explicit flush requested by the caller, so silent
-    discard is the intended contract. ``close`` warns because held items
-    present at shutdown indicate unexpected loss.
-
-    Args:
-        queue_name: The queue name.
-    """
-    self.bind(queue_name)
-    with self._state_lock:
-      self._connection_manager.get_queue_backend().clear_queue(queue_name)
-      self._holding.clear()
-    # R25-D: emit 0 so the gauge clears on an explicit flush (was push-only).
-    delay_depth_hook_failed = False
-    try:
-      self._monitor.on_delay_depth(0)
-    except Exception:  # noqa: BLE001 - monitor must not break clear()
-      delay_depth_hook_failed = True
-    if delay_depth_hook_failed:
-      try:
-        logger.debug("on_delay_depth hook raised")
-      except BaseException:
-        # The explicit clear already completed; fallback telemetry is best effort.
-        pass
-
-  def close(self) -> None:
-    """Release resources, warning about any held (delayed) items.
-
-    Held items live in-process, so any still-pending delayed items are
-    lost on close/restart. Clear the holding heap atomically, then make that
-    loss non-silent with a best-effort WARNING containing the discarded count.
-
-    If ``_holding`` is empty, this is a quiet no-op (clears nothing).
-    """
-    with self._state_lock:
-      held = len(self._holding)
-      self._holding.clear()
-
-    if held > 0:
-      try:
-        logger.warning(
-          "DelayQueueStrategy close: discarding %d held delayed item(s) "
-          "from the in-process holding queue; these delayed items are lost "
-          "on close/restart (non-silent data loss).",
-          held,
+        Returns:
+            The next ready item, or None if empty.
+        """
+        timeout = normalize_queue_timeout(timeout)
+        self.bind(queue_name)
+        return cast(
+            bytes | None,
+            self._pop_until_deadline(
+                queue_name,
+                timeout,
+                lambda wait: self._connection_manager.get_queue_backend().pop(
+                    queue_name, wait
+                ),
+            ),
         )
-      except BaseException:
-        # The terminal state is already committed; warning handlers are
-        # advisory and must not revive held work or make close fail.
-        pass
 
-  def snapshot(self) -> bytes | None:
-    """Serialize the holding heap for restart recovery (initiative #3).
+    def pop_with_ack(
+        self, queue_name: str, timeout: float = 0.0
+    ) -> tuple[bytes | None, Any | None]:
+        """Drain due held items, then pop the live queue (threads ack token, #28).
 
-    Returns ``None`` when the heap is empty (nothing to persist). Version 2
-    stores each item's remaining delay plus the snapshot wall-clock time.
-    Absolute monotonic timestamps are process-local and cannot be restored
-    safely after a reboot or on another host.
-
-    The ``seq`` tie-breaker is deliberately NOT persisted — it's a monotonic
-    process-local counter; :meth:`restore` re-sequences with a fresh ``_seq``,
-    preserving heap order (seq only breaks ``ready_at`` ties, and the
-    serialized list order preserves relative order among equal-``ready_at``
-    items, so the rebuilt heap is equivalent).
-    """
-    with self._state_lock:
-      if not self._holding:
-        return None
-      snapshot_now = _require_finite(self._clock(), "clock value")
-      snapshot_wall_time = _require_finite(self._wall_clock(), "wall clock value")
-      items = [
-        {
-          "remaining": max(0.0, ready_at - snapshot_now),
-          "item_b64": base64.b64encode(item).decode("ascii"),
-          "priority": priority,
-        }
-        for ready_at, _seq, item, priority in sorted(self._holding)
-      ]
-    return json.dumps(
-      {
-        "version": 2,
-        "strategy": "delay",
-        "snapshot_wall_time": snapshot_wall_time,
-        "items": items,
-      }
-    ).encode("utf-8")
-
-  def restore(self, state: bytes | None) -> None:
-    """Re-populate the holding heap from a prior :meth:`snapshot` (initiative #3).
-
-    Past-ready items (``ready_at <= now``) stay in the heap and drain
-    naturally on the next :meth:`pop`. Corrupt or unknown-format state is
-    logged + skipped — restore never crashes the spider.
-
-    Args:
-        state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
-    """
-    if not state:
-      return
-    corrupt_snapshot = False
-    try:
-      data = json.loads(state.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-      corrupt_snapshot = True
-    if corrupt_snapshot:
-      try:
-        logger.warning("DelayQueueStrategy restore: corrupt snapshot; starting clean.")
-      except BaseException:
-        pass
-      return
-    if (
-      not isinstance(data, dict)
-      or data.get("strategy") != "delay"
-      or data.get("version") not in (1, 2)
-    ):
-      try:
-        logger.warning("DelayQueueStrategy restore: unknown snapshot format; starting clean.")
-      except BaseException:
-        pass
-      return
-    items = data.get("items")
-    if not isinstance(items, list):
-      try:
-        logger.warning(
-          "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
+        Same drain-then-pop flow as :meth:`pop`, but delegates the live pop to
+        :meth:`QueueStrategy._pop_backend_with_ack` so MQ backends keep their
+        deferred-ack token instead of silently falling back to atomic ``pop()``
+        (pre-fix the inherited base default dropped the token). Held items are
+        re-pushed (not popped), so no token is involved in the drain.
+        """
+        timeout = normalize_queue_timeout(timeout)
+        self.bind(queue_name)
+        return cast(
+            tuple[bytes | None, Any | None],
+            self._pop_until_deadline(
+                queue_name,
+                timeout,
+                lambda wait: self._pop_backend_with_ack(queue_name, wait),
+                has_item=lambda result: result[0] is not None,
+                empty=(None, None),
+            ),
         )
-      except BaseException:
-        pass
-      return
-    version = int(data["version"])
-    invalid_clock_metadata = False
-    try:
-      now = _require_finite(self._clock(), "clock value")
-    except (TypeError, ValueError):
-      invalid_clock_metadata = True
-    if invalid_clock_metadata:
-      try:
-        logger.warning(
-          "DelayQueueStrategy restore: invalid clock metadata; starting clean."
-        )
-      except BaseException:
-        pass
-      return
-    downtime = 0.0
-    if version == 2:
-      invalid_v2_clock_metadata = False
-      try:
-        snapshot_wall_time = float(data["snapshot_wall_time"])
-        current_wall_time = float(self._wall_clock())
-        if not math.isfinite(snapshot_wall_time) or not math.isfinite(
-          current_wall_time
+
+    def _next_ready_at(self) -> float | None:
+        """Return the next held deadline while keeping heap access synchronized."""
+        with self._state_lock:
+            return self._holding[0][0] if self._holding else None
+
+    def _pop_until_deadline(
+        self,
+        queue_name: str,
+        timeout: float,
+        backend_pop: Callable[[float], Any],
+        *,
+        has_item: Callable[[Any], bool] | None = None,
+        empty: Any = None,
+    ) -> Any:
+        """Drain at local deadlines without exceeding one caller timeout budget."""
+        is_item = has_item if has_item is not None else lambda item: item is not None
+        deadline: float | None = None
+        while True:
+            self._drain_ready(queue_name)
+            before = _require_finite(self._clock(), "clock value")
+            if deadline is None:
+                deadline = _require_finite(before + timeout, "deadline")
+            remaining = max(0.0, deadline - before)
+            next_ready = self._next_ready_at()
+            wait = remaining
+            if next_ready is not None:
+                wait = min(wait, max(0.0, next_ready - before))
+            result = backend_pop(wait)
+            if is_item(result):
+                return result
+            after = _require_finite(self._clock(), "clock value")
+            if timeout == 0.0 or after >= deadline or after <= before:
+                return empty
+
+    def _drain_ready(self, queue_name: str) -> None:
+        """Move all due held items into the live queue.
+
+        Each drained item is re-pushed with the priority the caller originally
+        passed to :meth:`push` (R14-F). Pre-fix this dropped priority on drain,
+        silently landing every delayed item at priority 0 — a priority inversion
+        for any user mixing ``delay`` + ``priority``. Priority is the 4th slot
+        of the heap tuple; the live push uses the keyword form so backend
+        ``push(queue_name, item, priority)`` signatures are honored either way.
+
+        Args:
+            queue_name: The queue name to drain into.
+        """
+        qb = self._connection_manager.get_queue_backend()
+        with self._state_lock:
+            now = _require_finite(self._clock(), "clock value")
+            while self._holding and self._holding[0][0] <= now:
+                _, _, item, priority = self._holding[0]
+                qb.push(queue_name, item, priority)
+                heapq.heappop(self._holding)
+            held = len(self._holding)  # R25-D: capture post-drain depth for the gauge
+        # R25-D: emit on drain so queue/delay_depth can fall — pre-fix the gauge was
+        # push-only and pegged at peak, unable to reflect a drained heap (so an
+        # operator's max-held alert could never clear).
+        delay_depth_hook_failed = False
+        try:
+            self._monitor.on_delay_depth(held)
+        except Exception:  # noqa: BLE001 - monitor must not break the drain path
+            delay_depth_hook_failed = True
+        if delay_depth_hook_failed:
+            try:
+                logger.debug("on_delay_depth hook raised")
+            except BaseException:
+                # The held-to-live transfer already completed; fallback telemetry must
+                # not report that successful drain as a failure.
+                pass
+
+    def queue_len(self, queue_name: str) -> int:
+        """Return live-queue length plus held-item count.
+
+        Args:
+            queue_name: The queue name.
+
+        Returns:
+            Number of pending live items plus held (delayed) items.
+        """
+        self.bind(queue_name)
+        with self._state_lock:
+            held = len(self._holding)
+        return self._connection_manager.get_queue_backend().queue_len(queue_name) + held
+
+    def clear(self, queue_name: str) -> None:
+        """Clear the live queue and all held items.
+
+        Unlike :meth:`close`, this does NOT warn about discarded held items:
+        ``clear`` is an explicit flush requested by the caller, so silent
+        discard is the intended contract. ``close`` warns because held items
+        present at shutdown indicate unexpected loss.
+
+        Args:
+            queue_name: The queue name.
+        """
+        self.bind(queue_name)
+        with self._state_lock:
+            self._connection_manager.get_queue_backend().clear_queue(queue_name)
+            self._holding.clear()
+        # R25-D: emit 0 so the gauge clears on an explicit flush (was push-only).
+        delay_depth_hook_failed = False
+        try:
+            self._monitor.on_delay_depth(0)
+        except Exception:  # noqa: BLE001 - monitor must not break clear()
+            delay_depth_hook_failed = True
+        if delay_depth_hook_failed:
+            try:
+                logger.debug("on_delay_depth hook raised")
+            except BaseException:
+                # The explicit clear already completed; fallback telemetry is best effort.
+                pass
+
+    def close(self) -> None:
+        """Release resources, warning about any held (delayed) items.
+
+        Held items live in-process, so any still-pending delayed items are
+        lost on close/restart. Clear the holding heap atomically, then make that
+        loss non-silent with a best-effort WARNING containing the discarded count.
+
+        If ``_holding`` is empty, this is a quiet no-op (clears nothing).
+        """
+        with self._state_lock:
+            held = len(self._holding)
+            self._holding.clear()
+
+        if held > 0:
+            try:
+                logger.warning(
+                    "DelayQueueStrategy close: discarding %d held delayed item(s) "
+                    "from the in-process holding queue; these delayed items are lost "
+                    "on close/restart (non-silent data loss).",
+                    held,
+                )
+            except BaseException:
+                # The terminal state is already committed; warning handlers are
+                # advisory and must not revive held work or make close fail.
+                pass
+
+    def snapshot(self) -> bytes | None:
+        """Serialize the holding heap for restart recovery (initiative #3).
+
+        Returns ``None`` when the heap is empty (nothing to persist). Version 2
+        stores each item's remaining delay plus the snapshot wall-clock time.
+        Absolute monotonic timestamps are process-local and cannot be restored
+        safely after a reboot or on another host.
+
+        The ``seq`` tie-breaker is deliberately NOT persisted — it's a monotonic
+        process-local counter; :meth:`restore` re-sequences with a fresh ``_seq``,
+        preserving heap order (seq only breaks ``ready_at`` ties, and the
+        serialized list order preserves relative order among equal-``ready_at``
+        items, so the rebuilt heap is equivalent).
+        """
+        with self._state_lock:
+            if not self._holding:
+                return None
+            snapshot_now = _require_finite(self._clock(), "clock value")
+            snapshot_wall_time = _require_finite(self._wall_clock(), "wall clock value")
+            items = [
+                {
+                    "remaining": max(0.0, ready_at - snapshot_now),
+                    "item_b64": base64.b64encode(item).decode("ascii"),
+                    "priority": priority,
+                }
+                for ready_at, _seq, item, priority in sorted(self._holding)
+            ]
+        return json.dumps(
+            {
+                "version": 2,
+                "strategy": "delay",
+                "snapshot_wall_time": snapshot_wall_time,
+                "items": items,
+            }
+        ).encode("utf-8")
+
+    def restore(self, state: bytes | None) -> None:
+        """Re-populate the holding heap from a prior :meth:`snapshot` (initiative #3).
+
+        Past-ready items (``ready_at <= now``) stay in the heap and drain
+        naturally on the next :meth:`pop`. Corrupt or unknown-format state is
+        logged + skipped — restore never crashes the spider.
+
+        Args:
+            state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
+        """
+        if not state:
+            return
+        corrupt_snapshot = False
+        try:
+            data = json.loads(state.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            corrupt_snapshot = True
+        if corrupt_snapshot:
+            try:
+                logger.warning(
+                    "DelayQueueStrategy restore: corrupt snapshot; starting clean."
+                )
+            except BaseException:
+                pass
+            return
+        if (
+            not isinstance(data, dict)
+            or data.get("strategy") != "delay"
+            or data.get("version") not in (1, 2)
         ):
-          raise ValueError("wall clock is not finite")
-        downtime = max(0.0, current_wall_time - snapshot_wall_time)
-      except (KeyError, TypeError, ValueError):
-        invalid_v2_clock_metadata = True
-      if invalid_v2_clock_metadata:
+            try:
+                logger.warning(
+                    "DelayQueueStrategy restore: unknown snapshot format; starting clean."
+                )
+            except BaseException:
+                pass
+            return
+        items = data.get("items")
+        if not isinstance(items, list):
+            try:
+                logger.warning(
+                    "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
+                )
+            except BaseException:
+                pass
+            return
+        version = int(data["version"])
+        invalid_clock_metadata = False
         try:
-          logger.warning(
-            "DelayQueueStrategy restore: invalid v2 clock metadata; starting clean."
-          )
-        except BaseException:
-          pass
-        return
-
-    recovered_entries: list[tuple[float, float, int, bytes, float]] = []
-    for input_order, entry in enumerate(items):
-      if not isinstance(entry, dict):
-        continue
-      malformed_entry = False
-      try:
+            now = _require_finite(self._clock(), "clock value")
+        except (TypeError, ValueError):
+            invalid_clock_metadata = True
+        if invalid_clock_metadata:
+            try:
+                logger.warning(
+                    "DelayQueueStrategy restore: invalid clock metadata; starting clean."
+                )
+            except BaseException:
+                pass
+            return
+        downtime = 0.0
         if version == 2:
-          remaining = float(entry["remaining"])
-          if not math.isfinite(remaining):
-            raise ValueError("remaining delay is not finite")
-          ready_at = _require_finite(now + max(0.0, remaining - downtime), "ready_at")
-          original_deadline = remaining
-        else:
-          # v1 persisted an absolute monotonic value. Its epoch is unknowable
-          # after reboot or host migration, so make the item due immediately
-          # instead of risking an arbitrarily long stall. Preserve only its
-          # relative ordering so earlier legacy deadlines still drain first.
-          original_deadline = _require_finite(float(entry["ready_at"]), "ready_at")
-          ready_at = now
-        item = base64.b64decode(entry["item_b64"], validate=True)
-        priority = float(entry["priority"])
-        _require_finite(priority, "priority")
-      except (KeyError, TypeError, ValueError, binascii.Error):
-        malformed_entry = True
-      if malformed_entry:
-        try:
-          logger.warning("DelayQueueStrategy restore: skipping malformed entry.")
-        except BaseException:
-          pass
-        continue
-      recovered_entries.append(
-        (ready_at, original_deadline, input_order, item, priority)
-      )
-    recovered_entries.sort(key=lambda entry: entry[:3])
-    rebuilt = [
-      (ready_at, seq, item, priority)
-      for seq, (
-        ready_at,
-        _original_deadline,
-        _input_order,
-        item,
-        priority,
-      ) in enumerate(recovered_entries)
-    ]
-    heapq.heapify(rebuilt)
-    with self._state_lock:
-      self._holding = rebuilt
-      self._seq = itertools.count(len(rebuilt))
-    recovered = len(recovered_entries)
-    if recovered:
-      try:
-        logger.info(
-          "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",
-          recovered,
-        )
-      except BaseException:
-        pass
+            invalid_v2_clock_metadata = False
+            try:
+                snapshot_wall_time = float(data["snapshot_wall_time"])
+                current_wall_time = float(self._wall_clock())
+                if not math.isfinite(snapshot_wall_time) or not math.isfinite(
+                    current_wall_time
+                ):
+                    raise ValueError("wall clock is not finite")
+                downtime = max(0.0, current_wall_time - snapshot_wall_time)
+            except (KeyError, TypeError, ValueError):
+                invalid_v2_clock_metadata = True
+            if invalid_v2_clock_metadata:
+                try:
+                    logger.warning(
+                        "DelayQueueStrategy restore: invalid v2 clock metadata; starting clean."
+                    )
+                except BaseException:
+                    pass
+                return
+
+        recovered_entries: list[tuple[float, float, int, bytes, float]] = []
+        for input_order, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                continue
+            malformed_entry = False
+            try:
+                if version == 2:
+                    remaining = float(entry["remaining"])
+                    if not math.isfinite(remaining):
+                        raise ValueError("remaining delay is not finite")
+                    ready_at = _require_finite(
+                        now + max(0.0, remaining - downtime), "ready_at"
+                    )
+                    original_deadline = remaining
+                else:
+                    # v1 persisted an absolute monotonic value. Its epoch is unknowable
+                    # after reboot or host migration, so make the item due immediately
+                    # instead of risking an arbitrarily long stall. Preserve only its
+                    # relative ordering so earlier legacy deadlines still drain first.
+                    original_deadline = _require_finite(
+                        float(entry["ready_at"]), "ready_at"
+                    )
+                    ready_at = now
+                item = base64.b64decode(entry["item_b64"], validate=True)
+                priority = float(entry["priority"])
+                _require_finite(priority, "priority")
+            except (KeyError, TypeError, ValueError, binascii.Error):
+                malformed_entry = True
+            if malformed_entry:
+                try:
+                    logger.warning(
+                        "DelayQueueStrategy restore: skipping malformed entry."
+                    )
+                except BaseException:
+                    pass
+                continue
+            recovered_entries.append(
+                (ready_at, original_deadline, input_order, item, priority)
+            )
+        recovered_entries.sort(key=lambda entry: entry[:3])
+        rebuilt = [
+            (ready_at, seq, item, priority)
+            for seq, (
+                ready_at,
+                _original_deadline,
+                _input_order,
+                item,
+                priority,
+            ) in enumerate(recovered_entries)
+        ]
+        heapq.heapify(rebuilt)
+        with self._state_lock:
+            self._holding = rebuilt
+            self._seq = itertools.count(len(rebuilt))
+        recovered = len(recovered_entries)
+        if recovered:
+            try:
+                logger.info(
+                    "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",
+                    recovered,
+                )
+            except BaseException:
+                pass

@@ -15,14 +15,14 @@ import pytest
 
 from scrapy_extension.backends.base import QueueBackend, SetBackend, StorageBackend
 from scrapy_extension.backends.circuit_breaker import (
-  BreakerState,
-  CircuitBreaker,
-  CircuitBreakerOpenError,
-  _BackendProxyBase,
-  _CallAdmission,
-  wrap_queue_backend,
-  wrap_set_backend,
-  wrap_storage_backend,
+    BreakerState,
+    CircuitBreaker,
+    CircuitBreakerOpenError,
+    _BackendProxyBase,
+    _CallAdmission,
+    wrap_queue_backend,
+    wrap_set_backend,
+    wrap_storage_backend,
 )
 
 # ---------------------------------------------------------------------------
@@ -31,16 +31,16 @@ from scrapy_extension.backends.circuit_breaker import (
 
 
 class FakeClock:
-  """Manually-advanced monotonic clock for deterministic breaker timing."""
+    """Manually-advanced monotonic clock for deterministic breaker timing."""
 
-  def __init__(self, start: float = 0.0) -> None:
-    self._t = start
+    def __init__(self, start: float = 0.0) -> None:
+        self._t = start
 
-  def __call__(self) -> float:
-    return self._t
+    def __call__(self) -> float:
+        return self._t
 
-  def advance(self, seconds: float) -> None:
-    self._t += seconds
+    def advance(self, seconds: float) -> None:
+        self._t += seconds
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +49,11 @@ class FakeClock:
 
 
 def _boom(*_args: Any, **_kwargs: Any) -> Any:
-  raise RuntimeError("backend on fire")
+    raise RuntimeError("backend on fire")
 
 
 def _ok(*_args: Any, **_kwargs: Any) -> Any:
-  return "ok"
+    return "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -62,58 +62,58 @@ def _ok(*_args: Any, **_kwargs: Any) -> Any:
 
 
 class TestCircuitBreakerConstruction:
-  def test_defaults_are_closed(self):
-    b = CircuitBreaker("redis-queue")
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 0
-    assert b.last_failure_time is None
+    def test_defaults_are_closed(self):
+        b = CircuitBreaker("redis-queue")
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 0
+        assert b.last_failure_time is None
 
-  def test_invalid_failure_threshold_raises(self):
-    with pytest.raises(ValueError, match="failure_threshold"):
-      CircuitBreaker("x", failure_threshold=0)
+    def test_invalid_failure_threshold_raises(self):
+        with pytest.raises(ValueError, match="failure_threshold"):
+            CircuitBreaker("x", failure_threshold=0)
 
-  def test_invalid_reset_timeout_raises(self):
-    with pytest.raises(ValueError, match="reset_timeout"):
-      CircuitBreaker("x", reset_timeout=-1.0)
+    def test_invalid_reset_timeout_raises(self):
+        with pytest.raises(ValueError, match="reset_timeout"):
+            CircuitBreaker("x", reset_timeout=-1.0)
 
-  def test_inf_reset_timeout_raises(self):
-    """R21-A: inf reset_timeout would wedge an OPEN breaker forever (the
-    (now - opened_at) >= reset_timeout test is always False for inf)."""
-    with pytest.raises(ValueError, match="reset_timeout"):
-      CircuitBreaker("x", reset_timeout=float("inf"))
+    def test_inf_reset_timeout_raises(self):
+        """R21-A: inf reset_timeout would wedge an OPEN breaker forever (the
+        (now - opened_at) >= reset_timeout test is always False for inf)."""
+        with pytest.raises(ValueError, match="reset_timeout"):
+            CircuitBreaker("x", reset_timeout=float("inf"))
 
-  def test_huge_finite_reset_timeout_raises(self):
-    """R21-A: a huge finite reset_timeout (> the cap) effectively never recovers."""
-    with pytest.raises(ValueError, match="reset_timeout"):
-      CircuitBreaker("x", reset_timeout=1e308)
+    def test_huge_finite_reset_timeout_raises(self):
+        """R21-A: a huge finite reset_timeout (> the cap) effectively never recovers."""
+        with pytest.raises(ValueError, match="reset_timeout"):
+            CircuitBreaker("x", reset_timeout=1e308)
 
-  def test_bool_failure_threshold_raises(self):
-    """R21-A: bool is an int subclass but not a valid failure_threshold."""
-    with pytest.raises(ValueError, match="failure_threshold"):
-      CircuitBreaker("x", failure_threshold=True)
+    def test_bool_failure_threshold_raises(self):
+        """R21-A: bool is an int subclass but not a valid failure_threshold."""
+        with pytest.raises(ValueError, match="failure_threshold"):
+            CircuitBreaker("x", failure_threshold=True)
 
-  def test_bool_reset_timeout_raises(self):
-    """R34-B: bool is an int subclass but not a valid reset_timeout.
+    def test_bool_reset_timeout_raises(self):
+        """R34-B: bool is an int subclass but not a valid reset_timeout.
 
-    Asymmetric with the R21-A failure_threshold guard: ``math.isfinite(True)``
-    is True and ``True < 0`` is False, so ``reset_timeout=True`` was silently
-    accepted and stored as boolean ``True`` (the OPEN breaker then waited ~1s
-    instead of the intended value). Production is neutralized by pydantic
-    float-coercion on the settings field, but direct ``CircuitBreaker()``
-    construction (third-party plugins, YAML ``on``/``off`` parsed as bool,
-    test doubles) must still reject it — mirror the failure_threshold guard.
-    """
-    with pytest.raises(ValueError, match="reset_timeout"):
-      CircuitBreaker("x", reset_timeout=True)
+        Asymmetric with the R21-A failure_threshold guard: ``math.isfinite(True)``
+        is True and ``True < 0`` is False, so ``reset_timeout=True`` was silently
+        accepted and stored as boolean ``True`` (the OPEN breaker then waited ~1s
+        instead of the intended value). Production is neutralized by pydantic
+        float-coercion on the settings field, but direct ``CircuitBreaker()``
+        construction (third-party plugins, YAML ``on``/``off`` parsed as bool,
+        test doubles) must still reject it — mirror the failure_threshold guard.
+        """
+        with pytest.raises(ValueError, match="reset_timeout"):
+            CircuitBreaker("x", reset_timeout=True)
 
-  def test_cap_reset_timeout_accepted(self):
-    """R21-A: the cap value itself is accepted (boundary)."""
-    from scrapy_extension.backends.circuit_breaker import (
-      CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
-    )
+    def test_cap_reset_timeout_accepted(self):
+        """R21-A: the cap value itself is accepted (boundary)."""
+        from scrapy_extension.backends.circuit_breaker import (
+            CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
+        )
 
-    b = CircuitBreaker("x", reset_timeout=CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S)
-    assert b.reset_timeout == CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S
+        b = CircuitBreaker("x", reset_timeout=CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S)
+        assert b.reset_timeout == CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
@@ -122,29 +122,29 @@ class TestCircuitBreakerConstruction:
 
 
 class TestTrippingOpen:
-  def test_below_threshold_stays_closed(self):
-    b = CircuitBreaker("q", failure_threshold=3)
-    for _ in range(2):
-      with pytest.raises(RuntimeError):
-        b.call(_boom)
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 2
+    def test_below_threshold_stays_closed(self):
+        b = CircuitBreaker("q", failure_threshold=3)
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                b.call(_boom)
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 2
 
-  def test_at_threshold_trips_open(self):
-    b = CircuitBreaker("q", failure_threshold=3)
-    for _ in range(3):
-      with pytest.raises(RuntimeError):
-        b.call(_boom)
-    assert b.state is BreakerState.OPEN
+    def test_at_threshold_trips_open(self):
+        b = CircuitBreaker("q", failure_threshold=3)
+        for _ in range(3):
+            with pytest.raises(RuntimeError):
+                b.call(_boom)
+        assert b.state is BreakerState.OPEN
 
-  def test_failure_count_increments_per_failure(self):
-    b = CircuitBreaker("q", failure_threshold=5)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.failure_count == 1
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.failure_count == 2
+    def test_failure_count_increments_per_failure(self):
+        b = CircuitBreaker("q", failure_threshold=5)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.failure_count == 1
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.failure_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -153,34 +153,34 @@ class TestTrippingOpen:
 
 
 class TestOpenRejectsFast:
-  def test_open_raises_circuit_breaker_open_error_without_calling(self):
-    b = CircuitBreaker("redis-q", failure_threshold=1)
-    calls = []
+    def test_open_raises_circuit_breaker_open_error_without_calling(self):
+        b = CircuitBreaker("redis-q", failure_threshold=1)
+        calls = []
 
-    def tracker(*args, **kwargs):
-      calls.append(1)
-      return None
+        def tracker(*args, **kwargs):
+            calls.append(1)
+            return None
 
-    # Trip the breaker.
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
+        # Trip the breaker.
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
 
-    # A subsequent call must NOT invoke the backend at all.
-    with pytest.raises(CircuitBreakerOpenError) as exc_info:
-      b.call(tracker)
-    assert exc_info.value.name == "redis-q"
-    assert calls == []
+        # A subsequent call must NOT invoke the backend at all.
+        with pytest.raises(CircuitBreakerOpenError) as exc_info:
+            b.call(tracker)
+        assert exc_info.value.name == "redis-q"
+        assert calls == []
 
-  def test_open_error_subclasses_backend_error(self):
-    from scrapy_extension.exceptions import BackendError
+    def test_open_error_subclasses_backend_error(self):
+        from scrapy_extension.exceptions import BackendError
 
-    b = CircuitBreaker("q", failure_threshold=1)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    with pytest.raises(CircuitBreakerOpenError) as exc_info:
-      b.call(_ok)
-    assert isinstance(exc_info.value, BackendError)
+        b = CircuitBreaker("q", failure_threshold=1)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        with pytest.raises(CircuitBreakerOpenError) as exc_info:
+            b.call(_ok)
+        assert isinstance(exc_info.value, BackendError)
 
 
 # ---------------------------------------------------------------------------
@@ -189,41 +189,41 @@ class TestOpenRejectsFast:
 
 
 class TestHalfOpenTransition:
-  def test_open_transitions_to_half_open_after_timeout(self):
-    clock = FakeClock()
-    b = CircuitBreaker("q", failure_threshold=1, reset_timeout=30.0, time_fn=clock)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
+    def test_open_transitions_to_half_open_after_timeout(self):
+        clock = FakeClock()
+        b = CircuitBreaker("q", failure_threshold=1, reset_timeout=30.0, time_fn=clock)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
 
-    # Still open just before the reset timeout elapses.
-    clock.advance(29.9)
-    with pytest.raises(CircuitBreakerOpenError):
-      b.call(_ok)
-    # (state is re-evaluated lazily on each call; stays OPEN until timeout.)
+        # Still open just before the reset timeout elapses.
+        clock.advance(29.9)
+        with pytest.raises(CircuitBreakerOpenError):
+            b.call(_ok)
+        # (state is re-evaluated lazily on each call; stays OPEN until timeout.)
 
-    # After the reset timeout, the next call becomes a probe.
-    clock.advance(0.2)  # total elapsed since failure >= 30.0
-    assert b.call(_ok) == "ok"
-    # Successful probe -> CLOSED, count reset.
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 0
+        # After the reset timeout, the next call becomes a probe.
+        clock.advance(0.2)  # total elapsed since failure >= 30.0
+        assert b.call(_ok) == "ok"
+        # Successful probe -> CLOSED, count reset.
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 0
 
-  def test_probe_failure_reopens(self):
-    clock = FakeClock()
-    b = CircuitBreaker("q", failure_threshold=2, reset_timeout=5.0, time_fn=clock)
-    # Trip: two failures to reach threshold.
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
+    def test_probe_failure_reopens(self):
+        clock = FakeClock()
+        b = CircuitBreaker("q", failure_threshold=2, reset_timeout=5.0, time_fn=clock)
+        # Trip: two failures to reach threshold.
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
 
-    clock.advance(5.0)
-    # HALF_OPEN probe fails -> back to OPEN immediately.
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
+        clock.advance(5.0)
+        # HALF_OPEN probe fails -> back to OPEN immediately.
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
 
 
 # ---------------------------------------------------------------------------
@@ -232,235 +232,235 @@ class TestHalfOpenTransition:
 
 
 class TestSuccessResets:
-  def test_success_in_closed_resets_count(self):
-    b = CircuitBreaker("q", failure_threshold=3)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.failure_count == 2
-    # A success clears the consecutive-failure tally.
-    assert b.call(_ok) == "ok"
-    assert b.failure_count == 0
-    # Now we need a fresh run of 3 to trip.
-    for _ in range(2):
-      with pytest.raises(RuntimeError):
-        b.call(_boom)
-    assert b.state is BreakerState.CLOSED
+    def test_success_in_closed_resets_count(self):
+        b = CircuitBreaker("q", failure_threshold=3)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.failure_count == 2
+        # A success clears the consecutive-failure tally.
+        assert b.call(_ok) == "ok"
+        assert b.failure_count == 0
+        # Now we need a fresh run of 3 to trip.
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                b.call(_boom)
+        assert b.state is BreakerState.CLOSED
 
-  def test_half_open_probe_success_closes_and_resets(self):
-    clock = FakeClock()
-    b = CircuitBreaker("q", failure_threshold=1, reset_timeout=10.0, time_fn=clock)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
-    clock.advance(10.0)
-    # Probe succeeds -> CLOSED, and last_failure_time is cleared.
-    assert b.call(_ok) == "ok"
-    assert b.state is BreakerState.CLOSED
-    assert b.last_failure_time is None
+    def test_half_open_probe_success_closes_and_resets(self):
+        clock = FakeClock()
+        b = CircuitBreaker("q", failure_threshold=1, reset_timeout=10.0, time_fn=clock)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
+        clock.advance(10.0)
+        # Probe succeeds -> CLOSED, and last_failure_time is cleared.
+        assert b.call(_ok) == "ok"
+        assert b.state is BreakerState.CLOSED
+        assert b.last_failure_time is None
 
 
 class TestStaleSuccessRace:
-  """A late success from a slow call (stale admission) must not wedge the
-  breaker OPEN.
+    """A late success from a slow call (stale admission) must not wedge the
+    breaker OPEN.
 
-  Race: ``call()`` captures an admission under the lock, RELEASES the lock,
-  runs ``func()`` (slow, no lock), then re-acquires the lock and calls
-  ``_record_success(admission)`` with a STALE epoch. If another thread trips
-  the breaker OPEN during func(), the stale CLOSED success otherwise
-  clears ``_last_failure_time = None``. The cool-down check in ``_allow_call``
-  gates on ``opened_at is not None`` — a None timestamp prevents the
-  OPEN->HALF_OPEN transition, so the breaker can NEVER recover (no background
-  timer; recovery is lazy on the next call). Backend permanently unreachable
-  until manual ``reset()`` or process restart.
-  """
+    Race: ``call()`` captures an admission under the lock, RELEASES the lock,
+    runs ``func()`` (slow, no lock), then re-acquires the lock and calls
+    ``_record_success(admission)`` with a STALE epoch. If another thread trips
+    the breaker OPEN during func(), the stale CLOSED success otherwise
+    clears ``_last_failure_time = None``. The cool-down check in ``_allow_call``
+    gates on ``opened_at is not None`` — a None timestamp prevents the
+    OPEN->HALF_OPEN transition, so the breaker can NEVER recover (no background
+    timer; recovery is lazy on the next call). Backend permanently unreachable
+    until manual ``reset()`` or process restart.
+    """
 
-  def test_late_success_does_not_wedge_open_breaker(self):
-    clock = FakeClock()
-    b = CircuitBreaker("q", failure_threshold=3, reset_timeout=10.0, time_fn=clock)
+    def test_late_success_does_not_wedge_open_breaker(self):
+        clock = FakeClock()
+        b = CircuitBreaker("q", failure_threshold=3, reset_timeout=10.0, time_fn=clock)
 
-    # Thread A: capture a CLOSED admission under the lock (the slow call's
-    # acquire), then "release" — func() is now in flight (not simulated).
-    with b._lock:
-      admission = b._allow_call()
-    assert admission.state is BreakerState.CLOSED
+        # Thread A: capture a CLOSED admission under the lock (the slow call's
+        # acquire), then "release" — func() is now in flight (not simulated).
+        with b._lock:
+            admission = b._allow_call()
+        assert admission.state is BreakerState.CLOSED
 
-    # Thread B: while A's func() is in flight, threshold failures trip OPEN.
-    for _ in range(3):
-      with b._lock:
-        b._record_failure(_CallAdmission(BreakerState.CLOSED, b._epoch))
-    assert b.state is BreakerState.OPEN
-    trip_time = b.last_failure_time
-    assert trip_time is not None
+        # Thread B: while A's func() is in flight, threshold failures trip OPEN.
+        for _ in range(3):
+            with b._lock:
+                b._record_failure(_CallAdmission(BreakerState.CLOSED, b._epoch))
+        assert b.state is BreakerState.OPEN
+        trip_time = b.last_failure_time
+        assert trip_time is not None
 
-    # Thread A: slow func() finally SUCCEEDS and records with the STALE
-    # CLOSED admission (captured before the trip).
-    with b._lock:
-      b._record_success(admission)
+        # Thread A: slow func() finally SUCCEEDS and records with the STALE
+        # CLOSED admission (captured before the trip).
+        with b._lock:
+            b._record_success(admission)
 
-    # The breaker must STILL be OPEN with the trip timestamp INTACT — the wedge
-    # would clear _last_failure_time=None, blocking the OPEN->HALF_OPEN check.
-    assert b.state is BreakerState.OPEN
-    assert b.last_failure_time == trip_time, (
-      "late success clobbered _last_failure_time -> breaker wedged OPEN forever "
-      "(cool-down check gates on opened_at is not None)"
-    )
+        # The breaker must STILL be OPEN with the trip timestamp INTACT — the wedge
+        # would clear _last_failure_time=None, blocking the OPEN->HALF_OPEN check.
+        assert b.state is BreakerState.OPEN
+        assert b.last_failure_time == trip_time, (
+            "late success clobbered _last_failure_time -> breaker wedged OPEN forever "
+            "(cool-down check gates on opened_at is not None)"
+        )
 
-    # Recovery: after reset_timeout elapses, _allow_call MUST transition to
-    # HALF_OPEN. The wedge (cleared timestamp) returns OPEN here — the regression.
-    clock.advance(100.0)
-    with b._lock:
-      effective = b._allow_call()
-    assert effective.state is BreakerState.HALF_OPEN, (
-      "breaker could not recover OPEN->HALF_OPEN — _last_failure_time was "
-      "cleared by a stale success (permanent backend outage)"
-    )
+        # Recovery: after reset_timeout elapses, _allow_call MUST transition to
+        # HALF_OPEN. The wedge (cleared timestamp) returns OPEN here — the regression.
+        clock.advance(100.0)
+        with b._lock:
+            effective = b._allow_call()
+        assert effective.state is BreakerState.HALF_OPEN, (
+            "breaker could not recover OPEN->HALF_OPEN — _last_failure_time was "
+            "cleared by a stale success (permanent backend outage)"
+        )
 
 
 class TestStaleFailureRace:
-  """Outcomes admitted before a state generation change cannot mutate it."""
+    """Outcomes admitted before a state generation change cannot mutate it."""
 
-  def test_pre_trip_failure_cannot_reopen_breaker_after_probe_recovery(self):
-    clock = FakeClock()
-    breaker = CircuitBreaker(
-      "q",
-      failure_threshold=1,
-      reset_timeout=5.0,
-      time_fn=clock,
-    )
-    old_call_started = threading.Event()
-    release_old_call = threading.Event()
-    old_errors: list[RuntimeError] = []
+    def test_pre_trip_failure_cannot_reopen_breaker_after_probe_recovery(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            "q",
+            failure_threshold=1,
+            reset_timeout=5.0,
+            time_fn=clock,
+        )
+        old_call_started = threading.Event()
+        release_old_call = threading.Event()
+        old_errors: list[RuntimeError] = []
 
-    def slow_old_failure() -> None:
-      old_call_started.set()
-      release_old_call.wait(timeout=2.0)
-      raise RuntimeError("retired socket timed out")
+        def slow_old_failure() -> None:
+            old_call_started.set()
+            release_old_call.wait(timeout=2.0)
+            raise RuntimeError("retired socket timed out")
 
-    def run_old_call() -> None:
-      try:
-        breaker.call(slow_old_failure)
-      except RuntimeError as exc:
-        old_errors.append(exc)
+        def run_old_call() -> None:
+            try:
+                breaker.call(slow_old_failure)
+            except RuntimeError as exc:
+                old_errors.append(exc)
 
-    thread = threading.Thread(target=run_old_call)
-    thread.start()
-    try:
-      assert old_call_started.wait(timeout=1.0)
-      with pytest.raises(RuntimeError, match="backend on fire"):
-        breaker.call(_boom)
-      assert breaker.state is BreakerState.OPEN
+        thread = threading.Thread(target=run_old_call)
+        thread.start()
+        try:
+            assert old_call_started.wait(timeout=1.0)
+            with pytest.raises(RuntimeError, match="backend on fire"):
+                breaker.call(_boom)
+            assert breaker.state is BreakerState.OPEN
 
-      clock.advance(5.0)
-      assert breaker.call(_ok) == "ok"
-      assert breaker.state is BreakerState.CLOSED
-    finally:
-      release_old_call.set()
-      thread.join(timeout=1.0)
+            clock.advance(5.0)
+            assert breaker.call(_ok) == "ok"
+            assert breaker.state is BreakerState.CLOSED
+        finally:
+            release_old_call.set()
+            thread.join(timeout=1.0)
 
-    assert not thread.is_alive()
-    assert len(old_errors) == 1
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
-    assert breaker.last_failure_time is None
+        assert not thread.is_alive()
+        assert len(old_errors) == 1
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
+        assert breaker.last_failure_time is None
 
-  def test_reset_fences_failure_from_call_admitted_before_reset(self):
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    old_call_started = threading.Event()
-    release_old_call = threading.Event()
-    old_errors: list[RuntimeError] = []
+    def test_reset_fences_failure_from_call_admitted_before_reset(self):
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        old_call_started = threading.Event()
+        release_old_call = threading.Event()
+        old_errors: list[RuntimeError] = []
 
-    def slow_old_failure() -> None:
-      old_call_started.set()
-      release_old_call.wait(timeout=2.0)
-      raise RuntimeError("pre-reset failure")
+        def slow_old_failure() -> None:
+            old_call_started.set()
+            release_old_call.wait(timeout=2.0)
+            raise RuntimeError("pre-reset failure")
 
-    def run_old_call() -> None:
-      try:
-        breaker.call(slow_old_failure)
-      except RuntimeError as exc:
-        old_errors.append(exc)
+        def run_old_call() -> None:
+            try:
+                breaker.call(slow_old_failure)
+            except RuntimeError as exc:
+                old_errors.append(exc)
 
-    thread = threading.Thread(target=run_old_call)
-    thread.start()
-    try:
-      assert old_call_started.wait(timeout=1.0)
-      breaker.reset()
-    finally:
-      release_old_call.set()
-      thread.join(timeout=1.0)
+        thread = threading.Thread(target=run_old_call)
+        thread.start()
+        try:
+            assert old_call_started.wait(timeout=1.0)
+            breaker.reset()
+        finally:
+            release_old_call.set()
+            thread.join(timeout=1.0)
 
-    assert not thread.is_alive()
-    assert len(old_errors) == 1
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
-    assert breaker.last_failure_time is None
+        assert not thread.is_alive()
+        assert len(old_errors) == 1
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
+        assert breaker.last_failure_time is None
 
-  def test_stale_non_counted_probe_cannot_release_new_probe_slot(self):
-    breaker = CircuitBreaker(
-      "q",
-      failure_threshold=1,
-      reset_timeout=0.0,
-      failure_exceptions=(RuntimeError,),
-    )
-    old_probe_started = threading.Event()
-    release_old_probe = threading.Event()
-    new_probe_started = threading.Event()
-    release_new_probe = threading.Event()
-    old_errors: list[ValueError] = []
+    def test_stale_non_counted_probe_cannot_release_new_probe_slot(self):
+        breaker = CircuitBreaker(
+            "q",
+            failure_threshold=1,
+            reset_timeout=0.0,
+            failure_exceptions=(RuntimeError,),
+        )
+        old_probe_started = threading.Event()
+        release_old_probe = threading.Event()
+        new_probe_started = threading.Event()
+        release_new_probe = threading.Event()
+        old_errors: list[ValueError] = []
 
-    with pytest.raises(RuntimeError):
-      breaker.call(_boom)
+        with pytest.raises(RuntimeError):
+            breaker.call(_boom)
 
-    def old_probe() -> None:
-      old_probe_started.set()
-      release_old_probe.wait(timeout=2.0)
-      raise ValueError("non-counted old probe")
+        def old_probe() -> None:
+            old_probe_started.set()
+            release_old_probe.wait(timeout=2.0)
+            raise ValueError("non-counted old probe")
 
-    def run_old_probe() -> None:
-      try:
-        breaker.call(old_probe)
-      except ValueError as exc:
-        old_errors.append(exc)
+        def run_old_probe() -> None:
+            try:
+                breaker.call(old_probe)
+            except ValueError as exc:
+                old_errors.append(exc)
 
-    old_thread = threading.Thread(target=run_old_probe)
-    old_thread.start()
-    assert old_probe_started.wait(timeout=1.0)
+        old_thread = threading.Thread(target=run_old_probe)
+        old_thread.start()
+        assert old_probe_started.wait(timeout=1.0)
 
-    # Fence the old HALF_OPEN probe, then create a different HALF_OPEN epoch
-    # with its own in-flight probe.
-    breaker.reset()
-    with pytest.raises(RuntimeError):
-      breaker.call(_boom)
+        # Fence the old HALF_OPEN probe, then create a different HALF_OPEN epoch
+        # with its own in-flight probe.
+        breaker.reset()
+        with pytest.raises(RuntimeError):
+            breaker.call(_boom)
 
-    def new_probe() -> str:
-      new_probe_started.set()
-      release_new_probe.wait(timeout=2.0)
-      return "recovered"
+        def new_probe() -> str:
+            new_probe_started.set()
+            release_new_probe.wait(timeout=2.0)
+            return "recovered"
 
-    new_results: list[str] = []
-    new_thread = threading.Thread(
-      target=lambda: new_results.append(breaker.call(new_probe))
-    )
-    new_thread.start()
-    try:
-      assert new_probe_started.wait(timeout=1.0)
-      release_old_probe.set()
-      old_thread.join(timeout=1.0)
-      assert not old_thread.is_alive()
+        new_results: list[str] = []
+        new_thread = threading.Thread(
+            target=lambda: new_results.append(breaker.call(new_probe))
+        )
+        new_thread.start()
+        try:
+            assert new_probe_started.wait(timeout=1.0)
+            release_old_probe.set()
+            old_thread.join(timeout=1.0)
+            assert not old_thread.is_alive()
 
-      # The old ValueError must not clear the current epoch's probe slot.
-      with pytest.raises(CircuitBreakerOpenError):
-        breaker.call(_ok)
-    finally:
-      release_old_probe.set()
-      release_new_probe.set()
-      old_thread.join(timeout=1.0)
-      new_thread.join(timeout=1.0)
+            # The old ValueError must not clear the current epoch's probe slot.
+            with pytest.raises(CircuitBreakerOpenError):
+                breaker.call(_ok)
+        finally:
+            release_old_probe.set()
+            release_new_probe.set()
+            old_thread.join(timeout=1.0)
+            new_thread.join(timeout=1.0)
 
-    assert old_errors and new_results == ["recovered"]
-    assert breaker.state is BreakerState.CLOSED
+        assert old_errors and new_results == ["recovered"]
+        assert breaker.state is BreakerState.CLOSED
 
 
 # ---------------------------------------------------------------------------
@@ -469,15 +469,15 @@ class TestStaleFailureRace:
 
 
 class TestReset:
-  def test_reset_returns_to_closed_and_clears_count(self):
-    b = CircuitBreaker("q", failure_threshold=1)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
-    b.reset()
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 0
-    assert b.last_failure_time is None
+    def test_reset_returns_to_closed_and_clears_count(self):
+        b = CircuitBreaker("q", failure_threshold=1)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
+        b.reset()
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 0
+        assert b.last_failure_time is None
 
 
 # ---------------------------------------------------------------------------
@@ -486,93 +486,95 @@ class TestReset:
 
 
 class TestSignalPassthrough:
-  def test_keyboard_interrupt_does_not_trip(self):
-    b = CircuitBreaker("q", failure_threshold=1)
+    def test_keyboard_interrupt_does_not_trip(self):
+        b = CircuitBreaker("q", failure_threshold=1)
 
-    def raises_ki(*_args, **_kwargs):
-      raise KeyboardInterrupt()
+        def raises_ki(*_args, **_kwargs):
+            raise KeyboardInterrupt()
 
-    with pytest.raises(KeyboardInterrupt):
-      b.call(raises_ki)
-    # Breaker must remain CLOSED — Ctrl-C is not a backend failure.
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 0
+        with pytest.raises(KeyboardInterrupt):
+            b.call(raises_ki)
+        # Breaker must remain CLOSED — Ctrl-C is not a backend failure.
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 0
 
-  def test_signal_during_half_open_probe_does_not_wedge(self):
-    # Regression: a Ctrl-C / SystemExit arriving during a HALF_OPEN probe used
-    # to re-raise without releasing _probe_in_flight. Since the breaker sits in
-    # HALF_OPEN (not OPEN), no cool-down timer ever releases the slot — every
-    # subsequent call was rejected as OPEN permanently (until process restart).
-    clock = FakeClock()
-    b = CircuitBreaker("q", failure_threshold=1, reset_timeout=30.0, time_fn=clock)
-    with pytest.raises(RuntimeError):
-      b.call(_boom)
-    assert b.state is BreakerState.OPEN
+    def test_signal_during_half_open_probe_does_not_wedge(self):
+        # Regression: a Ctrl-C / SystemExit arriving during a HALF_OPEN probe used
+        # to re-raise without releasing _probe_in_flight. Since the breaker sits in
+        # HALF_OPEN (not OPEN), no cool-down timer ever releases the slot — every
+        # subsequent call was rejected as OPEN permanently (until process restart).
+        clock = FakeClock()
+        b = CircuitBreaker("q", failure_threshold=1, reset_timeout=30.0, time_fn=clock)
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        assert b.state is BreakerState.OPEN
 
-    clock.advance(30.0)  # cool-down elapses -> next call claims the probe slot
-    def raises_ki(*_args, **_kwargs):
-      raise KeyboardInterrupt()
-    with pytest.raises(KeyboardInterrupt):
-      b.call(raises_ki)
-    # Ctrl-C is not a failure -> state stays HALF_OPEN, but the probe slot
-    # MUST be released so the next call can retry.
-    assert b.state is BreakerState.HALF_OPEN
-    # Pre-fix this raised CircuitBreakerOpenError forever. With the fix the
-    # next call retries the probe and succeeds -> CLOSED.
-    assert b.call(_ok) == "ok"
-    assert b.state is BreakerState.CLOSED
+        clock.advance(30.0)  # cool-down elapses -> next call claims the probe slot
 
-  def test_system_exit_does_not_trip(self):
-    b = CircuitBreaker("q", failure_threshold=1)
+        def raises_ki(*_args, **_kwargs):
+            raise KeyboardInterrupt()
 
-    def raises_se(*_args, **_kwargs):
-      raise SystemExit(0)
+        with pytest.raises(KeyboardInterrupt):
+            b.call(raises_ki)
+        # Ctrl-C is not a failure -> state stays HALF_OPEN, but the probe slot
+        # MUST be released so the next call can retry.
+        assert b.state is BreakerState.HALF_OPEN
+        # Pre-fix this raised CircuitBreakerOpenError forever. With the fix the
+        # next call retries the probe and succeeds -> CLOSED.
+        assert b.call(_ok) == "ok"
+        assert b.state is BreakerState.CLOSED
 
-    with pytest.raises(SystemExit):
-      b.call(raises_se)
-    assert b.state is BreakerState.CLOSED
+    def test_system_exit_does_not_trip(self):
+        b = CircuitBreaker("q", failure_threshold=1)
+
+        def raises_se(*_args, **_kwargs):
+            raise SystemExit(0)
+
+        with pytest.raises(SystemExit):
+            b.call(raises_se)
+        assert b.state is BreakerState.CLOSED
 
 
 class TestCountedFailureContract:
-  def test_non_counted_exception_does_not_trip_or_reset_failures(self):
-    from scrapy_extension.exceptions import BackendError, QueueError
+    def test_non_counted_exception_does_not_trip_or_reset_failures(self):
+        from scrapy_extension.exceptions import BackendError, QueueError
 
-    b = CircuitBreaker(
-      "backend",
-      failure_threshold=2,
-      failure_exceptions=(BackendError,),
-    )
-    with pytest.raises(QueueError):
-      b.call(lambda: (_ for _ in ()).throw(QueueError("broker down")))
-    assert b.failure_count == 1
+        b = CircuitBreaker(
+            "backend",
+            failure_threshold=2,
+            failure_exceptions=(BackendError,),
+        )
+        with pytest.raises(QueueError):
+            b.call(lambda: (_ for _ in ()).throw(QueueError("broker down")))
+        assert b.failure_count == 1
 
-    with pytest.raises(ValueError):
-      b.call(lambda: (_ for _ in ()).throw(ValueError("bad key")))
+        with pytest.raises(ValueError):
+            b.call(lambda: (_ for _ in ()).throw(ValueError("bad key")))
 
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 1
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 1
 
-  def test_non_counted_half_open_exception_releases_probe_slot(self):
-    from scrapy_extension.exceptions import BackendError, QueueError
+    def test_non_counted_half_open_exception_releases_probe_slot(self):
+        from scrapy_extension.exceptions import BackendError, QueueError
 
-    clock = FakeClock()
-    b = CircuitBreaker(
-      "backend",
-      failure_threshold=1,
-      reset_timeout=5,
-      time_fn=clock,
-      failure_exceptions=(BackendError,),
-    )
-    with pytest.raises(QueueError):
-      b.call(lambda: (_ for _ in ()).throw(QueueError("broker down")))
-    clock.advance(5)
+        clock = FakeClock()
+        b = CircuitBreaker(
+            "backend",
+            failure_threshold=1,
+            reset_timeout=5,
+            time_fn=clock,
+            failure_exceptions=(BackendError,),
+        )
+        with pytest.raises(QueueError):
+            b.call(lambda: (_ for _ in ()).throw(QueueError("broker down")))
+        clock.advance(5)
 
-    with pytest.raises(ValueError):
-      b.call(lambda: (_ for _ in ()).throw(ValueError("bad key")))
+        with pytest.raises(ValueError):
+            b.call(lambda: (_ for _ in ()).throw(ValueError("bad key")))
 
-    assert b.state is BreakerState.HALF_OPEN
-    assert b.call(_ok) == "ok"
-    assert b.state is BreakerState.CLOSED
+        assert b.state is BreakerState.HALF_OPEN
+        assert b.call(_ok) == "ok"
+        assert b.state is BreakerState.CLOSED
 
 
 # ---------------------------------------------------------------------------
@@ -581,54 +583,54 @@ class TestCountedFailureContract:
 
 
 class TestThreadSafety:
-  def test_concurrent_failures_trip_exactly_once(self):
-    """N threads racing to call a failing op must land in OPEN, not crash.
+    def test_concurrent_failures_trip_exactly_once(self):
+        """N threads racing to call a failing op must land in OPEN, not crash.
 
-    The breaker lock must serialize the failure-recording critical section so
-    the count never goes negative or races past threshold into an inconsistent
-    state.
-    """
-    b = CircuitBreaker("q", failure_threshold=10)
-    barrier = threading.Barrier(20)
-    errors: list[BaseException] = []
+        The breaker lock must serialize the failure-recording critical section so
+        the count never goes negative or races past threshold into an inconsistent
+        state.
+        """
+        b = CircuitBreaker("q", failure_threshold=10)
+        barrier = threading.Barrier(20)
+        errors: list[BaseException] = []
 
-    def worker():
-      barrier.wait()
-      for _ in range(50):
-        try:
-          b.call(_boom)
-        except BaseException as exc:  # noqa: BLE001 — collect for assertion
-          errors.append(exc)
+        def worker():
+            barrier.wait()
+            for _ in range(50):
+                try:
+                    b.call(_boom)
+                except BaseException as exc:  # noqa: BLE001 — collect for assertion
+                    errors.append(exc)
 
-    threads = [threading.Thread(target=worker) for _ in range(20)]
-    for t in threads:
-      t.start()
-    for t in threads:
-      t.join()
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    assert b.state is BreakerState.OPEN
-    # No unexpected exception types leaked (only RuntimeError + our open error).
-    assert all(
-      isinstance(e, (RuntimeError, CircuitBreakerOpenError)) for e in errors
-    )
+        assert b.state is BreakerState.OPEN
+        # No unexpected exception types leaked (only RuntimeError + our open error).
+        assert all(
+            isinstance(e, (RuntimeError, CircuitBreakerOpenError)) for e in errors
+        )
 
-  def test_concurrent_success_path_is_safe(self):
-    b = CircuitBreaker("q", failure_threshold=5)
-    barrier = threading.Barrier(10)
+    def test_concurrent_success_path_is_safe(self):
+        b = CircuitBreaker("q", failure_threshold=5)
+        barrier = threading.Barrier(10)
 
-    def worker():
-      barrier.wait()
-      for _ in range(100):
-        b.call(_ok)
+        def worker():
+            barrier.wait()
+            for _ in range(100):
+                b.call(_ok)
 
-    threads = [threading.Thread(target=worker) for _ in range(10)]
-    for t in threads:
-      t.start()
-    for t in threads:
-      t.join()
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    assert b.state is BreakerState.CLOSED
-    assert b.failure_count == 0
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -637,426 +639,427 @@ class TestThreadSafety:
 
 
 class _FakeQueueBackend(QueueBackend):
-  def __init__(self) -> None:
-    self.pushed: list[tuple[str, bytes, float]] = []
-    self.clear_calls = 0
-    self.ack_calls = 0
+    def __init__(self) -> None:
+        self.pushed: list[tuple[str, bytes, float]] = []
+        self.clear_calls = 0
+        self.ack_calls = 0
 
-  def connect(self) -> None: ...
-  def disconnect(self) -> None: ...
-  def is_connected(self) -> bool:
-    return True
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def is_connected(self) -> bool:
+        return True
 
-  def ping(self) -> bool:
-    return True
+    def ping(self) -> bool:
+        return True
 
-  @property
-  def backend_type(self):
-    from scrapy_extension.backends.base import BackendType
+    @property
+    def backend_type(self):
+        from scrapy_extension.backends.base import BackendType
 
-    return BackendType.REDIS
+        return BackendType.REDIS
 
-  def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
-    self.pushed.append((queue_name, item, priority))
+    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+        self.pushed.append((queue_name, item, priority))
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-    return None
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        return None
 
-  def queue_len(self, queue_name: str) -> int:
-    return 0
+    def queue_len(self, queue_name: str) -> int:
+        return 0
 
-  def clear_queue(self, queue_name: str) -> None:
-    self.clear_calls += 1
+    def clear_queue(self, queue_name: str) -> None:
+        self.clear_calls += 1
 
-  def ack(self, queue_name: str) -> None:
-    self.ack_calls += 1
+    def ack(self, queue_name: str) -> None:
+        self.ack_calls += 1
 
 
 class _FakeMQBackend(_FakeQueueBackend):
-  """MQ-style queue backend that overrides ``pop_with_ack`` (per-message token).
+    """MQ-style queue backend that overrides ``pop_with_ack`` (per-message token).
 
-  Distinct return values on ``pop()`` vs ``pop_with_ack()`` let tests
-  discriminate which dispatch path ``BackendQueue._pop_with_ack`` took.
-  """
+    Distinct return values on ``pop()`` vs ``pop_with_ack()`` let tests
+    discriminate which dispatch path ``BackendQueue._pop_with_ack`` took.
+    """
 
-  def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-    return b"POP-PATH"
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        return b"POP-PATH"
 
-  def pop_with_ack(
-    self, queue_name: str, timeout: float = 0.0
-  ) -> tuple[bytes | None, Any | None]:
-    return (b"ACK-PATH", "REAL-TOKEN")
+    def pop_with_ack(
+        self, queue_name: str, timeout: float = 0.0
+    ) -> tuple[bytes | None, Any | None]:
+        return (b"ACK-PATH", "REAL-TOKEN")
 
 
 class _FakeDurableSingleSlotBackend(_FakeQueueBackend):
-  requires_ack = True
-  supports_concurrent_ack = False
-  _push_is_durable = True
+    requires_ack = True
+    supports_concurrent_ack = False
+    _push_is_durable = True
 
 
 class _FakeSetBackend(SetBackend):
-  def __init__(self) -> None:
-    self.added: list[bytes] = []
+    def __init__(self) -> None:
+        self.added: list[bytes] = []
 
-  def add(self, set_name: str, item: bytes) -> bool:
-    self.added.append(item)
-    return True
+    def add(self, set_name: str, item: bytes) -> bool:
+        self.added.append(item)
+        return True
 
-  def remove(self, set_name: str, item: bytes) -> bool:
-    return False
+    def remove(self, set_name: str, item: bytes) -> bool:
+        return False
 
-  def contains(self, set_name: str, item: bytes) -> bool:
-    return False
+    def contains(self, set_name: str, item: bytes) -> bool:
+        return False
 
-  def set_len(self, set_name: str) -> int:
-    return 0
+    def set_len(self, set_name: str) -> int:
+        return 0
 
-  def clear_set(self, set_name: str) -> None: ...
+    def clear_set(self, set_name: str) -> None: ...
 
-  def connect(self) -> None: ...
-  def disconnect(self) -> None: ...
-  def is_connected(self) -> bool:
-    return True
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def is_connected(self) -> bool:
+        return True
 
-  def ping(self) -> bool:
-    return True
+    def ping(self) -> bool:
+        return True
 
-  @property
-  def backend_type(self):
-    from scrapy_extension.backends.base import BackendType
+    @property
+    def backend_type(self):
+        from scrapy_extension.backends.base import BackendType
 
-    return BackendType.REDIS
+        return BackendType.REDIS
 
 
 class _FakeStorageBackend(StorageBackend):
-  def __init__(self) -> None:
-    self.stored: list[tuple[str, bytes]] = []
+    def __init__(self) -> None:
+        self.stored: list[tuple[str, bytes]] = []
 
-  def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-    self.stored.append((key, data))
+    def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
+        self.stored.append((key, data))
 
-  def retrieve(self, key: str) -> bytes | None:
-    return None
+    def retrieve(self, key: str) -> bytes | None:
+        return None
 
-  def delete(self, key: str) -> bool:
-    return False
+    def delete(self, key: str) -> bool:
+        return False
 
-  def exists(self, key: str) -> bool:
-    return False
+    def exists(self, key: str) -> bool:
+        return False
 
-  def ttl(self, key: str) -> int | None:
-    return None
+    def ttl(self, key: str) -> int | None:
+        return None
 
-  def clear_storage(self, prefix: str | None = None) -> None: ...
+    def clear_storage(self, prefix: str | None = None) -> None: ...
 
-  def connect(self) -> None: ...
-  def disconnect(self) -> None: ...
-  def is_connected(self) -> bool:
-    return True
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def is_connected(self) -> bool:
+        return True
 
-  def ping(self) -> bool:
-    return True
+    def ping(self) -> bool:
+        return True
 
-  @property
-  def backend_type(self):
-    from scrapy_extension.backends.base import BackendType
+    @property
+    def backend_type(self):
+        from scrapy_extension.backends.base import BackendType
 
-    return BackendType.REDIS
+        return BackendType.REDIS
 
 
 class TestQueueBackendProxy:
-  def test_isinstance_preserved(self):
-    b = CircuitBreaker("q", failure_threshold=2)
-    wrapped = wrap_queue_backend(_FakeQueueBackend(), b)
-    assert isinstance(wrapped, QueueBackend)
+    def test_isinstance_preserved(self):
+        b = CircuitBreaker("q", failure_threshold=2)
+        wrapped = wrap_queue_backend(_FakeQueueBackend(), b)
+        assert isinstance(wrapped, QueueBackend)
 
-  def test_hot_path_wrapped_and_open_rejects(self):
-    # The proxy snapshots hot-path bound methods at construction; build the
-    # proxy around an already-failing backend so the wrapped push trips it.
-    backend = _FakeQueueBackend()
-    backend.push = _boom  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    wrapped = wrap_queue_backend(backend, breaker)
+    def test_hot_path_wrapped_and_open_rejects(self):
+        # The proxy snapshots hot-path bound methods at construction; build the
+        # proxy around an already-failing backend so the wrapped push trips it.
+        backend = _FakeQueueBackend()
+        backend.push = _boom  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    with pytest.raises(RuntimeError):
-      wrapped.push("q", b"x")
-    assert breaker.state is BreakerState.OPEN
+        with pytest.raises(RuntimeError):
+            wrapped.push("q", b"x")
+        assert breaker.state is BreakerState.OPEN
 
-    # The OPEN breaker rejects push WITHOUT calling the backend.
-    call_count = [0]
+        # The OPEN breaker rejects push WITHOUT calling the backend.
+        call_count = [0]
 
-    def would_call(*_a, **_k):
-      call_count[0] += 1
+        def would_call(*_a, **_k):
+            call_count[0] += 1
 
-    backend.push = would_call  # type: ignore[method-assign]
-    # Note: backend.push reassignment does NOT affect the proxy's captured
-    # wrapped method — but in OPEN state the breaker never calls it anyway,
-    # so we assert via the breaker's own rejection.
-    with pytest.raises(CircuitBreakerOpenError):
-      wrapped.push("q", b"x")
-    assert call_count[0] == 0
+        backend.push = would_call  # type: ignore[method-assign]
+        # Note: backend.push reassignment does NOT affect the proxy's captured
+        # wrapped method — but in OPEN state the breaker never calls it anyway,
+        # so we assert via the breaker's own rejection.
+        with pytest.raises(CircuitBreakerOpenError):
+            wrapped.push("q", b"x")
+        assert call_count[0] == 0
 
-  def test_non_hot_path_methods_forwarded_unchanged(self):
-    # Proxy snapshots hot-path at construction; build around a failing pop.
-    backend = _FakeQueueBackend()
-    backend.pop = _boom  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    wrapped = wrap_queue_backend(backend, breaker)
+    def test_non_hot_path_methods_forwarded_unchanged(self):
+        # Proxy snapshots hot-path at construction; build around a failing pop.
+        backend = _FakeQueueBackend()
+        backend.pop = _boom  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    # Trip the breaker via pop.
-    with pytest.raises(RuntimeError):
-      wrapped.pop("q")
-    assert breaker.state is BreakerState.OPEN
+        # Trip the breaker via pop.
+        with pytest.raises(RuntimeError):
+            wrapped.pop("q")
+        assert breaker.state is BreakerState.OPEN
 
-    # Non-network admin methods must still work — they are NOT blocked by the
-    # breaker (clear_queue is administrative; is_connected is a health probe).
-    wrapped.clear_queue("q")
-    assert backend.clear_calls == 1
-    assert breaker.state is BreakerState.OPEN
-    # is_connected forwards to the wrapped backend.
-    assert wrapped.is_connected() is True
+        # Non-network admin methods must still work — they are NOT blocked by the
+        # breaker (clear_queue is administrative; is_connected is a health probe).
+        wrapped.clear_queue("q")
+        assert backend.clear_calls == 1
+        assert breaker.state is BreakerState.OPEN
+        # is_connected forwards to the wrapped backend.
+        assert wrapped.is_connected() is True
 
-  def test_admin_runtime_error_stays_raw_without_affecting_breaker(self):
-    """Unknown plugin exceptions remain a raw non-counting admin contract."""
-    backend = _FakeQueueBackend()
-    expected_error = RuntimeError("plugin queue-length failure")
+    def test_admin_runtime_error_stays_raw_without_affecting_breaker(self):
+        """Unknown plugin exceptions remain a raw non-counting admin contract."""
+        backend = _FakeQueueBackend()
+        expected_error = RuntimeError("plugin queue-length failure")
 
-    def _queue_len_fails(*_args: Any, **_kwargs: Any) -> int:
-      raise expected_error
+        def _queue_len_fails(*_args: Any, **_kwargs: Any) -> int:
+            raise expected_error
 
-    backend.queue_len = _queue_len_fails  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    wrapped = wrap_queue_backend(backend, breaker)
+        backend.queue_len = _queue_len_fails  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    with pytest.raises(RuntimeError) as exc_info:
-      wrapped.queue_len("q")
+        with pytest.raises(RuntimeError) as exc_info:
+            wrapped.queue_len("q")
 
-    assert exc_info.value is expected_error
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
+        assert exc_info.value is expected_error
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
 
-  def test_lifecycle_runtime_error_stays_raw_forward(self):
-    """Only I/O admin forwards are protected; lifecycle methods stay raw."""
-    backend = _FakeQueueBackend()
-    expected_error = RuntimeError("plugin connect failure")
+    def test_lifecycle_runtime_error_stays_raw_forward(self):
+        """Only I/O admin forwards are protected; lifecycle methods stay raw."""
+        backend = _FakeQueueBackend()
+        expected_error = RuntimeError("plugin connect failure")
 
-    def _connect_fails() -> None:
-      raise expected_error
+        def _connect_fails() -> None:
+            raise expected_error
 
-    backend.connect = _connect_fails  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    wrapped = wrap_queue_backend(backend, breaker)
+        backend.connect = _connect_fails  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    with pytest.raises(RuntimeError) as exc_info:
-      wrapped.connect()
+        with pytest.raises(RuntimeError) as exc_info:
+            wrapped.connect()
 
-    assert exc_info.value is expected_error
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
+        assert exc_info.value is expected_error
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
 
-  def test_ack_failure_trips_breaker_and_fail_fast_when_open(self):
-    """R34-C: ack() is a real network op on the 5 MQ backends (kafka
-    ``consumer.commit``, rabbitmq ``basic_ack``, sqs ``delete_message``,
-    rocketmq/pulsar ack all raise ``QueueError`` — a ``BackendError``). Pre-fix
-    ack/nack were in ``_FORWARDED``, so:
+    def test_ack_failure_trips_breaker_and_fail_fast_when_open(self):
+        """R34-C: ack() is a real network op on the 5 MQ backends (kafka
+        ``consumer.commit``, rabbitmq ``basic_ack``, sqs ``delete_message``,
+        rocketmq/pulsar ack all raise ``QueueError`` — a ``BackendError``). Pre-fix
+        ack/nack were in ``_FORWARDED``, so:
 
-    (a) ack-path-only broker degradation (e.g. Kafka group-coordinator /
-        ``__consumer_offsets`` broker partitioned while partition leaders keep
-        serving push/pop_with_ack) raised QueueError that NEVER reached
-        ``breaker.call`` → ``_failure_count`` never incremented → the breaker
-        never tripped → zero operator signal; and
-    (b) once OPEN via a later push/pop, forwarded ack() STILL hit the dead
-        broker and blocked on the commit timeout (librdmka ~60s) instead of
-        failing fast — tying up CONCURRENT_REQUESTS workers.
+        (a) ack-path-only broker degradation (e.g. Kafka group-coordinator /
+            ``__consumer_offsets`` broker partitioned while partition leaders keep
+            serving push/pop_with_ack) raised QueueError that NEVER reached
+            ``breaker.call`` → ``_failure_count`` never incremented → the breaker
+            never tripped → zero operator signal; and
+        (b) once OPEN via a later push/pop, forwarded ack() STILL hit the dead
+            broker and blocked on the commit timeout (librdmka ~60s) instead of
+            failing fast — tying up CONCURRENT_REQUESTS workers.
 
-    The 2026-07-10 fix already wrapped ``pop_with_ack`` for the identical
-    rationale ("a broker degradation on the MQ ack-pop path trips the
-    breaker"); R34-C extends that to ack/nack themselves. Atomic-pop backends
-    (Redis/MongoDB/ES) inherit the ABC no-op ack → wrapping is a no-op for
-    their breaker state. ``CircuitBreakerOpenError`` subclasses ``BackendError``,
-    so the scheduler's existing ``(QueueError, BackendError)`` ack-error
-    handling covers the fail-fast path unchanged.
-    """
-    from scrapy_extension.exceptions import QueueError
+        The 2026-07-10 fix already wrapped ``pop_with_ack`` for the identical
+        rationale ("a broker degradation on the MQ ack-pop path trips the
+        breaker"); R34-C extends that to ack/nack themselves. Atomic-pop backends
+        (Redis/MongoDB/ES) inherit the ABC no-op ack → wrapping is a no-op for
+        their breaker state. ``CircuitBreakerOpenError`` subclasses ``BackendError``,
+        so the scheduler's existing ``(QueueError, BackendError)`` ack-error
+        handling covers the fail-fast path unchanged.
+        """
+        from scrapy_extension.exceptions import QueueError
 
-    def _ack_fails(*_args: Any, **_kwargs: Any) -> None:
-      raise QueueError("broker commit failed")
+        def _ack_fails(*_args: Any, **_kwargs: Any) -> None:
+            raise QueueError("broker commit failed")
 
-    backend = _FakeQueueBackend()
-    backend.ack = _ack_fails  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    wrapped = wrap_queue_backend(backend, breaker)
+        backend = _FakeQueueBackend()
+        backend.ack = _ack_fails  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    # (a) ack failure now trips the breaker.
-    #     Pre-fix: forwarded → QueueError propagated but breaker stayed CLOSED.
-    with pytest.raises(QueueError):
-      wrapped.ack("q")
-    assert breaker.state is BreakerState.OPEN
+        # (a) ack failure now trips the breaker.
+        #     Pre-fix: forwarded → QueueError propagated but breaker stayed CLOSED.
+        with pytest.raises(QueueError):
+            wrapped.ack("q")
+        assert breaker.state is BreakerState.OPEN
 
-    # (b) once OPEN, ack fails fast with CircuitBreakerOpenError instead of
-    #     re-hitting the dead broker. Pre-fix: forwarded → QueueError again.
-    with pytest.raises(CircuitBreakerOpenError):
-      wrapped.ack("q")
+        # (b) once OPEN, ack fails fast with CircuitBreakerOpenError instead of
+        #     re-hitting the dead broker. Pre-fix: forwarded → QueueError again.
+        with pytest.raises(CircuitBreakerOpenError):
+            wrapped.ack("q")
 
-  def test_success_path_delegates(self):
-    backend = _FakeQueueBackend()
-    breaker = CircuitBreaker("q", failure_threshold=3)
-    wrapped = wrap_queue_backend(backend, breaker)
-    wrapped.push("q1", b"a", 5.0)
-    assert backend.pushed == [("q1", b"a", 5.0)]
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
+    def test_success_path_delegates(self):
+        backend = _FakeQueueBackend()
+        breaker = CircuitBreaker("q", failure_threshold=3)
+        wrapped = wrap_queue_backend(backend, breaker)
+        wrapped.push("q1", b"a", 5.0)
+        assert backend.pushed == [("q1", b"a", 5.0)]
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
 
-  def test_semantic_capabilities_and_durable_push_follow_raw_backend(self):
-    backend = _FakeDurableSingleSlotBackend()
-    breaker = CircuitBreaker("q", failure_threshold=3)
-    wrapped = wrap_queue_backend(backend, breaker)
+    def test_semantic_capabilities_and_durable_push_follow_raw_backend(self):
+        backend = _FakeDurableSingleSlotBackend()
+        breaker = CircuitBreaker("q", failure_threshold=3)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    assert wrapped.requires_ack is True
-    assert wrapped.supports_concurrent_ack is False
-    assert (
-      wrapped._push_with_durability(
-        "q1",
-        b"a",
-        2.0,
-        require_durable=True,
-      ).worker_crash_durable
-      is True
-    )
-    assert backend.pushed == [("q1", b"a", 2.0)]
-    assert breaker.failure_count == 0
+        assert wrapped.requires_ack is True
+        assert wrapped.supports_concurrent_ack is False
+        assert (
+            wrapped._push_with_durability(
+                "q1",
+                b"a",
+                2.0,
+                require_durable=True,
+            ).worker_crash_durable
+            is True
+        )
+        assert backend.pushed == [("q1", b"a", 2.0)]
+        assert breaker.failure_count == 0
 
-  def test_pop_with_ack_success_dispatches_to_override_and_preserves_token(self):
-    """GREEN-side companion to the failure test: a SUCCESSFUL pop_with_ack
-    through the proxy must dispatch to the backend override AND return its
-    per-message token (not the ABC default's (pop(), None)). Locks in that
-    wrapping does not silently downgrade MQ ack semantics on the happy path.
-    """
-    backend = _FakeMQBackend()
-    breaker = CircuitBreaker("q", failure_threshold=3)
-    wrapped = wrap_queue_backend(backend, breaker)
-    data, token = wrapped.pop_with_ack("q", 0.0)
-    assert data == b"ACK-PATH"
-    assert token == "REAL-TOKEN"
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
+    def test_pop_with_ack_success_dispatches_to_override_and_preserves_token(self):
+        """GREEN-side companion to the failure test: a SUCCESSFUL pop_with_ack
+        through the proxy must dispatch to the backend override AND return its
+        per-message token (not the ABC default's (pop(), None)). Locks in that
+        wrapping does not silently downgrade MQ ack semantics on the happy path.
+        """
+        backend = _FakeMQBackend()
+        breaker = CircuitBreaker("q", failure_threshold=3)
+        wrapped = wrap_queue_backend(backend, breaker)
+        data, token = wrapped.pop_with_ack("q", 0.0)
+        assert data == b"ACK-PATH"
+        assert token == "REAL-TOKEN"
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
 
-  def test_backend_queue_pop_with_ack_token_survives_breaker_proxy(self, mocker):
-    """2026-07-11: the PRODUCTION path BackendQueue._pop_with_ack must carry
-    the MQ per-message ack token even when the backend is breaker-wrapped.
+    def test_backend_queue_pop_with_ack_token_survives_breaker_proxy(self, mocker):
+        """2026-07-11: the PRODUCTION path BackendQueue._pop_with_ack must carry
+        the MQ per-message ack token even when the backend is breaker-wrapped.
 
-    The class-level override detection in queue.py (backend.__class__
-    .pop_with_ack is not QueueBackend.pop_with_ack) inspects the PROXY class
-    when the backend is wrapped — the proxy resolves pop_with_ack to the ABC
-    default via MRO, so pre-fix the detection reports no override → backend
-    .pop() → token=None (the reviewer-reproduced hazard under
-    SCRAPY_CIRCUIT_BREAKER_ENABLED). Post-fix the detection unwraps the proxy
-    (._backend) and the token survives end-to-end.
-    """
-    from scrapy_extension.queue.queue import BackendQueue
-    from scrapy_extension.queue.strategies.base import _BoundQueueAckToken
-    from scrapy_extension.queue.strategies.passthrough import (
-      PassthroughQueueStrategy,
-    )
+        The class-level override detection in queue.py (backend.__class__
+        .pop_with_ack is not QueueBackend.pop_with_ack) inspects the PROXY class
+        when the backend is wrapped — the proxy resolves pop_with_ack to the ABC
+        default via MRO, so pre-fix the detection reports no override → backend
+        .pop() → token=None (the reviewer-reproduced hazard under
+        SCRAPY_CIRCUIT_BREAKER_ENABLED). Post-fix the detection unwraps the proxy
+        (._backend) and the token survives end-to-end.
+        """
+        from scrapy_extension.queue.queue import BackendQueue
+        from scrapy_extension.queue.strategies.base import _BoundQueueAckToken
+        from scrapy_extension.queue.strategies.passthrough import (
+            PassthroughQueueStrategy,
+        )
 
-    raw = _FakeMQBackend()
-    breaker = CircuitBreaker("q", failure_threshold=5)
-    wrapped = wrap_queue_backend(raw, breaker)
-    cm = mocker.MagicMock()
-    cm.get_queue_backend.return_value = wrapped
-    storage_mock = mocker.MagicMock()
-    storage_mock.retrieve.return_value = None
-    cm.get_storage_backend.return_value = storage_mock
+        raw = _FakeMQBackend()
+        breaker = CircuitBreaker("q", failure_threshold=5)
+        wrapped = wrap_queue_backend(raw, breaker)
+        cm = mocker.MagicMock()
+        cm.get_queue_backend.return_value = wrapped
+        storage_mock = mocker.MagicMock()
+        storage_mock.retrieve.return_value = None
+        cm.get_storage_backend.return_value = storage_mock
 
-    bq = BackendQueue(
-      connection_manager=cm,
-      queue_name="q",
-      spider=None,
-      queue_strategy=PassthroughQueueStrategy(cm),
-    )
-    data, token = bq._pop_with_ack(0.0)
-    assert data == b"ACK-PATH"
-    assert isinstance(token, _BoundQueueAckToken)
-    assert token.backend is wrapped
-    assert token.queue_name == "q"
-    assert token.token == "REAL-TOKEN"
+        bq = BackendQueue(
+            connection_manager=cm,
+            queue_name="q",
+            spider=None,
+            queue_strategy=PassthroughQueueStrategy(cm),
+        )
+        data, token = bq._pop_with_ack(0.0)
+        assert data == b"ACK-PATH"
+        assert isinstance(token, _BoundQueueAckToken)
+        assert token.backend is wrapped
+        assert token.queue_name == "q"
+        assert token.token == "REAL-TOKEN"
 
+    def test_pop_with_ack_is_hot_path_and_dispatches_to_override(self):
+        """pop_with_ack is MQ traffic — it must be breaker-wrapped AND dispatch to
+        the backend's override (the per-message token path), not the ABC default.
 
-  def test_pop_with_ack_is_hot_path_and_dispatches_to_override(self):
-    """pop_with_ack is MQ traffic — it must be breaker-wrapped AND dispatch to
-    the backend's override (the per-message token path), not the ABC default.
+        Pre-fix: ``pop_with_ack`` is in neither ``_HOT_PATH`` nor ``_FORWARDED``,
+        so ``wrapped.pop_with_ack`` resolves via normal class lookup to the
+        ``QueueBackend`` ABC default ``(self.pop(), None)``. The MQ backend's
+        override is shadowed (token silently None under breaker+MQ) AND a
+        ``pop_with_ack`` failure never reaches the breaker → RED on both counts.
+        Post-fix: ``pop_with_ack`` in ``_HOT_PATH`` → the backend override is
+        captured + breaker-wrapped → GREEN.
+        """
+        backend = _FakeQueueBackend()
+        calls: list[tuple] = []
 
-    Pre-fix: ``pop_with_ack`` is in neither ``_HOT_PATH`` nor ``_FORWARDED``,
-    so ``wrapped.pop_with_ack`` resolves via normal class lookup to the
-    ``QueueBackend`` ABC default ``(self.pop(), None)``. The MQ backend's
-    override is shadowed (token silently None under breaker+MQ) AND a
-    ``pop_with_ack`` failure never reaches the breaker → RED on both counts.
-    Post-fix: ``pop_with_ack`` in ``_HOT_PATH`` → the backend override is
-    captured + breaker-wrapped → GREEN.
-    """
-    backend = _FakeQueueBackend()
-    calls: list[tuple] = []
+        def _mq_pop_with_ack(
+            queue_name: str, timeout: float = 0.0
+        ) -> tuple[bytes | None, Any | None]:
+            calls.append((queue_name, timeout))
+            msg = "broker down"
+            raise RuntimeError(msg)
 
-    def _mq_pop_with_ack(queue_name: str, timeout: float = 0.0) -> tuple[bytes | None, Any | None]:
-      calls.append((queue_name, timeout))
-      msg = "broker down"
-      raise RuntimeError(msg)
+        backend.pop_with_ack = _mq_pop_with_ack  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    backend.pop_with_ack = _mq_pop_with_ack  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    wrapped = wrap_queue_backend(backend, breaker)
-
-    with pytest.raises(RuntimeError):
-      wrapped.pop_with_ack("q", 0.0)
-    # The backend override WAS called (not the ABC default that calls self.pop).
-    assert calls == [("q", 0.0)]
-    # And the breaker recorded the failure (pop_with_ack is hot-path).
-    assert breaker.state is BreakerState.OPEN
-    assert breaker.failure_count == 1
+        with pytest.raises(RuntimeError):
+            wrapped.pop_with_ack("q", 0.0)
+        # The backend override WAS called (not the ABC default that calls self.pop).
+        assert calls == [("q", 0.0)]
+        # And the breaker recorded the failure (pop_with_ack is hot-path).
+        assert breaker.state is BreakerState.OPEN
+        assert breaker.failure_count == 1
 
 
 class TestSetBackendProxy:
-  def test_hot_path_wrapped(self):
-    # The proxy snapshots hot-path bound methods at construction; to trip the
-    # breaker through the proxy we build it around an already-failing backend.
-    backend = _FakeSetBackend()
-    backend.add = _boom  # type: ignore[method-assign]
-    breaker = CircuitBreaker("s", failure_threshold=1)
-    wrapped = wrap_set_backend(backend, breaker)
-    assert isinstance(wrapped, SetBackend)
+    def test_hot_path_wrapped(self):
+        # The proxy snapshots hot-path bound methods at construction; to trip the
+        # breaker through the proxy we build it around an already-failing backend.
+        backend = _FakeSetBackend()
+        backend.add = _boom  # type: ignore[method-assign]
+        breaker = CircuitBreaker("s", failure_threshold=1)
+        wrapped = wrap_set_backend(backend, breaker)
+        assert isinstance(wrapped, SetBackend)
 
-    with pytest.raises(RuntimeError):
-      wrapped.add("s", b"x")
-    assert breaker.state is BreakerState.OPEN
-    # non-hot-path forwarded
-    wrapped.clear_set("s")
-    assert breaker.state is BreakerState.OPEN  # clear didn't reset
+        with pytest.raises(RuntimeError):
+            wrapped.add("s", b"x")
+        assert breaker.state is BreakerState.OPEN
+        # non-hot-path forwarded
+        wrapped.clear_set("s")
+        assert breaker.state is BreakerState.OPEN  # clear didn't reset
 
 
 class TestStorageBackendProxy:
-  def test_hot_path_wrapped(self):
-    # Proxy snapshots hot-path at construction; build around failing store.
-    backend = _FakeStorageBackend()
-    backend.store = _boom  # type: ignore[method-assign]
-    breaker = CircuitBreaker("st", failure_threshold=1)
-    wrapped = wrap_storage_backend(backend, breaker)
-    assert isinstance(wrapped, StorageBackend)
+    def test_hot_path_wrapped(self):
+        # Proxy snapshots hot-path at construction; build around failing store.
+        backend = _FakeStorageBackend()
+        backend.store = _boom  # type: ignore[method-assign]
+        breaker = CircuitBreaker("st", failure_threshold=1)
+        wrapped = wrap_storage_backend(backend, breaker)
+        assert isinstance(wrapped, StorageBackend)
 
-    with pytest.raises(RuntimeError):
-      wrapped.store("k", b"v")
-    assert breaker.state is BreakerState.OPEN
-    # exists / clear_storage are NOT hot-path -> forwarded through __getattr__
-    assert wrapped.exists("k") is False
-    wrapped.clear_storage()
-    assert breaker.state is BreakerState.OPEN
+        with pytest.raises(RuntimeError):
+            wrapped.store("k", b"v")
+        assert breaker.state is BreakerState.OPEN
+        # exists / clear_storage are NOT hot-path -> forwarded through __getattr__
+        assert wrapped.exists("k") is False
+        wrapped.clear_storage()
+        assert breaker.state is BreakerState.OPEN
 
-  def test_store_success_delegates(self):
-    backend = _FakeStorageBackend()
-    breaker = CircuitBreaker("st", failure_threshold=2)
-    wrapped = wrap_storage_backend(backend, breaker)
-    wrapped.store("k", b"v", ttl=10)
-    assert backend.stored == [("k", b"v")]
-    assert breaker.failure_count == 0
+    def test_store_success_delegates(self):
+        backend = _FakeStorageBackend()
+        breaker = CircuitBreaker("st", failure_threshold=2)
+        wrapped = wrap_storage_backend(backend, breaker)
+        wrapped.store("k", b"v", ttl=10)
+        assert backend.stored == [("k", b"v")]
+        assert breaker.failure_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1067,33 +1070,33 @@ class TestStorageBackendProxy:
 
 
 class TestQueueLenNotHotPath:
-  def test_queue_len_failures_do_not_trip_the_breaker(self):
-    """queue_len is an observability probe — failures must not trip the breaker.
+    def test_queue_len_failures_do_not_trip_the_breaker(self):
+        """queue_len is an observability probe — failures must not trip the breaker.
 
-    Pre-fix (queue_len in _HOT_PATH): N consecutive queue_len failures trip the
-    breaker → RED. Post-fix (queue_len removed from _HOT_PATH): queue_len uses
-    a non-counting protected forward, so failures never reach the breaker →
-    GREEN.
-    """
-    backend = _FakeQueueBackend()
-    # queue_len always fails; push/pop succeed.
-    backend.queue_len = _boom  # type: ignore[method-assign]
-    breaker = CircuitBreaker("q", failure_threshold=3)
-    wrapped = wrap_queue_backend(backend, breaker)
+        Pre-fix (queue_len in _HOT_PATH): N consecutive queue_len failures trip the
+        breaker → RED. Post-fix (queue_len removed from _HOT_PATH): queue_len uses
+        a non-counting protected forward, so failures never reach the breaker →
+        GREEN.
+        """
+        backend = _FakeQueueBackend()
+        # queue_len always fails; push/pop succeed.
+        backend.queue_len = _boom  # type: ignore[method-assign]
+        breaker = CircuitBreaker("q", failure_threshold=3)
+        wrapped = wrap_queue_backend(backend, breaker)
 
-    # Hammer queue_len well past the failure threshold.
-    for _ in range(10):
-      with pytest.raises(RuntimeError):
-        wrapped.queue_len("q")
+        # Hammer queue_len well past the failure threshold.
+        for _ in range(10):
+            with pytest.raises(RuntimeError):
+                wrapped.queue_len("q")
 
-    # Breaker must remain CLOSED — queue_len is an admin probe, not traffic.
-    assert breaker.state is BreakerState.CLOSED
-    assert breaker.failure_count == 0
+        # Breaker must remain CLOSED — queue_len is an admin probe, not traffic.
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.failure_count == 0
 
-    # And traffic ops (push/pop) still work through the breaker.
-    wrapped.push("q", b"x", 1.0)
-    assert backend.pushed == [("q", b"x", 1.0)]
-    assert breaker.state is BreakerState.CLOSED
+        # And traffic ops (push/pop) still work through the breaker.
+        wrapped.push("q", b"x", 1.0)
+        assert backend.pushed == [("q", b"x", 1.0)]
+        assert breaker.state is BreakerState.CLOSED
 
 
 # ---------------------------------------------------------------------------
@@ -1106,128 +1109,128 @@ class TestQueueLenNotHotPath:
 
 
 class TestHalfOpenSingleProbe:
-  def test_concurrent_probes_issue_exactly_one_func_call(self):
-    """N threads blocked on an OPEN breaker, clock advances past reset_timeout,
-    all released → exactly ONE func() probe call reaches the backend.
+    def test_concurrent_probes_issue_exactly_one_func_call(self):
+        """N threads blocked on an OPEN breaker, clock advances past reset_timeout,
+        all released → exactly ONE func() probe call reaches the backend.
 
-    Pre-fix (lock released between OPEN→HALF_OPEN and func): multiple threads
-    observe HALF_OPEN and call func concurrently → call_count > 1 → RED.
-    Post-fix (probe serialized): exactly one call → GREEN.
-    """
-    clock = FakeClock()
-    breaker = CircuitBreaker(
-      "q", failure_threshold=1, reset_timeout=30.0, time_fn=clock
-    )
-    # Trip the breaker to OPEN.
-    with pytest.raises(RuntimeError):
-      breaker.call(_boom)
-    assert breaker.state is BreakerState.OPEN
+        Pre-fix (lock released between OPEN→HALF_OPEN and func): multiple threads
+        observe HALF_OPEN and call func concurrently → call_count > 1 → RED.
+        Post-fix (probe serialized): exactly one call → GREEN.
+        """
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            "q", failure_threshold=1, reset_timeout=30.0, time_fn=clock
+        )
+        # Trip the breaker to OPEN.
+        with pytest.raises(RuntimeError):
+            breaker.call(_boom)
+        assert breaker.state is BreakerState.OPEN
 
-    call_count = [0]
-    call_lock = threading.Lock()
-    barrier = threading.Barrier(8)
+        call_count = [0]
+        call_lock = threading.Lock()
+        barrier = threading.Barrier(8)
 
-    def probe(*_a, **_k):
-      # The race window is the gap between _allow_call() flipping to
-      # HALF_OPEN and this func body executing. Count callers atomically.
-      with call_lock:
-        call_count[0] += 1
-      # Sleep briefly to widen the race window so other threads can enter
-      # if the lock is dropped prematurely.
-      time.sleep(0.02)
-      return "ok"
+        def probe(*_a, **_k):
+            # The race window is the gap between _allow_call() flipping to
+            # HALF_OPEN and this func body executing. Count callers atomically.
+            with call_lock:
+                call_count[0] += 1
+            # Sleep briefly to widen the race window so other threads can enter
+            # if the lock is dropped prematurely.
+            time.sleep(0.02)
+            return "ok"
 
-    def worker():
-      barrier.wait()
-      try:
-        breaker.call(probe)
-      except CircuitBreakerOpenError:
-        pass  # allowed — some threads may still see OPEN if not chosen as probe
+        def worker():
+            barrier.wait()
+            try:
+                breaker.call(probe)
+            except CircuitBreakerOpenError:
+                pass  # allowed — some threads may still see OPEN if not chosen as probe
 
-    n_threads = 8
-    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        n_threads = 8
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
 
-    # Advance the clock past the reset timeout BEFORE releasing the threads,
-    # so every thread's _allow_call() will observe HALF_OPEN on its first call.
-    clock.advance(30.0)
+        # Advance the clock past the reset timeout BEFORE releasing the threads,
+        # so every thread's _allow_call() will observe HALF_OPEN on its first call.
+        clock.advance(30.0)
 
-    for t in threads:
-      t.start()
-    for t in threads:
-      t.join()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    # The single-probe contract: at most ONE func() call.
-    # (We assert <= 1 rather than == 1 because if the first probe SUCCEEDS the
-    # breaker closes immediately and subsequent threads legitimately proceed —
-    # but those subsequent calls are CLOSED-state traffic calls, not probes,
-    # and with the fix only the first thread reaches func() while in HALF_OPEN.
-    # The race we are fixing is multiple CONCURRENT probes during the
-    # HALF_OPEN window itself. A correct fix makes call_count == 1: the probe
-    # runs under the lock, so the first thread closes the breaker before any
-    # other thread enters func().)
-    assert call_count[0] == 1, (
-      f"expected exactly one probe call, got {call_count[0]} — "
-      "multiple threads observed HALF_OPEN concurrently"
-    )
+        # The single-probe contract: at most ONE func() call.
+        # (We assert <= 1 rather than == 1 because if the first probe SUCCEEDS the
+        # breaker closes immediately and subsequent threads legitimately proceed —
+        # but those subsequent calls are CLOSED-state traffic calls, not probes,
+        # and with the fix only the first thread reaches func() while in HALF_OPEN.
+        # The race we are fixing is multiple CONCURRENT probes during the
+        # HALF_OPEN window itself. A correct fix makes call_count == 1: the probe
+        # runs under the lock, so the first thread closes the breaker before any
+        # other thread enters func().)
+        assert call_count[0] == 1, (
+            f"expected exactly one probe call, got {call_count[0]} — "
+            "multiple threads observed HALF_OPEN concurrently"
+        )
 
 
 class TestBackendProxyBaseConstructionSkips:
-  """Cover the ``hasattr`` skip branches in ``_BackendProxyBase.__init__``
-  (circuit_breaker.py lines 330 + 335) and the ``__getattr__`` forward
-  (line 343).
+    """Cover the ``hasattr`` skip branches in ``_BackendProxyBase.__init__``
+    (circuit_breaker.py lines 330 + 335) and the ``__getattr__`` forward
+    (line 343).
 
-  The ABC-typed proxies (_QueueBackendProxy etc.) instantiate the FULL
-  fake backends in every other test, so the skip branches never fire.
-  Here we subclass _BackendProxyBase directly (no ABC constraint) and wrap
-  a backend missing some declared HOT_PATH / FORWARDED methods.
-  """
+    The ABC-typed proxies (_QueueBackendProxy etc.) instantiate the FULL
+    fake backends in every other test, so the skip branches never fire.
+    Here we subclass _BackendProxyBase directly (no ABC constraint) and wrap
+    a backend missing some declared HOT_PATH / FORWARDED methods.
+    """
 
-  def test_skips_hot_path_and_forwarded_methods_backend_lacks(self) -> None:
-    """A backend that lacks a declared HOT_PATH or FORWARDED method is
-    wrapped without crash — the missing methods are simply not bound as
-    instance attributes (the ``continue`` branches at lines 330 + 335)."""
+    def test_skips_hot_path_and_forwarded_methods_backend_lacks(self) -> None:
+        """A backend that lacks a declared HOT_PATH or FORWARDED method is
+        wrapped without crash — the missing methods are simply not bound as
+        instance attributes (the ``continue`` branches at lines 330 + 335)."""
 
-    class _PartialProxy(_BackendProxyBase):
-      _HOT_PATH = ("push", "pop")
-      _FORWARDED = ("clear_queue", "ack")
+        class _PartialProxy(_BackendProxyBase):
+            _HOT_PATH = ("push", "pop")
+            _FORWARDED = ("clear_queue", "ack")
 
-    class _MinimalBackend:
-      """Has ``push`` + a custom attr, but lacks pop/clear_queue/ack."""
+        class _MinimalBackend:
+            """Has ``push`` + a custom attr, but lacks pop/clear_queue/ack."""
 
-      def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
-        pass
+            def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+                pass
 
-      custom_attr = "backend-value"
+            custom_attr = "backend-value"
 
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    proxy = _PartialProxy(_MinimalBackend(), breaker)
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        proxy = _PartialProxy(_MinimalBackend(), breaker)
 
-    # push (declared HOT_PATH + present) IS bound as an instance attribute.
-    assert "push" in vars(proxy)
-    # pop (declared HOT_PATH but ABSENT on the backend) is NOT bound —
-    # the ``if not hasattr(backend, method_name): continue`` fired.
-    assert "pop" not in vars(proxy)
-    # clear_queue + ack (declared FORWARDED but absent) are NOT bound.
-    assert "clear_queue" not in vars(proxy)
-    assert "ack" not in vars(proxy)
+        # push (declared HOT_PATH + present) IS bound as an instance attribute.
+        assert "push" in vars(proxy)
+        # pop (declared HOT_PATH but ABSENT on the backend) is NOT bound —
+        # the ``if not hasattr(backend, method_name): continue`` fired.
+        assert "pop" not in vars(proxy)
+        # clear_queue + ack (declared FORWARDED but absent) are NOT bound.
+        assert "clear_queue" not in vars(proxy)
+        assert "ack" not in vars(proxy)
 
-  def test_getattr_forwards_non_method_attribute(self) -> None:
-    """``__getattr__`` fires for attributes NOT bound in __init__ and NOT on
-    the class MRO — e.g. a backend-specific custom attribute. It forwards to
-    the wrapped backend (line 343)."""
+    def test_getattr_forwards_non_method_attribute(self) -> None:
+        """``__getattr__`` fires for attributes NOT bound in __init__ and NOT on
+        the class MRO — e.g. a backend-specific custom attribute. It forwards to
+        the wrapped backend (line 343)."""
 
-    class _PlainProxy(_BackendProxyBase):
-      _HOT_PATH = ()
-      _FORWARDED = ()
+        class _PlainProxy(_BackendProxyBase):
+            _HOT_PATH = ()
+            _FORWARDED = ()
 
-    class _BackendWithAttr:
-      custom_attr = "forwarded-value"
+        class _BackendWithAttr:
+            custom_attr = "forwarded-value"
 
-      def connect(self) -> None:
-        pass
+            def connect(self) -> None:
+                pass
 
-    breaker = CircuitBreaker("q", failure_threshold=1)
-    proxy = _PlainProxy(_BackendWithAttr(), breaker)
+        breaker = CircuitBreaker("q", failure_threshold=1)
+        proxy = _PlainProxy(_BackendWithAttr(), breaker)
 
-    # custom_attr is not a method bound in __init__ → __getattr__ forwards it.
-    assert proxy.custom_attr == "forwarded-value"
+        # custom_attr is not a method bound in __init__ → __getattr__ forwards it.
+        assert proxy.custom_attr == "forwarded-value"

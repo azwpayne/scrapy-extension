@@ -1,19 +1,19 @@
 from scrapy_extension.exceptions.base import (
-  BackendConnectionError,
-  BackendError,
-  ConfigurationError,
-  QueueError,
-  SerializationError,
-  StorageBackpressureError,
-  StorageError,
+    BackendConnectionError,
+    BackendError,
+    ConfigurationError,
+    QueueError,
+    SerializationError,
+    StorageBackpressureError,
+    StorageError,
 )
 
 __all__ = [
-  "BackendConnectionError",
-  "BackendError",
-  "ConfigurationError",
-  "QueueError",
-  "SerializationError",
-  "StorageBackpressureError",
-  "StorageError",
+    "BackendConnectionError",
+    "BackendError",
+    "ConfigurationError",
+    "QueueError",
+    "SerializationError",
+    "StorageBackpressureError",
+    "StorageError",
 ]

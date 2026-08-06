@@ -314,8 +314,37 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Local environment, credentials, and certificate material.
+# Keep shareable templates and files under examples trackable.
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+# Do not broadly exempt examples: an accidentally copied real certificate is
+# still a secret. Name a fixture as ``*.example``/``*.sample``/``*.template``
+# if it must be tracked.
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+!*.pem.example
+!*.key.example
+!*.crt.example
+!*.cer.example
+!*.p12.example
+!*.pfx.example
+!*.jks.example
+!*.keystore.example
+/secrets/
+/credentials/
+/.secrets/
+
+# Environments
 env/
 venv/
 ENV/
@@ -361,4 +390,3 @@ agentdb.rvf.lock
 ruvector.db
 *.rvf
 *.rvf.lock
-
