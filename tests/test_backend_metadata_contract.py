@@ -99,3 +99,19 @@ def test_bundled_registry_metadata_matches_lazy_exports_and_extras() -> None:
 
         assert backend_type in project_extras
         assert project_extras[backend_type]
+
+    # R56: both lazy __getattr__ install-hint dep-module tables must cover every
+    # bundled backend module path and stay byte-identical (single source of
+    # truth). Catches drift the moment a future backend is added to one table
+    # but not the other, or a dep frozenset desyncs between the two import
+    # surfaces (_BACKEND_DEP_MODULES vs _OPTIONAL_DEP_MODULES).
+    bundled_backend_module_paths = {
+        _split_dotted_path(descriptor.backend_cls_path)[0]
+        for descriptor in _BUNDLED_DESCRIPTORS.values()
+    }
+    assert set(public_backends._BACKEND_DEP_MODULES) == bundled_backend_module_paths
+    assert set(scrapy_extension._OPTIONAL_DEP_MODULES) == bundled_backend_module_paths
+    assert (
+        public_backends._BACKEND_DEP_MODULES
+        == scrapy_extension._OPTIONAL_DEP_MODULES
+    )
