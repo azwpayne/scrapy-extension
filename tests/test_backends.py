@@ -193,6 +193,23 @@ class TestJSONSerializer:
         }
         assert serializer.deserialize(serializer.serialize(shaped)) == shaped
 
+    def test_unhashable_tag_in_marker_shaped_dict_round_trips(self):
+        """R57: a caller-owned dict shaped like a wire marker but whose tag value
+        is UNHASHABLE (list/dict) must round-trip unchanged. The encode-side
+        ``_looks_like_codec_marker`` check must not crash on an unhashable tag --
+        decode uses ``==`` (robust), but encode used set membership (``in {...}``)
+        which hashed the tag and raised ``TypeError``.
+        """
+        serializer = JSONSerializer()
+        for unhashable_tag in (["listval"], {"nested": 1}):
+            shaped = {
+                "outer": {
+                    "__scrapy_extension_json_type__": unhashable_tag,
+                    "data": "y",
+                }
+            }
+            assert serializer.deserialize(serializer.serialize(shaped)) == shaped
+
     def test_valid_legacy_marker_shaped_user_dict_round_trips_as_dict(self):
         """A caller-owned dict must not be confused with the bytes wire tag."""
         serializer = JSONSerializer()

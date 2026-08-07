@@ -148,7 +148,11 @@ def _looks_like_codec_marker(obj: dict[object, object]) -> bool:
     return (
         len(obj) == 2
         and obj.get(_CODEC_TAG)
-        in {_CODEC_BYTES, _CODEC_DICT, _CODEC_DATETIME, _CODEC_DATE}
+        # R57: tuple (not set) membership so an UNHASHABLE tag value (list/dict)
+        # returns False instead of raising TypeError -- mirrors the decode-side
+        # ``== _CODEC_*`` checks and restores encode/decode symmetry for the
+        # escape contract.
+        in (_CODEC_BYTES, _CODEC_DICT, _CODEC_DATETIME, _CODEC_DATE)
         and _CODEC_DATA in obj
     )
 
