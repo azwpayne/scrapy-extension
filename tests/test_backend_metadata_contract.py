@@ -112,6 +112,5 @@ def test_bundled_registry_metadata_matches_lazy_exports_and_extras() -> None:
     assert set(public_backends._BACKEND_DEP_MODULES) == bundled_backend_module_paths
     assert set(scrapy_extension._OPTIONAL_DEP_MODULES) == bundled_backend_module_paths
     assert (
-        public_backends._BACKEND_DEP_MODULES
-        == scrapy_extension._OPTIONAL_DEP_MODULES
+        public_backends._BACKEND_DEP_MODULES == scrapy_extension._OPTIONAL_DEP_MODULES
     )
