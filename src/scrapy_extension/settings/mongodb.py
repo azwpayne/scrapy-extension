@@ -1137,7 +1137,15 @@ class MongoDBSettings(RedactedBaseSettings):
             ConfigurationError: if a mode-specific required field is missing.
         """
         if self.mode == MongoDBMode.REPLICA_SET:
-            uri_has_rs = "replicaSet=" in self.uri
+            # PyMongo parses URI options case-insensitively, so match any-case
+            # ``replicaSet`` via the parsed query (helper at line 539) rather than
+            # a case-sensitive substring — the latter rejects valid lowercase/
+            # UPPER forms and false-matches a substring nested in another
+            # option's value (e.g. ``?appname=replicaSet=x``).
+            uri_has_rs = any(
+                name == "replicaset"
+                for name, _value in _mongodb_uri_option_pairs(urlsplit(self.uri).query)
+            )
             # R29-D: strip-aware — a whitespace ``replica_set_name`` (``not "  "`` is
             # False) otherwise bypasses this truthiness check and surfaces at connect
             # as an opaque discovery error with ``replicaSet='  '``.

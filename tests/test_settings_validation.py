@@ -487,6 +487,27 @@ class TestMongoDBModeConditional:
         )
         assert s.replica_set_name is None  # URI hint satisfies the requirement
 
+    def test_replica_set_uri_hint_is_case_insensitive(self) -> None:
+        """PyMongo parses URI options case-insensitively, so the REPLICA_SET
+        URI hint must too — lowercase / UPPER forms are valid (no name)."""
+        for query in ("?replicaset=rs0", "?REPLICASET=rs0"):
+            s = MongoDBSettings(
+                mode=MongoDBMode.REPLICA_SET,
+                uri=f"mongodb://fallback-host:27017/{query}",
+            )
+            assert s.replica_set_name is None  # URI hint satisfies the requirement
+
+    def test_replica_set_rejects_nested_replicaset_substring(self) -> None:
+        """A ``replicaSet=`` substring nested inside another option's value
+        (e.g. ``?appname=replicaSet=x``) is NOT a real replica-set declaration;
+        the validator must still fail fast rather than defer to the driver."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            MongoDBSettings(
+                mode=MongoDBMode.REPLICA_SET,
+                uri="mongodb://fallback-host:27017/?appname=replicaSet=x",
+            )
+        assert exc_info.value.setting_name == "replica_set_name"
+
     def test_replica_set_accepts_explicit_name(self) -> None:
         """REPLICA_SET mode + explicit ``replica_set_name`` is valid."""
         s = MongoDBSettings(mode=MongoDBMode.REPLICA_SET, replica_set_name="rs0")
