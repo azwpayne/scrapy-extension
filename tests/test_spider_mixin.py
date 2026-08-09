@@ -1127,6 +1127,57 @@ class TestConnectSignals:
         assert spider._signals_connected is False
         assert spider._connected_signals is None
 
+    def test_connect_signals_rollback_clears_primary_context_before_cleanup_and_logging(
+        self, mocker
+    ):
+        """R61: a failed signal registration's rollback cleanup and its diagnostic
+        log run with no active exception context (the 6b28166 invariant). Mirrors
+        the scheduler's test_open_rollback_clears_primary_context_before_cleanup_and_logging
+        (test_components.py:882) and R67's dupefilter variant."""
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+            backend_type = BackendType.REDIS
+
+        spider = TestSpider()
+        original_error = KeyboardInterrupt("registration interrupted")
+        signal_manager = mocker.MagicMock()
+        signal_manager.connect.side_effect = [None, original_error]
+        spider.crawler = mocker.MagicMock(signals=signal_manager)
+
+        cleanup_contexts: list[tuple[object | None, object | None, object | None]] = []
+
+        def fail_disconnect(_signal_manager, *, handlers):
+            cleanup_contexts.append(sys.exc_info())
+            raise RuntimeError("cleanup failed")
+
+        mocker.patch.object(
+            spider, "_disconnect_lifecycle_signals", side_effect=fail_disconnect
+        )
+        records: list[logging.LogRecord] = []
+
+        class Handler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        source_logger = spider_mixin_module.logger
+        handler = Handler()
+        prior_level = source_logger.level
+        source_logger.addHandler(handler)
+        source_logger.setLevel(logging.ERROR)
+        try:
+            with pytest.raises(KeyboardInterrupt) as captured:
+                spider._connect_signals()
+        finally:
+            source_logger.removeHandler(handler)
+            source_logger.setLevel(prior_level)
+
+        assert captured.value is original_error
+        assert cleanup_contexts == [(None, None, None)]
+        assert len(records) == 1
+        assert records[0].exc_info is None
+        assert records[0].exc_text is None
+
     def test_disconnect_lifecycle_signals_finishes_after_baseexception(self, mocker):
         """R73: a control error cannot skip the sibling lifecycle handler."""
 
