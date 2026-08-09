@@ -1,6 +1,7 @@
 """Tests for BackendDupeFilter component."""
 
 import logging
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -296,6 +297,56 @@ class TestBackendDupeFilterOpenClose:
         with pytest.raises(RuntimeError, match="closed"):
             dupefilter.open()
 
+    def test_open_rollback_clears_primary_context_before_cleanup_and_logging(
+        self, mock_connection_manager, mocker
+    ):
+        """A failed open remains primary; rollback cleanup and its diagnostic log
+        run with no active exception context (the 6b28166 invariant).
+
+        Mirrors the scheduler's
+        ``test_open_rollback_clears_primary_context_before_cleanup_and_logging``:
+        ``_close_locked`` and the cleanup-failed log must not observe the primary
+        failure's ``exc_info``.
+        """
+        membership_filter = mocker.MagicMock()
+        original_error = KeyboardInterrupt("open interrupted")
+        membership_filter.open.side_effect = original_error
+        cleanup_contexts: list[tuple[object | None, object | None, object | None]] = []
+
+        def fail_close_locked() -> None:
+            cleanup_contexts.append(sys.exc_info())
+            raise RuntimeError("cleanup failed")
+
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            membership_filter=membership_filter,
+        )
+        mocker.patch.object(dupefilter, "_close_locked", side_effect=fail_close_locked)
+        records: list[logging.LogRecord] = []
+
+        class Handler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+                assert sys.exc_info() == (None, None, None)
+
+        source_logger = logging.getLogger("scrapy_extension.dupefilter.dupefilter")
+        handler = Handler()
+        prior_level = source_logger.level
+        source_logger.addHandler(handler)
+        source_logger.setLevel(logging.ERROR)
+        try:
+            with pytest.raises(KeyboardInterrupt) as captured:
+                dupefilter.open()
+        finally:
+            source_logger.removeHandler(handler)
+            source_logger.setLevel(prior_level)
+
+        assert captured.value is original_error
+        assert cleanup_contexts == [(None, None, None)]
+        assert len(records) == 1
+        assert records[0].exc_info is None
+        assert records[0].exc_text is None
+
     @pytest.mark.parametrize("operation", ["open", "clear", "request_seen", "forget"])
     def test_operations_after_close_are_rejected(
         self, operation, mock_connection_manager
@@ -344,7 +395,7 @@ class TestBackendDupeFilterOpenClose:
         membership_filter.open.side_effect = signal
         membership_filter.close.side_effect = RuntimeError("cleanup failed")
         diagnostic = mocker.patch(
-            "scrapy_extension.dupefilter.dupefilter.logger.exception",
+            "scrapy_extension.dupefilter.dupefilter.logger.error",
             side_effect=SystemExit("logger failed"),
         )
         dupefilter = BackendDupeFilter(

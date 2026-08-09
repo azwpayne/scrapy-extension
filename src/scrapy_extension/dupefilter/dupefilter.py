@@ -710,6 +710,7 @@ class BackendDupeFilter:
                 if spider is self._opened_spider:
                     return
                 raise RuntimeError("dupefilter is already open for a different spider")
+            open_failure: BaseException | None = None
             try:
                 if spider is not None:
                     _validate_key_name(spider.name, field_name="spider.name")
@@ -718,17 +719,24 @@ class BackendDupeFilter:
                 self._filter.open()
                 if self.clear_on_open:
                     self.clear()
-            except BaseException:
+            except BaseException as exc:
+                # R59: capture the primary, then run rollback cleanup + its
+                # diagnostic OUTSIDE the except so ``sys.exc_info()`` is clear
+                # during cleanup and ``logger.error`` attaches no ``exc_info``
+                # (the 6b28166 invariant — mirrors scheduler.open).
+                open_failure = exc
+            if open_failure is not None:
+                cleanup_failed = False
                 try:
                     self._close_locked()
                 except BaseException:
+                    cleanup_failed = True
+                if cleanup_failed:
                     try:
-                        logger.exception(
-                            "Failed to clean up dupefilter after open failure"
-                        )
+                        logger.error("Failed to clean up dupefilter after open failure")
                     except BaseException:
                         pass
-                raise
+                raise open_failure
             self._opened = True
             self._opened_spider = spider
 
