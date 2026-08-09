@@ -101,6 +101,7 @@ class BackendSpiderMixin(Spider):
         super().__init__(**kwargs)
         self._connection_manager: ConnectionManager | None = None
         self._queue: BackendQueue | None = None
+        self._queue_name: str | None = None
         self._dupefilter: BackendDupeFilter | None = None
         self._scheduler: BackendScheduler | None = None
         self._consumer_manager_scope = uuid.uuid4().hex
@@ -567,6 +568,20 @@ class BackendSpiderMixin(Spider):
                         queue_strategy=self._build_queue_strategy_from_settings(
                             manager
                         ),
+                    )
+                    self._queue_name = name
+                elif self._queue_name != name:
+                    # R60: a non-consumer backend (Redis/MongoDB/ES/RabbitMQ/
+                    # Pulsar/SQS) skips _claim_consumer_queue's name check, so
+                    # without this guard a second get_queue(different_name)
+                    # silently returns the stale cached queue (data misrouting).
+                    # Track the name separately — self._queue may be a Mock in
+                    # tests, so reading self._queue.queue_name would mis-compare.
+                    raise ConfigurationError(
+                        f"{self.__class__.__name__} is already bound to queue "
+                        f"{self._queue_name!r}; cannot rebind to {name!r}.",
+                        setting_name="queue_name",
+                        setting_value=name,
                     )
             except BaseException:
                 self._consumer_queue_name = previous_claim

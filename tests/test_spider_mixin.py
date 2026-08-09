@@ -251,6 +251,28 @@ class TestSetupBackend:
 
         assert spider.get_queue("first-queue") is first
 
+    def test_non_consumer_backend_rejects_rebind_to_different_queue_name(
+        self, mocker
+    ) -> None:
+        """R60: a non-consumer backend (Redis) must reject rebinding get_queue to
+        a different name — previously it silently returned the stale cached queue
+        (data misrouting). Mirrors the consumer-backend contract above."""
+        manager = mocker.MagicMock(spec=ConnectionManager)
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+            backend_type = BackendType.REDIS
+
+        spider = TestSpider()
+        spider.setup_backend()
+        first = spider.get_queue("first-queue")
+
+        with pytest.raises(ConfigurationError, match="already bound to queue"):
+            spider.get_queue("second-queue")
+
+        assert spider.get_queue("first-queue") is first
+
     def test_consumer_backend_queue_and_scheduler_must_share_name(self, mocker) -> None:
         manager = mocker.MagicMock(spec=ConnectionManager)
         mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
