@@ -523,9 +523,19 @@ class BackendPipeline:
         with self._lifecycle_lock:
             if self._closed:
                 return
-            spider = self._resolve_spider(spider)
             try:
-                logger.info("Pipeline closed for spider %s", spider.name)
+                spider = self._resolve_spider(spider)
+            except Exception:
+                # _resolve_spider raises when there is no opened spider and no
+                # crawler (direct/from_settings use, or after an open_spider
+                # failure). Teardown must still run -- _close_locked() releases
+                # the storage strategy and the connection manager. The spider
+                # name only feeds the diagnostic log below; mirror the
+                # log-handler guard so a resolution failure cannot skip it.
+                spider = None
+            try:
+                if spider is not None:
+                    logger.info("Pipeline closed for spider %s", spider.name)
             except BaseException:
                 # This is diagnostic-only and runs before _close_locked() establishes
                 # the resource-release invariant.  A logging handler must therefore

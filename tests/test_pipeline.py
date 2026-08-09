@@ -621,6 +621,34 @@ class TestBackendPipelineCloseSpider:
         mock_connection_manager.close.assert_called_once_with()
         assert pipeline._closed is True
 
+    def test_close_spider_runs_teardown_when_spider_resolution_fails(
+        self, mock_connection_manager, mocker
+    ):
+        """R63: a spider-resolution failure cannot skip terminal teardown.
+
+        ``_resolve_spider`` raises when there is no opened spider and no
+        crawler (direct/from_settings use, or after an open_spider failure).
+        ``close_spider`` must still run ``_close_locked()`` -- closing the
+        storage strategy and releasing the connection manager -- mirroring the
+        log-handler guard above. Previously the unguarded
+        ``_resolve_spider(spider)`` propagated its RuntimeError out of the
+        lifecycle-lock block and ``_close_locked`` never ran (ConnectionManager
+        registry leak).
+        """
+        strategy = mocker.MagicMock()
+        pipeline = BackendPipeline(
+            connection_manager=mock_connection_manager,
+            storage_strategy=strategy,
+        )
+        # No open_spider() and no crawler -> _resolve_spider raises at close.
+
+        pipeline.close_spider()  # argument-less; _resolve_spider raises
+
+        strategy.close.assert_called_once_with()
+        mock_connection_manager.close.assert_called_once_with()
+        assert pipeline._closed is True
+        assert pipeline._manager_released is True
+
     def test_close_spider_releases_connection_on_flush_failure(
         self, mock_connection_manager, mocker
     ):
