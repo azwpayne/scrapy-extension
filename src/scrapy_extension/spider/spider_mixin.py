@@ -619,6 +619,7 @@ class BackendSpiderMixin(Spider):
 
             if self._dupefilter is None:
                 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+                from scrapy_extension.queue.queue import BackendQueue
 
                 key = f"{self.name}:dupefilter"
                 self._dupefilter = BackendDupeFilter(
@@ -627,6 +628,7 @@ class BackendSpiderMixin(Spider):
                     membership_filter=self._build_membership_filter_from_settings(
                         manager, key
                     ),
+                    monitor=BackendQueue._resolve_monitor(self),
                     owns_connection_manager=False,
                 )
 

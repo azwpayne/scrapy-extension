@@ -12,6 +12,7 @@ from scrapy import Spider, signals
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.spider import spider_mixin as spider_mixin_module
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 
@@ -1451,6 +1452,44 @@ class TestGetDupefilter:
         dupefilter = spider.get_dupefilter()
 
         assert dupefilter._owns_connection_manager is False
+
+    def test_get_dupefilter_wires_scrapystats_monitor_when_stats_available(
+        self, mocker
+    ):
+        """R70: get_dupefilter must auto-wire ScrapyStatsMonitor from
+        crawler.stats (parity with get_queue) — otherwise dedup hit/miss and
+        Bloom/Cuckoo filter-saturation telemetry is silently dead for mixin
+        users even when crawler.stats is available."""
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings.get.return_value = None
+        spider.crawler = crawler
+
+        dupefilter = spider.get_dupefilter()
+
+        assert isinstance(dupefilter._monitor, ScrapyStatsMonitor)
+
+    def test_get_dupefilter_falls_back_to_null_monitor_without_crawler_stats(
+        self, mocker
+    ):
+        """No-regression: without crawler.stats, get_dupefilter keeps the safe
+        NullMonitor default (the pre-wiring behavior)."""
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+        dupefilter = spider.get_dupefilter()
+
+        assert isinstance(dupefilter._monitor, NullMonitor)
 
 
 class TestGetScheduler:
