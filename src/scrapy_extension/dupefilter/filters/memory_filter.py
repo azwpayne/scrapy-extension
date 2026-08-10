@@ -192,7 +192,13 @@ class MemoryMembershipFilter(MembershipFilter):
         return True
 
     def __contains__(self, item: bytes) -> bool:
-        """Check membership (read-only — does not affect LRU order).
+        """Check membership, refreshing LRU on a hit so a read duplicate is not evicted.
+
+        Mirrors ``add()``'s re-add refresh: the transactional dedup read path
+        (``BackendDupeFilter._request_seen_for_scheduler_unlocked``) checks membership via
+        ``in``. Without an LRU refresh here, a hot duplicate would keep its insertion
+        position, get evicted at the cap, and be re-admitted (dedup false-negative) —
+        divergent from the non-transactional ``add()`` path that refreshes on re-add.
 
         Args:
             item: Fingerprint bytes.
@@ -200,7 +206,10 @@ class MemoryMembershipFilter(MembershipFilter):
         Returns:
             True if the item is tracked.
         """
-        return item in self._data
+        if item in self._data:
+            self._data.move_to_end(item)
+            return True
+        return False
 
     def __len__(self) -> int:
         """Return the number of tracked items.

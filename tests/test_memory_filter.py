@@ -172,6 +172,23 @@ class TestMemoryMembershipFilter:
         assert b"a" in flt
         assert b"b" not in flt
 
+    def test_contains_refreshes_lru_on_hit(self) -> None:
+        """A membership read (``in``) refreshes LRU so a hot duplicate is not evicted.
+
+        Mirrors ``add()``'s re-add refresh: the transactional dedup read path
+        (``BackendDupeFilter._request_seen_for_scheduler_unlocked``) checks membership
+        via ``in``, so without a refresh here a re-crawled hot URL would keep its
+        insertion position, get evicted, and be re-admitted (dedup false-negative) —
+        divergent from the non-transactional ``add()`` path.
+        """
+        flt = MemoryMembershipFilter(maxsize=2)
+        flt.add(b"a")
+        flt.add(b"b")  # {a, b}; "a" is LRU
+        assert b"a" in flt  # read hit — refreshes "a" to most-recently-used
+        flt.add(b"c")  # evicts the LRU ("b"), not "a"
+        assert b"a" in flt
+        assert b"b" not in flt
+
     def test_open_close_noops(self) -> None:
         flt = MemoryMembershipFilter()
         flt.open()
