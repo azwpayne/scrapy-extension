@@ -351,13 +351,23 @@ class _QueueComponentConfig:
                     setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
                     setting_value=snapshot_owner_raw,
                 )
+            # When SNAPSHOT_OWNER is unset and defaulted from worker_id, attribute a
+            # key-name failure to SCRAPY_QUEUE_WORKER_ID (the setting the operator
+            # configured), not the unset SCRAPY_QUEUE_SNAPSHOT_OWNER. worker_id is
+            # parsed with .strip() only and delay/time_wheel ignore it, so a
+            # key-unsafe value can survive to here.
+            owner_setting = (
+                "SCRAPY_QUEUE_SNAPSHOT_OWNER"
+                if snapshot_owner_raw is not None
+                else "SCRAPY_QUEUE_WORKER_ID"
+            )
             try:
-                _validate_key_name(queue_snapshot_owner, "SCRAPY_QUEUE_SNAPSHOT_OWNER")
+                _validate_key_name(queue_snapshot_owner, owner_setting)
             except ValueError as exc:
                 raise ConfigurationError(
                     str(exc),
-                    setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
-                    setting_value=snapshot_owner_raw,
+                    setting_name=owner_setting,
+                    setting_value=queue_snapshot_owner,
                 ) from exc
         return replace(
             self,

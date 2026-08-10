@@ -242,3 +242,28 @@ def test_ack_bypass_descriptor_control_interruption_still_propagates(
         BackendScheduler._warn_strategy_mq_ack_bypass(object(), "kafka")
 
     warning.assert_not_called()
+
+
+def test_snapshot_owner_defaulted_from_key_unsafe_worker_id_names_worker_id() -> None:
+    """A key-unsafe worker_id that defaults into snapshot_owner must attribute the
+    ConfigurationError to SCRAPY_QUEUE_WORKER_ID (the setting the operator configured),
+    not the unset SCRAPY_QUEUE_SNAPSHOT_OWNER (which would send the operator to debug a
+    setting they never touched)."""
+    from scrapy_extension.schedule.scheduler import _QueueComponentConfig
+
+    settings = ScrapySettings(
+        {
+            # delay ignores worker_id, so 'worker/1' survives with_strategy_settings
+            # unvalidated (only .strip(), no _validate_key_name).
+            "SCRAPY_QUEUE_STRATEGY": "delay",
+            "SCRAPY_QUEUE_WORKER_ID": "worker/1",  # '/' is rejected by KEY_NAME_PATTERN
+            # SCRAPY_QUEUE_SNAPSHOT_OWNER intentionally unset -> defaults to worker_id
+        }
+    )
+    config = _QueueComponentConfig.from_early_settings(settings)
+    config = config.with_queue_key(settings, spider_name=None)
+    config = config.with_strategy_settings(settings)
+    with pytest.raises(ConfigurationError) as exc_info:
+        config.with_runtime_settings(settings)
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_WORKER_ID"
+    assert exc_info.value.setting_value == "worker/1"
