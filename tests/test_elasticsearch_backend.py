@@ -167,33 +167,31 @@ class TestConnection:
         assert backend.is_connected()
 
     def test_cloud_mode_missing_id_fails_at_construction(self):
-        """R52: CLOUD mode without cloud_id fails at construction (fail-fast).
+        """R52/R66: CLOUD mode without cloud_id fails at construction.
 
-        Mirrors the Redis SENTINEL validator (R8). Previously this surfaced as a
-        BackendConnectionError at connect() time; now it's a pydantic
-        ValidationError at ElasticSearchSettings construction — closer to the
-        misconfiguration.
+        The misconfig surfaces as a ``ConfigurationError`` whose precise message
+        survives the RedactedBaseSettings sanitization layer (R14-B uniform-
+        exception-family invariant). Previously it was a ``ValueError`` that
+        pydantic wrapped into a generic-sanitized ``ValidationError``.
         """
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError):
+        with pytest.raises(ConfigurationError, match="requires 'cloud_id'") as exc_info:
             ElasticSearchSettings(mode=ElasticSearchMode.CLOUD)
 
+        assert exc_info.value.setting_name == "cloud_id"
+
     def test_cloud_mode_without_auth_fails_at_construction(self):
-        """R26-F: CLOUD mode with cloud_id but NO auth method fails at construction.
-
-        Elastic Cloud always 401s an anonymous client, so a no-auth CLOUD config
-        previously surfaced as an opaque ``BackendConnectionError('health check
-        returned false')`` at connect() (ping returns false on 401). The R52
-        validator required cloud_id but left the auth axis open. R26-F requires at
-        least one auth method (``api_key`` OR ``username``+``password``) in CLOUD
-        mode so the misconfiguration fails fast at construction.
+        """R26-F/R66: CLOUD mode with cloud_id but NO auth method fails at
+        construction with a ``ConfigurationError`` whose precise message survives
+        sanitization (R14-B invariant). Previously a generic-sanitized
+        ``ValueError``/``ValidationError``.
         """
-        from pydantic import ValidationError
-
         # cloud_id present but no api_key and no basic_auth → must fail.
-        with pytest.raises(ValidationError):
+        with pytest.raises(
+            ConfigurationError, match="requires an auth method"
+        ) as exc_info:
             ElasticSearchSettings(mode=ElasticSearchMode.CLOUD, cloud_id="test:abc")
+
+        assert exc_info.value.setting_name == "api_key"
 
     def test_cloud_mode_empty_api_key_fails_at_construction(self):
         """R45: an empty-string ``api_key`` fails before client construction.

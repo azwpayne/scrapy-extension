@@ -291,26 +291,25 @@ class ElasticSearchSettings(RedactedBaseSettings):
         (ping returns false on 401); now it fails fast at construction.
 
         Raises:
-            ValueError: If CLOUD mode is selected without ``cloud_id`` or without
-                any auth method.
+            ConfigurationError: If CLOUD mode is selected without ``cloud_id`` or
+                without any auth method.
         """
         if self.mode == ElasticSearchMode.CLOUD:
             if not self.cloud_id:
-                msg = (
-                    "ElasticSearch CLOUD mode requires 'cloud_id' to be set. "
-                    f"Got cloud_id={self.cloud_id!r}."
+                raise ConfigurationError(
+                    "ElasticSearch CLOUD mode requires 'cloud_id' to be set.",
+                    setting_name="cloud_id",
                 )
-                raise ValueError(msg)
             has_api_key = self.api_key is not None
             has_basic_auth = self.username is not None and self.password is not None
             if not (has_api_key or has_basic_auth):
-                msg = (
+                raise ConfigurationError(
                     "ElasticSearch CLOUD mode requires an auth method: set 'api_key' "
                     "or both 'username' and 'password'. Elastic Cloud always rejects "
                     "an anonymous client (401), so a no-auth config would surface as "
-                    "an opaque health-check failure at connect() rather than here."
+                    "an opaque health-check failure at connect() rather than here.",
+                    setting_name="api_key",
                 )
-                raise ValueError(msg)
         return self
 
     @model_validator(mode="after")
