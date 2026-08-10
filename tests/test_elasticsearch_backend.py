@@ -224,6 +224,19 @@ class TestConnection:
                 password="",
             )
 
+    def test_blank_password_message_survives_sanitization(self):
+        """R67: the blank-password ConfigurationError message must survive the
+        RedactedBaseSettings sanitization layer (R14-B invariant). The
+        api_key/username siblings are safe-listed; the password message in this
+        same validator was overlooked (R74 CLOUD-mode sibling gap, caught by
+        ndiff-regression)."""
+        with pytest.raises(
+            ConfigurationError, match="password must not be blank"
+        ) as exc_info:
+            ElasticSearchSettings(username="user", password="   ")
+
+        assert exc_info.value.setting_name == "password"
+
     def test_connect_rejects_mutated_authenticated_cleartext_host(self, mocker):
         """A post-construction downgrade must not send credentials over HTTP."""
         config = ElasticSearchSettings(

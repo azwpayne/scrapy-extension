@@ -28,6 +28,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     {
         "api_key and basic-auth (username/password) are mutually exclusive; remove one authentication method.",
         "api_key must not be blank when supplied.",
+        "password must not be blank when supplied.",
         "Authenticated Pulsar connections require 'pulsar+ssl://' transport.",
         "ElasticSearch CLOUD mode requires 'cloud_id' to be set.",
         "ElasticSearch CLOUD mode requires an auth method: set 'api_key' or both 'username' and 'password'. Elastic Cloud always rejects an anonymous client (401), so a no-auth config would surface as an opaque health-check failure at connect() rather than here.",
