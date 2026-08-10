@@ -38,6 +38,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "min_pool_size must be <= max_pool_size — an inverted pair makes the connection pool unable to satisfy any checkout (deadlock under load).",
         "MongoDB ATLAS mode requires an explicit 'mongodb+srv://' uri. atlas_cluster_name cannot replace uri because the backend uses uri verbatim and a complete Atlas SRV hostname cannot be derived from a cluster display name.",
         "MongoDB REPLICA_SET mode requires 'replica_set_name' to be set, or a uri that already carries a '?replicaSet=...' query.",
+        "MongoDB TLS uses a single combined certificate+key file (tlsCertificateKeyFile); set tls_cert_file OR tls_key_file, not both -- setting both silently drops the key.",
         "Pulsar cluster service_url must use a single scheme followed by a comma-separated endpoint list.",
         "Redis SENTINEL mode requires 'sentinel_master_name' to be set. No endpoint or credential values are included in this error.",
         "Redis SENTINEL mode requires 'sentinels' to be set. No endpoint or credential values are included in this error.",

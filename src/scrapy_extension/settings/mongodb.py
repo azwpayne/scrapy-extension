@@ -1098,6 +1098,17 @@ class MongoDBSettings(RedactedBaseSettings):
             auth_source=self.auth_source,
             allow_remote_plaintext=self.allow_remote_plaintext,
         )
+        if (
+            (self.tls_enabled or self.mode is MongoDBMode.ATLAS)
+            and self.tls_cert_file is not None
+            and self.tls_key_file is not None
+        ):
+            raise ConfigurationError(
+                "MongoDB TLS uses a single combined certificate+key file "
+                "(tlsCertificateKeyFile); set tls_cert_file OR tls_key_file, "
+                "not both -- setting both silently drops the key.",
+                setting_name="tls_key_file",
+            )
         return self
 
     @field_validator("uri")
