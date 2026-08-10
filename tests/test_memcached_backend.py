@@ -578,6 +578,23 @@ class TestMemcachedStorageOps:
 
         client.set.assert_called_once_with("key1", b"value", expire=0)
 
+    def test_store_ttl_over_30_days_converts_to_absolute_timestamp(
+        self, mocker
+    ) -> None:
+        # Memcached treats exptime > 60*60*24*30 (2_592_000) as an ABSOLUTE
+        # Unix epoch, not relative seconds. A 31-day TTL must therefore be
+        # converted to (now + ttl) so the server does not read it as a past
+        # timestamp (1970-01-31) and silently expire the item on write.
+        fixed_now = 1_700_000_000
+        mocker.patch("time.time", return_value=fixed_now)
+
+        b, client = _connected(mocker)
+        b.store("key1", b"value", ttl=2_592_001)
+
+        client.set.assert_called_once_with(
+            "key1", b"value", expire=fixed_now + 2_592_001
+        )
+
     def test_retrieve_gets(self, mocker) -> None:
         b, client = _connected(mocker)
         client.get.return_value = b"payload"

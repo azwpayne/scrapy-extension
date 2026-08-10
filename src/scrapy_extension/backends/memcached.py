@@ -18,6 +18,7 @@ pymemcache API used (stable):
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
@@ -73,6 +74,11 @@ _MEMCACHED_STORAGE_RETRIEVE_ERROR = "Memcached storage retrieve failed."
 _MEMCACHED_STORAGE_DELETE_ERROR = "Memcached storage delete failed."
 _MEMCACHED_STORAGE_EXISTS_ERROR = "Memcached storage existence check failed."
 _MEMCACHED_STORAGE_CLEAR_ERROR = "Memcached storage clear failed."
+# Memcached reads an exptime > 30 days (2_592_000s) as an ABSOLUTE Unix epoch
+# timestamp, not relative seconds. Relative TTLs above this bound must be
+# converted to (now + ttl) so the server does not treat them as a past
+# timestamp and silently expire the item on write.
+_MEMCACHED_MAX_RELATIVE_TTL_SECONDS = 60 * 60 * 24 * 30  # 2_592_000
 _MEMCACHED_CLEAR_STORAGE_PREFIX_UNSUPPORTED_MESSAGE = (
     "Memcached flush_all does not support prefix scoping; pass "
     "prefix=None only when a server-wide flush is explicitly acceptable."
@@ -393,7 +399,16 @@ class MemcachedBackend(Backend, StorageBackend):
             with self._lifecycle_lock:
                 client = self._client
             try:
-                stored = client.set(key, data, expire=0 if ttl is None else ttl)
+                if ttl is None:
+                    expire = 0
+                elif ttl > _MEMCACHED_MAX_RELATIVE_TTL_SECONDS:
+                    # Memcached reads exptime > 30 days as an absolute Unix
+                    # epoch; convert the relative TTL so the item is not
+                    # silently expired as a past timestamp.
+                    expire = int(time.time()) + ttl
+                else:
+                    expire = ttl
+                stored = client.set(key, data, expire=expire)
             except Exception as e:
                 msg = f"Failed to store key {key!r} in Memcached: {e}"
                 raise StorageError(msg, operation="store", key=key) from e
