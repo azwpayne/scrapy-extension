@@ -1369,11 +1369,11 @@ wheels = [
 
 [[package]]
 name = "pika"
-version = "1.4.2"
+version = "1.4.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5c/06/a5e4589eccb22be5790bf1327e20c5387b64327daa40c4d857cf9265ec3c/pika-1.4.2.tar.gz", hash = "sha256:48d1f50297e76be4fc798fd5232d4d532d7a4758e51f7c0ae6c4004b9808a26b", size = 154365, upload-time = "2026-07-23T02:11:26.003Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7f/26/54e0b98a7f60b474cb0a6c05ecf048d4bc8c866e10ab1c82bc83865e7421/pika-1.4.4.tar.gz", hash = "sha256:8cfc8b33a5cb16e733bd60cffca9732c0d1d761ecd80a89f34ed7df2cd38d6d6", size = 154713, upload-time = "2026-08-06T21:33:39.836Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/82/3b047c707700e08539cde489475eb5eaca13550599baaa17a8da038003e7/pika-1.4.2-py3-none-any.whl", hash = "sha256:b1df7389cdffaa45856bd01ade4e81bd488e0e199c443faf0c7bea89015f373f", size = 165087, upload-time = "2026-07-23T02:11:24.712Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/f3/921170b78779ac3f8b405cb28fce88acca1562ac114072cbf0a115e19bb9/pika-1.4.4-py3-none-any.whl", hash = "sha256:48de960c97a93b55db06b8be4c53eb977c9c8a2754c57cdae9097abcbd70ce04", size = 165275, upload-time = "2026-08-06T21:33:38.449Z" },
 ]
 
 [[package]]
@@ -2252,8 +2252,8 @@ requires-dist = [
     { name = "elasticsearch", marker = "extra == 'elasticsearch'", specifier = ">=9.4.1,<10" },
     { name = "kafka-python-ng", marker = "extra == 'all'", specifier = ">=2.2.2,<3" },
     { name = "kafka-python-ng", marker = "extra == 'kafka'", specifier = ">=2.2.2,<3" },
-    { name = "pika", marker = "extra == 'all'", specifier = ">=1.4.2,<2" },
-    { name = "pika", marker = "extra == 'rabbitmq'", specifier = ">=1.4.2,<2" },
+    { name = "pika", marker = "extra == 'all'", specifier = ">=1.4.4,<2" },
+    { name = "pika", marker = "extra == 'rabbitmq'", specifier = ">=1.4.4,<2" },
     { name = "pulsar-client", marker = "extra == 'all'", specifier = ">=3.13.0,<4" },
     { name = "pulsar-client", marker = "extra == 'pulsar'", specifier = ">=3.13.0,<4" },
     { name = "pyasn1", specifier = ">=0.6.4,<0.7" },
@@ -2286,7 +2286,7 @@ test = [
     { name = "hypothesis", specifier = ">=6.165.0,<7" },
     { name = "kafka-python-ng", specifier = ">=2.2.2,<3" },
     { name = "mypy" },
-    { name = "pika", specifier = ">=1.4.2,<2" },
+    { name = "pika", specifier = ">=1.4.4,<2" },
     { name = "pulsar-client", specifier = ">=3.13.0,<4" },
     { name = "pymemcache", specifier = ">=4.0,<5" },
     { name = "pymongo", specifier = ">=4.8.0,<5" },
