@@ -510,6 +510,19 @@ class KafkaSettings(RedactedBaseSettings):
         validate_kafka_transport_security(
             self.mode, self.security_protocol, self.ssl_check_hostname
         )
+        uses_tls = (
+            self.security_protocol in {"SSL", "SASL_SSL"}
+            or self.mode == KafkaMode.CONFLUENT
+        )
+        if uses_tls and (self.ssl_certfile is None) != (self.ssl_keyfile is None):
+            missing_name = (
+                "ssl_keyfile" if self.ssl_certfile is not None else "ssl_certfile"
+            )
+            raise ConfigurationError(
+                "Kafka TLS client authentication requires both certificate and "
+                "key files.",
+                setting_name=missing_name,
+            )
         return self
 
     @model_validator(mode="after")

@@ -33,6 +33,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "Kafka CONFLUENT mode requires 'confluent_api_key and confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
         "Kafka CONFLUENT mode requires 'confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
         "Kafka TLS connections require ssl_check_hostname=True.",
+        "Kafka TLS client authentication requires both certificate and key files.",
         KAFKA_BROKER_ENDPOINTS_ERROR,
         "min_pool_size must be <= max_pool_size — an inverted pair makes the connection pool unable to satisfy any checkout (deadlock under load).",
         "MongoDB ATLAS mode requires an explicit 'mongodb+srv://' uri. atlas_cluster_name cannot replace uri because the backend uses uri verbatim and a complete Atlas SRV hostname cannot be derived from a cluster display name.",
