@@ -662,6 +662,9 @@ class BackendSpiderMixin(Spider):
                     self._scheduler = BackendScheduler(
                         connection_manager=manager,
                         queue_key=queue_name,
+                        queue_strategy=self._build_queue_strategy_from_settings(
+                            manager
+                        ),
                         owns_connection_manager=False,
                     )
                 except BaseException:

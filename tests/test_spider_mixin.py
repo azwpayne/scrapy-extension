@@ -1543,6 +1543,25 @@ class TestGetScheduler:
 
         assert scheduler._owns_connection_manager is False
 
+    def test_get_scheduler_honors_queue_strategy_setting(self, mocker):
+        """get_scheduler() must thread SCRAPY_QUEUE_STRATEGY into the scheduler
+        (mirroring get_queue); otherwise the scheduler's internal queue silently
+        defaults to PassthroughQueueStrategy even when the operator configured a
+        different strategy."""
+        from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        spider.crawler = mocker.MagicMock()
+        spider.crawler.settings.get.return_value = "delay"
+
+        scheduler = spider.get_scheduler()
+
+        assert isinstance(scheduler._queue_strategy, DelayQueueStrategy)
+
 
 class TestConcurrentComponentGetters:
     """Each lazy component constructor is serialized with backend shutdown."""
