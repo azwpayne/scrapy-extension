@@ -1,5 +1,7 @@
 """Tests for backend implementations."""
 
+from decimal import Decimal
+
 import pytest
 from pydantic import SecretBytes, SecretStr
 
@@ -320,6 +322,42 @@ class TestJSONSerializer:
         serialized = serializer.serialize(data)
         deserialized = serializer.deserialize(serialized)
         assert deserialized["price"] == "19.99"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            Decimal("-Infinity"),
+            Decimal("sNaN"),
+        ],
+        ids=["nan", "inf", "neg_inf", "snan"],
+    )
+    def test_non_finite_decimal_rejected(self, value):
+        """R87: non-finite Decimal must fail fast, mirroring the float guard.
+
+        A ``Decimal('NaN'/'Infinity'/...)`` must not silently ``str()``-ify into
+        a wrong-type JSON string that slips past ``allow_nan=False``; it raises
+        ``ValueError`` at serialize time, exactly like a non-finite ``float``.
+        """
+        serializer = JSONSerializer()
+        with pytest.raises(ValueError, match="non-finite Decimal"):
+            serializer.serialize({"x": value})
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (Decimal("0"), "0"),
+            (Decimal("-0"), "-0"),
+            (Decimal("19.99"), "19.99"),
+        ],
+        ids=["zero", "neg_zero", "price"],
+    )
+    def test_finite_decimal_still_round_trips_as_str(self, value, expected):
+        """R87: the finiteness guard must not over-reject finite Decimal sentinels."""
+        serializer = JSONSerializer()
+        serialized = serializer.serialize({"x": value})
+        assert serializer.deserialize(serialized)["x"] == expected
 
     def test_uuid_serializes_as_str(self):
         """R19: UUID serializes to canonical hex form."""

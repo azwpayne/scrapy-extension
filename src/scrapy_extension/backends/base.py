@@ -56,7 +56,9 @@ def _json_default(obj: object) -> object:
       caller-owned dicts of the same shape survive untouched)
     - ``bytes`` / ``bytearray`` → tagged base64 marker (the recursive codec
       handles these before this fallback in normal ``JSONSerializer`` use)
-    - ``Decimal`` → ``str`` (preserves exact decimal representation, avoids float drift)
+    - ``Decimal`` → ``str`` for finite values (preserves exact decimal representation,
+      avoids float drift); non-finite (``NaN``/``Infinity``) raises ``ValueError``,
+      mirroring the float ``allow_nan=False`` guard
     - ``UUID`` → ``str`` (canonical hex form)
     - ``set`` / ``frozenset`` → ``list`` (JSON has no set type; order undefined)
     - ``Enum`` → ``.value`` (preserves the enum's declared value, not the member)
@@ -91,6 +93,8 @@ def _json_default(obj: object) -> object:
             _CODEC_DATA: base64.b64encode(bytes(obj)).decode("ascii"),
         }
     if isinstance(obj, Decimal):
+        if not obj.is_finite():
+            raise ValueError(f"Cannot serialize non-finite Decimal: {obj!r}")
         return str(obj)
     if isinstance(obj, uuid.UUID):
         return str(obj)
