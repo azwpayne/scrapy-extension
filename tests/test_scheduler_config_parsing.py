@@ -267,3 +267,47 @@ def test_snapshot_owner_defaulted_from_key_unsafe_worker_id_names_worker_id() ->
         config.with_runtime_settings(settings)
     assert exc_info.value.setting_name == "SCRAPY_QUEUE_WORKER_ID"
     assert exc_info.value.setting_value == "worker/1"
+
+
+def test_workstealing_key_unsafe_worker_id_names_worker_id(
+    mocker: MockerFixture,
+) -> None:
+    """R88: a key-unsafe SCRAPY_QUEUE_WORKER_ID under work_stealing must attribute the
+    ConfigurationError to SCRAPY_QUEUE_WORKER_ID (the setting the operator configured), not
+    the unrelated SCRAPY_QUEUE_PEER_IDS. Unfixed sibling of the snapshot_owner attribution
+    fix (R80 / fe72f30) -- R80's Directive demands source-setting attribution, which the
+    work_stealing constructor catch block violated."""
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = ScrapySettings(
+        {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_QUEUE_KEY": "scheduler:queue",
+            "SCRAPY_QUEUE_STRATEGY": "work_stealing",
+            "SCRAPY_QUEUE_WORKER_ID": "worker/1",  # '/' is rejected by KEY_NAME_PATTERN
+        }
+    )
+    with pytest.raises(ConfigurationError) as exc_info:
+        BackendScheduler.from_settings(settings)
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_WORKER_ID"
+    assert exc_info.value.setting_value == "worker/1"
+
+
+def test_workstealing_key_unsafe_peer_id_still_names_peer_ids(
+    mocker: MockerFixture,
+) -> None:
+    """R88 hardening: when a key-unsafe PEER_ID (not worker_id) is the offender under
+    work_stealing, attribution must stay on SCRAPY_QUEUE_PEER_IDS -- the worker_id
+    re-check must not over-redirect when worker_id itself is valid."""
+    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    settings = ScrapySettings(
+        {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_QUEUE_KEY": "scheduler:queue",
+            "SCRAPY_QUEUE_STRATEGY": "work_stealing",
+            "SCRAPY_QUEUE_WORKER_ID": "worker-a",  # valid
+            "SCRAPY_QUEUE_PEER_IDS": "peer/1",  # '/' rejected by KEY_NAME_PATTERN
+        }
+    )
+    with pytest.raises(ConfigurationError) as exc_info:
+        BackendScheduler.from_settings(settings)
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_PEER_IDS"

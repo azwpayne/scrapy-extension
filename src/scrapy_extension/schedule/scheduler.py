@@ -1131,6 +1131,20 @@ class BackendScheduler:
                     QueueStrategyType.WORK_STEALING: "SCRAPY_QUEUE_PEER_IDS",
                     QueueStrategyType.RING_BUFFER: "SCRAPY_QUEUE_RING_BUFFER_CAPACITY",
                 }.get(queue_config.strategy_type, "SCRAPY_QUEUE_STRATEGY")
+                # R88: WorkStealingQueueStrategy validates worker_id before peer_ids, so a
+                # key-unsafe SCRAPY_QUEUE_WORKER_ID (survives with_strategy_settings
+                # .strip()-only) raises here -- attribute it to the setting the operator
+                # configured, not the default SCRAPY_QUEUE_PEER_IDS. Sibling of the
+                # snapshot_owner attribution fix (R80/fe72f30); the worker_id-is-None guard
+                # mirrors work_stealing.py:108 (None auto-generates a uuid, never validates).
+                if (
+                    queue_config.strategy_type is QueueStrategyType.WORK_STEALING
+                    and queue_config.worker_id is not None
+                ):
+                    try:
+                        _validate_key_name(queue_config.worker_id, "worker_id")
+                    except ValueError:
+                        constructor_setting = "SCRAPY_QUEUE_WORKER_ID"
                 raise ConfigurationError(
                     f"Invalid {constructor_setting}: {exc}",
                     setting_name=constructor_setting,
