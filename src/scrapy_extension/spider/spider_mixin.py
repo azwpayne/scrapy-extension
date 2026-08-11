@@ -625,6 +625,11 @@ class BackendSpiderMixin(Spider):
                 self._dupefilter = BackendDupeFilter(
                     connection_manager=manager,
                     key=key,
+                    fingerprinter=getattr(
+                        getattr(self, "crawler", None),
+                        "request_fingerprinter",
+                        None,
+                    ),
                     membership_filter=self._build_membership_filter_from_settings(
                         manager, key
                     ),

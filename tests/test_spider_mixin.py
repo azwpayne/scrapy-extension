@@ -1491,6 +1491,44 @@ class TestGetDupefilter:
 
         assert isinstance(dupefilter._monitor, NullMonitor)
 
+    def test_get_dupefilter_wires_crawler_request_fingerprinter(self, mocker):
+        """R73: get_dupefilter must thread crawler.request_fingerprinter into
+        BackendDupeFilter (parity with from_crawler) — otherwise a custom
+        REQUEST_FINGERPRINTER_CLASS is silently ignored on the mixin-producer
+        path, so the dupefilter fingerprints with the legacy default while
+        Scrapy's engine/scheduler use the configured one (wrong dedup)."""
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings.get.return_value = None
+        fingerprinter = mocker.MagicMock()
+        crawler.request_fingerprinter = fingerprinter
+        spider.crawler = crawler
+
+        dupefilter = spider.get_dupefilter()
+
+        assert dupefilter._fingerprinter is fingerprinter
+
+    def test_get_dupefilter_fingerprinter_none_without_crawler(self, mocker):
+        """No-regression: without a crawler, get_dupefilter leaves
+        _fingerprinter as None (the pre-R73 default) so the legacy
+        scrapy.utils.request.fingerprint fallback is used unchanged."""
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+        dupefilter = spider.get_dupefilter()
+
+        assert dupefilter._fingerprinter is None
+
 
 class TestGetScheduler:
     """Test get_scheduler method."""
