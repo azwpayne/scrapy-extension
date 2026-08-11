@@ -182,6 +182,22 @@ class BackendSpiderMixin(Spider):
                 self._connection_manager = manager
                 acquired_here = True
 
+            # R14-D: thread default-on telemetry into the shared manager so the
+            # connection-lifecycle hooks (on_connect/on_disconnect/on_disconnect_
+            # result/on_retry -> backend/{connect,disconnect,retry}_count) fire
+            # in production. Parity with pipeline/dupefilter/scheduler from_crawler,
+            # all of which call connection_manager.set_monitor(...); spider_mixin
+            # was the lone exception, leaving the hooks dead for get_queue/
+            # get_dupefilter-direct spiders. Resolved on every setup_backend call
+            # so the legacy early-setup path (setup_backend in __init__ before
+            # crawler is attached -> resolves NullMonitor) is re-covered when
+            # from_crawler's idempotent second call runs with the crawler attached.
+            # A later scheduler.open() overwrites this with the same
+            # crawler.stats-backed monitor, so there is no conflict.
+            from scrapy_extension.queue.queue import BackendQueue
+
+            manager.set_monitor(BackendQueue._resolve_monitor(self))
+
             signal_wiring_failure: BaseException | None = None
             try:
                 self._connect_signals()

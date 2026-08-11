@@ -220,6 +220,75 @@ class TestSetupBackend:
         assert result is mock_manager
         assert get_manager_spy.call_count == 1
 
+    def test_setup_backend_wires_scrapystats_monitor_into_manager(self, mocker) -> None:
+        """R76: setup_backend must thread a ScrapyStatsMonitor into the shared
+        ConnectionManager (parity with pipeline/dupefilter/scheduler from_crawler)
+        -- otherwise the connection-lifecycle hooks (on_connect/on_disconnect/
+        on_retry -> backend/{connect,disconnect,retry}_count) are dead for
+        get_queue/get_dupefilter-direct spiders."""
+        mock_manager = mocker.MagicMock(spec=ConnectionManager)
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+            backend_type = BackendType.REDIS
+
+        spider = TestSpider()
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        spider.crawler = crawler
+
+        spider.setup_backend()
+
+        mock_manager.set_monitor.assert_called_once()
+        wired = mock_manager.set_monitor.call_args.args[0]
+        assert isinstance(wired, ScrapyStatsMonitor)
+
+    def test_setup_backend_monitor_null_without_crawler(self, mocker) -> None:
+        """R76 no-regression: without a crawler, _resolve_monitor returns
+        NullMonitor (the safe default), so the manager is wired byte-identically
+        to its NullMonitor default."""
+        mock_manager = mocker.MagicMock(spec=ConnectionManager)
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+            backend_type = BackendType.REDIS
+
+        spider = TestSpider()
+
+        spider.setup_backend()
+
+        mock_manager.set_monitor.assert_called_once()
+        wired = mock_manager.set_monitor.call_args.args[0]
+        assert isinstance(wired, NullMonitor)
+
+    def test_from_crawler_rewires_monitor_after_early_setup(self, mocker) -> None:
+        """R76: when a subclass calls setup_backend() in __init__ (before
+        crawler), from_crawler's idempotent second setup_backend call (crawler
+        attached) must re-resolve the monitor -> ScrapyStatsMonitor. Proves the
+        every-call placement covers the legacy early-setup path."""
+        manager = mocker.MagicMock(spec=ConnectionManager)
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+
+        class EarlySetupSpider(BackendSpiderMixin, Spider):
+            name = "early_setup_spider"
+            backend_type = BackendType.REDIS
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.setup_backend()  # before crawler -> NullMonitor
+
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+
+        EarlySetupSpider.from_crawler(crawler)
+
+        wired_calls = manager.set_monitor.call_args_list
+        assert wired_calls, "set_monitor should have been called"
+        last_wired = wired_calls[-1].args[0]
+        assert isinstance(last_wired, ScrapyStatsMonitor)
+
     def test_consumer_backend_scope_is_unique_per_spider_instance(self) -> None:
         class TestSpider(BackendSpiderMixin, Spider):
             name = "test_spider"
