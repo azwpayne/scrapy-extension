@@ -211,7 +211,16 @@ class PriorityQueueStrategy(QueueStrategy):
             if item is not None:
                 return item
         if timeout > 0:
-            return qb.pop(self._bucket_queue(queue_name, 0), timeout)
+            item = qb.pop(self._bucket_queue(queue_name, 0), timeout)
+            if item is not None:
+                return item
+            # A lower-priority bucket may have received an item during the
+            # blocking wait on p0; re-scan all levels non-blocking so the
+            # caller's "next ready item or None if empty" contract holds.
+            for level in range(self._levels):
+                candidate = qb.pop(self._bucket_queue(queue_name, level), 0.0)
+                if candidate is not None:
+                    return candidate
         return None
 
     def pop_with_ack(
@@ -230,11 +239,22 @@ class PriorityQueueStrategy(QueueStrategy):
             if data is not None:
                 return (data, token)
         if timeout > 0:
-            return self._pop_backend_instance_with_ack(
+            data, token = self._pop_backend_instance_with_ack(
                 qb,
                 self._bucket_queue(queue_name, 0),
                 timeout,
             )
+            if data is not None:
+                return (data, token)
+            # A lower-priority bucket may have received an item during the
+            # blocking wait on p0; re-scan all levels non-blocking so the
+            # caller's "next ready item or None if empty" contract holds.
+            for level in range(self._levels):
+                pdata, ptoken = self._pop_backend_instance_with_ack(
+                    qb, self._bucket_queue(queue_name, level), 0.0
+                )
+                if pdata is not None:
+                    return (pdata, ptoken)
         return (None, None)
 
     def queue_len(self, queue_name: str) -> int:

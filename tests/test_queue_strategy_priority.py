@@ -121,6 +121,42 @@ def test_pop_with_ack_uses_one_blocking_fallback_after_empty_scan():
     )
 
 
+def test_pop_rechecks_lower_buckets_after_blocking_p0_timeout():
+    """R75: after the blocking pop on p0 times out empty, pop must re-scan
+    p0..p(N-1) non-blocking before returning None -- otherwise an item that
+    arrived in a lower-priority bucket during the wait is missed until the next
+    pop (violates QueueStrategy.pop's 'next ready item or None if empty')."""
+    s, qb = _strategy(levels=3)
+    # scan p0,p1,p2 (None,None,None) -> block p0 (None) -> re-scan p0 (None), p1 (b"X")
+    qb.pop.side_effect = [None, None, None, None, None, b"X"]
+
+    result = s.pop("q", timeout=2.5)
+
+    assert result == b"X"
+    assert qb.pop.call_count == 6
+    assert qb.pop.call_args_list[5].args == (s._bucket_queue("q", 1), 0.0)
+
+
+def test_pop_with_ack_rechecks_lower_buckets_after_blocking_p0_timeout():
+    """R75 mirror: pop_with_ack re-scans p0..p(N-1) after the blocking p0 wait
+    times out, so a lower-bucket arrival during the wait is returned with its
+    ack token on the same call."""
+    s, qb = _strategy(levels=3)
+    qb.pop_with_ack.side_effect = [
+        (None, None),  # scan p0
+        (None, None),  # scan p1
+        (None, None),  # scan p2
+        (None, None),  # blocking p0 timeout
+        (None, None),  # re-scan p0
+        (b"X", "TOK"),  # re-scan p1 -> found
+    ]
+
+    data, token = s.pop_with_ack("q", timeout=2.5)
+
+    assert (data, token) == (b"X", "TOK")
+    assert qb.pop_with_ack.call_count == 6
+
+
 # ---------------------------------------------------------------------------
 # push — priority → level mapping
 # ---------------------------------------------------------------------------
