@@ -249,7 +249,19 @@ class WorkStealingQueueStrategy(QueueStrategy):
         # 3. Blocking fallback on own queue honoring caller's wait contract.
         remaining = self._remaining_timeout(deadline)
         if remaining > 0:
-            return qb.pop(own, remaining)
+            item = qb.pop(own, remaining)
+            if item is not None:
+                return item
+            # A peer queue may have received an item during the blocking wait
+            # on own; re-scan own + all peers non-blocking so the caller's
+            # "next ready item or None if empty" contract holds (R84 sibling).
+            item = qb.pop(own, 0.0)
+            if item is not None:
+                return item
+            for peer in self._peer_ids:
+                candidate = qb.pop(self._worker_queue(queue_name, peer), 0.0)
+                if candidate is not None:
+                    return candidate
         return None
 
     def pop_with_ack(
@@ -284,7 +296,21 @@ class WorkStealingQueueStrategy(QueueStrategy):
                         return (data, token)
         remaining = self._remaining_timeout(deadline)
         if remaining > 0:
-            return self._pop_backend_instance_with_ack(qb, own, remaining)
+            data, token = self._pop_backend_instance_with_ack(qb, own, remaining)
+            if data is not None:
+                return (data, token)
+            # A peer queue may have received an item during the blocking wait
+            # on own; re-scan own + all peers non-blocking so the caller's
+            # "next ready item or None if empty" contract holds (R84 sibling).
+            data, token = self._pop_backend_instance_with_ack(qb, own, 0.0)
+            if data is not None:
+                return (data, token)
+            for peer in self._peer_ids:
+                pdata, ptoken = self._pop_backend_instance_with_ack(
+                    qb, self._worker_queue(queue_name, peer), 0.0
+                )
+                if pdata is not None:
+                    return (pdata, ptoken)
         return (None, None)
 
     def queue_len(self, queue_name: str) -> int:

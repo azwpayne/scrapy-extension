@@ -141,6 +141,44 @@ def test_zero_timeout_never_accumulates_blocking_peer_probes():
     assert [call.args[1] for call in qb.pop.call_args_list] == [0.0, 0.0, 0.0]
 
 
+def test_pop_rechecks_peers_after_blocking_own_timeout():
+    """R77: after the blocking pop on own times out empty, pop must re-scan own
+    + all peers non-blocking before returning None -- otherwise an item a peer
+    worker pushed during the wait (the cross-worker routing event work-stealing
+    exists for) is missed until the next pop (violates QueueStrategy.pop's
+    'next ready item or None if empty'). R84 sibling."""
+    s, qb = _strategy(worker_id="w1", peer_ids=("w2", "w3"))
+    # own empty(0.0) -> steal w2 empty -> steal w3 empty -> block own None ->
+    # rescan own None -> rescan w2 -> b"X"
+    qb.pop.side_effect = [None, None, None, None, None, b"X"]
+
+    result = s.pop("q", timeout=2.5)
+
+    assert result == b"X"
+    assert qb.pop.call_count == 6
+    assert qb.pop.call_args_list[5].args == (s._worker_queue("q", "w2"), 0.0)
+
+
+def test_pop_with_ack_rechecks_peers_after_blocking_own_timeout():
+    """R77 mirror: pop_with_ack re-scans own + peers after the blocking own wait
+    times out, so a peer arrival during the wait is returned with its ack token
+    on the same call."""
+    s, qb = _strategy(worker_id="w1", peer_ids=("w2", "w3"))
+    qb.pop_with_ack.side_effect = [
+        (None, None),  # own empty
+        (None, None),  # steal w2 empty
+        (None, None),  # steal w3 empty
+        (None, None),  # blocking own timeout
+        (None, None),  # rescan own
+        (b"X", "TOK"),  # rescan w2 -> found
+    ]
+
+    data, token = s.pop_with_ack("q", timeout=2.5)
+
+    assert (data, token) == (b"X", "TOK")
+    assert qb.pop_with_ack.call_count == 6
+
+
 def test_compatible_backend_keeps_published_worker_queue_name():
     """A rolling upgrade reads and writes the existing ``q:worker`` queue in place."""
     cm = MagicMock(name="ConnectionManager")
