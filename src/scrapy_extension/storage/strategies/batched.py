@@ -358,7 +358,20 @@ class BatchedStorageStrategy(StorageStrategy):
                 pass
         else:
             try:
-                self._flush_serialized()
+                try:
+                    self._flush_serialized()
+                except Exception as first_error:
+                    # At-least-once at the final drain: _flush_serialized has
+                    # already re-enqueued the un-written tail into _buffer. Retry
+                    # the drain once so a transient store exception does not strand
+                    # the requeued items when the caller (BackendPipeline) closes
+                    # the backend right after close() returns/raises. Only ordinary
+                    # Exceptions retry -- control BaseExceptions bypass this
+                    # handler and propagate to the outer block (no retry, matching
+                    # the pre-fix control-signal contract).
+                    if not self._buffer:
+                        raise first_error
+                    self._flush_serialized()
             except BaseException as error:
                 if primary_error is None:
                     primary_error = error

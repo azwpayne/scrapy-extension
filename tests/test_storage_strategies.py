@@ -193,6 +193,55 @@ class TestBatchedStorageStrategy:
         backend.store.assert_called_once_with("k1", b"v1", ttl=None)
         assert strat.pending == 0
 
+    def test_close_retries_requeued_tail_after_transient_store_failure(self, mocker):
+        """R74: close() must retry the re-enqueued tail once after a transient
+        mid-drain store Exception, so at-least-once holds at the final drain.
+        Pre-fix: _flush_serialized re-enqueues items 24..49 then re-raises;
+        close() captures+re-raises WITHOUT retrying, so the pipeline closing the
+        backend strands ~25 buffered items (silent loss)."""
+
+        backend = mocker.Mock()
+        calls = {"n": 0}
+
+        def transient_store(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 25:
+                raise RuntimeError("transient blip")
+
+        backend.store.side_effect = transient_store
+        strat = BatchedStorageStrategy(threshold=100)
+        for i in range(50):
+            strat.store(backend, f"k{i}", b"v")
+
+        strat.close()  # pre-fix: raises RuntimeError after 25 calls; post-fix: recovers
+
+        stored_keys = {c.args[0] for c in backend.store.call_args_list}
+        assert stored_keys == {f"k{i}" for i in range(50)}
+        assert strat.pending == 0
+
+    def test_close_does_not_retry_control_signal(self, mocker) -> None:
+        """R74 no-regression: a control BaseException (KeyboardInterrupt) from
+        the drain is NOT retried (only ordinary store Exceptions retry) and IS
+        re-raised -- the operator's signal is preserved."""
+
+        backend = mocker.Mock()
+        calls = {"n": 0}
+
+        def interrupting_store(*args, **kwargs):
+            calls["n"] += 1
+            raise KeyboardInterrupt("ctrl-c during store")
+
+        backend.store.side_effect = interrupting_store
+        strat = BatchedStorageStrategy(threshold=100)
+        strat.store(backend, "k1", b"v1")
+        strat.store(backend, "k2", b"v2")
+
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c during store"):
+            strat.close()
+
+        # one drain only (no retry): the KI bypassed the inner except Exception
+        assert calls["n"] == 1
+
     def test_close_waits_for_inflight_threshold_flush(self, mocker) -> None:
         backend = mocker.Mock()
         store_entered = threading.Event()
