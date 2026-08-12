@@ -1432,6 +1432,10 @@ class BackendDupeFilter:
         """Discard transient failed-push allowances at lifecycle boundaries."""
         with self._retry_allowance_lock:
             self._retry_allowances.clear()
+            # Reset the one-shot advisory latch alongside the LRU it guards so a
+            # close->open cycle in the same process can re-emit the overflow
+            # warning (mirrors ``_volatile_fingerprint_overflow_warned`` below).
+            self._retry_allowance_overflow_warned = False
         self._pending_reservations.clear()
         self._active_reservations.clear()
         self._reservations_by_owner.clear()

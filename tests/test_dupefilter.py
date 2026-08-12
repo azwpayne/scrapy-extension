@@ -736,6 +736,59 @@ class TestBackendDupeFilterForget:
         assert dupefilter.request_seen(requests[1]) is False
         assert dupefilter.request_seen(requests[2]) is False
 
+    def test_clear_retry_allowances_resets_overflow_warning_latch(
+        self, mock_connection_manager
+    ):
+        # ``_clear_retry_allowances`` runs at open/close/clear boundaries and
+        # must reset the one-shot advisory latch alongside the LRU it guards --
+        # otherwise a close->open cycle in the same process leaves the latch
+        # True and the overflow warning never re-fires for later spiders.
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+        dupefilter._retry_allowance_overflow_warned = True
+
+        dupefilter._clear_retry_allowances()
+
+        assert dupefilter._retry_allowance_overflow_warned is False
+
+    def test_retry_allowance_overflow_warning_refires_after_clear(
+        self, mock_connection_manager, caplog
+    ):
+        # A close->open cycle (open/close/clear all call _clear_retry_allowances)
+        # must let the advisory warning fire again for a later overflow episode,
+        # not latch True for the whole process lifetime.
+        dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
+        dupefilter._retry_allowance_limit = 1
+        logger_name = "scrapy_extension.dupefilter.dupefilter"
+
+        def _grant_two() -> None:
+            # First grant fills the bound-1 LRU; second grant evicts -> overflow.
+            dupefilter._grant_retry_allowance(b"fp-a")
+            dupefilter._grant_retry_allowance(b"fp-b")
+
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            _grant_two()
+
+        assert dupefilter._retry_allowance_overflow_warned is True
+        first_count = sum(
+            1
+            for record in caplog.records
+            if "retry allowances reached" in record.message
+        )
+        assert first_count == 1
+
+        dupefilter._clear_retry_allowances()
+        assert dupefilter._retry_allowance_overflow_warned is False
+
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            _grant_two()
+
+        total_count = sum(
+            1
+            for record in caplog.records
+            if "retry allowances reached" in record.message
+        )
+        assert total_count == 2
+
 
 class TestBackendDupeFilterRequestFingerprint:
     """Test BackendDupeFilter request_fingerprint method."""
