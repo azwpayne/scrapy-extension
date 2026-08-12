@@ -570,6 +570,7 @@ class PulsarBackend(Backend, QueueBackend):
                     self._last_delivery = None
                     with self._in_flight_lock:
                         self._in_flight.clear()
+                        self._in_flight_overflow_warned = False
                     # Invalidate in-flight producer/consumer creations that observed
                     # this client before the post-publication failure was noticed.
                     self._lifecycle_generation += 1
@@ -610,6 +611,7 @@ class PulsarBackend(Backend, QueueBackend):
             self._last_delivery = None
             with self._in_flight_lock:
                 self._in_flight.clear()
+                self._in_flight_overflow_warned = False
         handles = [*consumers.values(), *producers.values()]
         if client is not None:
             handles.append(client)

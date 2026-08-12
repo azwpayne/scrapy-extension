@@ -557,6 +557,7 @@ class SqsBackend(Backend, QueueBackend):
                 self._last_receipt = None
                 self._last_receipt_epoch = None
                 self._last_receipt_generation_key = None
+                self._in_flight_overflow_warned = False
             if generation is not None:
                 generation.queue_urls.clear()
                 generation.queue_resolution_locks.clear()

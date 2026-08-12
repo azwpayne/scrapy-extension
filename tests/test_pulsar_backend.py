@@ -462,6 +462,34 @@ class TestPulsarConnect:
         client.close.assert_called_once()
         assert b.is_connected() is False
 
+    def test_in_flight_overflow_warning_flag_resets_on_disconnect(self, mocker) -> None:
+        """R90: the one-shot in-flight-overflow warning flag must reset on disconnect,
+        mirroring R89/rabbitmq (d2269be). _in_flight is cleared on disconnect (room for a
+        chronic ack-leak to recur), so the flag must reset alongside it -- a reconnect then
+        re-warns on the next overflow, not stay latched for the process lifetime."""
+        b, _ = _connected(mocker)
+        b._in_flight_overflow_warned = True  # a prior overflow warned
+
+        b.disconnect()
+
+        assert b._in_flight_overflow_warned is False
+
+    def test_in_flight_overflow_warning_flag_resets_on_abort_failed_connect(
+        self, mocker
+    ) -> None:
+        """R90: the connect-failure rollback (_abort_failed_connect) also resets the flag,
+        so a reconnect attempt after a failed connect re-enables the warning (distinct from
+        the disconnect path)."""
+        b = _make_backend()
+        client = mocker.MagicMock()
+        b._client = client
+        b._lifecycle_generation = 5
+        b._in_flight_overflow_warned = True
+
+        b._abort_failed_connect(client, published_generation=5)
+
+        assert b._in_flight_overflow_warned is False
+
     def test_disconnect_closes_all_topic_consumers(self, mocker) -> None:
         consumer_a = mocker.MagicMock(name="consumer_a")
         consumer_a.receive.side_effect = pulsar.Timeout("empty a")

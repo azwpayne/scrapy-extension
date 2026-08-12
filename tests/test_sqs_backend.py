@@ -440,6 +440,18 @@ class TestSqsConnect:
         client.close.assert_called_once()
         assert b.is_connected() is False
 
+    def test_in_flight_overflow_warning_flag_resets_on_disconnect(self, mocker) -> None:
+        """R90: the one-shot in-flight-overflow warning flag must reset on disconnect,
+        mirroring R89/rabbitmq (d2269be). _in_flight is cleared on disconnect (room for a
+        chronic ack-leak to recur), so the flag must reset alongside it -- a reconnect then
+        re-warns on the next overflow, not stay latched for the process lifetime."""
+        b, _ = _connected(mocker)
+        b._in_flight_overflow_warned = True  # a prior overflow warned
+
+        b.disconnect()
+
+        assert b._in_flight_overflow_warned is False
+
     def test_disconnect_swallows_close_error_when_diagnostic_interrupts(
         self, mocker
     ) -> None:
