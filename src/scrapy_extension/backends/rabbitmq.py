@@ -322,6 +322,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._last_delivery_tag = None
         self._last_delivery_queue = None
         self._in_flight_tags.clear()
+        self._in_flight_overflow_warned = False
         self._pending_deliveries.clear()
         self._channel_generation += 1
         self._connection = connection
@@ -349,6 +350,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._last_delivery_tag = None
         self._last_delivery_queue = None
         self._in_flight_tags.clear()
+        self._in_flight_overflow_warned = False
         self._pending_deliveries.clear()
         return channel, connection
 

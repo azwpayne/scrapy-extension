@@ -178,6 +178,37 @@ def test_rabbitmq_backend_ssl_warning_debounces_across_reconnects(mocker, caplog
     assert len(ssl_warnings) == 1, "SSL warning must fire exactly once per instance"
 
 
+def test_in_flight_overflow_warning_flag_resets_on_detach() -> None:
+    """R89: the one-shot in-flight-overflow warning flag must reset when the ack
+    session is detached (reconnect teardown), mirroring ``_in_flight_tags`` and the
+    other reconnect-scoped fields ``_detach_handles_locked`` clears. Unlike the SSL
+    warning (a static config condition that correctly persists per-instance), the
+    overflow is a transient runtime condition tied to ``_in_flight_tags`` -- a
+    recurring ack-leak after reconnect must re-warn, not stay latched for the
+    process lifetime."""
+    backend = RabbitMQBackend(RabbitMQSettings())
+    backend._in_flight_overflow_warned = True  # a prior overflow warned
+
+    backend._detach_handles_locked()
+
+    assert backend._in_flight_overflow_warned is False
+
+
+def test_in_flight_overflow_warning_flag_resets_on_publish_handles(mocker) -> None:
+    """R89 hardening: the connect path (_publish_handles_locked) also resets the
+    overflow flag, so a reconnect via ``connect()`` re-enables the warning."""
+    backend = RabbitMQBackend(RabbitMQSettings())
+    backend._in_flight_overflow_warned = True
+
+    backend._publish_handles_locked(
+        connection=mocker.MagicMock(),
+        channel=mocker.MagicMock(),
+        snapshot=None,
+    )
+
+    assert backend._in_flight_overflow_warned is False
+
+
 def test_rabbitmq_backend_no_warning_when_ssl_enabled(mocker, caplog):
     """R2-B3: ssl_enabled=True produces no cleartext warning."""
     import logging
