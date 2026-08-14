@@ -157,6 +157,38 @@ def test_pop_with_ack_rechecks_lower_buckets_after_blocking_p0_timeout():
     assert qb.pop_with_ack.call_count == 6
 
 
+def test_pop_with_ack_returns_tombstone_token_from_bucket_scan():
+    """R133: a (None, token) delivery from the non-blocking bucket scan is a
+    broker tombstone whose token BackendQueue._pop must settle -- the strategy
+    returns it instead of swallowing it (a swallowed token pins the Kafka
+    commit watermark at the tombstone offset forever)."""
+    s, qb = _strategy(levels=3)
+    qb.pop_with_ack.side_effect = [(None, "TOMB"), (b"X", "TOK"), (b"X", "TOK")]
+
+    assert s.pop_with_ack("q", timeout=0.0) == (None, "TOMB")
+    assert qb.pop_with_ack.call_count == 1
+
+
+def test_pop_with_ack_returns_tombstone_token_from_blocking_p0_wait():
+    """R133: the blocking p0 arm must propagate a (None, token) tombstone
+    delivery for settlement instead of gating on data-only and re-scanning."""
+    s, qb = _strategy(levels=3)
+    qb.pop_with_ack.side_effect = [
+        (None, None),  # scan p0
+        (None, None),  # scan p1
+        (None, None),  # scan p2
+        (None, "TOMB"),  # blocking p0 -> tombstone delivery
+        (None, None),  # (re-scan arms only run if the tombstone were swallowed)
+        (None, None),
+        (None, None),
+    ]
+
+    data, token = s.pop_with_ack("q", timeout=2.5)
+
+    assert (data, token) == (None, "TOMB")
+    assert qb.pop_with_ack.call_count == 4
+
+
 # ---------------------------------------------------------------------------
 # push — priority → level mapping
 # ---------------------------------------------------------------------------
