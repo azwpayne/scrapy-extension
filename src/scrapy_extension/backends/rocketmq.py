@@ -539,7 +539,22 @@ class RocketMQBackend(Backend, QueueBackend):
                 queue_name=queue_name,
                 operation="pop",
             ) from e
-        self._subscribed_topics.add(topic_name)
+        # disconnect()/_abort_partial_connect() clear _subscribed_topics and
+        # replace the consumer under _connection_lock; a subscribe that was in
+        # flight during that teardown must not record into the new generation's
+        # set — that would permanently skip subscribe on the live consumer.
+        with self._connection_lock:
+            if self._consumer is not consumer:
+                reconnected = True
+            else:
+                reconnected = False
+                self._subscribed_topics.add(topic_name)
+        if reconnected:
+            raise QueueError(
+                f"RocketMQ reconnected while subscribing to queue {queue_name}; retry pop",
+                queue_name=queue_name,
+                operation="pop",
+            )
 
     @queue_operation_error_boundary(
         "push",

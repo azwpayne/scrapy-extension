@@ -116,3 +116,34 @@ def test_receive_raises_when_consumer_becomes_none_after_connect_check(mocker) -
     mocker.patch.object(backend, "is_connected", return_value=True)
     with pytest.raises(QueueError, match="consumer is None"):
         backend._receive_message("q", 0.0)
+
+
+def test_subscribe_in_flight_reconnect_does_not_poison_subscribed_topics(
+    mocker,
+) -> None:
+    """A disconnect completing while ``subscribe()`` is in flight (R132 Finding A)
+    must not record the topic into the new generation's cleared set — that would
+    permanently skip subscribe on the live consumer. ``_receive_message`` must
+    raise a clean retryable ``QueueError`` and leave ``_subscribed_topics``
+    empty."""
+    backend = _connected_backend(mocker)
+    consumer = backend._consumer
+
+    def _subscribe_then_disconnect(topic_name):
+        backend.disconnect()
+        return None
+
+    consumer.subscribe.side_effect = _subscribe_then_disconnect
+    with pytest.raises(QueueError, match="reconnected"):
+        backend._receive_message("q", 0.0)
+    assert backend._subscribed_topics == set()
+
+
+def test_subscribe_records_topic_when_generation_stable(mocker) -> None:
+    """Happy path: when no reconnect races the subscribe, the topic IS recorded
+    in ``_subscribed_topics`` and the receive proceeds without error."""
+    backend = _connected_backend(mocker)
+    backend._consumer.receive.return_value = []
+    backend._receive_message("q", 0.0)
+    assert backend._get_topic_name("q") in backend._subscribed_topics
+    backend._consumer.subscribe.assert_called_once_with(backend._get_topic_name("q"))
