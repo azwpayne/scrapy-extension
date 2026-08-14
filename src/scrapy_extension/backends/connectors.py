@@ -54,6 +54,7 @@ from scrapy_extension.backends.base import (
     _QueuePushReceipt,
 )
 from scrapy_extension.backends.circuit_breaker import (
+    CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
     CircuitBreaker,
     CircuitBreakerOpenError,
 )
@@ -71,6 +72,11 @@ from scrapy_extension.exceptions import (
 )
 from scrapy_extension.exceptions._redaction import configuration_error_boundary
 from scrapy_extension.monitor.base import Monitor, NullMonitor
+from scrapy_extension.utils._config import (
+    parse_bool_setting,
+    parse_float_setting,
+    parse_int_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,13 +125,6 @@ _CONNECTION_MANAGER_SCOPE_KEY = "__connection_manager_queue_scope"
 _CONSUMER_SCOPED_BACKENDS: frozenset[str] = frozenset(
     {BackendType.KAFKA.value, BackendType.ROCKETMQ.value}
 )
-_CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS: frozenset[str] = frozenset(
-    {
-        *_CONNECTION_MANAGER_INTERNAL_KEYS.values(),
-        *_CONNECTION_MANAGER_DIRECT_KEYS.values(),
-        _CONNECTION_MANAGER_SCOPE_KEY,
-    }
-)
 _CONNECTION_MANAGER_SCRAPY_KEYS: dict[str, str] = {
     "retry_attempts": "SCRAPY_RETRY_ATTEMPTS",
     "retry_delay": "SCRAPY_RETRY_DELAY",
@@ -134,9 +133,35 @@ _CONNECTION_MANAGER_DEFAULTS: dict[str, int | float] = {
     "retry_attempts": 3,
     "retry_delay": 1.0,
 }
+_CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS: dict[str, str] = {
+    "enabled": "__connection_manager_circuit_breaker_enabled",
+    "failure_threshold": "__connection_manager_circuit_breaker_failure_threshold",
+    "reset_timeout": "__connection_manager_circuit_breaker_reset_timeout",
+}
+_CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS: dict[str, str] = {
+    "enabled": "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+    "failure_threshold": "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+    "reset_timeout": "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
+}
+_CONNECTION_MANAGER_CIRCUIT_BREAKER_DEFAULTS: dict[str, bool | int | float] = {
+    "enabled": False,
+    "failure_threshold": 5,
+    "reset_timeout": 30.0,
+}
+_CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS: frozenset[str] = frozenset(
+    {
+        *_CONNECTION_MANAGER_INTERNAL_KEYS.values(),
+        *_CONNECTION_MANAGER_DIRECT_KEYS.values(),
+        *_CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS.values(),
+        _CONNECTION_MANAGER_SCOPE_KEY,
+    }
+)
 _MANAGER_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
     {
         "SCRAPY_BACKEND_TYPE",
+        "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+        "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
         "api_key",
         "backend_settings",
         "retry_attempts",
@@ -149,6 +174,9 @@ _RESOLVED_BACKEND_SETTING_NAMES: frozenset[str] = frozenset(
         "SCRAPY_QUEUE_BACKEND_TYPE",
         "SCRAPY_SET_BACKEND_TYPE",
         "SCRAPY_STORAGE_BACKEND_TYPE",
+        "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+        "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
         "backend_settings",
     }
 )
@@ -742,9 +770,80 @@ def _merge_connection_manager_settings(
                 _CONNECTION_MANAGER_DEFAULTS[public_name],
             )
 
+    manager_settings.update(_resolve_circuit_breaker_policy(settings))
     merged_backend_settings.update(merged_nested_settings)
     merged_backend_settings.update(manager_settings)
     return merged_backend_settings
+
+
+def _resolve_circuit_breaker_policy(
+    settings: Any,
+) -> dict[str, bool | int | float]:
+    """Resolve explicit Scrapy breaker values before their environment fallback.
+
+    No source means the manager retains its existing lazy ``Settings`` fallback;
+    the absent internal keys therefore represent the all-default policy without
+    changing the public backend-settings mapping returned by the resolver.
+    """
+    raw_values: dict[str, object] = {}
+    has_source = False
+    for (
+        policy_name,
+        scrapy_key,
+    ) in _CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS.items():
+        value = settings.get(scrapy_key)
+        if value is None:
+            value = os.environ.get(scrapy_key)
+        if value is not None:
+            has_source = True
+        raw_values[policy_name] = (
+            _CONNECTION_MANAGER_CIRCUIT_BREAKER_DEFAULTS[policy_name]
+            if value is None
+            else value
+        )
+
+    if not has_source:
+        return {}
+
+    enabled, failure_threshold, reset_timeout = _parse_circuit_breaker_policy(
+        raw_values["enabled"],
+        raw_values["failure_threshold"],
+        raw_values["reset_timeout"],
+    )
+    return {
+        _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS["enabled"]: enabled,
+        _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS[
+            "failure_threshold"
+        ]: failure_threshold,
+        _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS["reset_timeout"]: (
+            reset_timeout
+        ),
+    }
+
+
+def _parse_circuit_breaker_policy(
+    raw_enabled: object,
+    raw_failure_threshold: object,
+    raw_reset_timeout: object,
+) -> tuple[bool, int, float]:
+    """Parse one breaker policy with the Settings-model bounds."""
+    return (
+        parse_bool_setting(
+            raw_enabled,
+            _CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS["enabled"],
+        ),
+        parse_int_setting(
+            raw_failure_threshold,
+            _CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS["failure_threshold"],
+            minimum=1,
+        ),
+        parse_float_setting(
+            raw_reset_timeout,
+            _CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS["reset_timeout"],
+            minimum=0.0,
+            maximum=CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S,
+        ),
+    )
 
 
 def _unknown_backend_setting(
@@ -1350,10 +1449,10 @@ class ConnectionManager:
         # without changing the independent direct-connect path.
         self._lazy_connection_context = _LazyConnectionContext()
         # Circuit-breaker holder. Lazily constructed on first
-        # ``get_*_backend()`` call from the env-loaded ``Settings``
-        # (``SCRAPY_CIRCUIT_BREAKER_ENABLED``). ``None`` while disabled — which
-        # is the default, so the default path returns the raw backend with zero
-        # overhead and byte-identical behavior.
+        # ``get_*_backend()`` call from the resolved Scrapy policy, or from the
+        # env-loaded ``Settings`` when this manager was constructed directly.
+        # ``None`` while disabled — which is the default, so the default path
+        # returns the raw backend with zero overhead and byte-identical behavior.
         self._breaker: CircuitBreaker | None = None
         self._breaker_configured: bool = False
         # R14-D: observability monitor for connection-lifecycle hooks
@@ -2468,7 +2567,7 @@ class ConnectionManager:
         return backend.is_connected()
 
     def _get_breaker(self) -> CircuitBreaker | None:
-        """Lazily resolve the per-manager circuit breaker from env settings.
+        """Lazily resolve the per-manager circuit breaker policy.
 
         Reads the breaker config once (``SCRAPY_CIRCUIT_BREAKER_ENABLED`` +
         threshold + reset-timeout) and caches the result on the instance:
@@ -2480,31 +2579,35 @@ class ConnectionManager:
           shared by every wrapped interface returned from this manager, so a
           queue+set+storage on the same backend share one failure signal.
 
-        The Settings object is constructed lazily (deferred to first use so the
-        pydantic env scan does not run at import time — important because this
-        module is imported eagerly via ``backends/__init__`` and the env may not
-        be fully populated at import time). The config read runs OUTSIDE
+        A manager created through ``resolve_backend_config`` receives a parsed,
+        private Scrapy policy. Directly constructed managers retain the lazy
+        ``Settings`` environment fallback. That fallback runs OUTSIDE
         ``self._lock`` (initiative #15): the env scan is process-global
         idempotent state, not connection-manager state, and this lock is shared
-        with ``get_manager()`` / ``close()`` / the A2 slow-path owner gate —
-        holding it across the scan serialized peer threads' warm-up. A lost race
-        constructs a second transient ``Settings()`` (GC'd); correct, and cheaper
-        than blocking every peer on the lock.
+        with ``get_manager()`` / ``close()`` / the A2 slow-path owner gate.
 
         Returns:
             The manager's breaker, or ``None`` when the feature is disabled.
         """
         if self._breaker_configured:
             return self._breaker
-        # Read the breaker config OUTSIDE self._lock (#15). Imported lazily to
-        # avoid a settings-module import cycle at module load time and to keep
-        # the breaker config read deferred to first use.
-        from scrapy_extension.settings import Settings
+        policy_keys = _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS
+        if all(key in self.settings for key in policy_keys.values()):
+            enabled, failure_threshold, reset_timeout = _parse_circuit_breaker_policy(
+                self.settings[policy_keys["enabled"]],
+                self.settings[policy_keys["failure_threshold"]],
+                self.settings[policy_keys["reset_timeout"]],
+            )
+        else:
+            # Read the breaker config OUTSIDE self._lock (#15). Imported lazily
+            # to avoid a settings-module import cycle at module load time and to
+            # keep the direct-construction fallback deferred to first use.
+            from scrapy_extension.settings import Settings
 
-        settings = Settings()
-        enabled = settings.circuit_breaker_enabled
-        failure_threshold = settings.circuit_breaker_failure_threshold
-        reset_timeout = settings.circuit_breaker_reset_timeout
+            settings = Settings()
+            enabled = settings.circuit_breaker_enabled
+            failure_threshold = settings.circuit_breaker_failure_threshold
+            reset_timeout = settings.circuit_breaker_reset_timeout
         with self._lock:
             if self._breaker_configured:
                 return self._breaker

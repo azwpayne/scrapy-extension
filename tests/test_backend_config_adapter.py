@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from scrapy.settings import Settings as ScrapySettings
 
 from scrapy_extension.backends import connectors
@@ -16,6 +16,8 @@ pytestmark = pytest.mark.unit
 
 class _PluginRetrySettings(BaseModel):
     """Plugin model whose public retry names must not be stolen by the manager."""
+
+    model_config = ConfigDict(extra="forbid")
 
     endpoint: str
     retry_attempts: int
@@ -196,6 +198,7 @@ def test_plugin_retry_fields_remain_backend_owned_and_manager_aliases_win(
                 "manager_retry_attempts": 2,
                 "manager_retry_delay": 0.25,
             },
+            "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
         }
     )
 
@@ -213,6 +216,152 @@ def test_plugin_retry_fields_remain_backend_owned_and_manager_aliases_win(
         "retry_delay": 9.5,
     }
     assert manager._retry_policy() == (2, 0.25)
+
+
+def test_scrapy_breaker_enabled_without_environment_configures_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in connectors._CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS.values():
+        monkeypatch.delenv(key, raising=False)
+    settings = ScrapySettings(
+        {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+            "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 2,
+            "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 4.5,
+        }
+    )
+
+    backend_type, backend_settings = _resolve_queue(settings)
+    manager = connectors.ConnectionManager.get_manager(backend_type, backend_settings)
+    try:
+        breaker = manager._get_breaker()
+
+        assert breaker is not None
+        assert breaker.failure_threshold == 2
+        assert breaker.reset_timeout == 4.5
+    finally:
+        manager.close()
+
+
+def test_scrapy_breaker_disabled_overrides_enabled_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "2")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT", "4.5")
+    settings = ScrapySettings(
+        {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_CIRCUIT_BREAKER_ENABLED": False,
+        }
+    )
+
+    backend_type, backend_settings = _resolve_queue(settings)
+    manager = connectors.ConnectionManager.get_manager(backend_type, backend_settings)
+    try:
+        assert manager._get_breaker() is None
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    ("environment_values", "expected_enabled"),
+    [
+        (
+            {
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": "true",
+                "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": "3",
+                "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": "6.5",
+            },
+            True,
+        ),
+        ({}, False),
+    ],
+)
+def test_unset_scrapy_breaker_settings_use_environment_or_default(
+    monkeypatch: pytest.MonkeyPatch,
+    environment_values: dict[str, str],
+    expected_enabled: bool,
+) -> None:
+    for key in connectors._CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS.values():
+        monkeypatch.delenv(key, raising=False)
+    for key, value in environment_values.items():
+        monkeypatch.setenv(key, value)
+
+    backend_type, backend_settings = _resolve_queue(
+        ScrapySettings({"SCRAPY_BACKEND_TYPE": "redis"})
+    )
+    manager = connectors.ConnectionManager.get_manager(backend_type, backend_settings)
+    try:
+        breaker = manager._get_breaker()
+
+        assert (breaker is not None) is expected_enabled
+        if breaker is not None:
+            assert breaker.failure_threshold == 3
+            assert breaker.reset_timeout == 6.5
+    finally:
+        manager.close()
+
+
+def test_direct_manager_retains_breaker_environment_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT", "6.5")
+    manager = connectors.ConnectionManager("redis")
+    try:
+        breaker = manager._get_breaker()
+
+        assert breaker is not None
+        assert breaker.failure_threshold == 3
+        assert breaker.reset_timeout == 6.5
+    finally:
+        manager.close()
+
+
+def test_breaker_policy_partitions_connection_manager_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in connectors._CONNECTION_MANAGER_CIRCUIT_BREAKER_SCRAPY_KEYS.values():
+        monkeypatch.delenv(key, raising=False)
+    base_settings = {
+        "SCRAPY_BACKEND_TYPE": "redis",
+        "SCRAPY_REDIS_HOST": "shared-redis.internal",
+    }
+    disabled_type, disabled_settings = _resolve_queue(
+        ScrapySettings(
+            {
+                **base_settings,
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": False,
+            }
+        )
+    )
+    enabled_type, enabled_settings = _resolve_queue(
+        ScrapySettings(
+            {
+                **base_settings,
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+            }
+        )
+    )
+
+    disabled_manager = connectors.ConnectionManager.get_manager(
+        disabled_type,
+        disabled_settings,
+    )
+    enabled_manager = connectors.ConnectionManager.get_manager(
+        enabled_type,
+        enabled_settings,
+    )
+    try:
+        assert disabled_manager is not enabled_manager
+        assert disabled_manager._get_breaker() is None
+        assert enabled_manager._get_breaker() is not None
+    finally:
+        disabled_manager.close()
+        enabled_manager.close()
 
 
 def test_non_pydantic_settings_class_safely_skips_flat_extraction(
