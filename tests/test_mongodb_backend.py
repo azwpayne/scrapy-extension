@@ -2,6 +2,7 @@ import logging
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
+from unittest.mock import PropertyMock
 
 import pytest
 
@@ -2710,3 +2711,97 @@ def test_mongodb_valid_names_pass_validation(mocker):
     backend.queue_len("scheduler:queue")
     backend.set_len("dedup:spider.name")
     backend.exists("items:a-b_c.1")
+
+
+def test_mongodb_pop_collection_none_between_guard_and_use_is_not_attribute_error(
+    mocker,
+):
+    """R132 Finding B: a concurrent ``_discard_client()`` landing between the
+    ``_queue_collection`` None-guard and the call site must not surface a raw
+    ``AttributeError`` (mirrors the rocketmq TOCTOU convention).
+
+    A class-level PropertyMock shadows the instance attribute so every read is
+    programmable: successive reads return [stub, stub, None]. ``_assert_connected()``
+    consumes the first read, the None-guard passes on the second, and the use
+    site reads None — i.e. a concurrent discard landed in the check-to-use
+    window. The call must not raise AttributeError; a typed
+    QueueError/BackendConnectionError or clean success are all acceptable."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+    mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+    backend.connect()
+    stub_collection = mocker.MagicMock()
+    stub_collection.find_one_and_delete.return_value = None
+
+    mock_property = mocker.patch.object(
+        MongoDBBackend, "_queue_collection", new_callable=PropertyMock, create=True
+    )
+    mock_property.side_effect = [stub_collection, stub_collection, None]
+    try:
+        backend.pop("test_queue")
+    except AttributeError:
+        pytest.fail(
+            "pop surfaced a raw AttributeError when a concurrent disconnect "
+            "landed between the None-guard and the call site"
+        )
+    except (QueueError, BackendConnectionError):
+        pass  # Typed degradation is acceptable.
+    stub_collection.find_one_and_delete.assert_called_once()
+
+
+def test_mongodb_add_collection_none_between_guard_and_use_is_not_attribute_error(
+    mocker,
+):
+    """R132 Finding B sibling: same simulated discard window for a set op on
+    ``_set_collection`` — the None-guard read returns the stub, the use-site
+    read returns None. ``add`` must not raise a raw ``AttributeError``."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+    mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+    backend.connect()
+    stub_collection = mocker.MagicMock()
+    stub_collection.insert_one.return_value = mocker.MagicMock()
+
+    mock_property = mocker.patch.object(
+        MongoDBBackend, "_set_collection", new_callable=PropertyMock, create=True
+    )
+    mock_property.side_effect = [stub_collection, stub_collection, None]
+    try:
+        backend.add("test_set", b"item")
+    except AttributeError:
+        pytest.fail(
+            "add surfaced a raw AttributeError when a concurrent disconnect "
+            "landed between the None-guard and the call site"
+        )
+    except (BackendConnectionError, QueueError):
+        pass  # Typed degradation is acceptable.
+    stub_collection.insert_one.assert_called_once()
+
+
+def test_mongodb_store_collection_none_between_guard_and_use_is_not_attribute_error(
+    mocker,
+):
+    """R132 Finding B sibling: same simulated discard window for a storage op
+    on ``_storage_collection`` — the None-guard read returns the stub, the
+    use-site read returns None. ``store`` must not raise a raw
+    ``AttributeError``."""
+    config = MongoDBSettings()
+    backend = MongoDBBackend(config)
+    mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+    backend.connect()
+    stub_collection = mocker.MagicMock()
+
+    mock_property = mocker.patch.object(
+        MongoDBBackend, "_storage_collection", new_callable=PropertyMock, create=True
+    )
+    mock_property.side_effect = [stub_collection, stub_collection, None]
+    try:
+        backend.store("test_key", b"data")
+    except AttributeError:
+        pytest.fail(
+            "store surfaced a raw AttributeError when a concurrent disconnect "
+            "landed between the None-guard and the call site"
+        )
+    except (BackendConnectionError, StorageError):
+        pass  # Typed degradation is acceptable.
+    stub_collection.replace_one.assert_called_once()

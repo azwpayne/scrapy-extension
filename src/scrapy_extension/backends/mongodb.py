@@ -1050,7 +1050,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         self._assert_connected()
-        if self._queue_collection is None:
+        queue_collection = self._queue_collection
+        if queue_collection is None:
             msg = "MongoDBBackend not connected: queue collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         doc = {
@@ -1060,7 +1061,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             "created_at": datetime.now(tz=timezone.utc),
         }
         try:
-            self._queue_collection.insert_one(doc)
+            queue_collection.insert_one(doc)
         except PyMongoError as e:
             msg = f"Failed to push to queue {queue_name}: {e}"
             raise QueueError(msg, queue_name=queue_name, operation="push") from e
@@ -1087,12 +1088,13 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         self._assert_connected()
-        if self._queue_collection is None:
+        queue_collection = self._queue_collection
+        if queue_collection is None:
             msg = "MongoDBBackend not connected: queue collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
             # MongoDB doesn't support blocking pop, so we ignore timeout
-            result = self._queue_collection.find_one_and_delete(
+            result = queue_collection.find_one_and_delete(
                 {"queue_name": queue_name},
                 sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
             )
@@ -1140,11 +1142,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         self._assert_connected()
-        if self._queue_collection is None:
+        queue_collection = self._queue_collection
+        if queue_collection is None:
             msg = "MongoDBBackend not connected: queue collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            return self._queue_collection.count_documents(
+            return queue_collection.count_documents(
                 {"queue_name": queue_name}, limit=100000
             )
         except PyMongoError as e:
@@ -1169,11 +1172,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         self._assert_connected()
-        if self._queue_collection is None:
+        queue_collection = self._queue_collection
+        if queue_collection is None:
             msg = "MongoDBBackend not connected: queue collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            self._queue_collection.delete_many({"queue_name": queue_name})
+            queue_collection.delete_many({"queue_name": queue_name})
         except PyMongoError as e:
             msg = f"Failed to clear queue {queue_name}: {e}"
             raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
@@ -1199,7 +1203,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         self._assert_connected()
-        if self._set_collection is None:
+        set_collection = self._set_collection
+        if set_collection is None:
             msg = "MongoDBBackend not connected: set collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         doc = {
@@ -1209,7 +1214,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             "created_at": datetime.now(tz=timezone.utc),
         }
         try:
-            self._set_collection.insert_one(doc)
+            set_collection.insert_one(doc)
         except DuplicateKeyError:
             return False
         except PyMongoError as e:
@@ -1243,11 +1248,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         self._assert_connected()
-        if self._set_collection is None:
+        set_collection = self._set_collection
+        if set_collection is None:
             msg = "MongoDBBackend not connected: set collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = self._set_collection.delete_one(
+            result = set_collection.delete_one(
                 {
                     "set_name": set_name,
                     "item_hash": _hash_item(item),
@@ -1280,11 +1286,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         self._assert_connected()
-        if self._set_collection is None:
+        set_collection = self._set_collection
+        if set_collection is None:
             msg = "MongoDBBackend not connected: set collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = self._set_collection.find_one(
+            result = set_collection.find_one(
                 {
                     "set_name": set_name,
                     "item_hash": _hash_item(item),
@@ -1317,13 +1324,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         self._assert_connected()
-        if self._set_collection is None:
+        set_collection = self._set_collection
+        if set_collection is None:
             msg = "MongoDBBackend not connected: set collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            return self._set_collection.count_documents(
-                {"set_name": set_name}, limit=100000
-            )
+            return set_collection.count_documents({"set_name": set_name}, limit=100000)
         except PyMongoError as e:
             raise BackendConnectionError(
                 f"MongoDB set length failed for {set_name!r}: {e}",
@@ -1348,11 +1354,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         self._assert_connected()
-        if self._set_collection is None:
+        set_collection = self._set_collection
+        if set_collection is None:
             msg = "MongoDBBackend not connected: set collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            self._set_collection.delete_many({"set_name": set_name})
+            set_collection.delete_many({"set_name": set_name})
         except PyMongoError as e:
             # R-rclears-mongo: wrap operational PyMongoError (parity with add
             # R-dupe-1 #38 + redis clear_set #71) so BackendDupeFilter's
@@ -1388,7 +1395,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         _validate_key_name(key, "key")
         _validate_ttl(ttl)
         self._assert_connected()
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         doc: dict[str, Any] = {
@@ -1399,7 +1407,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             doc["expireAt"] = datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
 
         try:
-            self._storage_collection.replace_one(
+            storage_collection.replace_one(
                 {"key": key},
                 doc,
                 upsert=True,
@@ -1428,7 +1436,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         if remaining is None or remaining > 0:
             return False
 
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         reap_failed = False
@@ -1436,7 +1445,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # The read snapshot may be stale: a concurrent store() can replace the
             # same key before this delete runs. Matching the observed expireAt makes
             # the cleanup a CAS, so a fresh replacement is not removed.
-            self._storage_collection.delete_one(
+            storage_collection.delete_one(
                 {"key": key, "expireAt": document["expireAt"]}
             )
         except PyMongoError:
@@ -1475,11 +1484,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         self._assert_connected()
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = self._storage_collection.find_one({"key": key})
+            result = storage_collection.find_one({"key": key})
             if result and self._lazy_reap_expired_storage(result, key):
                 return None
         except PyMongoError as e:
@@ -1511,11 +1521,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         self._assert_connected()
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = self._storage_collection.delete_one({"key": key})
+            result = storage_collection.delete_one({"key": key})
         except PyMongoError as e:
             msg = f"Failed to delete key {key!r} in MongoDB: {e}"
             raise StorageError(msg, operation="delete", key=key) from e
@@ -1542,11 +1553,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         self._assert_connected()
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = self._storage_collection.find_one(
+            result = storage_collection.find_one(
                 {"key": key}, {"_id": 1, "expireAt": 1}
             )
             if result and self._lazy_reap_expired_storage(result, key):
@@ -1577,11 +1589,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         self._assert_connected()
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = self._storage_collection.find_one({"key": key}, {"expireAt": 1})
+            result = storage_collection.find_one({"key": key}, {"expireAt": 1})
         except PyMongoError as e:
             msg = f"Failed to read TTL of key {key!r} in MongoDB: {e}"
             raise StorageError(msg, operation="ttl", key=key) from e
@@ -1615,19 +1628,20 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         if prefix is not None:
             _validate_key_name(prefix, "prefix")
         self._assert_connected()
-        if self._storage_collection is None:
+        storage_collection = self._storage_collection
+        if storage_collection is None:
             msg = "MongoDBBackend not connected: storage collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         if prefix:
             pattern = re.escape(prefix)
             try:
-                self._storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
+                storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
             except PyMongoError as e:
                 msg = f"Failed to clear MongoDB storage (prefix={prefix!r}): {e}"
                 raise StorageError(msg, operation="clear_storage", key=None) from e
         else:
             try:
-                self._storage_collection.delete_many(
+                storage_collection.delete_many(
                     {"_id": {"$ne": _CAPABILITY_DOMAIN_MARKER_ID}}
                 )
             except PyMongoError as e:
