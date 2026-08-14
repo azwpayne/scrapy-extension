@@ -378,10 +378,11 @@ acquire is independent of whether the item pipeline is enabled. A legacy
 queue-only global configuration with no storage component continues to skip
 snapshots best-effort.
 
-Without an owner, the logical snapshot key remains:
+Without an owner, the logical snapshot key is now a length-prefixed v3
+identity:
 
 ```text
-queue:snapshot:<spider-name>:<queue-name>
+queue:snapshot:v3:<spider-length>:<spider>:<queue-length>:<queue>
 ```
 
 With `SCRAPY_QUEUE_SNAPSHOT_OWNER=<owner>` (or the
@@ -392,12 +393,30 @@ v2 identity:
 queue:snapshot:v2:<owner-length>:<owner>:<spider-length>:<spider>:<queue>
 ```
 
-Every worker using a stateful queue strategy must have a stable, unique owner.
-Enabling an owner does not consume or delete the old unowned snapshot. Decide
-while workers are stopped whether to restore the old state once, transform it
-to the owner-specific key, or discard it.
+A v3 checkpoint is preferred. The package automatically checks the old
+`queue:snapshot:<queue>` form only when there is no named spider and the queue
+name contains no `:`; after a successful v3 store or delete it retires that
+eligible old key. If a checkpoint update fails before legacy retirement, it
+leaves the old key untouched. For a clean empty checkpoint, it first writes a
+separate private empty marker for the v3 identity, deletes the v3 checkpoint,
+then retires the eligible old key, and finally removes the marker. If the
+marker persists after an interruption, it blocks legacy fallback only when the
+v3 checkpoint is absent rather than replaying the old checkpoint.
 
-A successful restore retains its checkpoint until a later clean close writes
+Do not rely on automatic recovery of old named-spider keys such as
+`queue:snapshot:<spider>:<queue>`, or of any old key with `:` in its unscoped
+queue name. The old delimiter format cannot distinguish a named `(spider,
+queue)` pair from an unscoped queue named `<spider>:<queue>` (and colon-bearing
+components add more possible splits). To avoid restoring or deleting another
+queue's checkpoint, the upgrade deliberately leaves those ambiguous keys
+untouched. While all workers are stopped, drain them with the old package or
+perform an explicit, operator-verified migration to the intended v3/v2 key.
+
+Every worker using a stateful queue strategy should have a stable, unique owner.
+Enabling an owner does not consume an old unowned snapshot automatically; decide
+while workers are stopped whether to drain, transform, or discard that state.
+
+A successful restore retains its v3 checkpoint until a later clean close writes
 the current state or deletes the key after a clean drain. A crash during that
 interval replays the prior checkpoint: completed work can repeat, but pending
 work is not lost. Keep callbacks idempotent and alert on checkpoint store/delete

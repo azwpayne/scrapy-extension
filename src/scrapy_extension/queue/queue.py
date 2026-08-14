@@ -65,6 +65,11 @@ _QUEUE_POP_MONITOR_FAILURE = "Queue pop deserialization failed."
 #: was uncapped, restore was capped → asymmetric data-loss trap).
 _MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 
+#: Opaque payload for the private key that fences an eligible legacy snapshot
+#: during an empty-state transition. Presence of the separate key, not this
+#: value, is authoritative so arbitrary strategy snapshot bytes stay valid.
+_EMPTY_SNAPSHOT_TOMBSTONE_MARKER = b"1"
+
 #: Meta key carrying the backend ack token from pop → request → response → ack.
 #: Atomic-pop backends set this to ``None`` (harmless); message-queue backends
 #: set it to an opaque token bound to the issuing backend incarnation and
@@ -156,8 +161,10 @@ class BackendQueue:
                 without code changes (round-12 U2 left it stuck at the default).
             snapshot_owner: Optional stable worker identity used to isolate
                 in-process strategy snapshots in multi-worker deployments. When
-                omitted, the legacy spider+queue key is preserved for single-worker
-                compatibility. Multi-worker callers should keep this value stable
+                omitted, a delimiter-safe v3 spider+queue key is used. A missing
+                v3 checkpoint falls back only for a safely attributable unscoped
+                pre-v3 key, then retires it after the next successful clean
+                checkpoint. Multi-worker callers should keep this value stable
                 across restarts and unique per worker.
             snapshot_connection_manager: Optional storage-capable connection manager
                 used only to restore and persist in-process strategy snapshots.
@@ -1258,26 +1265,23 @@ class BackendQueue:
         if primary_error is not None:
             raise primary_error
 
-    #: Storage-key prefix for strategy snapshots (initiative #3). Legacy key is
-    #: ``<prefix><spider.name>:<queue_name>`` when a named spider is attached
-    #: (initiative #16 — one snapshot per spider+queue, so two spiders sharing
-    #: a storage backend with the same ``queue_name`` cannot overwrite each
-    #: other's snapshot), or ``<prefix><queue_name>`` when no named spider is
-    #: present (test stubs, no-spider construction — pre-#16 shape). When a
-    #: stable snapshot owner is configured, a length-prefixed v2 identity adds
-    #: worker isolation without delimiter collisions. No TTL:
-    #: the snapshot is cheap to overwrite and represents last-shutdown state.
+    #: Storage-key prefix for strategy snapshots (initiative #3). The default
+    #: v3 identity length-prefixes both spider and queue components so valid
+    #: colon-bearing names cannot collide. A configured stable snapshot owner
+    #: keeps its existing v2 identity for compatibility. Legacy fallback is only
+    #: safe for unscoped names without ``:``; a named old key can also name an
+    #: unscoped queue. No TTL: the snapshot is cheap to overwrite and represents
+    #: last-shutdown state.
     _SNAPSHOT_KEY_PREFIX = "queue:snapshot:"
+    _SNAPSHOT_TOMBSTONE_KEY_PREFIX = "queue:snapshot-tombstone:"
 
     def _snapshot_key(self) -> str:
         """Build the storage key for this queue's strategy snapshot.
 
         Includes the spider name when available so different spiders do not share
-        state. When ``snapshot_owner`` is configured, also includes that stable
-        worker identity using length-prefixed components; this prevents workers of
-        the same spider from clobbering one another and avoids ambiguous ``:``
-        delimiters inside otherwise-valid names. Without an owner, preserves the
-        pre-v2 spider+queue key shape for single-worker compatibility.
+        state. When ``snapshot_owner`` is configured, preserves the existing v2
+        worker identity. Otherwise v3 length-prefixes both logical components so
+        valid ``:`` characters cannot make distinct spider/queue pairs collide.
         """
         spider_name = getattr(self._spider, "name", None)
         if self._snapshot_owner is not None:
@@ -1287,9 +1291,32 @@ class BackendQueue:
                 f"{self._SNAPSHOT_KEY_PREFIX}v2:{len(owner)}:{owner}:"
                 f"{len(spider_component)}:{spider_component}:{self.queue_name}"
             )
-        if spider_name:
-            return f"{self._SNAPSHOT_KEY_PREFIX}{spider_name}:{self.queue_name}"
+        spider_component = str(spider_name) if spider_name else ""
+        return (
+            f"{self._SNAPSHOT_KEY_PREFIX}v3:{len(spider_component)}:{spider_component}:"
+            f"{len(self.queue_name)}:{self.queue_name}"
+        )
+
+    def _legacy_snapshot_key(self) -> str | None:
+        """Return the only safely attributable pre-v3 key for compatibility.
+
+        A named legacy identity ``<spider>:<queue>`` can also be the unscoped
+        queue name ``<spider>:<queue>``. The old blob contains no owner metadata,
+        so no named identity can prove that it owns the key. An unscoped name is
+        unique only when it contains no ``:``. Leave all other legacy values
+        untouched rather than loading or deleting another queue's checkpoint.
+        """
+        if self._snapshot_owner is not None:
+            return None
+        spider_name = getattr(self._spider, "name", None)
+        if spider_name or ":" in self.queue_name:
+            return None
         return f"{self._SNAPSHOT_KEY_PREFIX}{self.queue_name}"
+
+    def _empty_snapshot_tombstone_key(self) -> str:
+        """Build the private marker key for an empty legacy-migration transition."""
+        snapshot_identity = self._snapshot_key().removeprefix(self._SNAPSHOT_KEY_PREFIX)
+        return f"{self._SNAPSHOT_TOMBSTONE_KEY_PREFIX}{snapshot_identity}"
 
     def _persist_snapshot(self) -> None:
         """Persist the strategy's in-process state on close (initiative #3).
@@ -1297,12 +1324,16 @@ class BackendQueue:
         Calls ``strategy.snapshot()``; non-None bytes replace the prior snapshot,
         while ``None`` deletes any stale snapshot left by an earlier run. Without
         the delete, a clean run that drains all restored items can replay them on
-        the next restart. The optional ``snapshot_connection_manager`` lets a
-        queue-only backend use the configured storage component; otherwise a
-        storage-incapable manager raises ``NotImplementedError`` and the snapshot
-        is skipped. Connection managers without a ``get_storage_backend``
-        attribute (e.g. test stubs) also skip. Best-effort: any failure is logged,
-        never crashes :meth:`close`.
+        the next restart. After a successful v3 update, an eligible legacy key is
+        retired too; an empty state first writes a private tombstone so a failed
+        legacy delete cannot make old work replay. If an update fails before
+        retirement, the legacy key is not deleted; a persisted tombstone fails
+        closed rather than replaying it. The optional
+        ``snapshot_connection_manager`` lets a queue-only backend use the
+        configured storage component; otherwise a storage-incapable manager raises
+        ``NotImplementedError`` and the snapshot is skipped. Connection managers
+        without a ``get_storage_backend`` attribute (e.g. test stubs) also skip.
+        Best-effort: any failure is logged, never crashes :meth:`close`.
         """
         snapshot_failed = False
         try:
@@ -1377,17 +1408,47 @@ class BackendQueue:
                 )
             except BaseException:
                 pass
+        legacy_snapshot_key = self._legacy_snapshot_key()
+        tombstone_key = self._empty_snapshot_tombstone_key()
+        uses_empty_tombstone = state is None and legacy_snapshot_key is not None
         snapshot_update_failed = False
         try:
-            if state is None:
+            if uses_empty_tombstone:
+                storage.store(tombstone_key, _EMPTY_SNAPSHOT_TOMBSTONE_MARKER)
+                storage.delete(snapshot_key)
+            elif state is None:
                 storage.delete(snapshot_key)
             else:
                 storage.store(snapshot_key, state)
-        except Exception:  # noqa: BLE001 — store must not crash close
+        except Exception:  # noqa: BLE001 — snapshot update must not crash close
             snapshot_update_failed = True
         if snapshot_update_failed:
             try:
                 logger.error("Failed to update strategy snapshot; continuing")
+            except BaseException:
+                pass
+            return
+        if legacy_snapshot_key is None:
+            return
+        legacy_cleanup_failed = False
+        try:
+            storage.delete(legacy_snapshot_key)
+        except Exception:  # noqa: BLE001 — migration cleanup must not crash close
+            legacy_cleanup_failed = True
+        if legacy_cleanup_failed:
+            try:
+                logger.error("Failed to retire legacy strategy snapshot; continuing")
+            except BaseException:
+                pass
+            return
+        tombstone_delete_failed = False
+        try:
+            storage.delete(tombstone_key)
+        except Exception:  # noqa: BLE001 — tombstone cleanup must not crash close
+            tombstone_delete_failed = True
+        if tombstone_delete_failed:
+            try:
+                logger.error("Failed to remove empty strategy snapshot tombstone")
             except BaseException:
                 pass
 
@@ -1399,7 +1460,9 @@ class BackendQueue:
         storage until a later clean close atomically replaces it with the current
         state (or deletes it after a clean drain). Retaining it makes a crash after
         restore replay-safe: already-processed entries may repeat, but unprocessed
-        entries cannot disappear with the only checkpoint. An injected
+        entries cannot disappear with the only checkpoint. When a v3 checkpoint
+        is absent, an eligible legacy fallback first checks the separate empty
+        marker so an interrupted clean drain cannot replay old state. An injected
         ``snapshot_connection_manager`` can provide storage for a queue-only
         backend; otherwise storage-incapable managers and connection managers
         without ``get_storage_backend`` skip silently. Only real
@@ -1440,6 +1503,37 @@ class BackendQueue:
             except BaseException:
                 pass
             return
+        legacy_snapshot_key = self._legacy_snapshot_key()
+        if state is None and legacy_snapshot_key is not None:
+            tombstone_retrieval_failed = False
+            try:
+                tombstone = storage.retrieve(self._empty_snapshot_tombstone_key())
+            except Exception:  # noqa: BLE001 — tombstone failure must not replay legacy
+                tombstone_retrieval_failed = True
+            if tombstone_retrieval_failed:
+                try:
+                    logger.error(
+                        "Failed to retrieve empty strategy snapshot tombstone; "
+                        "starting clean"
+                    )
+                except BaseException:
+                    pass
+                return
+            if tombstone is not None:
+                return
+            legacy_retrieval_failed = False
+            try:
+                state = storage.retrieve(legacy_snapshot_key)
+            except Exception:  # noqa: BLE001 — legacy migration must not crash startup
+                legacy_retrieval_failed = True
+            if legacy_retrieval_failed:
+                try:
+                    logger.error(
+                        "Failed to retrieve legacy strategy snapshot; starting clean"
+                    )
+                except BaseException:
+                    pass
+                return
         # Only restore real bytes — None (no prior snapshot) or any non-bytes
         # value (unexpected type / mock) is a no-op, never passed to restore().
         if not isinstance(state, (bytes, bytearray)):
@@ -1470,3 +1564,4 @@ class BackendQueue:
                 logger.error("Strategy snapshot restore failed; starting clean")
             except BaseException:
                 pass
+            return

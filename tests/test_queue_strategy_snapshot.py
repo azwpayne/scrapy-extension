@@ -16,18 +16,23 @@ import base64
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from scrapy.http import Request
 
 from scrapy_extension.exceptions import QueueError
-from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.queue import (
+    _EMPTY_SNAPSHOT_TOMBSTONE_MARKER,
+    BackendQueue,
+)
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 
-_SNAPSHOT_KEY = "queue:snapshot:q"
+_SNAPSHOT_KEY = "queue:snapshot:v3:0::1:q"
+_SNAPSHOT_TOMBSTONE_KEY = "queue:snapshot-tombstone:v3:0::1:q"
+_LEGACY_SNAPSHOT_KEY = "queue:snapshot:q"
 
 
 def _delay(
@@ -259,6 +264,14 @@ def _stateful_storage(initial: dict[str, bytes]):
     storage.store.side_effect = lambda key, value: state.__setitem__(key, value)
     storage.delete.side_effect = lambda key: state.pop(key, None)
     return storage, state
+
+
+def _legacy_delay_snapshot() -> bytes:
+    source = _delay(clock_value=100.0)
+    source.push("q", b"legacy-recovered", delay=10.0)
+    state = source.snapshot()
+    assert state is not None
+    return state
 
 
 def _wired_cm(storage=None, queue_backend=None):
@@ -540,6 +553,324 @@ def test_backends_queue_init_restores_snapshot():
     storage.delete.assert_not_called()
 
 
+def test_backends_queue_restores_marker_like_v3_snapshot_bytes():
+    """A strategy's arbitrary snapshot bytes are never interpreted as a marker."""
+    marker_like_state = b"\x00scrapy-extension:empty-snapshot:v3"
+    storage = _storage_mock(retrieve_return=marker_like_state)
+    cm = _wired_cm(storage=storage)
+    strategy = MagicMock(name="OpaqueBytesStrategy")
+
+    BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    strategy.restore.assert_called_once_with(marker_like_state)
+
+
+def test_backends_queue_marker_retrieval_failure_skips_legacy_fallback():
+    """A marker read error must not resurrect the legacy checkpoint."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+
+    def retrieve(key: str):
+        if key == _SNAPSHOT_TOMBSTONE_KEY:
+            raise RuntimeError("marker storage unavailable")
+        return state.get(key)
+
+    storage.retrieve.side_effect = retrieve
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+
+    BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    assert strategy._holding == []
+    assert storage.retrieve.call_args_list == [
+        call(_SNAPSHOT_KEY),
+        call(_SNAPSHOT_TOMBSTONE_KEY),
+    ]
+
+
+def test_backends_queue_restores_legacy_snapshot_when_v3_is_missing():
+    """An upgrade restores and retires an existing legacy checkpoint."""
+    legacy_state = _legacy_delay_snapshot()
+    legacy_key = _LEGACY_SNAPSHOT_KEY
+    storage, state = _stateful_storage({legacy_key: legacy_state})
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+
+    queue = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    assert len(strategy._holding) == 1
+    assert strategy._holding[0][2] == b"legacy-recovered"
+    storage.retrieve.assert_has_calls(
+        [
+            call(queue._snapshot_key()),
+            call(_SNAPSHOT_TOMBSTONE_KEY),
+            call(legacy_key),
+        ]
+    )
+    queue.close()
+    assert queue._snapshot_key() in state
+    assert legacy_key not in state
+
+
+def test_backends_queue_prefers_v3_snapshot_over_legacy_snapshot():
+    """A current checkpoint must prevent a stale legacy checkpoint from replaying."""
+    current = _delay(clock_value=100.0)
+    current.push("q", b"v3", delay=10.0)
+    current_state = current.snapshot()
+    assert current_state is not None
+    storage, _state = _stateful_storage(
+        {
+            _SNAPSHOT_KEY: current_state,
+            _LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot(),
+        }
+    )
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+
+    BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    assert len(strategy._holding) == 1
+    assert strategy._holding[0][2] == b"v3"
+    storage.retrieve.assert_called_once_with(_SNAPSHOT_KEY)
+
+
+@pytest.mark.parametrize(
+    ("spider", "queue_name", "legacy_key"),
+    [
+        (SimpleNamespace(name="a"), "b", "queue:snapshot:a:b"),
+        (SimpleNamespace(name="a:b"), "c", "queue:snapshot:a:b:c"),
+        (SimpleNamespace(name="a"), "b:c", "queue:snapshot:a:b:c"),
+        (None, "a:b:c", "queue:snapshot:a:b:c"),
+    ],
+    ids=[
+        "scoped-collides-with-unscoped",
+        "colon-in-spider",
+        "colon-in-queue",
+        "colon-in-unscoped-queue",
+    ],
+)
+def test_backends_queue_skips_non_unique_legacy_snapshot(
+    spider, queue_name: str, legacy_key: str
+):
+    """A non-unique legacy identity must not restore or delete another queue."""
+    storage, state = _stateful_storage({legacy_key: _legacy_delay_snapshot()})
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+    queue = BackendQueue(
+        connection_manager=cm,
+        queue_name=queue_name,
+        spider=spider,
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    assert strategy._holding == []
+    storage.retrieve.assert_called_once_with(queue._snapshot_key())
+
+    queue.close()
+
+    assert legacy_key in state
+    storage.delete.assert_called_once_with(queue._snapshot_key())
+
+
+def test_backends_queue_empty_close_retires_restored_legacy_snapshot():
+    """A clean empty checkpoint deletes both v3 and the restored legacy key."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+    queue = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    queue.clear()
+    queue.close()
+
+    assert _SNAPSHOT_KEY not in state
+    assert _LEGACY_SNAPSHOT_KEY not in state
+    tombstone_key = queue._empty_snapshot_tombstone_key()
+    storage.store.assert_called_once_with(
+        tombstone_key,
+        _EMPTY_SNAPSHOT_TOMBSTONE_MARKER,
+    )
+    assert storage.delete.call_args_list == [
+        call(_SNAPSHOT_KEY),
+        call(_LEGACY_SNAPSHOT_KEY),
+        call(tombstone_key),
+    ]
+
+
+@pytest.mark.parametrize(
+    "clear_before_close",
+    [False, True],
+    ids=["stateful-checkpoint", "empty-tombstone"],
+)
+def test_backends_queue_keeps_legacy_snapshot_when_v3_checkpoint_store_fails(
+    clear_before_close: bool,
+):
+    """A failed v3 update leaves the only successful legacy checkpoint intact."""
+    legacy_state = _legacy_delay_snapshot()
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: legacy_state})
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+    queue = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    if clear_before_close:
+        queue.clear()
+    storage.store.side_effect = RuntimeError("v3 store failed")
+
+    queue.close()
+
+    assert state[_LEGACY_SNAPSHOT_KEY] == legacy_state
+    assert _SNAPSHOT_KEY not in state
+
+
+def test_backends_queue_retries_legacy_cleanup_after_v3_restart():
+    """A stale legacy key cannot replay after its first cleanup attempt fails."""
+    legacy_state = _legacy_delay_snapshot()
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: legacy_state})
+    legacy_delete_failed_once = False
+
+    def delete(key: str) -> None:
+        nonlocal legacy_delete_failed_once
+        if key == _LEGACY_SNAPSHOT_KEY and not legacy_delete_failed_once:
+            legacy_delete_failed_once = True
+            raise RuntimeError("legacy delete failed")
+        state.pop(key, None)
+
+    storage.delete.side_effect = delete
+    cm = _wired_cm(storage=storage)
+
+    first = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=_delay(clock_value=100.0),
+        monitor=MagicMock(),
+    )
+    first.close()
+
+    assert _SNAPSHOT_KEY in state
+    assert _LEGACY_SNAPSHOT_KEY in state
+
+    second_strategy = _delay(clock_value=100.0)
+    second = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=second_strategy,
+        monitor=MagicMock(),
+    )
+
+    assert len(second_strategy._holding) == 1
+    assert storage.retrieve.call_args_list == [
+        call(_SNAPSHOT_KEY),
+        call(_SNAPSHOT_TOMBSTONE_KEY),
+        call(_LEGACY_SNAPSHOT_KEY),
+        call(_SNAPSHOT_KEY),
+    ]
+
+    second.clear()
+    second.close()
+
+    assert _SNAPSHOT_KEY not in state
+    assert _LEGACY_SNAPSHOT_KEY not in state
+
+    third_strategy = _delay(clock_value=100.0)
+    BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=third_strategy,
+        monitor=MagicMock(),
+    )
+
+    assert third_strategy._holding == []
+
+
+def test_empty_checkpoint_tombstone_blocks_legacy_replay_after_retirement_failure():
+    """A failed legacy delete after an empty close cannot resurrect old work."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+
+    def delete(key: str) -> None:
+        if key == _LEGACY_SNAPSHOT_KEY:
+            raise RuntimeError("legacy delete failed")
+        state.pop(key, None)
+
+    storage.delete.side_effect = delete
+    cm = _wired_cm(storage=storage)
+    first = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=_delay(clock_value=100.0),
+        monitor=MagicMock(),
+    )
+
+    first.clear()
+    first.close()
+
+    tombstone_key = first._empty_snapshot_tombstone_key()
+    assert _SNAPSHOT_KEY not in state
+    assert state[tombstone_key] == _EMPTY_SNAPSHOT_TOMBSTONE_MARKER
+    assert _LEGACY_SNAPSHOT_KEY in state
+
+    second_strategy = _delay(clock_value=100.0)
+    second = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=second_strategy,
+        monitor=MagicMock(),
+    )
+
+    assert second_strategy._holding == []
+    assert storage.retrieve.call_args_list == [
+        call(_SNAPSHOT_KEY),
+        call(first._empty_snapshot_tombstone_key()),
+        call(_LEGACY_SNAPSHOT_KEY),
+        call(_SNAPSHOT_KEY),
+        call(first._empty_snapshot_tombstone_key()),
+    ]
+
+    storage.delete.side_effect = lambda key: state.pop(key, None)
+    second.close()
+
+    assert _SNAPSHOT_KEY not in state
+    assert _LEGACY_SNAPSHOT_KEY not in state
+
+    third_strategy = _delay(clock_value=100.0)
+    BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=third_strategy,
+        monitor=MagicMock(),
+    )
+
+    assert third_strategy._holding == []
+
+
 def test_backends_queue_uses_injected_snapshot_manager_only_for_snapshot_io():
     """An external snapshot manager must not replace the queue manager.
 
@@ -569,7 +900,13 @@ def test_backends_queue_uses_injected_snapshot_manager_only_for_snapshot_io():
     queue.close()
 
     queue_manager.get_storage_backend.assert_not_called()
-    snapshot_storage.retrieve.assert_called_once_with(_SNAPSHOT_KEY)
+    snapshot_storage.retrieve.assert_has_calls(
+        [
+            call(_SNAPSHOT_KEY),
+            call(_SNAPSHOT_TOMBSTONE_KEY),
+            call(_LEGACY_SNAPSHOT_KEY),
+        ]
+    )
     snapshot_storage.store.assert_called_once_with(
         _SNAPSHOT_KEY,
         expected_snapshot,
@@ -614,15 +951,23 @@ def test_restored_snapshot_survives_crash_until_clean_checkpoint():
 
 
 def test_backends_queue_close_deletes_stale_snapshot_when_strategy_is_empty():
-    """An empty clean close must invalidate any snapshot from an earlier run."""
+    """An empty clean close invalidates the current and eligible legacy keys."""
     storage = _storage_mock()
     cm = _wired_cm(storage=storage)
     bq = BackendQueue(connection_manager=cm, queue_name="q", monitor=MagicMock())
 
     bq.close()
 
-    storage.store.assert_not_called()
-    storage.delete.assert_called_once_with(_SNAPSHOT_KEY)
+    tombstone_key = bq._empty_snapshot_tombstone_key()
+    storage.store.assert_called_once_with(
+        tombstone_key,
+        _EMPTY_SNAPSHOT_TOMBSTONE_MARKER,
+    )
+    assert storage.delete.call_args_list == [
+        call(_SNAPSHOT_KEY),
+        call(_LEGACY_SNAPSHOT_KEY),
+        call(tombstone_key),
+    ]
 
 
 def test_backends_queue_storage_incapable_skips_cleanly():
@@ -761,18 +1106,36 @@ def test_snapshot_key_includes_spider_name():
     assert key_b.endswith(":jobs")
 
 
-def test_snapshot_key_without_spider_preserves_legacy_shape():
-    """A queue constructed without a spider keeps the pre-#16 key
-    ``queue:snapshot:<queue_name>`` — backward-compat for the no-spider
-    construction path used by the rest of this test module and by test stubs.
-    """
+def test_default_snapshot_key_distinguishes_colon_delimited_components():
+    """Distinct spider/queue pairs must never share a recovery checkpoint."""
+    first = _make_queue_for_key(
+        spider=SimpleNamespace(name="a:b"),
+        queue_name="c",
+    )
+    second = _make_queue_for_key(
+        spider=SimpleNamespace(name="a"),
+        queue_name="b:c",
+    )
+
+    assert first._snapshot_key() != second._snapshot_key()
+
+
+def test_snapshot_key_without_spider_uses_v3_identity():
+    """A queue without a spider still uses an injective v3 checkpoint key."""
     key = _make_queue_for_key(spider=None, queue_name="jobs")._snapshot_key()
-    assert key == "queue:snapshot:jobs"
+    assert key == "queue:snapshot:v3:0::4:jobs"
+
+
+def test_empty_snapshot_tombstone_uses_a_separate_namespace():
+    """The migration marker must never collide with a legacy snapshot key."""
+    queue = _make_queue_for_key(spider=None, queue_name="q")
+
+    assert queue._empty_snapshot_tombstone_key() == _SNAPSHOT_TOMBSTONE_KEY
+    assert not queue._empty_snapshot_tombstone_key().startswith("queue:snapshot:")
 
 
 def test_snapshot_key_spider_without_name_attr_falls_back():
-    """A spider-like object without a ``name`` attribute falls back to the
-    queue_name-only key rather than raising ``AttributeError``.
+    """A spider-like object without a ``name`` attribute uses an empty v3 part.
 
     Mirrors the defensive ``getattr`` chaining already used at
     ``queue.py:561`` (``getattr(self._spider, "crawler", None)``).
@@ -780,7 +1143,7 @@ def test_snapshot_key_spider_without_name_attr_falls_back():
     key = _make_queue_for_key(
         spider=SimpleNamespace(), queue_name="jobs"
     )._snapshot_key()
-    assert key == "queue:snapshot:jobs"
+    assert key == "queue:snapshot:v3:0::4:jobs"
 
 
 def test_snapshot_key_isolates_workers_with_stable_owner():
