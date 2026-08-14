@@ -182,6 +182,10 @@ class BackendQueue:
             _validate_key_name(snapshot_owner, "snapshot_owner")
         self._snapshot_owner = snapshot_owner
         self._snapshot_connection_manager = snapshot_connection_manager
+        # One-shot: set when startup could not read an eligible legacy
+        # checkpoint; the next close skips retiring it so a later restart can
+        # still recover the unread pending items.
+        self._defer_legacy_retirement = False
         self._strategy: QueueStrategy = (
             queue_strategy
             if queue_strategy is not None
@@ -1430,17 +1434,33 @@ class BackendQueue:
             return
         if legacy_snapshot_key is None:
             return
-        legacy_cleanup_failed = False
-        try:
-            storage.delete(legacy_snapshot_key)
-        except Exception:  # noqa: BLE001 — migration cleanup must not crash close
-            legacy_cleanup_failed = True
-        if legacy_cleanup_failed:
+        if self._defer_legacy_retirement:
+            # R133: the startup restore could not read this checkpoint;
+            # retiring it now would permanently drop its unread pending items.
+            # Keep it for a later restart (the tombstone cleanup below still
+            # runs so the legacy fallback path stays reachable).
+            self._defer_legacy_retirement = False
             try:
-                logger.error("Failed to retire legacy strategy snapshot; continuing")
+                logger.error(
+                    "Deferring legacy strategy snapshot retirement; "
+                    "checkpoint was unreadable at startup"
+                )
             except BaseException:
                 pass
-            return
+        else:
+            legacy_cleanup_failed = False
+            try:
+                storage.delete(legacy_snapshot_key)
+            except Exception:  # noqa: BLE001 — migration cleanup must not crash close
+                legacy_cleanup_failed = True
+            if legacy_cleanup_failed:
+                try:
+                    logger.error(
+                        "Failed to retire legacy strategy snapshot; continuing"
+                    )
+                except BaseException:
+                    pass
+                return
         tombstone_delete_failed = False
         try:
             storage.delete(tombstone_key)
@@ -1508,18 +1528,21 @@ class BackendQueue:
             tombstone_retrieval_failed = False
             try:
                 tombstone = storage.retrieve(self._empty_snapshot_tombstone_key())
-            except Exception:  # noqa: BLE001 — tombstone failure must not replay legacy
+            except Exception:  # noqa: BLE001 — fall back to legacy below
                 tombstone_retrieval_failed = True
             if tombstone_retrieval_failed:
+                # R133: with the tombstone unreadable we cannot distinguish
+                # present from absent; falling through to the legacy read errs
+                # toward duplicates (invariant-tolerated) while starting clean
+                # would let the next close retire the unread legacy key.
                 try:
                     logger.error(
                         "Failed to retrieve empty strategy snapshot tombstone; "
-                        "starting clean"
+                        "checking legacy checkpoint"
                     )
                 except BaseException:
                     pass
-                return
-            if tombstone is not None:
+            elif tombstone is not None:
                 return
             legacy_retrieval_failed = False
             try:
@@ -1527,6 +1550,7 @@ class BackendQueue:
             except Exception:  # noqa: BLE001 — legacy migration must not crash startup
                 legacy_retrieval_failed = True
             if legacy_retrieval_failed:
+                self._defer_legacy_retirement = True
                 try:
                     logger.error(
                         "Failed to retrieve legacy strategy snapshot; starting clean"

@@ -570,8 +570,12 @@ def test_backends_queue_restores_marker_like_v3_snapshot_bytes():
     strategy.restore.assert_called_once_with(marker_like_state)
 
 
-def test_backends_queue_marker_retrieval_failure_skips_legacy_fallback():
-    """A marker read error must not resurrect the legacy checkpoint."""
+def test_backends_queue_marker_retrieval_failure_falls_back_to_legacy():
+    """R133: a tombstone read error falls through to the legacy checkpoint.
+
+    Starting clean instead would let the next clean close retire the unread
+    legacy key and permanently drop its pending items; replaying errs toward
+    duplicates, which the restore invariant tolerates."""
     storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
 
     def retrieve(key: str):
@@ -590,11 +594,42 @@ def test_backends_queue_marker_retrieval_failure_skips_legacy_fallback():
         monitor=MagicMock(),
     )
 
-    assert strategy._holding == []
+    assert strategy._holding[0][2] == b"legacy-recovered"
     assert storage.retrieve.call_args_list == [
         call(_SNAPSHOT_KEY),
         call(_SNAPSHOT_TOMBSTONE_KEY),
+        call(_LEGACY_SNAPSHOT_KEY),
     ]
+
+
+def test_backends_queue_legacy_read_failure_defers_retirement_on_close():
+    """R133: an unreadable legacy checkpoint starts clean, but the next close
+    must NOT retire the legacy key -- it is kept so a later restart can still
+    recover it (one-shot deferral; the tombstone cleanup still runs so the
+    fallback path stays reachable)."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+
+    def retrieve(key: str):
+        if key == _LEGACY_SNAPSHOT_KEY:
+            raise RuntimeError("legacy storage unavailable")
+        return state.get(key)
+
+    storage.retrieve.side_effect = retrieve
+    cm = _wired_cm(storage=storage)
+    strategy = _delay(clock_value=100.0)
+
+    bq = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+    assert strategy._holding == []
+    bq.close()
+
+    deleted_keys = [c.args[0] for c in storage.delete.call_args_list]
+    assert _LEGACY_SNAPSHOT_KEY not in deleted_keys
+    assert deleted_keys == [_SNAPSHOT_KEY, _SNAPSHOT_TOMBSTONE_KEY]
 
 
 def test_backends_queue_restores_legacy_snapshot_when_v3_is_missing():
