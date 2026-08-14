@@ -163,7 +163,6 @@ executor.type = "uv"
 tasks.full = ["check"]
 tasks.check = ["format-check", "lint-check", "type-check", "security-check"]
 tasks.test = [
-    "clean",
     "test-py310",
     "test-py311",
     "test-py312",
