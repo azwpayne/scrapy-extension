@@ -366,7 +366,7 @@ class DelayQueueStrategy(QueueStrategy):
                 queue_name,
                 timeout,
                 lambda wait: self._pop_backend_with_ack(queue_name, wait),
-                has_item=lambda result: result[0] is not None,
+                has_item=lambda result: result[0] is not None or result[1] is not None,
                 empty=(None, None),
             ),
         )

@@ -1734,6 +1734,28 @@ class TestBackendQueuePop:
             "test_queue", token="tombstone-token"
         )
 
+    @pytest.mark.parametrize(
+        "strategy_type",
+        [DelayQueueStrategy, TimeWheelQueueStrategy],
+    )
+    def test_pop_settles_empty_delivery_token_through_temporal_strategy(
+        self, mock_connection_manager, strategy_type
+    ):
+        """Temporal strategies must preserve a broker tombstone token for the queue."""
+        backend = mock_connection_manager.get_queue_backend()
+        token = object()
+        backend.pop_with_ack.return_value = (None, token)
+        strategy = strategy_type(mock_connection_manager, clock=lambda: 100.0)
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="test_queue",
+            queue_strategy=strategy,
+        )
+
+        assert queue.pop() is None
+
+        backend.ack.assert_called_once_with("test_queue", token=token)
+
     def test_pop_deserializes_and_returns_request(
         self, mock_connection_manager, mock_spider
     ):
