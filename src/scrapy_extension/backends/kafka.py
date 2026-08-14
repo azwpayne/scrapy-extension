@@ -1249,12 +1249,16 @@ class KafkaBackend(Backend, QueueBackend):
             QueueError: If the pop operation fails.
             ValueError: If queue_name contains invalid characters.
         """
-        with self._delivery_lock:
-            record = self._poll_record(queue_name, timeout)
-            if record is None:
-                return None
-            self._last_record = record
-            return cast(bytes, record.value)
+        # Consumer bootstrap reads the connection snapshot. Keep the same lock
+        # order as disconnect() so a first pop cannot hold delivery while waiting
+        # for a concurrent disconnect's connection lock.
+        with self._connection_lock:
+            with self._delivery_lock:
+                record = self._poll_record(queue_name, timeout)
+                if record is None:
+                    return None
+                self._last_record = record
+                return cast(bytes, record.value)
 
     @queue_operation_error_boundary(
         "pop",
@@ -1284,38 +1288,41 @@ class KafkaBackend(Backend, QueueBackend):
         Raises:
             QueueError: If the pop operation fails.
         """
-        with self._delivery_lock:
-            record = self._poll_record(queue_name, timeout)
-            if record is None:
-                return (None, None)
-            self._next_delivery_attempt += 1
-            token = _KafkaAckToken(
-                partition=record.partition,
-                offset=record.offset,
-                topic=record.topic,
-                consumer_generation=self._consumer_generation,
-                assignment_epoch=self._assignment_epoch,
-                delivery_attempt=self._next_delivery_attempt,
-            )
-            topic_partition = (record.topic, record.partition)
-            # KafkaConsumer.position(tp) points at the NEXT record to fetch after a
-            # poll, so it cannot seed the lowest unprocessed offset. Capture the first
-            # record actually handed to the application instead; this is the commit
-            # watermark base for the current in-flight cohort on this topic-partition.
-            self._watermarks.setdefault(topic_partition, record.offset)
-            self._in_flight[topic_partition].add(record.offset)
-            self._active_attempts[self._attempt_key(token)] = token.delivery_attempt
-            # Track the pop frontier so the watermark walk terminates at the highest
-            # popped offset (+1) on this topic-partition — never walks into
-            # not-yet-popped offsets and never runs away on an empty in-flight set.
-            self._high_water[topic_partition] = max(
-                self._high_water.get(topic_partition, 0), record.offset + 1
-            )
-            # Token and legacy settlement modes must not share a bare-commit slot.
-            # Otherwise nack(token) followed by ack(token=None) can commit the nacked
-            # offset through KafkaConsumer.commit().
-            self._last_record = None
-            return (record.value, token)
+        # Match disconnect()'s connection -> delivery order. _poll_record() can
+        # acquire the reentrant connection lock while creating the first consumer.
+        with self._connection_lock:
+            with self._delivery_lock:
+                record = self._poll_record(queue_name, timeout)
+                if record is None:
+                    return (None, None)
+                self._next_delivery_attempt += 1
+                token = _KafkaAckToken(
+                    partition=record.partition,
+                    offset=record.offset,
+                    topic=record.topic,
+                    consumer_generation=self._consumer_generation,
+                    assignment_epoch=self._assignment_epoch,
+                    delivery_attempt=self._next_delivery_attempt,
+                )
+                topic_partition = (record.topic, record.partition)
+                # KafkaConsumer.position(tp) points at the NEXT record to fetch after a
+                # poll, so it cannot seed the lowest unprocessed offset. Capture the first
+                # record actually handed to the application instead; this is the commit
+                # watermark base for the current in-flight cohort on this topic-partition.
+                self._watermarks.setdefault(topic_partition, record.offset)
+                self._in_flight[topic_partition].add(record.offset)
+                self._active_attempts[self._attempt_key(token)] = token.delivery_attempt
+                # Track the pop frontier so the watermark walk terminates at the highest
+                # popped offset (+1) on this topic-partition — never walks into
+                # not-yet-popped offsets and never runs away on an empty in-flight set.
+                self._high_water[topic_partition] = max(
+                    self._high_water.get(topic_partition, 0), record.offset + 1
+                )
+                # Token and legacy settlement modes must not share a bare-commit slot.
+                # Otherwise nack(token) followed by ack(token=None) can commit the nacked
+                # offset through KafkaConsumer.commit().
+                self._last_record = None
+                return (record.value, token)
 
     def _poll_record(self, queue_name: str, timeout: float) -> Any:
         """Poll a single record from ``queue_name``; return None if empty.

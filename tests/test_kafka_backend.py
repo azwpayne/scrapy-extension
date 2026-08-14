@@ -1368,6 +1368,42 @@ class TestKafkaBackendPop:
 
         assert result is None
 
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [("pop", None), ("pop_with_ack", (None, None))],
+    )
+    def test_first_pop_acquires_connection_before_delivery(
+        self, mocker, operation, expected
+    ):
+        """First consumer creation never takes connection after delivery."""
+        backend = KafkaBackend(KafkaSettings())
+        backend._connection_snapshot = backend._capture_connection_snapshot()
+
+        class ConnectionBeforeDeliveryLock:
+            def __init__(self) -> None:
+                self._lock = kafka_module.threading.RLock()
+                self.delivery_then_connection_observed = False
+
+            def __enter__(self):
+                if not self._lock._is_owned() and backend._delivery_lock._is_owned():
+                    self.delivery_then_connection_observed = True
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self._lock.release()
+
+        connection_lock = ConnectionBeforeDeliveryLock()
+        backend._connection_lock = connection_lock
+        consumer = mocker.MagicMock()
+        consumer.poll.return_value = {}
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer", return_value=consumer
+        )
+
+        assert getattr(backend, operation)("testq", timeout=0.0) == expected
+        assert connection_lock.delivery_then_connection_observed is False
+
     def test_pop_subscribes_once_per_topic_not_every_call(self, mocker):
         """R57: pop() re-subscribes only when the topic changes, not every call.
 
