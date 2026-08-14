@@ -497,6 +497,61 @@ def test_attempt_connection_close_wins_preserves_discard_error_when_warning_inte
     assert manager._backend is None
 
 
+def test_connect_with_retries_preserves_release_error_when_close_wins(mocker):
+    """The retry loop keeps the typed release error when close wins the race.
+
+    ``_connect_with_retries`` broad-catches every ordinary connection failure
+    and reports the generic attempt-count tail.  A concurrent ``close()`` that
+    retires the manager mid-attempt is not an ordinary failure: the typed
+    ``BackendConnectionError`` from ``_attempt_connection()`` explains the
+    actionable cause and must surface verbatim instead of being re-wrapped
+    (with a miscounted attempt number) by the generic tail.
+    """
+    import threading
+
+    manager = ConnectionManager(
+        BackendType.REDIS,
+        {"retry_attempts": 1, "retry_delay": 0},
+    )
+    connect_entered = threading.Event()
+    allow_connect_return = threading.Event()
+
+    def _connect() -> None:
+        connect_entered.set()
+        assert allow_connect_return.wait(timeout=5), "test did not release connect"
+
+    backend = mocker.MagicMock()
+    backend.connect.side_effect = _connect
+    mocker.patch.object(manager, "_create_backend", return_value=backend)
+
+    outcome: list[BaseException] = []
+
+    def _connect_with_retries() -> None:
+        try:
+            manager._connect_with_retries([])
+        except BaseException as exc:  # noqa: BLE001 - capture the thread outcome
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_connect_with_retries)
+    worker.start()
+    assert connect_entered.wait(timeout=5), "backend.connect() was not entered"
+
+    # ``close()`` retires the manager while ``backend.connect()`` is still in
+    # flight, so the retry loop deterministically observes a released manager
+    # when the attempt resolves with the typed discard error.
+    manager.close()
+    allow_connect_return.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "connection attempt did not finish"
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], BackendConnectionError)
+    assert "backend discarded" in str(outcome[0])
+    assert "Failed to connect after" not in str(outcome[0])
+    backend.disconnect.assert_called_once_with()
+    assert manager._backend is None
+
+
 def test_attempt_connection_close_wins_logs_after_disconnect_context_unwinds(
     mocker,
 ) -> None:

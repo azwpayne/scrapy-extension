@@ -2059,6 +2059,14 @@ class ConnectionManager:
                 # nothing caught by ``except Exception`` can be an instance of either.)
                 failed_attempt = True
                 attempt_failed = True
+                with self._lock:
+                    retired = self._retired
+                if retired:
+                    # A concurrent close() won the race and detached this
+                    # manager mid-attempt; its typed release error is the
+                    # actionable reason. Re-raise it instead of falling
+                    # through to the generic attempt-count failure.
+                    raise
 
             if attempt_failed:
                 # The driver exception is no longer active here.  Keep continuation
@@ -2068,10 +2076,6 @@ class ConnectionManager:
                     logger.warning,
                     "Connection attempt failed.",
                 )
-                with self._lock:
-                    retired = self._retired
-                if retired:
-                    break
                 if attempt < retry_attempts:
                     # Record each retry while its transaction is serialized. User
                     # callbacks are dispatched only after ``_connect_lock`` is released;
