@@ -131,6 +131,9 @@ This is a minimal but complete plugin exposing all three capabilities
 (queue / set / storage). It uses an in-process dict for storage so it has no
 external dependencies and runs anywhere.
 
+Its queue keeps each `queue_name` isolated, pops higher numeric priorities
+first, and preserves FIFO order among items with equal priority.
+
 ### Project layout
 
 ```
@@ -215,7 +218,7 @@ class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     def __init__(self, settings: MySettings) -> None:
         self._settings = settings
-        self._queue: list[tuple[str, bytes]] = []   # (priority, item)
+        self._queues: dict[str, list[tuple[float, bytes]]] = {}
         self._seen: set[str] = set()
         self._store: dict[str, bytes] = {}
 
@@ -229,19 +232,22 @@ class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     # -- QueueBackend --------------------------------------------------------
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
-        self._queue.append((f"{priority:010.3f}", item))
+        self._queues.setdefault(queue_name, []).append((priority, item))
 
     def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-        if not self._queue:
+        queue = self._queues.get(queue_name)
+        if not queue:
             return None
-        self._queue.sort(key=lambda pair: pair[0])
-        return self._queue.pop(0)[1]
+        # Python's stable sort preserves FIFO order for equal priorities.
+        queue.sort(key=lambda pair: pair[0], reverse=True)
+        return queue.pop(0)[1]
 
     def queue_len(self, queue_name: str) -> int:
-        return len(self._queue)
+        queue = self._queues.get(queue_name)
+        return len(queue) if queue else 0
 
     def clear_queue(self, queue_name: str) -> None:
-        self._queue.clear()
+        self._queues.pop(queue_name, None)
 
     # -- SetBackend ----------------------------------------------------------
     def add(self, set_name: str, item: bytes) -> bool:
@@ -254,8 +260,12 @@ class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     def contains(self, set_name: str, item: bytes) -> bool:
         return f"{set_name}:{item.hex()}" in self._seen
 
-    def remove(self, set_name: str, item: bytes) -> None:
-        self._seen.discard(f"{set_name}:{item.hex()}")
+    def remove(self, set_name: str, item: bytes) -> bool:
+        key = f"{set_name}:{item.hex()}"
+        if key not in self._seen:
+            return False
+        self._seen.remove(key)
+        return True
 
     def set_len(self, set_name: str) -> int:
         prefix = f"{set_name}:"
@@ -273,7 +283,9 @@ class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         return self._store.get(key)
 
     def delete(self, key: str) -> bool:
-        self._store.pop(key, None)
+        if key not in self._store:
+            return False
+        del self._store[key]
         return True
 
     def exists(self, key: str) -> bool:
