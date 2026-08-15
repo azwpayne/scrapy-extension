@@ -1460,6 +1460,15 @@ class ConnectionManager:
         # returns the raw backend with zero overhead and byte-identical behavior.
         self._breaker: CircuitBreaker | None = None
         self._breaker_configured: bool = False
+        # R137: HOW the breaker was resolved, and from which values. The
+        # env-fallback marker lets an explicit Scrapy policy (applied after a
+        # pre-crawler first use cached the disabled default) OVERRIDE that
+        # fallback, while an already-explicit resolution keeps first-write-wins
+        # semantics on shared managers. The parsed values power the
+        # dropped-differing-policy warning.
+        self._breaker_resolved_from_env_fallback: bool = False
+        self._breaker_policy_values: tuple[bool, int, float] | None = None
+        self._dropped_breaker_policy_warned: bool = False
         # R14-D: observability monitor for connection-lifecycle hooks
         # (on_connect / on_disconnect / on_retry). Defaults to NullMonitor so the
         # hooks are no-ops unless a caller (scheduler / dupefilter factory) threads
@@ -2607,6 +2616,7 @@ class ConnectionManager:
                 self.settings[policy_keys["failure_threshold"]],
                 self.settings[policy_keys["reset_timeout"]],
             )
+            from_env_fallback = False
         else:
             # Read the breaker config OUTSIDE self._lock (#15). Imported lazily
             # to avoid a settings-module import cycle at module load time and to
@@ -2617,45 +2627,112 @@ class ConnectionManager:
             enabled = settings.circuit_breaker_enabled
             failure_threshold = settings.circuit_breaker_failure_threshold
             reset_timeout = settings.circuit_breaker_reset_timeout
+            from_env_fallback = True
         with self._lock:
             if self._breaker_configured:
                 return self._breaker
-            bt_key = (
-                self.backend_type.value
-                if isinstance(self.backend_type, BackendType)
-                else self.backend_type
+            self._install_breaker_locked(
+                enabled,
+                failure_threshold,
+                reset_timeout,
+                from_env_fallback=from_env_fallback,
             )
-            if enabled:
-                self._breaker = CircuitBreaker(
-                    name=f"{bt_key}-backend",
-                    failure_threshold=failure_threshold,
-                    reset_timeout=reset_timeout,
-                    failure_exceptions=(BackendError,),
-                )
-            else:
-                self._breaker = None
-            self._breaker_configured = True
             return self._breaker
 
+    def _install_breaker_locked(
+        self,
+        enabled: bool,
+        failure_threshold: int,
+        reset_timeout: float,
+        *,
+        from_env_fallback: bool,
+    ) -> None:
+        """Configure the breaker latch; caller MUST hold ``self._lock``.
+
+        Shared by :meth:`_get_breaker` and :meth:`apply_scrapy_breaker_policy`
+        so both paths construct identical breakers and record the same
+        resolution provenance.
+        """
+        bt_key = (
+            self.backend_type.value
+            if isinstance(self.backend_type, BackendType)
+            else self.backend_type
+        )
+        if enabled:
+            self._breaker = CircuitBreaker(
+                name=f"{bt_key}-backend",
+                failure_threshold=failure_threshold,
+                reset_timeout=reset_timeout,
+                failure_exceptions=(BackendError,),
+            )
+        else:
+            self._breaker = None
+        self._breaker_configured = True
+        self._breaker_resolved_from_env_fallback = from_env_fallback
+        self._breaker_policy_values = (enabled, failure_threshold, reset_timeout)
+
     def apply_scrapy_breaker_policy(self, settings: Any) -> None:
-        """Fold Scrapy-level breaker settings into this manager post-acquisition.
+        """Fold an explicit Scrapy breaker policy into this manager post-acquisition.
 
         Companion to :func:`resolve_circuit_breaker_policy` for managers that
-        were acquired before the Scrapy crawler existed — the spider mixin's
-        documented early-setup pattern calls ``setup_backend()`` in
-        ``__init__``, so the acquisition-time fold cannot see crawler settings
-        and :meth:`_get_breaker` would otherwise cache the env-only fallback
-        forever, silently disabling a Scrapy-configured breaker. A no-op when
-        no source exists anywhere or the breaker has already been resolved
-        (post-hoc application is only meaningful before first use).
+        were acquired (or first used) before the Scrapy crawler existed — the
+        spider mixin's documented early-setup pattern calls
+        ``setup_backend()`` in ``__init__``, so the acquisition-time fold
+        cannot see crawler settings. The breaker is installed DIRECTLY under
+        ``_lock``: ``self.settings`` is never mutated, because the registry key
+        is the hash of the settings snapshot at registration time and
+        :meth:`close` recomputes it at release — a post-hoc mutation would
+        break eviction and resurrect retired managers (R137-F1).
+
+        Resolution precedence:
+
+        - unresolved → the explicit policy installs.
+        - resolved from the lazy env fallback (a pre-crawler first backend use
+          cached the disabled default) → the explicit policy OVERRIDES it;
+          without this, a Scrapy-configured breaker silently never engages
+          (R137-F2).
+        - already resolved from an explicit policy → first resolution wins:
+          one shared manager owns exactly one breaker. A later DIFFERING
+          policy is dropped with a one-shot warning rather than silently
+          overwriting the first configuration (R137-F3).
+
+        A no-op when no source exists anywhere.
         """
         policy = resolve_circuit_breaker_policy(settings)
         if not policy:
             return
+        policy_keys = _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS
+        enabled, failure_threshold, reset_timeout = _parse_circuit_breaker_policy(
+            policy[policy_keys["enabled"]],
+            policy[policy_keys["failure_threshold"]],
+            policy[policy_keys["reset_timeout"]],
+        )
         with self._lock:
-            if self._breaker_configured:
+            if self._breaker_configured and not (
+                self._breaker_resolved_from_env_fallback
+            ):
+                policy_values: tuple[bool, int, float] = (
+                    enabled,
+                    failure_threshold,
+                    reset_timeout,
+                )
+                if (
+                    self._breaker_policy_values != policy_values
+                    and not self._dropped_breaker_policy_warned
+                ):
+                    self._dropped_breaker_policy_warned = True
+                    logger.warning(
+                        "Dropping a differing circuit breaker policy applied to "
+                        "an already-resolved shared connection manager; the "
+                        "first explicit policy remains in effect."
+                    )
                 return
-            self.settings.update(policy)
+            self._install_breaker_locked(
+                enabled,
+                failure_threshold,
+                reset_timeout,
+                from_env_fallback=False,
+            )
 
     @_manager_terminal_error_boundary()
     @configuration_error_boundary(
