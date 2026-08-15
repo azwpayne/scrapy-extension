@@ -154,6 +154,7 @@ class BackendSpiderMixin(Spider):
         with self._lifecycle_lock:
             manager = self._connection_manager
             acquired_here = False
+            crawler = getattr(self, "crawler", None)
             if manager is None:
                 if self.backend_type is None:
                     msg = (
@@ -176,7 +177,8 @@ class BackendSpiderMixin(Spider):
                 # so a breaker configured in Scrapy settings applies to every
                 # backend object the mixin hands out. An empty dict (no source
                 # anywhere) is a no-op, leaving the lazy env fallback intact.
-                crawler = getattr(self, "crawler", None)
+                # (The fold must precede get_manager so the registry key hashes
+                # the policy, matching the factory path.)
                 if crawler is not None:
                     settings.update(resolve_circuit_breaker_policy(crawler.settings))
 
@@ -194,6 +196,17 @@ class BackendSpiderMixin(Spider):
                 )
                 self._connection_manager = manager
                 acquired_here = True
+
+            # R136-F1: re-apply the breaker policy on EVERY setup_backend call,
+            # mirroring the set_monitor hoist below. The acquisition-time fold
+            # above only covers managers acquired after the crawler exists; the
+            # documented early-setup path (setup_backend in __init__, before
+            # Scrapy attaches the crawler) acquires a policy-less manager, and
+            # this idempotent re-run is its only chance to receive the policy
+            # before _get_breaker caches the env-only fallback forever. No-op
+            # when no breaker source exists or the breaker already resolved.
+            if crawler is not None:
+                manager.apply_scrapy_breaker_policy(crawler.settings)
 
             # R14-D: thread default-on telemetry into the shared manager so the
             # connection-lifecycle hooks (on_connect/on_disconnect/on_disconnect_
@@ -605,10 +618,18 @@ class BackendSpiderMixin(Spider):
             # Preserve its best-effort no-snapshot behavior; an explicit
             # invalid storage override remains fail-fast.
             return None
-        return ConnectionManager.get_manager(
+        snapshot_manager = ConnectionManager.get_manager(
             backend_type=snapshot_backend_type,
             settings=snapshot_backend_settings,
         )
+        # R136-F2: mirror the scheduler factory pairing (R55) — without this,
+        # the snapshot manager's backend lifecycle stats
+        # (backend/{connect,disconnect,retry}_count) stay dead on the
+        # get_queue-direct path.
+        from scrapy_extension.queue.queue import BackendQueue
+
+        snapshot_manager.set_monitor(BackendQueue._resolve_monitor(self))
+        return snapshot_manager
 
     def _build_membership_filter_from_settings(
         self, connection_manager: ConnectionManager, key: str

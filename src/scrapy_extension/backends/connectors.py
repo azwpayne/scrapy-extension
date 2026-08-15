@@ -2637,6 +2637,26 @@ class ConnectionManager:
             self._breaker_configured = True
             return self._breaker
 
+    def apply_scrapy_breaker_policy(self, settings: Any) -> None:
+        """Fold Scrapy-level breaker settings into this manager post-acquisition.
+
+        Companion to :func:`resolve_circuit_breaker_policy` for managers that
+        were acquired before the Scrapy crawler existed — the spider mixin's
+        documented early-setup pattern calls ``setup_backend()`` in
+        ``__init__``, so the acquisition-time fold cannot see crawler settings
+        and :meth:`_get_breaker` would otherwise cache the env-only fallback
+        forever, silently disabling a Scrapy-configured breaker. A no-op when
+        no source exists anywhere or the breaker has already been resolved
+        (post-hoc application is only meaningful before first use).
+        """
+        policy = resolve_circuit_breaker_policy(settings)
+        if not policy:
+            return
+        with self._lock:
+            if self._breaker_configured:
+                return
+            self.settings.update(policy)
+
     @_manager_terminal_error_boundary()
     @configuration_error_boundary(
         "Connection manager configuration is invalid.",
