@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from scrapy import Spider, signals
 
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.monitor import NullMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -631,6 +632,44 @@ class BackendSpiderMixin(Spider):
         snapshot_manager.set_monitor(BackendQueue._resolve_monitor(self))
         return snapshot_manager
 
+    def _resolve_queue_monitor(self) -> tuple[Any, float]:
+        """Resolve the queue monitor + pop-rate window from crawler settings.
+
+        R137-F4: R14-C parity for the get_queue-direct path. The scheduler
+        thread reads ``SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD`` /
+        ``SCRAPY_MONITOR_POP_RATE_WINDOW_S`` and forwards a tuned monitor into
+        ``BackendQueue``; the mixin's direct path previously let the queue
+        resolve its own monitor with constructor defaults, so the knobs were
+        dead on that path. Delegates to the scheduler's resolver (stats-backed
+        ``ScrapyStatsMonitor`` with the knobs, or ``NullMonitor`` when the
+        crawler/stats are unreachable — e.g. the early-setup window).
+        """
+        from scrapy_extension.schedule.scheduler import BackendScheduler
+        from scrapy_extension.utils._config import (
+            parse_float_setting,
+            parse_int_setting,
+        )
+
+        settings = self._crawler_settings() or {}
+        backpressure_threshold = parse_int_setting(
+            settings.get("SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD", 1_000),
+            "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD",
+            minimum=0,
+        )
+        pop_rate_window_s = parse_float_setting(
+            settings.get("SCRAPY_MONITOR_POP_RATE_WINDOW_S", 60.0),
+            "SCRAPY_MONITOR_POP_RATE_WINDOW_S",
+            minimum=0.0,
+            minimum_exclusive=True,
+            maximum=86400.0,
+        )
+        monitor = BackendScheduler._resolve_monitor_for_spider(
+            self,
+            backpressure_threshold=backpressure_threshold,
+            pop_rate_window_s=pop_rate_window_s,
+        )
+        return monitor, pop_rate_window_s
+
     def _build_membership_filter_from_settings(
         self, connection_manager: ConnectionManager, key: str
     ) -> Any | None:
@@ -688,11 +727,17 @@ class BackendSpiderMixin(Spider):
                     snapshot_manager = self._resolve_snapshot_connection_manager(
                         queue_strategy
                     )
+                    # R137-F4: R14-C parity for the get_queue-direct path — the
+                    # SCRAPY_MONITOR_* operator knobs must reach the queue, not
+                    # just the scheduler-driven one.
+                    monitor, pop_rate_window_s = self._resolve_queue_monitor()
                     self._queue = BackendQueue(
                         connection_manager=manager,
                         queue_name=name,
                         spider=self,
                         queue_strategy=queue_strategy,
+                        monitor=monitor,
+                        pop_rate_window_s=pop_rate_window_s,
                         snapshot_connection_manager=snapshot_manager,
                     )
                     self._queue_name = name
@@ -710,6 +755,14 @@ class BackendSpiderMixin(Spider):
                         setting_name="queue_name",
                         setting_value=name,
                     )
+                # R137-F5: a queue built in the early-setup window (no crawler)
+                # carries NullMonitor for its whole life unless upgraded here.
+                # Only a NullMonitor is replaced — a real monitor (e.g. one
+                # tuned externally) always wins over a later default resolve.
+                if isinstance(self._queue._monitor, NullMonitor):
+                    monitor, _ = self._resolve_queue_monitor()
+                    if not isinstance(monitor, NullMonitor):
+                        self._queue.set_monitor(monitor)
             except BaseException:
                 self._consumer_queue_name = previous_claim
                 if snapshot_manager is not None:

@@ -244,6 +244,20 @@ class BackendQueue:
         self._strategy.open()
         self._restore_snapshot()
 
+    def set_monitor(self, monitor: Monitor) -> None:
+        """Replace the queue-level monitor (push/pop/depth hooks).
+
+        R137-F5: lets a caller upgrade a monitor baked in before the crawler
+        existed (early ``get_queue()`` resolves NullMonitor) without rebuilding
+        the queue. R21-B convention preserved — strategies that own
+        operability gauges (delay depth, ...) get the new monitor forwarded;
+        strategies without a ``set_monitor`` hook are unaffected.
+        """
+        self._monitor = monitor
+        strategy_set_monitor = getattr(self._strategy, "set_monitor", None)
+        if callable(strategy_set_monitor):
+            strategy_set_monitor(monitor)
+
     @cached_property
     def _serializer(self) -> JSONSerializer:
         """Lazy-initialized JSON serializer."""

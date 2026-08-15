@@ -1595,6 +1595,84 @@ class TestGetQueue:
 
         assert result1 is result2
 
+    def test_get_queue_threads_monitor_knobs_from_settings(self, mocker):
+        """R137-F4: the SCRAPY_MONITOR_* operator knobs must reach the
+        get_queue-direct BackendQueue (R14-C parity with the scheduler path,
+        whose comment documents exactly this gap for the mixin direct path):
+        backpressure_threshold and pop_rate_window_s come from crawler
+        settings instead of constructor defaults."""
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 7,
+                "SCRAPY_MONITOR_POP_RATE_WINDOW_S": 12.5,
+            }
+        )
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        spider.crawler = crawler
+
+        queue = spider.get_queue()
+
+        assert isinstance(queue._monitor, ScrapyStatsMonitor)
+        assert queue._monitor.backpressure_threshold == 7
+        assert queue._pop_rate_window_s == 12.5
+
+    def test_get_queue_upgrades_null_monitor_after_early_setup(self, mocker):
+        """R137-F5: get_queue() in the early-setup window (no crawler) bakes
+        NullMonitor into the cached queue. Once the crawler is attached, a
+        later get_queue() call must upgrade the NullMonitor to the resolved
+        stats monitor — without rebuilding the queue."""
+        from scrapy_extension.monitor import NullMonitor
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+        queue = spider.get_queue()
+        assert isinstance(queue._monitor, NullMonitor)
+
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings()
+        spider.crawler = crawler
+
+        queue2 = spider.get_queue()
+        assert queue2 is queue  # cached instance, not rebuilt
+        assert isinstance(queue._monitor, ScrapyStatsMonitor)
+
+    def test_get_queue_never_rewires_a_real_monitor(self, mocker):
+        """R137-F5 guard: once the queue carries a real (stats-backed)
+        monitor, a later get_queue() must NOT rewire it — protects externally
+        tuned wiring (e.g. a scheduler-typed monitor) from being replaced by a
+        later default resolution."""
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 7})
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        spider.crawler = crawler
+
+        queue = spider.get_queue()
+        wired_first = queue._monitor
+        assert wired_first.backpressure_threshold == 7
+
+        # A later call with DIFFERENT knob settings must keep the wired monitor.
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 9})
+        spider.get_queue()
+        assert queue._monitor is wired_first
+
 
 class TestGetDupefilter:
     """Test get_dupefilter method."""
