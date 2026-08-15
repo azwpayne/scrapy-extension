@@ -7,6 +7,7 @@ to Scrapy spiders, enabling distributed crawling capabilities.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -102,6 +103,7 @@ class BackendSpiderMixin(Spider):
         self._connection_manager: ConnectionManager | None = None
         self._queue: BackendQueue | None = None
         self._queue_name: str | None = None
+        self._snapshot_connection_manager: ConnectionManager | None = None
         self._dupefilter: BackendDupeFilter | None = None
         self._scheduler: BackendScheduler | None = None
         self._consumer_manager_scope = uuid.uuid4().hex
@@ -165,7 +167,18 @@ class BackendSpiderMixin(Spider):
                     _CONNECTION_MANAGER_SCOPE_KEY,
                     _CONSUMER_SCOPED_BACKENDS,
                     ConnectionManager,
+                    resolve_circuit_breaker_policy,
                 )
+
+                # R135-B: fold Scrapy-level breaker settings into the manager
+                # settings for parity with the component-factory path
+                # (resolve_backend_config -> _merge_connection_manager_settings),
+                # so a breaker configured in Scrapy settings applies to every
+                # backend object the mixin hands out. An empty dict (no source
+                # anywhere) is a no-op, leaving the lazy env fallback intact.
+                crawler = getattr(self, "crawler", None)
+                if crawler is not None:
+                    settings.update(resolve_circuit_breaker_policy(crawler.settings))
 
                 if self._backend_type_name() in _CONSUMER_SCOPED_BACKENDS:
                     settings = {
@@ -535,6 +548,68 @@ class BackendSpiderMixin(Spider):
 
         return build_queue_strategy(QueueStrategyType(str(raw)), connection_manager)
 
+    def _resolve_snapshot_connection_manager(
+        self, queue_strategy: Any
+    ) -> ConnectionManager | None:
+        """Acquire a storage manager for a stateful strategy on a queue-only backend.
+
+        Mirrors the scheduler factory pairing (``BackendScheduler.from_settings``):
+        delay/round_robin/time_wheel/ring_buffer strategies hold in-process state
+        that must survive shutdown; when the queue backend itself has no storage
+        capability, the configured storage component provides the snapshot
+        backend. No explicit storage override → best-effort skip (the legacy
+        queue-only behavior); an explicit but invalid override stays fail-fast.
+        """
+        from scrapy_extension.backends.registry import has_capability
+        from scrapy_extension.queue.strategies import (
+            DelayQueueStrategy,
+            RingBufferQueueStrategy,
+            RoundRobinQueueStrategy,
+            TimeWheelQueueStrategy,
+        )
+
+        stateful_strategy_types = (
+            DelayQueueStrategy,
+            RoundRobinQueueStrategy,
+            TimeWheelQueueStrategy,
+            RingBufferQueueStrategy,
+        )
+        if not isinstance(queue_strategy, stateful_strategy_types):
+            return None
+        if has_capability(self._backend_type_name() or "", "storage"):
+            return None
+        settings = self._crawler_settings()
+        if settings is None:
+            return None
+        storage_type_override = settings.get("SCRAPY_STORAGE_BACKEND_TYPE")
+        has_explicit_storage_type = storage_type_override not in (None, "") or bool(
+            os.environ.get("SCRAPY_STORAGE_BACKEND_TYPE")
+        )
+        from scrapy_extension.backends.connectors import (
+            ConnectionManager,
+            resolve_backend_config,
+        )
+
+        try:
+            snapshot_backend_type, snapshot_backend_settings = resolve_backend_config(
+                settings,
+                type_key="SCRAPY_STORAGE_BACKEND_TYPE",
+                settings_key="SCRAPY_STORAGE_BACKEND_SETTINGS",
+                required_capabilities={"storage"},
+                component_name="storage",
+            )
+        except ConfigurationError:
+            if has_explicit_storage_type:
+                raise
+            # A queue-only global backend has no storage component configured.
+            # Preserve its best-effort no-snapshot behavior; an explicit
+            # invalid storage override remains fail-fast.
+            return None
+        return ConnectionManager.get_manager(
+            backend_type=snapshot_backend_type,
+            settings=snapshot_backend_settings,
+        )
+
     def _build_membership_filter_from_settings(
         self, connection_manager: ConnectionManager, key: str
     ) -> Any | None:
@@ -585,17 +660,22 @@ class BackendSpiderMixin(Spider):
             name = queue_name or f"{self.name}:queue"
             previous_claim = self._consumer_queue_name
             self._claim_consumer_queue(name)
+            snapshot_manager: ConnectionManager | None = None
             try:
                 if self._queue is None:
+                    queue_strategy = self._build_queue_strategy_from_settings(manager)
+                    snapshot_manager = self._resolve_snapshot_connection_manager(
+                        queue_strategy
+                    )
                     self._queue = BackendQueue(
                         connection_manager=manager,
                         queue_name=name,
                         spider=self,
-                        queue_strategy=self._build_queue_strategy_from_settings(
-                            manager
-                        ),
+                        queue_strategy=queue_strategy,
+                        snapshot_connection_manager=snapshot_manager,
                     )
                     self._queue_name = name
+                    self._snapshot_connection_manager = snapshot_manager
                 elif self._queue_name != name:
                     # R60: a non-consumer backend (Redis/MongoDB/ES/RabbitMQ/
                     # Pulsar/SQS) skips _claim_consumer_queue's name check, so
@@ -611,6 +691,22 @@ class BackendSpiderMixin(Spider):
                     )
             except BaseException:
                 self._consumer_queue_name = previous_claim
+                if snapshot_manager is not None:
+                    # The BackendQueue was not constructed with this acquire;
+                    # release it so the failed get_queue cannot leak it.
+                    snapshot_release_failed = False
+                    try:
+                        snapshot_manager.close()
+                    except BaseException:
+                        snapshot_release_failed = True
+                    if snapshot_release_failed:
+                        try:
+                            logger.error(
+                                "Failed to release snapshot ConnectionManager "
+                                "after queue construction failure"
+                            )
+                        except BaseException:
+                            pass
                 raise
 
             return self._queue
@@ -707,6 +803,7 @@ class BackendSpiderMixin(Spider):
             dupefilter = self._dupefilter
             scheduler = self._scheduler
             manager = self._connection_manager
+            snapshot_manager = self._snapshot_connection_manager
 
             # Clear shared state before invoking user-extensible close hooks so
             # duplicate/re-entrant shutdown cannot release the manager twice.
@@ -716,6 +813,7 @@ class BackendSpiderMixin(Spider):
             self._dupefilter = None
             self._scheduler = None
             self._connection_manager = None
+            self._snapshot_connection_manager = None
             self._consumer_queue_name = None
 
             primary_error: BaseException | None = None
@@ -748,6 +846,24 @@ class BackendSpiderMixin(Spider):
                     # custom logger cannot observe it through ``sys.exc_info()``.
                     try:
                         logger.error("Failed to close backend component")
+                    except BaseException:  # noqa: BLE001 - teardown must continue
+                        pass
+
+            # R135-C: the snapshot manager must outlive the queue close (the
+            # strategy persists its final checkpoint there) and precede the
+            # mixin's own manager release — the scheduler's close ordering.
+            if snapshot_manager is not None:
+                snapshot_close_failed = False
+                try:
+                    snapshot_manager.close()
+                except Exception:
+                    snapshot_close_failed = True
+                except BaseException as exc:  # noqa: BLE001 - do not mask component error
+                    if primary_error is None:
+                        primary_error = exc
+                if snapshot_close_failed:
+                    try:
+                        logger.error("Failed to close snapshot connection manager")
                     except BaseException:  # noqa: BLE001 - teardown must continue
                         pass
 

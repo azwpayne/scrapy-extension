@@ -770,13 +770,13 @@ def _merge_connection_manager_settings(
                 _CONNECTION_MANAGER_DEFAULTS[public_name],
             )
 
-    manager_settings.update(_resolve_circuit_breaker_policy(settings))
+    manager_settings.update(resolve_circuit_breaker_policy(settings))
     merged_backend_settings.update(merged_nested_settings)
     merged_backend_settings.update(manager_settings)
     return merged_backend_settings
 
 
-def _resolve_circuit_breaker_policy(
+def resolve_circuit_breaker_policy(
     settings: Any,
 ) -> dict[str, bool | int | float]:
     """Resolve explicit Scrapy breaker values before their environment fallback.
@@ -819,6 +819,11 @@ def _resolve_circuit_breaker_policy(
             reset_timeout
         ),
     }
+
+
+# Backward-compatible alias for callers of the former private name (kept so
+# external references keep working after the R135-B promotion to public).
+_resolve_circuit_breaker_policy = resolve_circuit_breaker_policy
 
 
 def _parse_circuit_breaker_policy(
