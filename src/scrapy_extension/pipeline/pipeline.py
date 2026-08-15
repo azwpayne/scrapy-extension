@@ -156,6 +156,7 @@ class BackendPipeline:
         *,
         max_storage_errors: int | None = None,
         monitor: Monitor | None = None,
+        owns_connection_manager: bool = True,
     ) -> None:
         """Initialize the pipeline.
 
@@ -185,6 +186,10 @@ class BackendPipeline:
                 :meth:`from_crawler` when ``crawler.stats`` is available, so the
                 ``pipeline/store_count`` stat is default-on. Emitted hooks are
                 additive — existing component stats untouched.
+            owns_connection_manager: Whether :meth:`close_spider` releases the
+                supplied manager. Defaults to True for factory-created standalone
+                pipelines; composite owners can pass False and release their
+                single shared acquire after all borrowed components are closed.
         """
         _validate_key_name(key_prefix, "key_prefix")
         self.connection_manager = connection_manager
@@ -200,6 +205,7 @@ class BackendPipeline:
         self._consecutive_storage_errors = 0
         self._storage_supported: bool | None = None
         self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
+        self._owns_connection_manager = owns_connection_manager
         self._manager_released = False
         self._lifecycle_lock = threading.Lock()
         self._opened = False
@@ -562,11 +568,13 @@ class BackendPipeline:
         except BaseException as exc:
             primary_error = exc
         finally:
-            # Teardown invariant: release the backend connection even if the final
-            # flush raised (batched partial-flush, backend error). Without this, a
-            # failed close leaks one socket/fd per spider-close-under-error on
-            # long-running Scrapyd deploys.
-            if not self._manager_released:
+            # Teardown invariant: an owning pipeline releases the backend connection
+            # even if the final flush raised (batched partial-flush, backend error).
+            # Without this, a failed close leaks one socket/fd per
+            # spider-close-under-error on long-running Scrapyd deploys. Non-owning
+            # pipelines (composite owners lending one shared acquire) skip the
+            # release; the owner releases after all borrowed components are closed.
+            if self._owns_connection_manager and not self._manager_released:
                 self._manager_released = True
                 try:
                     self.connection_manager.close()

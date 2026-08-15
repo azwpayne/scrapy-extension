@@ -700,6 +700,43 @@ class TestBackendPipelineCloseSpider:
         strategy.close.assert_called_once_with()
         mock_connection_manager.close.assert_called_once_with()
 
+    def test_close_spider_composite_ownership_keeps_lent_manager_alive(
+        self, mock_connection_manager, mocker
+    ):
+        """R135-A: a composite owner lending one shared acquire keeps it alive.
+
+        BackendScheduler and BackendDupeFilter both support composite wiring
+        (one shared ``ConnectionManager`` acquire lent to several components,
+        each built with ``owns_connection_manager=False`` so only the owner
+        releases). The pipeline must honor the same contract: closing a
+        non-owning pipeline flushes its strategy but never releases the
+        shared manager, while the default constructor still releases on
+        close.
+        """
+        strategy = mocker.MagicMock()
+        pipeline = BackendPipeline(
+            connection_manager=mock_connection_manager,
+            storage_strategy=strategy,
+            owns_connection_manager=False,
+        )
+        mock_spider = mocker.Mock()
+        mock_spider.name = "test_spider"
+
+        pipeline.close_spider(mock_spider)
+
+        strategy.close.assert_called_once_with()
+        assert pipeline._closed is True
+        assert pipeline._manager_released is False
+        mock_connection_manager.close.assert_not_called()
+
+        owning = BackendPipeline(
+            connection_manager=mock_connection_manager,
+            storage_strategy=strategy,
+        )
+        owning.close_spider(mock_spider)
+
+        mock_connection_manager.close.assert_called_once_with()
+
 
 class TestBackendPipelineProcessItem:
     """Test BackendPipeline.process_item method."""
