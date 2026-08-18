@@ -165,6 +165,34 @@ def validate_pulsar_connection(
 
     token = _auth_token_value(auth_token)
     normalized_url = f"{scheme}{','.join(endpoints)}"
+    endpoints_are_loopback = all(is_loopback_host(host) for host in endpoint_hosts)
+    if scheme == "pulsar://":
+        if tls_trust_certs_file is not None:
+            raise ConfigurationError(
+                "tls_trust_certs_file requires a pulsar+ssl:// service_url.",
+                setting_name="tls_trust_certs_file",
+            )
+        if allow_insecure_connection:
+            raise ConfigurationError(
+                "allow_insecure_connection applies only to pulsar+ssl://.",
+                setting_name="allow_insecure_connection",
+            )
+        if not tls_validate_hostname:
+            raise ConfigurationError(
+                "tls_validate_hostname applies only to pulsar+ssl:// and must remain true for plaintext.",
+                setting_name="tls_validate_hostname",
+            )
+    elif not endpoints_are_loopback:
+        if allow_insecure_connection:
+            raise ConfigurationError(
+                "Remote Pulsar TLS connections require certificate verification.",
+                setting_name="allow_insecure_connection",
+            )
+        if not tls_validate_hostname:
+            raise ConfigurationError(
+                "Remote Pulsar TLS connections require hostname verification.",
+                setting_name="tls_validate_hostname",
+            )
     if token is not None:
         if scheme != "pulsar+ssl://":
             raise ConfigurationError(
@@ -181,12 +209,8 @@ def validate_pulsar_connection(
                 "Authenticated Pulsar connections require hostname verification.",
                 setting_name="tls_validate_hostname",
             )
-    elif scheme == "pulsar://" and not all(
-        is_loopback_host(host) for host in endpoint_hosts
-    ):
-        require_remote_plaintext_opt_in(
-            "Pulsar", normalized_allow_remote_plaintext
-        )
+    elif scheme == "pulsar://" and not endpoints_are_loopback:
+        require_remote_plaintext_opt_in("Pulsar", normalized_allow_remote_plaintext)
     return (
         normalized_url,
         token,

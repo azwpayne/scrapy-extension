@@ -39,6 +39,11 @@ from scrapy_extension.backends.mongodb import MongoDBBackend
 from scrapy_extension.settings import MongoDBMode, MongoDBSettings
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_mongodb_fixtures(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_MONGO_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 def _patch_mongo_client(mocker) -> MagicMock:
     """Patch ``MongoClient`` in the mongodb module with a fresh MagicMock.
 

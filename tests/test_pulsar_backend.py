@@ -1595,10 +1595,9 @@ class TestPulsarTlsDecouple:
         assert "tls_trust_certs_file_path" not in kwargs
 
     def test_ssl_passes_allow_insecure_true_without_trust_certs(self, mocker) -> None:
-        """SEC-5 reverse: allow_insecure_connection=True is forwarded (not silently
-        dropped) even when tls_trust_certs_file is unset."""
+        """The explicit insecure compatibility option remains available on loopback."""
         b = _make_backend(
-            service_url="pulsar+ssl://broker:6651",
+            service_url="pulsar+ssl://localhost:6651",
             allow_insecure_connection=True,
         )
         mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
@@ -1609,9 +1608,9 @@ class TestPulsarTlsDecouple:
         assert "tls_trust_certs_file_path" not in kwargs
 
     def test_ssl_passes_both_when_both_set(self, mocker) -> None:
-        """Both set → both passed (backward compat with the original path)."""
+        """Loopback TLS forwards both explicit compatibility settings."""
         b = _make_backend(
-            service_url="pulsar+ssl://broker:6651",
+            service_url="pulsar+ssl://localhost:6651",
             allow_insecure_connection=True,
             tls_trust_certs_file="/etc/ssl/ca.pem",
         )
@@ -1622,10 +1621,10 @@ class TestPulsarTlsDecouple:
         assert kwargs.get("tls_validate_hostname") is True
         assert kwargs.get("tls_trust_certs_file_path") == "/etc/ssl/ca.pem"
 
-    def test_ssl_forwards_explicit_hostname_validation_opt_out(self, mocker) -> None:
-        """The public compatibility setting controls the real SDK keyword."""
+    def test_ssl_forwards_loopback_hostname_validation_opt_out(self, mocker) -> None:
+        """The explicit compatibility setting remains available only on loopback."""
         b = _make_backend(
-            service_url="pulsar+ssl://broker:6651",
+            service_url="pulsar+ssl://localhost:6651",
             tls_validate_hostname=False,
         )
         mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
@@ -1633,21 +1632,25 @@ class TestPulsarTlsDecouple:
 
         assert pulsar.Client.call_args.kwargs["tls_validate_hostname"] is False
 
-    def test_non_ssl_url_omits_tls_kwargs(self, mocker) -> None:
-        """pulsar:// (plaintext) doesn't pass either TLS field."""
-        b = _make_backend(
-            service_url="pulsar://broker:6650",
-            allow_remote_plaintext=True,
-            allow_insecure_connection=True,  # ignored — not an ssl url
-            tls_trust_certs_file="/tmp/plaintext-ignored.pem",
-            tls_validate_hostname=False,
-        )
-        mocker.patch.object(pulsar, "Client", return_value=mocker.MagicMock())
-        b.connect()
-        kwargs = pulsar.Client.call_args.kwargs
-        assert "tls_allow_insecure_connection" not in kwargs
-        assert "tls_validate_hostname" not in kwargs
-        assert "tls_trust_certs_file_path" not in kwargs
+    @pytest.mark.parametrize(
+        ("setting_name", "value"),
+        [
+            ("allow_insecure_connection", True),
+            ("tls_trust_certs_file", "/tmp/plaintext-ignored.pem"),
+            ("tls_validate_hostname", False),
+        ],
+    )
+    def test_non_ssl_url_rejects_ignored_tls_intent(
+        self, mocker, setting_name: str, value: object
+    ) -> None:
+        """TLS-only settings cannot be silently discarded on pulsar://."""
+        client = mocker.patch.object(pulsar, "Client")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_backend(**{setting_name: value})
+
+        assert exc_info.value.setting_name == setting_name
+        client.assert_not_called()
 
 
 def test_locked_pulsar_sdk_tls_keyword_contract() -> None:

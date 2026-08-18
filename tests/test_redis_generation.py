@@ -18,6 +18,11 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.settings import RedisMode, RedisSettings
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_redis_fixtures(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_REDIS_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 def _client(mocker, name: str):
     client = mocker.MagicMock(name=name)
     client.ping.return_value = True

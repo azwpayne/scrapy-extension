@@ -80,6 +80,7 @@ def _backend(mocker: Any, *, max_message_size: int = 1024 * 1024) -> RocketMQBac
     backend = RocketMQBackend(
         RocketMQSettings(
             namesrv_address=f"{_MARKER}.example:8081",
+            allow_remote_plaintext=True,
             max_message_size=max_message_size,
         )
     )

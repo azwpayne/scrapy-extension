@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override; the former warning-only transition is over. Loopback development
   remains available, and authenticated plaintext remains unconditionally
   rejected.
+- **Remote TLS verification can no longer be disabled anonymously.** Redis
+  requires hostname checks, Elasticsearch requires certificate verification,
+  and Pulsar requires certificate and hostname verification for non-loopback
+  TLS endpoints. MongoDB, Elasticsearch, and Pulsar now reject TLS material or
+  controls ignored by their selected mode/scheme. RocketMQ exposes no custom CA
+  controls in its supported SDK; only its existing TLS switch can be enforced.
 - **Cuckoo item-level deletion is now fail-safe unsupported.** Calling
   `CuckooMembershipFilter.remove()` now raises `NotImplementedError` without
   mutating the filter. The former behavior could delete a resident item when an

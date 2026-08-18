@@ -53,7 +53,10 @@ class TestPulsarHelpers:
 class TestPulsarErrorPaths:
     def test_connect_with_tls_certs(self, mocker) -> None:
         b, _ = _connected(
-            mocker, tls_trust_certs_file="/tmp/ca.pem", allow_insecure_connection=True
+            mocker,
+            service_url="pulsar+ssl://localhost:6651",
+            tls_trust_certs_file="/tmp/ca.pem",
+            allow_insecure_connection=True,
         )
         assert b.is_connected()
 

@@ -94,7 +94,10 @@ def _assert_operation_error_is_redacted(error: BaseException, marker: str) -> No
 
 def _connected_pulsar_backend(mocker: Any) -> tuple[PulsarBackend, MagicMock]:
     backend = PulsarBackend(
-        PulsarSettings(service_url=f"pulsar://{_MARKER}.example:6650")
+        PulsarSettings(
+            service_url=f"pulsar://{_MARKER}.example:6650",
+            allow_remote_plaintext=True,
+        )
     )
     client = mocker.MagicMock()
     mocker.patch.object(pulsar, "Client", return_value=client)

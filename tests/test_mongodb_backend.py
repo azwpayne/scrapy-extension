@@ -20,6 +20,11 @@ from scrapy_extension.settings.mongodb import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_mongodb_fixtures(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_MONGO_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 def _assert_package_traceback_locals_are_redacted(
     error: BaseException,
     marker: str,

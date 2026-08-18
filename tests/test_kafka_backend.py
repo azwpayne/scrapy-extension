@@ -22,6 +22,11 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.settings import KafkaMode, KafkaSettings
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_kafka_fixtures(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_KAFKA_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 class TestKafkaBackendConnect:
     """Tests for connect() method and its helper methods."""
 

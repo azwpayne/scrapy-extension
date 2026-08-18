@@ -531,6 +531,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             auth_mechanism=auth_mechanism,
             auth_source=auth_source,
             allow_remote_plaintext=allow_remote_plaintext,
+            tls_ca_file=tls_ca_file,
+            tls_cert_file=tls_cert_file,
+            tls_key_file=tls_key_file,
         )
 
         return _MongoDBConnectionSnapshot(

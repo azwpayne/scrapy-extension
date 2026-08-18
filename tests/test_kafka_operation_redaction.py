@@ -74,7 +74,11 @@ def _assert_terminal_error_is_redacted(error: BaseException, marker: str) -> Non
 
 def _backend() -> KafkaBackend:
     """Build a direct backend whose retained configuration is deliberately private."""
-    return KafkaBackend(KafkaSettings(bootstrap_servers=f"{_MARKER}.example:9092"))
+    return KafkaBackend(
+        KafkaSettings(
+            bootstrap_servers=f"{_MARKER}.example:9092", allow_remote_plaintext=True
+        )
+    )
 
 
 def _failing_operation(mocker: Any, method_name: str) -> Callable[[], object]:

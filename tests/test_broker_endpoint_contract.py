@@ -19,6 +19,12 @@ from scrapy_extension.settings._broker_endpoints import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_broker_fixtures(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_KAFKA_ALLOW_REMOTE_PLAINTEXT", "true")
+    monkeypatch.setenv("SCRAPY_ROCKETMQ_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 def test_kafka_normalizes_supported_endpoint_kinds() -> None:
     """Kafka accepts each SDK-supported host form and canonicalizes delimiters."""
     settings = KafkaSettings(

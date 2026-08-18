@@ -39,7 +39,10 @@ _MONGODB_CONFIGURATION_FIELD_NAMES: frozenset[str] = frozenset(
         "replica_set_members",
         "replica_set_name",
         "tls_allow_invalid_certificates",
+        "tls_ca_file",
+        "tls_cert_file",
         "tls_enabled",
+        "tls_key_file",
         "uri",
         "username",
         "w",
@@ -733,6 +736,9 @@ def validate_mongodb_transport_security(
     auth_mechanism: object,
     auth_source: object = "admin",
     allow_remote_plaintext: object = False,
+    tls_ca_file: object = None,
+    tls_cert_file: object = None,
+    tls_key_file: object = None,
 ) -> None:
     """Require verified TLS for remote authenticated MongoDB connections."""
     if not isinstance(mode, MongoDBMode):
@@ -779,6 +785,26 @@ def validate_mongodb_transport_security(
         or mode is MongoDBMode.ATLAS
         or (not derived_seed_uri and uri_scheme == "mongodb+srv")
     )
+    sdk_tls_enabled = tls_enabled or mode is MongoDBMode.ATLAS
+    tls_intent = (
+        ("tls_ca_file", tls_ca_file),
+        ("tls_cert_file", tls_cert_file),
+        ("tls_key_file", tls_key_file),
+    )
+    if not sdk_tls_enabled:
+        ignored_setting = next(
+            (name for name, value in tls_intent if value is not None), None
+        )
+        if ignored_setting is not None:
+            raise ConfigurationError(
+                "MongoDB TLS certificate settings require tls_enabled=True or mode='atlas'.",
+                setting_name=ignored_setting,
+            )
+        if tls_allow_invalid_certificates:
+            raise ConfigurationError(
+                "tls_allow_invalid_certificates requires an SDK TLS mode.",
+                setting_name="tls_allow_invalid_certificates",
+            )
     local_standalone_plaintext = (
         mode is MongoDBMode.STANDALONE
         and is_mongodb_direct_loopback_uri(normalized_uri)
@@ -795,9 +821,7 @@ def validate_mongodb_transport_security(
             setting_name="tls_enabled",
         )
     if not authenticated and not effective_tls and not loopback_only:
-        require_remote_plaintext_opt_in(
-            "MongoDB", normalized_allow_remote_plaintext
-        )
+        require_remote_plaintext_opt_in("MongoDB", normalized_allow_remote_plaintext)
 
 
 class MongoDBSettings(RedactedBaseSettings):
@@ -1104,6 +1128,9 @@ class MongoDBSettings(RedactedBaseSettings):
             auth_mechanism=self.auth_mechanism,
             auth_source=self.auth_source,
             allow_remote_plaintext=self.allow_remote_plaintext,
+            tls_ca_file=self.tls_ca_file,
+            tls_cert_file=self.tls_cert_file,
+            tls_key_file=self.tls_key_file,
         )
         if (
             (self.tls_enabled or self.mode is MongoDBMode.ATLAS)

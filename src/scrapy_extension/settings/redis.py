@@ -720,10 +720,20 @@ class RedisSettings(RedactedBaseSettings):
                 self.sentinel_password,
             )
         )
+        endpoints_are_loopback = _redis_configured_endpoints_are_loopback(self)
+        if (
+            self.ssl_enabled
+            and not endpoints_are_loopback
+            and not self.ssl_check_hostname
+        ):
+            raise ConfigurationError(
+                "Remote Redis TLS connections require ssl_check_hostname=True.",
+                setting_name="ssl_check_hostname",
+            )
         if (
             not self.ssl_enabled
             and not has_authentication
-            and not _redis_configured_endpoints_are_loopback(self)
+            and not endpoints_are_loopback
         ):
             require_remote_plaintext_opt_in("Redis", allow_remote_plaintext)
         return self

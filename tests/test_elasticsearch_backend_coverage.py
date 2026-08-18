@@ -80,7 +80,9 @@ class TestBuildKwargs:
 
     def test_ca_certs_in_kwargs(self, mocker):
         """Test ca_certs is included when set."""
-        settings = ElasticSearchSettings(ca_certs="/path/to/ca.crt")
+        settings = ElasticSearchSettings(
+            hosts=["https://es.example:9200"], ca_certs="/path/to/ca.crt"
+        )
         backend = ElasticSearchBackend(settings)
         # ca_certs is added in connect(), not _build_kwargs
         # Verify it doesn't cause issues
@@ -111,7 +113,9 @@ class TestBuildKwargs:
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
             return_value=mock_client,
         )
-        backend = ElasticSearchBackend(ElasticSearchSettings(verify_certs=False))
+        backend = ElasticSearchBackend(
+            ElasticSearchSettings(hosts=["https://localhost:9200"], verify_certs=False)
+        )
         backend.connect()
         assert backend.is_connected()
 

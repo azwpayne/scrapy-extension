@@ -112,9 +112,7 @@ def validate_rocketmq_connection(
         and not tls_enabled
         and not _rocketmq_namesrv_endpoints_are_loopback(namesrv_address)
     ):
-        require_remote_plaintext_opt_in(
-            "RocketMQ", normalized_allow_remote_plaintext
-        )
+        require_remote_plaintext_opt_in("RocketMQ", normalized_allow_remote_plaintext)
     return mode, namesrv_address, key_text, secret_text, tls_enabled
 
 

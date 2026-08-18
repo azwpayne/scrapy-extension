@@ -39,14 +39,19 @@ def test_tls_accepts_key_only() -> None:
     assert settings.tls_cert_file is None
 
 
-def test_tls_both_set_without_tls_enabled_is_accepted() -> None:
-    """R65 gating: both-set is rejected only under TLS. Without tls_enabled (and
-    not ATLAS) the backend ignores the cert/key fields, so the validator must not
-    reject -- construction succeeds (the both-set check is gated on TLS-active)."""
-    settings = MongoDBSettings(
-        tls_enabled=False,
-        tls_cert_file="/tls/client.pem",
-        tls_key_file="/tls/client.key",
-    )
-    assert settings.tls_cert_file == "/tls/client.pem"
-    assert settings.tls_key_file == "/tls/client.key"
+@pytest.mark.parametrize(
+    ("setting_name", "value"),
+    [
+        ("tls_ca_file", "/tls/ca.pem"),
+        ("tls_cert_file", "/tls/client.pem"),
+        ("tls_key_file", "/tls/client.key"),
+    ],
+)
+def test_tls_material_without_sdk_tls_is_rejected(
+    setting_name: str, value: str
+) -> None:
+    """Certificate intent must not be silently ignored on a plaintext scheme."""
+    with pytest.raises(ConfigurationError) as exc_info:
+        MongoDBSettings(**{setting_name: value})
+
+    assert exc_info.value.setting_name == setting_name

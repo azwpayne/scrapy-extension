@@ -84,7 +84,9 @@ def _assert_terminal_error_is_redacted(error: BaseException, marker: str) -> Non
 
 def _backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     """Build a direct backend retaining deliberately private mutable settings."""
-    config = ElasticSearchSettings(hosts=[f"http://{_MARKER}.example:9200"])
+    config = ElasticSearchSettings(
+        hosts=[f"http://{_MARKER}.example:9200"], allow_remote_plaintext=True
+    )
     backend = ElasticSearchBackend(config)
     client = mocker.MagicMock()
     backend._client = client
@@ -351,7 +353,9 @@ def test_elasticsearch_disconnected_operation_rebuilds_private_error_graph(
     expected_type: type[Exception],
     expected_operation: str | None,
 ) -> None:
-    config = ElasticSearchSettings(hosts=[f"http://{_MARKER}.example:9200"])
+    config = ElasticSearchSettings(
+        hosts=[f"http://{_MARKER}.example:9200"], allow_remote_plaintext=True
+    )
     backend = ElasticSearchBackend(config)
     mocker.patch.object(
         backend,

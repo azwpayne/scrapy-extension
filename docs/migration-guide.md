@@ -93,7 +93,11 @@ or whitespace-only. Cloud mode refuses to start without this complete pair and
 TLS. Anonymous standalone/cluster connections are plaintext only on loopback by
 default. Remote plaintext requires the explicit trusted-network override below.
 The TLS flag targets the RocketMQ 5.x gRPC proxy and is propagated separately
-to both SDK client constructors; it is not a `ClientConfiguration` option.
+to both SDK client constructors; it is not a `ClientConfiguration` option. The
+supported RocketMQ SDK exposes only this TLS on/off switch, not a CA bundle or
+hostname-verification control. This backend therefore cannot offer a custom CA
+setting; configure proxy trust outside the SDK and do not assume certificate
+pinning controls that the client does not implement.
 
 ## Remote Plaintext Opt-in
 
@@ -118,6 +122,14 @@ connections still require their verified TLS settings, Elasticsearch credentials
 over `http://` still fail, Kafka `SASL_PLAINTEXT` still fails, Pulsar tokens
 still require `pulsar+ssl://`, and authenticated RocketMQ connections still
 require `tls_enabled=True`.
+
+Remote TLS now also requires identity verification without regard to whether
+credentials are configured: Redis requires hostname checking, Elasticsearch
+requires certificate verification, and Pulsar requires both certificate and
+hostname verification. Explicit insecure TLS compatibility remains only for
+literal-loopback development. TLS CA/certificate/key settings that a selected
+MongoDB, Elasticsearch, or Pulsar mode/scheme would ignore now fail validation
+instead of silently discarding operator intent.
 
 ## SQS Private boto3 Sessions
 

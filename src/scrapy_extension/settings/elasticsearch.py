@@ -355,15 +355,44 @@ class ElasticSearchSettings(RedactedBaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _validate_authenticated_tls(self) -> Self:
-        """Require certificate verification whenever standalone auth is enabled."""
-        if (
-            self.mode == ElasticSearchMode.STANDALONE
-            and not self.verify_certs
-            and (self.api_key is not None or self.username is not None)
+    def _validate_tls_verification_and_intent(self) -> Self:
+        """Require verified remote TLS and reject TLS settings the mode ignores."""
+        if self.mode is ElasticSearchMode.CLOUD:
+            if self.ca_certs is not None:
+                raise ConfigurationError(
+                    "ca_certs is unsupported in CLOUD mode because this backend does not pass it to the SDK.",
+                    setting_name="ca_certs",
+                )
+            if not self.verify_certs:
+                raise ConfigurationError(
+                    "CLOUD mode requires SDK certificate verification.",
+                    setting_name="verify_certs",
+                )
+            return self
+
+        parsed_hosts = tuple(urlsplit(host) for host in self.hosts)
+        has_http = any(parsed.scheme.lower() == "http" for parsed in parsed_hosts)
+        has_remote_tls = any(
+            parsed.scheme.lower() == "https" and not is_loopback_host(parsed.hostname)
+            for parsed in parsed_hosts
+        )
+        if self.ca_certs is not None and has_http:
+            raise ConfigurationError(
+                "ca_certs requires every standalone Elasticsearch host to use https://.",
+                setting_name="ca_certs",
+            )
+        if not self.verify_certs and not any(
+            parsed.scheme.lower() == "https" for parsed in parsed_hosts
         ):
             raise ConfigurationError(
-                "verify_certs must be enabled for authenticated standalone connections.",
+                "verify_certs=False is invalid when every Elasticsearch host uses http://.",
+                setting_name="verify_certs",
+            )
+        if not self.verify_certs and (
+            has_remote_tls or self.api_key is not None or self.username is not None
+        ):
+            raise ConfigurationError(
+                "Remote or authenticated Elasticsearch TLS requires verify_certs=True.",
                 setting_name="verify_certs",
             )
         return self
@@ -387,7 +416,5 @@ class ElasticSearchSettings(RedactedBaseSettings):
             and not has_credential
             and has_remote_plaintext_host
         ):
-            require_remote_plaintext_opt_in(
-                "Elasticsearch", allow_remote_plaintext
-            )
+            require_remote_plaintext_opt_in("Elasticsearch", allow_remote_plaintext)
         return self

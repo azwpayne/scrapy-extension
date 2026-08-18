@@ -218,7 +218,7 @@ class TestRedisSettings:
 
     def test_custom_host(self):
         """Test custom host."""
-        settings = RedisSettings(host="redis.example.com")
+        settings = RedisSettings(host="redis.example.com", allow_remote_plaintext=True)
         assert settings.host == "redis.example.com"
 
     def test_custom_port(self):
@@ -246,6 +246,7 @@ class TestRedisSettings:
         """Test loading from environment variables."""
         monkeypatch.setenv("SCRAPY_REDIS_HOST", "redis.example.com")
         monkeypatch.setenv("SCRAPY_REDIS_PORT", "6380")
+        monkeypatch.setenv("SCRAPY_REDIS_ALLOW_REMOTE_PLAINTEXT", "true")
 
         settings = RedisSettings()
         assert settings.host == "redis.example.com"
@@ -289,6 +290,7 @@ class TestMongoDBSettings:
 
         monkeypatch.setenv("SCRAPY_MONGO_URI", "mongodb://custom:27017")
         monkeypatch.setenv("SCRAPY_MONGO_DATABASE", "custom_db")
+        monkeypatch.setenv("SCRAPY_MONGO_ALLOW_REMOTE_PLAINTEXT", "true")
         settings = MongoDBSettings()
         assert settings.uri == "mongodb://custom:27017"
         assert settings.database == "custom_db"
@@ -436,6 +438,7 @@ def test_kafka_settings_from_env(monkeypatch):
 
     monkeypatch.setenv("SCRAPY_KAFKA_BOOTSTRAP_SERVERS", "kafka.example.com:9092")
     monkeypatch.setenv("SCRAPY_KAFKA_GROUP_ID", "my-group")
+    monkeypatch.setenv("SCRAPY_KAFKA_ALLOW_REMOTE_PLAINTEXT", "true")
     settings = KafkaSettings()
     assert settings.bootstrap_servers == "kafka.example.com:9092"
     assert settings.group_id == "my-group"
@@ -670,7 +673,9 @@ class TestSec2MongoTlsModeGuard:
         from scrapy_extension.settings.mongodb import MongoDBMode
 
         settings = MongoDBSettings(
-            mode=MongoDBMode.STANDALONE, tls_allow_invalid_certificates=True
+            mode=MongoDBMode.STANDALONE,
+            tls_enabled=True,
+            tls_allow_invalid_certificates=True,
         )
         assert settings.tls_allow_invalid_certificates is True
 

@@ -484,6 +484,7 @@ class TestMongoDBModeConditional:
         s = MongoDBSettings(
             mode=MongoDBMode.REPLICA_SET,
             uri="mongodb://fallback-host:27017/?replicaSet=existing",
+            allow_remote_plaintext=True,
         )
         assert s.replica_set_name is None  # URI hint satisfies the requirement
 
@@ -494,6 +495,7 @@ class TestMongoDBModeConditional:
             s = MongoDBSettings(
                 mode=MongoDBMode.REPLICA_SET,
                 uri=f"mongodb://fallback-host:27017/{query}",
+                allow_remote_plaintext=True,
             )
             assert s.replica_set_name is None  # URI hint satisfies the requirement
 
@@ -505,6 +507,7 @@ class TestMongoDBModeConditional:
             MongoDBSettings(
                 mode=MongoDBMode.REPLICA_SET,
                 uri="mongodb://fallback-host:27017/?appname=replicaSet=x",
+                allow_remote_plaintext=True,
             )
         assert exc_info.value.setting_name == "replica_set_name"
 
@@ -762,7 +765,10 @@ class TestMongoDBUriScheme:
     )
     def test_uri_accepts_valid_schemes(self, uri: str) -> None:
         """Valid ``mongodb://`` and ``mongodb+srv://`` URIs stay accepted."""
-        assert MongoDBSettings(uri=uri).uri == uri
+        settings = MongoDBSettings(
+            uri=uri, allow_remote_plaintext="localhost" not in uri
+        )
+        assert settings.uri == uri
 
 
 class TestPulsarServiceUrlScheme:
@@ -805,7 +811,13 @@ class TestPulsarServiceUrlScheme:
         canonical_url: str,
     ) -> None:
         """Normalize scheme case and endpoint whitespace before SDK construction."""
-        assert PulsarSettings(service_url=raw_url).service_url == canonical_url
+        assert (
+            PulsarSettings(
+                service_url=raw_url,
+                allow_remote_plaintext=raw_url.strip().lower().startswith("pulsar://"),
+            ).service_url
+            == canonical_url
+        )
 
     def test_cluster_service_url_rejects_repeated_schemes(self) -> None:
         """The SDK expects one scheme followed by a comma-separated host list."""
@@ -868,12 +880,17 @@ class TestRocketMQNamesrvFormat:
     )
     def test_namesrv_accepts_valid_host_port(self, addr: str) -> None:
         """Valid ``host:port`` values stay accepted (incl. DNS, IPv4)."""
-        assert RocketMQSettings(namesrv_address=addr).namesrv_address == addr
+        settings = RocketMQSettings(
+            namesrv_address=addr,
+            allow_remote_plaintext=not addr.startswith(("localhost", "127.")),
+        )
+        assert settings.namesrv_address == addr
 
     def test_namesrv_accepts_and_canonicalizes_cluster_endpoints(self) -> None:
         settings = RocketMQSettings(
             mode="cluster",  # type: ignore[arg-type]
             namesrv_address=" 192.0.2.10:8081 ; 192.0.2.11:8082 ",
+            allow_remote_plaintext=True,
         )
         assert settings.namesrv_address == "192.0.2.10:8081;192.0.2.11:8082"
 
@@ -953,7 +970,13 @@ class TestElasticSearchHostsScheme:
     )
     def test_hosts_accepts_valid_schemes(self, hosts: list[str]) -> None:
         """All-valid ``http://`` / ``https://`` lists stay accepted."""
-        assert ElasticSearchSettings(hosts=hosts).hosts == hosts
+        settings = ElasticSearchSettings(
+            hosts=hosts,
+            allow_remote_plaintext=any(
+                host.startswith("http://") and "localhost" not in host for host in hosts
+            ),
+        )
+        assert settings.hosts == hosts
 
     def test_standalone_empty_hosts_list_rejected(self) -> None:
         """R28-B: STANDALONE ``hosts=[]`` must reject — opaque client error otherwise.
@@ -1327,7 +1350,9 @@ class TestSV3PulsarAuthTokenRequiresSsl:
 
     def test_no_auth_token_with_plain_url_accepted(self) -> None:
         """No ``auth_token`` + ``pulsar://`` → accepted (validator skips)."""
-        s = PulsarSettings(service_url="pulsar://broker:6650")
+        s = PulsarSettings(
+            service_url="pulsar://broker:6650", allow_remote_plaintext=True
+        )
         assert s.auth_token is None
 
     def test_tls_hostname_validation_defaults_secure(self) -> None:
@@ -1338,7 +1363,7 @@ class TestSV3PulsarAuthTokenRequiresSsl:
     def test_tls_hostname_validation_can_be_explicitly_disabled(self) -> None:
         """Local compatibility remains available as an explicit insecure choice."""
         s = PulsarSettings(
-            service_url="pulsar+ssl://broker:6651",
+            service_url="pulsar+ssl://localhost:6651",
             tls_validate_hostname=False,
         )
         assert s.tls_validate_hostname is False

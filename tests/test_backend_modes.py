@@ -118,6 +118,7 @@ class TestKafkaBackendModes:
             mode=KafkaMode.CLUSTER,
             bootstrap_servers="broker1:9092",
             cluster_brokers=["broker1:9092", "broker2:9092", "broker3:9092"],
+            allow_remote_plaintext=True,
         )
 
         mock_producer_class = mocker.patch(
@@ -246,6 +247,7 @@ class TestMongoDBBackendModes:
             database="testdb",
             replica_set_name="myReplicaSet",
             replica_set_members=["host1:27017", "host2:27017", "host3:27017"],
+            allow_remote_plaintext=True,
         )
 
         mock_client_class = mocker.patch(
@@ -268,6 +270,7 @@ class TestMongoDBBackendModes:
             mode=MongoDBMode.SHARDED_CLUSTER,
             database="testdb",
             mongos_routers=["router1:27017", "router2:27017"],
+            allow_remote_plaintext=True,
         )
 
         mock_client_class = mocker.patch(

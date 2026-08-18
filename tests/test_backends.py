@@ -12,6 +12,12 @@ from scrapy_extension.backends.base import (
 from scrapy_extension.exceptions import BackendConnectionError
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_redis_fixtures(monkeypatch) -> None:
+    """Keep non-transport backend fixtures explicit under fail-closed policy."""
+    monkeypatch.setenv("SCRAPY_REDIS_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 class TestRedisMode:
     """Test RedisMode enum."""
 

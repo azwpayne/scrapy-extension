@@ -29,6 +29,11 @@ from scrapy_extension.settings import RedisMode, RedisSettings
 _SECRET = "redis-mode-contract-secret"
 
 
+@pytest.fixture(autouse=True)
+def _authorize_legacy_remote_redis_fixtures(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_REDIS_ALLOW_REMOTE_PLAINTEXT", "true")
+
+
 def _client(mocker, name: str = "redis-client"):
     client = mocker.MagicMock(name=name)
     client.ping.return_value = True

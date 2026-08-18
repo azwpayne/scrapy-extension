@@ -19,7 +19,13 @@ def _connected_backend(mocker: Any) -> tuple[RedisBackend, Any]:
     client = mocker.MagicMock()
     client.ping.return_value = True
     mocker.patch("scrapy_extension.backends.redis.Redis", return_value=client)
-    backend = RedisBackend(RedisSettings(host=f"{_MARKER}.example", namespace=_MARKER))
+    backend = RedisBackend(
+        RedisSettings(
+            host=f"{_MARKER}.example",
+            namespace=_MARKER,
+            allow_remote_plaintext=True,
+        )
+    )
     backend.connect()
     return backend, client
 
