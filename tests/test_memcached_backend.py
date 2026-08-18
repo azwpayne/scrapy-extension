@@ -294,10 +294,7 @@ class TestMemcachedConnect:
 
         assert exc_info.value.setting_name == setting_name
         assert exc_info.value.setting_value is None
-        assert str(exc_info.value) == (
-            "Memcached timeout must be finite, greater than 0, and at most 86400 "
-            "seconds."
-        )
+        assert str(exc_info.value) == "Memcached configuration is invalid."
         client.assert_not_called()
 
     def test_connect_revalidates_mutated_flush_permission_before_sdk_io(

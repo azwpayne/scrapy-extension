@@ -468,7 +468,11 @@ class _CanonicalScalarEnvironmentSource(PydanticBaseSettingsSource):
             return values
         normalized = dict(values)
         for field_name, field in fields.items():
-            if type(field_name) is str and field_name in normalized:
+            if (
+                type(field_name) is str
+                and field_name in normalized
+                and field_name not in self.current_state
+            ):
                 normalized[field_name] = _normalize_bundled_environment_scalar(
                     self.settings_cls,
                     field_name,

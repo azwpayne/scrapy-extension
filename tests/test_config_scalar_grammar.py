@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import traceback
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -276,6 +277,24 @@ def test_documented_negative_integer_text_remains_available_from_environment(
     monkeypatch.setenv("SCRAPY_QUEUE_DELAY_MAX_HELD", "-1")
 
     assert Settings().queue_delay_max_held == -1
+
+
+def test_init_scalar_overrides_invalid_environment_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCRAPY_KAFKA_RETRIES", "not-canonical")
+
+    assert KafkaSettings(retries=8).retries == 8
+
+
+def test_environment_scalar_overrides_invalid_dotenv_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SCRAPY_KAFKA_RETRIES=not-canonical\n", encoding="utf-8")
+    monkeypatch.setenv("SCRAPY_KAFKA_RETRIES", "8")
+
+    assert KafkaSettings(_env_file=dotenv).retries == 8
 
 
 def test_scalar_errors_do_not_retain_raw_input() -> None:

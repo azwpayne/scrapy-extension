@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from ipaddress import ip_address
 from math import isfinite
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
@@ -110,7 +110,7 @@ def validate_memcached_timeout(
     """Return one finite, positive, bounded Memcached socket timeout."""
     if type(value) not in (int, float):
         raise ConfigurationError(_MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name)
-    timeout = float(value)
+    timeout = float(cast("int | float", value))
     if not isfinite(timeout) or not 0 < timeout <= _MEMCACHED_MAX_TIMEOUT_SECONDS:
         raise ConfigurationError(_MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name)
     return timeout
