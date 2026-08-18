@@ -1632,10 +1632,33 @@ class BackendScheduler:
                     pass
             raise open_failure
 
-        with self._lifecycle_lock:
-            self._backpressure_paused = False
-            self._backpressure_probe_due = False
-            self._lifecycle_state = _LIFECYCLE_OPEN
+        publication_failure: BaseException | None = None
+        try:
+            with self._lifecycle_lock:
+                # OPEN is the first success publication. If a later package-state
+                # assignment is interrupted, the recovery path below can close an
+                # ordinary OPEN scheduler instead of stranding OPENING ownership.
+                self._lifecycle_state = _LIFECYCLE_OPEN
+                self._backpressure_paused = False
+                self._backpressure_probe_due = False
+        except BaseException as exc:
+            publication_failure = exc
+
+        if publication_failure is not None:
+            cleanup_failed = False
+            try:
+                self._close_attempt("open-publication-failed", allow_opening=True)
+            except BaseException:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    logger.error(
+                        "Failed to clean up scheduler after open publication failure"
+                    )
+                except BaseException:
+                    pass
+            raise publication_failure
+
         try:
             logger.info("Scheduler opened for spider %s", spider.name)
         except BaseException:

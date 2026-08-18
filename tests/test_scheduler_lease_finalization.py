@@ -260,3 +260,46 @@ def test_interrupted_close_owner_finalization_is_reclaimed_on_retry() -> None:
     assert queue.close.call_count == 2
     assert scheduler._lifecycle_state == "closed"
     manager.close.assert_called_once_with()
+
+
+class _InterruptOpenPublicationScheduler(BackendScheduler):
+    interrupt_open_publication = False
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if (
+            name == "_lifecycle_state"
+            and value == "open"
+            and self.interrupt_open_publication
+        ):
+            object.__setattr__(self, "interrupt_open_publication", False)
+            raise KeyboardInterrupt("open publication")
+        super().__setattr__(name, value)
+
+
+def test_interrupted_open_publication_closes_owned_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = Mock()
+    scheduler = _InterruptOpenPublicationScheduler(manager)
+    queue = Mock()
+    monkeypatch.setattr(
+        "scrapy_extension.schedule.scheduler.BackendQueue", Mock(return_value=queue)
+    )
+    signal_manager = Mock()
+    spider = Mock()
+    spider.name = "interrupted-open-publication"
+    spider.crawler.signals = signal_manager
+    scheduler.interrupt_open_publication = True
+
+    with pytest.raises(KeyboardInterrupt, match="open publication"):
+        scheduler.open(spider)
+
+    assert scheduler._lifecycle_state == "closed"
+    assert scheduler._queue is None
+    assert scheduler._spider is None
+    assert scheduler._signal_leases == []
+    queue.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+
+    scheduler.close("retry")
+    manager.close.assert_called_once_with()
