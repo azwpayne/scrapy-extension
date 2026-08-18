@@ -29,7 +29,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, NoReturn, Protocol
 
 from pydantic import SecretStr
 
@@ -45,6 +45,22 @@ _CODEC_BYTES = "bytes"
 _CODEC_DICT = "dict"
 _CODEC_DATETIME = "datetime"
 _CODEC_DATE = "date"
+
+
+class _SecretWrapperSerializationRejected(Exception):
+    """Internal signal whose fields contain only a non-sensitive wrapper name."""
+
+    def __init__(self, wrapper_name: str) -> None:
+        super().__init__(wrapper_name)
+        self.wrapper_name = wrapper_name
+
+
+def _raise_terminal_secret_serialization_error(wrapper_name: str) -> NoReturn:
+    """Raise the public error after all secret-bearing codec frames have unwound."""
+    raise TypeError(
+        f"{wrapper_name} values cannot be JSON serialized; explicitly encrypt or "
+        "unwrap only after accepting persistence risk."
+    ) from None
 
 
 def _json_default(obj: object) -> object:
@@ -163,6 +179,9 @@ def _looks_like_codec_marker(obj: dict[object, object]) -> bool:
 
 def _encode_json_value(obj: object) -> object:
     """Recursively encode rich types (bytes/datetime/date), escaping marker-shaped dicts."""
+    type_name = type(obj).__name__
+    if type_name in {"SecretStr", "SecretBytes"}:
+        raise _SecretWrapperSerializationRejected(type_name)
     if isinstance(obj, (bytes, bytearray)):
         return {
             _CODEC_TAG: _CODEC_BYTES,
@@ -350,11 +369,21 @@ class JSONSerializer:
         Raises:
             TypeError: If the object contains types not handled by _json_default.
         """
-        return json.dumps(
-            _encode_json_value(obj),
-            default=_json_default,
-            allow_nan=False,
-        ).encode("utf-8")
+        try:
+            return json.dumps(
+                _encode_json_value(obj),
+                default=_json_default,
+                allow_nan=False,
+            ).encode("utf-8")
+        except _SecretWrapperSerializationRejected as source_error:
+            wrapper_name = source_error.wrapper_name
+
+        # Reconstruct at a terminal boundary only after the internal exception and
+        # its secret-bearing codec frames have unwound. Removing the public frame's
+        # receiver and input prevents the replacement traceback from retaining the
+        # serializer, caller container, wrapper, or underlying secret.
+        del self, obj
+        _raise_terminal_secret_serialization_error(wrapper_name)
 
     def deserialize(self, data: bytes) -> object:
         """Deserialize JSON bytes to an object.

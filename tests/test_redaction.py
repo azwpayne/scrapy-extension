@@ -12,14 +12,66 @@ backend depends on.
 
 from __future__ import annotations
 
+import gc
 import json
 import traceback
+from types import CodeType, FrameType, FunctionType, ModuleType
 
 import pytest
 from pydantic import SecretBytes, SecretStr
 
 from scrapy_extension.backends._redaction import _redact, _RedactedStr
 from scrapy_extension.backends.base import JSONSerializer
+
+
+def _exception_library_graph(error: BaseException) -> list[object]:
+    """Collect exception fields and recursively reachable library-frame locals."""
+    roots: list[object] = [error]
+    trace = error.__traceback__
+    while trace is not None:
+        if "/src/scrapy_extension/" in trace.tb_frame.f_code.co_filename:
+            roots.append(dict(trace.tb_frame.f_locals))
+        trace = trace.tb_next
+
+    reachable: list[object] = []
+    pending: list[object] = roots
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        reachable.append(value)
+
+        if isinstance(value, BaseException):
+            pending.extend(
+                candidate
+                for candidate in (
+                    value.args,
+                    value.__dict__,
+                    value.__cause__,
+                    value.__context__,
+                )
+                if candidate is not None
+            )
+            continue
+        if isinstance(
+            value,
+            (
+                str,
+                bytes,
+                bytearray,
+                CodeType,
+                FrameType,
+                FunctionType,
+                ModuleType,
+                type,
+            ),
+        ):
+            continue
+        pending.extend(gc.get_referents(value))
+    return reachable
 
 
 def test_redact_wraps_non_empty_string() -> None:
@@ -95,9 +147,13 @@ def test_redacted_str_ordinary_string_paths_expose_underlying_value() -> None:
 def test_json_serializer_rejects_secret_wrappers_without_leaking_exception_graph(
     wrapped: SecretStr | SecretBytes, marker: str
 ) -> None:
-    """Secret wrappers fail closed and remain masked throughout the failure."""
+    """The terminal public failure retains no sensitive library-owned objects."""
+    serializer = JSONSerializer()
+    raw_secret = wrapped.get_secret_value()
+    payload = {"request": [{"nested": ("safe", [wrapped])}]}
+
     with pytest.raises(TypeError) as exc_info:
-        JSONSerializer().serialize({"credential": wrapped})
+        serializer.serialize(payload)
 
     error = exc_info.value
     surfaces = [
@@ -107,18 +163,22 @@ def test_json_serializer_rejects_secret_wrappers_without_leaking_exception_graph
         repr(error.__dict__),
         "".join(traceback.format_exception(error)),
     ]
-    current: BaseException | None = error
-    while current is not None:
-        surfaces.extend((repr(current.args), repr(current.__dict__)))
-        trace = current.__traceback__
-        while trace is not None:
-            if "/src/scrapy_extension/" in trace.tb_frame.f_code.co_filename:
-                surfaces.append(repr(trace.tb_frame.f_locals))
-            trace = trace.tb_next
-        current = current.__cause__ or current.__context__
+    reachable = _exception_library_graph(error)
+    reachable_ids = {id(value) for value in reachable}
+    reachable_secrets = [
+        value.get_secret_value()
+        for value in reachable
+        if type(value).__name__ in {"SecretStr", "SecretBytes"}
+    ]
 
     assert type(wrapped).__name__ in str(error)
     assert all(marker not in surface for surface in surfaces)
+    assert reachable_secrets == []
+    assert id(serializer) not in reachable_ids
+    assert id(payload) not in reachable_ids
+    assert id(wrapped) not in reachable_ids
+    assert id(raw_secret) not in reachable_ids
+    assert [value for value in reachable if isinstance(value, BaseException)] == [error]
     assert error.__cause__ is None
     assert error.__context__ is None
 

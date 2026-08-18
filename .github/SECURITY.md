@@ -125,11 +125,14 @@ implementation are responsible for its safety.
 
 JSON serialization is not encryption and redaction wrappers are not a data
 classification boundary. `JSONSerializer` fails closed for Pydantic `SecretStr`
-and `SecretBytes`: it raises `TypeError` without unwrapping or including the
-secret in the exception graph. Only a caller-explicit unwrap to an ordinary
-serializable string or bytes value permits persistence. Request metadata,
-callback arguments, items, queue snapshots, and custom settings may still
-contain such caller-owned credentials or personal data. Use authenticated TLS
+and `SecretBytes`: after secret-bearing codec frames unwind, it raises a terminal
+`TypeError` whose public fields and library-owned traceback frame locals retain
+neither the wrapper, its input container, nor its underlying secret. The caller's
+own invocation frame and input remain outside that boundary. Only a
+caller-explicit unwrap to an ordinary serializable string or bytes value permits
+persistence. Request metadata, callback arguments, items, queue snapshots, and
+custom settings may still contain such caller-owned credentials or personal
+data. Use authenticated TLS
 to every remote backend, backend ACLs scoped to the smallest required
 key/topic/index namespace, and encryption at rest (or application-layer
 encryption where the backend cannot provide it). Restrict broker and snapshot
