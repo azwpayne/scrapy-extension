@@ -27,9 +27,14 @@ def _connected(mocker, **settings: Any) -> tuple[DynamoDBBackend, Any, Any]:
 
     def successful_conditional_delete(**kwargs: Any) -> dict[str, Any]:
         attributes = {"pk": kwargs["Key"]["pk"]}
-        revision = kwargs.get("ExpressionAttributeValues", {}).get(":revision")
+        values = kwargs.get("ExpressionAttributeValues", {})
+        revision = values.get(":revision")
         if revision is not None:
             attributes[_REVISION] = revision
+        else:
+            for token, name in kwargs["ExpressionAttributeNames"].items():
+                if token.startswith("#item"):
+                    attributes[name] = values[token.replace("#", ":", 1)]
         return {"Attributes": attributes}
 
     table.delete_item.side_effect = successful_conditional_delete
@@ -134,6 +139,35 @@ def test_default_clear_preserves_revisionless_row_and_fails_closed(mocker) -> No
     table.delete_item.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "0" * 31,
+        "0" * 33,
+        "A" * 32,
+        "g" * 32,
+        0,
+    ],
+)
+def test_clear_rejects_malformed_revision_before_any_delete(
+    mocker, revision: Any
+) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {
+        "Items": [
+            _revision_item("valid"),
+            {"pk": "malformed", "value": b"value", _REVISION: revision},
+        ]
+    }
+
+    with pytest.raises(StorageError, match="malformed revision metadata") as exc_info:
+        backend.clear_storage()
+
+    assert exc_info.value.operation == "clear_storage"
+    assert exc_info.value.key is None
+    table.delete_item.assert_not_called()
+
+
 def test_identical_attribute_aba_is_not_claimed_or_deleted_by_default(mocker) -> None:
     backend, table, _resource = _connected(mocker)
     observed = {"pk": "key", "value": b"identical", "expire_at": 123}
@@ -211,6 +245,32 @@ def test_quiesced_override_condition_loss_preserves_replacement(mocker) -> None:
     assert exc_info.value.__cause__ is None
     assert table.delete_item.call_count == 1
     table.update_item.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "returned_attributes",
+    [
+        {"pk": "legacy", "value": b"changed", "expire_at": 123},
+        {"pk": "legacy", "value": b"old"},
+        {"pk": "legacy", "value": b"old", "expire_at": 123, "extra": True},
+    ],
+)
+def test_quiesced_override_rejects_all_old_response_mismatch(
+    mocker, returned_attributes: dict[str, Any]
+) -> None:
+    backend, table, _resource = _connected(mocker, allow_unfenced_legacy_clear=True)
+    legacy = {"pk": "legacy", "value": b"old", "expire_at": 123}
+    table.scan.return_value = {"Items": [legacy]}
+    table.delete_item.side_effect = None
+    table.delete_item.return_value = {"Attributes": returned_attributes}
+
+    with pytest.raises(StorageError, match="malformed conditional DeleteItem") as exc:
+        backend.clear_storage()
+
+    assert exc.value.operation == "clear_storage"
+    assert exc.value.key is None
+    assert exc.value.__cause__ is None
+    assert table.delete_item.call_count == 1
 
 
 def test_override_is_captured_by_connected_generation(mocker) -> None:

@@ -66,8 +66,15 @@ logger = logging.getLogger(__name__)
 _DYNAMODB_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
     DynamoDBSettings.model_fields
 )
+_DYNAMODB_INVALID_LEGACY_CLEAR_OVERRIDE = (
+    "DynamoDB legacy clear override must be an exact boolean."
+)
 _DYNAMODB_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
-    {"Unsupported DynamoDB mode."} | _AWS_SAFE_CONFIGURATION_MESSAGES
+    {
+        "Unsupported DynamoDB mode.",
+        _DYNAMODB_INVALID_LEGACY_CLEAR_OVERRIDE,
+    }
+    | _AWS_SAFE_CONFIGURATION_MESSAGES
 )
 _DYNAMODB_SAFE_CONNECTION_MESSAGES: frozenset[str] = frozenset(
     {"Failed to connect to DynamoDB."}
@@ -102,12 +109,17 @@ _DYNAMODB_CLEAR_MALFORMED_DELETE = (
     "DynamoDB returned a malformed conditional DeleteItem response; the clear may "
     "be partially complete"
 )
+_DYNAMODB_CLEAR_MALFORMED_REVISION = (
+    "DynamoDB clear is partially complete: stopped at an item with malformed "
+    "revision metadata; the item was preserved"
+)
 _DYNAMODB_SAFE_STORAGE_MESSAGES: frozenset[str] = frozenset(
     {
         "DynamoDB backend is not connected",
         _DYNAMODB_CLEAR_CONCURRENT_WRITE,
         _DYNAMODB_CLEAR_UNFENCED_LEGACY,
         _DYNAMODB_CLEAR_MALFORMED_DELETE,
+        _DYNAMODB_CLEAR_MALFORMED_REVISION,
         "DynamoDB returned a malformed scan response; the clear may be "
         "partially complete",
         "DynamoDB returned a malformed out-of-scope scan response; the clear may "
@@ -169,6 +181,15 @@ def _validate_partition_key(key: str) -> None:
         raise ValueError(
             f"DynamoDB partition key exceeds 2,048 UTF-8 bytes ({key_size} bytes)."
         )
+
+
+def _is_valid_item_revision(revision: object) -> bool:
+    """Return whether a clear fence has the exact generated revision grammar."""
+    return (
+        isinstance(revision, str)
+        and len(revision) == _DDB_REVISION_BYTES
+        and all(character in "0123456789abcdef" for character in revision)
+    )
 
 
 def _validate_dynamodb_storage_key_argument(
@@ -344,13 +365,21 @@ class DynamoDBBackend(Backend, StorageBackend):
             access_key,
             secret_key,
         )
+        allow_unfenced_legacy_clear = self.config.allow_unfenced_legacy_clear
+        # Pydantic validates construction, but callers can mutate settings objects
+        # afterward. Never let a truthy string become a destructive generation flag.
+        if type(allow_unfenced_legacy_clear) is not bool:
+            raise ConfigurationError(
+                _DYNAMODB_INVALID_LEGACY_CLEAR_OVERRIDE,
+                setting_name="allow_unfenced_legacy_clear",
+            )
 
         snapshot = _DynamoDBConnectionSnapshot(
             mode=mode,
             table_name=table_name,
             region_name=region_name,
             endpoint_url=endpoint_url,
-            allow_unfenced_legacy_clear=self.config.allow_unfenced_legacy_clear,
+            allow_unfenced_legacy_clear=allow_unfenced_legacy_clear,
         )
         kwargs: dict[str, Any] = {
             "region_name": region_name,
@@ -539,6 +568,13 @@ class DynamoDBBackend(Backend, StorageBackend):
         for item in raw_items:
             if not isinstance(item, dict) or not isinstance(item.get("pk"), str):
                 raise malformed
+            revision = item.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
+            if revision is not _MISSING and not _is_valid_item_revision(revision):
+                raise StorageError(
+                    _DYNAMODB_CLEAR_MALFORMED_REVISION,
+                    operation="clear_storage",
+                    key=None,
+                )
             items.append(item)
 
         cursor = response.get("LastEvaluatedKey")
@@ -580,7 +616,10 @@ class DynamoDBBackend(Backend, StorageBackend):
         expected_revision = item.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
         returned_revision = attributes.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
         if expected_revision is _MISSING:
-            if returned_revision is not _MISSING:
+            # The maintenance override has no revision CAS. Its conditional
+            # expression narrows races, and ALL_OLD must independently confirm that
+            # DynamoDB deleted the complete item observed by Scan.
+            if returned_revision is not _MISSING or attributes != item:
                 raise malformed
         elif (
             not isinstance(expected_revision, str)
@@ -599,9 +638,15 @@ class DynamoDBBackend(Backend, StorageBackend):
     ) -> None:
         """Conditionally delete one observed row under the selected safety policy."""
         revision = item.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
+        if revision is not _MISSING and not _is_valid_item_revision(revision):
+            raise StorageError(
+                _DYNAMODB_CLEAR_MALFORMED_REVISION,
+                operation="clear_storage",
+                key=None,
+            )
         delete_kwargs: dict[str, Any]
         if revision is _MISSING:
-            if not allow_unfenced_legacy_clear:
+            if allow_unfenced_legacy_clear is not True:
                 raise StorageError(
                     _DYNAMODB_CLEAR_UNFENCED_LEGACY,
                     operation="clear_storage",

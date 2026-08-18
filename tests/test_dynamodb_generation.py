@@ -555,6 +555,24 @@ def test_connect_revalidates_mutated_region_before_boto3(mocker) -> None:
     factory.assert_not_called()
 
 
+def test_connect_rejects_mutated_string_legacy_clear_override_before_boto3(
+    mocker,
+) -> None:
+    backend = _backend()
+    backend.config.allow_unfenced_legacy_clear = "true"  # type: ignore[assignment]
+    session_factory, factory = _patch_resource(mocker)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        backend.connect()
+
+    assert str(exc_info.value) == (
+        "DynamoDB legacy clear override must be an exact boolean."
+    )
+    assert exc_info.value.setting_name == "allow_unfenced_legacy_clear"
+    session_factory.assert_not_called()
+    factory.assert_not_called()
+
+
 @pytest.mark.parametrize("region_name", ["us-gov-east-1", "eusc-de-east-1"])
 def test_connect_accepts_valid_multi_segment_region_mutation(
     mocker, region_name: str
