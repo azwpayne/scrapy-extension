@@ -121,6 +121,25 @@ class _IdentityToken:
     pass
 
 
+_QUEUE_FACTORY_CALLS: list[str] = []
+
+
+def _queue_backend_factory(settings: _Settings | None = None) -> _QueuePlugin:
+    del settings
+    _QUEUE_FACTORY_CALLS.append("factory-called")
+    return _QueuePlugin()
+
+
+class _CallableQueueBackendInstance(_QueuePlugin):
+    def __call__(self, settings: _Settings | None = None) -> _QueuePlugin:
+        del settings
+        _QUEUE_FACTORY_CALLS.append("instance-called")
+        return _QueuePlugin()
+
+
+_CALLABLE_QUEUE_BACKEND_INSTANCE = _CallableQueueBackendInstance()
+
+
 async def _tracked_delivery_coroutine(broker_events: list[str]) -> None:
     broker_events.append("coroutine-advanced")
 
@@ -271,6 +290,42 @@ def test_manager_conformance_matrix_fails_before_construction_or_broker_io(
     manager = ConnectionManager("ackplugin")
     assert manager._deferred_ack_plugin is deferred
     assert manager._backend is None
+
+
+@pytest.mark.parametrize(
+    "backend_object_name",
+    ["_queue_backend_factory", "_CALLABLE_QUEUE_BACKEND_INSTANCE"],
+)
+@pytest.mark.parametrize("requires_ack", [False, True])
+def test_queue_descriptor_rejects_callable_non_classes_before_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_object_name: str,
+    requires_ack: bool,
+) -> None:
+    backend_object = globals()[backend_object_name]
+    monkeypatch.setattr(backend_object, "requires_ack", requires_ack, raising=False)
+    _QUEUE_FACTORY_CALLS.clear()
+    _install_descriptor(
+        monkeypatch,
+        BackendDescriptor(
+            backend_type="ackplugin",
+            backend_cls_path=f"{__name__}.{backend_object_name}",
+            settings_cls_path=f"{__name__}._Settings",
+            capabilities=frozenset({"queue"}),
+        ),
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        ConnectionManager("ackplugin")
+
+    error = exc_info.value
+    assert str(error) == (
+        "Selected third-party queue backend has an invalid acknowledgement contract."
+    )
+    assert error.setting_name == "SCRAPY_BACKEND_TYPE"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert _QUEUE_FACTORY_CALLS == []
 
 
 def test_manager_constructs_the_exact_class_returned_by_dynamic_module(

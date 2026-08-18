@@ -468,11 +468,13 @@ def _validate_plugin_ack_class(
     """
     if "queue" not in descriptor.capabilities:
         return _PluginAckCapabilitySnapshot(False, False, False)
+    # A queue descriptor is executable configuration, but its target must be a
+    # concrete class from the queue ABC hierarchy.  Reject factories and callable
+    # instances before reading ACK metadata or invoking the object: even atomic-pop
+    # plugins (``requires_ack=False``) participate in queue contract dispatch.
+    if not isinstance(backend_cls, type) or not issubclass(backend_cls, QueueBackend):
+        raise _invalid_plugin_ack_contract()
     requires_ack = getattr_static(backend_cls, "requires_ack", None)
-    if requires_ack is None:
-        # Preserve the existing runtime ABC check for legacy descriptors that
-        # overclaim ``queue`` without implementing QueueBackend at all.
-        return _PluginAckCapabilitySnapshot(False, False, False)
     if type(requires_ack) is not bool:
         raise _invalid_plugin_ack_contract()
     supports_concurrent = getattr_static(
@@ -2410,6 +2412,14 @@ class ConnectionManager:
                 descriptor.backend_cls_path,
             )
         settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
+        if "queue" in descriptor.capabilities and (
+            not isinstance(backend_cls, type)
+            or not issubclass(backend_cls, QueueBackend)
+        ):
+            if descriptor.backend_type not in _BUNDLED_BACKEND_TYPES:
+                raise _invalid_plugin_ack_contract()
+            msg = "Selected backend must provide callable backend and settings classes."
+            raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
         if not callable(backend_cls) or not callable(settings_cls):
             msg = "Selected backend must provide callable backend and settings classes."
             raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
