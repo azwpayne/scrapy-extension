@@ -1292,6 +1292,7 @@ def test_queue_close_waits_for_an_in_progress_close() -> None:
     def complete_close() -> None:
         queue._close_in_progress = False
         queue._close_complete = True
+        queue._close_attempt_outcomes[1] = True
 
     operation_gate.wait.side_effect = complete_close
     queue._operation_gate = operation_gate

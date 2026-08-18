@@ -9,6 +9,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from scrapy_extension.backends.base import BackendType, _validate_key_name
+
 DEFAULT_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024
 DEFAULT_SNAPSHOT_CHUNK_BYTES = MAX_SNAPSHOT_CHUNK_BYTES
@@ -19,6 +21,11 @@ _MAX_MANIFEST_BYTES = 64 * 1024
 _CHUNK_KEY_PREFIX = "queue:snapshot-chunk:v1:"
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
+_BACKEND_LOGICAL_KEY_LIMITS = {
+    BackendType.MEMCACHED: 250,
+    BackendType.ELASTICSEARCH: 512,
+    BackendType.DYNAMODB: 2_048,
+}
 
 
 class SnapshotRepositoryError(Exception):
@@ -74,11 +81,33 @@ class SnapshotRepository:
         self._max_bytes = max_bytes
         self._chunk_bytes = chunk_bytes
 
-    @staticmethod
-    def _validate_logical_key(key: str) -> None:
+    def _validate_logical_key(self, key: str) -> None:
+        try:
+            _validate_key_name(key, "snapshot logical key")
+        except (TypeError, ValueError):
+            raise SnapshotRepositoryError("Snapshot logical key is invalid.") from None
         if key.startswith(_CHUNK_KEY_PREFIX):
             raise SnapshotRepositoryError(
                 "Snapshot logical key uses the reserved chunk namespace."
+            )
+
+        raw_backend_type: object = getattr(self._storage, "backend_type", None)
+        backend_type: BackendType | None = None
+        if isinstance(raw_backend_type, BackendType):
+            backend_type = raw_backend_type
+        elif isinstance(raw_backend_type, str):
+            try:
+                backend_type = BackendType(raw_backend_type)
+            except ValueError:
+                pass
+        limit = (
+            None
+            if backend_type is None
+            else _BACKEND_LOGICAL_KEY_LIMITS.get(backend_type)
+        )
+        if limit is not None and len(key.encode("utf-8")) > limit:
+            raise SnapshotRepositoryError(
+                "Snapshot logical key exceeds the storage backend limit."
             )
 
     @staticmethod

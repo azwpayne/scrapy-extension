@@ -242,7 +242,10 @@ class BackendQueue:
         self._close_complete = False
         self._close_in_progress = False
         self._close_attempt = 0
-        self._last_failed_close_attempt = 0
+        # Retain an attempt outcome until every caller that observed that exact
+        # attempt has consumed it. A retry must not overtake those waiters.
+        self._close_attempt_outcomes: dict[int, bool] = {}
+        self._close_attempt_waiters: dict[int, int] = {}
         self._begin_close_complete = False
         self._checkpoint_complete = False
         self._monitor: Monitor = (
@@ -1287,12 +1290,27 @@ class BackendQueue:
                 return
             if self._close_in_progress:
                 observed_attempt = self._close_attempt
-                while self._close_in_progress and not self._close_complete:
-                    self._operation_gate.wait()
-                if self._close_complete:
+                self._close_attempt_waiters[observed_attempt] = (
+                    self._close_attempt_waiters.get(observed_attempt, 0) + 1
+                )
+                try:
+                    while observed_attempt not in self._close_attempt_outcomes:
+                        self._operation_gate.wait()
+                    observed_success = self._close_attempt_outcomes[observed_attempt]
+                finally:
+                    remaining_waiters = (
+                        self._close_attempt_waiters[observed_attempt] - 1
+                    )
+                    if remaining_waiters == 0:
+                        del self._close_attempt_waiters[observed_attempt]
+                        self._close_attempt_outcomes.pop(observed_attempt, None)
+                    else:
+                        self._close_attempt_waiters[observed_attempt] = (
+                            remaining_waiters
+                        )
+                if observed_success:
                     return
-                if self._last_failed_close_attempt == observed_attempt:
-                    raise QueueError("Queue close failed; checkpoint can be retried.")
+                raise QueueError("Queue close failed; checkpoint can be retried.")
             self._close_in_progress = True
             self._close_attempt += 1
             attempt = self._close_attempt
@@ -1316,10 +1334,10 @@ class BackendQueue:
 
         with self._operation_gate:
             self._close_in_progress = False
+            if self._close_attempt_waiters.get(attempt, 0) > 0:
+                self._close_attempt_outcomes[attempt] = failure is None
             if failure is None:
                 self._close_complete = True
-            else:
-                self._last_failed_close_attempt = attempt
             self._operation_gate.notify_all()
         if failure is not None:
             raise failure

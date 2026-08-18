@@ -87,6 +87,89 @@ def test_concurrent_close_callers_observe_the_same_failed_attempt() -> None:
     strategy.close.assert_called_once_with()
 
 
+@pytest.mark.timeout(10)
+def test_failed_close_waiter_is_not_overtaken_by_successful_retry() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    first_store_entered = threading.Event()
+    release_first_store = threading.Event()
+    waiter_is_waiting = threading.Event()
+    retry_may_start = threading.Barrier(2)
+    retry_completed = threading.Barrier(2)
+
+    class _DelayedWaiterCondition(threading.Condition):
+        """Let caller C complete its retry before caller B resumes from wait."""
+
+        def wait(self, timeout: float | None = None) -> bool:
+            if threading.current_thread().name == "close-waiter-b":
+                waiter_is_waiting.set()
+            notified = super().wait(timeout)
+            if threading.current_thread().name == "close-waiter-b":
+                self.release()
+                try:
+                    retry_may_start.wait(timeout=2.0)
+                    retry_completed.wait(timeout=2.0)
+                finally:
+                    self.acquire()
+            return notified
+
+    store_calls = 0
+
+    def store(_key: str, _value: bytes) -> None:
+        nonlocal store_calls
+        store_calls += 1
+        if store_calls == 1:
+            first_store_entered.set()
+            assert release_first_store.wait(timeout=2.0)
+            raise RuntimeError("secret backend failure")
+
+    storage.store.side_effect = store
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = _queue_with_storage(strategy, storage)
+    queue._operation_gate = _DelayedWaiterCondition()
+    outcomes: dict[str, BaseException | None] = {}
+
+    def close_queue(caller: str) -> None:
+        try:
+            if caller == "c":
+                retry_may_start.wait(timeout=2.0)
+            queue.close()
+        except BaseException as exc:  # capture each thread outcome for assertion
+            outcomes[caller] = exc
+        else:
+            outcomes[caller] = None
+        finally:
+            if caller == "c":
+                retry_completed.wait(timeout=2.0)
+
+    caller_a = threading.Thread(
+        target=close_queue, args=("a",), name="close-owner-a", daemon=True
+    )
+    caller_b = threading.Thread(
+        target=close_queue, args=("b",), name="close-waiter-b", daemon=True
+    )
+    caller_c = threading.Thread(
+        target=close_queue, args=("c",), name="close-retry-c", daemon=True
+    )
+    caller_a.start()
+    assert first_store_entered.wait(timeout=2.0)
+    caller_b.start()
+    assert waiter_is_waiting.wait(timeout=2.0)
+    caller_c.start()
+    release_first_store.set()
+
+    for caller in (caller_a, caller_b, caller_c):
+        caller.join(timeout=2.0)
+        assert not caller.is_alive()
+
+    assert isinstance(outcomes["a"], QueueError)
+    assert isinstance(outcomes["b"], QueueError)
+    assert outcomes["c"] is None
+    assert store_calls == 4  # failed generation chunk, then successful retry
+    strategy.close.assert_called_once_with()
+
+
 def test_nonempty_state_without_storage_requires_explicit_lossy_abort() -> None:
     manager = MagicMock()
     manager.get_storage_backend.side_effect = NotImplementedError("queue only")

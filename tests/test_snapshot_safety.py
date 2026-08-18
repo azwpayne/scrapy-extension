@@ -14,6 +14,7 @@ import boto3
 import pytest
 
 import scrapy_extension.backends.memcached as memcached_mod
+from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.dynamodb import DynamoDBBackend
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.backends.memcached import MemcachedBackend
@@ -23,6 +24,7 @@ from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.snapshot import (
     MAX_SNAPSHOT_CHUNK_BYTES,
     SnapshotRepository,
+    SnapshotRepositoryError,
 )
 from scrapy_extension.settings import (
     DynamoDBSettings,
@@ -219,6 +221,37 @@ def test_legacy_read_logs_have_no_backend_exception_context(
 
     _assert_callback_isolated(probe)
     assert [record.getMessage() for record in probe.records] == [expected_message]
+
+
+@pytest.mark.parametrize(
+    ("backend_type", "maximum_key_bytes"),
+    [
+        (BackendType.MEMCACHED, 250),
+        (BackendType.ELASTICSEARCH, 512),
+        (BackendType.DYNAMODB, 2_048),
+    ],
+)
+def test_manifest_key_backend_limit_is_rejected_before_any_chunk_write(
+    backend_type: BackendType, maximum_key_bytes: int
+) -> None:
+    storage = MagicMock()
+    storage.backend_type = backend_type
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+
+    with pytest.raises(SnapshotRepositoryError, match="storage backend limit"):
+        repository.commit("k" * (maximum_key_bytes + 1), b"state")
+
+    storage.store.assert_not_called()
+
+
+def test_unknown_custom_backend_does_not_inherit_a_bundled_key_limit() -> None:
+    storage = MagicMock()
+    storage.backend_type = "third-party-storage"
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+
+    repository.commit("k" * 3_000, b"state")
+
+    assert storage.store.call_count == 3
 
 
 def test_memcached_contract_accepts_maximum_snapshot_chunk(mocker: Any) -> None:
