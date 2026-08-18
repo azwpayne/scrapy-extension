@@ -319,24 +319,18 @@ def test_push_pop_round_trip(rocketmq_backend, unique_prefix):
 
     received, npe_hits = _drain(rocketmq_backend, queue, n)
 
-    # R7 verification: at least one pushed message made it through the full
-    # push→subscribe→receive→ack round-trip, and every received body is one we
-    # pushed (fidelity). We do NOT assert N==len(received): the apache
-    # SimpleConsumer pins to one queue per receive call and the broker's
-    # invisible-duration window hides recently-popped messages, so a single
-    # consumer session within the drain deadline is not guaranteed to drain all
-    # N (queue rotation + redelivery timing are broker-side concerns the backend
-    # does not control). Proving >=1 + fidelity is the honest R7 claim.
-    #
-    # A zero-delivery round-trip is a failed verification, even when the broker
-    # reports no transient receive errors. Service-unavailability skips belong at
-    # the environment/topic setup boundaries above, not here.
+    # The live contract is the complete multi-message round trip, not merely one
+    # successful delivery. Compare the full multiset so loss, duplication, and an
+    # unexpected body all fail while remaining independent of broker queue order.
     if not received:
         pytest.fail(
             f"broker delivered 0 of {n} pushed messages within the drain window "
             f"({npe_hits} receive NPE(s)); push succeeded (producer accepted all {n})."
         )
-    assert set(received).issubset(set(sent)), f"unexpected body: {received!r}"
+    assert sorted(received) == sorted(sent), (
+        f"broker delivered {len(received)} of {n} expected messages "
+        f"({npe_hits} receive NPE(s)): {received!r}"
+    )
 
 
 def test_pop_empty_returns_none(rocketmq_backend, unique_prefix):

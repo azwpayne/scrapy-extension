@@ -137,8 +137,9 @@ _MIN_LONG_POLL_DURATION = 5
 _MAX_REQUEST_TIMEOUT_S = 300
 
 # Consumer shutdown should interrupt an in-flight receive promptly. Do not trust
-# that SDK guarantee during teardown: a broken transport or shutdown path must
-# not make ``disconnect`` wait forever for the daemon pump.
+# either shutdown itself or that interrupt guarantee during teardown: a broken
+# SDK must not make ``disconnect`` wait forever for cleanup or the daemon pump.
+_CLIENT_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 _RECEIVE_PUMP_JOIN_TIMEOUT_S = 1.0
 
 
@@ -150,6 +151,31 @@ def _validate_queue_name_argument(
 ) -> None:
     """Validate a public queue argument before its terminal error boundary."""
     _validate_key_name(queue_name, "queue_name")
+
+
+class _RocketMQCleanupResult:
+    """Fence one daemon shutdown task's result after its join budget expires."""
+
+    __slots__ = ("_accepting", "_completed", "_error", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._accepting = True
+        self._completed = False
+        self._error: BaseException | None = None
+
+    def publish(self, error: BaseException | None) -> None:
+        """Publish completion only while the disconnect generation accepts it."""
+        with self._lock:
+            if self._accepting:
+                self._completed = True
+                self._error = error
+
+    def fence(self) -> tuple[bool, BaseException | None]:
+        """Reject late publication and return the result visible at the fence."""
+        with self._lock:
+            self._accepting = False
+            return self._completed, self._error
 
 
 class _RocketMQAckToken:
@@ -456,9 +482,7 @@ class RocketMQBackend(Backend, QueueBackend):
             self._receive_condition.notify_all()
             return worker
 
-    def _finish_receive_pump_shutdown(
-        self, worker: threading.Thread | None
-    ) -> bool:
+    def _finish_receive_pump_shutdown(self, worker: threading.Thread | None) -> bool:
         """Bound the detached-worker join and report whether it really stopped."""
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=_RECEIVE_PUMP_JOIN_TIMEOUT_S)
@@ -540,25 +564,64 @@ class RocketMQBackend(Backend, QueueBackend):
                 pass
 
     @staticmethod
+    def _shutdown_detached_client(closer: Any, result: _RocketMQCleanupResult) -> None:
+        """Run one potentially blocking SDK shutdown in a fenced daemon task."""
+        error: BaseException | None = None
+        try:
+            closer.shutdown()
+        except BaseException as caught:
+            error = caught
+        result.publish(error)
+
+    @classmethod
     def _shutdown_detached_clients(
+        cls,
         *clients: tuple[Any | None, str],
         suppress_control_errors: bool = False,
     ) -> bool:
-        """Shut down every detached client, retaining the first control exception."""
-        primary_error: BaseException | None = None
-        ordinary_shutdown_failed = False
-        for closer, _label in clients:
-            if closer is not None:
-                try:
-                    closer.shutdown()
-                except Exception:
-                    ordinary_shutdown_failed = True
-                except BaseException as error:
-                    if primary_error is None:
-                        primary_error = error
-        if primary_error is not None and not suppress_control_errors:
-            raise primary_error
-        return ordinary_shutdown_failed
+        """Bound all SDK shutdowns and retain the first ordered control error."""
+        tasks: list[tuple[threading.Thread, _RocketMQCleanupResult]] = []
+        for closer, label in clients:
+            if closer is None:
+                continue
+            result = _RocketMQCleanupResult()
+            worker = threading.Thread(
+                target=cls._shutdown_detached_client,
+                args=(closer, result),
+                name=f"rocketmq-shutdown-{label}",
+                daemon=True,
+            )
+            tasks.append((worker, result))
+            try:
+                worker.start()
+            except BaseException as start_error:
+                result.publish(start_error)
+
+        deadline = time.monotonic() + _CLIENT_SHUTDOWN_JOIN_TIMEOUT_S
+        for worker, _result in tasks:
+            if worker.ident is None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+
+        cleanup_failed = False
+        primary_control_error: BaseException | None = None
+        for _worker, result in tasks:
+            completed, shutdown_error = result.fence()
+            if not completed:
+                cleanup_failed = True
+            elif isinstance(shutdown_error, Exception):
+                cleanup_failed = True
+            elif shutdown_error is not None and primary_control_error is None:
+                primary_control_error = shutdown_error
+
+        if primary_control_error is not None:
+            if not suppress_control_errors:
+                raise primary_control_error
+            cleanup_failed = True
+        return cleanup_failed
 
     def is_connected(self) -> bool:
         """Check if RocketMQ is connected (both clients running).
@@ -705,11 +768,8 @@ class RocketMQBackend(Backend, QueueBackend):
             consumer.await_duration = _MIN_LONG_POLL_DURATION
             while True:
                 with self._receive_condition:
-                    while (
-                        self._pump_is_current_locked(consumer, generation, stop)
-                        and (
-                            self._receive_buffer or self._receive_demand == 0
-                        )
+                    while self._pump_is_current_locked(consumer, generation, stop) and (
+                        self._receive_buffer or self._receive_demand == 0
                     ):
                         self._receive_condition.wait()
                     if not self._pump_is_current_locked(consumer, generation, stop):
@@ -721,9 +781,7 @@ class RocketMQBackend(Backend, QueueBackend):
                         return
                     self._receive_cycle += 1
                     if messages:
-                        self._receive_buffer.append(
-                            (messages[0], consumer, generation)
-                        )
+                        self._receive_buffer.append((messages[0], consumer, generation))
                     self._receive_condition.notify_all()
         except Exception as error:
             # Never retain a driver exception (and its potentially sensitive graph)
@@ -790,6 +848,10 @@ class RocketMQBackend(Backend, QueueBackend):
                 # one-slot delivery buffer and one pump thread cannot grow with
                 # repeated timeout=0 calls.
                 self._receive_demand = 1
+                # A prior empty broker cycle leaves the pump idle on this
+                # condition. Every public pop that publishes fresh demand must
+                # wake it so the request performs its corresponding broker cycle.
+                self._receive_condition.notify_all()
                 observed_cycle = self._receive_cycle
                 if not self._receive_failed and self._receive_control_error is None:
                     self._start_receive_worker_locked()

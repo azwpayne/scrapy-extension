@@ -81,6 +81,53 @@ def test_positive_timeout_is_woken_by_pumped_delivery() -> None:
     backend.disconnect()
 
 
+def test_second_pop_wakes_idle_pump_for_a_second_broker_cycle() -> None:
+    backend, _, consumer = _connected_backend()
+    first_receive_entered = threading.Event()
+    release_first_receive = threading.Event()
+    second_receive_entered = threading.Event()
+    release_second_receive = threading.Event()
+    message = MagicMock(body=b"second-cycle")
+    call_count = 0
+
+    def receive(_maximum: int, _lease: int) -> list[object]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            first_receive_entered.set()
+            assert release_first_receive.wait(timeout=2)
+            return []
+        if call_count == 2:
+            second_receive_entered.set()
+            assert release_second_receive.wait(timeout=2)
+            return [message]
+        return []
+
+    consumer.receive.side_effect = receive
+    assert backend.pop("jobs", timeout=0) is None
+    assert first_receive_entered.wait(timeout=1)
+    release_first_receive.set()
+    with backend._receive_condition:
+        assert backend._receive_condition.wait_for(
+            lambda: backend._receive_cycle == 1 and backend._receive_demand == 0,
+            timeout=1,
+        )
+
+    result: list[bytes | None] = []
+    waiter = threading.Thread(
+        target=lambda: result.append(backend.pop("jobs", timeout=1))
+    )
+    waiter.start()
+    assert second_receive_entered.wait(timeout=1)
+    release_second_receive.set()
+    waiter.join(timeout=2)
+
+    assert not waiter.is_alive()
+    assert result == [b"second-cycle"]
+    assert consumer.receive.call_count == 2
+    backend.disconnect()
+
+
 def test_generation_rejects_second_topic_before_broker_work() -> None:
     backend, _, consumer = _connected_backend()
     subscribe_entered = threading.Event()
@@ -274,6 +321,54 @@ def test_disconnect_bounds_stuck_pump_and_fences_late_publication() -> None:
     backend._consumer_generation += 1
     assert backend.pop("fresh", timeout=1) == b"fresh"
 
+    release_receive.set()
+    stale_worker.join(timeout=1)
+    assert not stale_worker.is_alive()
+    assert all(item[0] is not stale_message for item in backend._receive_buffer)
+    backend.disconnect()
+
+
+def test_disconnect_bounds_blocked_shutdown_and_receive_and_fences_both() -> None:
+    backend, producer, consumer = _connected_backend()
+    receive_entered = threading.Event()
+    shutdown_entered = threading.Event()
+    release_receive = threading.Event()
+    release_shutdown = threading.Event()
+    stale_message = MagicMock(body=b"stale")
+
+    def receive(_maximum: int, _lease: int) -> list[object]:
+        receive_entered.set()
+        assert release_receive.wait(timeout=5)
+        return [stale_message]
+
+    def shutdown() -> None:
+        shutdown_entered.set()
+        assert release_shutdown.wait(timeout=5)
+
+    consumer.receive.side_effect = receive
+    consumer.shutdown.side_effect = shutdown
+    assert backend.pop("jobs", timeout=0) is None
+    assert receive_entered.wait(timeout=1)
+    stale_worker = backend._receive_worker
+    assert stale_worker is not None
+
+    started = time.monotonic()
+    with pytest.raises(BackendConnectionError, match="Failed to disconnect"):
+        backend.disconnect()
+    assert time.monotonic() - started < 3
+    assert shutdown_entered.is_set()
+    assert producer.shutdown.call_count == 1
+    assert stale_worker.is_alive()
+
+    replacement = MagicMock(body=b"fresh")
+    second_consumer = MagicMock(is_running=True)
+    second_consumer.receive.return_value = [replacement]
+    backend._producer = MagicMock(is_running=True)
+    backend._consumer = second_consumer
+    backend._consumer_generation += 1
+    assert backend.pop("fresh", timeout=1) == b"fresh"
+
+    release_shutdown.set()
     release_receive.set()
     stale_worker.join(timeout=1)
     assert not stale_worker.is_alive()
