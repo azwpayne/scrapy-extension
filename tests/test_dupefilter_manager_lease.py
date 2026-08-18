@@ -28,6 +28,35 @@ def _dupefilter_with_lease(
     return dupefilter, lease, backend
 
 
+def test_filter_and_manager_lifecycle_callbacks_run_outside_lock() -> None:
+    manager = Mock()
+    membership_filter = Mock(spec=MembershipFilter)
+    dupefilter = BackendDupeFilter(
+        connection_manager=manager,
+        membership_filter=membership_filter,
+        clear_on_open=True,
+    )
+    observations: list[bool] = []
+
+    def observe(*_args: object, **_kwargs: object) -> None:
+        observations.append(dupefilter._lifecycle_lock._is_owned())  # type: ignore[attr-defined]
+
+    membership_filter.open.side_effect = observe
+    membership_filter.clear.side_effect = observe
+    membership_filter.close.side_effect = lambda: (
+        dupefilter.close("reentrant"),
+        observe(),
+    )
+    manager.close.side_effect = observe
+
+    dupefilter.open()
+    dupefilter.clear()
+    dupefilter.close("finished")
+
+    assert observations == [False, False, False, False, False]
+    assert dupefilter._closed is True
+
+
 def test_filter_failure_retains_manager_lease_for_retry() -> None:
     membership_filter = Mock(spec=MembershipFilter)
     membership_filter.close.side_effect = [RuntimeError("filter failed"), None]

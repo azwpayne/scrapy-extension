@@ -287,8 +287,12 @@ class BackendDupeFilter:
         ] = {}
         self._opened = False
         self._opened_spider: Spider | None = None
+        self._opening = False
         self._closed = False
         self._closing = False
+        self._release_in_progress = False
+        self._release_thread_id: int | None = None
+        self._clear_in_progress = False
         self._filter_released = False
         # A MemoryMembershipFilter can emit saturation from inside ``add``. Keep
         # that internal callback on a NullMonitor while the filter is owned here;
@@ -720,64 +724,49 @@ class BackendDupeFilter:
             raise
 
     def open(self, spider: Spider | None = None) -> None:
-        """Open the dupefilter and its membership filter.
-
-        Called by Scrapy's engine with no args (stock scheduler calls
-        ``self.df.open()``); accepts an optional ``spider`` for explicit invocation
-        (e.g. from a custom scheduler's ``open(spider)``). When a spider is
-        provided, two additive behaviors activate (both default-off / no-op when
-        no spider is passed or the relevant setting is unset):
-
-        1. ``{spider}`` key templating (C8): if :attr:`key` contains the literal
-           placeholder ``"{spider}"``, it is substituted with ``spider.name`` and
-           the resolved key is propagated to the underlying membership filter
-           (for backend-backed filters like :class:`SetMembershipFilter`) so each
-           spider gets its own dedup scope. Keys without the placeholder are
-           passed through unchanged.
-        2. ``SCRAPY_DUPEFILTER_CLEAR_ON_OPEN`` (C5): when the dupefilter was
-           constructed with ``clear_on_open=True``, any prior fingerprints are
-           cleared before the run begins — so a re-run / resume crawl is not
-           silently blocked by stale state.
-
-        Args:
-            spider: The spider opening the crawl (optional).
-        """
+        """Reserve, execute, and publish one filter open outside the lifecycle lock."""
         with self._lifecycle_lock:
             if self._closed or self._closing:
                 raise RuntimeError("dupefilter is closing or closed")
+            if self._opening:
+                raise RuntimeError("dupefilter open is already in progress")
             if self._opened:
                 if spider is self._opened_spider:
                     return
                 raise RuntimeError("dupefilter is already open for a different spider")
-            open_failure: BaseException | None = None
+            self._opening = True
+
+        open_failure: BaseException | None = None
+        try:
+            if spider is not None:
+                _validate_key_name(spider.name, field_name="spider.name")
+                self._resolve_spider_key(spider)
+            self._clear_retry_allowances()
+            self._filter.open()
+            if self.clear_on_open:
+                self._filter.clear()
+        except BaseException as exc:
+            open_failure = exc
+
+        if open_failure is not None:
+            with self._lifecycle_lock:
+                self._opening = False
+            cleanup_failed = False
             try:
-                if spider is not None:
-                    _validate_key_name(spider.name, field_name="spider.name")
-                    self._resolve_spider_key(spider)
-                self._clear_retry_allowances()
-                self._filter.open()
-                if self.clear_on_open:
-                    self.clear()
-            except BaseException as exc:
-                # R59: capture the primary, then run rollback cleanup + its
-                # diagnostic OUTSIDE the except so ``sys.exc_info()`` is clear
-                # during cleanup and ``logger.error`` attaches no ``exc_info``
-                # (the 6b28166 invariant — mirrors scheduler.open).
-                open_failure = exc
-            if open_failure is not None:
-                cleanup_failed = False
+                self.release(self._direct_release_owner, "open-failed")
+            except BaseException:
+                cleanup_failed = True
+            if cleanup_failed:
                 try:
-                    self._close_locked()
+                    logger.error("Failed to clean up dupefilter after open failure")
                 except BaseException:
-                    cleanup_failed = True
-                if cleanup_failed:
-                    try:
-                        logger.error("Failed to clean up dupefilter after open failure")
-                    except BaseException:
-                        pass
-                raise open_failure
+                    pass
+            raise open_failure
+
+        with self._lifecycle_lock:
             self._opened = True
             self._opened_spider = spider
+            self._opening = False
 
     def _resolve_spider_key(self, spider: Spider) -> None:
         """Substitute ``{spider}`` in :attr:`key` with ``spider.name``, propagating
@@ -806,8 +795,9 @@ class BackendDupeFilter:
         self.release(self._direct_release_owner, reason)
 
     def release(self, owner_token: object, reason: str) -> None:
-        """Retryably close for one exact owner without changing ``close`` API."""
+        """Retryably close for one exact owner without holding lifecycle locks."""
         del reason
+        thread_id = get_ident()
         with self._lifecycle_lock:
             if self._release_owner_token is None:
                 self._release_owner_token = owner_token
@@ -815,20 +805,32 @@ class BackendDupeFilter:
                 if self._closed:
                     return
                 raise RuntimeError("dupefilter close is owned by another caller")
+            if self._closed:
+                return
+            if self._release_in_progress:
+                if self._release_thread_id == thread_id:
+                    return
+                raise RuntimeError("dupefilter close is already in progress")
+            self._release_in_progress = True
+            self._release_thread_id = thread_id
+            self._closing = True
+            self._opening = False
+            self._opened = False
+            self._opened_spider = None
+            # Receipts before queue commit own no marker and need no backend call.
+            for reservation in tuple(self._active_reservations.values()):
+                self._discard_reservation(reservation)
+            self._clear_retry_allowances()
+
+        try:
             self._close_locked()
+        finally:
+            with self._lifecycle_lock:
+                self._release_in_progress = False
+                self._release_thread_id = None
 
     def _close_locked(self) -> None:
-        """Release one dupefilter lifecycle while ``_lifecycle_lock`` is held."""
-        if self._closed:
-            return
-        self._closing = True
-        self._opened = False
-        self._opened_spider = None
-        # Active receipts have not crossed the queue commit boundary and therefore
-        # own no marker. Discard them before closing without backend cleanup.
-        for reservation in tuple(self._active_reservations.values()):
-            self._discard_reservation(reservation)
-        self._clear_retry_allowances()
+        """Run reserved filter/manager callbacks outside ``_lifecycle_lock``."""
         primary_error: BaseException | None = None
         if not self._filter_released:
             try:
@@ -836,7 +838,8 @@ class BackendDupeFilter:
             except BaseException as exc:
                 primary_error = exc
             else:
-                self._filter_released = True
+                with self._lifecycle_lock:
+                    self._filter_released = True
         if (
             self._filter_released
             and self._owns_connection_manager
@@ -859,30 +862,38 @@ class BackendDupeFilter:
                     except BaseException:
                         pass
             else:
-                self._manager_released = True
-        if self._filter_released and (
-            not self._owns_connection_manager or self._manager_released
-        ):
-            self._closed = True
-            self._closing = False
+                with self._lifecycle_lock:
+                    self._manager_released = True
+        with self._lifecycle_lock:
+            if self._filter_released and (
+                not self._owns_connection_manager or self._manager_released
+            ):
+                self._closed = True
+                self._closing = False
         if primary_error is not None:
             raise primary_error
 
     def clear(self) -> None:
-        """Clear all tracked fingerprints via the membership filter.
-
-        Used by :meth:`open` when ``clear_on_open=True`` (C5 fix). Delegates to
-        the underlying strategy's :meth:`MembershipFilter.clear`, so every
-        concrete filter (set/memory/bloom/cuckoo) supports it.
-        """
+        """Clear fingerprints through a reservation/publication transition."""
         with self._lifecycle_lock:
             if self._closed or self._closing:
                 raise RuntimeError("dupefilter is closing or closed")
+            if self._opening or self._clear_in_progress:
+                raise RuntimeError(
+                    "dupefilter lifecycle transition is already in progress"
+                )
+            self._clear_in_progress = True
+        succeeded = False
+        try:
             self._filter.clear()
-            # Publish the new generation only after the filter clear succeeds. If a
-            # remote clear fails, existing receipts must remain able to compensate
-            # their still-present markers.
-            self._clear_retry_allowances()
+            succeeded = True
+        finally:
+            with self._lifecycle_lock:
+                if succeeded:
+                    # Publish only after remote clear succeeds; existing receipts
+                    # remain compensatable across a failed callback.
+                    self._clear_retry_allowances()
+                self._clear_in_progress = False
 
     def log(self, request: Request, spider: Spider) -> None:
         """Log a filtered request.
