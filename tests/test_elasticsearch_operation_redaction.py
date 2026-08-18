@@ -90,6 +90,7 @@ def _backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     )
     backend = ElasticSearchBackend(config)
     client = mocker.MagicMock()
+    client.options.return_value = client
     shards = {"total": 1, "successful": 1, "failed": 0}
     client.index.return_value = {"result": "created", "_shards": shards}
     client.delete.return_value = {"result": "deleted", "_shards": shards}

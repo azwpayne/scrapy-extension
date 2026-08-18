@@ -203,6 +203,23 @@ def test_mutation_view_has_fixed_no_replay_options_and_shares_root_transport() -
         backend.disconnect()
 
 
+def test_mutation_view_with_unrelated_transport_fails_generation_closed(mocker: Any) -> None:
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    client = mocker.MagicMock()
+    client.options.return_value.transport = object()
+    client.transport = object()
+    backend._client = client
+    backend._connection_snapshot = backend._capture_connection_snapshot()
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+        backend._build_generation(client, backend._connection_snapshot)
+
+    assert str(exc_info.value) == (
+        "ElasticSearch mutation client does not share the root transport."
+    )
+    assert exc_info.value.backend_type == "elasticsearch"
+
+
 _SHARDS = {"total": 1, "successful": 1, "failed": 0}
 _REFRESH_RESPONSE = {"_shards": _SHARDS}
 
@@ -210,6 +227,7 @@ _REFRESH_RESPONSE = {"_shards": _SHARDS}
 def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(ElasticSearchSettings())
     client = mocker.MagicMock()
+    client.options.return_value = client
     client.index.return_value = {"result": "created", "_shards": _SHARDS}
     client.delete.return_value = {"result": "deleted", "_shards": _SHARDS}
     client.indices.refresh.return_value = _REFRESH_RESPONSE

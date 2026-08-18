@@ -17,8 +17,15 @@ _INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
 _DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
 
 
+def _adapt_elasticsearch_client_mock(client: Any) -> Any:
+    client.options.return_value = client
+    return client
+
+
 def _successful_client(mocker: Any) -> Any:
-    client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    client = _adapt_elasticsearch_client_mock(
+        mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    )
     client.index.return_value = _INDEX_RESPONSE
     client.delete.return_value = _DELETE_RESPONSE
     return client
@@ -26,7 +33,7 @@ def _successful_client(mocker: Any) -> Any:
 
 def _injected_backend(mocker: Any, **settings: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(ElasticSearchSettings(**settings))
-    client = mocker.MagicMock()
+    client = _adapt_elasticsearch_client_mock(mocker.MagicMock())
     client.index.return_value = _INDEX_RESPONSE
     client.delete.return_value = _DELETE_RESPONSE
     client.indices.refresh.return_value = {"_shards": _SHARDS}
@@ -325,7 +332,7 @@ def test_post_publication_interrupt_preserves_leasable_generation(
     candidate = _successful_client(mocker)
     factory = mocker.patch(
         "scrapy_extension.backends.elasticsearch.Elasticsearch",
-        return_value=candidate,
+        return_value=_adapt_elasticsearch_client_mock(candidate),
     )
     backend = ElasticSearchBackend(ElasticSearchSettings())
     original_notify_all = backend._generation_condition.notify_all
@@ -489,7 +496,7 @@ def test_private_candidate_rejects_same_thread_reentrant_lifecycle(
 
     factory = mocker.patch(
         "scrapy_extension.backends.elasticsearch.Elasticsearch",
-        return_value=candidate,
+        return_value=_adapt_elasticsearch_client_mock(candidate),
     )
 
     with pytest.raises(BackendConnectionError):

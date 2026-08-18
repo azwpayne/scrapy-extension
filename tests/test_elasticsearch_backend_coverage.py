@@ -12,6 +12,11 @@ from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 _SHARDS = {"total": 1, "successful": 1, "failed": 0}
 
 
+def _adapt_elasticsearch_client_mock(client):
+    client.options.return_value = client
+    return client
+
+
 def _make_not_found_error() -> NotFoundError:
     """Create a properly typed NotFoundError for test mocks."""
     from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
@@ -97,7 +102,7 @@ class TestBuildKwargs:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
         backend.connect()
         assert backend.is_connected()
@@ -113,7 +118,7 @@ class TestBuildKwargs:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
         backend = ElasticSearchBackend(
             ElasticSearchSettings(hosts=["https://localhost:9200"], verify_certs=False)
@@ -131,7 +136,7 @@ class TestConnect:
         mock_client.ping.return_value = False
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -148,7 +153,7 @@ class TestConnect:
         mock_client.ping.side_effect = TransportError("Connection failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -175,7 +180,7 @@ class TestIsConnected:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -204,7 +209,7 @@ class TestIsConnected:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -236,7 +241,7 @@ class TestPop:
         mock_client.search.side_effect = _make_not_found_error()
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -256,7 +261,7 @@ class TestPop:
         mock_client.search.side_effect = TransportError("Search failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -291,7 +296,7 @@ class TestPop:
         mock_client.search.side_effect = _make_api_error()
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -327,7 +332,7 @@ class TestAdd:
         mock_client.index.side_effect = TransportError("Index failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -359,7 +364,7 @@ class TestContains:
         mock_client.exists.side_effect = TransportError("Exists failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -401,7 +406,7 @@ class TestRetrieve:
         mock_client.get.side_effect = TransportError("Get failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -444,7 +449,7 @@ class TestExists:
         mock_client.get.side_effect = TransportError("Exists failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -479,7 +484,7 @@ class TestTTL:
         mock_client.get.side_effect = TransportError("Get failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -515,7 +520,7 @@ class TestDeleteById:
         mock_client.delete.side_effect = TransportError("Delete failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -539,7 +544,7 @@ class TestDeleteByQuery:
         mock_client.delete_by_query.side_effect = TransportError("Delete failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -563,7 +568,7 @@ class TestPush:
         mock_client.index.side_effect = TransportError("Index failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())

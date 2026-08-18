@@ -108,6 +108,9 @@ _ELASTICSEARCH_STORAGE_DELETE_ERROR = "ElasticSearch storage delete failed."
 _ELASTICSEARCH_STORAGE_EXISTS_ERROR = "ElasticSearch storage existence check failed."
 _ELASTICSEARCH_STORAGE_TTL_ERROR = "ElasticSearch storage TTL read failed."
 _ELASTICSEARCH_STORAGE_CLEAR_ERROR = "ElasticSearch storage clear failed."
+_ELASTICSEARCH_MUTATION_VIEW_ERROR = (
+    "ElasticSearch mutation client does not share the root transport."
+)
 
 
 class _ElasticSearchResponseError(Exception):
@@ -430,13 +433,16 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             retry_on_timeout=False,
             retry_on_status=(),
         )
-        # ``MagicMock.options()`` creates an unrelated child. Keeping legacy test
-        # doubles usable does not weaken real clients: an Elasticsearch options
-        # view always shares the exact root transport.
+        # A mutation view backed by another transport cannot prove that the
+        # no-replay options govern the transport which will perform the request.
+        # Fail closed instead of silently using the replay-capable root client.
         if getattr(mutation_client, "transport", None) is not getattr(
             client, "transport", None
         ):
-            mutation_client = client
+            raise BackendConnectionError(
+                _ELASTICSEARCH_MUTATION_VIEW_ERROR,
+                backend_type="elasticsearch",
+            )
         return _ElasticSearchGeneration(client, mutation_client, snapshot)
 
     @configuration_error_boundary(

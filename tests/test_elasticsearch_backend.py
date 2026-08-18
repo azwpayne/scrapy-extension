@@ -70,10 +70,15 @@ def _count_response(count):
     return {"count": count, "_shards": _SHARDS}
 
 
+def _adapt_elasticsearch_client_mock(client):
+    client.options.return_value = client
+    return client
+
+
 def _mock_backend(mocker, **settings_kwargs):
     config = ElasticSearchSettings(**settings_kwargs)
     backend = ElasticSearchBackend(config)
-    backend._client = mocker.MagicMock()
+    backend._client = _adapt_elasticsearch_client_mock(mocker.MagicMock())
     backend._client.index.return_value = _INDEX_RESPONSE
     backend._client.delete.return_value = _DELETE_RESPONSE
     backend._client.indices.refresh.return_value = {"_shards": _SHARDS}
@@ -130,7 +135,7 @@ class TestConnection:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -199,7 +204,7 @@ class TestConnection:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(
@@ -338,7 +343,8 @@ class TestConnection:
         client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
         client.index.return_value = _INDEX_RESPONSE
         mocker.patch(
-            "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=client
+            "scrapy_extension.backends.elasticsearch.Elasticsearch",
+            return_value=_adapt_elasticsearch_client_mock(client),
         )
         config = ElasticSearchSettings(
             queue_index="queue-a", set_index="set-a", storage_index="storage-a"
@@ -368,7 +374,7 @@ class TestConnection:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -1325,7 +1331,7 @@ class TestClientProperty:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -1344,7 +1350,7 @@ class TestEnsureIndices:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         backend = ElasticSearchBackend(ElasticSearchSettings())
@@ -1362,7 +1368,7 @@ class TestConnectionManager:
         )
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=mock_client,
+            return_value=_adapt_elasticsearch_client_mock(mock_client),
         )
 
         manager = ConnectionManager.get_manager(BackendType.ELASTICSEARCH)
