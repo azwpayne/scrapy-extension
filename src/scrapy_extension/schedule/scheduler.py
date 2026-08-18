@@ -1798,11 +1798,9 @@ class BackendScheduler:
     def abort(self, reason: str) -> None:
         """Explicitly discard uncheckpointed queue state and finish teardown."""
         with self._lifecycle_lock:
-            if self._queue is not None:
-                self._queue.close(lossy=True)
-            self._close_locked(reason)
+            self._close_locked(reason, lossy=True)
 
-    def _close_locked(self, reason: str) -> None:
+    def _close_locked(self, reason: str, *, lossy: bool = False) -> None:
         """Release one scheduler lifecycle while ``_lifecycle_lock`` is held."""
         if self._lifecycle_state == _LIFECYCLE_CLOSED:
             return None
@@ -1814,11 +1812,19 @@ class BackendScheduler:
         if self._queue is not None:
             queue_failure: BaseException | None = None
             try:
-                self._queue.close()
+                if lossy:
+                    self._queue.close(lossy=True)
+                else:
+                    self._queue.close()
             except BaseException as exc:
                 queue_failure = exc
             if queue_failure is not None:
-                if isinstance(self._queue, BackendQueue):
+                if lossy:
+                    # An explicit abort is terminal even if begin_close() or
+                    # strategy.close() fails before BackendQueue can publish its
+                    # checkpoint gate. Teardown must still release every acquire.
+                    checkpoint_incomplete = False
+                elif isinstance(self._queue, BackendQueue):
                     # BackendQueue publishes this gate immediately after the
                     # durable snapshot commit and before strategy.close(). A
                     # QueueError from the latter is an ordinary cleanup failure,

@@ -484,9 +484,50 @@ def test_scheduler_abort_is_an_explicit_lossy_teardown() -> None:
 
     scheduler.abort("operator-selected-lossy-abort")
 
-    assert queue.close.call_args_list == [call(lossy=True), call()]
+    assert queue.close.call_args_list == [call(lossy=True)]
     queue_manager.close.assert_called_once_with()
 
     scheduler.abort("duplicate-abort")
-    assert queue.close.call_args_list == [call(lossy=True), call()]
+    assert queue.close.call_args_list == [call(lossy=True)]
     queue_manager.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "queue_failure",
+    [RuntimeError("lossy close failed"), KeyboardInterrupt("lossy close interrupted")],
+)
+def test_scheduler_lossy_abort_failure_still_runs_terminal_teardown(
+    queue_failure: BaseException,
+) -> None:
+    queue_manager = MagicMock(name="queue-manager")
+    snapshot_manager = MagicMock(name="snapshot-manager")
+    signal_manager = MagicMock(name="signal-manager")
+    dupefilter = MagicMock(name="dupefilter")
+    queue = MagicMock(name="queue")
+    queue.close.side_effect = queue_failure
+    scheduler = BackendScheduler(
+        queue_manager,
+        snapshot_connection_manager=snapshot_manager,
+        owns_snapshot_connection_manager=True,
+    )
+    scheduler._queue = queue
+    scheduler._connected_signals = signal_manager
+    scheduler._signals_connected = True
+    scheduler.dupefilter = dupefilter
+    scheduler._owns_dupefilter = True
+
+    if isinstance(queue_failure, Exception):
+        scheduler.abort("lossy-abort")
+    else:
+        with pytest.raises(type(queue_failure)) as exc_info:
+            scheduler.abort("lossy-abort")
+        assert exc_info.value is queue_failure
+
+    queue.close.assert_called_once_with(lossy=True)
+    assert signal_manager.disconnect.call_count == 2
+    dupefilter.close.assert_called_once_with("lossy-abort")
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+    assert scheduler._queue is None
+    assert scheduler._connected_signals is None
+    assert scheduler._signals_connected is False
