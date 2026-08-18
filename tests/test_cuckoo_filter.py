@@ -52,9 +52,7 @@ class TestCuckooMembershipFilterSizing:
             flt = CuckooMembershipFilter(capacity=100, error_rate=below)
             assert flt.fp_len == expected_bytes + 1
         else:
-            with pytest.raises(
-                ValueError, match="exceeds the 32-byte SHA-256 digest"
-            ):
+            with pytest.raises(ValueError, match="exceeds the 32-byte SHA-256 digest"):
                 CuckooMembershipFilter(capacity=100, error_rate=below)
 
     @pytest.mark.parametrize(

@@ -1197,7 +1197,11 @@ class BackendDupeFilter:
             if not isinstance(self._filter, MemoryMembershipFilter):
                 saturation = getattr(self._filter, "saturation", None)
                 if saturation is not None:
-                    capacity = getattr(self._filter, "capacity", None)
+                    capacity = getattr(
+                        self._filter,
+                        "configured_capacity",
+                        getattr(self._filter, "capacity", None),
+                    )
                     monitor_events.append(
                         ("on_filter_saturation", (len(self._filter), capacity))
                     )
@@ -1243,7 +1247,11 @@ class BackendDupeFilter:
                 if not is_memory_filter or added:
                     saturation = getattr(self._filter, "saturation", None)
                     if saturation is not None:
-                        capacity = getattr(self._filter, "capacity", None)
+                        capacity = getattr(
+                            self._filter,
+                            "configured_capacity",
+                            getattr(self._filter, "capacity", None),
+                        )
                         saturation_event = (
                             "on_filter_saturation",
                             (len(self._filter), capacity),

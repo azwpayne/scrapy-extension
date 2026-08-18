@@ -628,6 +628,86 @@ class TestFilterSaturationEmission:
         sat2 = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
         assert sat2 > sat
 
+    def test_one_phase_duplicate_uses_configured_cuckoo_capacity(
+        self, mock_connection_manager
+    ):
+        monitor = ScrapyStatsMonitor(_stats())
+        cuckoo = CuckooMembershipFilter(capacity=1_000, error_rate=0.01)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            monitor=monitor,
+            membership_filter=cuckoo,
+        )
+        request = Request(url="https://example.com/one-phase")
+
+        assert dupefilter.request_seen(request) is False
+        monitor._stats.set_value("dupefilter/filter_saturation", 0.0)  # type: ignore[attr-defined]
+        assert dupefilter.request_seen(request.replace()) is True
+
+        saturation = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
+        assert saturation == pytest.approx(1 / cuckoo.configured_capacity)
+        assert cuckoo.capacity != cuckoo.configured_capacity
+
+    def test_two_phase_commits_use_configured_capacity_even_without_insert(
+        self, mock_connection_manager
+    ):
+        monitor = ScrapyStatsMonitor(_stats())
+        cuckoo = CuckooMembershipFilter(capacity=1_000, error_rate=0.01)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            monitor=monitor,
+            membership_filter=cuckoo,
+        )
+        request = Request(url="https://example.com/two-phase")
+        first = dupefilter.request_seen_with_reservation(request)
+        concurrent = dupefilter.request_seen_with_reservation(request.replace())
+
+        assert first.reservation is not None
+        assert concurrent.reservation is not None
+        assert monitor._stats.get_value("dupefilter/filter_saturation") is None  # type: ignore[attr-defined]
+
+        dupefilter.commit_reservation(first.reservation)
+        assert monitor._stats.get_value(
+            "dupefilter/filter_saturation"
+        ) == pytest.approx(  # type: ignore[attr-defined]
+            1 / cuckoo.configured_capacity
+        )
+
+        monitor._stats.set_value("dupefilter/filter_saturation", 0.0)  # type: ignore[attr-defined]
+        dupefilter.commit_reservation(concurrent.reservation)
+        assert len(cuckoo) == 1
+        assert monitor._stats.get_value(
+            "dupefilter/filter_saturation"
+        ) == pytest.approx(  # type: ignore[attr-defined]
+            1 / cuckoo.configured_capacity
+        )
+
+    def test_scheduler_duplicate_uses_configured_cuckoo_capacity(
+        self, mock_connection_manager
+    ):
+        monitor = ScrapyStatsMonitor(_stats())
+        cuckoo = CuckooMembershipFilter(capacity=1_000, error_rate=0.01)
+        dupefilter = BackendDupeFilter(
+            connection_manager=mock_connection_manager,
+            monitor=monitor,
+            membership_filter=cuckoo,
+        )
+        request = Request(url="https://example.com/scheduler-duplicate")
+        initial = dupefilter.request_seen_with_reservation(request)
+        assert initial.reservation is not None
+        dupefilter.commit_reservation(initial.reservation)
+        monitor._stats.set_value("dupefilter/filter_saturation", 0.0)  # type: ignore[attr-defined]
+
+        duplicate = dupefilter.request_seen_with_reservation(request.replace())
+
+        assert duplicate.seen is True
+        assert duplicate.reservation is None
+        assert monitor._stats.get_value(
+            "dupefilter/filter_saturation"
+        ) == pytest.approx(  # type: ignore[attr-defined]
+            1 / cuckoo.configured_capacity
+        )
+
     def test_request_seen_silent_when_filter_has_no_saturation(
         self, mock_connection_manager
     ):
