@@ -655,6 +655,7 @@ class PulsarBackend(Backend, QueueBackend):
 
         handles: list[Any] = []
         pumps: list[_PulsarReceivePump] = []
+        abort_retirements: list[_PulsarConsumerRetirement] = []
         if published_generation is None:
             # Construction completed but publication did not.  No public teardown
             # could have claimed this private candidate, so this connect owns it.
@@ -676,6 +677,19 @@ class PulsarBackend(Backend, QueueBackend):
                     pumps = list(self._receive_pumps.values())
                     for pump in pumps:
                         pump.stop_admission()
+                        if pump.consumer is not None:
+                            consumers.pop(id(pump.consumer), None)
+                            retirement = pump.retirement
+                            if retirement is None:
+                                retirement = self._start_consumer_retirement_locked(
+                                    pump, pump.consumer
+                                )
+                            abort_retirements.append(retirement)
+                        elif not pump.stopped.is_set():
+                            retirement = pump.retirement
+                            if retirement is None:
+                                retirement = self._new_consumer_retirement_locked(pump)
+                            abort_retirements.append(retirement)
                     self._receive_pumps.clear()
                     self._consumers.clear()
                     self._consumer = None
@@ -697,6 +711,12 @@ class PulsarBackend(Backend, QueueBackend):
         # A driver close must never replace the connection failure currently being
         # handled. The normal failure path logs after this helper returns.
         cleanup_failure_count = len(close_errors) + close_timeout_count
+        for retirement in abort_retirements:
+            if not retirement.completed.wait(
+                max(0.0, self._receive_shutdown_timeout)
+            ):
+                cleanup_failure_count += 1
+                self._log_close_shutdown_timeout()
         for pump in pumps:
             worker = pump.worker
             if worker is not None and worker is not current_thread():

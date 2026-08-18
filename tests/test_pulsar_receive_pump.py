@@ -440,6 +440,52 @@ def test_failed_consumer_close_fences_concurrent_replacement_across_disconnect(
 
 
 @pytest.mark.parametrize("consumer_type", ["Exclusive", "Failover"])
+def test_failed_connect_abort_fences_pump_consumer_across_reconnect(
+    mocker: Any, consumer_type: str
+) -> None:
+    """Connect rollback cannot clear a still-closing topic subscription fence."""
+    close_started = Event()
+    release_close = Event()
+    failed_consumer = _ControllableConsumer()
+    replacement_consumer = _ControllableConsumer()
+    real_close = failed_consumer.close
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+        real_close()
+
+    failed_consumer.close = blocked_close  # type: ignore[method-assign]
+    old_client = MagicMock(name="failed-connect-old-client")
+    old_client.subscribe.return_value = failed_consumer
+    new_client = MagicMock(name="failed-connect-new-client")
+    new_client.subscribe.return_value = replacement_consumer
+    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
+    backend = PulsarBackend(PulsarSettings(consumer_type=consumer_type))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    topic = "scrapy-failed-connect-retirement"
+
+    assert backend.pop("failed-connect-retirement", timeout=0) is None
+    assert failed_consumer.receive_started.wait(timeout=0.5)
+    old_generation = backend._lifecycle_generation
+
+    backend._abort_failed_connect(old_client, old_generation)
+    assert close_started.is_set()
+    assert list(backend._consumer_retirements) == [topic]
+    backend.connect()
+    assert backend.pop("failed-connect-retirement", timeout=0) is None
+    new_client.subscribe.assert_not_called()
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("failed-connect-retirement", timeout=0) is None
+    assert replacement_consumer.receive_started.wait(timeout=0.5)
+    assert new_client.subscribe.call_count == 1
+
+
+@pytest.mark.parametrize("consumer_type", ["Exclusive", "Failover"])
 def test_disconnect_retires_unobserved_terminal_consumer_across_reconnect(
     mocker: Any, consumer_type: str
 ) -> None:
