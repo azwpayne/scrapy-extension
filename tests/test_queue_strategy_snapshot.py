@@ -22,10 +22,8 @@ import pytest
 from scrapy.http import Request
 
 from scrapy_extension.exceptions import QueueError
-from scrapy_extension.queue.queue import (
-    _EMPTY_SNAPSHOT_TOMBSTONE_MARKER,
-    BackendQueue,
-)
+from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.snapshot import SnapshotRepository
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
@@ -274,6 +272,14 @@ def _legacy_delay_snapshot() -> bytes:
     return state
 
 
+def _stored_snapshot_payload(storage, key: str = _SNAPSHOT_KEY) -> bytes | None:
+    """Reassemble the v4 payload from captured mock store calls."""
+    values = {args.args[0]: args.args[1] for args in storage.store.call_args_list}
+    reader = MagicMock()
+    reader.retrieve.side_effect = lambda stored_key: values.get(stored_key)
+    return SnapshotRepository(reader).read(key).state
+
+
 def _wired_cm(storage=None, queue_backend=None):
     cm = MagicMock(name="ConnectionManager")
     cm.get_storage_backend.return_value = (
@@ -302,10 +308,9 @@ def test_backends_queue_close_persists_snapshot_before_clearing():
 
     bq.close()
 
-    storage.store.assert_called_once()
-    args = storage.store.call_args.args
-    assert args[0] == _SNAPSHOT_KEY
-    assert json.loads(args[1].decode())["items"][0]["item_b64"]
+    payload = _stored_snapshot_payload(storage)
+    assert payload is not None
+    assert json.loads(payload.decode())["items"][0]["item_b64"]
 
 
 @pytest.mark.parametrize("operation", ["push", "pop", "ack", "nack", "len", "clear"])
@@ -361,8 +366,9 @@ def test_close_rejects_operations_after_snapshot_store_starts(operation):
     assert close_done.is_set()
     assert not thread.is_alive()
     assert close_errors == []
-    snapshot = json.loads(storage.store.call_args.args[1].decode())
-    assert len(snapshot["items"]) == 1
+    payload = _stored_snapshot_payload(storage)
+    assert payload is not None
+    assert len(json.loads(payload)["items"]) == 1
 
 
 def test_close_waits_for_entered_push_before_snapshot():
@@ -412,7 +418,7 @@ def test_close_waits_for_entered_push_before_snapshot():
     assert not close_thread.is_alive()
     assert push_errors == []
     assert close_errors == []
-    storage.store.assert_called_once_with(_SNAPSHOT_KEY, b"1")
+    assert _stored_snapshot_payload(storage) == b"1"
 
 
 @pytest.mark.parametrize("operation", ["ack", "nack"])
@@ -689,7 +695,7 @@ def test_backends_queue_skips_non_unique_legacy_snapshot(
     queue.close()
 
     assert legacy_key in state
-    storage.delete.assert_called_once_with(queue._snapshot_key())
+    storage.delete.assert_not_called()
 
 
 def test_backends_queue_empty_close_retires_restored_legacy_snapshot():
@@ -707,17 +713,11 @@ def test_backends_queue_empty_close_retires_restored_legacy_snapshot():
     queue.clear()
     queue.close()
 
-    assert _SNAPSHOT_KEY not in state
+    assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state is None
     assert _LEGACY_SNAPSHOT_KEY not in state
-    tombstone_key = queue._empty_snapshot_tombstone_key()
-    storage.store.assert_called_once_with(
-        tombstone_key,
-        _EMPTY_SNAPSHOT_TOMBSTONE_MARKER,
-    )
     assert storage.delete.call_args_list == [
-        call(_SNAPSHOT_KEY),
         call(_LEGACY_SNAPSHOT_KEY),
-        call(tombstone_key),
+        call(queue._empty_snapshot_tombstone_key()),
     ]
 
 
@@ -787,7 +787,7 @@ def test_backends_queue_retries_legacy_cleanup_after_v3_restart():
     )
 
     assert len(second_strategy._holding) == 1
-    assert storage.retrieve.call_args_list == [
+    assert storage.retrieve.call_args_list[:4] == [
         call(_SNAPSHOT_KEY),
         call(_SNAPSHOT_TOMBSTONE_KEY),
         call(_LEGACY_SNAPSHOT_KEY),
@@ -797,7 +797,7 @@ def test_backends_queue_retries_legacy_cleanup_after_v3_restart():
     second.clear()
     second.close()
 
-    assert _SNAPSHOT_KEY not in state
+    assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state is None
     assert _LEGACY_SNAPSHOT_KEY not in state
 
     third_strategy = _delay(clock_value=100.0)
@@ -833,8 +833,8 @@ def test_empty_checkpoint_tombstone_blocks_legacy_replay_after_retirement_failur
     first.close()
 
     tombstone_key = first._empty_snapshot_tombstone_key()
-    assert _SNAPSHOT_KEY not in state
-    assert state[tombstone_key] == _EMPTY_SNAPSHOT_TOMBSTONE_MARKER
+    assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state is None
+    assert tombstone_key not in state
     assert _LEGACY_SNAPSHOT_KEY in state
 
     second_strategy = _delay(clock_value=100.0)
@@ -846,18 +846,13 @@ def test_empty_checkpoint_tombstone_blocks_legacy_replay_after_retirement_failur
     )
 
     assert second_strategy._holding == []
-    assert storage.retrieve.call_args_list == [
-        call(_SNAPSHOT_KEY),
-        call(first._empty_snapshot_tombstone_key()),
-        call(_LEGACY_SNAPSHOT_KEY),
-        call(_SNAPSHOT_KEY),
-        call(first._empty_snapshot_tombstone_key()),
-    ]
+    assert call(_SNAPSHOT_KEY) in storage.retrieve.call_args_list
+    assert call(_LEGACY_SNAPSHOT_KEY) in storage.retrieve.call_args_list
 
     storage.delete.side_effect = lambda key: state.pop(key, None)
     second.close()
 
-    assert _SNAPSHOT_KEY not in state
+    assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state is None
     assert _LEGACY_SNAPSHOT_KEY not in state
 
     third_strategy = _delay(clock_value=100.0)
@@ -907,10 +902,7 @@ def test_backends_queue_uses_injected_snapshot_manager_only_for_snapshot_io():
             call(_LEGACY_SNAPSHOT_KEY),
         ]
     )
-    snapshot_storage.store.assert_called_once_with(
-        _SNAPSHOT_KEY,
-        expected_snapshot,
-    )
+    assert _stored_snapshot_payload(snapshot_storage) == expected_snapshot
     snapshot_manager.close.assert_not_called()
 
 
@@ -947,7 +939,7 @@ def test_restored_snapshot_survives_crash_until_clean_checkpoint():
     # A later clean checkpoint with no remaining state retires the old snapshot.
     second.clear()
     second.close()
-    assert _SNAPSHOT_KEY not in state
+    assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state is None
 
 
 def test_backends_queue_close_deletes_stale_snapshot_when_strategy_is_empty():
@@ -958,15 +950,10 @@ def test_backends_queue_close_deletes_stale_snapshot_when_strategy_is_empty():
 
     bq.close()
 
-    tombstone_key = bq._empty_snapshot_tombstone_key()
-    storage.store.assert_called_once_with(
-        tombstone_key,
-        _EMPTY_SNAPSHOT_TOMBSTONE_MARKER,
-    )
+    assert _stored_snapshot_payload(storage) is None
     assert storage.delete.call_args_list == [
-        call(_SNAPSHOT_KEY),
         call(_LEGACY_SNAPSHOT_KEY),
-        call(tombstone_key),
+        call(bq._empty_snapshot_tombstone_key()),
     ]
 
 

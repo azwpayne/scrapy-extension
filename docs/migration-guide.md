@@ -536,15 +536,21 @@ v2 identity:
 queue:snapshot:v2:<owner-length>:<owner>:<spider-length>:<spider>:<queue>
 ```
 
-A v3 checkpoint is preferred. The package automatically checks the old
-`queue:snapshot:<queue>` form only when there is no named spider and the queue
-name contains no `:`; after a successful v3 store or delete it retires that
-eligible old key. If a checkpoint update fails before legacy retirement, it
-leaves the old key untouched. For a clean empty checkpoint, it first writes a
-separate private empty marker for the v3 identity, deletes the v3 checkpoint,
-then retires the eligible old key, and finally removes the marker. If the
-marker persists after an interruption, it blocks legacy fallback only when the
-v3 checkpoint is absent rather than replaying the old checkpoint.
+The v3/v2 strings above remain the logical keys. New writes place a v4
+manifest at that key and immutable generation chunks beneath it. The manifest
+is written last and includes schema version, logical length, chunk geometry,
+and SHA-256; a committed zero-length manifest represents a clean drain. Raw
+payloads already stored at either logical key remain readable and are migrated
+without an offline rewrite.
+
+The package automatically checks the old `queue:snapshot:<queue>` raw form only
+when there is no named spider and the queue name contains no `:`. A successful
+manifest commit becomes authoritative before that old key and the historical
+empty-marker key are retired. Any failure before manifest publication leaves the
+old manifest/raw value authoritative; any legacy cleanup failure leaves the new
+manifest authoritative and cleanup is retried after a later close. Configure the
+symmetric logical and chunk limits with `SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES`
+(default 128 MiB) and `SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES` (default 256 KiB).
 
 Do not rely on automatic recovery of old named-spider keys such as
 `queue:snapshot:<spider>:<queue>`, or of any old key with `:` in its unscoped
@@ -559,11 +565,13 @@ Every worker using a stateful queue strategy should have a stable, unique owner.
 Enabling an owner does not consume an old unowned snapshot automatically; decide
 while workers are stopped whether to drain, transform, or discard that state.
 
-A successful restore retains its v3 checkpoint until a later clean close writes
-the current state or deletes the key after a clean drain. A crash during that
-interval replays the prior checkpoint: completed work can repeat, but pending
-work is not lost. Keep callbacks idempotent and alert on checkpoint store/delete
-failures, which extend the duplicate-replay window.
+A successful restore retains its committed manifest until a later clean close
+publishes the current or empty generation. A crash during that interval replays
+the prior checkpoint: completed work can repeat, but pending work is not lost.
+Keep callbacks idempotent and alert on checkpoint failures, which extend the
+duplicate-replay window. Old unreferenced generation chunks can be removed only
+while the owning worker is stopped and after verifying they are not named by the
+logical manifest; never delete the manifest first.
 
 ## TTL Contract
 

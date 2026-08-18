@@ -285,8 +285,13 @@ def test_scheduler_persists_kafka_delay_snapshot_through_configured_storage(
 
     queue_manager.get_storage_backend.assert_not_called()
     storage.retrieve.assert_called_once()
-    storage.store.assert_called_once()
-    assert order == ["snapshot-store", "snapshot-release", "queue-release"]
+    assert storage.store.call_count == 2  # immutable chunk, then authoritative manifest
+    assert order == [
+        "snapshot-store",
+        "snapshot-store",
+        "snapshot-release",
+        "queue-release",
+    ]
 
 
 def test_scheduler_open_threads_monitor_into_snapshot_manager(mocker) -> None:

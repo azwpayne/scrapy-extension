@@ -29,6 +29,12 @@ from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.exceptions._redaction import serialization_error_boundary
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
+from scrapy_extension.queue.snapshot import (
+    DEFAULT_SNAPSHOT_CHUNK_BYTES,
+    DEFAULT_SNAPSHOT_MAX_BYTES,
+    SnapshotRepository,
+    SnapshotRepositoryError,
+)
 from scrapy_extension.queue.strategies.base import (
     QueueStrategy,
     _BoundQueueAckToken,
@@ -64,7 +70,7 @@ _QUEUE_POP_MONITOR_FAILURE = "Queue pop deserialization failed."
 #: ``max_item_bytes`` guard. R26-A raised this from the original 16 MiB, which
 #: silently dropped legitimate large delay-heap snapshots on restart (persist
 #: was uncapped, restore was capped → asymmetric data-loss trap).
-_MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
+_MAX_SNAPSHOT_BYTES = DEFAULT_SNAPSHOT_MAX_BYTES
 
 #: Opaque payload for the private key that fences an eligible legacy snapshot
 #: during an empty-state transition. Presence of the separate key, not this
@@ -125,6 +131,8 @@ class BackendQueue:
         wall_clock: Callable[[], float] = time.time,
         snapshot_owner: str | None = None,
         snapshot_connection_manager: ConnectionManager | None = None,
+        snapshot_max_bytes: int = DEFAULT_SNAPSHOT_MAX_BYTES,
+        snapshot_chunk_bytes: int = DEFAULT_SNAPSHOT_CHUNK_BYTES,
     ) -> None:
         """Initialize the backend queue.
 
@@ -177,6 +185,10 @@ class BackendQueue:
                 Queue operations continue to use ``connection_manager``. The
                 caller retains ownership of this manager and must release its
                 acquire after :meth:`close` completes.
+            snapshot_max_bytes: Maximum logical strategy snapshot size accepted on
+                both commit and restore. Defaults to 128 MiB.
+            snapshot_chunk_bytes: Maximum immutable generation chunk size. Defaults
+                to 256 KiB and must not exceed ``snapshot_max_bytes``.
         """
         self.connection_manager = connection_manager
         self.queue_name = queue_name
@@ -189,6 +201,18 @@ class BackendQueue:
             _validate_key_name(snapshot_owner, "snapshot_owner")
         self._snapshot_owner = snapshot_owner
         self._snapshot_connection_manager = snapshot_connection_manager
+        self._snapshot_max_bytes = snapshot_max_bytes
+        self._snapshot_chunk_bytes = snapshot_chunk_bytes
+        if (
+            isinstance(snapshot_max_bytes, bool)
+            or not isinstance(snapshot_max_bytes, int)
+            or snapshot_max_bytes < 1
+            or isinstance(snapshot_chunk_bytes, bool)
+            or not isinstance(snapshot_chunk_bytes, int)
+            or snapshot_chunk_bytes < 1
+            or snapshot_chunk_bytes > snapshot_max_bytes
+        ):
+            raise ValueError("Invalid snapshot size limits.")
         self._strategy: QueueStrategy = (
             queue_strategy
             if queue_strategy is not None
@@ -1338,250 +1362,116 @@ class BackendQueue:
         snapshot_identity = self._snapshot_key().removeprefix(self._SNAPSHOT_KEY_PREFIX)
         return f"{self._SNAPSHOT_TOMBSTONE_KEY_PREFIX}{snapshot_identity}"
 
-    def _persist_snapshot(self) -> None:
-        """Persist the strategy's in-process state on close (initiative #3).
+    def _snapshot_storage(self) -> Any | None:
+        """Resolve snapshot storage, returning ``None`` when unsupported."""
+        manager = (
+            self._snapshot_connection_manager
+            if self._snapshot_connection_manager is not None
+            else self.connection_manager
+        )
+        get_storage = getattr(manager, "get_storage_backend", None)
+        if get_storage is None:
+            return None
+        try:
+            return get_storage()
+        except NotImplementedError:
+            return None
+        except Exception:
+            try:
+                logger.error("Failed to resolve strategy snapshot storage")
+            except BaseException:
+                pass
+            return None
 
-        Calls ``strategy.snapshot()``; non-None bytes replace the prior snapshot,
-        while ``None`` deletes any stale snapshot left by an earlier run. Without
-        the delete, a clean run that drains all restored items can replay them on
-        the next restart. After a successful v3 update, an eligible legacy key is
-        retired too; an empty state first writes a private tombstone so a failed
-        legacy delete cannot make old work replay. If an update fails before
-        retirement, the legacy key is not deleted; a persisted tombstone fails
-        closed rather than replaying it. The optional
-        ``snapshot_connection_manager`` lets a queue-only backend use the
-        configured storage component; otherwise a storage-incapable manager raises
-        ``NotImplementedError`` and the snapshot is skipped. Connection managers
-        without a ``get_storage_backend`` attribute (e.g. test stubs) also skip.
-        Best-effort: any failure is logged, never crashes :meth:`close`.
-        """
-        snapshot_failed = False
+    def _snapshot_repository(self, storage: Any) -> SnapshotRepository:
+        return SnapshotRepository(
+            storage,
+            max_bytes=self._snapshot_max_bytes,
+            chunk_bytes=self._snapshot_chunk_bytes,
+        )
+
+    def _persist_snapshot(self) -> None:
+        """Commit a chunked strategy snapshot and then drain compatible old keys."""
         try:
             state = self._strategy.snapshot()
-        except Exception:  # noqa: BLE001 — snapshot must not crash close
-            snapshot_failed = True
-        if snapshot_failed:
-            # This only reports an already-selected best-effort fallback.  A custom
-            # handler may raise even a control-flow BaseException; it must not turn
-            # the promised non-fatal snapshot failure into a failed close.
+        except Exception:
             try:
                 logger.error("Strategy snapshot failed; skipping persist")
             except BaseException:
                 pass
             return
-        snapshot_manager = (
-            self._snapshot_connection_manager
-            if self._snapshot_connection_manager is not None
-            else self.connection_manager
-        )
-        get_storage = getattr(snapshot_manager, "get_storage_backend", None)
-        if get_storage is None:
-            return  # connection manager exposes no storage interface
-        storage_unsupported = False
-        storage_resolution_failed = False
+        storage = self._snapshot_storage()
+        if storage is None:
+            return
+        repository = self._snapshot_repository(storage)
         try:
-            storage = get_storage()
-        except NotImplementedError:
-            storage_unsupported = True
-        except Exception:  # noqa: BLE001 — resolver must not crash close
-            storage_resolution_failed = True
-        if storage_unsupported:
-            # This is an informational fallback after the backend capability was
-            # determined.  Diagnostics cannot make close fail.
+            repository.commit(self._snapshot_key(), state)
+        except SnapshotRepositoryError:
             try:
-                logger.info(
-                    "Snapshot storage is not available; in-process held state "
-                    "(e.g. delayed items) will not survive restart. Pair a queue-only "
-                    "backend with a storage-capable SCRAPY_STORAGE_BACKEND_TYPE "
-                    "(Redis/MongoDB/ElasticSearch) to enable snapshot/restore."
-                )
+                logger.error("Failed to commit strategy snapshot")
             except BaseException:
                 pass
             return
-        if storage_resolution_failed:
-            try:
-                logger.error(
-                    "Failed to resolve storage backend; skipping snapshot persist"
-                )
-            except BaseException:
-                pass
+
+        # A committed manifest, including an empty manifest, is authoritative.
+        # Legacy cleanup therefore happens only after the manifest-last commit.
+        legacy_key = self._legacy_snapshot_key()
+        if legacy_key is None:
             return
-        snapshot_key = self._snapshot_key()
-        # R26-A: warn at persist time when the snapshot exceeds the restore cap, so
-        # the operator learns at close — not on the NEXT restart's restore-skip
-        # WARNING — that the blob will be dropped. Persist is uncapped while restore
-        # is capped; without this the asymmetry is a silent data-loss trap for
-        # legitimate large delay heaps. Persist anyway: the operator may raise the
-        # cap or shrink the held heap (e.g. lower queue_delay_max_held) before the
-        # restart, in which case the snapshot restores cleanly.
-        if state is not None and len(state) > _MAX_SNAPSHOT_BYTES:
-            # This is a pure operator diagnostic after the snapshot is complete.
-            # A custom logging handler may raise even a control-flow BaseException;
-            # that must not prevent the checkpoint from reaching storage.
-            try:
-                logger.warning(
-                    "Strategy snapshot is %d bytes (restore cap %d); it will "
-                    "be DROPPED on restart. Reduce the held heap (e.g. queue_delay_max_held) "
-                    "or raise the cap before the next restart to preserve it.",
-                    len(state),
-                    _MAX_SNAPSHOT_BYTES,
-                )
-            except BaseException:
-                pass
-        legacy_snapshot_key = self._legacy_snapshot_key()
-        tombstone_key = self._empty_snapshot_tombstone_key()
-        uses_empty_tombstone = state is None and legacy_snapshot_key is not None
-        snapshot_update_failed = False
         try:
-            if uses_empty_tombstone:
-                storage.store(tombstone_key, _EMPTY_SNAPSHOT_TOMBSTONE_MARKER)
-                storage.delete(snapshot_key)
-            elif state is None:
-                storage.delete(snapshot_key)
-            else:
-                storage.store(snapshot_key, state)
-        except Exception:  # noqa: BLE001 — snapshot update must not crash close
-            snapshot_update_failed = True
-        if snapshot_update_failed:
+            storage.delete(legacy_key)
+            storage.delete(self._empty_snapshot_tombstone_key())
+        except Exception:
             try:
-                logger.error("Failed to update strategy snapshot; continuing")
-            except BaseException:
-                pass
-            return
-        if legacy_snapshot_key is None:
-            return
-        legacy_cleanup_failed = False
-        try:
-            storage.delete(legacy_snapshot_key)
-        except Exception:  # noqa: BLE001 — migration cleanup must not crash close
-            legacy_cleanup_failed = True
-        if legacy_cleanup_failed:
-            try:
-                logger.error("Failed to retire legacy strategy snapshot; continuing")
-            except BaseException:
-                pass
-            return
-        tombstone_delete_failed = False
-        try:
-            storage.delete(tombstone_key)
-        except Exception:  # noqa: BLE001 — tombstone cleanup must not crash close
-            tombstone_delete_failed = True
-        if tombstone_delete_failed:
-            try:
-                logger.error("Failed to remove empty strategy snapshot tombstone")
+                logger.error("Failed to retire legacy strategy snapshot")
             except BaseException:
                 pass
 
     def _restore_snapshot(self) -> None:
-        """Restore the strategy's in-process state on startup (initiative #3).
+        """Restore a validated v4 manifest or a compatible v3/v2/raw value."""
+        storage = self._snapshot_storage()
+        if storage is None:
+            return
+        repository = self._snapshot_repository(storage)
+        try:
+            result = repository.read(self._snapshot_key())
+        except SnapshotRepositoryError:
+            try:
+                logger.error("Failed to read strategy snapshot; starting clean")
+            except BaseException:
+                pass
+            return
 
-        Loads the snapshot bytes from the storage backend (when storage-capable),
-        and passes them to ``strategy.restore()``. The checkpoint remains in
-        storage until a later clean close atomically replaces it with the current
-        state (or deletes it after a clean drain). Retaining it makes a crash after
-        restore replay-safe: already-processed entries may repeat, but unprocessed
-        entries cannot disappear with the only checkpoint. When a v3 checkpoint
-        is absent, an eligible legacy fallback first checks the separate empty
-        marker so an interrupted clean drain cannot replay old state. An injected
-        ``snapshot_connection_manager`` can provide storage for a queue-only
-        backend; otherwise storage-incapable managers and connection managers
-        without ``get_storage_backend`` skip silently. Only real
-        ``bytes``/``bytearray`` are restored — a non-bytes retrieve result (e.g.
-        a mock in tests) is skipped. Best-effort: any failure is logged, never
-        crashes startup.
-        """
-        snapshot_manager = (
-            self._snapshot_connection_manager
-            if self._snapshot_connection_manager is not None
-            else self.connection_manager
-        )
-        get_storage = getattr(snapshot_manager, "get_storage_backend", None)
-        if get_storage is None:
-            return  # connection manager exposes no storage interface
-        storage_resolution_failed = False
-        try:
-            storage = get_storage()
-        except NotImplementedError:
-            return  # storage-incapable backend — no prior snapshot to restore
-        except Exception:  # noqa: BLE001 — resolver must not crash startup
-            storage_resolution_failed = True
-        if storage_resolution_failed:
-            try:
-                logger.error("Failed to resolve storage backend; starting clean")
-            except BaseException:
-                pass
-            return
-        snapshot_key = self._snapshot_key()
-        snapshot_retrieval_failed = False
-        try:
-            state = storage.retrieve(snapshot_key)
-        except Exception:  # noqa: BLE001 — retrieve must not crash startup
-            snapshot_retrieval_failed = True
-        if snapshot_retrieval_failed:
-            try:
-                logger.error("Failed to retrieve strategy snapshot; starting clean")
-            except BaseException:
-                pass
-            return
-        legacy_snapshot_key = self._legacy_snapshot_key()
-        if state is None and legacy_snapshot_key is not None:
-            tombstone_retrieval_failed = False
-            try:
-                tombstone = storage.retrieve(self._empty_snapshot_tombstone_key())
-            except Exception:  # noqa: BLE001 — tombstone failure must not replay legacy
-                tombstone_retrieval_failed = True
-            if tombstone_retrieval_failed:
+        if not result.found:
+            legacy_key = self._legacy_snapshot_key()
+            if legacy_key is not None:
                 try:
-                    logger.error(
-                        "Failed to retrieve empty strategy snapshot tombstone; "
-                        "starting clean"
-                    )
-                except BaseException:
-                    pass
-                return
-            if tombstone is not None:
-                return
-            legacy_retrieval_failed = False
-            try:
-                state = storage.retrieve(legacy_snapshot_key)
-            except Exception:  # noqa: BLE001 — legacy migration must not crash startup
-                legacy_retrieval_failed = True
-            if legacy_retrieval_failed:
+                    tombstone = storage.retrieve(self._empty_snapshot_tombstone_key())
+                except Exception:
+                    try:
+                        logger.error(
+                            "Failed to retrieve empty strategy snapshot tombstone; "
+                            "starting clean"
+                        )
+                    except BaseException:
+                        pass
+                    return
+                if tombstone is not None:
+                    return
                 try:
-                    logger.error(
-                        "Failed to retrieve legacy strategy snapshot; starting clean"
-                    )
-                except BaseException:
-                    pass
-                return
-        # Only restore real bytes — None (no prior snapshot) or any non-bytes
-        # value (unexpected type / mock) is a no-op, never passed to restore().
-        if not isinstance(state, (bytes, bytearray)):
+                    result = repository.read(legacy_key)
+                except SnapshotRepositoryError:
+                    try:
+                        logger.error("Failed to read legacy strategy snapshot; starting clean")
+                    except BaseException:
+                        pass
+                    return
+        if not result.found or result.state is None:
             return
-        # R25-B: bound the snapshot blob before the bytes(state) copy + json.loads
-        # materialization so a corrupt/malicious value cannot OOM-kill startup.
-        if len(state) > _MAX_SNAPSHOT_BYTES:
-            # This warning only explains an already-completed safety decision. A
-            # logging handler failure must not turn the clean-start fallback into a
-            # failed queue construction.
-            try:
-                logger.warning(
-                    "Strategy snapshot is %d bytes (cap %d); starting clean to avoid "
-                    "OOM during restore.",
-                    len(state),
-                    _MAX_SNAPSHOT_BYTES,
-                )
-            except BaseException:
-                pass
-            return
-        snapshot_restore_failed = False
         try:
-            self._strategy.restore(bytes(state))
-        except Exception:  # noqa: BLE001 — restore must not crash startup (docstring)
-            snapshot_restore_failed = True
-        if snapshot_restore_failed:
+            self._strategy.restore(result.state)
+        except Exception:
             try:
                 logger.error("Strategy snapshot restore failed; starting clean")
             except BaseException:
                 pass
-            return

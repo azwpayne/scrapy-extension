@@ -38,6 +38,10 @@ from scrapy_extension.exceptions import (
     SerializationError,
 )
 from scrapy_extension.queue.queue import BACKEND_ACK_TOKEN_META_KEY, BackendQueue
+from scrapy_extension.queue.snapshot import (
+    DEFAULT_SNAPSHOT_CHUNK_BYTES,
+    DEFAULT_SNAPSHOT_MAX_BYTES,
+)
 from scrapy_extension.queue.strategies.base import _QueueAckToken
 from scrapy_extension.utils._config import (
     get_bool_setting,
@@ -91,6 +95,8 @@ class _QueueComponentConfig:
     monitor_backpressure_threshold: int | None = None
     monitor_pop_rate_window_s: float | None = None
     queue_snapshot_owner: str | None = None
+    queue_snapshot_max_bytes: int | None = None
+    queue_snapshot_chunk_bytes: int | None = None
 
     @classmethod
     def from_early_settings(
@@ -340,6 +346,17 @@ class _QueueComponentConfig:
             minimum_exclusive=True,
             maximum=86400.0,
         )
+        queue_snapshot_max_bytes = parse_int_setting(
+            settings.get("SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES", DEFAULT_SNAPSHOT_MAX_BYTES),
+            "SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES",
+            minimum=1,
+        )
+        queue_snapshot_chunk_bytes = parse_int_setting(
+            settings.get("SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES", DEFAULT_SNAPSHOT_CHUNK_BYTES),
+            "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES",
+            minimum=1,
+            maximum=queue_snapshot_max_bytes,
+        )
         snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
         queue_snapshot_owner = (
             snapshot_owner_raw if snapshot_owner_raw is not None else self.worker_id
@@ -378,6 +395,8 @@ class _QueueComponentConfig:
             monitor_backpressure_threshold=monitor_backpressure_threshold,
             monitor_pop_rate_window_s=monitor_pop_rate_window_s,
             queue_snapshot_owner=queue_snapshot_owner,
+            queue_snapshot_max_bytes=queue_snapshot_max_bytes,
+            queue_snapshot_chunk_bytes=queue_snapshot_chunk_bytes,
         )
 
 
@@ -897,6 +916,8 @@ class BackendScheduler:
         monitor_backpressure_threshold: int = 1_000,
         monitor_pop_rate_window_s: float = 60.0,
         queue_snapshot_owner: str | None = None,
+        queue_snapshot_max_bytes: int = DEFAULT_SNAPSHOT_MAX_BYTES,
+        queue_snapshot_chunk_bytes: int = DEFAULT_SNAPSHOT_CHUNK_BYTES,
         snapshot_connection_manager: ConnectionManager | None = None,
         owns_snapshot_connection_manager: bool = False,
         owns_connection_manager: bool = True,
@@ -993,6 +1014,8 @@ class BackendScheduler:
         self._monitor_backpressure_threshold = monitor_backpressure_threshold
         self._monitor_pop_rate_window_s = monitor_pop_rate_window_s
         self._queue_snapshot_owner = queue_snapshot_owner
+        self._queue_snapshot_max_bytes = queue_snapshot_max_bytes
+        self._queue_snapshot_chunk_bytes = queue_snapshot_chunk_bytes
         self._snapshot_connection_manager = snapshot_connection_manager
         self._owns_snapshot_connection_manager = owns_snapshot_connection_manager
         self._snapshot_manager_released = False
@@ -1198,6 +1221,8 @@ class BackendScheduler:
             assert queue_config.queue_max_item_bytes is not None
             assert queue_config.monitor_backpressure_threshold is not None
             assert queue_config.monitor_pop_rate_window_s is not None
+            assert queue_config.queue_snapshot_max_bytes is not None
+            assert queue_config.queue_snapshot_chunk_bytes is not None
             return cls(
                 connection_manager=manager,
                 queue_key=queue_config.queue_key,
@@ -1211,6 +1236,8 @@ class BackendScheduler:
                 ),
                 monitor_pop_rate_window_s=queue_config.monitor_pop_rate_window_s,
                 queue_snapshot_owner=queue_config.queue_snapshot_owner,
+                queue_snapshot_max_bytes=queue_config.queue_snapshot_max_bytes,
+                queue_snapshot_chunk_bytes=queue_config.queue_snapshot_chunk_bytes,
                 snapshot_connection_manager=snapshot_connection_manager,
                 owns_snapshot_connection_manager=(
                     snapshot_connection_manager is not None
@@ -1544,6 +1571,8 @@ class BackendScheduler:
                     pop_rate_window_s=self._monitor_pop_rate_window_s,
                     snapshot_owner=self._queue_snapshot_owner,
                     snapshot_connection_manager=self._snapshot_connection_manager,
+                    snapshot_max_bytes=self._queue_snapshot_max_bytes,
+                    snapshot_chunk_bytes=self._queue_snapshot_chunk_bytes,
                 )
                 self._connect_ack_signals(spider)
             except BaseException as exc:
