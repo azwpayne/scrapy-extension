@@ -184,6 +184,70 @@ def test_json_serializer_rejects_secret_wrappers_without_leaking_exception_graph
 
 
 @pytest.mark.parametrize(
+    ("wrapped", "marker"),
+    [
+        pytest.param(SecretStr("key-string-marker"), "key-string-marker"),
+        pytest.param(SecretBytes(b"key-bytes-marker"), "key-bytes-marker"),
+    ],
+)
+@pytest.mark.parametrize("nested", [False, True], ids=["direct-key", "nested-key"])
+def test_json_serializer_rejects_secret_wrapper_keys_without_reachable_secrets(
+    wrapped: SecretStr | SecretBytes, marker: str, *, nested: bool
+) -> None:
+    """Secret-bearing mapping keys cross the same clean terminal boundary."""
+    serializer = JSONSerializer()
+    raw_secret = wrapped.get_secret_value()
+    secret_mapping = {wrapped: "safe-value"}
+    payload: object = {"request": [secret_mapping]} if nested else secret_mapping
+
+    with pytest.raises(TypeError) as exc_info:
+        serializer.serialize(payload)
+
+    error = exc_info.value
+    surfaces = [
+        str(error),
+        repr(error),
+        repr(error.args),
+        repr(error.__dict__),
+        "".join(traceback.format_exception(error)),
+    ]
+    reachable = _exception_library_graph(error)
+    reachable_ids = {id(value) for value in reachable}
+    reachable_secrets = [
+        value.get_secret_value()
+        for value in reachable
+        if type(value).__name__ in {"SecretStr", "SecretBytes"}
+    ]
+
+    assert type(wrapped).__name__ in str(error)
+    assert all(marker not in surface for surface in surfaces)
+    assert reachable_secrets == []
+    assert id(serializer) not in reachable_ids
+    assert id(payload) not in reachable_ids
+    assert id(secret_mapping) not in reachable_ids
+    assert id(wrapped) not in reachable_ids
+    assert id(raw_secret) not in reachable_ids
+    assert [value for value in reachable if isinstance(value, BaseException)] == [error]
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_json_serializer_preserves_explicitly_unwrapped_secret_key_semantics() -> None:
+    """Only an unwrapped string becomes a valid JSON key; bytes stay invalid."""
+    serializer = JSONSerializer()
+    string_key = SecretStr("explicit-key").get_secret_value()
+    bytes_key = SecretBytes(b"explicit-key").get_secret_value()
+
+    encoded = serializer.serialize({string_key: "value"})
+
+    assert serializer.deserialize(encoded) == {string_key: "value"}
+    with pytest.raises(
+        TypeError, match=r"^JSON object keys must be strings, got bytes$"
+    ):
+        serializer.serialize({bytes_key: "value"})
+
+
+@pytest.mark.parametrize(
     "wrapped",
     [
         pytest.param(SecretStr("explicit-string"), id="SecretStr"),

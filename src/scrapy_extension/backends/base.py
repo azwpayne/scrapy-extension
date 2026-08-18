@@ -199,9 +199,12 @@ def _encode_json_value(obj: object) -> object:
         }
     if isinstance(obj, dict):
         for key in obj:
+            key_type_name = type(key).__name__
+            if key_type_name in {"SecretStr", "SecretBytes"}:
+                raise _SecretWrapperSerializationRejected(key_type_name)
             if not isinstance(key, str):
                 raise TypeError(
-                    f"JSON object keys must be strings, got {type(key).__name__}"
+                    f"JSON object keys must be strings, got {key_type_name}"
                 )
         encoded = {key: _encode_json_value(value) for key, value in obj.items()}
         if _looks_like_codec_marker(encoded):
