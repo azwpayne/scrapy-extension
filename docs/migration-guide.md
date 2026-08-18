@@ -51,6 +51,28 @@ messages and do not retain the rejected value.
 
 No persisted backend data or wire-format migration is required for this change.
 
+## Secret Setting Mutation
+
+Assigning a plain `str` to an exact bundled `SecretStr` field now installs a
+`SecretStr` wrapper immediately; the equivalent rule applies to `bytes` and
+`SecretBytes` fields. Optional secret fields still accept `None`, while required
+secret fields and unrelated input types reject the assignment. This is targeted
+handling only: settings remain mutable, broad Pydantic `validate_assignment` is
+not enabled, and models are not frozen.
+
+Code that mutates credentials can continue to use plain strings, but code that
+inspects the field afterward must treat it as a secret wrapper and call
+`get_secret_value()` only at the transport boundary. Do not expect
+`repr(settings)`, `model_dump()`, or assignment exceptions to return plaintext.
+The internal `secret_value()` backend helper still accepts plain strings only
+for direct backend and plugin compatibility; bundled model assignment no longer
+relies on that fallback.
+
+Connect-time snapshot validation remains active. Mutation is not a way to bypass
+cross-field credential, transport, or topology rules: disconnect, apply the
+complete coherent settings change, and reconnect so a new validated generation
+is published. No persisted backend data or wire-format migration is required.
+
 ## Cuckoo Item-Deletion Contract
 
 `CuckooMembershipFilter.remove()` now raises `NotImplementedError` without

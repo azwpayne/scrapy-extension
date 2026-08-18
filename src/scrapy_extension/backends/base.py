@@ -300,12 +300,12 @@ def _json_object_from_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
 def secret_value(s: SecretStr | str | None) -> str | None:
     """Extract the raw string from a SecretStr (or pass through plain str).
 
-    Defensive against plain ``str`` values that bypass pydantic validation
-    (e.g., ``config.password = "x"`` after construction, which doesn't
-    coerce to SecretStr unless ``validate_assignment=True``).
+    Bundled settings wrap post-construction string assignments immediately.
+    Plain strings remain supported here for direct backend/plugin compatibility;
+    this helper is not an assignment-validation or redaction boundary.
 
     Args:
-        s: A SecretStr, plain str, or None.
+        s: A SecretStr, compatibility plain string, or None.
 
     Returns:
         The secret's raw string value, or None.

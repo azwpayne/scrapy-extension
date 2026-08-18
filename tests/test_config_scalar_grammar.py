@@ -167,11 +167,17 @@ def test_bundled_integer_direct_matrix_rejects_coercion(
     _expected: int,
     raw_value: object,
 ) -> None:
-    with pytest.raises(ConfigurationError) as exc_info:
+    expected_error = (
+        ValidationError if settings_type is Settings else ConfigurationError
+    )
+    with pytest.raises(expected_error) as exc_info:
         settings_type(**_required_kwargs(settings_type), **{field_name: raw_value})
 
-    assert exc_info.value.setting_name == field_name
-    assert exc_info.value.setting_value is None
+    if isinstance(exc_info.value, ConfigurationError):
+        assert exc_info.value.setting_name == field_name
+        assert exc_info.value.setting_value is None
+    else:
+        assert all(error["input"] is None for error in exc_info.value.errors())
 
 
 @pytest.mark.parametrize(

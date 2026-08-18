@@ -315,7 +315,9 @@ class TestConnection:
     def test_snapshot_validation_does_not_retain_mutated_secret_input(self, mocker):
         marker = "elasticsearch-snapshot-secret-marker"
         config = ElasticSearchSettings(hosts=["https://es.example:9200"])
-        config.api_key = [marker]  # type: ignore[assignment]
+        # Exercise the existing connect-time snapshot boundary independently of
+        # RedactedBaseSettings' targeted public secret-assignment guard.
+        object.__setattr__(config, "api_key", [marker])
         client_factory = mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch"
         )

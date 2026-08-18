@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from importlib import import_module
 from typing import Annotated, Any, cast, get_args, get_origin
 
-from pydantic import ValidationError, model_validator
+from pydantic import SecretBytes, SecretStr, ValidationError, model_validator
 from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, SettingsError
 
@@ -277,6 +277,25 @@ def _trusted_settings_field_names(instance: BaseSettings) -> frozenset[str]:
     return frozenset(name for name in fields if type(name) is str)
 
 
+def _secret_annotation_kind(
+    annotation: object,
+) -> tuple[type[SecretStr] | type[SecretBytes], bool] | None:
+    """Identify exact secret and optional-secret annotations, including Annotated."""
+    while get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    if annotation in (SecretStr, SecretBytes):
+        return annotation, False
+    args = get_args(annotation)
+    if len(args) != 2 or type(None) not in args:
+        return None
+    inner = args[0] if args[1] is type(None) else args[1]
+    while get_origin(inner) is Annotated:
+        inner = get_args(inner)[0]
+    if inner in (SecretStr, SecretBytes):
+        return cast("type[SecretStr] | type[SecretBytes]", inner), True
+    return None
+
+
 def _scalar_annotation_kind(annotation: object) -> tuple[type[object], bool] | None:
     """Identify exact scalar and optional-scalar annotations, including Annotated."""
     while get_origin(annotation) is Annotated:
@@ -374,8 +393,12 @@ def _normalize_bundled_scalar(
             normalized_float = float(value)
             if math.isfinite(normalized_float):
                 return normalized_float
-    if scalar_type is float:
-        raise ValueError("Bundled floating-point setting has an invalid value.")
+    if scalar_type is float or (
+        scalar_type is int
+        and settings_type.__module__ == "scrapy_extension.settings.base"
+        and settings_type.__qualname__ == "Settings"
+    ):
+        raise ValueError("Bundled numeric setting has an invalid value.")
     raise ConfigurationError(
         "Bundled scalar setting has an invalid value.",
         setting_name=field_name,
@@ -415,6 +438,43 @@ class RedactedBaseSettings(BaseSettings):
                     normalized[field_name],
                 )
         return normalized
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Wrap exact secret fields before publishing an assigned value."""
+        try:
+            fields = type(self).model_fields
+            field = fields.get(name) if isinstance(fields, Mapping) else None
+            secret = _secret_annotation_kind(
+                getattr(field, "annotation", None) if field is not None else None
+            )
+        except Exception:  # noqa: BLE001 - custom model metadata is not trusted
+            secret = None
+        if secret is None:
+            super().__setattr__(name, value)
+            return
+
+        secret_type, optional = secret
+        replacement: SecretStr | SecretBytes | None
+        if value is None and optional:
+            replacement = None
+        elif secret_type is SecretStr and type(value) is str:
+            replacement = SecretStr(value)
+        elif secret_type is SecretBytes and type(value) is bytes:
+            replacement = SecretBytes(value)
+        elif type(value) is secret_type:
+            replacement = value
+        else:
+            del value
+            del self
+            raise TypeError(
+                "Secret setting assignment requires the matching plaintext or "
+                "secret-wrapper type."
+            )
+
+        # If BaseModel's ordinary assignment machinery ever fails, its traceback
+        # can retain only a redacted wrapper (or None), never the plaintext input.
+        del value
+        super().__setattr__(name, replacement)
 
     def __init__(self, **values: Any) -> None:
         validation_error: ValidationError | None = None
