@@ -556,30 +556,54 @@ def _validate_backend_contract(
     return cast("Backend", backend)
 
 
+_UNUSABLE_ACK_VALUE_MESSAGE = "Deferred-ack acknowledgement token is unusable"
+_INVALID_ACK_QUEUE_NAME_MESSAGE = (
+    "Deferred-ack queue name must be an exact built-in string"
+)
+
+
 def _ack_token_key(token: Any) -> tuple[object, ...]:
-    """Return a non-disclosing overlap key without invoking plugin protocols."""
+    """Return a usable, non-disclosing key without invoking plugin protocols."""
+    key: tuple[object, ...]
     if type(token) in {str, bytes, int}:
-        return ("value", type(token), token)
-    return ("identity", id(token))
+        key = ("value", type(token), token)
+    else:
+        key = ("identity", id(token))
+    try:
+        # Dict/set operations repeat this hash while holding the contract lock.
+        # Prove here that the exact built-in-only key is usable before then.
+        hash(key)
+    except Exception:
+        raise QueueError(_UNUSABLE_ACK_VALUE_MESSAGE) from None
+    return key
 
 
 def _is_empty_ack_token(token: Any) -> bool:
-    """Recognize only exact empty built-in containers; never call plugin hooks."""
-    return (
-        type(token)
-        in {
-            str,
-            bytes,
-            bytearray,
-            memoryview,
-            tuple,
-            list,
-            dict,
-            set,
-            frozenset,
-        }
-        and len(token) == 0
-    )
+    """Recognize exact empty built-ins and fail closed for unusable values."""
+    if type(token) not in {
+        str,
+        bytes,
+        bytearray,
+        memoryview,
+        tuple,
+        list,
+        dict,
+        set,
+        frozenset,
+    }:
+        return False
+    try:
+        return len(token) == 0
+    except Exception:
+        # A released memoryview raises ValueError here. Do not let that raw
+        # exception cross the adapter boundary or treat the token as usable.
+        raise QueueError(_UNUSABLE_ACK_VALUE_MESSAGE) from None
+
+
+def _require_exact_ack_queue_name(queue_name: object, operation: str) -> None:
+    """Reject plugin-controlled string subclasses before delegation or locks."""
+    if type(queue_name) is not str:
+        raise QueueError(_INVALID_ACK_QUEUE_NAME_MESSAGE, operation=operation)
 
 
 _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
@@ -593,6 +617,8 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
             "Deferred-ack backend returned a delivery without an acknowledgement token",
             "Deferred-ack backend returned an empty acknowledgement token",
             "Deferred-ack backend reused an active acknowledgement token",
+            _UNUSABLE_ACK_VALUE_MESSAGE,
+            _INVALID_ACK_QUEUE_NAME_MESSAGE,
         }
     ),
     "ack": frozenset(
@@ -604,6 +630,8 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
             "Deferred-ack backend returned an iterator settlement result",
             "Deferred-ack backend returned an awaitable settlement result",
             "Deferred-ack backend returned an asynchronous-generator settlement result",
+            _UNUSABLE_ACK_VALUE_MESSAGE,
+            _INVALID_ACK_QUEUE_NAME_MESSAGE,
         }
     ),
     "nack": frozenset(
@@ -615,6 +643,8 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
             "Deferred-ack backend returned an iterator settlement result",
             "Deferred-ack backend returned an awaitable settlement result",
             "Deferred-ack backend returned an asynchronous-generator settlement result",
+            _UNUSABLE_ACK_VALUE_MESSAGE,
+            _INVALID_ACK_QUEUE_NAME_MESSAGE,
         }
     ),
 }
@@ -726,15 +756,19 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         self._settling_ack_tokens: set[tuple[str, tuple[object, ...]]] = set()
 
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+        _require_exact_ack_queue_name(queue_name, "push")
         self._delegate.push(queue_name, item, priority)
 
     def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        _require_exact_ack_queue_name(queue_name, "pop")
         return self._delegate.pop(queue_name, timeout)
 
     def queue_len(self, queue_name: str) -> int:
+        _require_exact_ack_queue_name(queue_name, "queue_len")
         return self._delegate.queue_len(queue_name)
 
     def clear_queue(self, queue_name: str) -> None:
+        _require_exact_ack_queue_name(queue_name, "clear_queue")
         self._delegate.clear_queue(queue_name)
 
     @_deferred_ack_queue_error_boundary("pop")
@@ -743,6 +777,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         queue_name: str,
         timeout: float = 0.0,
     ) -> tuple[bytes | None, Any | None]:
+        _require_exact_ack_queue_name(queue_name, "pop")
         result = self._delegate.pop_with_ack(queue_name, timeout)
         _reject_lazy_ack_result(result, "pop")
         if type(result) is not tuple or len(result) != 2:
@@ -783,6 +818,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         self._settle("nack", queue_name, token)
 
     def _settle(self, operation: str, queue_name: str, token: Any | None) -> None:
+        _require_exact_ack_queue_name(queue_name, operation)
         if token is None or _is_empty_ack_token(token):
             raise QueueError(
                 "Deferred-ack settlement requires an issued acknowledgement token",

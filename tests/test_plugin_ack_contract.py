@@ -678,6 +678,102 @@ def test_settlement_descriptor_and_hook_run_outside_contract_lock_and_reenter(
     assert contract._settling_ack_tokens == set()
 
 
+def test_delivery_rejects_reentrant_hash_queue_subclass() -> None:
+    marker = "private-reentrant-delivery-queue"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    hook_calls: list[str] = []
+
+    class ReentrantQueueName(str):
+        def __hash__(self) -> int:
+            hook_calls.append("hash")
+            contract.pop_with_ack("reentrant-safe-queue")
+            return super().__hash__()
+
+        def __str__(self) -> str:
+            hook_calls.append("str")
+            return super().__str__()
+
+    errors: list[BaseException] = []
+
+    def deliver() -> None:
+        try:
+            contract.pop_with_ack(ReentrantQueueName(marker))
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=deliver, daemon=True)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive(), "hostile queue hash deadlocked delivery"
+    assert len(errors) == 1
+    assert isinstance(errors[0], QueueError)
+    assert "exact built-in string" in str(errors[0])
+    _assert_terminal_queue_error_is_redacted(errors[0], marker)
+    assert hook_calls == []
+    assert backend.pop_results == {}
+    assert contract._active_ack_tokens == {}
+
+
+@pytest.mark.parametrize("method_name", ["ack", "nack"])
+def test_settlement_rejects_reentrant_hash_queue_subclass_and_keeps_token(
+    method_name: str,
+) -> None:
+    marker = f"private-reentrant-{method_name}-queue"
+    token = f"issued-{method_name}-token"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    backend.pop_results["q"].append((b"item", token))
+    contract.pop_with_ack("q")
+    hook_calls: list[str] = []
+
+    class ReentrantQueueName(str):
+        def __hash__(self) -> int:
+            hook_calls.append("hash")
+            getattr(contract, method_name)("q", token=token)
+            return super().__hash__()
+
+        def __str__(self) -> str:
+            hook_calls.append("str")
+            return super().__str__()
+
+    errors: list[BaseException] = []
+
+    def settle() -> None:
+        try:
+            getattr(contract, method_name)(ReentrantQueueName(marker), token=token)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=settle, daemon=True)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive(), "hostile queue hash deadlocked settlement"
+    assert len(errors) == 1
+    assert isinstance(errors[0], QueueError)
+    assert "exact built-in string" in str(errors[0])
+    _assert_terminal_queue_error_is_redacted(errors[0], marker)
+    assert hook_calls == []
+    assert backend.ack_calls == []
+    assert backend.nack_calls == []
+    assert contract._active_ack_tokens
+    assert contract._settling_ack_tokens == set()
+
+    getattr(contract, method_name)("q", token=token)
+    expected = [("q", token)]
+    assert backend.ack_calls == (expected if method_name == "ack" else [])
+    assert backend.nack_calls == (expected if method_name == "nack" else [])
+    assert contract._active_ack_tokens == {}
+
+
 @pytest.mark.parametrize("method_name", ["ack", "nack"])
 def test_blocked_settlement_fences_racer_then_failure_restores_exact_retry(
     monkeypatch: pytest.MonkeyPatch,
@@ -1091,6 +1187,55 @@ def test_deferred_plugin_rejects_empty_and_missing_tokens() -> None:
         backend.pop_results["q"].append((b"item", token))
         with pytest.raises(QueueError, match="token"):
             contract.pop_with_ack("q")
+
+
+def test_deferred_plugin_rejects_released_memoryview_delivery_token() -> None:
+    marker = "private-released-delivery-token"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    payload = bytearray(marker.encode())
+    token = memoryview(payload)
+    token.release()
+    backend.pop_results["q"].append((b"item", token))
+
+    with pytest.raises(QueueError, match="unusable") as exc_info:
+        contract.pop_with_ack("q")
+
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
+    assert contract._active_ack_tokens == {}
+    assert contract._settling_ack_tokens == set()
+    assert backend.ack_calls == []
+    assert backend.nack_calls == []
+
+
+@pytest.mark.parametrize("method_name", ["ack", "nack"])
+def test_deferred_plugin_rejects_released_memoryview_settlement_token_safely(
+    method_name: str,
+) -> None:
+    marker = f"private-released-{method_name}-token"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    payload = bytearray(marker.encode())
+    token = memoryview(payload)
+    backend.pop_results["q"].append((b"item", token))
+    assert contract.pop_with_ack("q") == (b"item", token)
+    token.release()
+
+    with pytest.raises(QueueError, match="unusable") as exc_info:
+        getattr(contract, method_name)("q", token=token)
+
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
+    assert backend.ack_calls == []
+    assert backend.nack_calls == []
+    assert contract._settling_ack_tokens == set()
+    active = contract._active_ack_tokens["q"]
+    assert list(active.values()) == [token]
 
 
 def _assert_value_graph_is_redacted(
