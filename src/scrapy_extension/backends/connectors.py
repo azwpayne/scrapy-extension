@@ -33,6 +33,7 @@ from decimal import Decimal
 from difflib import get_close_matches
 from enum import Enum
 from functools import wraps
+from inspect import getattr_static
 from json import JSONEncoder
 from pathlib import PurePath
 from types import ModuleType
@@ -203,6 +204,7 @@ _SAFE_MANAGER_MESSAGES: frozenset[str] = frozenset(
         "Selected backend could not be constructed.",
         "Selected backend has an invalid plugin class path.",
         "Selected backend must provide callable backend and settings classes.",
+        "Selected third-party queue backend has an invalid acknowledgement contract.",
         (
             "Selected backend type is not a registered backend type. "
             f"Valid bundled values: {', '.join(repr(name) for name in sorted(_BUNDLED_BACKEND_TYPES))}."
@@ -413,6 +415,61 @@ _CAPABILITY_INTERFACES: dict[str, type[ABC]] = {
 }
 
 
+def _invalid_plugin_ack_contract() -> ConfigurationError:
+    """Build the static fail-closed error for untrusted ACK declarations."""
+    return ConfigurationError(
+        "Selected third-party queue backend has an invalid acknowledgement contract.",
+        setting_name="SCRAPY_BACKEND_TYPE",
+    )
+
+
+def _validate_plugin_ack_class(
+    descriptor: BackendDescriptor,
+    backend_cls: object,
+) -> bool:
+    """Validate exact deferred-ACK metadata before any plugin broker I/O.
+
+    Legacy queue plugins inherit ``requires_ack=False`` and remain compatible.
+    A plugin opting into deferred acknowledgement must use literal boolean
+    metadata and concrete token-bearing methods rather than the permissive ABC
+    defaults. The returned flag tells the manager to install the runtime token
+    fence for that plugin.
+    """
+    if "queue" not in descriptor.capabilities:
+        return False
+    requires_ack = getattr_static(backend_cls, "requires_ack", None)
+    if requires_ack is None:
+        # Preserve the existing runtime ABC check for legacy descriptors that
+        # overclaim ``queue`` without implementing QueueBackend at all.
+        return False
+    if type(requires_ack) is not bool:
+        raise _invalid_plugin_ack_contract()
+    if requires_ack is False:
+        if isinstance(backend_cls, type) and issubclass(backend_cls, QueueBackend):
+            supports_concurrent = getattr_static(
+                backend_cls,
+                "supports_concurrent_ack",
+                None,
+            )
+            if type(supports_concurrent) is not bool:
+                raise _invalid_plugin_ack_contract()
+        return False
+    if not isinstance(backend_cls, type) or not issubclass(backend_cls, QueueBackend):
+        raise _invalid_plugin_ack_contract()
+    supports_concurrent = getattr_static(
+        backend_cls,
+        "supports_concurrent_ack",
+        None,
+    )
+    if type(supports_concurrent) is not bool:
+        raise _invalid_plugin_ack_contract()
+    for method_name in ("pop_with_ack", "ack", "nack"):
+        method = getattr_static(backend_cls, method_name, None)
+        if method is None or method is getattr(QueueBackend, method_name):
+            raise _invalid_plugin_ack_contract()
+    return True
+
+
 def _validate_backend_contract(
     backend: object, descriptor: BackendDescriptor
 ) -> Backend:
@@ -443,6 +500,114 @@ def _validate_backend_contract(
         )
         raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
     return cast("Backend", backend)
+
+
+def _ack_token_key(token: Any) -> tuple[object, ...]:
+    """Return a non-disclosing overlap key without invoking plugin protocols."""
+    if type(token) in {str, bytes, int}:
+        return ("value", type(token), token)
+    return ("identity", id(token))
+
+
+def _is_empty_ack_token(token: Any) -> bool:
+    """Recognize only exact empty built-in containers; never call plugin hooks."""
+    return type(token) in {str, bytes, tuple, list, dict, set, frozenset} and len(token) == 0
+
+
+class _DeferredAckPluginQueueBackend(QueueBackend):
+    """Runtime token fence for a statically conforming deferred-ACK plugin."""
+
+    requires_ack = True
+
+    def __init__(
+        self,
+        backend: QueueBackend,
+        *,
+        supports_concurrent_ack: bool,
+    ) -> None:
+        self._backend = backend
+        self.supports_concurrent_ack = supports_concurrent_ack
+        self._ack_contract_lock = threading.Lock()
+        self._active_ack_tokens: dict[str, set[tuple[object, ...]]] = {}
+
+    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+        self._backend.push(queue_name, item, priority)
+
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        return self._backend.pop(queue_name, timeout)
+
+    def queue_len(self, queue_name: str) -> int:
+        return self._backend.queue_len(queue_name)
+
+    def clear_queue(self, queue_name: str) -> None:
+        self._backend.clear_queue(queue_name)
+
+    def pop_with_ack(
+        self,
+        queue_name: str,
+        timeout: float = 0.0,
+    ) -> tuple[bytes | None, Any | None]:
+        result = self._backend.pop_with_ack(queue_name, timeout)
+        if type(result) is not tuple or len(result) != 2:
+            raise QueueError(
+                "Deferred-ack backend returned an invalid delivery result",
+                operation="pop",
+            )
+        item, token = result
+        if token is None:
+            if item is None:
+                return (None, None)
+            raise QueueError(
+                "Deferred-ack backend returned a delivery without an acknowledgement token",
+                operation="pop",
+            )
+        if _is_empty_ack_token(token):
+            raise QueueError(
+                "Deferred-ack backend returned an empty acknowledgement token",
+                operation="pop",
+            )
+        key = _ack_token_key(token)
+        with self._ack_contract_lock:
+            active = self._active_ack_tokens.setdefault(queue_name, set())
+            if key in active:
+                raise QueueError(
+                    "Deferred-ack backend reused an active acknowledgement token",
+                    operation="pop",
+                )
+            active.add(key)
+        return (item, token)
+
+    def ack(self, queue_name: str, *, token: Any | None = None) -> None:
+        self._settle("ack", queue_name, token)
+
+    def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+        self._settle("nack", queue_name, token)
+
+    def _settle(self, operation: str, queue_name: str, token: Any | None) -> None:
+        if token is None or _is_empty_ack_token(token):
+            raise QueueError(
+                "Deferred-ack settlement requires an issued acknowledgement token",
+                operation=operation,
+            )
+        key = _ack_token_key(token)
+        with self._ack_contract_lock:
+            active = self._active_ack_tokens.get(queue_name)
+            if active is None or key not in active:
+                raise QueueError(
+                    "Deferred-ack settlement rejected an unknown acknowledgement token",
+                    operation=operation,
+                )
+            try:
+                if operation == "ack":
+                    self._backend.ack(queue_name, token=token)
+                else:
+                    self._backend.nack(queue_name, token=token)
+            except BaseException:
+                raise
+            else:
+                active.remove(key)
+                if not active:
+                    self._active_ack_tokens.pop(queue_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1422,12 +1587,68 @@ class ConnectionManager:
             del backend_type
             del settings
             raise input_error
+        descriptor = get_descriptor(normalized_backend_type)
+        deferred_ack_plugin = False
+        plugin_supports_concurrent_ack = False
+        plugin_class_load_failed = False
+        ack_contract_failed = False
+        if descriptor.backend_type not in _BUNDLED_BACKEND_TYPES:
+            backend_cls: object | None = None
+            try:
+                backend_cls = _load_descriptor_object(
+                    descriptor,
+                    descriptor.backend_cls_path,
+                )
+            except Exception:  # noqa: BLE001 - plugin loader details stay private
+                plugin_class_load_failed = True
+            if not plugin_class_load_failed:
+                try:
+                    deferred_ack_plugin = _validate_plugin_ack_class(
+                        descriptor,
+                        backend_cls,
+                    )
+                    plugin_supports_concurrent_ack = (
+                        deferred_ack_plugin
+                        and getattr_static(
+                            backend_cls,
+                            "supports_concurrent_ack",
+                            False,
+                        )
+                        is True
+                    )
+                except Exception:  # noqa: BLE001 - static plugin metadata is untrusted
+                    ack_contract_failed = True
+        if plugin_class_load_failed or ack_contract_failed:
+            invalid_plugin_class = plugin_class_load_failed
+            del backend_type
+            del settings
+            del normalized_backend_type
+            del descriptor
+            del backend_cls
+            del deferred_ack_plugin
+            del plugin_supports_concurrent_ack
+            del plugin_class_load_failed
+            del ack_contract_failed
+            if invalid_plugin_class:
+                del invalid_plugin_class
+                raise ConfigurationError(
+                    "Selected backend has an invalid plugin class path.",
+                    setting_name="SCRAPY_BACKEND_TYPE",
+                )
+            del invalid_plugin_class
+            raise _invalid_plugin_ack_contract()
         self.backend_type = (
             backend_type
             if isinstance(backend_type, BackendType)
             else normalized_backend_type
         )
         self.settings = settings if settings is not None else {}
+        self._deferred_ack_plugin = deferred_ack_plugin
+        self._plugin_supports_concurrent_ack = plugin_supports_concurrent_ack
+        self._plugin_queue_backend_source: (
+            tuple[Backend, CircuitBreaker | None] | None
+        ) = None
+        self._plugin_queue_backend: _DeferredAckPluginQueueBackend | None = None
         # ``get_manager()`` fills these fields when it inserts the instance into
         # the shared registry. Pooled managers use the acquire-time values for
         # every operation and for eventual eviction, so mutations of the public
@@ -2802,11 +3023,33 @@ class ConnectionManager:
         if not isinstance(backend, QueueBackend):
             msg = f"Backend {backend.__class__.__name__} does not support queue operations"
             raise NotImplementedError(msg)
+        published_backend: QueueBackend
         if breaker is None:
-            return backend
-        from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
+            published_backend = backend
+        else:
+            from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
 
-        return wrap_queue_backend(backend, breaker)
+            published_backend = wrap_queue_backend(backend, breaker)
+        if not self._deferred_ack_plugin:
+            return published_backend
+
+        source = (backend, breaker)
+        with self._lock:
+            cached_source = self._plugin_queue_backend_source
+            if (
+                cached_source is not None
+                and cached_source[0] is backend
+                and cached_source[1] is breaker
+            ):
+                assert self._plugin_queue_backend is not None
+                return self._plugin_queue_backend
+            contract_backend = _DeferredAckPluginQueueBackend(
+                published_backend,
+                supports_concurrent_ack=self._plugin_supports_concurrent_ack,
+            )
+            self._plugin_queue_backend_source = source
+            self._plugin_queue_backend = contract_backend
+            return contract_backend
 
     @_durable_push_queue_error_boundary
     @_manager_terminal_error_boundary()

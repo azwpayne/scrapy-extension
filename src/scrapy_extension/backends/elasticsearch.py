@@ -425,6 +425,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """ElasticSearch backend: Queue (sorted docs), Set (unique _id), Storage (key-value with TTL)."""
 
     _push_is_durable = True
+    requires_ack = False
+    supports_concurrent_ack = True
 
     def __init__(self, config: ElasticSearchSettings) -> None:
         """Initialize ElasticSearch backend.

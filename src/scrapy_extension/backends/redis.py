@@ -346,6 +346,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """
 
     _push_is_durable = True
+    requires_ack = False
+    supports_concurrent_ack = True
 
     def __init__(self, config: RedisSettings) -> None:
         """Initialize Redis backend.

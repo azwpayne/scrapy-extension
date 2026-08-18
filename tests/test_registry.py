@@ -675,15 +675,12 @@ class TestDescriptorBoundary:
             "_wait_for_retry_backoff",
             lambda _event, delay: sleep_calls.append(delay),
         )
-        manager = connectors.ConnectionManager(
-            "runtime_contract", {"retry_attempts": 3, "retry_delay": 1}
-        )
-
         with pytest.raises(ConfigurationError) as exc_info:
-            manager.connect()
+            connectors.ConnectionManager(
+                "runtime_contract", {"retry_attempts": 3, "retry_delay": 1}
+            )
 
         _assert_redacted_error(exc_info.value, marker)
-        assert manager._backend is None
         assert sleep_calls == []
 
     def test_plugin_settings_loader_failure_during_adaptation_is_static(

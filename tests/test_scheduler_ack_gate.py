@@ -257,11 +257,11 @@ class TestAckCapabilityDefaults:
 
         assert QueueBackend.requires_ack is False
 
-    def test_queue_backend_defaults_support_concurrent_ack(self) -> None:
-        """QueueBackend.supports_concurrent_ack default is True."""
+    def test_queue_backend_defaults_do_not_claim_concurrent_ack(self) -> None:
+        """Third-party QueueBackend subclasses must opt into concurrency safety."""
         from scrapy_extension.backends.base import QueueBackend
 
-        assert QueueBackend.supports_concurrent_ack is True
+        assert QueueBackend.supports_concurrent_ack is False
 
 
 class TestAckCapabilityDeclarations:

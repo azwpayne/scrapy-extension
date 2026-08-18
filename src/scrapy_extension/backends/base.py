@@ -631,16 +631,17 @@ class QueueBackend(ABC):
       gate is unreachable for the 10 bundled backends — it remains a defensive
       backstop for a hypothetical single-slot 3rd-party backend.)
 
-    Defaults (``requires_ack=False``, ``supports_concurrent_ack=True``) keep
-    atomic-pop backends untouched and are the safe baseline for any new
-    QueueBackend that does not override them.
+    Defaults are conservative for third-party implementations:
+    ``requires_ack=False`` preserves legacy atomic-pop compatibility, while
+    ``supports_concurrent_ack=False`` grants no concurrency claim unless a
+    backend declares and implements the deferred-ack contract explicitly.
     """
 
     requires_ack: bool = False
     """True if pop yields a message needing explicit :meth:`ack` (MQ backends)."""
 
-    supports_concurrent_ack: bool = True
-    """True if ack is correct under ``CONCURRENT_REQUESTS > 1`` (real in-flight set)."""
+    supports_concurrent_ack: bool = False
+    """True only when explicitly declared safe for overlapping deliveries."""
 
     _push_is_durable: ClassVar[bool] = False
     """Whether this backend invariably crosses a worker-crash durable boundary."""

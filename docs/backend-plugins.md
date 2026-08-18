@@ -125,6 +125,47 @@ class paths, and unsupported capabilities follow the same path. The bundled 10
 backends are unaffected — one broken 3rd-party plugin never breaks the registry,
 even in applications that treat Python warnings as errors.
 
+### Deferred acknowledgement migration (fail closed)
+
+`QueueBackend` now defaults to `requires_ack=False` and
+`supports_concurrent_ack=False`. The first default explicitly preserves legacy
+plugins whose `pop()` removes a message atomically. The second grants no
+accidental concurrency claim.
+
+A queue plugin whose broker requires deferred acknowledgement must declare
+literal booleans and implement all three methods itself:
+
+```python
+class BrokerBackend(Backend, QueueBackend):
+    requires_ack = True
+    supports_concurrent_ack = True  # only for independently tracked deliveries
+
+    def pop_with_ack(self, queue_name, timeout=0.0): ...
+    def ack(self, queue_name, *, token=None): ...
+    def nack(self, queue_name, *, token=None): ...
+```
+
+Every non-empty delivery must return a non-`None`, non-empty opaque token.
+Tokens remain active until successful `ack`/`nack`, must not be reused for an
+overlapping delivery on the same physical queue, and cannot be settled against
+a different queue. The manager validates metadata and overrides at construction,
+before a plugin constructor, `connect()`, or broker operation runs; runtime token
+violations fail closed as `QueueError` and leave the delivery unacknowledged.
+
+Migration choices are explicit—there is no silent downgrade:
+
+- atomic-pop plugins keep or declare `requires_ack=False`;
+- deferred-ACK plugins implement the token contract and set
+  `supports_concurrent_ack=True` only after supporting overlapping deliveries;
+- a correct single-in-flight implementation may declare
+  `supports_concurrent_ack=False` and pin `CONCURRENT_REQUESTS=1` during
+  migration. `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` remains an explicit
+  emergency escape for the known unsafe mode, not an automatic fallback.
+
+Never set `requires_ack=False` merely to bypass validation when the broker still
+holds a delivery pending acknowledgement; that changes delivery semantics and
+can strand or replay work.
+
 ## A Worked Example: `mybackend`
 
 This is a minimal but complete plugin exposing all three capabilities
