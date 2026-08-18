@@ -66,6 +66,13 @@ def _make_settings(
     return settings
 
 
+def _lease(mocker, manager):
+    lease = mocker.Mock(name="connection-manager-lease")
+    lease.manager = manager
+    lease.release.side_effect = manager.close
+    return lease
+
+
 class TestAckCapabilityGate:
     """A3: scheduler.from_settings gates single-slot-ack backends under concurrency."""
 
@@ -96,7 +103,9 @@ class TestAckCapabilityGate:
         """SQS has a real in-flight set (round-3) -> concurrency-safe, no raise."""
         settings = _make_settings("sqs", concurrent=16)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -110,7 +119,9 @@ class TestAckCapabilityGate:
         from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
 
         get_manager = mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         BackendScheduler.from_settings(
@@ -131,7 +142,9 @@ class TestAckCapabilityGate:
         from scrapy_extension.backends.connectors import _CONNECTION_MANAGER_SCOPE_KEY
 
         get_manager = mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         BackendScheduler.from_settings(
@@ -157,7 +170,9 @@ class TestAckCapabilityGate:
         )
         settings = _make_settings("sqs", concurrent=16)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         with pytest.raises(ConfigurationError) as excinfo:
@@ -177,7 +192,9 @@ class TestAckCapabilityGate:
         )
         settings = _make_settings("sqs", concurrent=16, opt_out=True)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -187,7 +204,9 @@ class TestAckCapabilityGate:
         """Pulsar has a real in-flight set (round-3) -> concurrency-safe, no raise."""
         settings = _make_settings("pulsar", concurrent=4)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -197,7 +216,9 @@ class TestAckCapabilityGate:
         """Kafka has a real in-flight set -> concurrency-safe, no raise."""
         settings = _make_settings("kafka", concurrent=16)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -207,7 +228,9 @@ class TestAckCapabilityGate:
         """RabbitMQ has a real in-flight set -> concurrency-safe, no raise."""
         settings = _make_settings("rabbitmq", concurrent=8)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -217,7 +240,9 @@ class TestAckCapabilityGate:
         """Redis (atomic pop, requires_ack=False) -> concurrency-safe, no raise."""
         settings = _make_settings("redis", concurrent=32)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -227,7 +252,9 @@ class TestAckCapabilityGate:
         """Any queue backend + CONCURRENT_REQUESTS=1 -> no gate applies."""
         settings = _make_settings("sqs", concurrent=1)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -237,7 +264,9 @@ class TestAckCapabilityGate:
         """Single-slot ack is correct when CONCURRENT_REQUESTS=1."""
         settings = _make_settings("sqs", concurrent=1)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -265,7 +294,9 @@ class TestAckCapabilityGate:
         )
         settings = _make_settings("sqs", concurrent=1)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -458,7 +489,9 @@ class TestStrategyMqAckBypassWarning:
         import logging
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _strategy_settings("kafka", "delay")
         caplog.clear()
@@ -477,7 +510,9 @@ class TestStrategyMqAckBypassWarning:
         import logging
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _strategy_settings("kafka", "passthrough")
         caplog.clear()
@@ -496,7 +531,9 @@ class TestStrategyMqAckBypassWarning:
         import logging
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _strategy_settings("redis", "delay")
         caplog.clear()
@@ -523,7 +560,9 @@ class TestStrategyMqAckBypassWarning:
     ) -> None:
         """Token threading is insufficient when one consumer switches topics."""
         manager = mocker.Mock(backend_type=backend)
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+        mocker.patch.object(
+            ConnectionManager, "acquire_lease", return_value=_lease(mocker, manager)
+        )
         settings = _strategy_settings(backend, strategy)
 
         with pytest.raises(ConfigurationError, match="passthrough") as exc_info:
@@ -539,7 +578,9 @@ class TestStrategyMqAckBypassWarning:
         import logging
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _strategy_settings("kafka", "time_wheel")
         caplog.clear()
@@ -570,7 +611,9 @@ class TestStrategyMqAckBypassWarning:
         import logging
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _strategy_settings(backend, strategy)
         caplog.clear()

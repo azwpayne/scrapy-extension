@@ -1986,6 +1986,9 @@ class ConnectionManager:
         # and publishing ``_retired`` happen atomically under ``_registry_lock``;
         # a retry with an already-absent token still completes this teardown.
         self._retirement_complete = False
+        self._retirement_finalizing = False
+        self._retirement_finalizer_thread_id: int | None = None
+        self._retirement_finalization_event = threading.Event()
         self._retiring_backend: Backend | None = None
         self._retirement_disconnect_started = False
         self._retiring_adapter: _DeferredAckPluginQueueBackend | None = None
@@ -3068,9 +3071,7 @@ class ConnectionManager:
             return
 
         with cls._registry_lock:
-            legacy_token = (
-                self._legacy_acquires.pop(0) if self._legacy_acquires else None
-            )
+            legacy_token = self._legacy_acquires[0] if self._legacy_acquires else None
         if legacy_token is not None:
             self._release_acquire(legacy_token)
         elif self._retired:
@@ -3111,24 +3112,40 @@ class ConnectionManager:
     def _finalize_retirement(self) -> None:
         """Complete one manager retirement without replaying opaque teardown."""
         backend_to_disconnect: Backend | None = None
+        wait_for_finalizer: threading.Event | None = None
+        thread_id = threading.get_ident()
         with self._lock:
             self._retired = True
             self._retirement_event.set()
             if self._retirement_complete:
                 return
-            if self._retiring_backend is None and self._backend is not None:
-                self._retiring_backend = self._backend
-                self._backend = None
-            if self._retiring_adapter is None:
-                (
-                    self._retiring_adapter,
-                    self._retiring_adapter_source,
-                ) = self._detach_plugin_queue_backend_under_lock()
-            if not self._retirement_disconnect_started:
-                self._retirement_disconnect_started = True
-                backend_to_disconnect = self._retiring_backend
-            if self._breaker is not None:
-                self._breaker.reset()
+            if self._retirement_finalizing:
+                if self._retirement_finalizer_thread_id == thread_id:
+                    # Opaque teardown re-entry observes retirement in progress; the
+                    # outer owner will publish completion before returning.
+                    return
+                wait_for_finalizer = self._retirement_finalization_event
+            else:
+                self._retirement_finalizing = True
+                self._retirement_finalizer_thread_id = thread_id
+            if wait_for_finalizer is None:
+                if self._retiring_backend is None and self._backend is not None:
+                    self._retiring_backend = self._backend
+                    self._backend = None
+                if self._retiring_adapter is None:
+                    (
+                        self._retiring_adapter,
+                        self._retiring_adapter_source,
+                    ) = self._detach_plugin_queue_backend_under_lock()
+                if not self._retirement_disconnect_started:
+                    self._retirement_disconnect_started = True
+                    backend_to_disconnect = self._retiring_backend
+                if self._breaker is not None:
+                    self._breaker.reset()
+
+        if wait_for_finalizer is not None:
+            wait_for_finalizer.wait()
+            return
 
         disconnect_failed = False
         control_error: BaseException | None = None
@@ -3144,6 +3161,9 @@ class ConnectionManager:
 
         with self._lock:
             self._retirement_complete = True
+            self._retirement_finalizing = False
+            self._retirement_finalizer_thread_id = None
+            self._retirement_finalization_event.set()
             self._retiring_backend = None
             retired_adapter = self._retiring_adapter
             retired_source = self._retiring_adapter_source

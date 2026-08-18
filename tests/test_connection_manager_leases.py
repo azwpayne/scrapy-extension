@@ -95,6 +95,44 @@ def test_release_retry_repairs_interruption_around_retirement(
     backend.disconnect.assert_called_once_with()
 
 
+def test_duplicate_concurrent_release_waits_for_retirement_completion() -> None:
+    lease = ConnectionManager.acquire_lease(
+        BackendType.REDIS, {"host": "concurrent-release"}
+    )
+    manager = lease.manager
+    disconnect_entered = threading.Event()
+    allow_disconnect = threading.Event()
+    backend = Mock()
+
+    def disconnect() -> None:
+        disconnect_entered.set()
+        assert allow_disconnect.wait(timeout=3)
+
+    backend.disconnect.side_effect = disconnect
+    manager._backend = backend
+    completed: list[str] = []
+
+    first = threading.Thread(
+        target=lambda: (lease.release(), completed.append("first"))
+    )
+    second = threading.Thread(
+        target=lambda: (lease.release(), completed.append("second"))
+    )
+    first.start()
+    assert disconnect_entered.wait(timeout=3)
+    second.start()
+    second.join(timeout=0.05)
+    assert second.is_alive()
+
+    allow_disconnect.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert sorted(completed) == ["first", "second"]
+    assert manager._retirement_complete is True
+    backend.disconnect.assert_called_once_with()
+
+
 def test_single_flight_lease_callers_receive_unique_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

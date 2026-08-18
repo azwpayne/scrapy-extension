@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import sys
-from unittest.mock import ANY
 
 import pytest
 from scrapy import Field, Item
@@ -540,14 +539,11 @@ class TestBackendScheduler:
 
         assert signals.connect.call_count == 2
         assert signals.disconnect.call_count == 2
-        signals.disconnect.assert_any_call(
-            scheduler._on_response_received,
-            signal=ANY,
-        )
-        signals.disconnect.assert_any_call(
-            scheduler._on_spider_error,
-            signal=ANY,
-        )
+        disconnected = [
+            call.args[0].handler for call in signals.disconnect.call_args_list
+        ]
+        assert scheduler._on_response_received in disconnected
+        assert scheduler._on_spider_error in disconnected
 
     def test_open_uses_configured_queue_key(self, mock_connection_manager, mocker):
         """Test open creates BackendQueue with the configured queue_key."""
@@ -624,9 +620,10 @@ class TestBackendScheduler:
         mock_spider.crawler = mocker.MagicMock()
         scheduler.open(mock_spider)
 
-        mock_spider.crawler.signals.connect.assert_any_call(
-            scheduler._on_response_received,
-            signal=signals.response_received,
+        assert any(
+            call.args[0].handler == scheduler._on_response_received
+            and call.kwargs["signal"] is signals.response_received
+            for call in mock_spider.crawler.signals.connect.call_args_list
         )
 
     def test_open_wires_spider_error_to_nack(self, mock_connection_manager, mocker):
@@ -643,9 +640,10 @@ class TestBackendScheduler:
         mock_spider.crawler = mocker.MagicMock()
         scheduler.open(mock_spider)
 
-        mock_spider.crawler.signals.connect.assert_any_call(
-            scheduler._on_spider_error,
-            signal=signals.spider_error,
+        assert any(
+            call.args[0].handler == scheduler._on_spider_error
+            and call.kwargs["signal"] is signals.spider_error
+            for call in mock_spider.crawler.signals.connect.call_args_list
         )
 
     def test_signal_handlers_call_queue_ack_nack(self, mock_connection_manager, mocker):

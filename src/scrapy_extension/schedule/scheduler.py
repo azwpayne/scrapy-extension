@@ -28,6 +28,7 @@ from scrapy_extension.backends.connectors import (
     _CONNECTION_MANAGER_SCOPE_KEY,
     _CONSUMER_SCOPED_BACKENDS,
     ConnectionManager,
+    ConnectionManagerLease,
     resolve_backend_config,
 )
 from scrapy_extension.backends.registry import has_capability
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 _LIFECYCLE_NEW = "new"
 _LIFECYCLE_OPEN = "open"
+_LIFECYCLE_CLOSING = "closing"
 _LIFECYCLE_CLOSED = "closed"
 _MISSING_STATIC_ATTRIBUTE = object()
 _EnqueueDiagnostic = tuple[str, str, str | None]
@@ -79,8 +81,15 @@ class _SignalReceiver:
     def __init__(self, handler: Callable[..., Any]) -> None:
         self.handler = handler
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self.handler(*args, **kwargs)
+
+class _ResponseSignalReceiver(_SignalReceiver):
+    def __call__(self, response: Any, request: Any, spider: Any) -> Any:
+        return self.handler(response, request, spider)
+
+
+class _SpiderErrorSignalReceiver(_SignalReceiver):
+    def __call__(self, failure: Any, response: Any, spider: Any) -> Any:
+        return self.handler(failure, response, spider)
 
 
 @dataclass(frozen=True, slots=True)
@@ -946,6 +955,8 @@ class BackendScheduler:
         snapshot_connection_manager: ConnectionManager | None = None,
         owns_snapshot_connection_manager: bool = False,
         owns_connection_manager: bool = True,
+        connection_manager_lease: ConnectionManagerLease | None = None,
+        snapshot_connection_manager_lease: ConnectionManagerLease | None = None,
     ) -> None:
         """Initialize the scheduler.
 
@@ -1015,6 +1026,7 @@ class BackendScheduler:
         self._signal_leases: list[_SignalLease] = []
         self._manager_released: bool = False
         self._owns_connection_manager = owns_connection_manager
+        self._connection_manager_lease = connection_manager_lease
         # Backpressure gate config (round-4 BP-2). resume_at defaults to pause_at
         # (single-threshold) when unset — computed once here, not per-call.
         self._pause_at = backpressure_pause_at
@@ -1044,7 +1056,11 @@ class BackendScheduler:
         self._queue_snapshot_chunk_bytes = queue_snapshot_chunk_bytes
         self._snapshot_connection_manager = snapshot_connection_manager
         self._owns_snapshot_connection_manager = owns_snapshot_connection_manager
+        self._snapshot_connection_manager_lease = snapshot_connection_manager_lease
         self._snapshot_manager_released = False
+        self._queue_terminal = False
+        self._terminal_queue_error: BaseException | None = None
+        self._dupefilter_release_owner = object()
         # A scheduler owns one ConnectionManager acquire and is therefore a
         # single-lifecycle object. Serializing open/close prevents concurrent
         # callers from replacing a live queue or releasing its manager midway
@@ -1131,11 +1147,13 @@ class BackendScheduler:
                 **backend_settings,
                 _CONNECTION_MANAGER_SCOPE_KEY: scope,
             }
-        manager = ConnectionManager.get_manager(
+        manager_lease = ConnectionManager.acquire_lease(
             backend_type=backend_type,
             settings=backend_settings,
         )
+        manager = manager_lease.manager
         snapshot_connection_manager: ConnectionManager | None = None
+        snapshot_manager_lease: ConnectionManagerLease | None = None
         try:
             # Ack-concurrency gate (round-2 C1 fix). Inspect the backend CLASS —
             # no instantiation/connection needed. NOTE (2026-07-10): every bundled
@@ -1237,10 +1255,11 @@ class BackendScheduler:
                     # configured. Preserve its best-effort no-snapshot behavior;
                     # an explicit invalid storage override remains fail-fast.
                 else:
-                    snapshot_connection_manager = ConnectionManager.get_manager(
+                    snapshot_manager_lease = ConnectionManager.acquire_lease(
                         backend_type=snapshot_backend_type,
                         settings=snapshot_backend_settings,
                     )
+                    snapshot_connection_manager = snapshot_manager_lease.manager
             queue_config = queue_config.with_runtime_settings(settings)
             assert queue_config.queue_key is not None
             assert queue_config.queue_depth_sample_every is not None
@@ -1268,11 +1287,13 @@ class BackendScheduler:
                 owns_snapshot_connection_manager=(
                     snapshot_connection_manager is not None
                 ),
+                connection_manager_lease=manager_lease,
+                snapshot_connection_manager_lease=snapshot_manager_lease,
             )
         except BaseException:
-            if snapshot_connection_manager is not None:
+            if snapshot_manager_lease is not None:
                 try:
-                    snapshot_connection_manager.close()
+                    snapshot_manager_lease.release()
                 except BaseException:
                     try:
                         logger.exception(
@@ -1282,7 +1303,7 @@ class BackendScheduler:
                     except BaseException:
                         pass
             try:
-                manager.close()
+                manager_lease.release()
             except BaseException:
                 try:
                     logger.exception(
@@ -1538,6 +1559,8 @@ class BackendScheduler:
         with self._lifecycle_lock:
             if self._lifecycle_state == _LIFECYCLE_CLOSED:
                 raise RuntimeError("Scheduler is closed and cannot be reopened")
+            if self._lifecycle_state == _LIFECYCLE_CLOSING:
+                raise RuntimeError("Scheduler is closing and cannot be reopened")
             if self._lifecycle_state == _LIFECYCLE_OPEN:
                 if self._spider is spider:
                     return None
@@ -1660,7 +1683,11 @@ class BackendScheduler:
         for handler, signal in signal_handlers:
             # Publish one unique receiver before connect(). A manager that registers
             # and then raises is still repaired by keyed disconnect during close.
-            receiver = _SignalReceiver(handler)
+            receiver = (
+                _ResponseSignalReceiver(handler)
+                if signal is signals.response_received
+                else _SpiderErrorSignalReceiver(handler)
+            )
             lease = _SignalLease(sig, signal, receiver)
             self._signal_leases.append(lease)
             self._sync_signal_compatibility_views()
@@ -1822,182 +1849,111 @@ class BackendScheduler:
             self._close_locked(reason, lossy=True)
 
     def _close_locked(self, reason: str, *, lossy: bool = False) -> None:
-        """Release one scheduler lifecycle while ``_lifecycle_lock`` is held."""
+        """Advance one retryable ``CLOSING`` teardown state-machine pass."""
         if self._lifecycle_state == _LIFECYCLE_CLOSED:
-            return None
+            return
+        self._lifecycle_state = _LIFECYCLE_CLOSING
 
-        # A terminal queue close is the teardown commit gate. Until the queue
-        # publishes terminal completion, retain it, signals, dupefilter, and both
-        # manager acquires so a later close call can resume the same close attempt.
-        queue_teardown_error: BaseException | None = None
-        if self._queue is not None:
+        if not self._queue_terminal:
             queue_failure: BaseException | None = None
-            try:
-                if lossy:
-                    self._queue.close(lossy=True)
-                else:
-                    self._queue.close()
-            except BaseException as exc:
-                queue_failure = exc
+            queue = self._queue
+            if queue is not None:
+                try:
+                    queue.close(lossy=True) if lossy else queue.close()
+                except BaseException as exc:
+                    queue_failure = exc
             if queue_failure is not None:
                 if lossy:
-                    # An explicit abort is terminal even if begin_close() or
-                    # strategy.close() fails before BackendQueue can publish its
-                    # completion gate. Teardown must still release every acquire.
-                    queue_close_incomplete = False
-                elif isinstance(self._queue, BackendQueue):
-                    # A committed checkpoint is not terminal by itself: process
-                    # control can interrupt before destructive cleanup is marked
-                    # started. Retain every incomplete real queue so a later close
-                    # or explicit abort can finish cleanup exactly once. Once
-                    # BackendQueue publishes terminal completion, cleanup failures
-                    # follow the scheduler's ordinary terminal teardown policy.
-                    queue_close_incomplete = not self._queue._close_complete
+                    queue_incomplete = False
+                elif isinstance(queue, BackendQueue):
+                    queue_incomplete = not queue._close_complete
                 else:
-                    # Third-party queue implementations predate the explicit
-                    # completion gate. Preserve their historical QueueError retry
-                    # signal because no stronger completion state is available.
-                    queue_close_incomplete = isinstance(queue_failure, QueueError)
-                if queue_close_incomplete:
+                    queue_incomplete = isinstance(queue_failure, QueueError)
+                if queue_incomplete:
+                    raise queue_failure
+                if not isinstance(queue_failure, Exception):
+                    self._terminal_queue_error = queue_failure
+                else:
                     try:
-                        logger.error(
-                            "Queue close incomplete; scheduler close can be retried"
-                        )
+                        logger.error("Failed to close queue strategy during shutdown")
                     except BaseException:
                         pass
-                    raise queue_failure
-                queue_teardown_error = queue_failure
+            self._queue_terminal = True
+
+        # Every following handle remains authoritative until its provider confirms
+        # release. A failing pass leaves CLOSING and a later call resumes here.
+        if self._signal_leases:
+            self._disconnect_signal_leases()
+        elif self._connected_signals is not None:
+            # Compatibility-only state predating per-registration leases. Its
+            # opaque signal manager cannot provide the stronger retry guarantee.
+            handlers = self._connected_ack_signal_handlers or [
+                (self._on_response_received, signals.response_received),
+                (self._on_spider_error, signals.spider_error),
+            ]
+            for handler, signal in handlers:
                 try:
-                    logger.error("Failed to close queue strategy during shutdown")
-                except BaseException:
+                    self._connected_signals.disconnect(handler, signal=signal)
+                except Exception:
                     pass
+            self._connected_signals = None
+            self._connected_ack_signal_handlers = None
+            self._signals_connected = False
+
+        if (
+            self._owns_dupefilter
+            and self.dupefilter is not None
+            and not self._dupefilter_released
+        ):
+            from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+
+            if type(self.dupefilter) is BackendDupeFilter:
+                self.dupefilter.release(self._dupefilter_release_owner, reason)
+            else:
+                # Preserve subclass close hooks; BackendDupeFilter.close itself
+                # retries through one stable internal owner token.
+                self.dupefilter.close(reason)
+            self._dupefilter_released = True
+            self._dupefilter_open = False
+
+        if (
+            self._owns_snapshot_connection_manager
+            and self._snapshot_connection_manager is not None
+            and not self._snapshot_manager_released
+        ):
+            if self._snapshot_connection_manager_lease is not None:
+                self._snapshot_connection_manager_lease.release()
+            else:
+                self._snapshot_connection_manager.close()
+            self._snapshot_manager_released = True
+
+        if self._owns_connection_manager and not self._manager_released:
+            if self._connection_manager_lease is not None:
+                self._connection_manager_lease.release()
+            else:
+                self.connection_manager.close()
+            self._manager_released = True
+
+        # No ownership handle remains. Clear compatibility references before the
+        # final lifecycle publication; interruption here is repairable because all
+        # provider operations above are already terminal/idempotent.
+        self._queue = None
+        self._spider = None
+        self._connected_signals = None
+        self._connected_ack_signal_handlers = None
+        self._signals_connected = False
+        self._backpressure_paused = False
+        self._backpressure_probe_due = False
         self._lifecycle_state = _LIFECYCLE_CLOSED
-
-        # Shutdown diagnostics must never gain ownership of teardown. A custom
-        # logging handler can raise ``BaseException`` (for example when its output
-        # stream is interrupted); swallowing that diagnostic failure keeps the
-        # actual resource-close error, if any, as the observable outcome.
-        def _log_shutdown_exception(message: str) -> None:
-            try:
-                logger.error(message)
-            except BaseException:
-                pass  # noqa: BLE001 — diagnostics must not abort teardown
-
         try:
             logger.info("Scheduler closed: %s", reason)
         except BaseException:
-            pass  # noqa: BLE001 — diagnostics must not abort teardown
-        # R26-G: teardown must be BaseException-safe. The three teardown steps
-        # below (signal disconnect, queue.close, dupefilter.close) only catch
-        # ``Exception``; a ``BaseException`` (Ctrl+C / SystemExit) escaping any of
-        # them would otherwise skip ``connection_manager.close()`` and pin the
-        # shared manager (its ``_users`` never decrements → socket/fd leak,
-        # registry pin toward ``MAX_MANAGERS``). Capture the first BaseException
-        # into ``primary_error``, run the manager release in a ``finally``, and
-        # re-raise ``primary_error`` last. Mirrors pipeline._close_locked (R20-B).
-        primary_error: BaseException | None = (
-            queue_teardown_error
-            if queue_teardown_error is not None
-            and not isinstance(queue_teardown_error, Exception)
-            else None
-        )
-        try:
-            if self._signal_leases:
-                try:
-                    self._disconnect_signal_leases()
-                except BaseException as exc:
-                    if primary_error is None:
-                        primary_error = exc
-            elif self._connected_signals is not None:
-                # Compatibility cleanup for manually constructed legacy state.
-                signal_handlers = self._connected_ack_signal_handlers or [
-                    (self._on_response_received, signals.response_received),
-                    (self._on_spider_error, signals.spider_error),
-                ]
-                for handler, signal in signal_handlers:
-                    try:
-                        self._connected_signals.disconnect(handler, signal=signal)
-                    except Exception:
-                        _log_shutdown_exception(
-                            "Failed to disconnect signal during shutdown"
-                        )
-                    except BaseException as exc:
-                        if primary_error is None:
-                            primary_error = exc
-            if (
-                self._owns_dupefilter
-                and self.dupefilter is not None
-                and not self._dupefilter_released
-            ):
-                self._dupefilter_released = True
-                dupefilter_close_failed = False
-                try:
-                    self.dupefilter.close(reason)
-                except Exception:
-                    dupefilter_close_failed = True
-                except BaseException as exc:
-                    if primary_error is None:
-                        primary_error = exc
-                finally:
-                    self._dupefilter_open = False
-                if dupefilter_close_failed:
-                    _log_shutdown_exception(
-                        "Failed to close dupefilter during shutdown"
-                    )
-        finally:
-            # R35-F7: state-reset tail moved here so it runs even if BaseException
-            # aborts teardown mid-try. Idempotent: assigning None / False on
-            # already-None is a no-op; a re-entrant close() short-circuits at the
-            # lifecycle_state guard before reaching here, so no double-reset risk.
-            self._queue = None
-            self._spider = None
-            if not self._signal_leases:
-                self._connected_signals = None
-                self._connected_ack_signal_handlers = None
-                self._signals_connected = False
-            self._backpressure_paused = False
-            self._backpressure_probe_due = False
-            if (
-                self._owns_snapshot_connection_manager
-                and self._snapshot_connection_manager is not None
-                and not self._snapshot_manager_released
-            ):
-                # The queue owns snapshot I/O but not this acquire. Release it
-                # only after queue.close() has completed its final checkpoint.
-                self._snapshot_manager_released = True
-                snapshot_close_secondary_failure = False
-                try:
-                    self._snapshot_connection_manager.close()
-                except BaseException as exc:  # noqa: BLE001 — release must not mask primary
-                    if primary_error is None:
-                        primary_error = exc
-                    else:
-                        snapshot_close_secondary_failure = True
-                if snapshot_close_secondary_failure:
-                    _log_shutdown_exception(
-                        "Failed to close snapshot connection manager during shutdown"
-                    )
-            if self._owns_connection_manager and not self._manager_released:
-                # ``from_settings`` acquired one shared-manager reference for this
-                # scheduler. Pair it with exactly one release even if Scrapy (or a
-                # caller) delivers duplicate close notifications — and even if a
-                # BaseException aborted teardown above.
-                self._manager_released = True
-                manager_close_secondary_failure = False
-                try:
-                    self.connection_manager.close()
-                except BaseException as exc:  # noqa: BLE001 — release must not mask primary
-                    if primary_error is None:
-                        primary_error = exc
-                    else:
-                        manager_close_secondary_failure = True
-                if manager_close_secondary_failure:
-                    _log_shutdown_exception(
-                        "Failed to close connection manager during shutdown"
-                    )
-        if primary_error is not None:
-            raise primary_error
-        return None
+            pass
+
+        terminal_error = self._terminal_queue_error
+        self._terminal_queue_error = None
+        if terminal_error is not None:
+            raise terminal_error
 
     def enqueue_request(self, request: Request) -> bool:
         """Enqueue a request.

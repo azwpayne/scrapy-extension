@@ -731,7 +731,7 @@ def test_scheduler_legacy_dupefilter_cleanup_covers_all_failure_classes() -> Non
     assert stats.counts["scheduler/dupefilter_rollback_error"] >= 4
 
 
-def test_scheduler_close_isolates_owned_dupefilter_failure() -> None:
+def test_scheduler_close_retains_owned_dupefilter_failure_for_retry() -> None:
     manager = MagicMock(name="ConnectionManager")
     dupefilter = MagicMock(name="DupeFilter")
     dupefilter.close.side_effect = RuntimeError("close failed")
@@ -739,9 +739,15 @@ def test_scheduler_close_isolates_owned_dupefilter_failure() -> None:
     scheduler._owns_dupefilter = True
     scheduler._queue = MagicMock(name="Queue")
 
-    scheduler.close("done")
+    with pytest.raises(RuntimeError, match="close failed"):
+        scheduler.close("done")
 
     dupefilter.close.assert_called_once_with("done")
+    manager.close.assert_not_called()
+    assert scheduler._lifecycle_state == "closing"
+
+    dupefilter.close.side_effect = None
+    scheduler.close("retry")
     manager.close.assert_called_once_with()
 
 
@@ -972,10 +978,12 @@ def test_dupefilter_factory_rejects_non_string_key_after_manager_acquisition(
     monkeypatch,
 ) -> None:
     manager = MagicMock(name="ConnectionManager")
+    lease = MagicMock(name="ConnectionManagerLease", manager=manager)
+    lease.release.side_effect = manager.close
     monkeypatch.setattr(
         connectors_module.ConnectionManager,
-        "get_manager",
-        MagicMock(return_value=manager),
+        "acquire_lease",
+        MagicMock(return_value=lease),
     )
 
     with pytest.raises(ConfigurationError, match="must be a string"):
@@ -1013,10 +1021,12 @@ def test_scheduler_factory_rejects_invalid_key_and_worker_inputs(
     manager_created: bool,
 ) -> None:
     manager = MagicMock(name="ConnectionManager")
+    lease = MagicMock(name="ConnectionManagerLease", manager=manager)
+    lease.release.side_effect = manager.close
     monkeypatch.setattr(
         connectors_module.ConnectionManager,
-        "get_manager",
-        MagicMock(return_value=manager),
+        "acquire_lease",
+        MagicMock(return_value=lease),
     )
 
     with pytest.raises(ConfigurationError):

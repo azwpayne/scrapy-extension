@@ -34,8 +34,6 @@ close-race that the code doesn't have.
 
 from __future__ import annotations
 
-from unittest.mock import ANY, call
-
 import pytest
 from scrapy.http import Request
 
@@ -191,9 +189,12 @@ class TestOwnedDupeFilterLifecycle:
         with pytest.raises(RuntimeError, match="second signal registration failed"):
             scheduler.open(spider)
 
-        assert signal_manager.disconnect.call_args_list == [
-            call(scheduler._on_spider_error, signal=ANY),
-            call(scheduler._on_response_received, signal=ANY),
+        disconnected = [
+            item.args[0].handler for item in signal_manager.disconnect.call_args_list
+        ]
+        assert disconnected == [
+            scheduler._on_response_received,
+            scheduler._on_spider_error,
         ]
         dupefilter.open.assert_called_once_with(spider)
         dupefilter.close.assert_called_once_with("open-failed")
@@ -222,12 +223,17 @@ class TestOwnedDupeFilterLifecycle:
         with pytest.raises(RuntimeError) as raised:
             scheduler.open(spider)
 
-        # The registration failure remains primary even though the first
-        # best-effort rollback was interrupted. ``open``'s terminal close retries
-        # the still-owned handler and releases every other resource.
+        # The registration failure remains primary. The interrupted cleanup keeps
+        # its exact receiver leases and downstream ownership for a later retry.
         assert raised.value is registration_error
+        assert signal_manager.disconnect.call_count == 1
+        dupefilter.close.assert_not_called()
+        manager.close.assert_not_called()
+
+        signal_manager.disconnect.side_effect = None
+        scheduler.close("open-failed-retry")
         assert signal_manager.disconnect.call_count == 3
-        dupefilter.close.assert_called_once_with("open-failed")
+        dupefilter.close.assert_called_once_with("open-failed-retry")
         manager.close.assert_called_once_with()
         assert scheduler._queue is None
         assert scheduler._spider is None
@@ -350,14 +356,11 @@ class TestCloseDisconnectsAckSignals:
         scheduler.close("finished")
 
         assert signals_mock.disconnect.call_count == 2
-        signals_mock.disconnect.assert_any_call(
-            scheduler._on_response_received,
-            signal=ANY,
-        )
-        signals_mock.disconnect.assert_any_call(
-            scheduler._on_spider_error,
-            signal=ANY,
-        )
+        disconnected = [
+            item.args[0].handler for item in signals_mock.disconnect.call_args_list
+        ]
+        assert scheduler._on_response_received in disconnected
+        assert scheduler._on_spider_error in disconnected
 
 
 class TestCloseStrategyBeforeConnectionManager:
@@ -659,15 +662,15 @@ class TestSignalDisconnectFailureIsNonFatal:
             "stale tuple (already disconnected)"
         )
 
-        # Must NOT raise — the disconnect explosion is caught + logged inside close().
-        scheduler.close("finished")
+        # A non-absence failure remains owned and prevents terminal publication.
+        with pytest.raises(RuntimeError, match="stale tuple"):
+            scheduler.close("finished")
+        assert call_log == ["strategy_close"]
+        assert scheduler._lifecycle_state == "closing"
 
-        # queue.close() (strategy_close) AND connection_manager.close() (cm_close)
-        # BOTH ran despite the disconnect raising — snapshot persist + connection
-        # teardown were NOT skipped, in the correct order.
-        assert call_log == ["strategy_close", "cm_close"], (
-            f"Expected strategy_close then cm_close despite disconnect raising; got {call_log}"
-        )
+        scheduler._connected_signals.disconnect.side_effect = None
+        scheduler.close("retry")
+        assert call_log == ["strategy_close", "cm_close"]
         # State was STILL reset — no re-entry poison left for a second open().
         assert scheduler._queue is None
         assert scheduler._spider is None
@@ -687,22 +690,22 @@ class TestSignalDisconnectFailureIsNonFatal:
         )
         scheduler.open(spider)
         signals_mock.disconnect.reset_mock()
-        signals_mock.disconnect.side_effect = [
-            RuntimeError("response handler already disconnected"),
-            None,
+        signals_mock.disconnect.side_effect = RuntimeError(
+            "response handler already disconnected"
+        )
+
+        with pytest.raises(RuntimeError, match="response handler"):
+            scheduler.close("finished")
+        assert signals_mock.disconnect.call_count == 1
+
+        signals_mock.disconnect.side_effect = None
+        scheduler.close("retry")
+        assert signals_mock.disconnect.call_count == 3
+        disconnected = [
+            item.args[0].handler for item in signals_mock.disconnect.call_args_list
         ]
-
-        scheduler.close("finished")
-
-        assert signals_mock.disconnect.call_count == 2
-        signals_mock.disconnect.assert_any_call(
-            scheduler._on_response_received,
-            signal=ANY,
-        )
-        signals_mock.disconnect.assert_any_call(
-            scheduler._on_spider_error,
-            signal=ANY,
-        )
+        assert scheduler._on_response_received in disconnected
+        assert scheduler._on_spider_error in disconnected
 
 
 class TestTerminalLifecycle:
@@ -976,6 +979,15 @@ class TestStateResetsAfterBaseExceptionTeardown:
         with pytest.raises(KeyboardInterrupt):
             scheduler.close("test-done")
 
+        mock_connection_manager.close.assert_not_called()
+        assert scheduler._queue is not None
+        assert scheduler._spider is not None
+        assert scheduler._connected_signals is not None
+        assert scheduler._signals_connected is True
+        assert scheduler._lifecycle_state == "closing"
+
+        scheduler._connected_signals.disconnect.side_effect = None
+        scheduler.close("retry")
         mock_connection_manager.close.assert_called_once_with()
         assert scheduler._queue is None
         assert scheduler._spider is None
@@ -1001,9 +1013,16 @@ class TestStateResetsAfterBaseExceptionTeardown:
             scheduler.close("test-done")
 
         assert raised.value is first
-        assert connected_signals.disconnect.call_count == 2
+        assert connected_signals.disconnect.call_count == 1
         queue_close.assert_called_once_with()
-        dupefilter.close.assert_called_once_with("test-done")
+        dupefilter.close.assert_not_called()
+        manager.close.assert_not_called()
+
+        connected_signals.disconnect.side_effect = None
+        scheduler.close("retry")
+        assert connected_signals.disconnect.call_count == 3
+        queue_close.assert_called_once_with()
+        dupefilter.close.assert_called_once_with("retry")
         manager.close.assert_called_once_with()
 
     def test_queue_checkpoint_interrupt_retains_owned_dupefilter(self, mocker):
@@ -1075,6 +1094,13 @@ class TestStateResetsAfterBaseExceptionTeardown:
         with pytest.raises(KeyboardInterrupt):
             scheduler_with_df.close("test-done")
 
+        manager.close.assert_not_called()
+        assert scheduler_with_df._queue is fake_queue
+        assert scheduler_with_df._spider is fake_spider
+        assert scheduler_with_df._lifecycle_state == "closing"
+
+        dupefilter.close.side_effect = None
+        scheduler_with_df.close("retry")
         manager.close.assert_called_once_with()
         assert scheduler_with_df._queue is None
         assert scheduler_with_df._spider is None
@@ -1131,17 +1157,19 @@ class TestCloseDiagnosticsAreNonFatal:
         queue_close = mocker.patch.object(scheduler._queue, "close")
         assert scheduler._connected_signals is not None
         connected_signals = scheduler._connected_signals
-        connected_signals.disconnect.side_effect = [RuntimeError("stale"), None]
-        mocker.patch(
-            "scrapy_extension.schedule.scheduler.logger.error",
-            side_effect=KeyboardInterrupt("interrupted exception logger"),
-        )
+        connected_signals.disconnect.side_effect = RuntimeError("stale")
 
-        scheduler.close("test-done")
-
-        assert connected_signals.disconnect.call_count == 2
+        with pytest.raises(RuntimeError, match="stale"):
+            scheduler.close("test-done")
+        assert connected_signals.disconnect.call_count == 1
         queue_close.assert_called_once_with()
-        dupefilter.close.assert_called_once_with("test-done")
+        dupefilter.close.assert_not_called()
+        manager.close.assert_not_called()
+
+        connected_signals.disconnect.side_effect = None
+        scheduler.close("retry")
+        assert connected_signals.disconnect.call_count == 3
+        dupefilter.close.assert_called_once_with("retry")
         manager.close.assert_called_once_with()
 
     def test_state_resets_when_reentrant_close_after_baseexception(

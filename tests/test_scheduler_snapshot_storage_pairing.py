@@ -18,6 +18,13 @@ from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
+def _lease(mocker, manager):
+    lease = mocker.MagicMock(name=f"{manager._mock_name}-lease")
+    lease.manager = manager
+    lease.release.side_effect = manager.close
+    return lease
+
+
 def _settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "SCRAPY_QUEUE_BACKEND_TYPE": "kafka",
@@ -40,8 +47,8 @@ def test_queue_only_stateful_strategy_acquires_storage_snapshot_manager(
     queue_manager = mocker.MagicMock(name="queue-manager")
     snapshot_manager = mocker.MagicMock(name="snapshot-manager")
     get_manager = mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        side_effect=[queue_manager, snapshot_manager],
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        side_effect=[_lease(mocker, queue_manager), _lease(mocker, snapshot_manager)],
     )
 
     scheduler = BackendScheduler.from_settings(
@@ -68,8 +75,8 @@ def test_passthrough_queue_only_strategy_does_not_acquire_snapshot_manager(
     """A stateless Kafka queue keeps its historical single manager acquire."""
     queue_manager = mocker.MagicMock(name="queue-manager")
     get_manager = mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        return_value=queue_manager,
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        return_value=_lease(mocker, queue_manager),
     )
 
     scheduler = BackendScheduler.from_settings(
@@ -89,8 +96,8 @@ def test_storage_capable_queue_keeps_its_own_snapshot_manager(mocker) -> None:
     """A full Redis queue ignores a separate storage component for checkpoints."""
     queue_manager = mocker.MagicMock(name="queue-manager")
     get_manager = mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        return_value=queue_manager,
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        return_value=_lease(mocker, queue_manager),
     )
 
     scheduler = BackendScheduler.from_settings(
@@ -112,8 +119,8 @@ def test_legacy_queue_only_global_backend_keeps_best_effort_snapshot_skip(
     """No separate storage type preserves the old queue-only startup behavior."""
     queue_manager = mocker.MagicMock(name="queue-manager")
     get_manager = mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        return_value=queue_manager,
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        return_value=_lease(mocker, queue_manager),
     )
 
     scheduler = BackendScheduler.from_settings(
@@ -139,8 +146,8 @@ def test_explicit_storage_backend_without_storage_capability_stays_fail_fast(
     """An explicit invalid storage override is never silently downgraded."""
     queue_manager = mocker.MagicMock(name="queue-manager")
     get_manager = mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        return_value=queue_manager,
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        return_value=_lease(mocker, queue_manager),
     )
 
     with pytest.raises(ConfigurationError, match="does not support the storage"):
@@ -158,8 +165,8 @@ def test_second_manager_acquire_failure_releases_queue_manager(mocker) -> None:
     queue_manager = mocker.MagicMock(name="queue-manager")
     acquire_error = RuntimeError("snapshot acquire failed")
     mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        side_effect=[queue_manager, acquire_error],
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        side_effect=[_lease(mocker, queue_manager), acquire_error],
     )
 
     with pytest.raises(RuntimeError, match="snapshot acquire failed"):
@@ -178,8 +185,8 @@ def test_factory_failure_after_second_acquire_releases_both_managers_in_reverse_
     queue_manager.close.side_effect = lambda: order.append("queue")
     snapshot_manager.close.side_effect = lambda: order.append("snapshot")
     mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        side_effect=[queue_manager, snapshot_manager],
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        side_effect=[_lease(mocker, queue_manager), _lease(mocker, snapshot_manager)],
     )
     constructor_error = RuntimeError("scheduler construction failed")
     mocker.patch.object(BackendScheduler, "__init__", side_effect=constructor_error)
@@ -272,8 +279,8 @@ def test_scheduler_persists_kafka_delay_snapshot_through_configured_storage(
     snapshot_manager.close.side_effect = lambda: order.append("snapshot-release")
     queue_manager.close.side_effect = lambda: order.append("queue-release")
     mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        side_effect=[queue_manager, snapshot_manager],
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        side_effect=[_lease(mocker, queue_manager), _lease(mocker, snapshot_manager)],
     )
     scheduler = BackendScheduler.from_settings(_settings())
 
@@ -304,8 +311,8 @@ def test_scheduler_open_threads_monitor_into_snapshot_manager(mocker) -> None:
     queue_manager = mocker.MagicMock(name="queue-manager")
     snapshot_manager = mocker.MagicMock(name="snapshot-manager")
     mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        side_effect=[queue_manager, snapshot_manager],
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        side_effect=[_lease(mocker, queue_manager), _lease(mocker, snapshot_manager)],
     )
     scheduler = BackendScheduler.from_settings(_settings())
 
