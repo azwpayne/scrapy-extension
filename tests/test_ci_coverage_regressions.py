@@ -1297,9 +1297,11 @@ def test_queue_close_waits_for_an_in_progress_close() -> None:
     queue._close_complete = False
     queue._close_in_progress = True
     queue._close_attempt = 1
+    queue._close_owner_token = SimpleNamespace(active=True, thread_id=-1)  # type: ignore[assignment]
     operation_gate = MagicMock(name="OperationGate")
 
-    def complete_close() -> None:
+    def complete_close(*, timeout: float) -> None:
+        assert timeout == 0.05
         queue._close_in_progress = False
         queue._close_complete = True
         queue._close_attempt_outcomes[1] = True
@@ -1309,7 +1311,7 @@ def test_queue_close_waits_for_an_in_progress_close() -> None:
 
     queue.close()
 
-    operation_gate.wait.assert_called_once_with()
+    operation_gate.wait.assert_called_once_with(timeout=0.05)
 
 
 def test_queue_strategy_defensive_defaults_and_local_durability_gate() -> None:
