@@ -24,7 +24,10 @@ from scrapy_extension.exceptions import (
     StorageBackpressureError,
     StorageError,
 )
-from scrapy_extension.exceptions._redaction import serialization_error_boundary
+from scrapy_extension.exceptions._redaction import (
+    serialization_error_boundary,
+    storage_operation_error_boundary,
+)
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
     StorageStrategy,
@@ -64,6 +67,8 @@ _PIPELINE_STORAGE_FAILURE_MESSAGE = "Pipeline storage operation failed."
 _PIPELINE_STORAGE_THRESHOLD_MESSAGE = "Pipeline storage failure threshold exceeded."
 _PIPELINE_SERIALIZATION_FAILURE_MESSAGE = "Failed to serialize item."
 _PIPELINE_SERIALIZATION_MONITOR_FAILURE = "Pipeline item serialization failed."
+_PIPELINE_CLOSE_FAILURE_MESSAGE = "Pipeline storage close failed."
+_BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE = "Batched storage flush failed."
 
 
 class _PipelineStorageFailureThresholdExceeded(Exception):
@@ -206,6 +211,7 @@ class BackendPipeline:
         self._opened_spider: Spider | None = None
         self._crawler: Crawler | None = None
         self._closed = False
+        self._closing = False
         set_monitor = getattr(self.storage_strategy, "set_monitor", None)
         if callable(set_monitor):
             set_monitor(self._monitor)
@@ -465,6 +471,8 @@ class BackendPipeline:
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("pipeline is closed")
+            if self._closing:
+                raise RuntimeError("pipeline close must be retried")
             spider = self._resolve_spider(spider)
             if self._opened:
                 if spider is self._opened_spider:
@@ -520,6 +528,12 @@ class BackendPipeline:
             self._opened_spider = spider
             _emit_diagnostic(logger.info, "Pipeline opened for spider %s", spider.name)
 
+    @storage_operation_error_boundary(
+        "store",
+        _PIPELINE_CLOSE_FAILURE_MESSAGE,
+        "storage-strategy",
+        safe_messages=(_BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,),
+    )
     def close_spider(self, spider: Spider | None = None) -> None:
         """Called when a spider closes.
 
@@ -563,6 +577,10 @@ class BackendPipeline:
         if self._closed:
             return
 
+        # Publish the admission fence before entering the durability barrier. If
+        # close fails, only another close attempt may use the retained strategy and
+        # manager capability; new spiders/items must not enter that retry lifecycle.
+        self._closing = True
         primary_error: BaseException | None = None
         try:
             self.storage_strategy.close()
@@ -578,6 +596,7 @@ class BackendPipeline:
         # attempt before calling extension code because a BaseException may occur
         # after its refcount was decremented; retrying would risk a double release.
         self._closed = True
+        self._closing = False
         self._opened = False
         self._opened_spider = None
         secondary_manager_close_failed = False
@@ -612,6 +631,8 @@ class BackendPipeline:
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("pipeline is closed")
+            if self._closing:
+                raise RuntimeError("pipeline close must be retried")
             spider = self._resolve_spider(spider)
             return self._process_item_unlocked(item, spider)
 

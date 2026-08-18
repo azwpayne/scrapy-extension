@@ -699,6 +699,30 @@ SDK-call failures also stop copying driver diagnostics into
 channel. Code that parsed provider text from the public message must switch to
 typed operation/key handling.
 
+## Batched Storage Close Retry
+
+Batched manual flush and shutdown now expose a strict durability result. A
+direct `BatchedStorageStrategy.flush()` whose drain lock remains busy through
+the bounded wait raises a fixed `StorageError` and retains its pending records;
+it no longer returns as though the flush completed. Update callers that treated
+`flush()` as non-raising to catch the typed failure and retry or fail the unit
+of work.
+
+A normal `BackendPipeline.close_spider()` failure now leaves the pipeline in a
+distinct retry-only closing state. New `process_item()` and `open_spider()`
+calls are rejected rather than returning success-shaped items while the failed
+batch remains volatile. The manager acquire is intentionally retained. Shutdown
+integrations must keep that pipeline instance and retry `close_spider()` until
+it returns normally; only that successful durability barrier releases the
+manager. Do not manually close the manager between attempts. If manager release
+itself raises after the batch drained, its outcome is ambiguous and the
+pipeline is terminal, so retrying would risk a duplicate release.
+
+Before upgrading, audit custom Scrapy shutdown wrappers and tests for
+best-effort one-shot close behavior. During rollback, drain all retained batches
+with the version that created them before replacing workers; the retry buffer is
+in-process and cannot be migrated across a restart.
+
 ## Validation and Rollback
 
 Before opening traffic, verify:

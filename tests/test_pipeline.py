@@ -22,6 +22,8 @@ from scrapy_extension.exceptions import (
     StorageError,
 )
 from scrapy_extension.pipeline.pipeline import BackendPipeline
+from scrapy_extension.storage.strategies import BatchedStorageStrategy
+from scrapy_extension.storage.strategies import batched as batched_module
 
 
 def _assert_pipeline_value_is_redacted(
@@ -681,6 +683,69 @@ class TestBackendPipelineCloseSpider:
 
         strategy.close.assert_called_once_with()
         mock_connection_manager.close.assert_called_once_with()
+        assert pipeline._closed is True
+        assert pipeline._manager_released is True
+
+    def test_failed_batched_close_fences_admissions_and_redacts_timeout(
+        self, mock_connection_manager, monkeypatch, mocker
+    ) -> None:
+        """A timeout enters retry-only CLOSING without publishing private state."""
+        marker = "pipeline-batched-close-private-marker"
+        monkeypatch.setattr(batched_module, "_CLOSE_DRAIN_DEADLINE_S", 0.01)
+        backend = mocker.Mock()
+        backend.private_marker = marker
+        strategy = BatchedStorageStrategy(threshold=100)
+        strategy.store(backend, f"key-{marker}", f"value-{marker}".encode())
+        pipeline = BackendPipeline(
+            connection_manager=mock_connection_manager,
+            storage_strategy=strategy,
+        )
+        spider = mocker.Mock()
+        spider.name = "test_spider"
+        pipeline._opened = True
+        pipeline._opened_spider = spider
+        strategy._flush_lock.acquire()
+
+        try:
+            with _capture_diagnostics(
+                "scrapy_extension.storage.strategies.batched",
+                level=logging.WARNING,
+            ) as handler:
+                with pytest.raises(StorageError) as exc_info:
+                    pipeline.close_spider(spider)
+        finally:
+            strategy._flush_lock.release()
+
+        error = exc_info.value
+        assert type(error) is StorageError
+        assert str(error) == "Batched storage flush failed."
+        assert error.operation == "store"
+        assert error.key is None
+        _assert_pipeline_public_error_is_redacted(error, marker)
+        assert handler.records
+        assert handler.active_errors == [None] * len(handler.records)
+        assert all(marker not in record.getMessage() for record in handler.records)
+        assert all(record.exc_info is None for record in handler.records)
+        assert pipeline._closing is True
+        assert pipeline._closed is False
+        assert pipeline._manager_released is False
+        mock_connection_manager.close.assert_not_called()
+        backend.store.assert_not_called()
+
+        rejected_item = {"private": marker}
+        with pytest.raises(RuntimeError, match="close must be retried"):
+            pipeline.process_item(rejected_item, spider)
+        with pytest.raises(RuntimeError, match="close must be retried"):
+            pipeline.open_spider(spider)
+        backend.store.assert_not_called()
+
+        pipeline.close_spider(spider)
+
+        backend.store.assert_called_once_with(
+            f"key-{marker}", f"value-{marker}".encode(), ttl=None
+        )
+        mock_connection_manager.close.assert_called_once_with()
+        assert pipeline._closing is False
         assert pipeline._closed is True
         assert pipeline._manager_released is True
 

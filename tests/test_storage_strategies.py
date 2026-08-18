@@ -6,6 +6,7 @@ import logging
 import sys
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -34,6 +35,57 @@ class _ExceptionContextHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
         self.active_exceptions.append(sys.exc_info())
+
+
+def _assert_batched_error_graph_is_redacted(
+    error: BaseException,
+    marker: str,
+) -> None:
+    """Reject private batched state anywhere in package traceback locals."""
+
+    def assert_value_is_redacted(
+        value: object,
+        seen: set[int] | None = None,
+    ) -> None:
+        if seen is None:
+            seen = set()
+        value_id = id(value)
+        if value_id in seen:
+            return
+        seen.add(value_id)
+        if isinstance(value, str):
+            assert marker not in value
+            return
+        if isinstance(value, bytes):
+            assert marker.encode() not in value
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                assert_value_is_redacted(key, seen)
+                assert_value_is_redacted(item, seen)
+            return
+        if isinstance(value, (tuple, list, set, frozenset)):
+            for item in value:
+                assert_value_is_redacted(item, seen)
+            return
+        try:
+            attributes = vars(value)
+        except TypeError:
+            return
+        assert_value_is_redacted(attributes, seen)
+
+    assert marker not in str(error)
+    assert marker not in repr(error.args)
+    assert marker not in repr(error.__dict__)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in "".join(traceback.format_exception(error))
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            assert_value_is_redacted(frame.f_locals)
+        trace = trace.tb_next
 
 
 class TestPassthroughStorageStrategy:
@@ -163,6 +215,41 @@ class TestBatchedStorageStrategy:
             timeout=batched_module._FLUSH_LOCK_TIMEOUT_S
         )
         warning.assert_called_once()
+
+    @pytest.mark.parametrize("operation", ["flush", "close"])
+    def test_direct_timeout_error_rebuilds_private_graph(
+        self, operation: str, monkeypatch, mocker
+    ) -> None:
+        """Public timeout errors and warning handlers cannot recover the buffer."""
+        marker = f"batched-{operation}-private-marker"
+        monkeypatch.setattr(batched_module, "_FLUSH_LOCK_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(batched_module, "_CLOSE_DRAIN_DEADLINE_S", 0.01)
+        backend = mocker.Mock()
+        backend.private_marker = marker
+        strat = BatchedStorageStrategy(threshold=100)
+        strat.store(backend, f"key-{marker}", f"value-{marker}".encode())
+        handler = _ExceptionContextHandler()
+        batched_module.logger.addHandler(handler)
+        strat._flush_lock.acquire()
+        try:
+            with pytest.raises(StorageError) as exc_info:
+                getattr(strat, operation)()
+        finally:
+            strat._flush_lock.release()
+            batched_module.logger.removeHandler(handler)
+
+        error = exc_info.value
+        assert type(error) is StorageError
+        assert str(error) == "Batched storage flush failed."
+        assert error.operation == "store"
+        assert error.key is None
+        _assert_batched_error_graph_is_redacted(error, marker)
+        assert handler.records
+        assert handler.active_exceptions == [(None, None, None)] * len(handler.records)
+        assert all(marker not in record.getMessage() for record in handler.records)
+        assert all(record.exc_info is None for record in handler.records)
+        assert strat.pending == 1
+        backend.store.assert_not_called()
 
     def test_close_flushes_remaining(self, mocker) -> None:
         backend = mocker.Mock()

@@ -788,6 +788,16 @@ batch threshold when a tighter or larger live backlog is appropriate. The cap
 counts both records still buffered and records detached for a currently blocked
 backend flush, so it prevents unbounded process memory growth during an outage.
 
+Direct `BatchedStorageStrategy.flush()` is a truthful durability operation: if
+another flush still owns the drain lock after the bounded wait, it raises
+`StorageError` and retains pending work instead of returning successfully.
+`close()` likewise returns only after its drain completes. If a strategy or
+`BackendPipeline.close_spider()` call raises before that barrier, the pipeline
+enters a retry-only closing state: `process_item()` and `open_spider()` reject
+new admissions, the connection manager remains owned, and the caller **must
+retry close** until it succeeds. A successful retry drains the retained tail
+before releasing the manager.
+
 ### Ack and durability matrix
 
 | Surface | Ack / state boundary | Crash behavior | Operational guidance |

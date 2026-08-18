@@ -168,8 +168,19 @@ re-enqueues its failing item and tail, increments the monitor's `errors/store`
 counter, logs the failure, and retries on the next age interval rather than
 raising into a pipeline call. Direct explicit `flush()` and `close()` calls are
 synchronous: ordinary storage errors propagate after the unwritten tail is
-restored. A hard process crash is different from an exception: it can still
-lose both the buffer and a detached in-flight snapshot.
+restored. `flush()` also raises `StorageError` when its bounded drain-lock wait
+expires; a normal return therefore never means that a contending flush was
+silently skipped. A hard process crash is different from an exception: it can
+still lose both the buffer and a detached in-flight snapshot.
+
+Treat every failed batched close as an incomplete shutdown. The pipeline fences
+that lifecycle in a retry-only closing state: it rejects `process_item()` and
+`open_spider()`, retains manager ownership, and accepts only another
+`close_spider()` attempt. Retry close until it returns normally; do not discard
+the pipeline or release its manager manually, because the buffered tail still
+belongs to that exact backend generation. A manager-release exception after a
+successful drain is different: release outcome is ambiguous and the pipeline is
+terminal, so do not call close again (which could double-decrement ownership).
 
 Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance. When a blocked backend keeps the cap full, the next item is rejected immediately with `StorageBackpressureError`; treat that as an admission failure and let the crawler's retry/failure policy decide what to do, rather than assuming the item was persisted.
 

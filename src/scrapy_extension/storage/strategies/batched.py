@@ -28,6 +28,7 @@ import time
 from typing import TYPE_CHECKING
 
 from scrapy_extension.exceptions import StorageBackpressureError, StorageError
+from scrapy_extension.exceptions._redaction import storage_operation_error_boundary
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies.base import StorageStrategy
 
@@ -271,6 +272,12 @@ class BatchedStorageStrategy(StorageStrategy):
         if flush_now:
             self._flush()
 
+    @storage_operation_error_boundary(
+        "store",
+        _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,
+        "storage-strategy",
+        safe_messages=(_BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,),
+    )
     def flush(self) -> None:
         """Flush buffered items to their per-entry backends in insertion order.
 
@@ -279,6 +286,12 @@ class BatchedStorageStrategy(StorageStrategy):
         """
         self._flush(raise_on_lock_timeout=True)
 
+    @storage_operation_error_boundary(
+        "store",
+        _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,
+        "storage-strategy",
+        safe_messages=(_BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,),
+    )
     def close(self) -> None:
         """Flush remaining buffered items, then release resources.
 
