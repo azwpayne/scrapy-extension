@@ -29,6 +29,7 @@ def _injected_backend(mocker: Any, **settings: Any) -> tuple[ElasticSearchBacken
     client = mocker.MagicMock()
     client.index.return_value = _INDEX_RESPONSE
     client.delete.return_value = _DELETE_RESPONSE
+    client.indices.refresh.return_value = {"_shards": _SHARDS}
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend, client

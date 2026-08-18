@@ -15,6 +15,7 @@ from elasticsearch import Elasticsearch, RequestError
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import (
+    BackendConnectionError,
     QueueError,
     QueueOutcomeIndeterminateError,
     SetOutcomeIndeterminateError,
@@ -203,6 +204,7 @@ def test_mutation_view_has_fixed_no_replay_options_and_shares_root_transport() -
 
 
 _SHARDS = {"total": 1, "successful": 1, "failed": 0}
+_REFRESH_RESPONSE = {"_shards": _SHARDS}
 
 
 def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
@@ -210,6 +212,7 @@ def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     client = mocker.MagicMock()
     client.index.return_value = {"result": "created", "_shards": _SHARDS}
     client.delete.return_value = {"result": "deleted", "_shards": _SHARDS}
+    client.indices.refresh.return_value = _REFRESH_RESPONSE
     client.delete_by_query.return_value = {
         "took": 3,
         "timed_out": False,
@@ -265,6 +268,89 @@ def test_search_partial_or_malformed_response_fails_closed(
         backend.pop("jobs")
 
     client.delete.assert_not_called()
+
+
+_INVALID_REFRESH_RESPONSES = (
+    pytest.param({}, id="missing-shards"),
+    pytest.param({"_shards": None}, id="non-mapping-shards"),
+    pytest.param(
+        {"_shards": {"total": True, "successful": 1, "failed": 0}},
+        id="non-exact-total",
+    ),
+    pytest.param(
+        {"_shards": {"total": 2, "successful": 1, "failed": 0}},
+        id="partial-success",
+    ),
+    pytest.param(
+        {
+            "_shards": {
+                "total": 1,
+                "successful": 0,
+                "failed": 1,
+                "failures": [],
+            }
+        },
+        id="failed-shard",
+    ),
+    pytest.param(
+        {
+            "_shards": {
+                "total": 1,
+                "successful": 1,
+                "failed": 0,
+                "failures": [{}],
+            }
+        },
+        id="failure-details",
+    ),
+)
+
+
+@pytest.mark.parametrize("response", _INVALID_REFRESH_RESPONSES)
+def test_pop_rejects_partial_or_malformed_refresh_before_search(
+    mocker: Any, response: object
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.indices.refresh.return_value = response
+
+    with pytest.raises(QueueError) as exc_info:
+        backend.pop("jobs")
+
+    assert type(exc_info.value) is QueueError
+    assert str(exc_info.value) == "ElasticSearch queue pop failed."
+    assert exc_info.value.operation == "pop"
+    assert exc_info.value.__cause__ is None
+    client.search.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_error", "expected_message"),
+    (
+        ("queue", QueueError, "ElasticSearch queue length read failed."),
+        ("set", BackendConnectionError, "ElasticSearch set length read failed."),
+    ),
+)
+@pytest.mark.parametrize("response", _INVALID_REFRESH_RESPONSES)
+def test_count_rejects_partial_or_malformed_refresh_before_count(
+    mocker: Any,
+    operation: str,
+    expected_error: type[Exception],
+    expected_message: str,
+    response: object,
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.indices.refresh.return_value = response
+
+    with pytest.raises(expected_error) as exc_info:
+        if operation == "queue":
+            backend.queue_len("jobs")
+        else:
+            backend.set_len("seen")
+
+    assert type(exc_info.value) is expected_error
+    assert str(exc_info.value) == expected_message
+    assert exc_info.value.__cause__ is None
+    client.count.assert_not_called()
 
 
 @pytest.mark.parametrize("count", (None, -1, True, 1.5))

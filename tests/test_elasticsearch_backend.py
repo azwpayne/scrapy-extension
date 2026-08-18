@@ -76,6 +76,7 @@ def _mock_backend(mocker, **settings_kwargs):
     backend._client = mocker.MagicMock()
     backend._client.index.return_value = _INDEX_RESPONSE
     backend._client.delete.return_value = _DELETE_RESPONSE
+    backend._client.indices.refresh.return_value = {"_shards": _SHARDS}
     backend._client.delete_by_query.return_value = _DELETE_BY_QUERY_RESPONSE
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend

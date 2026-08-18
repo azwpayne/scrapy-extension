@@ -167,6 +167,11 @@ def _validate_shards(response: object, *, require_success: bool) -> None:
         raise _ElasticSearchResponseError
 
 
+def _validate_refresh_response(response: object) -> None:
+    """Require refresh to acknowledge every targeted shard without failures."""
+    _validate_shards(response, require_success=True)
+
+
 def _validate_index_response(response: object, allowed_results: frozenset[str]) -> None:
     """Require a successful shard acknowledgement and expected write result."""
     _validate_shards(response, require_success=True)
@@ -1147,9 +1152,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     # (just flushes the indexing buffer to a segment) — far cheaper than
                     # the per-push ``refresh="wait_for"`` it replaces (which blocked ~1s
                     # per push). Amortized: N fast pushes + 1 refresh per read.
-                    generation.client.indices.refresh(
+                    refresh_response = generation.client.indices.refresh(
                         index=generation.snapshot.queue_index
                     )
+                    _validate_refresh_response(refresh_response)
                     resp = generation.client.search(
                         index=generation.snapshot.queue_index,
                         # ``.keyword`` subfield for exact match: the dynamic mapping makes
@@ -1932,7 +1938,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # its own typed error contract.
         # Forced refresh so just-written docs (push/add don't refresh) are
         # searchable — same amortized-read-refresh rationale as pop.
-        generation.client.indices.refresh(index=index)
+        refresh_response = generation.client.indices.refresh(index=index)
+        _validate_refresh_response(refresh_response)
         # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
         # ``set_name`` are dynamically mapped as ``text``; count must match the
         # exact (unanalyzed) value via the keyword subfield.

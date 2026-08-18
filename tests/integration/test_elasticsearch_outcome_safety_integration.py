@@ -202,17 +202,20 @@ def test_committed_push_response_drop_is_not_replayed(
     backend, proxy = response_drop_backend
     queue_name = f"outcome-push:{uuid.uuid4().hex}"
     queue_path = f"/{backend.config.queue_index}/_doc/"
+    starting_requests = len(proxy.requests)
+    starting_dropped = len(proxy.dropped_requests)
     proxy.arm(lambda method, path: method == "PUT" and queue_path in path)
 
     with pytest.raises(QueueOutcomeIndeterminateError):
         backend.push(queue_name, b"committed")
 
-    assert len(proxy.dropped_requests) == 1
-    _method, dropped_path = proxy.dropped_requests[0]
+    newly_dropped = proxy.dropped_requests[starting_dropped:]
+    assert len(newly_dropped) == 1
+    _method, dropped_path = newly_dropped[0]
     document_id = unquote(urlsplit(dropped_path).path.rsplit("/", 1)[-1])
     matching_requests = [
         request
-        for request in proxy.requests
+        for request in proxy.requests[starting_requests:]
         if request[0] == "PUT" and queue_path in request[1]
     ]
     assert len(matching_requests) == 1
@@ -232,11 +235,16 @@ def test_committed_delete_response_drop_is_not_replayed_as_false(
     assert backend.exists(key) is True
     delete_path = f"/{backend.config.storage_index}/_doc/"
     starting_requests = len(proxy.requests)
+    starting_dropped = len(proxy.dropped_requests)
     proxy.arm(lambda method, path: method == "DELETE" and delete_path in path)
 
     with pytest.raises(StorageOutcomeIndeterminateError):
         backend.delete(key)
 
+    newly_dropped = proxy.dropped_requests[starting_dropped:]
+    assert len(newly_dropped) == 1
+    assert newly_dropped[0][0] == "DELETE"
+    assert delete_path in newly_dropped[0][1]
     mutation_requests = [
         request
         for request in proxy.requests[starting_requests:]

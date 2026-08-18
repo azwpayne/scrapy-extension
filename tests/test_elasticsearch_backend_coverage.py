@@ -9,6 +9,8 @@ from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
+_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+
 
 def _make_not_found_error() -> NotFoundError:
     """Create a properly typed NotFoundError for test mocks."""
@@ -230,6 +232,7 @@ class TestPop:
                 create=mocker.MagicMock(),
             ),
         )
+        mock_client.indices.refresh.return_value = {"_shards": _SHARDS}
         mock_client.search.side_effect = _make_not_found_error()
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
@@ -249,6 +252,7 @@ class TestPop:
                 create=mocker.MagicMock(),
             ),
         )
+        mock_client.indices.refresh.return_value = {"_shards": _SHARDS}
         mock_client.search.side_effect = TransportError("Search failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
@@ -283,6 +287,7 @@ class TestPop:
                 create=mocker.MagicMock(),
             ),
         )
+        mock_client.indices.refresh.return_value = {"_shards": _SHARDS}
         mock_client.search.side_effect = _make_api_error()
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",

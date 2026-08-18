@@ -93,6 +93,7 @@ def _backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     shards = {"total": 1, "successful": 1, "failed": 0}
     client.index.return_value = {"result": "created", "_shards": shards}
     client.delete.return_value = {"result": "deleted", "_shards": shards}
+    client.indices.refresh.return_value = {"_shards": shards}
     client.delete_by_query.return_value = {
         "timed_out": False,
         "total": 1,
