@@ -19,7 +19,11 @@ from scrapy_extension.backends.connectors import (
     _DeferredAckPluginQueueBackend,
 )
 from scrapy_extension.backends.registry import BackendDescriptor, _reset_registry_cache
-from scrapy_extension.exceptions import ConfigurationError, QueueError
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
+)
 from scrapy_extension.queue.strategies.base import QueueStrategy, _BoundQueueAckToken
 
 
@@ -418,6 +422,98 @@ def test_non_value_token_reference_is_released_on_adapter_teardown() -> None:
     del contract
     gc.collect()
     assert issued_ref() is None
+
+
+def test_final_close_releases_manager_adapter_without_erasing_active_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    manager._backend = backend
+    manager._breaker_configured = True
+    adapter = manager.get_queue_backend()
+    assert isinstance(adapter, _DeferredAckPluginQueueBackend)
+    adapter_ref = weakref.ref(adapter)
+    backend_ref = weakref.ref(backend)
+    settings_ref = weakref.ref(backend.settings)
+    token = _IdentityToken()
+    backend.pop_results["q"].append((b"item", token))
+    adapter.pop_with_ack("q")
+
+    manager.close()
+
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+    assert adapter._active_ack_tokens
+    adapter.ack("q", token=token)
+    backend.ack_calls.clear()
+    del token
+    del adapter
+    del backend
+    gc.collect()
+    assert adapter_ref() is None
+    assert backend_ref() is None
+    assert settings_ref() is None
+
+
+def test_forced_teardown_releases_manager_adapter_and_backend_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager.get_manager("ackplugin")
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    manager._backend = backend
+    manager._breaker_configured = True
+    adapter = manager.get_queue_backend()
+    adapter_ref = weakref.ref(adapter)
+    backend_ref = weakref.ref(backend)
+    settings_ref = weakref.ref(backend.settings)
+
+    ConnectionManager.clear_registry()
+
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+    del adapter
+    del backend
+    gc.collect()
+    assert adapter_ref() is None
+    assert backend_ref() is None
+    assert settings_ref() is None
+
+
+def test_failed_generation_replacement_releases_retired_plugin_delegate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin", {"retry_attempts": 0})
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    backend.is_connected = lambda: False  # type: ignore[method-assign]
+    manager._backend = backend
+    manager._breaker_configured = True
+    adapter = manager.get_queue_backend()
+    adapter_ref = weakref.ref(adapter)
+    backend_ref = weakref.ref(backend)
+    settings_ref = weakref.ref(backend.settings)
+
+    def fail_create() -> Backend:
+        raise RuntimeError("replacement failed")
+
+    monkeypatch.setattr(manager, "_create_backend", fail_create)
+    with pytest.raises(BackendConnectionError, match="Failed to connect"):
+        manager._connect_with_retries([])
+
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+    del adapter
+    del backend
+    gc.collect()
+    assert adapter_ref() is None
+    assert backend_ref() is None
+    assert settings_ref() is None
 
 
 def test_deferred_plugin_rejects_empty_and_missing_tokens() -> None:

@@ -2054,6 +2054,7 @@ class ConnectionManager:
             manager._retirement_event.set()
             backend = manager._backend
             manager._backend = None
+            manager._clear_plugin_queue_backend_under_lock()
         if backend is not None:
             try:
                 backend.disconnect()
@@ -2127,6 +2128,15 @@ class ConnectionManager:
         assert settings_key is not None
         settings_digest = hashlib.sha256(settings_key.encode("utf-8")).hexdigest()
         return f"{bt_key}:{settings_digest}"
+
+    def _clear_plugin_queue_backend_under_lock(self) -> None:
+        """Drop manager-owned adapter generation references under ``_lock``.
+
+        An adapter still held by an issued scheduler token remains intact, including
+        its active-token identity map. Only this manager's cache ownership ends.
+        """
+        self._plugin_queue_backend = None
+        self._plugin_queue_backend_source = None
 
     def _static_ack_capabilities(self) -> tuple[bool, bool]:
         """Return ACK flags from the exact backend class owned by this manager."""
@@ -2471,6 +2481,7 @@ class ConnectionManager:
                 if connected:
                     return
                 self._backend = None
+                self._clear_plugin_queue_backend_under_lock()
                 # Backend and breaker form one connection generation. Replace the
                 # breaker while holding the same state lock that detaches the backend
                 # so interface accessors can validate a coherent pair. Performing this
@@ -2703,6 +2714,8 @@ class ConnectionManager:
             except BaseException:
                 # Cleanup must never replace the original failed connection signal.
                 pass
+            with self._lock:
+                self._clear_plugin_queue_backend_under_lock()
             raise
         with self._lock:
             if not self._retired:
@@ -2789,6 +2802,7 @@ class ConnectionManager:
             self._retirement_event.set()
             backend = self._backend
             self._backend = None
+            self._clear_plugin_queue_backend_under_lock()
             # R14-E: reset the circuit breaker so a manager that reconnects after
             # teardown (or an orphan-evicted manager re-created from the same
             # settings) does not inherit a stale OPEN state from the prior
