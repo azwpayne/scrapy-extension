@@ -158,9 +158,11 @@ drain. A crash after restore can therefore replay already-processed entries,
 but cannot lose the only copy of entries not yet processed. Hard crashes can
 still lose changes since the last clean checkpoint.
 
-Snapshots use a v4 manifest-last repository. Each generation is written as
-immutable chunks (256 KiB by default), then a checksum/length/schema manifest is
-stored at the logical snapshot key as the commit point. An interrupted chunk or
+Snapshots use a v5 manifest-last repository. Each generation is written as
+immutable chunks (256 KiB by default) under fixed-length
+`queue:snapshot-chunk:v1:<sha256>` keys that hash the complete logical identity,
+generation, and index. The checksum/length/schema manifest is then stored at the
+logical snapshot key as the commit point. An interrupted chunk or
 manifest write leaves the previous manifest authoritative. Empty state is also a
 committed manifest, so stale state cannot replay after a clean drain. Existing
 raw payloads at v3/v2 keys and the safely attributable pre-v3 raw key remain
@@ -169,8 +171,9 @@ readable and are migrated by the next successful close.
 The logical cap is **128 MiB** by default and is enforced symmetrically before
 any write and before restore allocation. Configure
 `SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES` and `SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES`; the
-chunk value must not exceed the logical cap. Every chunk length and the assembled
-SHA-256 digest are validated before strategy restore. Size the logical cap for
+chunk value must not exceed the logical cap or the universal backend-safe
+**256 KiB** ceiling. Every chunk length and the assembled SHA-256 digest are
+validated before strategy restore. Size the logical cap for
 the worst expected held state (a completely full default delay heap can exceed
 128 MiB), rather than relying on a checkpoint that the next process cannot read.
 

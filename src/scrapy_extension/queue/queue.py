@@ -32,6 +32,7 @@ from scrapy_extension.monitor.base import DEFAULT_POP_RATE_WINDOW_S, Monitor
 from scrapy_extension.queue.snapshot import (
     DEFAULT_SNAPSHOT_CHUNK_BYTES,
     DEFAULT_SNAPSHOT_MAX_BYTES,
+    MAX_SNAPSHOT_CHUNK_BYTES,
     SnapshotRepository,
     SnapshotRepositoryError,
 )
@@ -188,7 +189,8 @@ class BackendQueue:
             snapshot_max_bytes: Maximum logical strategy snapshot size accepted on
                 both commit and restore. Defaults to 128 MiB.
             snapshot_chunk_bytes: Maximum immutable generation chunk size. Defaults
-                to 256 KiB and must not exceed ``snapshot_max_bytes``.
+                to and cannot exceed the universal backend-safe cap of 256 KiB;
+                it also must not exceed ``snapshot_max_bytes``.
         """
         self.connection_manager = connection_manager
         self.queue_name = queue_name
@@ -219,6 +221,7 @@ class BackendQueue:
             or not isinstance(resolved_snapshot_chunk_bytes, int)
             or resolved_snapshot_chunk_bytes < 1
             or resolved_snapshot_chunk_bytes > resolved_snapshot_max_bytes
+            or resolved_snapshot_chunk_bytes > MAX_SNAPSHOT_CHUNK_BYTES
         ):
             raise ValueError("Invalid snapshot size limits.")
         self._strategy: QueueStrategy = (
@@ -1435,50 +1438,65 @@ class BackendQueue:
                 return
             raise QueueError("Nonempty strategy state requires snapshot storage.")
         repository = self._snapshot_repository(storage)
+        commit_failed = False
         try:
             repository.commit(self._snapshot_key(), state)
         except SnapshotRepositoryError:
+            commit_failed = True
+        if commit_failed:
             try:
                 logger.error("Strategy snapshot commit failed")
             except BaseException:
                 pass
-            raise QueueError("Strategy snapshot commit failed.") from None
+            raise QueueError("Strategy snapshot commit failed.")
 
         # A committed manifest, including an empty manifest, is authoritative.
         # Legacy cleanup therefore happens only after the manifest-last commit.
         legacy_key = self._legacy_snapshot_key()
         if legacy_key is None:
             return
+        cleanup_failed = False
         try:
             storage.delete(legacy_key)
             storage.delete(self._empty_snapshot_tombstone_key())
         except Exception:
+            cleanup_failed = True
+        if cleanup_failed:
             try:
                 logger.error("Failed to retire legacy strategy snapshot")
             except BaseException:
                 pass
 
     def _restore_snapshot(self) -> None:
-        """Restore a validated v4 manifest or a compatible v3/v2/raw value."""
+        """Restore a validated v5 manifest or a compatible v3/v2/raw value."""
         storage = self._snapshot_storage()
         if storage is None:
             return
         repository = self._snapshot_repository(storage)
+        read_failed = False
         try:
             result = repository.read(self._snapshot_key())
         except SnapshotRepositoryError:
+            read_failed = True
+            result = None
+        if read_failed:
             try:
                 logger.error("Failed to read strategy snapshot; starting clean")
             except BaseException:
                 pass
             return
+        assert result is not None
 
         if not result.found:
             legacy_key = self._legacy_snapshot_key()
             if legacy_key is not None:
+                tombstone_failed = False
                 try:
                     tombstone = storage.retrieve(self._empty_snapshot_tombstone_key())
                 except Exception:
+                    tombstone_failed = True
+                    tombstone = None
+                if tombstone_failed:
                     try:
                         logger.error(
                             "Failed to retrieve empty strategy snapshot tombstone; "
@@ -1489,19 +1507,27 @@ class BackendQueue:
                     return
                 if tombstone is not None:
                     return
+                legacy_read_failed = False
                 try:
                     result = repository.read(legacy_key)
                 except SnapshotRepositoryError:
+                    legacy_read_failed = True
+                if legacy_read_failed:
                     try:
-                        logger.error("Failed to read legacy strategy snapshot; starting clean")
+                        logger.error(
+                            "Failed to read legacy strategy snapshot; starting clean"
+                        )
                     except BaseException:
                         pass
                     return
         if not result.found or result.state is None:
             return
+        restore_failed = False
         try:
             self._strategy.restore(result.state)
         except Exception:
+            restore_failed = True
+        if restore_failed:
             try:
                 logger.error("Strategy snapshot restore failed; starting clean")
             except BaseException:

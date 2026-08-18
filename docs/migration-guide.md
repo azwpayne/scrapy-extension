@@ -537,10 +537,13 @@ v2 identity:
 queue:snapshot:v2:<owner-length>:<owner>:<spider-length>:<spider>:<queue>
 ```
 
-The v3/v2 strings above remain the logical keys. New writes place a v4
-manifest at that key and immutable generation chunks beneath it. The manifest
-is written last and includes schema version, logical length, chunk geometry,
-and SHA-256; a committed zero-length manifest represents a clean drain. Raw
+The v3/v2 strings above remain the logical keys. New writes place a v5
+manifest at that key and immutable generation chunks in the fixed-length
+`queue:snapshot-chunk:v1:<sha256>` namespace. Each chunk key hashes the complete
+logical key, generation, and index, so v2/v3 identities cannot alias chunks and
+backend key limits do not depend on identity length. The manifest is written
+last and includes schema version, logical length, chunk geometry, and SHA-256;
+a committed zero-length manifest represents a clean drain. Raw
 payloads already stored at either logical key remain readable and are migrated
 without an offline rewrite.
 
@@ -552,6 +555,7 @@ old manifest/raw value authoritative; any legacy cleanup failure leaves the new
 manifest authoritative and cleanup is retried after a later close. Configure the
 symmetric logical and chunk limits with `SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES`
 (default 128 MiB) and `SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES` (default 256 KiB).
+The configured chunk size cannot exceed the universal backend-safe 256 KiB cap.
 
 Do not rely on automatic recovery of old named-spider keys such as
 `queue:snapshot:<spider>:<queue>`, or of any old key with `:` in its unscoped

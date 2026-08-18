@@ -273,7 +273,7 @@ def _legacy_delay_snapshot() -> bytes:
 
 
 def _stored_snapshot_payload(storage, key: str = _SNAPSHOT_KEY) -> bytes | None:
-    """Reassemble the v4 payload from captured mock store calls."""
+    """Reassemble the v5 payload from captured mock store calls."""
     values = {args.args[0]: args.args[1] for args in storage.store.call_args_list}
     reader = MagicMock()
     reader.retrieve.side_effect = lambda stored_key: values.get(stored_key)

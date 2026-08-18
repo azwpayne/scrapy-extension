@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.snapshot import (
     SnapshotRepository,
     SnapshotRepositoryError,
@@ -32,16 +34,19 @@ def test_commit_writes_chunks_before_manifest_and_round_trips() -> None:
 
     keys = [call.args[0] for call in storage.store.call_args_list]
     assert keys[-1] == _KEY
-    assert all(":generation:" in key for key in keys[:-1])
+    assert all(key.startswith("queue:snapshot-chunk:v1:") for key in keys[:-1])
+    assert len({len(key) for key in keys[:-1]}) == 1
     assert repository.read(_KEY).state == b"abcdefghij"
     manifest = json.loads(values[_KEY])
-    assert manifest["version"] == 4
+    assert manifest["version"] == 5
     assert manifest["length"] == 10
     assert manifest["chunks"] == 3
 
 
 @pytest.mark.parametrize("failed_chunk", [0, 1, 2])
-def test_each_chunk_failure_leaves_old_manifest_authoritative(failed_chunk: int) -> None:
+def test_each_chunk_failure_leaves_old_manifest_authoritative(
+    failed_chunk: int,
+) -> None:
     storage, values = _storage()
     repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
     repository.commit(_KEY, b"old-state")
@@ -146,3 +151,71 @@ def test_legacy_raw_value_remains_readable() -> None:
     assert result.found is True
     assert result.manifest is False
     assert result.state == b"legacy-v3-or-v2-payload"
+
+
+def _logical_key(
+    queue_name: str, *, owner: str | None = None, spider: str | None = None
+) -> str:
+    queue = object.__new__(BackendQueue)
+    queue.queue_name = queue_name
+    queue._snapshot_owner = owner
+    queue._spider = SimpleNamespace(name=spider) if spider is not None else None
+    return queue._snapshot_key()
+
+
+def test_chunk_keys_hash_complete_v2_v3_identity_generation_and_index() -> None:
+    repository = SnapshotRepository(MagicMock(), max_bytes=32, chunk_bytes=4)
+    generation = "0" * 32
+    v2_key = _logical_key("q", owner="o")
+    old_v2_suffix_alias = f"{v2_key}:generation:{generation}:chunk:0"
+    v2_adversarial_key = _logical_key(f"q:generation:{generation}:chunk:0", owner="o")
+    v3_key = _logical_key("q")
+    old_v3_suffix = f"{v3_key}:generation:{generation}:chunk:0"
+    v3_adversarial_key = _logical_key(f"q:generation:{generation}:chunk:0")
+    identities = [
+        v2_key,
+        v2_adversarial_key,
+        v3_key,
+        v3_adversarial_key,
+        _logical_key("q" * 10_000, spider="spider:with:delimiters"),
+    ]
+
+    # The old v2 suffix scheme exactly aliases another valid logical key. V3's
+    # queue-length frame avoids that exact equality, but both versions now share
+    # the same dedicated namespace and fixed physical-key size.
+    assert old_v2_suffix_alias == v2_adversarial_key
+    assert old_v3_suffix != v3_adversarial_key
+
+    keys = {
+        repository._chunk_key(identity, generation, index)
+        for identity in identities
+        for index in (0, 1)
+    }
+
+    assert len(keys) == len(identities) * 2
+    assert {len(key.encode("ascii")) for key in keys} == {88}
+    assert all(key.startswith("queue:snapshot-chunk:v1:") for key in keys)
+    assert keys.isdisjoint(identities)
+
+
+def test_reserved_chunk_namespace_cannot_be_used_as_a_logical_key() -> None:
+    storage, _ = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    chunk_key = repository._chunk_key(_KEY, "0" * 32, 0)
+
+    with pytest.raises(SnapshotRepositoryError, match="reserved chunk namespace"):
+        repository.commit(chunk_key, b"state")
+    with pytest.raises(SnapshotRepositoryError, match="reserved chunk namespace"):
+        repository.read(chunk_key)
+
+    storage.store.assert_not_called()
+    storage.retrieve.assert_not_called()
+
+
+def test_chunk_size_cannot_exceed_universal_backend_safe_cap() -> None:
+    with pytest.raises(ValueError, match="size limits"):
+        SnapshotRepository(
+            MagicMock(),
+            max_bytes=(256 * 1024) + 1,
+            chunk_bytes=(256 * 1024) + 1,
+        )

@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024
-DEFAULT_SNAPSHOT_CHUNK_BYTES = 256 * 1024
+MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024
+DEFAULT_SNAPSHOT_CHUNK_BYTES = MAX_SNAPSHOT_CHUNK_BYTES
 
 _MANIFEST_SCHEMA = "scrapy-extension.queue-strategy-snapshot"
-_MANIFEST_VERSION = 4
+_MANIFEST_VERSION = 5
 _MAX_MANIFEST_BYTES = 64 * 1024
+_CHUNK_KEY_PREFIX = "queue:snapshot-chunk:v1:"
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -47,7 +49,7 @@ class SnapshotRepository:
     The logical snapshot key contains only the authoritative manifest. A failed
     chunk write cannot replace it, and a failed manifest write leaves the prior
     manifest authoritative. Existing raw values remain readable for in-place
-    migration and are replaced only by a successful v4 commit.
+    migration and are replaced only by a successful v5 commit.
     """
 
     def __init__(
@@ -65,6 +67,7 @@ class SnapshotRepository:
             or not isinstance(chunk_bytes, int)
             or chunk_bytes < 1
             or chunk_bytes > max_bytes
+            or chunk_bytes > MAX_SNAPSHOT_CHUNK_BYTES
         ):
             raise ValueError("Invalid snapshot repository size limits.")
         self._storage = storage
@@ -72,8 +75,40 @@ class SnapshotRepository:
         self._chunk_bytes = chunk_bytes
 
     @staticmethod
+    def _validate_logical_key(key: str) -> None:
+        if key.startswith(_CHUNK_KEY_PREFIX):
+            raise SnapshotRepositoryError(
+                "Snapshot logical key uses the reserved chunk namespace."
+            )
+
+    @staticmethod
     def _chunk_key(key: str, generation: str, index: int) -> str:
-        return f"{key}:generation:{generation}:chunk:{index}"
+        identity = json.dumps(
+            [key, generation, index],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"{_CHUNK_KEY_PREFIX}{hashlib.sha256(identity).hexdigest()}"
+
+    def _retrieve(self, key: str, failure_message: str) -> Any:
+        failed = False
+        value: Any = None
+        try:
+            value = self._storage.retrieve(key)
+        except Exception:
+            failed = True
+        if failed:
+            raise SnapshotRepositoryError(failure_message)
+        return value
+
+    def _store(self, key: str, value: bytes, failure_message: str) -> None:
+        failed = False
+        try:
+            self._storage.store(key, value)
+        except Exception:
+            failed = True
+        if failed:
+            raise SnapshotRepositoryError(failure_message)
 
     @staticmethod
     def _decode_manifest(value: bytes) -> _Manifest | None:
@@ -138,10 +173,8 @@ class SnapshotRepository:
 
     def read(self, key: str) -> SnapshotRead:
         """Read and fully validate one committed logical snapshot."""
-        try:
-            value = self._storage.retrieve(key)
-        except Exception:
-            raise SnapshotRepositoryError("Snapshot manifest retrieval failed.") from None
+        self._validate_logical_key(key)
+        value = self._retrieve(key, "Snapshot manifest retrieval failed.")
         if value is None:
             return SnapshotRead(False, None, False)
         if not isinstance(value, (bytes, bytearray)):
@@ -150,9 +183,14 @@ class SnapshotRepository:
         manifest = self._decode_manifest(raw)
         if manifest is None:
             if len(raw) > self._max_bytes:
-                raise SnapshotRepositoryError("Snapshot exceeds the configured size limit.")
+                raise SnapshotRepositoryError(
+                    "Snapshot exceeds the configured size limit."
+                )
             return SnapshotRead(True, raw, False)
-        if manifest.length > self._max_bytes or manifest.chunk_bytes > self._chunk_bytes:
+        if (
+            manifest.length > self._max_bytes
+            or manifest.chunk_bytes > self._chunk_bytes
+        ):
             raise SnapshotRepositoryError("Snapshot exceeds the configured size limit.")
         if manifest.length == 0:
             if manifest.checksum != hashlib.sha256(b"").hexdigest():
@@ -160,12 +198,10 @@ class SnapshotRepository:
             return SnapshotRead(True, None, True)
         assembled = bytearray()
         for index in range(manifest.chunks):
-            try:
-                chunk = self._storage.retrieve(
-                    self._chunk_key(key, manifest.generation, index)
-                )
-            except Exception:
-                raise SnapshotRepositoryError("Snapshot chunk retrieval failed.") from None
+            chunk = self._retrieve(
+                self._chunk_key(key, manifest.generation, index),
+                "Snapshot chunk retrieval failed.",
+            )
             if not isinstance(chunk, (bytes, bytearray)):
                 raise SnapshotRepositoryError("Snapshot chunk is missing or invalid.")
             chunk_value = bytes(chunk)
@@ -174,7 +210,9 @@ class SnapshotRepository:
                 manifest.length - (index * manifest.chunk_bytes),
             )
             if len(chunk_value) != expected:
-                raise SnapshotRepositoryError("Snapshot chunk length validation failed.")
+                raise SnapshotRepositoryError(
+                    "Snapshot chunk length validation failed."
+                )
             assembled.extend(chunk_value)
         state = bytes(assembled)
         if len(state) != manifest.length:
@@ -185,6 +223,7 @@ class SnapshotRepository:
 
     def commit(self, key: str, state: bytes | None) -> None:
         """Commit ``state`` by writing all generation chunks before its manifest."""
+        self._validate_logical_key(key)
         if state is not None and not isinstance(state, bytes):
             raise SnapshotRepositoryError("Strategy snapshot has an invalid type.")
         length = 0 if state is None else len(state)
@@ -195,13 +234,11 @@ class SnapshotRepository:
         chunks = (length + self._chunk_bytes - 1) // self._chunk_bytes
         for index in range(chunks):
             start = index * self._chunk_bytes
-            try:
-                self._storage.store(
-                    self._chunk_key(key, generation, index),
-                    payload[start : start + self._chunk_bytes],
-                )
-            except Exception:
-                raise SnapshotRepositoryError("Snapshot chunk write failed.") from None
+            self._store(
+                self._chunk_key(key, generation, index),
+                payload[start : start + self._chunk_bytes],
+                "Snapshot chunk write failed.",
+            )
         manifest = _Manifest(
             generation=generation,
             length=length,
@@ -209,7 +246,8 @@ class SnapshotRepository:
             chunks=chunks,
             checksum=hashlib.sha256(payload).hexdigest(),
         )
-        try:
-            self._storage.store(key, self._encode_manifest(manifest))
-        except Exception:
-            raise SnapshotRepositoryError("Snapshot manifest write failed.") from None
+        self._store(
+            key,
+            self._encode_manifest(manifest),
+            "Snapshot manifest write failed.",
+        )

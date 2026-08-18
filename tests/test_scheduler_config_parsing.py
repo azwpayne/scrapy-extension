@@ -74,6 +74,23 @@ def test_queue_component_config_parses_queue_values_immutably() -> None:
         config.queue_key = "queue-other"  # type: ignore[misc]
 
 
+def test_snapshot_chunk_setting_rejects_values_above_backend_safe_cap() -> None:
+    from scrapy_extension.schedule.scheduler import _QueueComponentConfig
+
+    settings = ScrapySettings(
+        {
+            "SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES": 1024 * 1024,
+            "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES": (256 * 1024) + 1,
+        }
+    )
+    config = _QueueComponentConfig.from_early_settings(settings)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        config.with_runtime_settings(settings)
+
+    assert exc_info.value.setting_name == "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES"
+
+
 def test_strategy_is_read_once_before_ring_buffer_safety_gate(
     mocker: MockerFixture,
 ) -> None:
