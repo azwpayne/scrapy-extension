@@ -58,10 +58,14 @@ jobs:
         run: uv run --no-sync bandit -r src -c pyproject.toml
       - name: Dependency vulnerability audit
         if: matrix.python-version == '3.10'
-        # PyPA's PYSEC record lacks a fixed event, while the reviewed GHSA
-        # limits impact to Scrapy <=2.15.2. The lock uses 2.17.0; keep this
-        # exception exact so every other present or future advisory fails CI.
-        run: uv audit --locked --ignore PYSEC-2017-83
+        shell: bash
+        # The checker binds the one waiver to its package, lock range, owner,
+        # evidence fixture, and expiry before exposing its advisory ID. The
+        # audit still fails for every other present or future advisory.
+        run: |
+          set -euo pipefail
+          waiver_id=$(uv run --no-sync python tools/check_audit_waiver.py)
+          uv audit --locked --ignore "$waiver_id"
       - name: Discover and import examples without starting a crawl
         if: matrix.python-version == '3.10'
         shell: bash
@@ -168,11 +172,14 @@ jobs:
           for required in \
             conftest.py \
             uv.lock \
+            .github/audit-waivers.toml \
+            .github/audit-fixtures/PYSEC-2017-83.json \
             .github/workflows/ci.yml \
             .github/workflows/codeql.yml \
             examples/README.md \
             examples/scrapy.cfg \
-            tests/test_packaging_contract.py; do
+            tests/test_packaging_contract.py \
+            tools/check_audit_waiver.py; do
             grep -Fqx "$required" <<<"$sdist_contents"
           done
           wheel_contents=$(unzip -Z1 "${wheels[0]}")

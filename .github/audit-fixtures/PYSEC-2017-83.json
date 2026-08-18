@@ -1,0 +1,13 @@
+{
+  "advisory": "PYSEC-2017-83",
+  "aliases": [
+    "CVE-2017-14158",
+    "GHSA-h7wm-ph43-c39p"
+  ],
+  "package": "scrapy",
+  "reported_version": "2.17.0",
+  "affected_range": ">=0.7,<=2.15.2",
+  "fix_versions": [],
+  "source": "https://github.com/advisories/GHSA-h7wm-ph43-c39p",
+  "captured_for_lock": "uv.lock"
+}

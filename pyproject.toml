@@ -127,6 +127,8 @@ default-groups = ["dev", "test"]
 
 [tool.uv.build-backend]
 source-include = [
+    ".github/audit-fixtures/**",
+    ".github/audit-waivers.toml",
     ".github/CHANGELOG.md",
     ".github/CONTRIBUTING.md",
     ".github/SECURITY.md",
@@ -136,6 +138,7 @@ source-include = [
     "docs/**",
     "examples/**",
     "tests/**",
+    "tools/**",
     "uv.lock",
 ]
 source-exclude = [

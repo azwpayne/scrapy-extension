@@ -162,7 +162,7 @@ Two bundled backends currently carry supply-chain caveats:
   2022-10-17). Marked Experimental in [`STABILITY.md`](STABILITY.md);
   tracked as U20.
 
-### Dependency-audit exception
+### Dependency-audit waiver
 
 The core dependency floor requires `pyasn1>=0.6.4,<0.7`, excluding
 CVE-2026-59884/59885/59886 from Scrapy's service-identity TLS path. At the time
@@ -171,19 +171,31 @@ scanner result for that one advisory is not sufficient without the explicit
 version floor.
 
 The locked dependency graph contains Scrapy 2.17.0 and setuptools 83.0.0.
-`uv audit --locked` still reports `PYSEC-2017-83` for Scrapy because the PyPA
-record has no fixed-version event. The reviewed
+`uv audit --locked` reports `PYSEC-2017-83` for Scrapy because the PyPA record
+has no fixed-version event. The reviewed
 [GitHub advisory](https://github.com/advisories/GHSA-h7wm-ph43-c39p) limits the
-affected range to `>=0.7, <=2.15.2`; locked Scrapy 2.17.0 is outside that
-range. This is a record-specific false positive, not a blanket waiver.
+affected range to `>=0.7, <=2.15.2`; locked Scrapy 2.17.0 is outside that range.
+This is a record-specific false positive, not a blanket waiver.
 
-Reproduce the audit with only that exact finding suppressed:
+The temporary waiver is declared in [`audit-waivers.toml`](audit-waivers.toml):
 
-```bash
-uv audit --locked --ignore PYSEC-2017-83
-```
+- package and upstream affected range: `scrapy >=0.7,<=2.15.2`;
+- allowed locked range while the PyPA record remains over-broad: `>2.15.2,<3`;
+- accountable owner: `@azwpayne`;
+- expiry: **2026-12-31** (CI fails on and after this date).
 
-Do not add a package-wide or advisory-class ignore. Re-check the locked Scrapy
-version and upstream range whenever the lockfile or advisory changes.
+Before applying the advisory ID, CI runs `tools/check_audit_waiver.py`. The
+checker rejects missing metadata, a lock version inside the affected range or
+outside the narrow waived range, fixture drift, and expiry. Unit tests inject
+the evaluation date rather than depending on the wall clock. `uv audit` then
+ignores only the ID emitted by the successful checker, so all other findings
+remain fatal.
+
+The checked-in fixture records the evidence reviewed for this lock. It is not
+fabricated proof that the network advisory is still present: an ignored audit
+cannot distinguish an absent advisory from a suppressed one deterministically.
+The owner must manually re-check upstream and remove the waiver no later than
+expiry. Renewal requires fresh evidence and a new atomic commit; editing the
+expiry in place without that review is not an approved process.
 
 See [`STABILITY.md`](STABILITY.md) for the per-backend maturity tiers.

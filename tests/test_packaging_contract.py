@@ -11,9 +11,12 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 
 _REQUIRED_SOURCE_ENTRIES = {
+    ".github/audit-fixtures/**",
+    ".github/audit-waivers.toml",
     ".github/workflows/**",
     "conftest.py",
     "tests/**",
+    "tools/**",
     "uv.lock",
 }
 _REQUIRED_EXCLUDES = {

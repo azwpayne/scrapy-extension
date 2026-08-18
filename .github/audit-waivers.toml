@@ -1,0 +1,13 @@
+# Temporary dependency-audit waivers. Every waiver is rejected on its expiry
+# date; renewal requires fresh upstream evidence and a new atomic commit.
+version = 1
+
+[[waivers]]
+advisory = "PYSEC-2017-83"
+package = "scrapy"
+affected-range = ">=0.7,<=2.15.2"
+waived-lock-range = ">2.15.2,<3"
+rationale = "PyPA reports every Scrapy release because its record has no fixed event, while GHSA-h7wm-ph43-c39p bounds impact to Scrapy <=2.15.2; the locked release is outside that affected range."
+owner = "@azwpayne"
+expires = 2026-12-31
+evidence-fixture = ".github/audit-fixtures/PYSEC-2017-83.json"
