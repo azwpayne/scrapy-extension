@@ -66,6 +66,9 @@ from scrapy_extension.settings import KafkaMode, KafkaSettings
 from scrapy_extension.settings._broker_endpoints import (
     KAFKA_BROKER_ENDPOINTS_ERROR,
 )
+from scrapy_extension.settings._transport_security import (
+    validate_allow_remote_plaintext,
+)
 from scrapy_extension.settings.kafka import (
     validate_kafka_authentication,
     validate_kafka_delivery_policy,
@@ -612,6 +615,7 @@ class KafkaBackend(Backend, QueueBackend):
     def _capture_connection_snapshot(self) -> _KafkaConnectionSnapshot:
         """Copy and revalidate every setting consumed by one client generation."""
         raw_values = self.config.__dict__.copy()
+        validate_allow_remote_plaintext(raw_values.get("allow_remote_plaintext"))
         validated: KafkaSettings | None = None
         settings_error: ConfigurationError | None = None
         try:

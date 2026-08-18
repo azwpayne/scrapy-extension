@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import traceback
+from enum import Enum
 from typing import Any
 
 import pytest
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+from scrapy_extension.backends.kafka import KafkaBackend
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.settings import (
     ElasticSearchSettings,
@@ -66,6 +68,11 @@ _REMOTE_URL_HOSTS = (
     "[2001:db8::1]",
 )
 
+
+class _RemotePlaintextEnumLike(str, Enum):
+    TRUE_MARKER = "true"
+
+
 _REMOTE_PLAINTEXT_CASES: list[tuple[str, type[Any], dict[str, object], str]] = [
     (
         "redis",
@@ -118,6 +125,21 @@ def _assert_static_configuration_error(
     assert error.__context__ is None
 
 
+def _assert_mutated_opt_in_error_is_redacted(
+    error: ConfigurationError, lookalike: object
+) -> None:
+    """Assert snapshot rejection exposes neither input nor validator exception."""
+    assert repr(lookalike) not in str(error)
+    assert repr(lookalike) not in repr(error.__dict__)
+    assert error.setting_value is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    if isinstance(lookalike, _RemotePlaintextEnumLike):
+        assert type(lookalike).__name__ not in "".join(
+            traceback.format_exception(error)
+        )
+
+
 @pytest.mark.parametrize("host", _EXACT_LOOPBACK_HOSTS)
 def test_shared_loopback_classifier_accepts_only_exact_literals(host: str) -> None:
     assert is_loopback_host(host) is True
@@ -164,6 +186,44 @@ def test_ambiguous_plaintext_host_rejects_before_sdk_with_static_error(
     assert exc_info.value.setting_name == "allow_remote_plaintext"
     sdk.assert_not_called()
     _assert_static_configuration_error(exc_info.value, host)
+
+
+@pytest.mark.parametrize(
+    "lookalike", ["true", 1, _RemotePlaintextEnumLike.TRUE_MARKER]
+)
+def test_elasticsearch_snapshot_rejects_mutated_plaintext_opt_in_before_sdk(
+    lookalike: object, mocker
+) -> None:
+    settings = ElasticSearchSettings()
+    settings.allow_remote_plaintext = lookalike  # type: ignore[assignment]
+    sdk = mocker.patch("scrapy_extension.backends.elasticsearch.Elasticsearch")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        ElasticSearchBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+    sdk.assert_not_called()
+    _assert_mutated_opt_in_error_is_redacted(exc_info.value, lookalike)
+
+
+@pytest.mark.parametrize(
+    "lookalike", ["true", 1, _RemotePlaintextEnumLike.TRUE_MARKER]
+)
+def test_kafka_snapshot_rejects_mutated_plaintext_opt_in_before_sdk(
+    lookalike: object, mocker
+) -> None:
+    settings = KafkaSettings()
+    settings.allow_remote_plaintext = lookalike  # type: ignore[assignment]
+    producer = mocker.patch("scrapy_extension.backends.kafka.KafkaProducer")
+    admin = mocker.patch("scrapy_extension.backends.kafka.KafkaAdminClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        KafkaBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+    producer.assert_not_called()
+    admin.assert_not_called()
+    _assert_mutated_opt_in_error_is_redacted(exc_info.value, lookalike)
 
 
 @pytest.mark.parametrize(

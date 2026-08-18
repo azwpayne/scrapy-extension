@@ -57,6 +57,9 @@ from scrapy_extension.exceptions._redaction import (
     set_operation_error_boundary,
     storage_operation_error_boundary,
 )
+from scrapy_extension.settings._transport_security import (
+    validate_allow_remote_plaintext,
+)
 from scrapy_extension.settings.elasticsearch import ElasticSearchMode
 
 if TYPE_CHECKING:
@@ -258,10 +261,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         before an SDK call, while the frozen result prevents later mutation from
         retargeting a live client's capability operations.
         """
+        raw_values = self.config.__dict__.copy()
+        validate_allow_remote_plaintext(raw_values.get("allow_remote_plaintext"))
         validated: ElasticSearchSettings | None = None
         settings_error: ConfigurationError | None = None
         try:
-            validated = type(self.config).model_validate(self.config.__dict__.copy())
+            validated = type(self.config).model_validate(raw_values)
         except ConfigurationError:
             raise
         except ValidationError as exc:
