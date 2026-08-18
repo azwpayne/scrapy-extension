@@ -126,6 +126,13 @@ def _connected(mocker, **client_children):
     return b, client
 
 
+def _wait_for_pump_subscription(backend: PulsarBackend, queue_name: str) -> Any:
+    """Wait until a zero-time poll's consumer is published and receiving."""
+    pump = backend._receive_pumps[f"scrapy-{queue_name}"]
+    assert pump.receive_started.wait(timeout=0.5)
+    return pump
+
+
 class _ExceptionContextProbe(logging.Handler):
     """Capture exception state available to synchronous backend handlers."""
 
@@ -434,22 +441,26 @@ class TestPulsarConnect:
         )
 
         backend.connect()
-        assert backend.pop("queue") is None
+        try:
+            assert backend.pop("queue") is None
+            _wait_for_pump_subscription(backend, "queue")
 
-        client_factory.assert_called_once_with(
-            "pulsar+ssl://one:6651,two:6651",
-            authentication=auth_object,
-            tls_allow_insecure_connection=False,
-            tls_trust_certs_file_path="/tls/original-ca.pem",
-            tls_validate_hostname=True,
-        )
-        client.subscribe.assert_called_once_with(
-            "scrapy-queue",
-            "original-subscription",
-            consumer_type=pulsar.ConsumerType.Shared,
-            initial_position=pulsar.InitialPosition.Earliest,
-            negative_ack_redelivery_delay_ms=7_000,
-        )
+            client_factory.assert_called_once_with(
+                "pulsar+ssl://one:6651,two:6651",
+                authentication=auth_object,
+                tls_allow_insecure_connection=False,
+                tls_trust_certs_file_path="/tls/original-ca.pem",
+                tls_validate_hostname=True,
+            )
+            client.subscribe.assert_called_once_with(
+                "scrapy-queue",
+                "original-subscription",
+                consumer_type=pulsar.ConsumerType.Shared,
+                initial_position=pulsar.InitialPosition.Earliest,
+                negative_ack_redelivery_delay_ms=7_000,
+            )
+        finally:
+            backend.disconnect()
 
     def test_connection_snapshot_repr_redacts_auth_token(self) -> None:
         secret = "snapshot-secret"
@@ -488,6 +499,7 @@ class TestPulsarConnect:
         consumer.receive.side_effect = pulsar.Timeout("empty")
         b, old_client = _connected(mocker, subscribe=consumer)
         b.pop("queue")
+        _wait_for_pump_subscription(b, "queue")
         new_client = mocker.MagicMock(name="new_client")
         pulsar.Client.return_value = new_client
 
@@ -541,6 +553,8 @@ class TestPulsarConnect:
         client.subscribe.side_effect = [consumer_a, consumer_b]
         b.pop("queue_a")
         b.pop("queue_b")
+        _wait_for_pump_subscription(b, "queue_a")
+        _wait_for_pump_subscription(b, "queue_b")
 
         b.disconnect()
 
@@ -652,6 +666,7 @@ class TestPulsarConnect:
         old_consumer.close.side_effect = blocking_close
         b, old_client = _connected(mocker, subscribe=old_consumer)
         b.pop("queue")
+        _wait_for_pump_subscription(b, "queue")
         disconnect_thread = Thread(target=b.disconnect)
         disconnect_thread.start()
         assert close_started.wait(timeout=2.0)
@@ -772,6 +787,7 @@ class TestPulsarPop:
         consumer.receive.side_effect = pulsar.Timeout("timed out")
         b, _ = _connected(mocker, subscribe=consumer)
         assert b.pop("queue1") is None
+        _wait_for_pump_subscription(b, "queue1")
         assert b._last_msg is None
 
     def test_empty_timeout_diagnostic_hides_queue_and_driver_text(self, mocker) -> None:
@@ -837,6 +853,7 @@ class TestPulsarPop:
         )
 
         assert b.pop("queue1") is None
+        _wait_for_pump_subscription(b, "queue1")
         assert b._last_msg is None
 
     def test_pop_wraps_non_timeout_receive_failure(self, mocker) -> None:
@@ -858,6 +875,7 @@ class TestPulsarPop:
         consumer.receive.side_effect = pulsar.Timeout("none")
         b, client = _connected(mocker, subscribe=consumer)
         b.pop("queue1")
+        _wait_for_pump_subscription(b, "queue1")
         b.pop("queue1")
         client.subscribe.assert_called_once()
 
@@ -867,6 +885,8 @@ class TestPulsarPop:
         b, client = _connected(mocker, subscribe=consumer)
         b.pop("queue1")
         b.pop("queue2")
+        _wait_for_pump_subscription(b, "queue1")
+        _wait_for_pump_subscription(b, "queue2")
         assert client.subscribe.call_count == 2
 
     def test_pop_topic_subscribe_failure_preserves_cached_consumer(
@@ -1038,6 +1058,7 @@ class TestPulsarAckNack:
         client.subscribe.side_effect = [consumer_a, consumer_b]
         assert b.pop("queue_a", timeout=1.0) == b"a"
         assert b.pop("queue_b") is None
+        _wait_for_pump_subscription(b, "queue_b")
 
         b.ack("queue_a")
 
@@ -1081,6 +1102,7 @@ class TestPulsarAckNack:
         client.subscribe.side_effect = [consumer_a, consumer_b]
         assert b.pop("queue_a", timeout=1.0) == b"a"
         assert b.pop("queue_b") is None
+        _wait_for_pump_subscription(b, "queue_b")
 
         b.nack("queue_a")
 
@@ -1123,6 +1145,7 @@ class TestPulsarRealAck:
         consumer.receive.side_effect = pulsar.Timeout("timed out")
         b, _ = _connected(mocker, subscribe=consumer)
         value, token = b.pop_with_ack("queue1")
+        _wait_for_pump_subscription(b, "queue1")
         assert value is None
         assert token is None
         assert b._in_flight == set()

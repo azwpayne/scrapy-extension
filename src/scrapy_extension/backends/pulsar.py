@@ -208,6 +208,36 @@ class _BufferedPulsarRecord:
 
 
 @dataclass
+class _PulsarCloseTask:
+    """One daemon SDK close whose result is published only before its fence."""
+
+    handle: Any
+    outcome_lock: Lock = field(default_factory=Lock)
+    accepting_outcome: bool = True
+    completed: bool = False
+    error: BaseException | None = None
+    worker: Thread | None = None
+
+    def run(self) -> None:
+        """Close the handle and publish the outcome only while still admitted."""
+        error: BaseException | None = None
+        try:
+            self.handle.close()
+        except BaseException as close_error:
+            error = close_error
+        with self.outcome_lock:
+            if self.accepting_outcome:
+                self.error = error
+                self.completed = True
+
+    def fence_and_collect(self) -> tuple[bool, BaseException | None]:
+        """Stop late result publication and return the admitted outcome."""
+        with self.outcome_lock:
+            self.accepting_outcome = False
+            return self.completed, self.error
+
+
+@dataclass
 class _PulsarReceivePump:
     """Bounded local delivery buffer owned by one topic/client generation."""
 
@@ -640,14 +670,10 @@ class PulsarBackend(Backend, QueueBackend):
                     self._lifecycle_generation += 1
                     handles = [*consumers.values(), *producers.values(), client]
 
-        cleanup_failure_count = 0
-        for handle in handles:
-            try:
-                handle.close()
-            except BaseException:
-                # A driver close must never replace the connection failure currently
-                # being handled. The normal failure path logs after this helper returns.
-                cleanup_failure_count += 1
+        close_errors, close_timeout_count = self._run_bounded_close_tasks(*handles)
+        # A driver close must never replace the connection failure currently being
+        # handled. The normal failure path logs after this helper returns.
+        cleanup_failure_count = len(close_errors) + close_timeout_count
         for pump in pumps:
             worker = pump.worker
             if worker is not None and worker is not current_thread():
@@ -723,7 +749,7 @@ class PulsarBackend(Backend, QueueBackend):
 
     @staticmethod
     def _log_receive_shutdown_timeout() -> None:
-        """Emit a static diagnostic when an SDK worker ignores close()."""
+        """Emit a static diagnostic when an SDK receive worker ignores close()."""
         try:
             logger.warning(
                 "Pulsar receive worker did not stop within the shutdown timeout."
@@ -732,34 +758,91 @@ class PulsarBackend(Backend, QueueBackend):
             pass
 
     @staticmethod
-    def _close_detached_handles(*handles: Any) -> None:
-        """Close every detached handle, retaining the first control exception."""
-        primary_error: BaseException | None = None
-        for handle in handles:
-            cleanup = _suppress_pulsar_errors()
+    def _log_close_shutdown_timeout() -> None:
+        """Emit a static diagnostic when an SDK handle close does not finish."""
+        try:
+            logger.warning(
+                "Pulsar SDK handle close did not finish within the shutdown timeout."
+            )
+        except BaseException:
+            pass
+
+    def _run_bounded_close_tasks(
+        self, *handles: Any
+    ) -> tuple[list[BaseException], int]:
+        """Close detached SDK handles concurrently within one finite join budget.
+
+        Every close runs on a daemon so a broken sync SDK handle cannot pin process
+        shutdown. All tasks are started before any join, ensuring one stuck consumer
+        cannot prevent producer/client cleanup. Once the shared deadline expires,
+        each task's outcome slot is fenced before returning; a late close can neither
+        publish an exception nor alter the caller's selected teardown result.
+        """
+        if not handles:
+            return [], 0
+
+        tasks = [_PulsarCloseTask(handle) for handle in handles]
+        management_errors: list[BaseException] = []
+        started: list[_PulsarCloseTask] = []
+        for task in tasks:
+            worker = Thread(
+                target=task.run,
+                name="pulsar-sdk-close-cleanup",
+                daemon=True,
+            )
+            task.worker = worker
             try:
-                with cleanup:
-                    handle.close()
+                worker.start()
             except BaseException as error:
-                if primary_error is None:
-                    primary_error = error
-            if cleanup.did_suppress:
+                # Fence immediately: this handle has no worker that could publish.
+                task.fence_and_collect()
+                management_errors.append(error)
+            else:
+                started.append(task)
+
+        deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
+        for task in started:
+            close_worker = task.worker
+            if close_worker is None:
+                continue
+            try:
+                close_worker.join(max(0.0, deadline - monotonic()))
+            except BaseException as error:
+                management_errors.append(error)
+
+        errors: list[BaseException] = []
+        timeout_count = 0
+        for task in started:
+            completed, outcome_error = task.fence_and_collect()
+            if not completed:
+                timeout_count += 1
+            elif outcome_error is not None:
+                errors.append(outcome_error)
+        errors.extend(management_errors)
+        if timeout_count:
+            self._log_close_shutdown_timeout()
+        return errors, timeout_count
+
+    def _close_detached_handles(self, *handles: Any) -> None:
+        """Close every detached handle, retaining the first control exception."""
+        errors, _timeout_count = self._run_bounded_close_tasks(*handles)
+        primary_error: BaseException | None = None
+        for error in errors:
+            if isinstance(error, Exception):
                 _log_suppressed_cleanup_error()
+            elif primary_error is None:
+                primary_error = error
         if primary_error is not None:
             raise primary_error
 
-    @staticmethod
-    def _close_aborted_handle(handle: Any) -> None:
+    def _close_aborted_handle(self, handle: Any) -> None:
         """Best-effort close for a private candidate that never became live.
 
         This helper runs while a primary exception is already propagating.  Unlike
         normal teardown, including a control-flow exception from a driver close
         must not replace that primary error.
         """
-        try:
-            handle.close()
-        except BaseException:
-            pass
+        self._run_bounded_close_tasks(handle)
 
     def is_connected(self) -> bool:
         """Return True if the client has been created."""
@@ -847,11 +930,7 @@ class PulsarBackend(Backend, QueueBackend):
                 if not published:
                     self._close_aborted_handle(producer)
                 raise
-            cleanup = _suppress_pulsar_errors()
-            with cleanup:
-                producer.close()
-            if cleanup.did_suppress:
-                _log_suppressed_cleanup_error()
+            self._close_detached_handles(producer)
             raise QueueError(
                 f"Failed to create Pulsar producer for {topic}: connection changed",
                 queue_name=topic,
@@ -1558,11 +1637,7 @@ class PulsarBackend(Backend, QueueBackend):
                 if not published:
                     self._close_aborted_handle(consumer)
                 raise
-            cleanup = _suppress_pulsar_errors()
-            with cleanup:
-                consumer.close()
-            if cleanup.did_suppress:
-                _log_suppressed_cleanup_error()
+            self._close_detached_handles(consumer)
             raise QueueError(
                 f"Failed to subscribe to Pulsar topic {topic}: connection changed",
                 queue_name=topic,
@@ -1598,14 +1673,7 @@ def _message_bytes(msg: Any) -> bytes:
 
 
 class _suppress_pulsar_errors:
-    """Suppress regular cleanup errors and report that suppression to callers.
-
-    Close() calls during disconnect/clear must not raise — a failing close
-    during teardown would mask the original error and break cleanup of the
-    remaining handles. ``__exit__`` deliberately performs no diagnostics: it
-    runs with the close error active in ``sys.exc_info()``. Callers inspect
-    :attr:`did_suppress` after the ``with`` statement, then log static context.
-    """
+    """Suppress regular cleanup errors while preserving control exceptions."""
 
     def __init__(self) -> None:
         self.did_suppress = False
@@ -1617,10 +1685,6 @@ class _suppress_pulsar_errors:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
         if exc_type is None:
             return False
-        # R-swallow: suppress only regular cleanup Exceptions -- NEVER BaseException
-        # (KeyboardInterrupt / SystemExit / GeneratorExit). Pre-fix this swallowed
-        # any exception (return True), trapping Ctrl+C during close() (the
-        # operator's shutdown signal disappeared into a debug log).
         if not isinstance(exc, Exception):
             return False
         self.did_suppress = True

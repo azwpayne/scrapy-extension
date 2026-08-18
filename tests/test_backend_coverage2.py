@@ -78,7 +78,10 @@ class TestPulsarRemaining:
         consumer.receive.return_value = None
         client.subscribe.return_value = consumer
         try:
-            assert b.pop("q") is None
+            result = b.pop("q")
+            pump = b._receive_pumps["scrapy-q"]
+            assert pump.receive_started.wait(timeout=0.5)
+            assert result is None
         finally:
             b.disconnect()
 

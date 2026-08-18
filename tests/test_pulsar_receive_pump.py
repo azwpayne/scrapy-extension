@@ -6,7 +6,7 @@ from collections import deque
 from threading import Condition, Event, Thread, current_thread
 from time import monotonic
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pulsar
 import pytest
@@ -14,6 +14,20 @@ import pytest
 from scrapy_extension.backends.pulsar import PulsarBackend, _PulsarAckToken
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import PulsarSettings
+
+_CONNECTED_BACKENDS: list[PulsarBackend] = []
+
+
+@pytest.fixture(autouse=True)
+def _disconnect_receive_pumps_after_test() -> Any:
+    """Keep every receive/close daemon owned by a backend inside its test."""
+    yield
+    while _CONNECTED_BACKENDS:
+        backend = _CONNECTED_BACKENDS.pop()
+        try:
+            backend.disconnect()
+        except BaseException:
+            pass
 
 
 class _LifecycleGate:
@@ -105,6 +119,7 @@ def _connected_backend(
     mocker.patch.object(pulsar, "Client", return_value=client)
     backend = PulsarBackend(PulsarSettings())
     backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
     return backend
 
 
@@ -134,6 +149,7 @@ def test_first_poll_never_waits_outside_budget_for_blocked_subscribe(
     mocker.patch.object(pulsar, "Client", return_value=client)
     backend = PulsarBackend(PulsarSettings())
     backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
     try:
         started = monotonic()
         assert backend.pop("bootstrap", timeout=0) is None
@@ -234,9 +250,10 @@ def test_receive_buffer_is_bounded_per_topic(mocker: Any) -> None:
     backend._receive_buffer_size = 2
     try:
         assert backend.pop("bounded", timeout=0) is None
+        pump = backend._receive_pumps["scrapy-bounded"]
+        assert consumer.receive_started.wait(timeout=0.5)
         for index in range(3):
             consumer.deliver(_message(str(index).encode(), object()))
-        pump = backend._receive_pumps["scrapy-bounded"]
         assert _wait_until(lambda: len(pump.records) == 2)
         assert consumer.receive_calls == 2
         assert len(pump.records) == pump.capacity == 2
@@ -334,6 +351,48 @@ def test_disconnect_is_bounded_when_close_does_not_interrupt_receive(
     assert backend._in_flight == set()
 
 
+def test_disconnect_is_bounded_when_sdk_close_never_returns(mocker: Any) -> None:
+    release_close = Event()
+    close_started = Event()
+    consumer = _ControllableConsumer()
+    real_close = consumer.close
+
+    def close_that_never_returns() -> None:
+        close_started.set()
+        release_close.wait()
+        real_close()
+
+    consumer.close = close_that_never_returns  # type: ignore[method-assign]
+    backend = _connected_backend(mocker, [consumer])
+    backend._receive_shutdown_timeout = 0.05
+    warning = mocker.patch("scrapy_extension.backends.pulsar.logger.warning")
+
+    try:
+        assert backend.pop("stuck-close", timeout=0) is None
+        pump = backend._receive_pumps["scrapy-stuck-close"]
+        assert consumer.receive_started.wait(timeout=0.5)
+
+        started = monotonic()
+        backend.disconnect()
+        elapsed = monotonic() - started
+
+        assert elapsed < 0.5
+        assert close_started.is_set()
+        assert backend._client is None
+        assert backend._consumers == {}
+        assert not pump.stopped.is_set()
+        assert warning.call_args_list == [
+            call("Pulsar SDK handle close did not finish within the shutdown timeout."),
+            call("Pulsar receive worker did not stop within the shutdown timeout."),
+        ]
+    finally:
+        release_close.set()
+
+    assert pump.stopped.wait(timeout=0.5)
+    assert backend._client is None
+    assert backend._consumers == {}
+
+
 def test_disconnect_drops_unreturned_buffer_and_reconnect_fences_generation(
     mocker: Any,
 ) -> None:
@@ -348,9 +407,11 @@ def test_disconnect_drops_unreturned_buffer_and_reconnect_fences_generation(
     )
     backend = PulsarBackend(PulsarSettings())
     backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
 
     assert backend.pop("queue", timeout=0) is None
     old_pump = backend._receive_pumps["scrapy-queue"]
+    assert old_consumer.receive_started.wait(timeout=0.5)
     old_consumer.deliver(_message(b"old", object()))
     assert old_pump.buffered.wait(timeout=0.5)
 
@@ -368,6 +429,7 @@ def test_disconnect_drops_unreturned_buffer_and_reconnect_fences_generation(
         assert backend.pop("queue", timeout=0) is None
         new_pump = backend._receive_pumps["scrapy-queue"]
         assert new_pump is not old_pump
+        assert new_consumer.receive_started.wait(timeout=0.5)
         new_consumer.deliver(_message(b"new", object()))
         assert backend.pop("queue", timeout=1.0) == b"new"
         assert client_factory.call_count == 2

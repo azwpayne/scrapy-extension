@@ -123,5 +123,7 @@ class TestPulsarErrorPaths:
         consumer.receive.side_effect = pulsar.Timeout("none")
         client.subscribe.return_value = consumer
         b.pop("q")  # creates consumer for scrapy-q
+        pump = b._receive_pumps["scrapy-q"]
+        assert pump.receive_started.wait(timeout=0.5)
         with pytest.raises(QueueError, match="not supported"):
             b.clear_queue("q")
