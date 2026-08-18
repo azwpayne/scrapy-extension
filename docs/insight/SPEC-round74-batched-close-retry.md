@@ -1,6 +1,6 @@
 # SPEC — R74: BatchedStorageStrategy.close() abandons the requeued tail after a partial drain
 
-> Back-navigation: [../insight/](.) · Round log in [MEMORY index](../../../../.claude/projects/-Users-payne-WorkSpace-project-individual-dev-web-crawler-scrapy-extension/memory/MEMORY.md).
+> Back-navigation: [../insight/](.) · The round log was maintained in local agent memory and is not part of this repository.
 > R83 fire (2026-08-11). No fresh scan — ships the R82-queued finding #2 (confirmed real, surgical, clean-file). R82's 4-dim scan produced it; this fire implements it. Queued siblings priority.py:213 and spider_mixin.py:182 remain for future fires.
 
 ## Context and audit evidence

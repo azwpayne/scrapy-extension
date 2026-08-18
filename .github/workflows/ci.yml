@@ -38,6 +38,13 @@ jobs:
           uv run --no-sync python -c
           "import sys; expected = tuple(map(int, '${{ matrix.python-version }}'.split('.')));
           assert sys.version_info[:2] == expected, (sys.version, expected)"
+      - name: Repository hygiene contracts
+        if: matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git ls-files -ci --exclude-standard)"
+          uv run --no-sync pytest tests/test_repository_hygiene.py -q
       - name: Ruff
         run: uv run --no-sync ruff check
       - name: Ruff format

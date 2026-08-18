@@ -1,6 +1,6 @@
 # SPEC — R77: WorkStealing pop/pop_with_ack miss peer arrivals after the own-queue blocking wait (R84 sibling)
 
-> Back-navigation: [../insight/](.) · Round log in [MEMORY index](../../../../.claude/projects/-Users-payne-WorkSpace-project-individual-dev-web-crawler-scrapy-extension/memory/MEMORY.md).
+> Back-navigation: [../insight/](.) · The round log was maintained in local agent memory and is not part of this repository.
 > R86 fire (2026-08-11), 4-dim scan (ndiff + request-serde + dupefilter-internals + scheduler-internals). 3 confirmed (scheduler EMPTY); this is the top (ndiff). The other 2 (Decimal NaN serde bypass, volatile-shadow LRU-on-read) queue for future fires.
 
 ## Context and audit evidence

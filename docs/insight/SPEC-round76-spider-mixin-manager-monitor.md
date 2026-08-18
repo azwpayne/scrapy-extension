@@ -1,6 +1,6 @@
 # SPEC — R76: spider_mixin never wires a monitor into the shared ConnectionManager
 
-> Back-navigation: [../insight/](.) · Round log in [MEMORY index](../../../../.claude/projects/-Users-payne-WorkSpace-project-individual-dev-web-crawler-scrapy-extension/memory/MEMORY.md).
+> Back-navigation: [../insight/](.) · The round log was maintained in local agent memory and is not part of this repository.
 > R85 fire (2026-08-11). No fresh scan — ships the LAST R82-queued finding (#4, confirmed real/surgical/clean-file). R82's 4-confirmed scan is now fully shipped (fingerprinter→R82, batched→R83, priority→R84, this). Next fire does a fresh ndiff+rotate scan.
 
 ## Context and audit evidence

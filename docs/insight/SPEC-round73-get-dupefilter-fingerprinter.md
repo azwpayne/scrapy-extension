@@ -1,6 +1,6 @@
 # SPEC — R73: get_dupefilter() ignores REQUEST_FINGERPRINTER_CLASS
 
-> Back-navigation: [../insight/](.) · Round log in [MEMORY index](../../../../.claude/projects/-Users-payne-WorkSpace-project-individual-dev-web-crawler-scrapy-extension/memory/MEMORY.md).
+> Back-navigation: [../insight/](.) · The round log was maintained in local agent memory and is not part of this repository.
 > R82 fire (2026-08-11), 4-dim scan (ndiff-regression + queue-strategies + storage-strategies + monitor wiring). 4 findings confirmed; this is the top (HIGH, ndiff sibling of R70/R77). The other 3 (priority.py re-scan-after-block, batched.py close-retry, spider_mixin manager-monitor) are queued for future fires.
 
 ## Context and audit evidence

@@ -1,6 +1,6 @@
 # SPEC — R72: Memcached store() silently drops data when ttl > 30 days
 
-> Back-navigation: [../insight/](.) · Round log in [MEMORY index](../../../../.claude/projects/-Users-payne-WorkSpace-project-individual-dev-web-crawler-scrapy-extension/memory/MEMORY.md).
+> Back-navigation: [../insight/](.) · The round log was maintained in local agent memory and is not part of this repository.
 > R81 fire (2026-08-11), 2-dim scan on the fresh backend implementations (pulsar/sqs + memcached/dynamodb). 1 confirmed (this), 1 refuted (Pulsar sub-ms timeout — C++ `wait_for(0)` returns immediately, does not block).
 
 ## Goal

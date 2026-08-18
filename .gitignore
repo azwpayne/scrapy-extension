@@ -10,7 +10,12 @@ wheels/
 .venv*/
 .claude/
 .gstack
-docs/superpowers/
+# Historical superpowers notes remain local-only, except for the one design
+# plan intentionally retained in Git. Release builds exclude the whole tree.
+docs/superpowers/*
+!docs/superpowers/plans/
+docs/superpowers/plans/*
+!docs/superpowers/plans/2026-04-18-rocketmq-backend.md
 aaa
 .pytest_cache/
 .tox/

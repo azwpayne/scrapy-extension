@@ -125,9 +125,10 @@ read-only checks. They never rewrite the worktree.
 uv run pytest --cov=scrapy_extension --cov-report=term-missing
 ```
 
-Target: **≥95%**. This is enforced by `tool.coverage.report.fail_under = 95`;
-coverage commands fail below that floor, and CI runs the coverage command on
-the Python 3.10 lane.
+CI independently enforces **≥95% statement coverage** and **≥91% branch
+coverage** on the Python 3.10 lane. The local command reports both metrics;
+`tool.coverage.report.fail_under` stays disabled because its combined percentage
+would not enforce those two contracts separately.
 
 ## Build
 
@@ -148,10 +149,15 @@ sockets explicitly allowed. RocketMQ uses the pure-Python Apache gRPC client
 and requires the broker proxy endpoint (usually `localhost:8081`), not the
 legacy NameServer-only port.
 
-## Architecture & rationale
+## Current project documentation
 
-- [`.claude/CLAUDE.md`](../.claude/CLAUDE.md) — project overview, backend/component
-  structure, multi-mode support, lazy imports.
-- [`docs/code-review-2026-06-15.md`](../docs/code-review-2026-06-15.md) — the
-  multi-round adversarial review record: design rationale, every fixed bug, and
-  the contract decisions the test suite enforces. The authoritative deep-dive.
+Use the maintained, tracked documentation rather than workstation notes or
+historical audit records:
+
+- [`README.md`](../README.md) — project overview, configuration, and supported
+  backend/component behavior.
+- [`STABILITY.md`](STABILITY.md) — public API and backend maturity commitments.
+- [`docs/runbook.md`](../docs/runbook.md) — deployment, monitoring, and incident
+  operations.
+- [`docs/migration-guide.md`](../docs/migration-guide.md) — upgrade and persisted
+  backlog migration procedures.

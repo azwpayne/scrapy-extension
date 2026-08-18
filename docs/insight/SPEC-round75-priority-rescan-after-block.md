@@ -1,6 +1,6 @@
 # SPEC — R75: PriorityQueueStrategy.pop/pop_with_ack miss lower-bucket arrivals after the p0 blocking wait
 
-> Back-navigation: [../insight/](.) · Round log in [MEMORY index](../../../../.claude/projects/-Users-payne-WorkSpace-project-individual-dev-web-crawler-scrapy-extension/memory/MEMORY.md).
+> Back-navigation: [../insight/](.) · The round log was maintained in local agent memory and is not part of this repository.
 > R84 fire (2026-08-11). No fresh scan — ships the R82-queued finding #3 (confirmed real, surgical, clean-file). R82's 4-dim scan produced it; R82 shipped #1, R83 shipped #2, this fire ships #3. One R82-confirmed finding remains queued (spider_mixin.py:182, low).
 
 ## Context and audit evidence
