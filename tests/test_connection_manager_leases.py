@@ -167,6 +167,79 @@ def test_one_interrupted_retirement_publication_repairs_event_and_ownership(
     backend.disconnect.assert_called_once_with()
 
 
+def test_waiting_retirement_contender_reclaims_unwound_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = ConnectionManager.acquire_lease(
+        BackendType.REDIS, {"host": "retirement-owner-unwinds"}
+    )
+    manager = lease.manager
+    disconnect_entered = threading.Event()
+    allow_disconnect = threading.Event()
+    waiter_entered = threading.Event()
+    backend = Mock()
+
+    def disconnect() -> None:
+        disconnect_entered.set()
+        assert allow_disconnect.wait(timeout=3)
+
+    backend.disconnect.side_effect = disconnect
+    manager._backend = backend
+
+    class _ObservedEvent(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            waiter_entered.set()
+            return super().wait(timeout)
+
+    manager._retirement_finalization_event = _ObservedEvent()
+    original_publish = manager._publish_retirement_complete
+    owner_thread_id: int | None = None
+
+    def interrupt_owner_publication() -> None:
+        if threading.get_ident() == owner_thread_id:
+            raise KeyboardInterrupt("retirement owner unwound")
+        original_publish()
+
+    monkeypatch.setattr(
+        manager, "_publish_retirement_complete", interrupt_owner_publication
+    )
+    owner_errors: list[BaseException] = []
+    waiter_errors: list[BaseException] = []
+
+    def release_owner() -> None:
+        nonlocal owner_thread_id
+        owner_thread_id = threading.get_ident()
+        try:
+            lease.release()
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            owner_errors.append(error)
+
+    def release_waiter() -> None:
+        try:
+            lease.release()
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            waiter_errors.append(error)
+
+    owner = threading.Thread(target=release_owner, name="retirement-owner")
+    waiter = threading.Thread(target=release_waiter, name="retirement-waiter")
+    owner.start()
+    assert disconnect_entered.wait(timeout=3)
+    waiter.start()
+    assert waiter_entered.wait(timeout=3)
+    allow_disconnect.set()
+    owner.join(timeout=3)
+    waiter.join(timeout=3)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert len(owner_errors) == 1
+    assert isinstance(owner_errors[0], KeyboardInterrupt)
+    assert waiter_errors == []
+    assert manager._retirement_complete is True
+    assert manager._retirement_finalization_event.is_set()
+    backend.disconnect.assert_called_once_with()
+
+
 def test_duplicate_concurrent_release_waits_for_retirement_completion() -> None:
     lease = ConnectionManager.acquire_lease(
         BackendType.REDIS, {"host": "concurrent-release"}

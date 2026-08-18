@@ -3210,8 +3210,40 @@ class ConnectionManager:
                     self._breaker.reset()
 
         if wait_for_finalizer is not None:
-            wait_for_finalizer.wait()
-            return
+            # The owner can unwind after this contender observes it but before it
+            # publishes the event. Periodically re-check frame-scoped liveness so
+            # a one-shot control exception cannot strand every later releaser.
+            while not wait_for_finalizer.wait(timeout=0.01):
+                with self._lock:
+                    if self._retirement_complete:
+                        return
+                    current_owner = self._retirement_finalizer_token
+                    if (
+                        self._retirement_finalizing
+                        and current_owner is not None
+                        and current_owner.active
+                    ):
+                        continue
+                    self._retirement_finalizing = True
+                    self._retirement_finalizer_thread_id = finalizer_token.thread_id
+                    self._retirement_finalizer_token = finalizer_token
+                    wait_for_finalizer = None
+                    if self._retiring_backend is None and self._backend is not None:
+                        self._retiring_backend = self._backend
+                        self._backend = None
+                    if self._retiring_adapter is None:
+                        (
+                            self._retiring_adapter,
+                            self._retiring_adapter_source,
+                        ) = self._detach_plugin_queue_backend_under_lock()
+                    if not self._retirement_disconnect_started:
+                        self._retirement_disconnect_started = True
+                        backend_to_disconnect = self._retiring_backend
+                    if self._breaker is not None:
+                        self._breaker.reset()
+                    break
+            if wait_for_finalizer is not None:
+                return
 
         disconnect_failed = False
         control_error: BaseException | None = None
