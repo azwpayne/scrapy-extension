@@ -2,29 +2,46 @@
 
 from __future__ import annotations
 
-import random
+import math
 
 import pytest
 
+from scrapy_extension.dupefilter.filters import bloom_filter as bloom_filter_module
 from scrapy_extension.dupefilter.filters.bloom_filter import BloomMembershipFilter
+
+
+def _false_positive_upper_bound(flt: BloomMembershipFilter) -> float:
+    """Upper-bound the FPR at capacity for k distinct positions per item."""
+    unset_probability = math.exp(
+        flt.capacity * math.log1p(-flt.num_hashes / flt.num_bits)
+    )
+    return (1.0 - unset_probability) ** flt.num_hashes
 
 
 class TestBloomMembershipFilterSizing:
     """Capacity/error-rate validation and derived m, k."""
 
-    def test_invalid_capacity(self) -> None:
+    @pytest.mark.parametrize("capacity", [0, -1])
+    def test_invalid_capacity_value(self, capacity: int) -> None:
         with pytest.raises(ValueError, match="capacity"):
-            BloomMembershipFilter(capacity=0, error_rate=0.01)
-        with pytest.raises(ValueError, match="capacity"):
-            BloomMembershipFilter(capacity=-1, error_rate=0.01)
+            BloomMembershipFilter(capacity=capacity, error_rate=0.01)
 
-    def test_invalid_error_rate(self) -> None:
+    @pytest.mark.parametrize("capacity", [True, 1.0, "100", None])
+    def test_invalid_capacity_type(self, capacity: object) -> None:
+        with pytest.raises(TypeError, match="capacity"):
+            BloomMembershipFilter(capacity=capacity, error_rate=0.01)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "error_rate", [0.0, 1.0, 1.5, -0.1, math.inf, -math.inf, math.nan]
+    )
+    def test_invalid_error_rate_value(self, error_rate: float) -> None:
         with pytest.raises(ValueError, match="error_rate"):
-            BloomMembershipFilter(capacity=100, error_rate=0.0)
-        with pytest.raises(ValueError, match="error_rate"):
-            BloomMembershipFilter(capacity=100, error_rate=1.0)
-        with pytest.raises(ValueError, match="error_rate"):
-            BloomMembershipFilter(capacity=100, error_rate=1.5)
+            BloomMembershipFilter(capacity=100, error_rate=error_rate)
+
+    @pytest.mark.parametrize("error_rate", [True, 1, "0.01", None])
+    def test_invalid_error_rate_type(self, error_rate: object) -> None:
+        with pytest.raises(TypeError, match="error_rate"):
+            BloomMembershipFilter(capacity=100, error_rate=error_rate)  # type: ignore[arg-type]
 
     def test_sizing_positive(self) -> None:
         flt = BloomMembershipFilter(capacity=1000, error_rate=0.01)
@@ -36,6 +53,77 @@ class TestBloomMembershipFilterSizing:
         tight = BloomMembershipFilter(capacity=1000, error_rate=0.001)
         assert tight.num_bits > loose.num_bits
         assert tight.num_hashes >= loose.num_hashes
+
+    @pytest.mark.parametrize(
+        ("capacity", "error_rate"),
+        [
+            (1, 0.9),
+            (1, 0.01),
+            (2, 0.9),
+            (3, 0.5),
+            (5, 0.1),
+            (100, 0.9),
+            (100, 0.01),
+        ],
+    )
+    def test_integer_hash_sizing_honors_requested_bound(
+        self, capacity: int, error_rate: float
+    ) -> None:
+        """m is recomputed after k is integral, including tiny/high-FPR cases."""
+        flt = BloomMembershipFilter(capacity=capacity, error_rate=error_rate)
+
+        assert _false_positive_upper_bound(flt) <= error_rate
+
+        if flt.num_bits - 1 == flt.num_hashes:
+            smaller_bound = 1.0
+        else:
+            smaller_unset_probability = math.exp(
+                capacity * math.log1p(-flt.num_hashes / (flt.num_bits - 1))
+            )
+            smaller_bound = (1.0 - smaller_unset_probability) ** flt.num_hashes
+        assert smaller_bound > error_rate
+
+    def test_default_capacity_minimum_float_is_rejected_before_allocation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_allocation(_size: int) -> bytearray:
+            raise AssertionError("bytearray allocation was attempted")
+
+        monkeypatch.setattr(
+            bloom_filter_module, "bytearray", fail_allocation, raising=False
+        )
+
+        with pytest.raises(ValueError, match="memory budget"):
+            BloomMembershipFilter(
+                capacity=1_000_000,
+                error_rate=math.nextafter(0.0, 1.0),
+            )
+
+    def test_allocation_budget_uses_rounded_byte_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bloom_filter_module, "_MAX_FILTER_BYTES", 1)
+
+        at_boundary = BloomMembershipFilter(capacity=1, error_rate=0.0625)
+        assert at_boundary.num_bits == 8
+        assert len(at_boundary._bits) == 1
+
+        with pytest.raises(ValueError, match=r"2 bytes.*1-byte memory budget"):
+            BloomMembershipFilter(capacity=1, error_rate=0.0442)
+
+    @pytest.mark.parametrize(
+        ("capacity", "error_rate"), [(1, 0.9), (2, 0.5), (3, 0.1), (20, 0.01)]
+    )
+    def test_indices_are_exactly_k_distinct_positions(
+        self, capacity: int, error_rate: float
+    ) -> None:
+        flt = BloomMembershipFilter(capacity=capacity, error_rate=error_rate)
+
+        for item_number in range(100):
+            indices = list(flt._indices(f"item-{item_number}".encode()))
+            assert len(indices) == flt.num_hashes
+            assert len(set(indices)) == flt.num_hashes
+            assert all(0 <= index < flt.num_bits for index in indices)
 
 
 class TestBloomMembershipFilterOps:
@@ -86,19 +174,23 @@ class TestBloomMembershipFilterOps:
             flt.remove(b"a")
 
     def test_false_positive_rate_bounded(self) -> None:
-        """FP rate stays within a generous multiple of target (seeded → deterministic)."""
+        """Observed FPR stays below a deterministic one-sided Hoeffding bound."""
         capacity = 2000
         target = 0.05
+        trials = 20_000
+        significance = 1e-9
         flt = BloomMembershipFilter(capacity=capacity, error_rate=target)
         for i in range(capacity):
             flt.add(f"seen-{i}".encode())
-        rng = random.Random(12345)  # fixed seed → reproducible
-        fp = sum(
-            1 for _ in range(2000) if f"u-{rng.randrange(1 << 60)}".encode() in flt
+
+        false_positives = sum(f"unseen-{i}".encode() in flt for i in range(trials))
+        allowed = math.ceil(
+            trials * target + math.sqrt(trials * math.log(1.0 / significance) / 2.0)
         )
-        rate = fp / 2000
-        # 5x target margin: proves low FP without flakiness.
-        assert rate < target * 5, f"FP rate {rate:.3f} exceeded {target * 5}"
+        assert false_positives <= allowed, (
+            f"observed {false_positives}/{trials} false positives; "
+            f"one-sided bound allows {allowed}/{trials}"
+        )
 
     def test_open_close_noops(self) -> None:
         flt = BloomMembershipFilter(capacity=100, error_rate=0.01)

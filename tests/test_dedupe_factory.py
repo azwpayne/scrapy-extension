@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 import pytest
 from scrapy.http import Request
@@ -159,6 +160,35 @@ class TestFromSettingsStrategyWiring:
         )
         df = BackendDupeFilter.from_settings(settings)
         assert isinstance(df._filter, BloomMembershipFilter)
+
+    @pytest.mark.parametrize(
+        ("override", "expected_setting"),
+        [
+            (
+                {
+                    "SCRAPY_DEDUP_BLOOM_ERROR_RATE": math.nextafter(0.0, 1.0),
+                },
+                "SCRAPY_DEDUP_BLOOM_ERROR_RATE",
+            ),
+            (
+                {"SCRAPY_DEDUP_BLOOM_CAPACITY": 1_000_000_000_000},
+                "SCRAPY_DEDUP_BLOOM_CAPACITY",
+            ),
+        ],
+    )
+    def test_bloom_allocation_error_attributes_explicit_setting(
+        self, mocker, override: dict[str, object], expected_setting: str
+    ) -> None:
+        settings, _ = _make_settings(
+            mocker,
+            {"SCRAPY_DEDUP_STRATEGY": "bloom", **override},
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            BackendDupeFilter.from_settings(settings)
+
+        assert exc_info.value.setting_name == expected_setting
+        assert "memory budget" in str(exc_info.value)
 
     def test_cuckoo_strategy(self, mocker) -> None:
         settings, _ = _make_settings(

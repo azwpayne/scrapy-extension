@@ -1,10 +1,15 @@
 """Stdlib Bloom-filter membership strategy (subsystem ①).
 
 Probabilistic, in-process, space-efficient. Never produces false negatives;
-false-positive rate is bounded by ``error_rate`` at ``capacity`` items. Neither
-Bloom nor Cuckoo supports item-level removal; use the exact memory or set
-strategy when that is required. Cuckoo supports only a whole-filter ``clear()``.
-State is per-process, not shared across workers.
+false-positive rate is bounded by ``error_rate`` at ``capacity`` items. Does
+not support deletion — use the cuckoo strategy for that. State is per-process,
+not shared across workers.
+
+Each item maps to ``k`` distinct positions. The sizing bound therefore uses
+sampling without replacement within an item rather than assuming that repeated
+hash positions provide ``k`` independent checks. Allocations are capped at a
+conservative 128 MiB per filter so extreme, otherwise-valid settings fail before
+``bytearray`` can exhaust the process.
 """
 
 from __future__ import annotations
@@ -17,13 +22,24 @@ from collections.abc import Iterator
 
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
 
+_MAX_HASHES = 64
+_HASH_DOMAIN = b"scrapy-extension:bloom:v1\x00"
+_HASH_RANGE = 1 << 256
+# A process can host multiple spiders/filters. Keep a single Bloom vector at or
+# below 128 MiB so configuration mistakes cannot consume all typical worker RAM.
+_MAX_FILTER_BYTES = 128 * 1024 * 1024
+
+
+class _BloomFilterAllocationError(ValueError):
+    """The requested Bloom sizing exceeds the process-safe allocation budget."""
+
 
 class BloomMembershipFilter(MembershipFilter):
     """Pure-stdlib Bloom filter.
 
-    Uses a ``bytearray`` bit-vector and Kirsch-Mitzenmacher double hashing:
-    ``g_i(x) = (h1 + i·h2) mod m``, where ``h1`` and ``h2`` are the two 64-bit
-    halves of ``sha256(item)``. ``k`` hash functions are derived from just two.
+    Uses a ``bytearray`` bit-vector. Domain-separated SHA-256 samples drive
+    Floyd's algorithm for uniform sampling without replacement, so every item
+    maps to exactly ``k`` distinct positions.
 
     Attributes:
         _num_bits: Bit-vector length ``m``.
@@ -40,17 +56,47 @@ class BloomMembershipFilter(MembershipFilter):
             error_rate: Target false-positive probability at ``capacity`` items.
 
         Raises:
-            ValueError: If capacity is not positive or error_rate is outside (0, 1).
+            TypeError: If capacity is not an integer or error_rate is not a float.
+            ValueError: If capacity is not positive, error_rate is not finite and
+                inside (0, 1), or the resulting vector exceeds the 128 MiB budget.
         """
+        if isinstance(capacity, bool) or not isinstance(capacity, int):
+            raise TypeError(
+                f"capacity must be a positive integer, got {type(capacity).__name__}"
+            )
         if capacity <= 0:
             raise ValueError(f"capacity must be a positive integer, got {capacity}")
-        if not 0.0 < error_rate < 1.0:
-            raise ValueError(
-                f"error_rate must be in the open interval (0, 1), got {error_rate}"
+        if isinstance(error_rate, bool) or not isinstance(error_rate, float):
+            raise TypeError(
+                f"error_rate must be a float, got {type(error_rate).__name__}"
             )
-        ln2 = math.log(2)
-        m = max(8, math.ceil(-capacity * math.log(error_rate) / (ln2 * ln2)))
-        k = max(1, round((m / capacity) * ln2))
+        if not math.isfinite(error_rate) or not 0.0 < error_rate < 1.0:
+            raise ValueError(
+                f"error_rate must be a finite float in the open interval (0, 1), "
+                f"got {error_rate}"
+            )
+
+        # The continuous optimum is -log2(p). Choose an integer k first, cap
+        # hash work at a practical constant, and then solve m for that exact k.
+        # Capping k does not relax the requested bound: m grows as necessary.
+        k = min(_MAX_HASHES, max(1, round(-math.log2(error_rate))))
+        max_bits = _MAX_FILTER_BYTES * 8
+        # Every viable vector has m > n. This cheap integer-only check handles
+        # arbitrarily large Python ints without first converting them to float.
+        if capacity >= max_bits:
+            self._raise_allocation_error(capacity + 1)
+        target_root = math.exp(math.log(error_rate) / k)
+        denominator = -math.expm1(math.log1p(-target_root) / capacity)
+        m = max(k + 1, math.ceil(k / denominator))
+        self._check_allocation(m)
+
+        # Guard against downward floating-point rounding at the boundary.
+        # Compare in log space so very small representable rates stay stable.
+        log_error_rate = math.log(error_rate)
+        while self._log_false_positive_bound(capacity, m, k) > log_error_rate:
+            m += 1
+            self._check_allocation(m)
+
         self._num_bits = m
         self._num_hashes = k
         self._bits = bytearray((m + 7) >> 3)
@@ -102,24 +148,69 @@ class BloomMembershipFilter(MembershipFilter):
         """
         return len(self) / self._capacity
 
-    def _indices(self, item: bytes) -> Iterator[int]:
-        """Yield the k bit positions for ``item`` via double hashing.
+    @staticmethod
+    def _log_false_positive_bound(
+        capacity: int, num_bits: int, num_hashes: int
+    ) -> float:
+        """Return the log FPR upper bound for distinct per-item positions."""
+        log_unset_probability = capacity * math.log1p(-num_hashes / num_bits)
+        set_probability = -math.expm1(log_unset_probability)
+        return num_hashes * math.log(set_probability)
 
-        Two 64-bit seeds come from a single ``sha256``; the k indices are
-        ``g_i = (h1 + i·h2) mod m`` for i in 0..k-1.
+    @staticmethod
+    def _raise_allocation_error(num_bits: int) -> None:
+        """Raise a bounded-allocation error without constructing the vector."""
+        required_bytes = (num_bits + 7) >> 3
+        raise _BloomFilterAllocationError(
+            f"capacity/error_rate pair requires at least {required_bytes} bytes, "
+            f"exceeding the {_MAX_FILTER_BYTES}-byte memory budget"
+        )
+
+    @classmethod
+    def _check_allocation(cls, num_bits: int) -> None:
+        """Reject a rounded byte length above the documented memory budget."""
+        if (num_bits + 7) >> 3 > _MAX_FILTER_BYTES:
+            cls._raise_allocation_error(num_bits)
+
+    @staticmethod
+    def _uniform_index(item: bytes, hash_index: int, upper_bound: int) -> int:
+        """Derive an unbiased index in ``range(upper_bound)`` for one domain."""
+        limit = _HASH_RANGE - (_HASH_RANGE % upper_bound)
+        attempt = 0
+        while True:
+            digest = hashlib.sha256(
+                _HASH_DOMAIN
+                + hash_index.to_bytes(1, "big")
+                + attempt.to_bytes(4, "big")
+                + item
+            ).digest()
+            sample = int.from_bytes(digest, "big")
+            if sample < limit:
+                return sample % upper_bound
+            attempt += 1
+
+    def _indices(self, item: bytes) -> Iterator[int]:
+        """Yield exactly k distinct, domain-separated positions for ``item``.
+
+        Floyd's sampling algorithm selects a uniform k-subset of the m bit
+        positions without allocating an m-sized auxiliary collection. Each
+        sample has its own hash domain; rejection avoids modulo bias.
 
         Args:
             item: Fingerprint bytes.
 
         Yields:
-            Bit positions in [0, m).
+            Distinct bit positions in [0, m).
         """
-        digest = hashlib.sha256(item).digest()
-        h1 = int.from_bytes(digest[:8], "big")
-        h2 = int.from_bytes(digest[8:16], "big")
         m = self._num_bits
-        for i in range(self._num_hashes):
-            yield (h1 + i * h2) % m
+        k = self._num_hashes
+        selected: set[int] = set()
+        for hash_index, upper_index in enumerate(range(m - k, m)):
+            position = self._uniform_index(item, hash_index, upper_index + 1)
+            if position in selected:
+                position = upper_index
+            selected.add(position)
+            yield position
 
     def add(self, item: bytes) -> bool:
         """Record item; True if newly added, False if (probably) already present.

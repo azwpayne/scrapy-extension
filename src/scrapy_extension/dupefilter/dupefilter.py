@@ -498,6 +498,9 @@ class BackendDupeFilter:
             ConnectionManager,
             resolve_backend_config,
         )
+        from scrapy_extension.dupefilter.filters.bloom_filter import (
+            _BloomFilterAllocationError,
+        )
         from scrapy_extension.dupefilter.filters.factory import (
             DedupeStrategy,
             build_membership_filter,
@@ -608,6 +611,23 @@ class BackendDupeFilter:
                 )
             except ConfigurationError:
                 raise
+            except _BloomFilterAllocationError as exc:
+                # Sizing depends on both Bloom knobs. Attribute a budget failure
+                # to the sole explicit knob when possible; if both were supplied,
+                # capacity remains the actionable allocation-control setting.
+                capacity_setting = "SCRAPY_DEDUP_BLOOM_CAPACITY"
+                error_rate_setting = "SCRAPY_DEDUP_BLOOM_ERROR_RATE"
+                constructor_setting = (
+                    error_rate_setting
+                    if settings.getpriority(capacity_setting) is None
+                    and settings.getpriority(error_rate_setting) is not None
+                    else capacity_setting
+                )
+                raise ConfigurationError(
+                    f"Invalid {constructor_setting}: {exc}",
+                    setting_name=constructor_setting,
+                    setting_value=settings.get(constructor_setting),
+                ) from exc
             except (TypeError, ValueError, OverflowError) as exc:
                 constructor_setting = {
                     DedupeStrategy.MEMORY: "SCRAPY_DEDUP_MEMORY_MAXSIZE",
