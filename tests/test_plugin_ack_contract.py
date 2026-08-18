@@ -98,6 +98,35 @@ class _NonBooleanMetadata(_DeferredPlugin):
     requires_ack = 1  # type: ignore[assignment]
 
 
+class _CoroutineSettlementPlugin(_DeferredPlugin):
+    async def ack(self, queue_name: str, *, token: Any | None = None) -> None:
+        raise AssertionError("async ack body must not be invoked")
+
+    async def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+        raise AssertionError("async nack body must not be invoked")
+
+
+class _CustomAwaitable:
+    def __await__(self) -> Any:
+        yield
+
+
+async def _unstarted_settlement_coroutine() -> None:
+    raise AssertionError("settlement coroutine body must not be invoked")
+
+
+class _AwaitableSettlementPlugin(_DeferredPlugin):
+    settlement_result: object | None = None
+
+    def ack(self, queue_name: str, *, token: Any | None = None) -> None:
+        self.ack_calls.append((queue_name, token))
+        return self.settlement_result  # type: ignore[return-value]
+
+    def nack(self, queue_name: str, *, token: Any | None = None) -> None:
+        self.nack_calls.append((queue_name, token))
+        return self.settlement_result  # type: ignore[return-value]
+
+
 class _HostileMethodDescriptor:
     def __get__(self, instance: object, owner: type[object]) -> object:
         del instance, owner
@@ -244,6 +273,37 @@ def test_manager_ignores_backend_module_mutation_after_validation(
     assert manager._static_ack_capabilities() == (True, True)
 
 
+def test_manager_statically_rejects_coroutine_settlement_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _CoroutineSettlementPlugin)
+
+    with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+        ConnectionManager("ackplugin")
+
+
+@pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
+def test_manager_statically_rejects_signature_incompatible_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    if method_name == "pop_with_ack":
+
+        def incompatible(self: object, queue_name: str) -> None:
+            raise AssertionError("incompatible hook must not be invoked")
+
+    else:
+
+        def incompatible(self: object, queue_name: str) -> None:
+            raise AssertionError("incompatible hook must not be invoked")
+
+    monkeypatch.setattr(_DeferredPlugin, method_name, incompatible)
+    _install_plugin(monkeypatch, _DeferredPlugin)
+
+    with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+        ConnectionManager("ackplugin")
+
+
 @pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
 def test_manager_statically_rejects_noncallable_method_descriptors(
     monkeypatch: pytest.MonkeyPatch,
@@ -258,6 +318,41 @@ def test_manager_statically_rejects_noncallable_method_descriptors(
 
     with pytest.raises(ConfigurationError, match="acknowledgement contract"):
         ConnectionManager("ackplugin")
+
+
+@pytest.mark.parametrize("operation", ["ack", "nack"])
+@pytest.mark.parametrize("awaitable_kind", ["coroutine", "custom"])
+def test_awaitable_settlement_is_redacted_and_keeps_token_retryable(
+    operation: str,
+    awaitable_kind: str,
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    marker = f"awaitable-settlement-private-{operation}-{awaitable_kind}"
+    backend = _AwaitableSettlementPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    backend.pop_results["q"].append((b"item", marker))
+    contract.pop_with_ack("q")
+    backend.settlement_result = (
+        _unstarted_settlement_coroutine()
+        if awaitable_kind == "coroutine"
+        else _CustomAwaitable()
+    )
+
+    with pytest.raises(QueueError) as exc_info:
+        getattr(contract, operation)("q", token=marker)
+
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
+    assert "awaitable settlement result" in str(exc_info.value)
+    backend.settlement_result = None
+    getattr(contract, operation)("q", token=marker)
+    calls = backend.ack_calls if operation == "ack" else backend.nack_calls
+    assert calls == [("q", marker), ("q", marker)]
+    assert not [
+        warning for warning in recwarn if "never awaited" in str(warning.message)
+    ]
 
 
 def test_deferred_plugin_rejects_empty_and_missing_tokens() -> None:

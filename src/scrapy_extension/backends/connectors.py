@@ -33,10 +33,10 @@ from decimal import Decimal
 from difflib import get_close_matches
 from enum import Enum
 from functools import wraps
-from inspect import getattr_static
+from inspect import getattr_static, isawaitable, iscoroutinefunction, signature
 from json import JSONEncoder
 from pathlib import PurePath
-from types import ModuleType
+from types import CoroutineType, FunctionType, ModuleType
 from typing import Any, ClassVar, ParamSpec, TypeVar, cast
 from uuid import UUID
 
@@ -479,17 +479,25 @@ def _validate_plugin_ack_class(
     )
     if type(supports_concurrent) is not bool:
         raise _invalid_plugin_ack_contract()
-    for method_name in ("pop_with_ack", "ack", "nack"):
+    method_calls: dict[str, tuple[tuple[object, ...], dict[str, object]]] = {
+        "pop_with_ack": ((object(), "queue", 0.0), {}),
+        "ack": ((object(), "queue"), {"token": object()}),
+        "nack": ((object(), "queue"), {"token": object()}),
+    }
+    for method_name, (args, kwargs) in method_calls.items():
         method = getattr_static(backend_cls, method_name, None)
         default_method = getattr_static(QueueBackend, method_name, None)
-        is_abstract = getattr_static(method, "__isabstractmethod__", False)
         if (
-            method is None
+            type(method) is not FunctionType
             or method is default_method
-            or not callable(method)
-            or is_abstract is True
+            or getattr_static(method, "__isabstractmethod__", False) is True
+            or (method_name in {"ack", "nack"} and iscoroutinefunction(method))
         ):
             raise _invalid_plugin_ack_contract()
+        try:
+            signature(method).bind(*args, **kwargs)
+        except (TypeError, ValueError):
+            raise _invalid_plugin_ack_contract() from None
     return True
 
 
@@ -564,12 +572,14 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
         {
             "Deferred-ack settlement requires an issued acknowledgement token",
             "Deferred-ack settlement rejected an unknown acknowledgement token",
+            "Deferred-ack backend returned an awaitable settlement result",
         }
     ),
     "nack": frozenset(
         {
             "Deferred-ack settlement requires an issued acknowledgement token",
             "Deferred-ack settlement rejected an unknown acknowledgement token",
+            "Deferred-ack backend returned an awaitable settlement result",
         }
     ),
 }
@@ -709,10 +719,21 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
                     operation=operation,
                 )
             try:
-                if operation == "ack":
-                    self._delegate.ack(queue_name, token=token)
-                else:
-                    self._delegate.nack(queue_name, token=token)
+                settle_hook = cast(
+                    "Callable[..., Any]",
+                    self._delegate.ack if operation == "ack" else self._delegate.nack,
+                )
+                result = settle_hook(queue_name, token=token)
+                if isawaitable(result):
+                    # Native coroutine objects warn when garbage-collected without
+                    # being awaited. Close without advancing user code, then reject
+                    # the asynchronous contract while the token remains retryable.
+                    if type(result) is CoroutineType:
+                        CoroutineType.close(result)
+                    raise QueueError(
+                        "Deferred-ack backend returned an awaitable settlement result",
+                        operation=operation,
+                    )
             except BaseException:
                 raise
             else:
