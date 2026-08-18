@@ -1247,10 +1247,17 @@ class PulsarBackend(Backend, QueueBackend):
                     self._lifecycle_lock.release()
 
             if terminal_error is not None:
-                if retirement is not None and not retirement.completed.wait(
-                    max(0.0, self._receive_shutdown_timeout)
-                ):
-                    self._log_close_shutdown_timeout()
+                if retirement is not None:
+                    shutdown_budget = max(0.0, self._receive_shutdown_timeout)
+                    caller_remaining = (
+                        0.0
+                        if deadline is None
+                        else max(0.0, deadline - monotonic())
+                    )
+                    close_wait = min(shutdown_budget, caller_remaining)
+                    if close_wait > 0 and not retirement.completed.wait(close_wait):
+                        if shutdown_budget <= caller_remaining:
+                            self._log_close_shutdown_timeout()
                 # Retirement cleanup must not replace either a static QueueError or a
                 # preserved process-control exception crossing the worker boundary.
                 raise terminal_error

@@ -252,6 +252,45 @@ def test_transient_receive_failure_is_retired_for_next_poll(mocker: Any) -> None
         backend.disconnect()
 
 
+@pytest.mark.parametrize("timeout", [0.0, 0.05], ids=["zero", "positive"])
+def test_terminal_retirement_never_exceeds_caller_budget(
+    mocker: Any, timeout: float
+) -> None:
+    """A failed close starts, but terminal delivery honors the poll deadline."""
+    close_started = Event()
+    release_close = Event()
+    failed_consumer = MagicMock(name="budgeted-failed-consumer")
+    failed_consumer.receive.side_effect = RuntimeError("budgeted receive failure")
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    failed_consumer.close.side_effect = blocked_close
+    backend = _connected_backend(mocker, [failed_consumer])
+    backend._receive_shutdown_timeout = 0.5
+    topic = "scrapy-budgeted-retirement"
+    try:
+        assert backend.pop("budgeted-retirement", timeout=0) is None
+        failed_pump = backend._receive_pumps[topic]
+        assert failed_pump.stopped.wait(timeout=0.5)
+
+        started = monotonic()
+        with pytest.raises(QueueError, match="Failed to pop Pulsar message"):
+            backend.pop("budgeted-retirement", timeout=timeout)
+        elapsed = monotonic() - started
+
+        assert close_started.is_set()
+        assert list(backend._consumer_retirements) == [topic]
+        if timeout == 0:
+            assert elapsed < 0.1
+        else:
+            assert elapsed >= 0.04
+            assert elapsed < 0.2
+    finally:
+        release_close.set()
+
+
 @pytest.mark.parametrize("consumer_type", ["Exclusive", "Failover"])
 @pytest.mark.parametrize(
     "receive_error",
