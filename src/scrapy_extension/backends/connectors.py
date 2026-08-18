@@ -481,7 +481,14 @@ def _validate_plugin_ack_class(
         raise _invalid_plugin_ack_contract()
     for method_name in ("pop_with_ack", "ack", "nack"):
         method = getattr_static(backend_cls, method_name, None)
-        if method is None or method is getattr(QueueBackend, method_name):
+        default_method = getattr_static(QueueBackend, method_name, None)
+        is_abstract = getattr_static(method, "__isabstractmethod__", False)
+        if (
+            method is None
+            or method is default_method
+            or not callable(method)
+            or is_abstract is True
+        ):
             raise _invalid_plugin_ack_contract()
     return True
 
@@ -528,9 +535,87 @@ def _ack_token_key(token: Any) -> tuple[object, ...]:
 def _is_empty_ack_token(token: Any) -> bool:
     """Recognize only exact empty built-in containers; never call plugin hooks."""
     return (
-        type(token) in {str, bytes, tuple, list, dict, set, frozenset}
+        type(token)
+        in {
+            str,
+            bytes,
+            bytearray,
+            memoryview,
+            tuple,
+            list,
+            dict,
+            set,
+            frozenset,
+        }
         and len(token) == 0
     )
+
+
+_DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
+    "pop": frozenset(
+        {
+            "Deferred-ack backend returned an invalid delivery result",
+            "Deferred-ack backend returned a delivery without an acknowledgement token",
+            "Deferred-ack backend returned an empty acknowledgement token",
+            "Deferred-ack backend reused an active acknowledgement token",
+        }
+    ),
+    "ack": frozenset(
+        {
+            "Deferred-ack settlement requires an issued acknowledgement token",
+            "Deferred-ack settlement rejected an unknown acknowledgement token",
+        }
+    ),
+    "nack": frozenset(
+        {
+            "Deferred-ack settlement requires an issued acknowledgement token",
+            "Deferred-ack settlement rejected an unknown acknowledgement token",
+        }
+    ),
+}
+
+
+def _deferred_ack_queue_error_boundary(
+    operation: str,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """Rebuild adapter errors after private delivery and token frames unwind."""
+
+    def decorate(function: Callable[_P, _T]) -> Callable[_P, _T]:
+        @wraps(function)
+        def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            caught_error: QueueError | None = None
+            try:
+                return function(*args, **kwargs)
+            except QueueError as error:
+                caught_error = error
+            except BaseException:
+                del args
+                del kwargs
+                raise
+
+            message = "Deferred-ack queue operation failed."
+            raw_args: object = None
+            assert caught_error is not None
+            if type(caught_error) is QueueError:
+                raw_args = caught_error.args
+                if (
+                    type(raw_args) is tuple
+                    and len(raw_args) == 1
+                    and type(raw_args[0]) is str
+                    and raw_args[0] in _DEFERRED_ACK_QUEUE_ERROR_MESSAGES[operation]
+                ):
+                    message = raw_args[0]
+            sanitized_error = QueueError(message, operation=operation)
+            del args
+            del kwargs
+            del caught_error
+            del raw_args
+            del message
+            raise sanitized_error
+
+        return wrapped
+
+    return decorate
 
 
 class _DeferredAckPluginQueueBackend(QueueBackend):
@@ -565,6 +650,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
     def clear_queue(self, queue_name: str) -> None:
         self._delegate.clear_queue(queue_name)
 
+    @_deferred_ack_queue_error_boundary("pop")
     def pop_with_ack(
         self,
         queue_name: str,
@@ -600,9 +686,11 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
             active.add(key)
         return (item, token)
 
+    @_deferred_ack_queue_error_boundary("ack")
     def ack(self, queue_name: str, *, token: Any | None = None) -> None:
         self._settle("ack", queue_name, token)
 
+    @_deferred_ack_queue_error_boundary("nack")
     def nack(self, queue_name: str, *, token: Any | None = None) -> None:
         self._settle("nack", queue_name, token)
 

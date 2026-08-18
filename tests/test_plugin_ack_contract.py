@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from collections import defaultdict, deque
 from typing import Any
 
@@ -95,6 +96,12 @@ class _NonBooleanMetadata(_DeferredPlugin):
     requires_ack = 1  # type: ignore[assignment]
 
 
+class _HostileMethodDescriptor:
+    def __get__(self, instance: object, owner: type[object]) -> object:
+        del instance, owner
+        raise AssertionError("plugin method descriptor was invoked")
+
+
 _PLUGIN_CLASS: type[_QueuePlugin] = _QueuePlugin
 
 
@@ -159,17 +166,129 @@ def test_manager_conformance_matrix_fails_before_construction_or_broker_io(
     assert manager._backend is None
 
 
+@pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
+def test_manager_statically_rejects_noncallable_method_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    monkeypatch.setattr(
+        _DeferredPlugin,
+        method_name,
+        _HostileMethodDescriptor(),
+    )
+    _install_plugin(monkeypatch, _DeferredPlugin)
+
+    with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+        ConnectionManager("ackplugin")
+
+
 def test_deferred_plugin_rejects_empty_and_missing_tokens() -> None:
     backend = _DeferredPlugin()
     contract = _DeferredAckPluginQueueBackend(
         backend,
         supports_concurrent_ack=True,
     )
-    empty_tokens: tuple[Any, ...] = (None, "", b"", (), [], {}, set(), frozenset())
+    empty_tokens: tuple[Any, ...] = (
+        None,
+        "",
+        b"",
+        bytearray(),
+        memoryview(b""),
+        (),
+        [],
+        {},
+        set(),
+        frozenset(),
+    )
     for token in empty_tokens:
         backend.pop_results["q"].append((b"item", token))
         with pytest.raises(QueueError, match="token"):
             contract.pop_with_ack("q")
+
+
+def _assert_value_graph_is_redacted(
+    value: object,
+    marker: str,
+    seen: set[int] | None = None,
+) -> None:
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return
+    seen.add(value_id)
+    if isinstance(value, str):
+        assert marker not in value
+        return
+    if isinstance(value, bytes):
+        assert marker.encode() not in value
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _assert_value_graph_is_redacted(key, marker, seen)
+            _assert_value_graph_is_redacted(item, marker, seen)
+        return
+    if isinstance(value, (tuple, list, set, frozenset)):
+        for item in value:
+            _assert_value_graph_is_redacted(item, marker, seen)
+        return
+    try:
+        attributes = vars(value)
+    except TypeError:
+        return
+    _assert_value_graph_is_redacted(attributes, marker, seen)
+
+
+def _assert_terminal_queue_error_is_redacted(error: QueueError, marker: str) -> None:
+    assert marker not in str(error)
+    assert marker not in repr(error.args)
+    assert marker not in repr(error.__dict__)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_value_graph_is_redacted(error, marker)
+    assert marker not in "".join(traceback.format_exception(error))
+
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            for value in frame.f_locals.values():
+                _assert_value_graph_is_redacted(value, marker)
+        trace = trace.tb_next
+
+
+@pytest.mark.parametrize("case", ["missing", "empty", "duplicate", "forged", "cross"])
+def test_deferred_ack_contract_errors_drop_recursive_private_markers(
+    case: str,
+) -> None:
+    marker = f"deferred-ack-private-{case}"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+
+    with pytest.raises(QueueError) as exc_info:
+        if case == "missing":
+            backend.pop_results[marker].append((marker.encode(), None))
+            contract.pop_with_ack(marker)
+        elif case == "empty":
+            backend.pop_results[marker].append((marker.encode(), memoryview(b"")))
+            contract.pop_with_ack(marker)
+        elif case == "duplicate":
+            backend.pop_results[marker].extend(
+                [(marker.encode(), marker), (marker.encode(), marker)]
+            )
+            contract.pop_with_ack(marker)
+            contract.pop_with_ack(marker)
+        elif case == "forged":
+            contract.ack(marker, token=marker)
+        else:
+            backend.pop_results["issued-queue"].append((marker.encode(), marker))
+            contract.pop_with_ack("issued-queue")
+            contract.ack(marker, token=marker)
+
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
 
 
 def test_deferred_plugin_rejects_forged_and_cross_queue_tokens() -> None:
