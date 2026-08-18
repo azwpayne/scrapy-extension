@@ -2265,7 +2265,12 @@ class ConnectionManager:
             manager._retirement_event.set()
             backend = manager._backend
             manager._backend = None
-            manager._clear_plugin_queue_backend_under_lock()
+            retired_adapter, retired_source = (
+                manager._detach_plugin_queue_backend_under_lock()
+            )
+        # An adapter can own hostile identity tokens whose destructors re-enter the
+        # manager. Release the complete cache generation only after ``_lock`` is free.
+        del retired_adapter, retired_source
         if backend is not None:
             try:
                 backend.disconnect()
@@ -2340,14 +2345,23 @@ class ConnectionManager:
         settings_digest = hashlib.sha256(settings_key.encode("utf-8")).hexdigest()
         return f"{bt_key}:{settings_digest}"
 
-    def _clear_plugin_queue_backend_under_lock(self) -> None:
-        """Drop manager-owned adapter generation references under ``_lock``.
+    def _detach_plugin_queue_backend_under_lock(
+        self,
+    ) -> tuple[
+        _DeferredAckPluginQueueBackend | None,
+        tuple[Backend, CircuitBreaker | None] | None,
+    ]:
+        """Detach one cached adapter generation while retaining strong locals.
 
-        An adapter still held by an issued scheduler token remains intact, including
-        its active-token identity map. Only this manager's cache ownership ends.
+        The caller must keep the returned references alive until after ``_lock`` is
+        released.  Adapters own active identity tokens, and a token destructor is
+        arbitrary plugin code that may acquire or re-enter this manager.
         """
+        retired_adapter = self._plugin_queue_backend
+        retired_source = self._plugin_queue_backend_source
         self._plugin_queue_backend = None
         self._plugin_queue_backend_source = None
+        return retired_adapter, retired_source
 
     @property
     def _deferred_ack_plugin(self) -> bool:
@@ -2412,14 +2426,6 @@ class ConnectionManager:
                 descriptor.backend_cls_path,
             )
         settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
-        if "queue" in descriptor.capabilities and (
-            not isinstance(backend_cls, type)
-            or not issubclass(backend_cls, QueueBackend)
-        ):
-            if descriptor.backend_type not in _BUNDLED_BACKEND_TYPES:
-                raise _invalid_plugin_ack_contract()
-            msg = "Selected backend must provide callable backend and settings classes."
-            raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
         if not callable(backend_cls) or not callable(settings_cls):
             msg = "Selected backend must provide callable backend and settings classes."
             raise ConfigurationError(msg, setting_name="SCRAPY_BACKEND_TYPE")
@@ -2660,6 +2666,8 @@ class ConnectionManager:
     def _connect_with_retries(self, monitor_events: list[_MonitorEvent]) -> None:
         """Run one serialized transaction and record deferred monitor events."""
         stale_backend: Backend | None = None
+        retired_adapter: _DeferredAckPluginQueueBackend | None = None
+        retired_source: tuple[Backend, CircuitBreaker | None] | None = None
         while True:
             with self._lock:
                 if self._retired:
@@ -2704,7 +2712,9 @@ class ConnectionManager:
                 if connected:
                     return
                 self._backend = None
-                self._clear_plugin_queue_backend_under_lock()
+                retired_adapter, retired_source = (
+                    self._detach_plugin_queue_backend_under_lock()
+                )
                 # Backend and breaker form one connection generation. Replace the
                 # breaker while holding the same state lock that detaches the backend
                 # so interface accessors can validate a coherent pair. Performing this
@@ -2715,6 +2725,8 @@ class ConnectionManager:
                 stale_backend = backend
                 break
 
+        # Drop token-owning adapter state only after the generation lock is free.
+        del retired_adapter, retired_source
         if stale_backend is not None:
             stale_disconnect_failed = False
             try:
@@ -2938,7 +2950,10 @@ class ConnectionManager:
                 # Cleanup must never replace the original failed connection signal.
                 pass
             with self._lock:
-                self._clear_plugin_queue_backend_under_lock()
+                retired_adapter, retired_source = (
+                    self._detach_plugin_queue_backend_under_lock()
+                )
+            del retired_adapter, retired_source
             raise
         with self._lock:
             if not self._retired:
@@ -3025,7 +3040,9 @@ class ConnectionManager:
             self._retirement_event.set()
             backend = self._backend
             self._backend = None
-            self._clear_plugin_queue_backend_under_lock()
+            retired_adapter, retired_source = (
+                self._detach_plugin_queue_backend_under_lock()
+            )
             # R14-E: reset the circuit breaker so a manager that reconnects after
             # teardown (or an orphan-evicted manager re-created from the same
             # settings) does not inherit a stale OPEN state from the prior
@@ -3034,6 +3051,9 @@ class ConnectionManager:
             if self._breaker is not None:
                 self._breaker.reset()
 
+        # The adapter can release hostile identity tokens. Keep its source alive as
+        # part of the same retired generation until manager state is unlocked.
+        del retired_adapter, retired_source
         if backend is None:
             return
         disconnect_failed = False
@@ -3481,9 +3501,15 @@ class ConnectionManager:
                         plugin_ack_capabilities.supports_concurrent_ack
                     ),
                 )
+                retired_adapter, retired_source = (
+                    self._detach_plugin_queue_backend_under_lock()
+                )
                 self._plugin_queue_backend_source = source
                 self._plugin_queue_backend = contract_backend
-                return contract_backend
+            # Never overwrite the cache's last strong references under ``_lock``:
+            # adapter teardown may run identity-token destructors that re-enter us.
+            del retired_adapter, retired_source
+            return contract_backend
 
     @_durable_push_queue_error_boundary
     @_manager_terminal_error_boundary()

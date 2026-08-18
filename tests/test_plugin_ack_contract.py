@@ -140,6 +140,29 @@ class _CallableQueueBackendInstance(_QueuePlugin):
 _CALLABLE_QUEUE_BACKEND_INSTANCE = _CallableQueueBackendInstance()
 
 
+class _ManagerLockProbeToken:
+    """Identity token whose destructor probes and optionally re-enters a manager."""
+
+    def __init__(
+        self,
+        manager: ConnectionManager,
+        events: list[str],
+        reenter: Any | None = None,
+    ) -> None:
+        self.manager = manager
+        self.events = events
+        self.reenter = reenter
+
+    def __del__(self) -> None:
+        acquired = self.manager._lock.acquire(blocking=False)
+        self.events.append("lock-free" if acquired else "lock-held")
+        if not acquired:
+            return
+        self.manager._lock.release()
+        if self.reenter is not None:
+            self.reenter(self.manager, self.events)
+
+
 async def _tracked_delivery_coroutine(broker_events: list[str]) -> None:
     broker_events.append("coroutine-advanced")
 
@@ -987,6 +1010,53 @@ def test_non_value_token_reference_is_released_on_adapter_teardown() -> None:
     assert issued_ref() is None
 
 
+def _cache_manager_lock_probe_token(
+    manager: ConnectionManager,
+    backend: _DeferredPlugin,
+    events: list[str],
+    reenter: Any | None = None,
+) -> tuple[
+    weakref.ReferenceType[_DeferredAckPluginQueueBackend],
+    weakref.ReferenceType[_ManagerLockProbeToken],
+]:
+    adapter = manager.get_queue_backend()
+    assert isinstance(adapter, _DeferredAckPluginQueueBackend)
+    token = _ManagerLockProbeToken(manager, events, reenter)
+    adapter_ref = weakref.ref(adapter)
+    token_ref = weakref.ref(token)
+    backend.pop_results["q"].append((b"item", token))
+    _item, returned = adapter.pop_with_ack("q")
+    assert returned is token
+    del returned
+    del token
+    del adapter
+    gc.collect()
+    assert adapter_ref() is manager._plugin_queue_backend
+    assert token_ref() is not None
+    return adapter_ref, token_ref
+
+
+def _reenter_retired_manager(
+    manager: ConnectionManager,
+    events: list[str],
+) -> None:
+    try:
+        manager.get_queue_backend()
+    except BackendConnectionError:
+        events.append("retired")
+
+
+def _reenter_current_queue_cache(
+    manager: ConnectionManager,
+    events: list[str],
+) -> None:
+    events.append(
+        "current-cache"
+        if manager.get_queue_backend() is manager._plugin_queue_backend
+        else "wrong-cache"
+    )
+
+
 def test_final_close_releases_manager_adapter_without_erasing_active_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1019,6 +1089,177 @@ def test_final_close_releases_manager_adapter_without_erasing_active_tokens(
     assert adapter_ref() is None
     assert backend_ref() is None
     assert settings_ref() is None
+
+
+@pytest.mark.parametrize("teardown", ["close", "clear_registry"])
+def test_retirement_releases_identity_token_with_manager_lock_free(
+    monkeypatch: pytest.MonkeyPatch,
+    teardown: str,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = (
+        ConnectionManager.get_manager("ackplugin")
+        if teardown == "clear_registry"
+        else ConnectionManager("ackplugin")
+    )
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    manager._backend = backend
+    manager._breaker_configured = True
+    events: list[str] = []
+    adapter_ref, token_ref = _cache_manager_lock_probe_token(
+        manager,
+        backend,
+        events,
+        _reenter_retired_manager,
+    )
+
+    if teardown == "close":
+        manager.close()
+    else:
+        ConnectionManager.clear_registry()
+
+    gc.collect()
+    assert events == ["lock-free", "retired"]
+    assert adapter_ref() is None
+    assert token_ref() is None
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+
+
+def test_reconnect_releases_identity_token_with_manager_lock_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin", {"retry_attempts": 0})
+    backend = manager._create_backend()
+    replacement = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    backend.is_connected = lambda: False  # type: ignore[method-assign]
+    manager._backend = backend
+    manager._breaker_configured = True
+    events: list[str] = []
+
+    def reenter(manager: ConnectionManager, events: list[str]) -> None:
+        events.append("disconnected" if not manager.is_connected() else "connected")
+
+    adapter_ref, token_ref = _cache_manager_lock_probe_token(
+        manager, backend, events, reenter
+    )
+    monkeypatch.setattr(manager, "_create_backend", lambda: replacement)
+
+    manager._connect_with_retries([])
+
+    gc.collect()
+    assert events == ["lock-free", "disconnected"]
+    assert adapter_ref() is None
+    assert token_ref() is None
+    assert manager._backend is replacement
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+
+
+def test_failed_reconnect_releases_identity_token_with_manager_lock_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin", {"retry_attempts": 0})
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    backend.is_connected = lambda: False  # type: ignore[method-assign]
+    manager._backend = backend
+    manager._breaker_configured = True
+    events: list[str] = []
+    adapter_ref, token_ref = _cache_manager_lock_probe_token(manager, backend, events)
+    monkeypatch.setattr(
+        manager,
+        "_create_backend",
+        lambda: (_ for _ in ()).throw(RuntimeError("replacement failed")),
+    )
+
+    with pytest.raises(BackendConnectionError, match="Failed to connect"):
+        manager._connect_with_retries([])
+
+    gc.collect()
+    assert events == ["lock-free"]
+    assert adapter_ref() is None
+    assert token_ref() is None
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+
+
+def test_cache_replacement_releases_identity_token_with_manager_lock_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+    backend = manager._create_backend()
+    replacement = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    manager._backend = backend
+    manager._breaker_configured = True
+    events: list[str] = []
+    adapter_ref, token_ref = _cache_manager_lock_probe_token(
+        manager,
+        backend,
+        events,
+        _reenter_current_queue_cache,
+    )
+    with manager._lock:
+        manager._backend = replacement
+
+    replacement_adapter = manager.get_queue_backend()
+
+    gc.collect()
+    assert events == ["lock-free", "current-cache"]
+    assert adapter_ref() is None
+    assert token_ref() is None
+    assert replacement_adapter is manager._plugin_queue_backend
+    assert manager._plugin_queue_backend_source == (replacement, None)
+
+
+def test_generation_race_releases_identity_token_with_manager_lock_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+    backend = manager._create_backend()
+    replacement = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    manager._backend = backend
+    manager._breaker_configured = True
+    events: list[str] = []
+    adapter_ref, token_ref = _cache_manager_lock_probe_token(
+        manager,
+        backend,
+        events,
+        _reenter_current_queue_cache,
+    )
+    snapshot_taken, resume_publication = _pause_after_next_generation_snapshot(
+        monkeypatch, manager
+    )
+    adapters: list[QueueBackend] = []
+    accessor = threading.Thread(
+        target=lambda: adapters.append(manager.get_queue_backend())
+    )
+    accessor.start()
+    snapshot_taken.wait(timeout=5)
+
+    with manager._lock:
+        manager._backend = replacement
+        retired_adapter, retired_source = (
+            manager._detach_plugin_queue_backend_under_lock()
+        )
+    del retired_adapter, retired_source
+
+    assert events == ["lock-free", "current-cache"]
+    assert adapter_ref() is None
+    assert token_ref() is None
+    resume_publication.wait(timeout=5)
+    accessor.join(timeout=5)
+    assert not accessor.is_alive()
+    assert adapters == [manager._plugin_queue_backend]
+    assert manager._plugin_queue_backend_source == (replacement, None)
 
 
 def test_forced_teardown_releases_manager_adapter_and_backend_config(
@@ -1127,7 +1368,10 @@ def test_backend_replacement_race_publishes_only_replacement_adapter(
     replacement = manager._create_backend()
     with manager._lock:
         manager._backend = replacement
-        manager._clear_plugin_queue_backend_under_lock()
+        retired_adapter, retired_source = (
+            manager._detach_plugin_queue_backend_under_lock()
+        )
+    del retired_adapter, retired_source
     resume_publication.wait(timeout=5)
     accessor.join(timeout=5)
 
@@ -1171,7 +1415,10 @@ def test_breaker_replacement_race_publishes_only_replacement_adapter(
     replacement = retired_breaker.new_generation()
     with manager._lock:
         manager._breaker = replacement
-        manager._clear_plugin_queue_backend_under_lock()
+        retired_adapter, retired_source = (
+            manager._detach_plugin_queue_backend_under_lock()
+        )
+    del retired_adapter, retired_source
     resume_publication.wait(timeout=5)
     accessor.join(timeout=5)
 

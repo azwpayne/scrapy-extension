@@ -605,19 +605,28 @@ class TestDescriptorBoundary:
 
         _assert_redacted_error(exc_info.value, marker)
 
-    def test_plugin_requires_callable_backend_and_settings_classes(self, monkeypatch):
+    def test_queue_plugin_rejects_non_class_backend_before_settings_loading(
+        self, monkeypatch
+    ):
         descriptor = self._runtime_descriptor()
+        loaded_paths: list[str] = []
         monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
-        monkeypatch.setattr(connectors, "_load_object", lambda _: object())
 
-        with pytest.raises(ConfigurationError, match="callable backend and settings"):
-            connectors.ConnectionManager("runtime_contract")._create_backend()
+        def _load(path: str) -> object:
+            loaded_paths.append(path)
+            return object()
+
+        monkeypatch.setattr(connectors, "_load_object", _load)
+
+        with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+            connectors.ConnectionManager("runtime_contract")
+        assert loaded_paths == [descriptor.backend_cls_path]
 
     def test_plugin_constructor_type_error_is_not_retried(self, monkeypatch):
         descriptor = self._runtime_descriptor()
         monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
 
-        class _BrokenBackend:
+        class _BrokenBackend(_StubBackend):
             def __init__(self, settings: object) -> None:
                 del settings
                 raise TypeError("unsupported settings")
@@ -637,7 +646,7 @@ class TestDescriptorBoundary:
         marker = "plugin-constructor-secret-marker"
         monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
 
-        class _BrokenBackend:
+        class _BrokenBackend(_StubBackend):
             def __init__(self, settings: object) -> None:
                 del settings
                 raise RuntimeError(f"plugin constructor diagnostic included {marker}")
@@ -856,24 +865,28 @@ class TestDescriptorBoundary:
         assert manager._backend is None
         assert sleeps == []
 
-    def test_plugin_missing_backend_base_class_fails_fast(self, monkeypatch):
+    def test_plugin_missing_queue_backend_class_fails_before_invocation(
+        self, monkeypatch
+    ):
         descriptor = self._runtime_descriptor()
+        factory_calls: list[object] = []
         monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
 
+        def _factory(settings: object) -> object:
+            factory_calls.append(settings)
+            return object()
+
         def _load(path: str) -> object:
-            return (
-                (lambda settings: object())
-                if path == descriptor.backend_cls_path
-                else _StubSettings
-            )
+            return _factory if path == descriptor.backend_cls_path else _StubSettings
 
         monkeypatch.setattr(connectors, "_load_object", _load)
 
-        with pytest.raises(ConfigurationError, match="missing Backend, QueueBackend"):
-            connectors.ConnectionManager("runtime_contract")._create_backend()
+        with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+            connectors.ConnectionManager("runtime_contract")
+        assert factory_calls == []
 
     def test_selected_plugin_overclaim_fails_before_connection_retry(self, monkeypatch):
-        """Runtime interface validation happens on first use, not discovery."""
+        """Queue overclaims fail statically before construction or retry."""
         from scrapy_extension.backends.connectors import ConnectionManager
         from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
         from scrapy_extension.exceptions import ConfigurationError
@@ -890,10 +903,8 @@ class TestDescriptorBoundary:
         )
         _reset_registry_cache()
 
-        manager = ConnectionManager("overclaimed", {"retry_attempts": 3})
-        with pytest.raises(ConfigurationError, match="QueueBackend"):
-            manager.connect()
-        assert manager._backend is None
+        with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+            ConnectionManager("overclaimed", {"retry_attempts": 3})
 
     def test_broken_plugin_isolated_when_user_warnings_are_errors(self, monkeypatch):
         from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
