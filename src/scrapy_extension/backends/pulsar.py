@@ -89,6 +89,7 @@ _MAX_IN_FLIGHT = 10_000
 # beyond this local bound, keeping background prefetch independent between topics.
 _PULSAR_RECEIVE_BUFFER_SIZE = 100
 _PULSAR_RECEIVE_TIMEOUT_MS = 1_000
+_PULSAR_RECEIVE_SHUTDOWN_TIMEOUT = 1.0
 
 
 def _validate_queue_name_argument(
@@ -211,9 +212,11 @@ class _PulsarReceivePump:
     """Bounded local delivery buffer owned by one topic/client generation."""
 
     topic: str
-    consumer: Any
+    client: Any
+    snapshot: Any
     generation: int
     capacity: int
+    consumer: Any = None
     condition: Condition = field(default_factory=Condition)
     records: deque[_BufferedPulsarRecord] = field(default_factory=deque)
     accepting: bool = True
@@ -229,32 +232,6 @@ class _PulsarReceivePump:
         with self.condition:
             self.accepting = False
             self.condition.notify_all()
-
-    def take(self, timeout: float) -> _BufferedPulsarRecord | None:
-        """Return a buffered record without exceeding the caller's wait budget."""
-        deadline = monotonic() + timeout if timeout > 0 else None
-        with self.condition:
-            while True:
-                if self.records:
-                    record = self.records.popleft()
-                    self.condition.notify_all()
-                    return record
-                if not self.accepting:
-                    return None
-                if self.control_error is not None:
-                    raise self.control_error
-                if self.failed:
-                    raise QueueError(
-                        "Pulsar receive pump failed.",
-                        queue_name=self.topic,
-                        operation="pop",
-                    )
-                if deadline is None:
-                    return None
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    return None
-                self.condition.wait(remaining)
 
     def discard_buffered(self) -> None:
         """Release local references; broker deliveries intentionally remain unacked."""
@@ -398,6 +375,10 @@ class PulsarBackend(Backend, QueueBackend):
         # Kept as an instance attribute so live tests can exercise backpressure
         # with a deliberately small bound without changing production behavior.
         self._receive_buffer_size = _PULSAR_RECEIVE_BUFFER_SIZE
+        # A broken SDK close must not make process shutdown wait forever. Tests
+        # may reduce this bound when exercising a deliberately uninterruptible
+        # receive double.
+        self._receive_shutdown_timeout = _PULSAR_RECEIVE_SHUTDOWN_TIMEOUT
         # Compatibility view for callers/tests that inspect the historical
         # single-consumer state. Message-token routing uses ``_consumers``.
         self._consumer: Any = None
@@ -671,7 +652,9 @@ class PulsarBackend(Backend, QueueBackend):
             worker = pump.worker
             if worker is not None and worker is not current_thread():
                 try:
-                    worker.join()
+                    worker.join(self._receive_shutdown_timeout)
+                    if worker.is_alive():
+                        self._log_receive_shutdown_timeout()
                 except BaseException:
                     cleanup_failure_count += 1
             pump.discard_buffered()
@@ -724,7 +707,9 @@ class PulsarBackend(Backend, QueueBackend):
             worker = pump.worker
             if worker is not None and worker is not current_thread():
                 try:
-                    worker.join()
+                    worker.join(self._receive_shutdown_timeout)
+                    if worker.is_alive():
+                        self._log_receive_shutdown_timeout()
                 except BaseException as error:
                     if join_error is None:
                         join_error = error
@@ -735,6 +720,16 @@ class PulsarBackend(Backend, QueueBackend):
             raise close_error
         if join_error is not None:
             raise join_error
+
+    @staticmethod
+    def _log_receive_shutdown_timeout() -> None:
+        """Emit a static diagnostic when an SDK worker ignores close()."""
+        try:
+            logger.warning(
+                "Pulsar receive worker did not stop within the shutdown timeout."
+            )
+        except BaseException:
+            pass
 
     @staticmethod
     def _close_detached_handles(*handles: Any) -> None:
@@ -922,11 +917,18 @@ class PulsarBackend(Backend, QueueBackend):
             QueueError: If the receive fails for a non-timeout reason.
             ValueError: If queue_name contains invalid characters.
         """
-        record = self._receive(queue_name, timeout)
+
+        def publish_legacy(record: _BufferedPulsarRecord) -> _BufferedPulsarRecord:
+            # Called while the lifecycle fence still proves this pump belongs to
+            # the live client generation. Disconnect therefore linearizes either
+            # before extraction (no delivery) or after this state is published.
+            self._last_msg = record.message
+            self._last_delivery = (record.consumer, record.message)
+            return record
+
+        record = self._receive(queue_name, timeout, publish_legacy)
         if record is None:
             return None
-        self._last_msg = record.message
-        self._last_delivery = (record.consumer, record.message)
         return _message_bytes(record.message)
 
     @queue_operation_error_boundary(
@@ -961,15 +963,24 @@ class PulsarBackend(Backend, QueueBackend):
             ValueError: If queue_name contains invalid characters.
         """
         topic = self._topic_name(queue_name)
-        record = self._receive(queue_name, timeout)
-        if record is None:
+
+        def publish_token(
+            record: _BufferedPulsarRecord,
+        ) -> tuple[_BufferedPulsarRecord, _PulsarAckToken]:
+            # Token creation and diagnostic publication share the lifecycle fence
+            # with generation validation and deque extraction.
+            token = _PulsarAckToken(
+                message_id=record.message_id,
+                topic=topic,
+                consumer=record.consumer,
+            )
+            self._track_in_flight(token)
+            return (record, token)
+
+        delivery = self._receive(queue_name, timeout, publish_token)
+        if delivery is None:
             return (None, None)
-        token = _PulsarAckToken(
-            message_id=record.message_id,
-            topic=topic,
-            consumer=record.consumer,
-        )
-        self._track_in_flight(token)
+        record, token = delivery
         return (_message_bytes(record.message), token)
 
     def _track_in_flight(self, token: _PulsarAckToken) -> None:
@@ -1006,19 +1017,80 @@ class PulsarBackend(Backend, QueueBackend):
                 except BaseException:
                     pass
 
-    def _receive(self, queue_name: str, timeout: float) -> _BufferedPulsarRecord | None:
-        """Take one delivery from the topic pump within the caller's budget.
+    def _receive(
+        self,
+        queue_name: str,
+        timeout: float,
+        publish: Callable[[_BufferedPulsarRecord], Any],
+    ) -> Any | None:
+        """Extract and publish one live-generation delivery within ``timeout``.
 
-        Sync SDK receives happen only on the per-topic worker. In particular,
-        ``timeout=0`` never enters ``consumer.receive`` on the caller/reactor
-        thread; it checks the local buffer once and returns immediately.
+        The caller's deadline is captured before pump creation, so a positive
+        timeout includes worker startup and ``client.subscribe``. A zero timeout
+        starts the worker but never waits for either subscription or SDK receive.
+        Record availability is checked only after acquiring the lifecycle fence;
+        extraction, generation validation, and legacy/token publication are one
+        atomic step with respect to disconnect.
         """
         deadline = monotonic() + timeout if timeout > 0 else None
         topic = self._topic_name(queue_name)
         pump = self._ensure_receive_pump(topic)
-        if deadline is None:
-            return pump.take(0.0)
-        return pump.take(max(0.0, deadline - monotonic()))
+
+        while True:
+            lifecycle_held = False
+            condition_held = False
+            self._lifecycle_lock.acquire()
+            lifecycle_held = True
+            pump.condition.acquire()
+            condition_held = True
+            try:
+                generation_is_live = (
+                    pump.accepting
+                    and self._client is pump.client
+                    and self._lifecycle_generation == pump.generation
+                    and self._receive_pumps.get(topic) is pump
+                )
+                if not generation_is_live:
+                    return None
+                # This check deliberately follows the lifecycle fence. A buffered
+                # record from a detached generation must never be extracted first
+                # and published after disconnect has cleared legacy/token state.
+                if pump.records:
+                    record = pump.records.popleft()
+                    if (
+                        pump.consumer is None
+                        or self._consumers.get(topic) is not pump.consumer
+                        or record.consumer is not pump.consumer
+                    ):
+                        return None
+                    result = publish(record)
+                    pump.condition.notify_all()
+                    return result
+                if pump.control_error is not None:
+                    raise pump.control_error
+                if pump.failed:
+                    raise QueueError(
+                        "Pulsar receive pump failed.",
+                        queue_name=topic,
+                        operation="pop",
+                    )
+                if deadline is None:
+                    return None
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return None
+
+                # Retain the condition across lifecycle release and wait so worker
+                # publication cannot be missed. Lock acquisition everywhere else is
+                # lifecycle -> condition, while the wait holds no lifecycle lock.
+                self._lifecycle_lock.release()
+                lifecycle_held = False
+                pump.condition.wait(remaining)
+            finally:
+                if condition_held:
+                    pump.condition.release()
+                if lifecycle_held:
+                    self._lifecycle_lock.release()
 
     def _ensure_receive_pump(self, topic: str) -> _PulsarReceivePump:
         """Create or return the single bounded receive pump for ``topic``."""
@@ -1027,21 +1099,23 @@ class PulsarBackend(Backend, QueueBackend):
                 pump = self._receive_pumps.get(topic)
                 if pump is not None:
                     return pump
-            consumer = self._ensure_consumer(topic)
-            with self._lifecycle_lock:
-                existing = self._receive_pumps.get(topic)
-                if existing is not None:
-                    return existing
-                if self._consumers.get(topic) is not consumer:
+                client = self._client
+                generation = self._lifecycle_generation
+                snapshot = self._connection_snapshot
+                if client is None:
                     raise QueueError(
-                        "Pulsar connection changed while starting receive pump.",
+                        f"Cannot subscribe to Pulsar topic {topic}: backend is disconnected",
                         queue_name=topic,
                         operation="pop",
                     )
-                generation = self._lifecycle_generation
+                if snapshot is None:
+                    # Compatibility for direct private-client injection. Snapshot
+                    # capture is local and contains no SDK/network call.
+                    snapshot = self._capture_connection_snapshot()
                 pump = _PulsarReceivePump(
                     topic=topic,
-                    consumer=consumer,
+                    client=client,
+                    snapshot=snapshot,
                     generation=generation,
                     capacity=self._receive_buffer_size,
                 )
@@ -1061,9 +1135,86 @@ class PulsarBackend(Backend, QueueBackend):
                     raise
                 return pump
 
+    @staticmethod
+    def _subscribe_pump_consumer(pump: _PulsarReceivePump) -> Any:
+        """Perform a pump's potentially blocking subscription on its worker."""
+        snapshot = pump.snapshot
+        return pump.client.subscribe(
+            pump.topic,
+            snapshot.subscription_name,
+            consumer_type=_consumer_type(snapshot.consumer_type),
+            initial_position=_initial_position(snapshot.initial_position),
+            negative_ack_redelivery_delay_ms=(
+                snapshot.negative_ack_redelivery_delay_ms
+            ),
+        )
+
     def _run_receive_pump(self, pump: _PulsarReceivePump) -> None:
-        """Receive synchronously off-reactor and publish only into this generation."""
+        """Bootstrap and receive off-reactor, publishing only while generation-live."""
+        candidate: Any = None
         try:
+            bootstrap_failed = False
+            bootstrap_control_error: BaseException | None = None
+            try:
+                candidate = self._subscribe_pump_consumer(pump)
+            except Exception:
+                bootstrap_failed = True
+            except BaseException as error:
+                bootstrap_control_error = error
+
+            if candidate is None:
+                with self._lifecycle_lock:
+                    generation_is_live = (
+                        pump.accepting
+                        and self._client is pump.client
+                        and self._lifecycle_generation == pump.generation
+                        and self._receive_pumps.get(pump.topic) is pump
+                    )
+                    if generation_is_live:
+                        with pump.condition:
+                            if bootstrap_control_error is not None:
+                                pump.control_error = bootstrap_control_error
+                            elif bootstrap_failed:
+                                pump.failed = True
+                            pump.condition.notify_all()
+                return
+
+            publication_error: BaseException | None = None
+            try:
+                with self._lifecycle_lock:
+                    generation_is_live = (
+                        pump.accepting
+                        and self._client is pump.client
+                        and self._lifecycle_generation == pump.generation
+                        and self._receive_pumps.get(pump.topic) is pump
+                    )
+                    if generation_is_live:
+                        pump.consumer = candidate
+                        self._consumers[pump.topic] = candidate
+                        self._consumer = candidate
+                        self._subscribed_topic = pump.topic
+                        candidate = None
+                        with pump.condition:
+                            pump.condition.notify_all()
+            except BaseException as error:
+                # Publication faults are transferred through the pump just like
+                # receive faults; no exception may escape as an unhandled daemon
+                # thread failure. The private candidate remains worker-owned.
+                publication_error = error
+            if publication_error is not None:
+                if candidate is not None:
+                    self._close_aborted_handle(candidate)
+                    candidate = None
+                with pump.condition:
+                    if pump.accepting:
+                        pump.control_error = publication_error
+                        pump.condition.notify_all()
+                return
+            if candidate is not None:
+                self._close_aborted_handle(candidate)
+                candidate = None
+                return
+
             while True:
                 with pump.condition:
                     while pump.accepting and len(pump.records) >= pump.capacity:
@@ -1087,8 +1238,7 @@ class PulsarBackend(Backend, QueueBackend):
                     failed = True
                 except BaseException as error:
                     # Process-control exceptions retain their historical identity,
-                    # but cross the worker boundary through the waiting public poll
-                    # instead of becoming an unhandled thread exception.
+                    # but cross the worker boundary through the waiting public poll.
                     control_error = error
 
                 if timed_out:
@@ -1106,31 +1256,34 @@ class PulsarBackend(Backend, QueueBackend):
                 with self._lifecycle_lock:
                     generation_is_live = (
                         pump.accepting
+                        and self._client is pump.client
                         and self._lifecycle_generation == pump.generation
                         and self._receive_pumps.get(pump.topic) is pump
                         and self._consumers.get(pump.topic) is pump.consumer
                     )
-                with pump.condition:
-                    if not generation_is_live or not pump.accepting:
-                        return
-                    if control_error is not None:
-                        pump.control_error = control_error
-                        pump.condition.notify_all()
-                        return
-                    if failed:
-                        pump.failed = True
-                        pump.condition.notify_all()
-                        return
-                    pump.records.append(
-                        _BufferedPulsarRecord(
-                            message=message,
-                            message_id=message_id,
-                            consumer=pump.consumer,
+                    with pump.condition:
+                        if not generation_is_live or not pump.accepting:
+                            return
+                        if control_error is not None:
+                            pump.control_error = control_error
+                            pump.condition.notify_all()
+                            return
+                        if failed:
+                            pump.failed = True
+                            pump.condition.notify_all()
+                            return
+                        pump.records.append(
+                            _BufferedPulsarRecord(
+                                message=message,
+                                message_id=message_id,
+                                consumer=pump.consumer,
+                            )
                         )
-                    )
-                    pump.buffered.set()
-                    pump.condition.notify_all()
+                        pump.buffered.set()
+                        pump.condition.notify_all()
         finally:
+            if candidate is not None:
+                self._close_aborted_handle(candidate)
             pump.stopped.set()
 
     @queue_operation_error_boundary(

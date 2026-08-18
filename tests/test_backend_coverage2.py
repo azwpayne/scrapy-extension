@@ -77,7 +77,10 @@ class TestPulsarRemaining:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = None
         client.subscribe.return_value = consumer
-        assert b.pop("q") is None
+        try:
+            assert b.pop("q") is None
+        finally:
+            b.disconnect()
 
     def test_nack_without_message_is_noop(self, mocker) -> None:
         b, _ = _pulsar(mocker)

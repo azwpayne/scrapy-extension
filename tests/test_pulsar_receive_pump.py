@@ -3,16 +3,46 @@
 from __future__ import annotations
 
 from collections import deque
-from threading import Condition, Event, Thread
+from threading import Condition, Event, Thread, current_thread
 from time import monotonic
 from typing import Any
 from unittest.mock import MagicMock
 
 import pulsar
+import pytest
 
 from scrapy_extension.backends.pulsar import PulsarBackend, _PulsarAckToken
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import PulsarSettings
+
+
+class _LifecycleGate:
+    """Lock wrapper that lets teardown win before a poll's extraction fence."""
+
+    def __init__(self, lock: Any, target_name: str) -> None:
+        self._lock = lock
+        self._target_name = target_name
+        self._target_entries = 0
+        self.extraction_attempted = Event()
+        self.allow_extraction = Event()
+
+    def acquire(self, *args: Any, **kwargs: Any) -> bool:
+        if current_thread().name == self._target_name:
+            self._target_entries += 1
+            if self._target_entries == 2:
+                self.extraction_attempted.set()
+                self.allow_extraction.wait(timeout=2.0)
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> _LifecycleGate:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
 
 
 class _ControllableConsumer:
@@ -67,7 +97,9 @@ def _message(payload: bytes, message_id: Any) -> MagicMock:
     return message
 
 
-def _connected_backend(mocker: Any, consumers: list[_ControllableConsumer]) -> PulsarBackend:
+def _connected_backend(
+    mocker: Any, consumers: list[_ControllableConsumer]
+) -> PulsarBackend:
     client = MagicMock(name="pulsar-client")
     client.subscribe.side_effect = consumers
     mocker.patch.object(pulsar, "Client", return_value=client)
@@ -83,6 +115,40 @@ def _wait_until(predicate: Any, timeout: float = 1.0) -> bool:
             return True
         Event().wait(0.005)
     return bool(predicate())
+
+
+def test_first_poll_never_waits_outside_budget_for_blocked_subscribe(
+    mocker: Any,
+) -> None:
+    subscribe_started = Event()
+    release_subscribe = Event()
+    consumer = _ControllableConsumer()
+    client = MagicMock(name="blocked-subscribe-client")
+
+    def subscribe(*_args: Any, **_kwargs: Any) -> _ControllableConsumer:
+        subscribe_started.set()
+        release_subscribe.wait(timeout=2.0)
+        return consumer
+
+    client.subscribe.side_effect = subscribe
+    mocker.patch.object(pulsar, "Client", return_value=client)
+    backend = PulsarBackend(PulsarSettings())
+    backend.connect()
+    try:
+        started = monotonic()
+        assert backend.pop("bootstrap", timeout=0) is None
+        assert monotonic() - started < 0.2
+        assert subscribe_started.wait(timeout=0.5)
+
+        started = monotonic()
+        assert backend.pop("bootstrap", timeout=0.05) is None
+        elapsed = monotonic() - started
+        assert elapsed >= 0.04
+        assert elapsed < 0.5
+        assert not consumer.receive_started.is_set()
+    finally:
+        release_subscribe.set()
+        backend.disconnect()
 
 
 def test_scheduler_zero_poll_returns_while_sync_receive_is_blocked(mocker: Any) -> None:
@@ -176,6 +242,96 @@ def test_receive_buffer_is_bounded_per_topic(mocker: Any) -> None:
         assert len(pump.records) == pump.capacity == 2
     finally:
         backend.disconnect()
+
+
+@pytest.mark.parametrize("with_ack", [False, True])
+def test_disconnect_wins_before_atomic_buffer_extraction(
+    mocker: Any, with_ack: bool
+) -> None:
+    consumer = _ControllableConsumer()
+    backend = _connected_backend(mocker, [consumer])
+    old_message = _message(b"old", object())
+    results: list[Any] = []
+    poll_name = f"fenced-poll-{with_ack}"
+    try:
+        assert backend.pop("race", timeout=0) is None
+        pump = backend._receive_pumps["scrapy-race"]
+        assert consumer.receive_started.wait(timeout=0.5)
+        consumer.deliver(old_message)
+        assert pump.buffered.wait(timeout=0.5)
+
+        gate = _LifecycleGate(backend._lifecycle_lock, poll_name)
+        backend._lifecycle_lock = gate  # type: ignore[assignment]
+
+        def poll() -> None:
+            if with_ack:
+                results.append(backend.pop_with_ack("race", timeout=1.0))
+            else:
+                results.append(backend.pop("race", timeout=1.0))
+
+        thread = Thread(target=poll, name=poll_name)
+        thread.start()
+        assert gate.extraction_attempted.wait(timeout=0.5)
+
+        # The poll has found its pump but has not entered the lifecycle-fenced
+        # record check. Teardown linearizes first and must make that record stale.
+        backend.disconnect()
+        gate.allow_extraction.set()
+        thread.join(timeout=1.0)
+
+        assert not thread.is_alive()
+        assert results == ([(None, None)] if with_ack else [None])
+        assert backend._last_msg is None
+        assert backend._last_delivery is None
+        assert backend._in_flight == set()
+        assert len(pump.records) == 0
+    finally:
+        if isinstance(backend._lifecycle_lock, _LifecycleGate):
+            backend._lifecycle_lock.allow_extraction.set()
+        backend.disconnect()
+
+
+def test_disconnect_is_bounded_when_close_does_not_interrupt_receive(
+    mocker: Any,
+) -> None:
+    release_receive = Event()
+    receive_started = Event()
+    close_called = Event()
+    message = _message(b"late", object())
+    consumer = MagicMock(name="uninterruptible-consumer")
+
+    def receive(*, timeout_millis: int) -> Any:
+        del timeout_millis
+        receive_started.set()
+        release_receive.wait(timeout=2.0)
+        return message
+
+    consumer.receive.side_effect = receive
+    consumer.close.side_effect = close_called.set
+    backend = _connected_backend(mocker, [consumer])
+    backend._receive_shutdown_timeout = 0.05
+    warning = mocker.patch("scrapy_extension.backends.pulsar.logger.warning")
+
+    assert backend.pop("stuck", timeout=0) is None
+    pump = backend._receive_pumps["scrapy-stuck"]
+    assert receive_started.wait(timeout=0.5)
+
+    started = monotonic()
+    backend.disconnect()
+    elapsed = monotonic() - started
+
+    assert elapsed < 0.5
+    assert close_called.is_set()
+    warning.assert_called_once_with(
+        "Pulsar receive worker did not stop within the shutdown timeout."
+    )
+    assert not pump.stopped.is_set()
+
+    release_receive.set()
+    assert pump.stopped.wait(timeout=0.5)
+    assert len(pump.records) == 0
+    assert backend._last_msg is None
+    assert backend._in_flight == set()
 
 
 def test_disconnect_drops_unreturned_buffer_and_reconnect_fences_generation(

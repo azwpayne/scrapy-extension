@@ -39,6 +39,19 @@ from scrapy_extension.settings import PulsarSettings, SqsSettings
 
 _MARKER = "round42a-private-marker"
 _FORWARDED_MARKER = "round43b-forwarded-private-marker"
+_CONNECTED_PULSAR_BACKENDS: list[PulsarBackend] = []
+
+
+@pytest.fixture(autouse=True)
+def _disconnect_pulsar_receive_pumps_after_test():
+    """Keep every receive worker inside the test that starts it."""
+    yield
+    while _CONNECTED_PULSAR_BACKENDS:
+        backend = _CONNECTED_PULSAR_BACKENDS.pop()
+        try:
+            backend.disconnect()
+        except BaseException:
+            pass
 
 
 def _assert_value_is_redacted(
@@ -102,6 +115,7 @@ def _connected_pulsar_backend(mocker: Any) -> tuple[PulsarBackend, MagicMock]:
     client = mocker.MagicMock()
     mocker.patch.object(pulsar, "Client", return_value=client)
     backend.connect()
+    _CONNECTED_PULSAR_BACKENDS.append(backend)
     return backend, client
 
 

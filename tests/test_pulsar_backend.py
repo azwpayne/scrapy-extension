@@ -11,7 +11,7 @@ import logging
 import subprocess
 import sys
 import traceback
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from types import TracebackType
 from typing import Any
 from unittest.mock import MagicMock
@@ -142,16 +142,39 @@ class _ExceptionContextProbe(logging.Handler):
 class _InterruptOnLifecycleEntry:
     """Lock proxy that raises at a deterministic lifecycle-lock entry."""
 
-    def __init__(self, lock: Any, interrupt_on_entry: int) -> None:
+    def __init__(
+        self,
+        lock: Any,
+        interrupt_on_entry: int,
+        thread_name_prefix: str | None = None,
+    ) -> None:
         self._lock = lock
         self._interrupt_on_entry = interrupt_on_entry
+        self._thread_name_prefix = thread_name_prefix
         self._entries = 0
+        self._interrupted = False
+
+    def acquire(self) -> bool:
+        is_target = (
+            self._thread_name_prefix is None
+            or current_thread().name.startswith(self._thread_name_prefix)
+        )
+        if is_target:
+            self._entries += 1
+        if (
+            is_target
+            and not self._interrupted
+            and self._entries == self._interrupt_on_entry
+        ):
+            self._interrupted = True
+            raise KeyboardInterrupt("lifecycle publication interrupted")
+        return self._lock.acquire()
+
+    def release(self) -> None:
+        self._lock.release()
 
     def __enter__(self) -> _InterruptOnLifecycleEntry:
-        self._entries += 1
-        if self._entries == self._interrupt_on_entry:
-            raise KeyboardInterrupt("lifecycle publication interrupted")
-        self._lock.acquire()
+        self.acquire()
         return self
 
     def __exit__(
@@ -161,7 +184,7 @@ class _InterruptOnLifecycleEntry:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc_value, traceback
-        self._lock.release()
+        self.release()
 
 
 class TestPulsarBackendType:
@@ -853,10 +876,10 @@ class TestPulsarPop:
         consumer = mocker.MagicMock()
         consumer.receive.side_effect = pulsar.Timeout("none")
         b, client = _connected(mocker, subscribe=consumer)
-        b.pop("queue1")
+        b.pop("queue1", timeout=1.0)
         client.subscribe.side_effect = RuntimeError("subscribe failed")
         with pytest.raises(QueueError):
-            b.pop("queue2")
+            b.pop("queue2", timeout=1.0)
 
         assert b._consumer is consumer
         assert b._subscribed_topic == "scrapy-queue1"
@@ -919,6 +942,8 @@ class TestPulsarPop:
         assert duplicate_created is False
         assert errors == []
         assert client.subscribe.call_count == 1
+        pump = b._receive_pumps["scrapy-queue"]
+        assert pump.receive_started.wait(timeout=0.5)
         assert b._consumers == {"scrapy-queue": consumers[0]}
 
     def test_disconnect_during_consumer_creation_closes_loser(self, mocker) -> None:
@@ -933,25 +958,20 @@ class TestPulsarPop:
 
         b, client = _connected(mocker)
         client.subscribe.side_effect = subscribe
-        errors: list[Exception] = []
+        b._receive_shutdown_timeout = 0.05
+        results: list[bytes | None] = []
 
-        def pop_one() -> None:
-            try:
-                b.pop("queue")
-            except Exception as error:
-                errors.append(error)
-
-        pop_thread = Thread(target=pop_one)
+        pop_thread = Thread(target=lambda: results.append(b.pop("queue")))
         pop_thread.start()
         assert subscribe_started.wait(timeout=2.0)
+        pop_thread.join(timeout=0.5)
+        assert results == [None]
+
+        pump = b._receive_pumps["scrapy-queue"]
         b.disconnect()
         release_subscribe.set()
-        pop_thread.join(timeout=2.0)
+        assert pump.stopped.wait(timeout=0.5)
 
-        assert not pop_thread.is_alive()
-        assert len(errors) == 1
-        assert isinstance(errors[0], QueueError)
-        assert errors[0].operation == "pop"
         consumer.close.assert_called_once_with()
         assert b._consumers == {}
         assert b._consumer is None
@@ -963,10 +983,14 @@ class TestPulsarPop:
         consumer = mocker.MagicMock(name="unpublished_consumer")
         consumer.close.side_effect = SystemExit("cleanup must not mask interrupt")
         b, _ = _connected(mocker, subscribe=consumer)
-        b._lifecycle_lock = _InterruptOnLifecycleEntry(b._lifecycle_lock, 3)
+        b._lifecycle_lock = _InterruptOnLifecycleEntry(
+            b._lifecycle_lock,
+            1,
+            thread_name_prefix="scrapy-pulsar-receive-",
+        )
 
         with pytest.raises(KeyboardInterrupt, match="publication interrupted"):
-            b.pop("queue")
+            b.pop("queue", timeout=1.0)
 
         consumer.close.assert_called_once_with()
         consumer.receive.assert_not_called()
