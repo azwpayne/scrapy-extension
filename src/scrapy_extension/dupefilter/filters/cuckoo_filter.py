@@ -186,9 +186,9 @@ class CuckooMembershipFilter(MembershipFilter):
     def _insert(self, fp: bytes, i1: int, i2: int) -> bool:
         """Place ``fp`` in a free slot of i1/i2, kicking if both full.
 
-        Every placement lands in one of fp's two valid buckets, so the table
-        stays consistent even when kicks exhaust ``_MAX_KICKS`` and insertion
-        fails.
+        Every placement lands in one of fp's two valid buckets. The displacement
+        path is journaled so exhaustion or an interruption restores the exact
+        pre-insertion table.
 
         Args:
             fp: Fingerprint to insert.
@@ -207,20 +207,39 @@ class CuckooMembershipFilter(MembershipFilter):
             buckets[i2].append(fp)
             return True
         index = i1
-        kick_path: list[tuple[int, int]] = []
-        for _ in range(self._MAX_KICKS):
-            slot = self._rng.randrange(b)
-            kick_path.append((index, slot))
-            # Swap fp into bucket[index][slot]; the evicted value becomes fp.
-            fp, buckets[index][slot] = buckets[index][slot], fp
-            index = self._alt_index(index, fp)
-            if len(buckets[index]) < b:
-                buckets[index].append(fp)
-                return True
-        # A swap is reversible when replayed with the dangling fingerprint. Undo
-        # the path so FilterFull leaves every previously inserted item intact.
-        for index, slot in reversed(kick_path):
-            fp, buckets[index][slot] = buckets[index][slot], fp
+        kick_path: list[tuple[int, int, bytes]] = []
+        appended_bucket: list[bytes] | None = None
+        appended_size = 0
+        try:
+            for _ in range(self._MAX_KICKS):
+                slot = self._rng.randrange(b)
+                evicted = buckets[index][slot]
+                # Journal the original slot before committing its replacement.
+                kick_path.append((index, slot, evicted))
+                buckets[index][slot] = fp
+                fp = evicted
+                index = self._alt_index(index, fp)
+                if len(buckets[index]) < b:
+                    destination_bucket = buckets[index]
+                    appended_size = len(destination_bucket)
+                    appended_bucket = destination_bucket
+                    appended_bucket.append(fp)
+                    return True
+        except BaseException:
+            # A final append may commit immediately before an asynchronous
+            # interruption. Remove it before restoring the displaced slots.
+            if appended_bucket is not None and len(appended_bucket) > appended_size:
+                appended_bucket.pop()
+            # Replay only recorded swaps. ``list.pop`` and direct slot assignment
+            # keep emergency cleanup free of hashing, RNG calls, and new journals.
+            while kick_path:
+                index, slot, evicted = kick_path.pop()
+                buckets[index][slot] = evicted
+            raise
+        # Restore the exact pre-insertion slots before add() raises FilterFull.
+        while kick_path:
+            index, slot, evicted = kick_path.pop()
+            buckets[index][slot] = evicted
         return False
 
     def __contains__(self, item: bytes) -> bool:

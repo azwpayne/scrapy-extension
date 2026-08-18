@@ -120,6 +120,49 @@ class TestCuckooMembershipFilterOps:
         assert not missing, f"failed insertion lost existing items: {missing!r}"
         assert overflow not in flt
 
+    @pytest.mark.parametrize(
+        ("exception_type", "kick_number"),
+        [(KeyboardInterrupt, 1), (MemoryError, 250)],
+        ids=["keyboard-interrupt-after-early-swap", "memory-error-after-mid-swap"],
+    )
+    def test_interrupted_kicks_restore_exact_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        exception_type: type[BaseException],
+        kick_number: int,
+    ) -> None:
+        flt = CuckooMembershipFilter(capacity=8, error_rate=0.01)
+        flt._rng = random.Random(0)  # noqa: SLF001 - deterministic kick path
+        existing = [f"x-{i}".encode() for i in range(flt.capacity)]
+        for item in existing:
+            assert flt.add(item) is True
+        overflow = f"x-{flt.capacity}".encode()
+        buckets_before = [bucket.copy() for bucket in flt._buckets]
+        count_before = len(flt)
+        interruption = exception_type(f"injected after kick {kick_number}")
+        original_alt_index = flt._alt_index
+        alt_index_calls = 0
+
+        def interrupt_after_swap(index: int, fp: bytes) -> int:
+            nonlocal alt_index_calls
+            alt_index_calls += 1
+            if alt_index_calls == kick_number + 1:
+                raise interruption
+            return original_alt_index(index, fp)
+
+        monkeypatch.setattr(flt, "_alt_index", interrupt_after_swap)
+
+        with pytest.raises(exception_type) as raised:
+            flt.add(overflow)
+
+        assert raised.value is interruption
+        assert alt_index_calls == kick_number + 1
+        assert flt._buckets == buckets_before
+        assert len(flt) == count_before
+        missing = [item for item in existing if item not in flt]
+        assert not missing, f"interrupted insertion lost existing items: {missing!r}"
+        assert overflow not in flt
+
     def test_false_positive_rate_bounded(self) -> None:
         """FP rate stays within a generous multiple of target (seeded)."""
         capacity = 2000
