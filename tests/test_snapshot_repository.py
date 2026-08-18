@@ -8,7 +8,7 @@ import traceback
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,11 +53,7 @@ def _assert_no_secret_object_graph(value: object, seen: set[int]) -> None:
                 _assert_no_secret_object_graph(linked, seen)
 
 
-def _assert_static_repository_error(error: SnapshotRepositoryError) -> None:
-    assert error.__cause__ is None
-    assert error.__context__ is None
-    assert _SECRET_MARKER not in "".join(traceback.format_exception(error))
-    _assert_no_secret_object_graph(error, set())
+def _assert_package_frames_cleared(error: BaseException) -> None:
     current = error.__traceback__
     while current is not None:
         frame = current.tb_frame
@@ -68,6 +64,14 @@ def _assert_static_repository_error(error: SnapshotRepositoryError) -> None:
                 if name != "self":
                     _assert_no_secret_object_graph(value, set())
         current = current.tb_next
+
+
+def _assert_static_repository_error(error: SnapshotRepositoryError) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert _SECRET_MARKER not in "".join(traceback.format_exception(error))
+    _assert_no_secret_object_graph(error, set())
+    _assert_package_frames_cleared(error)
 
 
 def _storage(initial: dict[str, bytes] | None = None):
@@ -152,6 +156,122 @@ def test_chunk_write_failure_has_no_recursive_secret_graph() -> None:
         repository.commit(_KEY, _SECRET_MARKER.encode())
 
     _assert_static_repository_error(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "failure_point", ["uuid", "hash", "manifest", "manifest-encode"]
+)
+def test_commit_construction_failures_are_static_and_clear_payload_frames(
+    failure_point: str, mocker: Any
+) -> None:
+    payload = _SECRET_MARKER.encode()
+    storage, _ = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    failure = MemoryError(_SECRET_MARKER)
+
+    if failure_point == "uuid":
+        mocker.patch("scrapy_extension.queue.snapshot.uuid.uuid4", side_effect=failure)
+    elif failure_point == "hash":
+        real_sha256 = __import__("hashlib").sha256
+
+        def fail_payload_hash(value: bytes = b"") -> Any:
+            if value == payload:
+                raise failure
+            return real_sha256(value)
+
+        mocker.patch(
+            "scrapy_extension.queue.snapshot.hashlib.sha256",
+            side_effect=fail_payload_hash,
+        )
+    elif failure_point == "manifest":
+        mocker.patch("scrapy_extension.queue.snapshot._Manifest", side_effect=failure)
+    else:
+        mocker.patch.object(repository, "_encode_manifest", side_effect=failure)
+
+    with pytest.raises(SnapshotRepositoryError, match="construction") as exc_info:
+        repository.commit(_KEY, payload)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+class _SliceBomb(bytes):
+    failure: BaseException = MemoryError(_SECRET_MARKER)
+
+    def __getitem__(self, key: object) -> bytes:
+        raise self.failure
+
+
+class _AssemblyBomb(bytearray):
+    failure: BaseException = MemoryError(_SECRET_MARKER)
+
+    def extend(self, value: object) -> None:
+        super().extend(value)  # type: ignore[arg-type]
+        raise self.failure
+
+
+def test_slice_failure_is_static_and_clears_adversarial_payload(
+    mocker: Any,
+) -> None:
+    payload = _SECRET_MARKER.encode()
+    storage, _ = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    hostile = _SliceBomb(payload)
+    mocker.patch.object(repository, "_copy_buffer", return_value=(hostile, None))
+
+    with pytest.raises(SnapshotRepositoryError, match="construction") as exc_info:
+        repository.commit(_KEY, payload)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_buffer_assembly_failure_is_static_after_clearing_partial_state() -> None:
+    payload = _SECRET_MARKER.encode()
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    repository.commit(_KEY, payload)
+    assembly = _AssemblyBomb()
+    assembly.failure = MemoryError(_SECRET_MARKER)
+
+    with patch("builtins.bytearray", return_value=assembly):
+        with pytest.raises(SnapshotRepositoryError, match="assembly") as exc_info:
+            repository.read(_KEY)
+
+    assert assembly == b""
+    _assert_static_repository_error(exc_info.value)
+    assert values
+
+
+@pytest.mark.parametrize("failure_point", ["slice", "assembly"])
+def test_construction_control_errors_propagate_only_after_payload_cleanup(
+    failure_point: str, mocker: Any
+) -> None:
+    class _ControlFlow(BaseException):
+        pass
+
+    payload = _SECRET_MARKER.encode()
+    control_error = _ControlFlow("stop")
+    storage, _ = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+
+    if failure_point == "slice":
+        hostile = _SliceBomb(payload)
+        hostile.failure = control_error
+        mocker.patch.object(repository, "_copy_buffer", return_value=(hostile, None))
+        operation = lambda: repository.commit(_KEY, payload)
+    else:
+        repository.commit(_KEY, payload)
+        assembly = _AssemblyBomb()
+        assembly.failure = control_error
+
+        def operation() -> None:
+            with patch("builtins.bytearray", return_value=assembly):
+                repository.read(_KEY)
+
+    with pytest.raises(_ControlFlow) as exc_info:
+        operation()
+
+    assert exc_info.value is control_error
+    _assert_package_frames_cleared(exc_info.value)
 
 
 def test_empty_state_is_a_committed_authoritative_manifest() -> None:

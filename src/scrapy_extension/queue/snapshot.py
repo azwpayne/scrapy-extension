@@ -135,31 +135,36 @@ class SnapshotRepository:
     def _store(self, key: str, value: bytes) -> bool:
         """Store backend data and terminally collapse ordinary failures."""
         try:
-            self._storage.store(key, value)
-        except Exception:
-            return False
-        return True
+            try:
+                self._storage.store(key, value)
+            except Exception:
+                return False
+            return True
+        finally:
+            value = b""
 
     @staticmethod
     def _copy_buffer(value: object, maximum: int) -> tuple[bytes | None, str | None]:
         """Copy one immutable contiguous byte buffer without calling its hooks."""
-        if not isinstance(value, _BUFFER_TYPES):
-            return None, _BUFFER_INVALID
-
         view: memoryview | None = None
-        view_failed = False
+        copied: bytes | None = None
+        exporter: object = None
         try:
-            # Constructing the builtin view uses the buffer protocol directly. In
-            # particular, bytes/bytearray subclass ``__len__`` and ``__bytes__``
-            # overrides cannot influence either the bound or the copy below.
-            view = memoryview(value)
-        except Exception:
-            view_failed = True
-        value = None
-        if view_failed or view is None:
-            return None, _BUFFER_CONVERSION_FAILED
+            if not isinstance(value, _BUFFER_TYPES):
+                return None, _BUFFER_INVALID
 
-        try:
+            view_failed = False
+            try:
+                # Constructing the builtin view uses the buffer protocol directly. In
+                # particular, bytes/bytearray subclass ``__len__`` and ``__bytes__``
+                # overrides cannot influence either the bound or the copy below.
+                view = memoryview(value)
+            except Exception:
+                view_failed = True
+            value = None
+            if view_failed or view is None:
+                return None, _BUFFER_CONVERSION_FAILED
+
             size = view.nbytes
             if size > maximum:
                 return None, _BUFFER_OVERSIZED
@@ -168,15 +173,13 @@ class SnapshotRepository:
             # Read-only views can still alias mutable exporters (for example,
             # ``memoryview(bytearray(...)).toreadonly()``). Accept only buffers
             # whose root exporter is provably immutable bytes.
-            exporter: object = view.obj
+            exporter = view.obj
             while isinstance(exporter, memoryview):
                 exporter = exporter.obj
             if not view.readonly or not isinstance(exporter, bytes):
-                exporter = None
                 return None, _BUFFER_MUTABLE
             exporter = None
 
-            copied: bytes | None = None
             copy_failed = False
             try:
                 copied = view.tobytes()
@@ -192,7 +195,12 @@ class SnapshotRepository:
                 return None, _BUFFER_OVERSIZED
             return copied, None
         finally:
-            view.release()
+            value = None
+            exporter = None
+            copied = None
+            if view is not None:
+                view.release()
+            view = None
 
     @staticmethod
     def _decode_manifest(
@@ -282,79 +290,96 @@ class SnapshotRepository:
 
     def _read_terminal(self, key: str) -> tuple[SnapshotRead | None, str | None]:
         """Reconstruct a snapshot and return only a static failure status."""
-        value, retrieve_failed = self._retrieve(key)
-        if retrieve_failed:
-            return None, "Snapshot manifest retrieval failed."
-        if value is None:
-            return SnapshotRead(False, None, False), None
-        raw, buffer_error = self._copy_buffer(
-            value, max(self._max_bytes, _MAX_MANIFEST_BYTES)
-        )
-        value = None
-        if buffer_error == _BUFFER_INVALID:
-            return None, "Snapshot manifest has an invalid type."
-        if buffer_error == _BUFFER_NONCONTIGUOUS:
-            return None, "Snapshot manifest is not contiguous."
-        if buffer_error == _BUFFER_MUTABLE:
-            return None, "Snapshot manifest is mutable."
-        if buffer_error == _BUFFER_OVERSIZED:
-            return None, "Snapshot exceeds the configured size limit."
-        if buffer_error is not None or raw is None:
-            return None, "Snapshot manifest conversion failed."
-        manifest, manifest_error = self._decode_manifest(raw)
-        if manifest_error is not None:
-            return None, manifest_error
-        if manifest is None:
-            if len(raw) > self._max_bytes:
-                return None, "Snapshot exceeds the configured size limit."
-            return SnapshotRead(True, raw, False), None
-        raw = None
-        if (
-            manifest.length > self._max_bytes
-            or manifest.chunk_bytes > self._chunk_bytes
-        ):
-            return None, "Snapshot exceeds the configured size limit."
-        if manifest.length == 0:
-            if manifest.checksum != hashlib.sha256(b"").hexdigest():
-                return None, "Snapshot checksum validation failed."
-            return SnapshotRead(True, None, True), None
-        assembled = bytearray()
-        for index in range(manifest.chunks):
-            chunk, retrieve_failed = self._retrieve(
-                self._chunk_key(key, manifest.generation, index)
-            )
+        value: object = None
+        raw: bytes | None = None
+        manifest: _Manifest | None = None
+        assembled: bytearray | None = None
+        chunk: object = None
+        copied_chunk: bytes | None = None
+        state: bytes | None = None
+        try:
+            value, retrieve_failed = self._retrieve(key)
             if retrieve_failed:
-                return None, "Snapshot chunk retrieval failed."
-            expected = min(
-                manifest.chunk_bytes,
-                manifest.length - (index * manifest.chunk_bytes),
+                return None, "Snapshot manifest retrieval failed."
+            if value is None:
+                return SnapshotRead(False, None, False), None
+            raw, buffer_error = self._copy_buffer(
+                value, max(self._max_bytes, _MAX_MANIFEST_BYTES)
             )
-            copied_chunk, buffer_error = self._copy_buffer(chunk, expected)
-            chunk = None
+            value = None
             if buffer_error == _BUFFER_INVALID:
-                return None, "Snapshot chunk is missing or invalid."
+                return None, "Snapshot manifest has an invalid type."
             if buffer_error == _BUFFER_NONCONTIGUOUS:
-                return None, "Snapshot chunk is not contiguous."
+                return None, "Snapshot manifest is not contiguous."
             if buffer_error == _BUFFER_MUTABLE:
-                return None, "Snapshot chunk is mutable."
+                return None, "Snapshot manifest is mutable."
             if buffer_error == _BUFFER_OVERSIZED:
-                return None, "Snapshot chunk length validation failed."
-            if buffer_error is not None or copied_chunk is None:
-                return None, "Snapshot chunk conversion failed."
-            if len(copied_chunk) != expected:
-                return None, "Snapshot chunk length validation failed."
-            assembled.extend(copied_chunk)
+                return None, "Snapshot exceeds the configured size limit."
+            if buffer_error is not None or raw is None:
+                return None, "Snapshot manifest conversion failed."
+            manifest, manifest_error = self._decode_manifest(raw)
+            if manifest_error is not None:
+                return None, manifest_error
+            if manifest is None:
+                if len(raw) > self._max_bytes:
+                    return None, "Snapshot exceeds the configured size limit."
+                return SnapshotRead(True, raw, False), None
+            raw = None
+            if (
+                manifest.length > self._max_bytes
+                or manifest.chunk_bytes > self._chunk_bytes
+            ):
+                return None, "Snapshot exceeds the configured size limit."
+            if manifest.length == 0:
+                if manifest.checksum != hashlib.sha256(b"").hexdigest():
+                    return None, "Snapshot checksum validation failed."
+                return SnapshotRead(True, None, True), None
+            assembled = bytearray()
+            for index in range(manifest.chunks):
+                chunk, retrieve_failed = self._retrieve(
+                    self._chunk_key(key, manifest.generation, index)
+                )
+                if retrieve_failed:
+                    return None, "Snapshot chunk retrieval failed."
+                expected = min(
+                    manifest.chunk_bytes,
+                    manifest.length - (index * manifest.chunk_bytes),
+                )
+                copied_chunk, buffer_error = self._copy_buffer(chunk, expected)
+                chunk = None
+                if buffer_error == _BUFFER_INVALID:
+                    return None, "Snapshot chunk is missing or invalid."
+                if buffer_error == _BUFFER_NONCONTIGUOUS:
+                    return None, "Snapshot chunk is not contiguous."
+                if buffer_error == _BUFFER_MUTABLE:
+                    return None, "Snapshot chunk is mutable."
+                if buffer_error == _BUFFER_OVERSIZED:
+                    return None, "Snapshot chunk length validation failed."
+                if buffer_error is not None or copied_chunk is None:
+                    return None, "Snapshot chunk conversion failed."
+                if len(copied_chunk) != expected:
+                    return None, "Snapshot chunk length validation failed."
+                assembled.extend(copied_chunk)
+                copied_chunk = None
+            state = bytes(assembled)
+            assembled.clear()
+            if len(state) != manifest.length:
+                return None, "Snapshot length validation failed."
+            if hashlib.sha256(state).hexdigest() != manifest.checksum:
+                return None, "Snapshot checksum validation failed."
+            return SnapshotRead(True, state, True), None
+        except Exception:
+            return None, "Snapshot assembly failed."
+        finally:
+            value = None
+            raw = None
+            manifest = None
+            chunk = None
             copied_chunk = None
-        state = bytes(assembled)
-        assembled.clear()
-        assembled = bytearray()
-        if len(state) != manifest.length:
-            state = b""
-            return None, "Snapshot length validation failed."
-        if hashlib.sha256(state).hexdigest() != manifest.checksum:
-            state = b""
-            return None, "Snapshot checksum validation failed."
-        return SnapshotRead(True, state, True), None
+            state = None
+            if assembled is not None:
+                assembled.clear()
+            assembled = None
 
     def read(self, key: str) -> SnapshotRead:
         """Read and fully validate one committed logical snapshot."""
@@ -368,50 +393,68 @@ class SnapshotRepository:
     def _commit_terminal(self, key: str, state: bytes | None) -> str | None:
         """Write a snapshot and return only a static failure status."""
         payload = b""
-        buffer_error: str | None = None
-        if state is not None:
-            if not isinstance(state, bytes):
+        copied_payload: bytes | None = None
+        chunk = b""
+        manifest: _Manifest | None = None
+        manifest_bytes = b""
+        try:
+            buffer_error: str | None = None
+            if state is not None:
+                if not isinstance(state, bytes):
+                    return "Strategy snapshot has an invalid type."
+                copied_payload, buffer_error = self._copy_buffer(state, self._max_bytes)
                 state = None
-                return "Strategy snapshot has an invalid type."
-            copied_payload, buffer_error = self._copy_buffer(state, self._max_bytes)
-            state = None
-            if buffer_error == _BUFFER_NONCONTIGUOUS:
-                return "Strategy snapshot is not contiguous."
-            if buffer_error == _BUFFER_MUTABLE:
-                return "Strategy snapshot is mutable."
-            if buffer_error == _BUFFER_OVERSIZED:
+                if buffer_error == _BUFFER_NONCONTIGUOUS:
+                    return "Strategy snapshot is not contiguous."
+                if buffer_error == _BUFFER_MUTABLE:
+                    return "Strategy snapshot is mutable."
+                if buffer_error == _BUFFER_OVERSIZED:
+                    return "Snapshot exceeds the configured size limit."
+                if buffer_error is not None or copied_payload is None:
+                    return "Strategy snapshot conversion failed."
+                payload = copied_payload
+                copied_payload = None
+            length = len(payload)
+            if length > self._max_bytes:
                 return "Snapshot exceeds the configured size limit."
-            if buffer_error is not None or copied_payload is None:
-                return "Strategy snapshot conversion failed."
-            payload = copied_payload
-        length = len(payload)
-        if length > self._max_bytes:
-            return "Snapshot exceeds the configured size limit."
-        generation = uuid.uuid4().hex
-        chunks = (length + self._chunk_bytes - 1) // self._chunk_bytes
-        for index in range(chunks):
-            start = index * self._chunk_bytes
-            if not self._store(
-                self._chunk_key(key, generation, index),
-                payload[start : start + self._chunk_bytes],
-            ):
-                return "Snapshot chunk write failed."
-        manifest = _Manifest(
-            generation=generation,
-            length=length,
-            chunk_bytes=self._chunk_bytes,
-            chunks=chunks,
-            checksum=hashlib.sha256(payload).hexdigest(),
-        )
-        payload = b""
-        if not self._store(key, self._encode_manifest(manifest)):
-            return "Snapshot manifest write failed."
-        return None
+            generation = uuid.uuid4().hex
+            chunks = (length + self._chunk_bytes - 1) // self._chunk_bytes
+            for index in range(chunks):
+                start = index * self._chunk_bytes
+                chunk = payload[start : start + self._chunk_bytes]
+                if not self._store(self._chunk_key(key, generation, index), chunk):
+                    return "Snapshot chunk write failed."
+                chunk = b""
+            manifest = _Manifest(
+                generation=generation,
+                length=length,
+                chunk_bytes=self._chunk_bytes,
+                chunks=chunks,
+                checksum=hashlib.sha256(payload).hexdigest(),
+            )
+            payload = b""
+            manifest_bytes = self._encode_manifest(manifest)
+            manifest = None
+            if not self._store(key, manifest_bytes):
+                return "Snapshot manifest write failed."
+            return None
+        except Exception:
+            return "Snapshot construction failed."
+        finally:
+            state = None
+            payload = b""
+            copied_payload = None
+            chunk = b""
+            manifest = None
+            manifest_bytes = b""
 
     def commit(self, key: str, state: bytes | None) -> None:
         """Commit ``state`` by writing all generation chunks before its manifest."""
-        self._validate_logical_key(key)
-        failure_message = self._commit_terminal(key, state)
-        state = None
+        failure_message: str | None = None
+        try:
+            self._validate_logical_key(key)
+            failure_message = self._commit_terminal(key, state)
+        finally:
+            state = None
         if failure_message is not None:
             raise SnapshotRepositoryError(failure_message) from None
