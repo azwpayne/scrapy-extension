@@ -92,8 +92,18 @@ def _backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     client = mocker.MagicMock()
     client.options.return_value = client
     shards = {"total": 1, "successful": 1, "failed": 0}
-    client.index.return_value = {"result": "created", "_shards": shards}
-    client.delete.return_value = {"result": "deleted", "_shards": shards}
+    client.index.side_effect = lambda **kwargs: {
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+        "result": "created",
+        "_shards": shards,
+    }
+    client.delete.side_effect = lambda **kwargs: {
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+        "result": "deleted",
+        "_shards": shards,
+    }
     client.indices.refresh.return_value = {"_shards": shards}
     client.delete_by_query.return_value = {
         "timed_out": False,
@@ -498,6 +508,7 @@ def test_malformed_mutation_response_raises_static_redacted_typed_error(
     mocker: Any,
 ) -> None:
     backend, client = _backend(mocker)
+    client.delete.side_effect = None
     client.delete.return_value = {
         "result": "deleted",
         "_shards": {

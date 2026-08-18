@@ -79,8 +79,16 @@ def _mock_backend(mocker, **settings_kwargs):
     config = ElasticSearchSettings(**settings_kwargs)
     backend = ElasticSearchBackend(config)
     backend._client = _adapt_elasticsearch_client_mock(mocker.MagicMock())
-    backend._client.index.return_value = _INDEX_RESPONSE
-    backend._client.delete.return_value = _DELETE_RESPONSE
+    backend._client.index.side_effect = lambda **kwargs: {
+        **_INDEX_RESPONSE,
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+    }
+    backend._client.delete.side_effect = lambda **kwargs: {
+        **_DELETE_RESPONSE,
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+    }
     backend._client.indices.refresh.return_value = {"_shards": _SHARDS}
     backend._client.delete_by_query.return_value = _DELETE_BY_QUERY_RESPONSE
     backend._connection_snapshot = backend._capture_connection_snapshot()
@@ -341,7 +349,11 @@ class TestConnection:
     def test_live_client_keeps_original_capability_indices_after_mutation(self, mocker):
         """Live operations use the client generation's immutable index snapshot."""
         client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
-        client.index.return_value = _INDEX_RESPONSE
+        client.index.side_effect = lambda **kwargs: {
+            **_INDEX_RESPONSE,
+            "_index": kwargs["index"],
+            "_id": kwargs["id"],
+        }
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",
             return_value=_adapt_elasticsearch_client_mock(client),
@@ -590,7 +602,11 @@ class TestQueue:
         ]
         b._client.delete.side_effect = [
             ConflictError("conflict", 409, body={}),
-            _DELETE_RESPONSE,
+            {
+                **_DELETE_RESPONSE,
+                "_index": "scrapy_queue",
+                "_id": "2",
+            },
         ]
 
         assert b.pop("q") == b"won"

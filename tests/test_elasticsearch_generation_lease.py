@@ -17,6 +17,22 @@ _INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
 _DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
 
 
+def _index_response(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **_INDEX_RESPONSE,
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+    }
+
+
+def _delete_response(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **_DELETE_RESPONSE,
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+    }
+
+
 def _adapt_elasticsearch_client_mock(client: Any) -> Any:
     client.options.return_value = client
     return client
@@ -26,16 +42,16 @@ def _successful_client(mocker: Any) -> Any:
     client = _adapt_elasticsearch_client_mock(
         mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
     )
-    client.index.return_value = _INDEX_RESPONSE
-    client.delete.return_value = _DELETE_RESPONSE
+    client.index.side_effect = lambda **kwargs: _index_response(kwargs)
+    client.delete.side_effect = lambda **kwargs: _delete_response(kwargs)
     return client
 
 
 def _injected_backend(mocker: Any, **settings: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(ElasticSearchSettings(**settings))
     client = _adapt_elasticsearch_client_mock(mocker.MagicMock())
-    client.index.return_value = _INDEX_RESPONSE
-    client.delete.return_value = _DELETE_RESPONSE
+    client.index.side_effect = lambda **kwargs: _index_response(kwargs)
+    client.delete.side_effect = lambda **kwargs: _delete_response(kwargs)
     client.indices.refresh.return_value = {"_shards": _SHARDS}
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
@@ -64,7 +80,7 @@ def test_push_lease_keeps_client_open_until_sdk_call_finishes(mocker: Any) -> No
     def index(**_kwargs: Any) -> dict[str, Any]:
         entered.set()
         assert release.wait(timeout=2)
-        return _INDEX_RESPONSE
+        return _index_response(_kwargs)
 
     client.index.side_effect = index
     pushing = _thread(lambda: backend.push("jobs", b"payload"))
@@ -113,7 +129,7 @@ def test_pop_search_delete_uses_one_generation_lease(mocker: Any) -> None:
 
     def delete(**_kwargs: Any) -> dict[str, Any]:
         calls.append("delete")
-        return _DELETE_RESPONSE
+        return _delete_response(_kwargs)
 
     client.delete.side_effect = delete
     client.close.side_effect = lambda: calls.append("close")
@@ -148,7 +164,7 @@ def test_expired_storage_reap_uses_get_generation_for_delete(mocker: Any) -> Non
     def delete(**_kwargs: Any) -> dict[str, Any]:
         reap_entered.set()
         assert release_reap.wait(timeout=2)
-        return _DELETE_RESPONSE
+        return _delete_response(_kwargs)
 
     client.delete.side_effect = delete
     result: list[bytes | None] = []
@@ -177,7 +193,7 @@ def test_disconnect_drains_all_peer_operation_leases(mocker: Any) -> None:
     def index(**_kwargs: Any) -> dict[str, Any]:
         both_entered.wait(timeout=2)
         assert release.wait(timeout=2)
-        return _INDEX_RESPONSE
+        return _index_response(_kwargs)
 
     client.index.side_effect = index
     first = _thread(lambda: backend.push("jobs", b"one"))
@@ -213,7 +229,7 @@ def test_reconnect_fences_retired_client_and_snapshot(mocker: Any) -> None:
     def old_index(**_kwargs: Any) -> dict[str, Any]:
         entered.set()
         assert release.wait(timeout=2)
-        return _INDEX_RESPONSE
+        return _index_response(_kwargs)
 
     first.index.side_effect = old_index
     pushing = _thread(lambda: backend.push("jobs", b"old"))
@@ -267,7 +283,7 @@ def test_connect_during_drain_rejects_lease_owner_and_replaces_for_peer(
         finally:
             nested_connect_done.set()
         assert release_operation.wait(timeout=2)
-        return _INDEX_RESPONSE
+        return _index_response(_kwargs)
 
     def push() -> None:
         try:
@@ -369,7 +385,7 @@ def test_post_publication_interrupt_preserves_leasable_generation(
     def hold_lease(**_kwargs: Any) -> dict[str, Any]:
         operation_entered.wait(timeout=2)
         assert release_operation.wait(timeout=2)
-        return _INDEX_RESPONSE
+        return _index_response(_kwargs)
 
     def push() -> None:
         try:
@@ -440,7 +456,7 @@ def test_reentrant_disconnect_is_rejected_without_deadlock(mocker: Any) -> None:
         with pytest.raises(BackendConnectionError) as exc_info:
             backend.disconnect()
         rejection.append(exc_info.value)
-        return _INDEX_RESPONSE
+        return _index_response(_kwargs)
 
     client.index.side_effect = index
     backend.push("jobs", b"payload")

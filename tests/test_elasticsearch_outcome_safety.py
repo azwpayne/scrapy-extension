@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from urllib.parse import unquote
 from collections.abc import Callable
 from typing import Any, ClassVar
 
@@ -70,14 +71,24 @@ class _RetryProbeNode(BaseNode):
             raise ElasticConnectionError("simulated response loss")
 
         response: dict[str, Any]
+        if operation in {"index", "delete"}:
+            document_target = target.partition("?")[0]
+            index, document_id = (
+                unquote(part) for part in document_target.split("/_doc/", maxsplit=1)
+            )
+            index = index.removeprefix("/")
         if operation == "index":
             response = {
+                "_index": index,
+                "_id": document_id,
                 "result": "created",
                 "_shards": {"total": 1, "successful": 1, "failed": 0},
             }
             status = 201
         elif operation == "delete":
             response = {
+                "_index": index,
+                "_id": document_id,
                 "result": "deleted",
                 "_shards": {"total": 1, "successful": 1, "failed": 0},
             }
@@ -203,7 +214,9 @@ def test_mutation_view_has_fixed_no_replay_options_and_shares_root_transport() -
         backend.disconnect()
 
 
-def test_mutation_view_with_unrelated_transport_fails_generation_closed(mocker: Any) -> None:
+def test_mutation_view_with_unrelated_transport_fails_generation_closed(
+    mocker: Any,
+) -> None:
     backend = ElasticSearchBackend(ElasticSearchSettings())
     client = mocker.MagicMock()
     client.options.return_value.transport = object()
@@ -228,8 +241,18 @@ def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(ElasticSearchSettings())
     client = mocker.MagicMock()
     client.options.return_value = client
-    client.index.return_value = {"result": "created", "_shards": _SHARDS}
-    client.delete.return_value = {"result": "deleted", "_shards": _SHARDS}
+    client.index.side_effect = lambda **kwargs: {
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+        "result": "created",
+        "_shards": _SHARDS,
+    }
+    client.delete.side_effect = lambda **kwargs: {
+        "_index": kwargs["index"],
+        "_id": kwargs["id"],
+        "result": "deleted",
+        "_shards": _SHARDS,
+    }
     client.indices.refresh.return_value = _REFRESH_RESPONSE
     client.delete_by_query.return_value = {
         "took": 3,
@@ -531,6 +554,31 @@ def test_clear_families_accept_documented_response_without_shards(
             },
             id="malformed-task",
         ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "retries": None,
+                "failures": [],
+            },
+            id="null-retries",
+        ),
+        *(
+            pytest.param(
+                {
+                    "timed_out": False,
+                    "total": 1,
+                    "deleted": 1,
+                    "version_conflicts": 0,
+                    "requests_per_second": rate,
+                    "failures": [],
+                },
+                id=f"invalid-rate-{rate!r}",
+            )
+            for rate in (0, True, float("nan"), float("inf"), -2)
+        ),
     ),
 )
 def test_clear_families_reject_indeterminate_documented_responses(
@@ -588,17 +636,58 @@ def test_mutation_requires_complete_acknowledgement(
     backend, client = _mock_backend(mocker)
     call: Callable[[], object]
     if operation == "push":
+        client.index.side_effect = None
         client.index.return_value = response
         call = lambda: backend.push("jobs", b"item")
     elif operation == "set":
+        client.index.side_effect = None
         client.index.return_value = response
         call = lambda: backend.add("seen", b"item")
     elif operation == "store":
+        client.index.side_effect = None
         client.index.return_value = response
         call = lambda: backend.store("key", b"item")
     else:
+        client.delete.side_effect = None
         client.delete.return_value = response
         call = lambda: backend.delete("key")
+
+    with pytest.raises(expected_error):
+        call()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_error"),
+    (
+        ("push", QueueOutcomeIndeterminateError),
+        ("set", SetOutcomeIndeterminateError),
+        ("store", StorageOutcomeIndeterminateError),
+        ("delete", StorageOutcomeIndeterminateError),
+    ),
+)
+def test_mutation_rejects_acknowledgement_for_another_document(
+    mocker: Any, operation: str, expected_error: type[Exception]
+) -> None:
+    backend, client = _mock_backend(mocker)
+    response = {
+        "_index": "wrong-index",
+        "_id": "wrong-id",
+        "result": "deleted" if operation == "delete" else "created",
+        "_shards": _SHARDS,
+    }
+    if operation == "delete":
+        client.delete.side_effect = None
+        client.delete.return_value = response
+        call = lambda: backend.delete("key")
+    else:
+        client.index.side_effect = None
+        client.index.return_value = response
+        if operation == "push":
+            call = lambda: backend.push("jobs", b"item")
+        elif operation == "set":
+            call = lambda: backend.add("seen", b"item")
+        else:
+            call = lambda: backend.store("key", b"item")
 
     with pytest.raises(expected_error):
         call()

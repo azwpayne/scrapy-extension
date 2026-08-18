@@ -175,18 +175,43 @@ def _validate_refresh_response(response: object) -> None:
     _validate_shards(response, require_success=True)
 
 
-def _validate_index_response(response: object, allowed_results: frozenset[str]) -> None:
-    """Require a successful shard acknowledgement and expected write result."""
+def _validate_mutation_identity(
+    response_body: Mapping[str, Any], *, expected_index: str, expected_id: str
+) -> None:
+    """Require an acknowledgement for the exact requested document."""
+    if (
+        response_body.get("_index") != expected_index
+        or response_body.get("_id") != expected_id
+    ):
+        raise _ElasticSearchResponseError
+
+
+def _validate_index_response(
+    response: object,
+    allowed_results: frozenset[str],
+    *,
+    expected_index: str,
+    expected_id: str,
+) -> None:
+    """Require a successful acknowledgement for the exact expected write."""
     _validate_shards(response, require_success=True)
     response_body = _response_mapping(response)
+    _validate_mutation_identity(
+        response_body, expected_index=expected_index, expected_id=expected_id
+    )
     if response_body.get("result") not in allowed_results:
         raise _ElasticSearchResponseError
 
 
-def _validate_delete_response(response: object) -> bool:
-    """Return a server-confirmed delete result, rejecting ambiguous shapes."""
+def _validate_delete_response(
+    response: object, *, expected_index: str, expected_id: str
+) -> bool:
+    """Return a confirmed delete result for the exact requested document."""
     _validate_shards(response, require_success=True)
     response_body = _response_mapping(response)
+    _validate_mutation_identity(
+        response_body, expected_index=expected_index, expected_id=expected_id
+    )
     result = response_body.get("result")
     if result == "deleted":
         return True
@@ -255,8 +280,8 @@ def _validate_delete_by_query_response(response: object) -> None:
         if field in response_body:
             _exact_nonnegative_int(response_body[field])
 
-    retries = response_body.get("retries")
-    if retries is not None:
+    if "retries" in response_body:
+        retries = response_body["retries"]
         if not isinstance(retries, Mapping):
             raise _ElasticSearchResponseError
         _exact_nonnegative_int(retries.get("bulk"))
@@ -268,7 +293,7 @@ def _validate_delete_by_query_response(response: object) -> None:
             isinstance(rate, bool)
             or not isinstance(rate, (int, float))
             or not math.isfinite(rate)
-            or (rate < 0 and rate != -1)
+            or (rate != -1 and rate <= 0)
         ):
             raise _ElasticSearchResponseError
 
@@ -1108,7 +1133,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     id=document_id,
                     document=doc,
                 )
-                _validate_index_response(response, frozenset({"created"}))
+                _validate_index_response(
+                    response,
+                    frozenset({"created"}),
+                    expected_index=generation.snapshot.queue_index,
+                    expected_id=document_id,
+                )
         except (TransportError, _ElasticSearchResponseError):
             raise QueueOutcomeIndeterminateError(
                 _ELASTICSEARCH_QUEUE_PUSH_ERROR, operation="push"
@@ -1194,7 +1224,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                             if_seq_no=sequence_number,
                             if_primary_term=primary_term,
                         )
-                        if not _validate_delete_response(delete_response):
+                        if not _validate_delete_response(
+                            delete_response,
+                            expected_index=generation.snapshot.queue_index,
+                            expected_id=document_id,
+                        ):
                             raise _ElasticSearchResponseError
                     except ConflictError:
                         # Lost the race to another worker — retry to find the next item.
@@ -1378,7 +1412,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     document=doc,
                     op_type="create",
                 )
-                _validate_index_response(response, frozenset({"created"}))
+                _validate_index_response(
+                    response,
+                    frozenset({"created"}),
+                    expected_index=generation.snapshot.set_index,
+                    expected_id=doc_id,
+                )
         except ConflictError:
             return False
         except RequestError as e:
@@ -1597,7 +1636,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 response = generation.mutation_client.index(
                     index=generation.snapshot.storage_index, id=key, document=doc
                 )
-                _validate_index_response(response, frozenset({"created", "updated"}))
+                _validate_index_response(
+                    response,
+                    frozenset({"created", "updated"}),
+                    expected_index=generation.snapshot.storage_index,
+                    expected_id=key,
+                )
         except (TransportError, _ElasticSearchResponseError):
             raise StorageOutcomeIndeterminateError(
                 _ELASTICSEARCH_STORAGE_STORE_ERROR, operation="store"
@@ -1706,7 +1750,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 if_seq_no=seq_no,
                 if_primary_term=primary_term,
             )
-            _validate_delete_response(delete_response)
+            _validate_delete_response(
+                delete_response,
+                expected_index=generation.snapshot.storage_index,
+                expected_id=key,
+            )
         except (ConflictError, NotFoundError):
             pass
         except (TransportError, _ElasticSearchResponseError):
@@ -1968,7 +2016,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             response = generation.mutation_client.delete(index=index, id=doc_id)
         except NotFoundError:
             return False
-        return _validate_delete_response(response)
+        return _validate_delete_response(
+            response, expected_index=index, expected_id=doc_id
+        )
 
     def _delete_by_term(
         self,
