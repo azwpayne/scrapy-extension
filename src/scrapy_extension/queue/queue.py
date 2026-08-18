@@ -1340,11 +1340,9 @@ class BackendQueue:
         while True:
             try:
                 with self._operation_gate:
-                    if self._close_owner_token is owner_token:
-                        self._close_in_progress = False
-                        self._close_owner_token = None
-                        if succeeded:
-                            self._close_complete = True
+                    owns_attempt = self._close_owner_token is owner_token
+                    if owns_attempt and succeeded:
+                        self._close_complete = True
                     waiters = self._close_attempt_waiters.get(attempt)
                     if waiters:
                         self._close_attempt_outcomes[attempt] = succeeded
@@ -1352,6 +1350,13 @@ class BackendQueue:
                         self._close_attempt_waiters.pop(attempt, None)
                         self._close_attempt_outcomes.pop(attempt, None)
                     self._operation_gate.notify_all()
+                    if owns_attempt:
+                        self._close_in_progress = False
+                        # Keep ownership recognizable until every terminal state
+                        # mutation is complete. An interruption before this final
+                        # write therefore retries publication; one after it can
+                        # only observe the already-terminal attempt.
+                        self._close_owner_token = None
                 return interrupted
             except BaseException as exc:
                 if interrupted is None:

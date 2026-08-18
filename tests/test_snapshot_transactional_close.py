@@ -18,13 +18,17 @@ class _CustomControlFlow(BaseException):
     pass
 
 
-def _instruction_after(opname: str, argval: object) -> int:
-    instructions = list(dis.get_instructions(BackendQueue.close))
+def _instruction_after_in(function: object, opname: str, argval: object) -> int:
+    instructions = list(dis.get_instructions(function))
     for index in range(len(instructions) - 2, -1, -1):
         instruction = instructions[index]
         if instruction.opname == opname and instruction.argval == argval:
             return instructions[index + 1].offset
-    raise AssertionError(f"Missing {opname} {argval!r} in BackendQueue.close")
+    raise AssertionError(f"Missing {opname} {argval!r} in {function!r}")
+
+
+def _instruction_after(opname: str, argval: object) -> int:
+    return _instruction_after_in(BackendQueue.close, opname, argval)
 
 
 def _queue_with_storage(strategy: MagicMock, storage: MagicMock) -> BackendQueue:
@@ -356,6 +360,225 @@ def test_interrupted_owner_publication_repairs_waiters_and_allows_retry() -> Non
     assert queue._close_attempt_waiters == {}
     assert queue._close_attempt_outcomes == {}
     strategy.close.assert_called_once_with()
+
+
+class _PublicationBoundaryInterruption(BaseException):
+    pass
+
+
+class _MutationBoundaryQueue(BackendQueue):
+    """Inject once immediately after a publication-state mutation."""
+
+    _TRACKED_ATTRIBUTES = {
+        "_close_complete": "close-complete",
+        "_close_in_progress": "close-in-progress",
+        "_close_owner_token": "owner-token",
+    }
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        object.__setattr__(self, "_boundary_tracking", False)
+        object.__setattr__(self, "_boundary_target", None)
+        object.__setattr__(self, "_boundary_interruption", None)
+        object.__setattr__(self, "_boundary_raised", False)
+        object.__setattr__(self, "_boundary_observed", [])
+        super().__init__(*args, **kwargs)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        object.__setattr__(self, name, value)
+        label = self._TRACKED_ATTRIBUTES.get(name)
+        if label is not None and getattr(self, "_boundary_tracking", False):
+            self._after_mutation(label)
+
+    def _after_mutation(self, label: str) -> None:
+        self._boundary_observed.append(label)
+        if self._boundary_target == label and not self._boundary_raised:
+            object.__setattr__(self, "_boundary_raised", True)
+            interruption = self._boundary_interruption
+            assert interruption is not None
+            raise interruption
+
+    def arm_boundary(self, label: str, interruption: BaseException) -> None:
+        object.__setattr__(self, "_boundary_target", label)
+        object.__setattr__(self, "_boundary_interruption", interruption)
+        object.__setattr__(self, "_boundary_raised", False)
+        self._boundary_observed.clear()
+        object.__setattr__(self, "_boundary_tracking", True)
+
+
+class _MutationBoundaryMap(dict[int, object]):
+    def __init__(
+        self,
+        queue: _MutationBoundaryQueue,
+        *,
+        set_label: str,
+        pop_label: str,
+        initial: dict[int, object],
+    ) -> None:
+        super().__init__(initial)
+        self._queue = queue
+        self._set_label = set_label
+        self._pop_label = pop_label
+
+    def __setitem__(self, key: int, value: object) -> None:
+        super().__setitem__(key, value)
+        self._queue._after_mutation(self._set_label)
+
+    def pop(self, key: int, default: object = None) -> object:
+        value = super().pop(key, default)
+        self._queue._after_mutation(self._pop_label)
+        return value
+
+
+class _MutationBoundaryCondition(threading.Condition):
+    def __init__(self, queue: _MutationBoundaryQueue) -> None:
+        super().__init__()
+        self._queue = queue
+
+    def notify_all(self) -> None:
+        super().notify_all()
+        self._queue._after_mutation("notify-all")
+
+
+_PUBLICATION_MODELS = {
+    (True, True): [
+        "close-complete",
+        "outcome-set",
+        "notify-all",
+        "close-in-progress",
+        "owner-token",
+    ],
+    (True, False): [
+        "close-complete",
+        "waiters-pop",
+        "outcomes-pop",
+        "notify-all",
+        "close-in-progress",
+        "owner-token",
+    ],
+    (False, True): [
+        "outcome-set",
+        "notify-all",
+        "close-in-progress",
+        "owner-token",
+    ],
+    (False, False): [
+        "waiters-pop",
+        "outcomes-pop",
+        "notify-all",
+        "close-in-progress",
+        "owner-token",
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("succeeded", "has_waiter", "boundary"),
+    [
+        (succeeded, has_waiter, boundary)
+        for (succeeded, has_waiter), boundaries in _PUBLICATION_MODELS.items()
+        for boundary in boundaries
+    ],
+)
+def test_every_close_publication_mutation_boundary_repairs_to_terminal_state(
+    succeeded: bool, has_waiter: bool, boundary: str
+) -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    queue = _MutationBoundaryQueue(
+        MagicMock(
+            get_storage_backend=MagicMock(return_value=storage),
+            get_queue_backend=MagicMock(return_value=MagicMock()),
+        ),
+        "q",
+        queue_strategy=strategy,
+    )
+    attempt = 1
+    owner_token = object()
+    waiter_token = object()
+    queue._close_owner_token = owner_token
+    queue._close_in_progress = True
+    queue._close_complete = False
+    waiter_values: dict[int, object] = {
+        attempt: {waiter_token} if has_waiter else set()
+    }
+    outcome_values: dict[int, object] = {attempt: not succeeded}
+    queue._close_attempt_waiters = _MutationBoundaryMap(
+        queue,
+        set_label="waiters-set",
+        pop_label="waiters-pop",
+        initial=waiter_values,
+    )  # type: ignore[assignment]
+    queue._close_attempt_outcomes = _MutationBoundaryMap(
+        queue,
+        set_label="outcome-set",
+        pop_label="outcomes-pop",
+        initial=outcome_values,
+    )  # type: ignore[assignment]
+    queue._operation_gate = _MutationBoundaryCondition(queue)
+    interruption = _PublicationBoundaryInterruption(boundary)
+    queue.arm_boundary(boundary, interruption)
+
+    publication_failure = queue._publish_close_attempt(
+        attempt, owner_token, succeeded=succeeded
+    )
+
+    assert publication_failure is interruption
+    expected_order = _PUBLICATION_MODELS[succeeded, has_waiter]
+    assert list(dict.fromkeys(queue._boundary_observed)) == expected_order
+    assert queue._close_complete is succeeded
+    assert queue._close_in_progress is False
+    assert queue._close_owner_token is None
+    if has_waiter:
+        assert queue._close_attempt_outcomes == {attempt: succeeded}
+        with queue._operation_gate:
+            assert queue._cleanup_close_waiter_locked(attempt, waiter_token) is None
+    assert queue._close_attempt_waiters == {}
+    assert queue._close_attempt_outcomes == {}
+
+
+@pytest.mark.timeout(10)
+def test_opcode_interruption_at_former_owner_clear_boundary_is_terminal() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = _queue_with_storage(strategy, storage)
+    interruption = _PublicationBoundaryInterruption(
+        "interrupted immediately after owner-token clearing"
+    )
+    target_offset = _instruction_after_in(
+        BackendQueue._publish_close_attempt, "STORE_ATTR", "_close_owner_token"
+    )
+
+    def inject(frame: object, event: str, _arg: object) -> object:
+        if (
+            getattr(frame, "f_code", None)
+            is BackendQueue._publish_close_attempt.__code__
+        ):
+            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                raise interruption
+        return inject
+
+    sys.settrace(inject)
+    try:
+        with pytest.raises(_PublicationBoundaryInterruption) as exc_info:
+            queue.close()
+    finally:
+        sys.settrace(None)
+
+    assert exc_info.value is interruption
+    assert queue._close_complete is True
+    assert queue._close_in_progress is False
+    assert queue._close_owner_token is None
+    assert queue._close_attempt_waiters == {}
+    assert queue._close_attempt_outcomes == {}
+
+    queue.close()
+
+    strategy.close.assert_called_once_with()
+    assert queue._close_owner_token is None
 
 
 @pytest.mark.parametrize(
