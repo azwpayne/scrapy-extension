@@ -12,6 +12,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from scrapy.settings import Settings as ScrapySettings
 
 from scrapy_extension.backends.base import Backend, QueueBackend
 from scrapy_extension.backends.circuit_breaker import CircuitBreaker, wrap_queue_backend
@@ -26,6 +27,7 @@ from scrapy_extension.exceptions import (
     QueueError,
 )
 from scrapy_extension.queue.strategies.base import QueueStrategy, _BoundQueueAckToken
+from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
 class _Settings:
@@ -306,6 +308,70 @@ def test_manager_ignores_backend_module_mutation_after_validation(
 
     assert type(manager._create_backend()) is _DeferredPlugin
     assert manager._static_ack_capabilities() == (True, True)
+
+
+def test_manager_pins_mutated_plugin_flags_for_gate_and_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _SingleConcurrencyDeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+    assert manager._static_ack_capabilities() == (True, False)
+
+    monkeypatch.setattr(_SingleConcurrencyDeferredPlugin, "requires_ack", False)
+    monkeypatch.setattr(
+        _SingleConcurrencyDeferredPlugin,
+        "supports_concurrent_ack",
+        True,
+    )
+
+    settings = ScrapySettings({"CONCURRENT_REQUESTS": 2})
+    with pytest.raises(ConfigurationError, match="single-slot ack"):
+        BackendScheduler._enforce_ack_concurrency_gate(settings, manager)
+
+    backend = manager._create_backend()
+    manager._backend = backend
+    manager._breaker_configured = True
+    adapter = manager.get_queue_backend()
+    assert isinstance(adapter, _DeferredAckPluginQueueBackend)
+    assert adapter.requires_ack is True
+    assert adapter.supports_concurrent_ack is False
+
+    later_manager = ConnectionManager("ackplugin")
+    assert later_manager._static_ack_capabilities() == (False, True)
+    later_backend = later_manager._create_backend()
+    later_manager._backend = later_backend
+    later_manager._breaker_configured = True
+    assert later_manager.get_queue_backend() is later_backend
+
+
+def test_later_manager_revalidates_mutated_flags_with_static_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "private-mutated-ack-capability"
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+
+    monkeypatch.setattr(_DeferredPlugin, "requires_ack", marker)
+    monkeypatch.setattr(_DeferredPlugin, "supports_concurrent_ack", marker)
+
+    assert manager._static_ack_capabilities() == (True, True)
+    with pytest.raises(ConfigurationError) as exc_info:
+        ConnectionManager("ackplugin")
+
+    error = exc_info.value
+    assert str(error) == (
+        "Selected third-party queue backend has an invalid acknowledgement contract."
+    )
+    assert error.setting_name == "SCRAPY_BACKEND_TYPE"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in "".join(traceback.format_exception(error))
+    trace = error.__traceback__
+    while trace is not None:
+        if "/src/scrapy_extension/" in trace.tb_frame.f_code.co_filename:
+            for value in trace.tb_frame.f_locals.values():
+                _assert_value_graph_is_redacted(value, marker)
+        trace = trace.tb_next
 
 
 @pytest.mark.filterwarnings("error")

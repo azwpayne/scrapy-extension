@@ -44,7 +44,7 @@ from inspect import (
 from json import JSONEncoder
 from pathlib import PurePath
 from types import CoroutineType, FunctionType, ModuleType
-from typing import Any, ClassVar, ParamSpec, TypeVar, cast
+from typing import Any, ClassVar, NamedTuple, ParamSpec, TypeVar, cast
 from uuid import UUID
 
 from pydantic import BaseModel, SecretBytes, SecretStr, ValidationError
@@ -446,44 +446,53 @@ def _invalid_plugin_ack_contract() -> ConfigurationError:
     )
 
 
+class _PluginAckCapabilitySnapshot(NamedTuple):
+    """Immutable exact booleans accepted from one plugin class generation."""
+
+    requires_ack: bool
+    supports_concurrent_ack: bool
+    deferred_ack_plugin: bool
+
+
 def _validate_plugin_ack_class(
     descriptor: BackendDescriptor,
     backend_cls: object,
-) -> bool:
-    """Validate exact deferred-ACK metadata before any plugin broker I/O.
+) -> _PluginAckCapabilitySnapshot:
+    """Validate and snapshot deferred-ACK metadata before plugin broker I/O.
 
     Legacy queue plugins inherit ``requires_ack=False`` and remain compatible.
     A plugin opting into deferred acknowledgement must use literal boolean
     metadata and concrete token-bearing methods rather than the permissive ABC
-    defaults. The returned flag tells the manager to install the runtime token
-    fence for that plugin.
+    defaults. The immutable result pins the flags for the manager's lifetime.
     """
     if "queue" not in descriptor.capabilities:
-        return False
+        return _PluginAckCapabilitySnapshot(False, False, False)
     requires_ack = getattr_static(backend_cls, "requires_ack", None)
     if requires_ack is None:
         # Preserve the existing runtime ABC check for legacy descriptors that
         # overclaim ``queue`` without implementing QueueBackend at all.
-        return False
+        return _PluginAckCapabilitySnapshot(False, False, False)
     if type(requires_ack) is not bool:
-        raise _invalid_plugin_ack_contract()
-    if requires_ack is False:
-        if isinstance(backend_cls, type) and issubclass(backend_cls, QueueBackend):
-            supports_concurrent = getattr_static(
-                backend_cls,
-                "supports_concurrent_ack",
-                None,
-            )
-            if type(supports_concurrent) is not bool:
-                raise _invalid_plugin_ack_contract()
-        return False
-    if not isinstance(backend_cls, type) or not issubclass(backend_cls, QueueBackend):
         raise _invalid_plugin_ack_contract()
     supports_concurrent = getattr_static(
         backend_cls,
         "supports_concurrent_ack",
         None,
     )
+    if requires_ack is False:
+        if (
+            isinstance(backend_cls, type)
+            and issubclass(backend_cls, QueueBackend)
+            and type(supports_concurrent) is not bool
+        ):
+            raise _invalid_plugin_ack_contract()
+        return _PluginAckCapabilitySnapshot(
+            requires_ack,
+            supports_concurrent if type(supports_concurrent) is bool else False,
+            False,
+        )
+    if not isinstance(backend_cls, type) or not issubclass(backend_cls, QueueBackend):
+        raise _invalid_plugin_ack_contract()
     if type(supports_concurrent) is not bool:
         raise _invalid_plugin_ack_contract()
     method_calls: dict[str, tuple[tuple[object, ...], dict[str, object]]] = {
@@ -506,7 +515,11 @@ def _validate_plugin_ack_class(
             signature(method).bind(*args, **kwargs)
         except (TypeError, ValueError):
             raise _invalid_plugin_ack_contract() from None
-    return True
+    return _PluginAckCapabilitySnapshot(
+        requires_ack,
+        supports_concurrent,
+        True,
+    )
 
 
 def _validate_backend_contract(
@@ -1755,8 +1768,7 @@ class ConnectionManager:
             raise input_error
         descriptor = get_descriptor(normalized_backend_type)
         plugin_backend_cls: object | None = None
-        deferred_ack_plugin = False
-        plugin_supports_concurrent_ack = False
+        plugin_ack_capabilities: _PluginAckCapabilitySnapshot | None = None
         plugin_class_load_failed = False
         ack_contract_failed = False
         if descriptor.backend_type not in _BUNDLED_BACKEND_TYPES:
@@ -1770,18 +1782,9 @@ class ConnectionManager:
                 plugin_class_load_failed = True
             if not plugin_class_load_failed:
                 try:
-                    deferred_ack_plugin = _validate_plugin_ack_class(
+                    plugin_ack_capabilities = _validate_plugin_ack_class(
                         descriptor,
                         backend_cls,
-                    )
-                    plugin_supports_concurrent_ack = (
-                        deferred_ack_plugin
-                        and getattr_static(
-                            backend_cls,
-                            "supports_concurrent_ack",
-                            False,
-                        )
-                        is True
                     )
                     # The exact object whose static contract was accepted is the
                     # only class this manager may later construct. Re-resolving an
@@ -1797,8 +1800,7 @@ class ConnectionManager:
             del descriptor
             del backend_cls
             del plugin_backend_cls
-            del deferred_ack_plugin
-            del plugin_supports_concurrent_ack
+            del plugin_ack_capabilities
             del plugin_class_load_failed
             del ack_contract_failed
             if invalid_plugin_class:
@@ -1816,8 +1818,10 @@ class ConnectionManager:
         )
         self.settings = settings if settings is not None else {}
         self._plugin_backend_cls = plugin_backend_cls
-        self._deferred_ack_plugin = deferred_ack_plugin
-        self._plugin_supports_concurrent_ack = plugin_supports_concurrent_ack
+        # This immutable construction-time snapshot is the sole source for every
+        # plugin ACK gate and adapter decision. Class metadata may be mutated by
+        # third-party code later; only a newly constructed manager revalidates it.
+        self._plugin_ack_capabilities = plugin_ack_capabilities
         self._plugin_queue_backend_source: (
             tuple[Backend, CircuitBreaker | None] | None
         ) = None
@@ -2163,26 +2167,30 @@ class ConnectionManager:
         self._plugin_queue_backend = None
         self._plugin_queue_backend_source = None
 
+    @property
+    def _deferred_ack_plugin(self) -> bool:
+        """Backward-compatible view of the pinned plugin adapter decision."""
+        snapshot = self._plugin_ack_capabilities
+        return snapshot is not None and snapshot.deferred_ack_plugin
+
+    @property
+    def _plugin_supports_concurrent_ack(self) -> bool:
+        """Backward-compatible view of the pinned plugin concurrency claim."""
+        snapshot = self._plugin_ack_capabilities
+        return snapshot is not None and snapshot.supports_concurrent_ack
+
     def _static_ack_capabilities(self) -> tuple[bool, bool]:
-        """Return ACK flags from the exact backend class owned by this manager."""
-        backend_cls = self._plugin_backend_cls
-        if backend_cls is None:
-            backend_type = self._backend_type_for_operations()
-            descriptor = get_descriptor(
-                backend_type.value
-                if isinstance(backend_type, BackendType)
-                else backend_type
-            )
-            return _load_static_ack_capabilities(descriptor)
-        requires_ack = getattr_static(backend_cls, "requires_ack", False)
-        supports_concurrent = getattr_static(
-            backend_cls,
-            "supports_concurrent_ack",
-            False,
+        """Return ACK flags pinned when this plugin manager was constructed."""
+        snapshot = self._plugin_ack_capabilities
+        if snapshot is not None:
+            return snapshot.requires_ack, snapshot.supports_concurrent_ack
+        backend_type = self._backend_type_for_operations()
+        descriptor = get_descriptor(
+            backend_type.value
+            if isinstance(backend_type, BackendType)
+            else backend_type
         )
-        if type(requires_ack) is not bool or type(supports_concurrent) is not bool:
-            raise _invalid_plugin_ack_contract()
-        return requires_ack, supports_concurrent
+        return _load_static_ack_capabilities(descriptor)
 
     @_manager_terminal_error_boundary()
     @configuration_error_boundary(
@@ -3244,7 +3252,11 @@ class ConnectionManager:
                 from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
 
                 published_backend = wrap_queue_backend(backend, breaker)
-            if not self._deferred_ack_plugin:
+            plugin_ack_capabilities = self._plugin_ack_capabilities
+            if (
+                plugin_ack_capabilities is None
+                or not plugin_ack_capabilities.deferred_ack_plugin
+            ):
                 return published_backend
 
             source = (backend, breaker)
@@ -3266,7 +3278,9 @@ class ConnectionManager:
                     return self._plugin_queue_backend
                 contract_backend = _DeferredAckPluginQueueBackend(
                     published_backend,
-                    supports_concurrent_ack=self._plugin_supports_concurrent_ack,
+                    supports_concurrent_ack=(
+                        plugin_ack_capabilities.supports_concurrent_ack
+                    ),
                 )
                 self._plugin_queue_backend_source = source
                 self._plugin_queue_backend = contract_backend
