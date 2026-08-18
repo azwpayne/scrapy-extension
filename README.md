@@ -349,8 +349,10 @@ provide exactly-once semantics. If a mutation response is lost or malformed,
 the backend raises a typed `QueueOutcomeIndeterminateError`,
 `SetOutcomeIndeterminateError`, or `StorageOutcomeIndeterminateError`. Callers
 must reconcile by stable document/domain identity before deciding whether to
-retry. Search, count, delete, and delete-by-query responses also fail closed on
-timeouts, shard failures, partial results, or malformed acknowledgements.
+retry. Search, count, and single-document responses fail closed on shard
+failures, partial results, or malformed acknowledgements. Delete-by-query has
+no documented top-level `_shards` block; its synchronous response instead must
+prove no timeout, failures, version conflicts, or delete-count mismatch.
 
 ### RocketMQ (standalone, cluster, cloud)
 

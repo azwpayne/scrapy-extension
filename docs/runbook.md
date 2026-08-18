@@ -479,10 +479,12 @@ Elasticsearch safe reads and index setup retain
 set, storage, TTL-reap, and delete-by-query mutations instead use one
 shared-transport no-replay view (`max_retries=0`, `retry_on_timeout=False`, and
 no retry statuses). A normal return requires a complete, well-formed response:
-no search/delete-by-query timeout, no failed/partial shards or failure entries,
-an exact nonnegative count, and the expected mutation result. A typed
-`*OutcomeIndeterminateError` means the server may have committed before the
-response was lost or proved malformed. No automatic replay is not exactly-once;
+search/count/single-document operations require complete shard metadata, while
+delete-by-query has no documented top-level `_shards` block and instead
+requires no timeout, failures, version conflicts, or delete-count mismatch.
+Counts and documented optional task/throttling fields must have exact valid
+types. A typed `*OutcomeIndeterminateError` means the server may have committed
+before the response was lost or proved malformed. No automatic replay is not exactly-once;
 stop blind retry loops and reconcile through the queue document ID, set member
 hash, storage key, or domain state first. The localhost response-drop harness is
 opt-in with `SCRAPY_TEST_ES_OUTCOME_SAFETY=1` and a single local HTTP

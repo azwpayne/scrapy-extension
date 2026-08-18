@@ -5,7 +5,7 @@ Run only against an explicitly enabled local HTTP Elasticsearch instance::
     SCRAPY_TEST_ES_OUTCOME_SAFETY=1 \
     SCRAPY_TEST_ES_HOSTS=http://localhost:9200 \
       uv run pytest tests/integration/test_elasticsearch_outcome_safety_integration.py \
-      --force-enable-socket
+      --allow-hosts=localhost,127.0.0.1,::1
 """
 
 from __future__ import annotations
@@ -178,6 +178,20 @@ def response_drop_backend() -> Iterator[tuple[Any, _ResponseDropProxy]]:
         proxy.shutdown()
         proxy.server_close()
         thread.join(timeout=5)
+
+
+def test_successful_clear_accepts_unmodified_client_response(
+    response_drop_backend: tuple[Any, _ResponseDropProxy],
+) -> None:
+    """Exercise the real synchronous delete-by-query response without patching it."""
+    backend, _proxy = response_drop_backend
+    queue_name = f"outcome-clear:{uuid.uuid4().hex}"
+    backend.push(queue_name, b"clear-me")
+    backend.client.indices.refresh(index=backend.config.queue_index)
+
+    backend.clear_queue(queue_name)
+
+    assert backend.queue_len(queue_name) == 0
 
 
 def test_committed_push_response_drop_is_not_replayed(

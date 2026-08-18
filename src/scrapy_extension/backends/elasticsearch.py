@@ -7,6 +7,7 @@ import binascii
 import contextlib
 import hashlib
 import logging
+import math
 import threading
 import uuid
 from collections.abc import Iterator, Mapping
@@ -215,11 +216,16 @@ def _validate_count_response(response: object) -> int:
 
 
 def _validate_delete_by_query_response(response: object) -> None:
-    """Require a complete, failure-free delete-by-query response."""
+    """Require a complete, failure-free documented delete-by-query response.
+
+    Unlike search, count, and single-document writes, Elasticsearch's
+    delete-by-query response has no top-level ``_shards`` acknowledgement.
+    Its completion counters and failure list are therefore the proof of a
+    successful synchronous outcome.
+    """
     response_body = _response_mapping(response)
     if response_body.get("timed_out") is not False:
         raise _ElasticSearchResponseError
-    _validate_shards(response_body, require_success=False)
     failures = response_body.get("failures")
     if not isinstance(failures, list) or failures:
         raise _ElasticSearchResponseError
@@ -228,6 +234,40 @@ def _validate_delete_by_query_response(response: object) -> None:
     conflicts = _exact_nonnegative_int(response_body.get("version_conflicts"))
     if deleted != total or conflicts != 0:
         raise _ElasticSearchResponseError
+
+    for field in (
+        "took",
+        "updated",
+        "batches",
+        "noops",
+        "throttled_millis",
+        "throttled_until_millis",
+        "slice_id",
+    ):
+        if field in response_body:
+            _exact_nonnegative_int(response_body[field])
+
+    retries = response_body.get("retries")
+    if retries is not None:
+        if not isinstance(retries, Mapping):
+            raise _ElasticSearchResponseError
+        _exact_nonnegative_int(retries.get("bulk"))
+        _exact_nonnegative_int(retries.get("search"))
+
+    if "requests_per_second" in response_body:
+        rate = response_body["requests_per_second"]
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not math.isfinite(rate)
+            or (rate < 0 and rate != -1)
+        ):
+            raise _ElasticSearchResponseError
+
+    if "task" in response_body:
+        task = response_body["task"]
+        if not isinstance(task, str) or not task:
+            raise _ElasticSearchResponseError
 
 
 def _validate_queue_name_argument(

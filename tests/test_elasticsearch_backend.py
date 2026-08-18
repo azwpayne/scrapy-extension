@@ -40,12 +40,18 @@ _SHARDS = {"total": 1, "successful": 1, "failed": 0}
 _INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
 _DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
 _DELETE_BY_QUERY_RESPONSE = {
+    "took": 3,
     "timed_out": False,
     "total": 1,
     "deleted": 1,
+    "batches": 1,
     "version_conflicts": 0,
+    "noops": 0,
+    "retries": {"bulk": 0, "search": 0},
+    "throttled_millis": 0,
+    "requests_per_second": -1.0,
+    "throttled_until_millis": 0,
     "failures": [],
-    "_shards": _SHARDS,
 }
 
 

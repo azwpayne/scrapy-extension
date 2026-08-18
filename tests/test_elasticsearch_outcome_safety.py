@@ -83,12 +83,18 @@ class _RetryProbeNode(BaseNode):
             status = 200
         elif operation == "delete_by_query":
             response = {
+                "took": 3,
                 "timed_out": False,
                 "total": 1,
                 "deleted": 1,
+                "batches": 1,
                 "version_conflicts": 0,
+                "noops": 0,
+                "retries": {"bulk": 0, "search": 0},
+                "throttled_millis": 0,
+                "requests_per_second": -1.0,
+                "throttled_until_millis": 0,
                 "failures": [],
-                "_shards": {"total": 1, "successful": 1, "failed": 0},
             }
             status = 200
         elif operation == "refresh":
@@ -205,12 +211,18 @@ def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     client.index.return_value = {"result": "created", "_shards": _SHARDS}
     client.delete.return_value = {"result": "deleted", "_shards": _SHARDS}
     client.delete_by_query.return_value = {
+        "took": 3,
         "timed_out": False,
         "total": 1,
         "deleted": 1,
+        "batches": 1,
         "version_conflicts": 0,
+        "noops": 0,
+        "retries": {"bulk": 0, "search": 0},
+        "throttled_millis": 0,
+        "requests_per_second": -1.0,
+        "throttled_until_millis": 0,
         "failures": [],
-        "_shards": _SHARDS,
     }
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
@@ -283,6 +295,158 @@ def test_count_rejects_missing_failed_or_partial_shards(
         backend.queue_len("jobs")
 
 
+_CLEAR_FAMILIES = (
+    (
+        "queue",
+        QueueOutcomeIndeterminateError,
+        "ElasticSearch queue clear failed.",
+    ),
+    (
+        "set",
+        SetOutcomeIndeterminateError,
+        "ElasticSearch set clear failed.",
+    ),
+    (
+        "storage",
+        StorageOutcomeIndeterminateError,
+        "ElasticSearch storage clear failed.",
+    ),
+)
+
+
+def _call_clear(backend: ElasticSearchBackend, operation: str) -> None:
+    if operation == "queue":
+        backend.clear_queue("jobs")
+    elif operation == "set":
+        backend.clear_set("seen")
+    else:
+        backend.clear_storage()
+
+
+@pytest.mark.parametrize(("operation", "_error_type", "_message"), _CLEAR_FAMILIES)
+def test_clear_families_accept_documented_response_without_shards(
+    mocker: Any,
+    operation: str,
+    _error_type: type[Exception],
+    _message: str,
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.delete_by_query.return_value = {
+        "took": 3,
+        "timed_out": False,
+        "total": 2,
+        "deleted": 2,
+        "batches": 1,
+        "version_conflicts": 0,
+        "noops": 0,
+        "retries": {"bulk": 0, "search": 0},
+        "throttled_millis": 0,
+        "requests_per_second": -1.0,
+        "throttled_until_millis": 0,
+        "task": "node:123",
+        "failures": [],
+        "future_extension": {"opaque": True},
+    }
+
+    _call_clear(backend, operation)
+
+
+@pytest.mark.parametrize(("operation", "error_type", "message"), _CLEAR_FAMILIES)
+@pytest.mark.parametrize(
+    "response",
+    (
+        pytest.param(
+            {
+                "timed_out": True,
+                "total": 1,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "failures": [],
+            },
+            id="timeout",
+        ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 0,
+                "version_conflicts": 0,
+                "failures": [{"cause": "redacted"}],
+            },
+            id="failures",
+        ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 0,
+                "version_conflicts": 1,
+                "failures": [],
+            },
+            id="version-conflict",
+        ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": 2,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "failures": [],
+            },
+            id="count-mismatch",
+        ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": True,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "failures": [],
+            },
+            id="non-exact-count",
+        ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "throttled_millis": True,
+                "failures": [],
+            },
+            id="malformed-throttling",
+        ),
+        pytest.param(
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "task": "",
+                "failures": [],
+            },
+            id="malformed-task",
+        ),
+    ),
+)
+def test_clear_families_reject_indeterminate_documented_responses(
+    mocker: Any,
+    operation: str,
+    error_type: type[Exception],
+    message: str,
+    response: object,
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.delete_by_query.return_value = response
+
+    with pytest.raises(error_type) as exc_info:
+        _call_clear(backend, operation)
+
+    assert type(exc_info.value) is error_type
+    assert str(exc_info.value) == message
+    assert exc_info.value.__cause__ is None
+
+
 @pytest.mark.parametrize(
     ("operation", "response", "expected_error"),
     (
@@ -309,53 +473,6 @@ def test_count_rejects_missing_failed_or_partial_shards(
             },
             StorageOutcomeIndeterminateError,
         ),
-        (
-            "clear",
-            {
-                "timed_out": True,
-                "total": 1,
-                "deleted": 1,
-                "version_conflicts": 0,
-                "failures": [],
-                "_shards": _SHARDS,
-            },
-            StorageOutcomeIndeterminateError,
-        ),
-        (
-            "clear",
-            {
-                "timed_out": False,
-                "total": 1,
-                "deleted": 0,
-                "version_conflicts": 0,
-                "failures": [{"cause": "redacted"}],
-                "_shards": _SHARDS,
-            },
-            StorageOutcomeIndeterminateError,
-        ),
-        (
-            "clear",
-            {
-                "timed_out": False,
-                "total": 1,
-                "deleted": 0,
-                "version_conflicts": 0,
-                "failures": [],
-                "_shards": _SHARDS,
-            },
-            StorageOutcomeIndeterminateError,
-        ),
-        (
-            "clear",
-            {
-                "timed_out": False,
-                "total": 1,
-                "deleted": 1,
-                "failures": [],
-                "_shards": _SHARDS,
-            },
-            StorageOutcomeIndeterminateError,
-        ),
     ),
 )
 def test_mutation_requires_complete_acknowledgement(
@@ -375,12 +492,9 @@ def test_mutation_requires_complete_acknowledgement(
     elif operation == "store":
         client.index.return_value = response
         call = lambda: backend.store("key", b"item")
-    elif operation == "delete":
+    else:
         client.delete.return_value = response
         call = lambda: backend.delete("key")
-    else:
-        client.delete_by_query.return_value = response
-        call = lambda: backend.clear_storage()
 
     with pytest.raises(expected_error):
         call()
