@@ -162,8 +162,11 @@ Snapshots use a v6 manifest-last repository. Each generation is written as
 immutable chunks (256 KiB by default) under fixed-length
 `queue:snapshot-chunk:v1:<sha256>` keys that hash the complete logical identity,
 generation, and index. The checksum/length/schema manifest is then stored at the
-logical snapshot key as the commit point. An interrupted chunk or manifest write
-leaves the previous manifest authoritative. Its strict `state` discriminator
+logical snapshot key as the commit point. A chunk failure cannot replace the
+logical manifest. A manifest write confirmed not to have taken effect leaves the
+previous manifest authoritative; an effect-then-error response is verified by one
+exact readback when possible, but an unavailable readback remains ambiguous and a
+later successful retry establishes the authority callers should rely on. Its strict `state` discriminator
 separates an authoritative clean checkpoint (`none`) from a present bytes
 payload (`bytes`), including `b""`; only the clean checkpoint skips strategy
 restore. Existing v5/v4 manifests keep their old zero-length-is-clean meaning,

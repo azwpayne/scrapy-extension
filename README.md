@@ -824,8 +824,10 @@ snapshots. Redis, MongoDB, and Elasticsearch queues use their own storage
 capability. For a queue-only backend, set `SCRAPY_STORAGE_BACKEND_TYPE` (and
 its settings) to a storage-capable backend; the scheduler independently uses
 that manager for snapshots even when no item pipeline is enabled. A legacy
-queue-only global configuration with no storage component keeps its best-effort
-no-snapshot behavior. In a multi-worker deployment, configure a stable unique
+queue-only global configuration with no storage component may still start and
+may close empty local state, but a nonempty stateful strategy fails clean close
+rather than silently discarding held work; use explicit `close(lossy=True)` only
+when that loss is intended. In a multi-worker deployment, configure a stable unique
 `SCRAPY_QUEUE_SNAPSHOT_OWNER` per worker; when omitted,
 `SCRAPY_QUEUE_WORKER_ID` is the fallback. A restored checkpoint remains stored
 until the next clean close replaces it with current state or deletes it after a
