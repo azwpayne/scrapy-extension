@@ -56,6 +56,7 @@ from scrapy_extension.settings.memcached import (
     is_memcached_loopback,
     validate_memcached_connection,
     validate_memcached_flush_policy,
+    validate_memcached_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,6 +187,8 @@ class _MemcachedConnectionSnapshot:
     host: str
     port: int
     allow_remote_plaintext: bool
+    connect_timeout: float
+    socket_timeout: float
     allow_flush_all: bool
 
 
@@ -232,12 +235,20 @@ class MemcachedBackend(Backend, StorageBackend):
             self.config.port,
             self.config.allow_remote_plaintext,
         )
+        connect_timeout = validate_memcached_timeout(
+            self.config.connect_timeout, "connect_timeout"
+        )
+        socket_timeout = validate_memcached_timeout(
+            self.config.socket_timeout, "socket_timeout"
+        )
         allow_flush_all = validate_memcached_flush_policy(self.config.allow_flush_all)
         return _MemcachedConnectionSnapshot(
             mode=mode,
             host=host,
             port=port,
             allow_remote_plaintext=allow_remote,
+            connect_timeout=connect_timeout,
+            socket_timeout=socket_timeout,
             allow_flush_all=allow_flush_all,
         )
 
@@ -276,7 +287,10 @@ class MemcachedBackend(Backend, StorageBackend):
                 # read. StorageBackend success is a commit boundary, so require replies
                 # for every mutating operation on this client generation.
                 candidate = MemcachedClient(
-                    (snapshot.host, snapshot.port), default_noreply=False
+                    (snapshot.host, snapshot.port),
+                    connect_timeout=snapshot.connect_timeout,
+                    timeout=snapshot.socket_timeout,
+                    default_noreply=False,
                 )
                 candidate.stats()
             except Exception:

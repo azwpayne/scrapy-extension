@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 import traceback
 from threading import Event, Thread
+from time import monotonic
 
 import pytest
 
@@ -55,7 +57,42 @@ class TestMemcachedBackendType:
         assert s.host == "localhost"
         assert s.port == 11211
         assert s.allow_remote_plaintext is False
+        assert s.connect_timeout == 5.0
+        assert s.socket_timeout == 30.0
         assert s.allow_flush_all is False
+
+    @pytest.mark.parametrize(
+        "timeout",
+        [True, False, float("nan"), float("inf"), -float("inf"), 0, -1, 86_400.1],
+    )
+    @pytest.mark.parametrize("setting_name", ["connect_timeout", "socket_timeout"])
+    def test_timeouts_require_finite_positive_bounded_numbers(
+        self, timeout: object, setting_name: str
+    ) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            MemcachedSettings(**{setting_name: timeout})
+
+        assert exc_info.value.setting_name == setting_name
+        assert str(exc_info.value) == (
+            "Memcached timeout must be finite, greater than 0, and at most 86400 "
+            "seconds."
+        )
+
+    @pytest.mark.parametrize(
+        ("env_name", "expected"),
+        [
+            ("SCRAPY_MEMCACHED_CONNECT_TIMEOUT", 1.25),
+            ("SCRAPY_MEMCACHED_SOCKET_TIMEOUT", 2.5),
+        ],
+    )
+    def test_timeouts_accept_environment_numbers(
+        self, monkeypatch, env_name: str, expected: float
+    ) -> None:
+        monkeypatch.setenv(env_name, str(expected))
+        settings = MemcachedSettings()
+        field_name = env_name.removeprefix("SCRAPY_MEMCACHED_").lower()
+
+        assert getattr(settings, field_name) == expected
 
     @pytest.mark.parametrize("allow_flush_all", [1, 0, "yes", None])
     def test_allow_flush_all_requires_exact_boolean(self, allow_flush_all) -> None:
@@ -86,7 +123,10 @@ class TestMemcachedConnect:
     def test_connect_creates_client_and_stats(self, mocker) -> None:
         b, client = _connected(mocker)
         memcached_mod.MemcachedClient.assert_called_once_with(
-            ("localhost", 11211), default_noreply=False
+            ("localhost", 11211),
+            connect_timeout=5.0,
+            timeout=30.0,
+            default_noreply=False,
         )
         client.stats.assert_called_once()
         assert b.is_connected() is True
@@ -148,7 +188,10 @@ class TestMemcachedConnect:
         b.connect()
 
         memcached_mod.MemcachedClient.assert_called_once_with(
-            ("localhost", 11211), default_noreply=False
+            ("localhost", 11211),
+            connect_timeout=5.0,
+            timeout=30.0,
+            default_noreply=False,
         )
         client.stats.assert_called_once_with()
 
@@ -232,6 +275,20 @@ class TestMemcachedConnect:
         assert exc_info.value.setting_name == "port"
         client.assert_not_called()
 
+    @pytest.mark.parametrize("setting_name", ["connect_timeout", "socket_timeout"])
+    def test_connect_revalidates_mutated_timeout_before_sdk_io(
+        self, mocker, setting_name: str
+    ) -> None:
+        settings = MemcachedSettings()
+        setattr(settings, setting_name, float("inf"))
+        client = mocker.patch.object(memcached_mod, "MemcachedClient")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            MemcachedBackend(settings).connect()
+
+        assert exc_info.value.setting_name == setting_name
+        client.assert_not_called()
+
     def test_connect_revalidates_mutated_flush_permission_before_sdk_io(
         self, mocker
     ) -> None:
@@ -253,6 +310,8 @@ class TestMemcachedConnect:
             settings.host = "attacker.internal"
             settings.port = 22122
             settings.allow_remote_plaintext = False
+            settings.connect_timeout = 45.0
+            settings.socket_timeout = 60.0
             return client
 
         client_factory = mocker.patch.object(
@@ -265,12 +324,60 @@ class TestMemcachedConnect:
         backend.connect()
 
         client_factory.assert_called_once_with(
-            ("cache.internal", 11211), default_noreply=False
+            ("cache.internal", 11211),
+            connect_timeout=5.0,
+            timeout=30.0,
+            default_noreply=False,
         )
         assert backend._connection_snapshot is not None
         assert backend._connection_snapshot.host == "cache.internal"
         assert backend._connection_snapshot.port == 11211
         assert backend._connection_snapshot.allow_remote_plaintext is True
+        assert backend._connection_snapshot.connect_timeout == 5.0
+        assert backend._connection_snapshot.socket_timeout == 30.0
+
+    def test_blocked_stats_probe_is_bounded_by_socket_timeout(
+        self, socket_enabled
+    ) -> None:
+        """A server that accepts but never replies cannot wedge ``connect()``."""
+        del socket_enabled
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        _host, port = server.getsockname()
+        accepted = Event()
+        release_server = Event()
+
+        def stall_after_accept() -> None:
+            connection, _address = server.accept()
+            with connection:
+                accepted.set()
+                release_server.wait(timeout=2.0)
+
+        server_thread = Thread(target=stall_after_accept)
+        server_thread.start()
+        backend = _make_backend(
+            host="127.0.0.1",
+            port=port,
+            connect_timeout=0.05,
+            socket_timeout=0.05,
+        )
+
+        started = monotonic()
+        try:
+            with pytest.raises(BackendConnectionError):
+                backend.connect()
+            elapsed = monotonic() - started
+            assert accepted.wait(timeout=0.5)
+            assert elapsed < 1.0
+            assert backend.is_connected() is False
+        finally:
+            release_server.set()
+            server.close()
+            server_thread.join(timeout=2.0)
+
+        assert not server_thread.is_alive()
 
     def test_disconnect_returns_and_fences_in_progress_connect_probe(
         self, mocker

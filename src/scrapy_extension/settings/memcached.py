@@ -8,13 +8,20 @@ from __future__ import annotations
 
 from enum import Enum
 from ipaddress import ip_address
+from math import isfinite
+from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._redacted import RedactedBaseSettings
+
+_MEMCACHED_MAX_TIMEOUT_SECONDS = 86_400.0
+_MEMCACHED_TIMEOUT_ERROR = (
+    "Memcached timeout must be finite, greater than 0, and at most 86400 seconds."
+)
 
 
 class MemcachedMode(str, Enum):
@@ -96,6 +103,24 @@ def validate_memcached_connection(
     return mode, normalized_host, port, allow_remote_plaintext
 
 
+def validate_memcached_timeout(
+    value: object,
+    setting_name: Literal["connect_timeout", "socket_timeout"],
+) -> float:
+    """Return one finite, positive, bounded Memcached socket timeout."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ConfigurationError(_MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name)
+    try:
+        timeout = float(value)
+    except ValueError:
+        raise ConfigurationError(
+            _MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name
+        ) from None
+    if not isfinite(timeout) or not 0 < timeout <= _MEMCACHED_MAX_TIMEOUT_SECONDS:
+        raise ConfigurationError(_MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name)
+    return timeout
+
+
 def validate_memcached_flush_policy(allow_flush_all: object) -> bool:
     """Require an explicit boolean for the destructive server-wide permission."""
     if not isinstance(allow_flush_all, bool):
@@ -154,6 +179,18 @@ class MemcachedSettings(RedactedBaseSettings):
             "only when the network boundary is explicitly trusted"
         ),
     )
+    connect_timeout: float = Field(
+        default=5.0,
+        gt=0,
+        le=_MEMCACHED_MAX_TIMEOUT_SECONDS,
+        description="TCP connection timeout in seconds",
+    )
+    socket_timeout: float = Field(
+        default=30.0,
+        gt=0,
+        le=_MEMCACHED_MAX_TIMEOUT_SECONDS,
+        description="Socket operation timeout in seconds",
+    )
     allow_flush_all: bool = Field(
         default=False,
         description=(
@@ -167,6 +204,15 @@ class MemcachedSettings(RedactedBaseSettings):
     def _validate_flush_permission_type(cls, value: object) -> bool:
         """Prevent permissive bool coercion for a destructive capability."""
         return normalize_memcached_flush_setting(value)
+
+    @field_validator("connect_timeout", "socket_timeout", mode="before")
+    @classmethod
+    def _validate_timeout(cls, value: object, info: ValidationInfo) -> float:
+        """Reject unbounded and coercible-boolean timeout values."""
+        field_name = getattr(info, "field_name", None)
+        if field_name == "connect_timeout":
+            return validate_memcached_timeout(value, "connect_timeout")
+        return validate_memcached_timeout(value, "socket_timeout")
 
     @model_validator(mode="after")
     def _validate_connection(self) -> Self:

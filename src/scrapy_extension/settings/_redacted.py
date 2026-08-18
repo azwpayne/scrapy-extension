@@ -68,6 +68,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "Memcached host must be a non-empty hostname or IP address.",
         "Memcached host must not include a port or URL scheme.",
         "Memcached port must be between 1 and 65535.",
+        "Memcached timeout must be finite, greater than 0, and at most 86400 seconds.",
         "MongoDB 'auth_source' must be a non-empty string.",
         "MongoDB 'database' name must be a non-empty string.",
         "MongoDB 'password' must be a string or SecretStr.",
