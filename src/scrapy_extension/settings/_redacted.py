@@ -5,11 +5,15 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from importlib import import_module
-from typing import Annotated, Any, cast, get_args, get_origin
+from typing import Annotated, Any, NoReturn, cast, get_args, get_origin
 
 from pydantic import SecretBytes, SecretStr, ValidationError, model_validator
 from pydantic_core import InitErrorDetails
-from pydantic_settings import BaseSettings, SettingsError
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsError,
+)
 
 from scrapy_extension.exceptions._redaction import sanitize_configuration_error
 from scrapy_extension.exceptions.base import ConfigurationError
@@ -349,50 +353,12 @@ _NEGATIVE_TEXT_FIELDS: frozenset[tuple[str, str, str]] = frozenset(
 )
 
 
-def _normalize_bundled_scalar(
+def _raise_invalid_bundled_scalar(
     settings_type: type[BaseSettings],
     field_name: str,
-    annotation: object,
-    value: object,
-) -> object:
-    """Normalize one exact bundled scalar without Pydantic's permissive coercions."""
-    scalar = _scalar_annotation_kind(annotation)
-    if scalar is None:
-        return value
-    scalar_type, optional = scalar
-    if value is None and optional:
-        return None
-    if scalar_type is bool:
-        if type(value) is bool:
-            return value
-        if type(value) is str:
-            normalized = value.lower()
-            if normalized in {"true", "1"}:
-                return True
-            if normalized in {"false", "0"}:
-                return False
-    elif scalar_type is int:
-        if type(value) is int:
-            return value
-        if type(value) is str:
-            negative_allowed = (
-                settings_type.__module__,
-                settings_type.__qualname__,
-                field_name,
-            ) in _NEGATIVE_TEXT_FIELDS
-            if _canonical_unsigned_decimal(value) or (
-                negative_allowed and _canonical_negative_decimal(value)
-            ):
-                return int(value)
-    elif scalar_type is float:
-        if type(value) in (int, float):
-            normalized_float = float(cast("int | float", value))
-            if math.isfinite(normalized_float):
-                return normalized_float
-        elif type(value) is str and _canonical_float_text(value):
-            normalized_float = float(value)
-            if math.isfinite(normalized_float):
-                return normalized_float
+    scalar_type: type[object],
+) -> NoReturn:
+    """Raise the established typed, redacted error for one invalid scalar."""
     if scalar_type is float or (
         scalar_type is int
         and settings_type.__module__ == "scrapy_extension.settings.base"
@@ -405,6 +371,104 @@ def _normalize_bundled_scalar(
     )
 
 
+def _normalize_bundled_environment_scalar(
+    settings_type: type[BaseSettings],
+    field_name: str,
+    annotation: object,
+    value: object,
+) -> object:
+    """Normalize canonical text supplied by an environment settings source."""
+    scalar = _scalar_annotation_kind(annotation)
+    if scalar is None:
+        return value
+    scalar_type, optional = scalar
+    if value is None and optional:
+        return None
+    if type(value) is not str:
+        _raise_invalid_bundled_scalar(settings_type, field_name, scalar_type)
+    text = value
+    if scalar_type is bool:
+        normalized = text.lower()
+        if normalized in {"true", "1"}:
+            return True
+        if normalized in {"false", "0"}:
+            return False
+    elif scalar_type is int:
+        negative_allowed = (
+            settings_type.__module__,
+            settings_type.__qualname__,
+            field_name,
+        ) in _NEGATIVE_TEXT_FIELDS
+        if _canonical_unsigned_decimal(text) or (
+            negative_allowed and _canonical_negative_decimal(text)
+        ):
+            return int(text)
+    elif scalar_type is float and _canonical_float_text(text):
+        normalized_float = float(text)
+        if math.isfinite(normalized_float):
+            return normalized_float
+    _raise_invalid_bundled_scalar(settings_type, field_name, scalar_type)
+
+
+def _enforce_bundled_programmatic_scalar(
+    settings_type: type[BaseSettings],
+    field_name: str,
+    annotation: object,
+    value: object,
+) -> object:
+    """Require exact programmatic scalar types after settings sources merge."""
+    scalar = _scalar_annotation_kind(annotation)
+    if scalar is None:
+        return value
+    scalar_type, optional = scalar
+    if value is None and optional:
+        return None
+    if scalar_type is bool and type(value) is bool:
+        return value
+    if scalar_type is int and type(value) is int:
+        return value
+    if scalar_type is float and type(value) in (int, float):
+        normalized_float = float(cast("int | float", value))
+        if math.isfinite(normalized_float):
+            return normalized_float
+    _raise_invalid_bundled_scalar(settings_type, field_name, scalar_type)
+
+
+class _CanonicalScalarEnvironmentSource(PydanticBaseSettingsSource):
+    """Normalize only text originating from environment-style sources."""
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        source: PydanticBaseSettingsSource,
+    ) -> None:
+        super().__init__(settings_cls)
+        self._source = source
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        """Delegate field lookup to the wrapped source."""
+        return self._source.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        """Return source values with canonical bundled scalar text normalized."""
+        self._source._set_current_state(self.current_state)
+        self._source._set_settings_sources_data(self.settings_sources_data)
+        values = self._source()
+        fields = _trusted_settings_fields(self.settings_cls)
+        if fields is None or not isinstance(values, Mapping):
+            return values
+        normalized = dict(values)
+        for field_name, field in fields.items():
+            if type(field_name) is str and field_name in normalized:
+                normalized[field_name] = _normalize_bundled_environment_scalar(
+                    self.settings_cls,
+                    field_name,
+                    getattr(field, "annotation", None),
+                    normalized[field_name],
+                )
+        return normalized
+
+
 class RedactedBaseSettings(BaseSettings):
     """Base settings that retain typed errors without retaining raw input.
 
@@ -414,24 +478,36 @@ class RedactedBaseSettings(BaseSettings):
     locations and ``input=None`` after the original handler exits.
     """
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Normalize canonical scalar text only in environment-style sources."""
+        if _trusted_settings_fields(settings_cls) is None:
+            return init_settings, env_settings, dotenv_settings, file_secret_settings
+        return (
+            init_settings,
+            _CanonicalScalarEnvironmentSource(settings_cls, env_settings),
+            _CanonicalScalarEnvironmentSource(settings_cls, dotenv_settings),
+            file_secret_settings,
+        )
+
     @model_validator(mode="before")
     @classmethod
     def _enforce_bundled_scalar_grammar(cls, values: object) -> object:
-        """Apply exact scalar coercion only to the package's bundled models."""
+        """Require exact programmatic scalars after settings sources merge."""
         fields = _trusted_settings_fields(cls)
         if fields is None or not isinstance(values, Mapping):
             return values
         normalized = dict(values)
         for field_name, field in fields.items():
-            if (
-                type(field_name) is str
-                and field_name in normalized
-                and not (
-                    cls.__module__ == "scrapy_extension.settings.memcached"
-                    and field_name in {"connect_timeout", "socket_timeout"}
-                )
-            ):
-                normalized[field_name] = _normalize_bundled_scalar(
+            if type(field_name) is str and field_name in normalized:
+                normalized[field_name] = _enforce_bundled_programmatic_scalar(
                     cls,
                     field_name,
                     getattr(field, "annotation", None),

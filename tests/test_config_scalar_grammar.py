@@ -88,16 +88,9 @@ def _required_kwargs(settings_type: type[Any]) -> dict[str, object]:
 )
 @pytest.mark.parametrize(
     ("raw_value", "expected"),
-    [
-        (True, True),
-        (False, False),
-        ("true", True),
-        ("FALSE", False),
-        ("1", True),
-        ("0", False),
-    ],
+    [(True, True), (False, False)],
 )
-def test_bundled_boolean_direct_matrix_accepts_only_canonical_values(
+def test_bundled_boolean_direct_matrix_accepts_only_exact_values(
     settings_type: type[Any],
     field_name: str,
     _env_name: str,
@@ -116,7 +109,10 @@ def test_bundled_boolean_direct_matrix_accepts_only_canonical_values(
     _BUNDLED_BOOL_FIELDS,
     ids=lambda value: value.__name__ if isinstance(value, type) else None,
 )
-@pytest.mark.parametrize("raw_value", [1, 0, "yes", "on", " true ", 1.0, [], {}])
+@pytest.mark.parametrize(
+    "raw_value",
+    [1, 0, "true", "FALSE", "1", "0", "yes", "on", " true ", 1.0, [], {}],
+)
 def test_bundled_boolean_direct_matrix_rejects_ambiguous_values(
     settings_type: type[Any], field_name: str, _env_name: str, raw_value: object
 ) -> None:
@@ -158,7 +154,8 @@ def test_bundled_boolean_environment_matrix_remains_usable(
     ids=lambda value: value.__name__ if isinstance(value, type) else None,
 )
 @pytest.mark.parametrize(
-    "raw_value", [True, False, 1.0, 0.0, "01", "+1", " 1", "1 ", "1.0", [], {}]
+    "raw_value",
+    [True, False, 1.0, 0.0, "1", "01", "+1", " 1", "1 ", "1.0", [], {}],
 )
 def test_bundled_integer_direct_matrix_rejects_coercion(
     settings_type: type[Any],
@@ -185,16 +182,14 @@ def test_bundled_integer_direct_matrix_rejects_coercion(
     _BUNDLED_INTEGER_FIELDS,
     ids=lambda value: value.__name__ if isinstance(value, type) else None,
 )
-def test_bundled_integer_direct_and_environment_matrix_accepts_canonical_decimal(
+def test_bundled_integer_direct_and_environment_matrix_accepts_exact_and_decimal(
     monkeypatch: pytest.MonkeyPatch,
     settings_type: type[Any],
     field_name: str,
     env_name: str,
     expected: int,
 ) -> None:
-    direct = settings_type(
-        **_required_kwargs(settings_type), **{field_name: str(expected)}
-    )
+    direct = settings_type(**_required_kwargs(settings_type), **{field_name: expected})
     assert getattr(direct, field_name) == expected
 
     monkeypatch.setenv(env_name, str(expected))
@@ -216,17 +211,70 @@ def test_bundled_integer_direct_and_environment_matrix_accepts_canonical_decimal
 )
 @pytest.mark.parametrize(
     "raw_value",
-    [True, False, float("nan"), float("inf"), float("-inf")],
+    [True, False, "1", "1.0", float("nan"), float("inf"), float("-inf")],
 )
-def test_bundled_float_duration_fields_reject_booleans_and_nonfinite_values(
+def test_bundled_float_duration_fields_reject_coercion_and_nonfinite_values(
     settings_type: type[Any], field_name: str, raw_value: object
 ) -> None:
     with pytest.raises((ConfigurationError, ValidationError)):
         settings_type(**{field_name: raw_value})
 
 
-def test_documented_negative_integer_text_remains_available() -> None:
-    assert Settings(queue_delay_max_held="-1").queue_delay_max_held == -1
+@pytest.mark.parametrize("field_name", ["connect_timeout", "socket_timeout"])
+@pytest.mark.parametrize(
+    "raw_value",
+    [" 1 ", "+1", "01", "1e2", "1.", ".1", "-1", "nan", "inf"],
+)
+def test_memcached_timeout_direct_text_is_rejected(
+    field_name: str, raw_value: str
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        MemcachedSettings(**{field_name: raw_value})
+
+    assert all(error["input"] is None for error in exc_info.value.errors())
+
+
+@pytest.mark.parametrize("field_name", ["connect_timeout", "socket_timeout"])
+@pytest.mark.parametrize(
+    "raw_value",
+    [" 1 ", "+1", "01", "1e2", "1.", ".1", "-1", "nan", "inf"],
+)
+def test_memcached_timeout_environment_text_is_canonical(
+    monkeypatch: pytest.MonkeyPatch, field_name: str, raw_value: str
+) -> None:
+    monkeypatch.setenv(f"SCRAPY_MEMCACHED_{field_name.upper()}", raw_value)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        MemcachedSettings()
+
+    assert exc_info.value.setting_value is None
+
+
+@pytest.mark.parametrize(
+    "raw_value,expected", [("1", 1.0), ("1.25", 1.25), ("0.5", 0.5)]
+)
+def test_memcached_timeout_environment_accepts_canonical_decimal(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str, expected: float
+) -> None:
+    monkeypatch.setenv("SCRAPY_MEMCACHED_CONNECT_TIMEOUT", raw_value)
+
+    assert MemcachedSettings().connect_timeout == expected
+
+
+def test_programmatic_scalar_strings_are_rejected_by_model_validate() -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+        KafkaSettings.model_validate({"retries": "8"}, strict=True)
+
+    assert exc_info.value.setting_name == "retries"
+    assert exc_info.value.setting_value is None
+
+
+def test_documented_negative_integer_text_remains_available_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCRAPY_QUEUE_DELAY_MAX_HELD", "-1")
+
+    assert Settings().queue_delay_max_held == -1
 
 
 def test_scalar_errors_do_not_retain_raw_input() -> None:

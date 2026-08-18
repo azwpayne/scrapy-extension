@@ -25,29 +25,35 @@ generations are not always distinguishable.
 
 The eleven bundled settings models now use one canonical scalar grammar before
 Pydantic coercion. Programmatic boolean values must be exact `bool` objects.
-Environment text remains convenient and accepts case-insensitive `true` /
-`false` and `1` / `0`; values such as `yes`, `no`, `on`, `off`, surrounding
-whitespace, Python integers, floats, and containers are rejected. This applies
+Environment-variable and dotenv text remains convenient and accepts
+case-insensitive `true` / `false` and `1` / `0`; values such as `yes`, `no`,
+`on`, `off`, and surrounding whitespace are rejected. Python integers, floats,
+strings, and containers are not accepted as programmatic booleans. This applies
 to security acknowledgements as well as ordinary feature flags, so a YAML
-loader that turns a flag into integer `1` must be changed to produce `True` or
-the string `"1"`.
+loader that turns a flag into integer `1` or string `"1"` must be changed to
+produce `True` before constructing a settings model.
 
-Exact integer and optional-integer fields accept Python `int` values and
-canonical ASCII base-10 environment text. Remove leading zeroes, plus signs,
-whitespace, decimal points, and exponent notation. Booleans and every float are
-rejected rather than being truncated or treated as integers. Negative text is
-accepted only by a field whose documentation explicitly permits it (currently
+Exact integer and optional-integer fields accept only Python `int` values from
+programmatic model construction or validation. Environment-variable and dotenv
+sources additionally accept canonical ASCII base-10 text. Remove leading
+zeroes, plus signs, whitespace, decimal points, and exponent notation from those
+environment values. Booleans and every float are rejected rather than being
+truncated or treated as integers. Negative environment text is accepted only by
+a field whose documentation explicitly permits it (currently
 `SCRAPY_QUEUE_DELAY_MAX_HELD`, where a value at or below zero disables its
 warning); model field bounds still decide the valid numeric range. Semantic
 unions such as MongoDB `w: int | str`, enums, and literals retain their dedicated
 parsers and meaning.
 
-Float/duration fields continue to accept finite numeric values and ordinary
-canonical decimal environment strings, while booleans and non-finite values are
-rejected. Existing canonical environment configurations therefore need no
-change. Audit configuration assembled by Python, YAML, or generic JSON adapters
-for implicit scalar conversions before upgrading. Failures use static redacted
-messages and do not retain the rejected value.
+Float/duration fields continue to accept finite programmatic numeric values and
+canonical unsigned decimal text from environment-variable and dotenv sources.
+Programmatic strings, booleans, non-finite values, whitespace, signs, leading
+zero variants, and exponent notation are rejected; this includes Memcached
+`connect_timeout` and `socket_timeout`. Existing canonical environment
+configurations therefore need no change. Audit configuration assembled by
+Python, YAML, or generic JSON adapters for implicit scalar conversions before
+upgrading. Failures use static redacted messages and do not retain the rejected
+value.
 
 No persisted backend data or wire-format migration is required for this change.
 
