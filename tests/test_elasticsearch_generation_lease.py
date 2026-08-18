@@ -203,6 +203,174 @@ def test_reconnect_fences_retired_client_and_snapshot(mocker: Any) -> None:
     second.close.assert_not_called()
 
 
+def test_connect_during_drain_rejects_lease_owner_and_replaces_for_peer(
+    mocker: Any,
+) -> None:
+    first = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    second = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    factory = mocker.patch(
+        "scrapy_extension.backends.elasticsearch.Elasticsearch",
+        side_effect=[first, second],
+    )
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    backend.connect()
+    operation_entered = threading.Barrier(2)
+    try_nested_connect = threading.Event()
+    nested_connect_done = threading.Event()
+    release_operation = threading.Event()
+    nested_errors: list[BaseException] = []
+    push_errors: list[BaseException] = []
+    disconnect_errors: list[BaseException] = []
+    peer_errors: list[BaseException] = []
+    peer_connected = threading.Event()
+
+    def hold_lease(**_kwargs: Any) -> None:
+        operation_entered.wait(timeout=2)
+        assert try_nested_connect.wait(timeout=2)
+        try:
+            backend.connect()
+        except BaseException as error:
+            nested_errors.append(error)
+        finally:
+            nested_connect_done.set()
+        assert release_operation.wait(timeout=2)
+
+    def push() -> None:
+        try:
+            backend.push("jobs", b"payload")
+        except BaseException as error:
+            push_errors.append(error)
+
+    def disconnect() -> None:
+        try:
+            backend.disconnect()
+        except BaseException as error:
+            disconnect_errors.append(error)
+
+    def peer_connect() -> None:
+        try:
+            backend.connect()
+        except BaseException as error:
+            peer_errors.append(error)
+        finally:
+            peer_connected.set()
+
+    first.index.side_effect = hold_lease
+    pushing = _thread(push)
+    operation_entered.wait(timeout=2)
+    disconnecting = _thread(disconnect)
+    _wait_for_disconnect_entry(backend)
+
+    try_nested_connect.set()
+    assert nested_connect_done.wait(timeout=2)
+    assert len(nested_errors) == 1
+    assert isinstance(nested_errors[0], BackendConnectionError)
+    assert nested_errors[0].backend_type == "elasticsearch"
+
+    connecting = _thread(peer_connect)
+    assert not peer_connected.wait(timeout=0.1)
+    assert factory.call_count == 1
+    first.close.assert_not_called()
+
+    release_operation.set()
+    pushing.join(timeout=2)
+    disconnecting.join(timeout=2)
+    connecting.join(timeout=2)
+
+    assert not pushing.is_alive()
+    assert not disconnecting.is_alive()
+    assert not connecting.is_alive()
+    assert push_errors == []
+    assert disconnect_errors == []
+    assert peer_errors == []
+    assert factory.call_count == 2
+    first.close.assert_called_once_with()
+    second.close.assert_not_called()
+    with backend._generation_condition:
+        assert backend._active_leases == 0
+        assert backend._generation is not None
+        assert backend._generation.client is second
+
+
+def test_post_publication_interrupt_preserves_leasable_generation(
+    mocker: Any,
+) -> None:
+    candidate = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    factory = mocker.patch(
+        "scrapy_extension.backends.elasticsearch.Elasticsearch",
+        return_value=candidate,
+    )
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    original_notify_all = backend._generation_condition.notify_all
+    publication_entered = threading.Event()
+    allow_interrupt = threading.Event()
+    operation_entered = threading.Barrier(2)
+    release_operation = threading.Event()
+    interrupt = KeyboardInterrupt()
+    notify_calls = 0
+    connect_errors: list[BaseException] = []
+    push_errors: list[BaseException] = []
+
+    def interrupt_first_publication_notification() -> None:
+        nonlocal notify_calls
+        notify_calls += 1
+        if notify_calls == 1:
+            publication_entered.set()
+            assert allow_interrupt.wait(timeout=2)
+            raise interrupt
+        original_notify_all()
+
+    mocker.patch.object(
+        backend._generation_condition,
+        "notify_all",
+        side_effect=interrupt_first_publication_notification,
+    )
+
+    def connect() -> None:
+        try:
+            backend.connect()
+        except BaseException as error:
+            connect_errors.append(error)
+
+    def hold_lease(**_kwargs: Any) -> None:
+        operation_entered.wait(timeout=2)
+        assert release_operation.wait(timeout=2)
+
+    def push() -> None:
+        try:
+            backend.push("jobs", b"payload")
+        except BaseException as error:
+            push_errors.append(error)
+
+    candidate.index.side_effect = hold_lease
+    connecting = _thread(connect)
+    assert publication_entered.wait(timeout=2)
+    pushing = _thread(push)
+    assert pushing.is_alive()
+    allow_interrupt.set()
+    operation_entered.wait(timeout=2)
+    connecting.join(timeout=2)
+
+    assert not connecting.is_alive()
+    assert connect_errors == [interrupt]
+    factory.assert_called_once()
+    candidate.close.assert_not_called()
+    with backend._generation_condition:
+        generation = backend._generation
+        assert generation is not None
+        assert generation.client is candidate
+        assert backend._client is candidate
+        assert backend._connection_snapshot is generation.snapshot
+        assert backend._active_leases == 1
+
+    release_operation.set()
+    pushing.join(timeout=2)
+    assert not pushing.is_alive()
+    assert push_errors == []
+    with backend._generation_condition:
+        assert backend._active_leases == 0
+
+
 def test_health_probe_lease_delays_disconnect(mocker: Any) -> None:
     backend, client = _injected_backend(mocker)
     ping_entered = threading.Event()

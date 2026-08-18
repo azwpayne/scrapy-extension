@@ -368,8 +368,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                         "Cannot connect to Elasticsearch re-entrantly during disconnect.",
                         backend_type="elasticsearch",
                     )
-                if self._generation is not None:
-                    return
+                # A generation remains published while disconnect drains its
+                # leases, but it is already retiring and must not satisfy a new
+                # connect. Peers wait for teardown and may publish a replacement;
+                # a current lease owner cannot wait on its own lease to drain.
                 if self._disconnecting:
                     if int(getattr(self._lease_local, "depth", 0)):
                         raise BackendConnectionError(
@@ -378,6 +380,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                         )
                     self._generation_condition.wait()
                     continue
+                if self._generation is not None:
+                    return
                 if self._connecting:
                     self._generation_condition.wait()
                     continue
@@ -414,16 +418,26 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 # historical private mirrors. Adopt both into one atomic generation.
                 if injected_client is not None:
                     snapshot = injected_snapshot or self._capture_connection_snapshot()
-                    generation = _ElasticSearchGeneration(injected_client, snapshot)
-                    with self._generation_condition:
-                        self._generation = generation
-                        self._client = generation.client
-                        self._connection_snapshot = generation.snapshot
-                        self._generation_condition.notify_all()
+                    injected_generation = _ElasticSearchGeneration(
+                        injected_client, snapshot
+                    )
+                    try:
+                        with self._generation_condition:
+                            self._generation = injected_generation
+                            self._client = injected_generation.client
+                            self._connection_snapshot = injected_generation.snapshot
+                            self._generation_condition.notify_all()
+                    except BaseException:
+                        # Identity publication transfers ownership to the backend.
+                        # Repair compatibility mirrors and wake waiters, but never
+                        # roll back or close the now-leasable generation.
+                        self._preserve_published_generation(injected_generation)
+                        raise
                     return
 
                 snapshot = self._capture_connection_snapshot()
                 candidate: Elasticsearch | None = None
+                generation: _ElasticSearchGeneration | None = None
                 startup_error: BackendConnectionError | None = None
                 cleanup_diagnostic_pending = False
                 try:
@@ -470,19 +484,24 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     except BaseException:
                         pass
                 except (BackendConnectionError, ApiError, TransportError):
+                    if self._preserve_published_generation(generation):
+                        raise
                     cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
                     startup_error = BackendConnectionError(
                         f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
                         backend_type="elasticsearch",
                     )
                 except Exception:
+                    if self._preserve_published_generation(generation):
+                        raise
                     cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
                     startup_error = BackendConnectionError(
                         f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
                         backend_type="elasticsearch",
                     )
                 except BaseException:
-                    self._abort_failed_connect(candidate)
+                    if not self._preserve_published_generation(generation):
+                        self._abort_failed_connect(candidate)
                     raise
 
                 if cleanup_diagnostic_pending:
@@ -494,7 +513,41 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     with self._generation_condition:
                         self._connecting = False
                         self._connect_owner = None
-                        self._generation_condition.notify_all()
+                        try:
+                            self._generation_condition.notify_all()
+                        except BaseException:
+                            # Notification is bookkeeping after any publication
+                            # commit. Retry once without replacing the original
+                            # control-flow exception.
+                            try:
+                                self._generation_condition.notify_all()
+                            except BaseException:
+                                pass
+                            raise
+
+    def _preserve_published_generation(
+        self, generation: _ElasticSearchGeneration | None
+    ) -> bool:
+        """Repair mirrors for an identity-published generation.
+
+        Publishing ``_generation`` is the ownership commit point. Once another
+        caller can lease that identity, later interruption may propagate but must
+        not detach or close its client.
+        """
+        if generation is None:
+            return False
+        with self._generation_condition:
+            if self._generation is not generation:
+                return False
+            self._client = generation.client
+            self._connection_snapshot = generation.snapshot
+            try:
+                self._generation_condition.notify_all()
+            except BaseException:
+                # Best effort only: preserve the primary interruption. The connect
+                # finalizer also retries after clearing the startup fence.
+                pass
+            return True
 
     @staticmethod
     def _log_failed_connect_cleanup_diagnostic() -> None:
