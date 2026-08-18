@@ -108,14 +108,9 @@ def validate_memcached_timeout(
     setting_name: Literal["connect_timeout", "socket_timeout"],
 ) -> float:
     """Return one finite, positive, bounded Memcached socket timeout."""
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+    if type(value) not in (int, float):
         raise ConfigurationError(_MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name)
-    try:
-        timeout = float(value)
-    except ValueError:
-        raise ConfigurationError(
-            _MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name
-        ) from None
+    timeout = float(value)
     if not isfinite(timeout) or not 0 < timeout <= _MEMCACHED_MAX_TIMEOUT_SECONDS:
         raise ConfigurationError(_MEMCACHED_TIMEOUT_ERROR, setting_name=setting_name)
     return timeout

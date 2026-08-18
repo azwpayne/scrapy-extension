@@ -281,17 +281,23 @@ class TestMemcachedConnect:
         client.assert_not_called()
 
     @pytest.mark.parametrize("setting_name", ["connect_timeout", "socket_timeout"])
+    @pytest.mark.parametrize("raw_timeout", [" 1 ", "+1", "01", "1e2", "1."])
     def test_connect_revalidates_mutated_timeout_before_sdk_io(
-        self, mocker, setting_name: str
+        self, mocker, setting_name: str, raw_timeout: str
     ) -> None:
         settings = MemcachedSettings()
-        setattr(settings, setting_name, float("inf"))
+        setattr(settings, setting_name, raw_timeout)
         client = mocker.patch.object(memcached_mod, "MemcachedClient")
 
         with pytest.raises(ConfigurationError) as exc_info:
             MemcachedBackend(settings).connect()
 
         assert exc_info.value.setting_name == setting_name
+        assert exc_info.value.setting_value is None
+        assert str(exc_info.value) == (
+            "Memcached timeout must be finite, greater than 0, and at most 86400 "
+            "seconds."
+        )
         client.assert_not_called()
 
     def test_connect_revalidates_mutated_flush_permission_before_sdk_io(
