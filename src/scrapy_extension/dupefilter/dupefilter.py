@@ -38,7 +38,10 @@ if TYPE_CHECKING:
     from scrapy.http import Request
     from scrapy.settings import Settings
 
-    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.connectors import (
+        ConnectionManager,
+        ConnectionManagerLease,
+    )
 
     class _Fingerprinter(Protocol):
         """Duck type for Scrapy's request fingerprinter.
@@ -181,6 +184,7 @@ class BackendDupeFilter:
         monitor: Monitor | None = None,
         clear_on_open: bool = False,
         owns_connection_manager: bool = True,
+        connection_manager_lease: ConnectionManagerLease | None = None,
     ) -> None:
         """Initialize the dupefilter.
 
@@ -243,6 +247,9 @@ class BackendDupeFilter:
         self._pending_reservations: WeakSet[Request] = WeakSet()
         self._manager_released = False
         self._owns_connection_manager = owns_connection_manager
+        self._connection_manager_lease = connection_manager_lease
+        self._release_owner_token: object | None = None
+        self._direct_release_owner = object()
         self._lifecycle_lock = RLock()
         # Operations enqueue complete telemetry batches under the lifecycle lock.
         # One elected caller drains this shared FIFO outside the lock; peers never
@@ -526,10 +533,11 @@ class BackendDupeFilter:
             required_capabilities={"set"} if strategy is DedupeStrategy.SET else set(),
             component_name="set",
         )
-        manager = ConnectionManager.get_manager(
+        manager_lease = ConnectionManager.acquire_lease(
             backend_type=backend_type,
             settings=backend_settings,
         )
+        manager = manager_lease.manager
         try:
             key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
             # getpriority() distinguishes an absent setting from an explicitly stored
@@ -655,10 +663,11 @@ class BackendDupeFilter:
                 debug=debug,
                 membership_filter=membership_filter,
                 clear_on_open=clear_on_open,
+                connection_manager_lease=manager_lease,
             )
         except BaseException:
             try:
-                manager.close()
+                manager_lease.release()
             except BaseException:
                 try:
                     logger.exception(
@@ -793,13 +802,19 @@ class BackendDupeFilter:
             self._filter.key = resolved  # type: ignore[attr-defined]
 
     def close(self, reason: str) -> None:
-        """Close the dupefilter and its membership filter.
+        """Close the dupefilter and its membership filter."""
+        self.release(self._direct_release_owner, reason)
 
-        Args:
-            reason: The reason for closing.
-        """
+    def release(self, owner_token: object, reason: str) -> None:
+        """Retryably close for one exact owner without changing ``close`` API."""
         del reason
         with self._lifecycle_lock:
+            if self._release_owner_token is None:
+                self._release_owner_token = owner_token
+            elif self._release_owner_token is not owner_token:
+                if self._closed:
+                    return
+                raise RuntimeError("dupefilter close is owned by another caller")
             self._close_locked()
 
     def _close_locked(self) -> None:
@@ -828,7 +843,10 @@ class BackendDupeFilter:
             and not self._manager_released
         ):
             try:
-                self.connection_manager.close()
+                if self._connection_manager_lease is not None:
+                    self._connection_manager_lease.release()
+                else:
+                    self.connection_manager.close()
             except BaseException as exc:
                 if primary_error is None:
                     primary_error = exc

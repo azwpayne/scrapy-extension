@@ -91,11 +91,21 @@ def mock_settings(mocker):
 
 
 def _patch_get_manager(mocker):
-    """Patch ConnectionManager.get_manager to return a fresh Mock and capture calls."""
+    """Patch both legacy and lease acquisitions while retaining one call spy."""
     mock_manager = mocker.Mock()
-    return mock_manager, mocker.patch.object(
+    get_manager = mocker.patch.object(
         ConnectionManager, "get_manager", return_value=mock_manager
     )
+    lease = mocker.Mock(name="connection-manager-lease")
+    lease.manager = mock_manager
+    lease.release.side_effect = mock_manager.close
+
+    def acquire_lease(*args, **kwargs):
+        get_manager(*args, **kwargs)
+        return lease
+
+    mocker.patch.object(ConnectionManager, "acquire_lease", side_effect=acquire_lease)
+    return mock_manager, get_manager
 
 
 class TestSchedulerPerComponentBackend:

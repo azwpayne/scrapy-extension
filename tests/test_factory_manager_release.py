@@ -33,6 +33,15 @@ def _patch_manager(mocker: Any) -> tuple[Any, Any]:
         "get_manager",
         return_value=manager,
     )
+    lease = mocker.Mock(name="connection-manager-lease")
+    lease.manager = manager
+    lease.release.side_effect = manager.close
+
+    def acquire_lease(*args: Any, **kwargs: Any) -> Any:
+        get_manager(*args, **kwargs)
+        return lease
+
+    mocker.patch.object(ConnectionManager, "acquire_lease", side_effect=acquire_lease)
     return manager, get_manager
 
 

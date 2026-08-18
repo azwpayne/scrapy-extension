@@ -14,6 +14,12 @@ from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFi
 from scrapy_extension.dupefilter.filters.memory_filter import MemoryMembershipFilter
 
 
+def _patch_acquire_lease(mocker, manager_cls, manager):
+    lease = mocker.Mock(name="connection-manager-lease")
+    lease.manager = manager
+    return mocker.patch.object(manager_cls, "acquire_lease", return_value=lease)
+
+
 class TestBackendDupeFilterInit:
     """Test BackendDupeFilter __init__ method."""
 
@@ -74,7 +80,7 @@ class TestBackendDupeFilterClassMethods:
         mock_settings.getdict.return_value = {}
 
         mock_manager = mocker.Mock()
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
 
@@ -97,7 +103,7 @@ class TestBackendDupeFilterClassMethods:
         mock_settings.getdict.return_value = {"uri": "mongodb://localhost:27017"}
 
         mock_manager = mocker.Mock()
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
 
@@ -120,7 +126,7 @@ class TestBackendDupeFilterClassMethods:
         mock_settings.getdict.return_value = {}
 
         mock_manager = mocker.Mock()
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         BackendDupeFilter.from_settings(mock_settings)
 
@@ -142,7 +148,7 @@ class TestBackendDupeFilterClassMethods:
         mock_crawler.settings.getdict.return_value = {}
 
         mock_manager = mocker.Mock()
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
 
@@ -165,9 +171,7 @@ class TestBackendDupeFilterClassMethods:
         }.get(key, default)
         mock_crawler.settings.getdict.return_value = {}
 
-        mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
-        )
+        _patch_acquire_lease(mocker, ConnectionManager, mocker.Mock())
 
         dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
         assert dupefilter._fingerprinter is sentinel_fp
@@ -186,9 +190,7 @@ class TestBackendDupeFilterClassMethods:
         }.get(key, default)
         mock_crawler.settings.getdict.return_value = {}
 
-        mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
-        )
+        _patch_acquire_lease(mocker, ConnectionManager, mocker.Mock())
 
         dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
         assert dupefilter._fingerprinter is None
@@ -969,7 +971,7 @@ class TestBackendDupeFilterIntegration:
         mock_set_backend.add.return_value = True
         mock_manager.get_set_backend.return_value = mock_set_backend
 
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
 
@@ -1011,7 +1013,7 @@ class TestBackendDupeFilterClearOnOpen:
         # newly added (True) — proving the set was cleared.
         mock_set_backend.add.side_effect = [True, True]
         mock_manager.get_set_backend.return_value = mock_set_backend
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
         spider = mocker.Mock(name="spider")
@@ -1050,7 +1052,7 @@ class TestBackendDupeFilterClearOnOpen:
         mock_manager = mocker.Mock()
         mock_set_backend = mocker.Mock()
         mock_manager.get_set_backend.return_value = mock_set_backend
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
         spider = mocker.Mock(name="spider")
@@ -1088,7 +1090,7 @@ class TestBackendDupeFilterSpiderKeyTemplating:
         mock_set_backend = mocker.Mock()
         mock_set_backend.add.return_value = True
         mock_manager.get_set_backend.return_value = mock_set_backend
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
         spider = mocker.Mock(name="spider")
@@ -1125,7 +1127,7 @@ class TestBackendDupeFilterSpiderKeyTemplating:
         mock_set_backend = mocker.Mock()
         mock_set_backend.add.return_value = True
         mock_manager.get_set_backend.return_value = mock_set_backend
-        mocker.patch.object(ConnectionManager, "get_manager", return_value=mock_manager)
+        _patch_acquire_lease(mocker, ConnectionManager, mock_manager)
 
         dupefilter = BackendDupeFilter.from_settings(mock_settings)
         spider = mocker.Mock(name="spider")
