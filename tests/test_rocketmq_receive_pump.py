@@ -422,6 +422,53 @@ def test_live_error_observer_sees_driver_error_without_public_retention() -> Non
     backend.disconnect()
 
 
+def test_retired_pump_exception_cannot_contaminate_replacement_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scrapy_extension.backends.rocketmq._RECEIVE_PUMP_JOIN_TIMEOUT_S", 0.01
+    )
+    backend, _, first_consumer = _connected_backend()
+    receive_entered = threading.Event()
+    release_receive = threading.Event()
+    stale_error = RuntimeError("retired pump failed late")
+    observed: list[BaseException] = []
+    backend._receive_error_observer = observed.append
+
+    def stale_receive(_maximum: int, _lease: int) -> list[object]:
+        receive_entered.set()
+        assert release_receive.wait(timeout=2)
+        raise stale_error
+
+    first_consumer.receive.side_effect = stale_receive
+    assert backend.pop("jobs", timeout=0) is None
+    assert receive_entered.wait(timeout=1)
+    stale_worker = backend._receive_worker
+    assert stale_worker is not None
+
+    with pytest.raises(BackendConnectionError, match="Failed to disconnect"):
+        backend.disconnect()
+    assert stale_worker.is_alive()
+
+    fresh_message = MagicMock(body=b"fresh")
+    second_consumer = MagicMock(is_running=True)
+    second_consumer.receive.return_value = [fresh_message]
+    backend._producer = MagicMock(is_running=True)
+    backend._consumer = second_consumer
+    backend._consumer_generation += 1
+
+    assert backend.pop("fresh", timeout=1) == b"fresh"
+    assert backend._receive_failed is False
+
+    release_receive.set()
+    stale_worker.join(timeout=1)
+
+    assert not stale_worker.is_alive()
+    assert observed == []
+    assert backend._receive_failed is False
+    backend.disconnect()
+
+
 def test_disconnect_drops_buffered_delivery_without_ack() -> None:
     backend, _, consumer = _connected_backend()
     message = MagicMock(body=b"undelivered")

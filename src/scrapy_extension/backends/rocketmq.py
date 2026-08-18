@@ -786,13 +786,18 @@ class RocketMQBackend(Backend, QueueBackend):
         except Exception as error:
             # Never retain a driver exception (and its potentially sensitive graph)
             # across the worker boundary. Public operations expose only fixed text.
-            observer = self._receive_error_observer
-            if observer is not None:
-                try:
-                    observer(error)
-                except BaseException:
-                    pass
+            # Fence the private live-test observation under the same identity check as
+            # failure publication: a late exception from a retired pump must not be
+            # attributed to the replacement generation.
             with self._receive_condition:
+                if not self._pump_is_current_locked(consumer, generation, stop):
+                    return
+                observer = self._receive_error_observer
+                if observer is not None:
+                    try:
+                        observer(error)
+                    except BaseException:
+                        pass
                 if self._pump_is_current_locked(consumer, generation, stop):
                     self._receive_failed = True
                     self._receive_cycle += 1

@@ -99,11 +99,11 @@ def _drain(backend, queue: str, n: int, deadline_s: float = 15.0):  # type: igno
         except QueueError as exc:
             # apache rocketmq 5.x proxy has two broker-side propagation races:
             # NPE in ReceiveMessageActivity (delivery race), and "no topic to
-            # receive message" (route-cache lag after topic creation). Treat both
-            # as an empty receive for this iteration and let the poll loop retry
-            # — the deadline bounds total effort. Other errors propagate. Track
-            # NPE count so the caller can skip (not fail) when delivery is NPE-blocked.
-            transient_state = _proxy_receive_transient_state(exc)
+            # receive message" (route-cache lag after topic creation). A pump
+            # failure is sticky for its consumer generation, so migrate to a new
+            # generation before the deadline-bounded loop retries. Other errors
+            # propagate. Track NPE count for the final failure diagnostic.
+            transient_state = _reconnect_after_proxy_receive_transient(backend, exc)
             if transient_state is None:
                 raise
             if transient_state == "npe":
@@ -169,6 +169,16 @@ def _proxy_receive_transient_state(error: QueueError) -> str | None:
     if _ROCKETMQ_PROXY_NO_TOPIC_SIGNATURE in detail.lower():
         return "no-topic"
     return None
+
+
+def _reconnect_after_proxy_receive_transient(backend, error: QueueError) -> str | None:  # type: ignore[no-untyped-def]
+    """Migrate away from a sticky failed pump after a recognized Proxy race."""
+    transient_state = _proxy_receive_transient_state(error)
+    if transient_state is None:
+        return None
+    backend.disconnect()
+    backend.connect()
+    return transient_state
 
 
 def _ensure_topic(backend, queue_name: str) -> None:  # type: ignore[no-untyped-def]
@@ -302,6 +312,47 @@ def test_proxy_receive_classifier_retries_only_known_startup_npe() -> None:
     assert _proxy_receive_transient_state(unrelated_error) is None
 
 
+def test_proxy_transient_reconnects_before_retry() -> None:
+    """A classified pump failure migrates generations before the next pop."""
+    events: list[str] = []
+    token = object()
+
+    class _ScriptedBackend:
+        _receive_error_observer = None
+        pop_calls = 0
+
+        def pop_with_ack(self, _queue: str, _timeout: float):  # type: ignore[no-untyped-def]
+            events.append("pop")
+            self.pop_calls += 1
+            if self.pop_calls == 1:
+                observer = self._receive_error_observer
+                assert observer is not None
+                observer(
+                    RuntimeError(
+                        "50001, null. NullPointerException. "
+                        "org.apache.rocketmq.proxy.grpc.v2.consumer."
+                        "ReceiveMessageActivity.receiveMessage(ReceiveMessageActivity.java:63)"
+                    )
+                )
+                raise QueueError("RocketMQ receive pump failed.")
+            return b"recovered", token
+
+        def disconnect(self) -> None:
+            events.append("disconnect")
+
+        def connect(self) -> None:
+            events.append("connect")
+
+        def ack(self, _queue: str, *, token: object) -> None:
+            events.append("ack")
+
+    received, npe_hits = _drain(_ScriptedBackend(), "jobs", 1, deadline_s=1)
+
+    assert received == [b"recovered"]
+    assert npe_hits == 1
+    assert events == ["pop", "disconnect", "connect", "pop", "ack"]
+
+
 def test_push_pop_round_trip(rocketmq_backend, unique_prefix):
     """R7 verification: N in → N out, no loss.
 
@@ -359,9 +410,9 @@ def test_pop_empty_returns_none(rocketmq_backend, unique_prefix):
             if token is not None:
                 rocketmq_backend.ack(queue, token=token)
         except QueueError as exc:
-            if _proxy_receive_transient_state(exc) is None:
+            if _reconnect_after_proxy_receive_transient(rocketmq_backend, exc) is None:
                 raise  # non-transient error → surface, don't mask
-        # transient race (no-topic / NPE) OR a stray message → keep polling
+        # transient race (migrated generation) OR a stray message → keep polling
     pytest.fail(
         "pop on empty topic did not return None within 30s "
         "(apache proxy route-cache lag did not resolve)"
