@@ -721,6 +721,9 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
             str,
             dict[tuple[object, ...], object],
         ] = {}
+        # A reservation fences concurrent and reentrant settlement while plugin
+        # descriptors and hooks run without holding the adapter's project lock.
+        self._settling_ack_tokens: set[tuple[str, tuple[object, ...]]] = set()
 
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
         self._delegate.push(queue_name, item, priority)
@@ -786,35 +789,46 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
                 operation=operation,
             )
         key = _ack_token_key(token)
+        reservation = (queue_name, key)
         with self._ack_contract_lock:
             active = self._active_ack_tokens.get(queue_name)
             issued_token = active.get(key) if active is not None else None
-            if issued_token is None or (
-                key[0] == "identity" and issued_token is not token
+            if (
+                issued_token is None
+                or (key[0] == "identity" and issued_token is not token)
+                or reservation in self._settling_ack_tokens
             ):
                 raise QueueError(
                     "Deferred-ack settlement rejected an unknown acknowledgement token",
                     operation=operation,
                 )
-            assert active is not None
-            try:
-                settle_hook = cast(
-                    "Callable[..., Any]",
-                    self._delegate.ack if operation == "ack" else self._delegate.nack,
+            self._settling_ack_tokens.add(reservation)
+
+        try:
+            # Attribute resolution itself may invoke a plugin descriptor, so it
+            # belongs outside the contract lock along with the settlement hook.
+            settle_hook = cast(
+                "Callable[..., Any]",
+                self._delegate.ack if operation == "ack" else self._delegate.nack,
+            )
+            result = settle_hook(queue_name, token=token)
+            _reject_lazy_ack_result(result, operation)
+            if result is not None:
+                raise QueueError(
+                    "Deferred-ack backend returned a non-None settlement result",
+                    operation=operation,
                 )
-                result = settle_hook(queue_name, token=token)
-                _reject_lazy_ack_result(result, operation)
-                if result is not None:
-                    raise QueueError(
-                        "Deferred-ack backend returned a non-None settlement result",
-                        operation=operation,
-                    )
-            except BaseException:
-                raise
-            else:
-                active.pop(key)
-                if not active:
-                    self._active_ack_tokens.pop(queue_name, None)
+        except BaseException:
+            with self._ack_contract_lock:
+                self._settling_ack_tokens.discard(reservation)
+            raise
+
+        with self._ack_contract_lock:
+            self._settling_ack_tokens.remove(reservation)
+            active = self._active_ack_tokens[queue_name]
+            active.pop(key)
+            if not active:
+                self._active_ack_tokens.pop(queue_name)
 
 
 # ---------------------------------------------------------------------------

@@ -622,6 +622,126 @@ def test_non_none_settlement_result_is_terminal_redacted_and_retryable(
     assert backend.ack_calls == (expected if method_name == "ack" else [])
     assert backend.nack_calls == (expected if method_name == "nack" else [])
     assert contract._active_ack_tokens == {}
+    assert contract._settling_ack_tokens == set()
+
+
+@pytest.mark.parametrize("method_name", ["ack", "nack"])
+def test_settlement_descriptor_and_hook_run_outside_contract_lock_and_reenter(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    marker = f"private-reentrant-{method_name}"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    backend.pop_results["q"].append((b"item", marker))
+    contract.pop_with_ack("q")
+    opposite_name = "nack" if method_name == "ack" else "ack"
+    original_hook = getattr(_DeferredPlugin, method_name)
+    lock_checks: list[bool] = []
+    reentrant_errors: list[QueueError] = []
+
+    class LockCheckingDescriptor:
+        def __get__(self, instance: object, owner: type[object]) -> object:
+            del owner
+            acquired = contract._ack_contract_lock.acquire(blocking=False)
+            lock_checks.append(acquired)
+            if acquired:
+                contract._ack_contract_lock.release()
+
+            def settle(queue_name: str, *, token: object | None = None) -> None:
+                acquired = contract._ack_contract_lock.acquire(blocking=False)
+                lock_checks.append(acquired)
+                if acquired:
+                    contract._ack_contract_lock.release()
+                try:
+                    getattr(contract, opposite_name)(queue_name, token=token)
+                except QueueError as error:
+                    reentrant_errors.append(error)
+                original_hook(instance, queue_name, token=token)
+
+            return settle
+
+    monkeypatch.setattr(type(backend), method_name, LockCheckingDescriptor())
+
+    getattr(contract, method_name)("q", token=marker)
+
+    assert lock_checks == [True, True]
+    assert len(reentrant_errors) == 1
+    _assert_terminal_queue_error_is_redacted(reentrant_errors[0], marker)
+    expected = [("q", marker)]
+    assert backend.ack_calls == (expected if method_name == "ack" else [])
+    assert backend.nack_calls == (expected if method_name == "nack" else [])
+    assert contract._active_ack_tokens == {}
+    assert contract._settling_ack_tokens == set()
+
+
+@pytest.mark.parametrize("method_name", ["ack", "nack"])
+def test_blocked_settlement_fences_racer_then_failure_restores_exact_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    marker = f"private-race-{method_name}"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    backend.pop_results["q"].append((b"item", marker))
+    contract.pop_with_ack("q")
+    original_hook = getattr(backend, method_name)
+    entered = threading.Event()
+    release = threading.Event()
+    broker_calls = 0
+    worker_errors: list[BaseException] = []
+
+    def fail_once_then_settle(queue_name: str, *, token: object | None = None) -> None:
+        nonlocal broker_calls
+        broker_calls += 1
+        if broker_calls == 1:
+            entered.set()
+            assert release.wait(timeout=2.0)
+            raise QueueError(marker)
+        original_hook(queue_name, token=token)
+
+    monkeypatch.setattr(backend, method_name, fail_once_then_settle)
+
+    def settle_in_worker() -> None:
+        try:
+            getattr(contract, method_name)("q", token=marker)
+        except BaseException as error:
+            worker_errors.append(error)
+
+    worker = threading.Thread(target=settle_in_worker, daemon=True)
+    worker.start()
+    assert entered.wait(timeout=1.0)
+
+    opposite_name = "nack" if method_name == "ack" else "ack"
+    with pytest.raises(QueueError) as exc_info:
+        getattr(contract, opposite_name)("q", token=marker)
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
+    assert broker_calls == 1
+    assert backend.ack_calls == []
+    assert backend.nack_calls == []
+
+    release.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert len(worker_errors) == 1
+    assert isinstance(worker_errors[0], QueueError)
+    _assert_terminal_queue_error_is_redacted(worker_errors[0], marker)
+    assert contract._active_ack_tokens
+    assert contract._settling_ack_tokens == set()
+
+    getattr(contract, method_name)("q", token=marker)
+    assert broker_calls == 2
+    expected = [("q", marker)]
+    assert backend.ack_calls == (expected if method_name == "ack" else [])
+    assert backend.nack_calls == (expected if method_name == "nack" else [])
+    assert contract._active_ack_tokens == {}
+    assert contract._settling_ack_tokens == set()
 
 
 @pytest.mark.parametrize(
