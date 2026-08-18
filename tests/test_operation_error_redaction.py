@@ -106,7 +106,12 @@ def _connected_pulsar_backend(mocker: Any) -> tuple[PulsarBackend, MagicMock]:
 
 
 def _connected_sqs_backend(mocker: Any) -> tuple[SqsBackend, MagicMock]:
-    backend = SqsBackend(SqsSettings(endpoint_url=f"http://{_MARKER}.example:4566"))
+    backend = SqsBackend(
+        SqsSettings(
+            endpoint_url=f"http://{_MARKER}.example:4566",
+            allow_remote_http=True,
+        )
+    )
     client = mocker.MagicMock()
     session = mocker.MagicMock()
     session.client.return_value = client

@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TLS endpoints. MongoDB, Elasticsearch, and Pulsar now reject TLS material or
   controls ignored by their selected mode/scheme. RocketMQ exposes no custom CA
   controls in its supported SDK; only its existing TLS switch can be enforced.
+- **Standalone SQS and DynamoDB remote HTTP endpoints are fail-closed.**
+  Loopback LocalStack remains available, while non-loopback HTTP requires the
+  backend's exact `ALLOW_REMOTE_HTTP=True` trusted-network override. Explicit
+  credentials are never permitted over remote HTTP, even with the override;
+  cloud custom endpoints remain HTTPS-only. Each generation immutably captures
+  its validated endpoint policy.
 - **Cuckoo item-level deletion is now fail-safe unsupported.** Calling
   `CuckooMembershipFilter.remove()` now raises `NotImplementedError` without
   mutating the filter. The former behavior could delete a resident item when an

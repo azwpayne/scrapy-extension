@@ -131,6 +131,21 @@ literal-loopback development. TLS CA/certificate/key settings that a selected
 MongoDB, Elasticsearch, or Pulsar mode/scheme would ignore now fail validation
 instead of silently discarding operator intent.
 
+## Standalone SQS/DynamoDB Remote HTTP Opt-in
+
+Standalone SQS and DynamoDB keep `http://localhost:4566` for LocalStack
+without an override. A non-loopback `http://` endpoint now fails unless the
+matching exact boolean setting is enabled:
+
+- `SCRAPY_SQS_ALLOW_REMOTE_HTTP=True`
+- `SCRAPY_DYNAMODB_ALLOW_REMOTE_HTTP=True`
+
+Use these high-risk compatibility flags only for an isolated trusted network.
+They never permit an explicitly configured access-key/secret-key pair over
+remote HTTP; use HTTPS for explicit credentials. Cloud-mode custom endpoints
+remain HTTPS-only. The endpoint and opt-in are captured together in each
+immutable client generation, so changing either requires disconnect/reconnect.
+
 ## SQS Private boto3 Sessions
 
 Every new SQS connection generation now creates a private

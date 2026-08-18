@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.settings._aws import (
+    normalize_allow_remote_http,
     validate_aws_credentials,
     validate_aws_endpoint,
     validate_aws_region_name,
@@ -66,6 +67,13 @@ class DynamoDBSettings(RedactedBaseSettings):
             "LocalStack edge endpoint; CLOUD may leave this unset for real AWS."
         ),
     )
+    allow_remote_http: bool = Field(
+        default=False,
+        description=(
+            "Allow a standalone non-loopback HTTP endpoint only on an explicitly "
+            "trusted private network; never permits explicit credentials"
+        ),
+    )
     aws_access_key_id: SecretStr | None = Field(
         default=None, description="AWS access key id (optional; IAM role otherwise)"
     )
@@ -80,6 +88,12 @@ class DynamoDBSettings(RedactedBaseSettings):
         ),
     )
 
+    @field_validator("allow_remote_http", mode="before")
+    @classmethod
+    def _normalize_remote_http_opt_in(cls, value: object) -> bool:
+        """Accept canonical environment booleans but reject truthy lookalikes."""
+        return normalize_allow_remote_http(value)
+
     @model_validator(mode="after")
     def _validate_endpoint_url_scheme(self) -> Self:
         """Normalize local defaults and enforce the shared AWS URL policy."""
@@ -90,6 +104,11 @@ class DynamoDBSettings(RedactedBaseSettings):
             self.endpoint_url,
             cloud=self.mode == DynamoDBMode.CLOUD,
             require_endpoint=self.mode == DynamoDBMode.STANDALONE,
+            allow_remote_http=self.allow_remote_http,
+            explicit_credentials=(
+                self.aws_access_key_id is not None
+                or self.aws_secret_access_key is not None
+            ),
         )
         return self
 

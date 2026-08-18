@@ -369,6 +369,7 @@ class _SqsConnectionSnapshot:
     mode: SqsMode
     region_name: str
     endpoint_url: str | None
+    allow_remote_http: bool
     queue_name_prefix: str
     queue_name_generation: SqsQueueNameGeneration
     visibility_timeout: int
@@ -459,6 +460,7 @@ class SqsBackend(Backend, QueueBackend):
         endpoint_url = self.config.endpoint_url
         access_key = self.config.aws_access_key_id
         secret_key = self.config.aws_secret_access_key
+        allow_remote_http = self.config.allow_remote_http
         queue_name_prefix = self.config.queue_name_prefix
         queue_name_generation = self.config.queue_name_generation
         visibility_timeout = self.config.visibility_timeout
@@ -471,6 +473,8 @@ class SqsBackend(Backend, QueueBackend):
             endpoint_url,
             cloud=mode == SqsMode.CLOUD,
             require_endpoint=mode == SqsMode.STANDALONE,
+            allow_remote_http=allow_remote_http,
+            explicit_credentials=access_key is not None or secret_key is not None,
         )
         key_id, secret = validate_aws_credentials(access_key, secret_key)
         region_name = validate_aws_region_name(region_name)
@@ -500,6 +504,7 @@ class SqsBackend(Backend, QueueBackend):
             mode=mode,
             region_name=region_name,
             endpoint_url=endpoint_url,
+            allow_remote_http=allow_remote_http,
             queue_name_prefix=queue_name_prefix,
             queue_name_generation=queue_name_generation,
             visibility_timeout=visibility_timeout,

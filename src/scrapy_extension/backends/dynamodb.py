@@ -154,6 +154,7 @@ class _DynamoDBConnectionSnapshot:
     region_name: str
     endpoint_url: str | None
     allow_unfenced_legacy_clear: bool
+    allow_remote_http: bool
 
 
 @dataclass(frozen=True)
@@ -350,6 +351,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         table_name = self.config.table_name
         access_key = self.config.aws_access_key_id
         secret_key = self.config.aws_secret_access_key
+        allow_remote_http = self.config.allow_remote_http
         if not isinstance(mode, DynamoDBMode):
             raise ConfigurationError(
                 "Unsupported DynamoDB mode.",
@@ -360,6 +362,8 @@ class DynamoDBBackend(Backend, StorageBackend):
             self.config.endpoint_url,
             cloud=mode == DynamoDBMode.CLOUD,
             require_endpoint=mode == DynamoDBMode.STANDALONE,
+            allow_remote_http=allow_remote_http,
+            explicit_credentials=access_key is not None or secret_key is not None,
         )
         key_id, secret = validate_aws_credentials(
             access_key,
@@ -380,6 +384,7 @@ class DynamoDBBackend(Backend, StorageBackend):
             region_name=region_name,
             endpoint_url=endpoint_url,
             allow_unfenced_legacy_clear=allow_unfenced_legacy_clear,
+            allow_remote_http=allow_remote_http,
         )
         kwargs: dict[str, Any] = {
             "region_name": region_name,

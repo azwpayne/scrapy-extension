@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr
 
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.settings._transport_security import is_loopback_host
 
 # AWS partition region identifiers are not all three labels: GovCloud/ISO use
 # four (``us-gov-west-1``), while the European Sovereign Cloud starts with a
@@ -50,6 +51,15 @@ _AWS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
             "through the dedicated credential fields."
         ),
         "An explicit endpoint_url in cloud mode must use HTTPS.",
+        "allow_remote_http must be a boolean.",
+        (
+            "Remote standalone HTTP endpoints require allow_remote_http=True. "
+            "Use this override only for an explicitly trusted private network."
+        ),
+        (
+            "Explicit AWS credentials cannot be sent to a remote HTTP endpoint; "
+            "use HTTPS or a loopback LocalStack endpoint."
+        ),
     }
 )
 
@@ -113,13 +123,42 @@ def validate_aws_credentials(
     return key_text, secret_text
 
 
+def normalize_allow_remote_http(value: object) -> bool:
+    """Parse canonical environment booleans without accepting truthy lookalikes."""
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ConfigurationError(
+        "allow_remote_http must be a boolean.",
+        setting_name="allow_remote_http",
+    )
+
+
+def validate_allow_remote_http(value: object) -> bool:
+    """Require an exact boolean when mutable settings bypass Pydantic."""
+    if type(value) is not bool:
+        raise ConfigurationError(
+            "allow_remote_http must be a boolean.",
+            setting_name="allow_remote_http",
+        )
+    return value
+
+
 def validate_aws_endpoint(
     endpoint_url: str | None,
     *,
     cloud: bool,
     require_endpoint: bool = False,
+    allow_remote_http: object = False,
+    explicit_credentials: bool = False,
 ) -> str | None:
     """Validate an AWS endpoint override without retaining or echoing userinfo."""
+    remote_http_allowed = validate_allow_remote_http(allow_remote_http)
     if endpoint_url is None:
         if require_endpoint:
             raise ConfigurationError(
@@ -167,4 +206,17 @@ def validate_aws_endpoint(
             "An explicit endpoint_url in cloud mode must use HTTPS.",
             setting_name="endpoint_url",
         )
+    if not cloud and scheme == "http" and not is_loopback_host(hostname):
+        if explicit_credentials:
+            raise ConfigurationError(
+                "Explicit AWS credentials cannot be sent to a remote HTTP endpoint; "
+                "use HTTPS or a loopback LocalStack endpoint.",
+                setting_name="endpoint_url",
+            )
+        if remote_http_allowed is not True:
+            raise ConfigurationError(
+                "Remote standalone HTTP endpoints require allow_remote_http=True. "
+                "Use this override only for an explicitly trusted private network.",
+                setting_name="allow_remote_http",
+            )
     return endpoint_url
