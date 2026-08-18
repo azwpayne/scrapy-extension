@@ -40,7 +40,22 @@ is process-local. Stop old workers normally; their tables disappear with the
 process. Successful inserts, the no-false-negative guarantee for those inserts,
 and `FilterFull` behavior are unchanged.
 
-<<<<<<< HEAD
+## Cuckoo Sizing and Saturation Metrics
+
+Cuckoo fingerprint sizing now rejects non-finite rates and rates that would need
+more than SHA-256's 32-byte digest. Such startup failures are attributed to
+`SCRAPY_DEDUP_CUCKOO_ERROR_RATE`; raise that value to a supported rate rather
+than relying on the former silent digest truncation.
+
+The public `capacity` property keeps its historical meaning: physical bucket
+slots. `slot_capacity` is an explicit alias for that physical diagnostic, while
+`configured_capacity` records `SCRAPY_DEDUP_CUCKOO_CAPACITY`. Monitoring now
+uses the configured target, so `dupefilter/filter_saturation` reaches `1.0` at
+the requested item count even when power-of-two bucket rounding created extra
+physical slots. Dashboards that directly divide `len(filter) / filter.capacity`
+should migrate to `filter.saturation` or `configured_capacity`; dashboards that
+inspect physical headroom can use `slot_capacity` without a semantic change.
+
 ## Pulsar Polling and Teardown Semantics
 
 Pulsar's Stable queue backend now performs synchronous SDK subscription and
@@ -63,23 +78,6 @@ No setting or persisted-data migration is required. During a rolling upgrade,
 expect temporary redistribution as old foreground receivers and new bounded
 pumps coexist. For the clearest operational boundary, stop old workers, allow
 consumer closes to complete, and then start upgraded workers.
-=======
-### Cuckoo sizing and saturation metrics
-
-Cuckoo fingerprint sizing now rejects non-finite rates and rates that would need
-more than SHA-256's 32-byte digest. Such startup failures are attributed to
-`SCRAPY_DEDUP_CUCKOO_ERROR_RATE`; raise that value to a supported rate rather
-than relying on the former silent digest truncation.
-
-The public `capacity` property keeps its historical meaning: physical bucket
-slots. `slot_capacity` is an explicit alias for that physical diagnostic, while
-`configured_capacity` records `SCRAPY_DEDUP_CUCKOO_CAPACITY`. Monitoring now
-uses the configured target, so `dupefilter/filter_saturation` reaches `1.0` at
-the requested item count even when power-of-two bucket rounding created extra
-physical slots. Dashboards that directly divide `len(filter) / filter.capacity`
-should migrate to `filter.saturation` or `configured_capacity`; dashboards that
-inspect physical headroom can use `slot_capacity` without a semantic change.
->>>>>>> da87f17 (fix(cuckoo): validate fingerprint bounds and target saturation)
 
 ## Pulsar TLS Hostname Validation
 

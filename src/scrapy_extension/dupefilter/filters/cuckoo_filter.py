@@ -19,10 +19,6 @@ from typing import NoReturn
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 
 _SHA256_DIGEST_BYTES = hashlib.sha256().digest_size
-# With four slots per bucket the standard Cuckoo false-positive bound needs
-# ceil(-log2(error_rate) + log2(2 * bucket_size)) fingerprint bits. SHA-256 can
-# supply at most 256 non-repeated bits, so rates below 2**-253 are unsupported.
-_MIN_ERROR_RATE = math.ldexp(1.0, -(8 * _SHA256_DIGEST_BYTES - 3))
 
 
 class _CuckooFingerprintSizeError(ValueError):
@@ -75,23 +71,21 @@ class CuckooMembershipFilter(MembershipFilter):
                 "error_rate must be finite and in the open interval (0, 1), "
                 f"got {error_rate}"
             )
-        if error_rate < _MIN_ERROR_RATE:
-            raise _CuckooFingerprintSizeError(
-                "error_rate is too small: the required fingerprint exceeds the "
-                f"{_SHA256_DIGEST_BYTES}-byte SHA-256 digest"
-            )
         b = self._BUCKET_SIZE
-        # Avoid ``log2(1 / error_rate)``: the reciprocal overflows for valid,
-        # subnormal floats before the logarithm can size or reject them.
-        fp_bits = math.ceil(-math.log2(error_rate) + math.log2(2 * b))
-        if fp_bits > _SHA256_DIGEST_BYTES * 8:
-            # Defensive guard for future bucket-size/digest changes and floating
-            # boundary behavior; never silently truncate a requested fingerprint.
+        # Allocate whole bytes directly from the Cuckoo false-positive bound
+        # ``error_rate >= 2 * b / 2**(8 * fingerprint_bytes)``. For b=4 each
+        # boundary is the exactly representable power of two ``2**(3 - 8L)``;
+        # avoiding logarithms prevents rounding across those byte boundaries.
+        for fp_len in range(1, _SHA256_DIGEST_BYTES + 1):
+            byte_threshold = math.ldexp(2.0 * b, -(8 * fp_len))
+            if error_rate >= byte_threshold:
+                self._fp_len = fp_len
+                break
+        else:
             raise _CuckooFingerprintSizeError(
                 "error_rate is too small: the required fingerprint exceeds the "
                 f"{_SHA256_DIGEST_BYTES}-byte SHA-256 digest"
             )
-        self._fp_len = max(1, (fp_bits + 7) >> 3)
         self._configured_capacity = capacity
         # Size buckets for ~85% load, rounded up to a power of two so the
         # two-index xor scheme can mask with (m - 1).

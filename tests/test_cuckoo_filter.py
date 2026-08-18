@@ -30,19 +30,32 @@ class TestCuckooMembershipFilterSizing:
         with pytest.raises(ValueError, match="error_rate"):
             CuckooMembershipFilter(capacity=100, error_rate=error_rate)
 
-    def test_rejects_fingerprint_larger_than_sha256_digest(self) -> None:
-        with pytest.raises(ValueError, match="exceeds the 32-byte SHA-256 digest"):
-            CuckooMembershipFilter(
-                capacity=100,
-                error_rate=math.nextafter(math.ldexp(1.0, -253), 0.0),
+    @pytest.mark.parametrize("expected_bytes", range(1, 33))
+    def test_exact_byte_boundaries_never_under_allocate(
+        self, expected_bytes: int
+    ) -> None:
+        threshold = math.ldexp(
+            2.0 * CuckooMembershipFilter._BUCKET_SIZE,  # noqa: SLF001
+            -(8 * expected_bytes),
+        )
+
+        for error_rate in (math.nextafter(threshold, math.inf), threshold):
+            flt = CuckooMembershipFilter(capacity=100, error_rate=error_rate)
+            assert flt.fp_len == expected_bytes
+            assert error_rate >= math.ldexp(
+                2.0 * flt._BUCKET_SIZE,  # noqa: SLF001
+                -(8 * flt.fp_len),
             )
 
-    def test_digest_limit_boundary_uses_all_32_bytes(self) -> None:
-        flt = CuckooMembershipFilter(
-            capacity=100,
-            error_rate=math.ldexp(1.0, -253),
-        )
-        assert flt.fp_len == 32
+        below = math.nextafter(threshold, 0.0)
+        if expected_bytes < 32:
+            flt = CuckooMembershipFilter(capacity=100, error_rate=below)
+            assert flt.fp_len == expected_bytes + 1
+        else:
+            with pytest.raises(
+                ValueError, match="exceeds the 32-byte SHA-256 digest"
+            ):
+                CuckooMembershipFilter(capacity=100, error_rate=below)
 
     @pytest.mark.parametrize(
         ("error_rate", "expected_bytes"),
