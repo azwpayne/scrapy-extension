@@ -1093,6 +1093,13 @@ class BackendScheduler:
         self._queue_terminal = False
         self._terminal_queue_error: BaseException | None = None
         self._dupefilter_release_owner = object()
+        if dupefilter is not None:
+            from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+
+            if type(dupefilter) is BackendDupeFilter:
+                dupefilter._authorize_release_owner_alias(  # noqa: SLF001
+                    self._dupefilter_release_owner
+                )
         # A scheduler owns one ConnectionManager acquire and is therefore a
         # single-lifecycle object. Serializing open/close prevents concurrent
         # callers from replacing a live queue or releasing its manager midway

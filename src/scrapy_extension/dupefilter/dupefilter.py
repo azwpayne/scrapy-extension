@@ -250,6 +250,11 @@ class BackendDupeFilter:
         self._connection_manager_lease = connection_manager_lease
         self._release_owner_token: object | None = None
         self._direct_release_owner = object()
+        # A composite owner (currently BackendScheduler) may register its stable
+        # lifecycle token before open.  That token is an explicit alias for the
+        # direct owner, allowing it to resume failed-open cleanup without making
+        # arbitrary release tokens interchangeable.
+        self._release_owner_aliases: list[object] = []
         self._lifecycle_lock = RLock()
         # Operations enqueue complete telemetry batches under the lifecycle lock.
         # One elected caller drains this shared FIFO outside the lock; peers never
@@ -820,6 +825,32 @@ class BackendDupeFilter:
         if reserved:
             self._run_reserved_release()
 
+    def _authorize_release_owner_alias(self, owner_token: object) -> None:
+        """Authorize one composite owner to resume direct-owner cleanup.
+
+        Registration is identity-based and intentionally private: it grants only
+        the supplied stable token access to this lifecycle's release reservation.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if any(alias is owner_token for alias in self._release_owner_aliases):
+                return
+            self._release_owner_aliases.append(owner_token)
+
+    def _release_owners_are_aliases(self, first: object, second: object) -> bool:
+        """Return whether two tokens are the direct owner and an authorized alias."""
+        if first is second:
+            return True
+        aliases = self._release_owner_aliases
+        return (
+            first is self._direct_release_owner
+            and any(alias is second for alias in aliases)
+        ) or (
+            second is self._direct_release_owner
+            and any(alias is first for alias in aliases)
+        )
+
     def _reserve_release_locked(
         self,
         owner_token: object,
@@ -846,7 +877,9 @@ class BackendDupeFilter:
                 self._open_owner_token = None
         if self._release_owner_token is None:
             self._release_owner_token = owner_token
-        elif self._release_owner_token is not owner_token:
+        elif not self._release_owners_are_aliases(
+            self._release_owner_token, owner_token
+        ):
             raise RuntimeError("dupefilter close is owned by another caller")
         if self._release_in_progress:
             if self._release_thread_id == thread_id:

@@ -11,6 +11,7 @@ from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters.base import MembershipFilter
+from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
 def _dupefilter_with_lease(
@@ -169,6 +170,123 @@ def test_failed_open_reserves_cleanup_before_another_open() -> None:
     assert errors == [open_error]
     assert dupefilter._closed is True
     membership_filter.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+
+
+def test_scheduler_resumes_interrupted_failed_open_cleanup() -> None:
+    manager = Mock()
+    membership_filter = Mock(spec=MembershipFilter)
+    membership_filter.open.side_effect = RuntimeError("filter open failed")
+    close_calls = 0
+
+    def close_then_interrupt_twice() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls <= 2:
+            raise KeyboardInterrupt("cleanup interrupted")
+
+    membership_filter.close.side_effect = close_then_interrupt_twice
+    dupefilter = BackendDupeFilter(
+        connection_manager=manager,
+        membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+        manager,
+        dupefilter=dupefilter,
+        owns_connection_manager=False,
+    )
+    spider = Mock()
+    spider.name = "spider"
+
+    with pytest.raises(RuntimeError, match="filter open failed"):
+        scheduler.open(spider)
+
+    assert membership_filter.close.call_count == 2
+    manager.close.assert_not_called()
+
+    scheduler.close("retry")
+
+    assert membership_filter.close.call_count == 3
+    manager.close.assert_called_once_with()
+    assert dupefilter._closed is True
+    assert scheduler._lifecycle_state == "closed"
+
+
+def test_failed_open_owner_alias_does_not_admit_unrelated_token() -> None:
+    manager = Mock()
+    membership_filter = Mock(spec=MembershipFilter)
+    membership_filter.open.side_effect = RuntimeError("filter open failed")
+    membership_filter.close.side_effect = KeyboardInterrupt("cleanup interrupted")
+    dupefilter = BackendDupeFilter(
+        connection_manager=manager,
+        membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+        manager,
+        dupefilter=dupefilter,
+        owns_connection_manager=False,
+    )
+
+    with pytest.raises(RuntimeError, match="filter open failed"):
+        dupefilter.open()
+
+    with pytest.raises(RuntimeError, match="owned by another caller"):
+        dupefilter.release(object(), "unrelated")
+
+    membership_filter.close.side_effect = None
+    dupefilter.release(scheduler._dupefilter_release_owner, "scheduler-retry")
+    membership_filter.close.assert_called()
+    manager.close.assert_called_once_with()
+
+
+def test_scheduler_alias_cannot_overtake_active_direct_cleanup() -> None:
+    manager = Mock()
+    membership_filter = Mock(spec=MembershipFilter)
+    membership_filter.open.side_effect = RuntimeError("filter open failed")
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+
+    def blocking_close() -> None:
+        cleanup_entered.set()
+        assert allow_cleanup.wait(timeout=3)
+
+    membership_filter.close.side_effect = blocking_close
+    dupefilter = BackendDupeFilter(
+        connection_manager=manager,
+        membership_filter=membership_filter,
+    )
+    scheduler = BackendScheduler(
+        manager,
+        dupefilter=dupefilter,
+        owns_connection_manager=False,
+    )
+    errors: list[BaseException] = []
+
+    def fail_open() -> None:
+        try:
+            dupefilter.open()
+        except BaseException as exc:
+            errors.append(exc)
+
+    opener = threading.Thread(target=fail_open, name="failed-open-cleanup-owner")
+    opener.start()
+    assert cleanup_entered.wait(timeout=3)
+    try:
+        with pytest.raises(RuntimeError, match="close is already in progress"):
+            scheduler.close("concurrent")
+        manager.close.assert_not_called()
+    finally:
+        allow_cleanup.set()
+    opener.join(timeout=3)
+
+    assert not opener.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "filter open failed"
+    manager.close.assert_called_once_with()
+
+    scheduler.close("terminal")
+    assert membership_filter.close.call_count == 1
     manager.close.assert_called_once_with()
 
 
