@@ -1225,9 +1225,11 @@ class PulsarBackend(Backend, QueueBackend):
                             self._subscribed_topic = active_topic
                             break
                     if retired_consumer is not None:
-                        retirement = self._start_consumer_retirement_locked(
-                            pump, retired_consumer
-                        )
+                        retirement = pump.retirement
+                        if retirement is None:
+                            retirement = self._start_consumer_retirement_locked(
+                                pump, retired_consumer
+                            )
                     pump.condition.notify_all()
                 elif deadline is None:
                     return None
@@ -1346,12 +1348,17 @@ class PulsarBackend(Backend, QueueBackend):
         self, pump: _PulsarReceivePump, candidate: Any
     ) -> None:
         """Close a late bootstrap result without dropping its reconnect fence."""
-        retirement = pump.retirement
-        if retirement is None:
-            self._close_aborted_handle(candidate)
-            return
-        retirement.consumer = candidate
-        retirement.worker = current_thread()
+        with self._lifecycle_lock:
+            retirement = pump.retirement
+            if retirement is None:
+                # Publication faults and other stale-candidate paths can arrive
+                # without a disconnect-created placeholder. Fence the topic before
+                # close starts so Exclusive/Failover cannot be replaced while the
+                # candidate's actual close remains blocked.
+                self._start_consumer_retirement_locked(pump, candidate)
+                return
+            retirement.consumer = candidate
+            retirement.worker = current_thread()
         self._run_consumer_retirement(retirement)
 
     def _ensure_receive_pump(
@@ -1366,8 +1373,12 @@ class PulsarBackend(Backend, QueueBackend):
                     if retirement is not None and retirement.completed.is_set():
                         self._consumer_retirements.pop(topic, None)
                         retirement = None
+                    pump = self._receive_pumps.get(topic)
+                    if pump is not None and pump.retirement is retirement:
+                        # A publication failure can start candidate retirement before
+                        # its live pump transfers the terminal error to a caller.
+                        return pump
                     if retirement is None:
-                        pump = self._receive_pumps.get(topic)
                         if pump is not None:
                             return pump
                         client = self._client
@@ -1406,6 +1417,13 @@ class PulsarBackend(Backend, QueueBackend):
                         except BaseException:
                             pump.stop_admission()
                             self._receive_pumps.pop(topic, None)
+                            # ``Thread.start`` may launch the receive target and then
+                            # raise. Such a worker can still return a live subscription
+                            # candidate, so publish its topic fence before releasing the
+                            # lifecycle lock. The worker attaches any late candidate and
+                            # releases the fence only after close actually exits.
+                            if not self._thread_definitely_unstarted(worker):
+                                self._new_consumer_retirement_locked(pump)
                             raise
                         return pump
 
@@ -1486,7 +1504,7 @@ class PulsarBackend(Backend, QueueBackend):
                 publication_error = error
             if publication_error is not None:
                 if candidate is not None:
-                    self._close_aborted_handle(candidate)
+                    self._close_stale_pump_candidate(pump, candidate)
                     candidate = None
                 with pump.condition:
                     if pump.accepting:

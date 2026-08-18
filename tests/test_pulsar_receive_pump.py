@@ -7,7 +7,7 @@ from threading import Condition, Event, Thread, current_thread
 from threading import enumerate as enumerate_threads
 from time import monotonic
 from typing import Any
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pulsar
 import pytest
@@ -537,6 +537,123 @@ def test_disconnect_fences_stale_blocked_bootstrap_return_across_reconnect(
     assert recovered_consumer.receive_started.wait(timeout=0.5)
     stale_consumer.close.assert_called_once_with()
     assert new_client.subscribe.call_count == 1
+
+
+def test_receive_start_launch_then_raise_fences_late_candidate_across_reconnect(
+    mocker: Any,
+) -> None:
+    """A launched receive worker cannot outlive its Exclusive topic fence."""
+    close_started = Event()
+    release_close = Event()
+    stale_consumer = MagicMock(name="ambiguous-receive-start-consumer")
+    replacement_consumer = _ControllableConsumer()
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    stale_consumer.close.side_effect = blocked_close
+    old_client = MagicMock(name="ambiguous-receive-old-client")
+    old_client.subscribe.return_value = stale_consumer
+    new_client = MagicMock(name="ambiguous-receive-new-client")
+    new_client.subscribe.return_value = replacement_consumer
+    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
+    backend = PulsarBackend(PulsarSettings(consumer_type="Exclusive"))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    topic = "scrapy-ambiguous-receive-start"
+    start_error = SystemExit("receive start marker")
+    real_start = Thread.start
+
+    def launch_then_raise(worker: Thread) -> None:
+        real_start(worker)
+        if worker.name.startswith("scrapy-pulsar-receive-"):
+            raise start_error
+
+    with patch.object(pulsar_backend_module.Thread, "start", launch_then_raise):
+        with pytest.raises(SystemExit) as captured:
+            backend.pop("ambiguous-receive-start", timeout=0)
+    assert captured.value is start_error
+    assert close_started.wait(timeout=0.5)
+    assert list(backend._consumer_retirements) == [topic]
+
+    backend.disconnect()
+    backend.connect()
+    assert backend.pop("ambiguous-receive-start", timeout=0) is None
+    new_client.subscribe.assert_not_called()
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("ambiguous-receive-start", timeout=0) is None
+    assert replacement_consumer.receive_started.wait(timeout=0.5)
+    stale_consumer.close.assert_called_once_with()
+    new_client.subscribe.assert_called_once_with(
+        topic,
+        "scrapy-extension",
+        consumer_type=pulsar.ConsumerType.Exclusive,
+        initial_position=pulsar.InitialPosition.Earliest,
+        negative_ack_redelivery_delay_ms=60_000,
+    )
+
+
+def test_publication_failure_fences_blocked_candidate_close_across_reconnect(
+    mocker: Any,
+) -> None:
+    """A candidate that only partially publishes remains fenced until close exits."""
+
+    class _FailingPublicationMap(dict[str, Any]):
+        def __setitem__(self, key: str, value: Any) -> None:
+            del key, value
+            raise KeyboardInterrupt("publication marker")
+
+    close_started = Event()
+    release_close = Event()
+    stale_consumer = MagicMock(name="publication-failure-consumer")
+    replacement_consumer = _ControllableConsumer()
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    stale_consumer.close.side_effect = blocked_close
+    old_client = MagicMock(name="publication-failure-old-client")
+    old_client.subscribe.return_value = stale_consumer
+    new_client = MagicMock(name="publication-failure-new-client")
+    new_client.subscribe.return_value = replacement_consumer
+    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
+    backend = PulsarBackend(PulsarSettings(consumer_type="Failover"))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    backend._consumers = _FailingPublicationMap()
+    topic = "scrapy-publication-failure"
+
+    assert backend.pop("publication-failure", timeout=0) is None
+    assert close_started.wait(timeout=0.5)
+    with pytest.raises(KeyboardInterrupt, match="publication marker"):
+        backend.pop("publication-failure", timeout=0.2)
+    assert list(backend._consumer_retirements) == [topic]
+    stale_consumer.close.assert_called_once_with()
+
+    backend.disconnect()
+    backend._consumers = {}
+    backend.connect()
+    assert backend.pop("publication-failure", timeout=0) is None
+    new_client.subscribe.assert_not_called()
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("publication-failure", timeout=0) is None
+    assert replacement_consumer.receive_started.wait(timeout=0.5)
+    stale_consumer.close.assert_called_once_with()
+    new_client.subscribe.assert_called_once_with(
+        topic,
+        "scrapy-extension",
+        consumer_type=pulsar.ConsumerType.Failover,
+        initial_position=pulsar.InitialPosition.Earliest,
+        negative_ack_redelivery_delay_ms=60_000,
+    )
 
 
 def test_receive_worker_name_does_not_expose_private_topic(mocker: Any) -> None:
