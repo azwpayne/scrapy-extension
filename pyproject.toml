@@ -338,12 +338,3 @@ disallow_untyped_calls = false
 now = true
 patterns = ["*.py", "*.toml"]
 ignore_patterns = ["*.pyc", "__pycache__/*", "reports/*"]
-
-
-[tool.pytest_benchmark]
-min_rounds = 5
-min_time = 0.000005
-max_time = 1.0
-calibration_precision = 10
-warmup = true
-warmup_iterations = 100000

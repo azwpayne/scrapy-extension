@@ -60,6 +60,30 @@ jobs:
         run: >-
           uv run --no-sync pytest -n 2 --benchmark-disable
           tests/test_memory_filter.py::TestMemoryMembershipFilter::test_add_new_returns_true -q
+      - name: Benchmark smoke (five measurements)
+        if: matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          uv run --no-sync pytest \
+            tests/test_bench_push_pop.py::test_push_single \
+            tests/test_bench_push_pop.py::test_pop_single \
+            tests/test_bench_push_pop.py::test_push_batch_of_10_latency \
+            tests/test_bench_serialization.py::test_request_to_dict \
+            tests/test_bench_serialization.py::test_serialize_deserialize_roundtrip \
+            --benchmark-only --benchmark-warmup=off \
+            --benchmark-json=benchmark-smoke.json -q
+          uv run --no-sync python - <<'PY'
+          import json
+          from pathlib import Path
+
+          benchmarks = json.loads(
+              Path("benchmark-smoke.json").read_text(encoding="utf-8")
+          )["benchmarks"]
+          assert len(benchmarks) == 5, (
+              f"expected 5 benchmark results, got {len(benchmarks)}"
+          )
+          assert all(result["stats"]["rounds"] > 0 for result in benchmarks)
+          PY
       - name: Build package artifacts
         if: matrix.python-version == '3.10'
         run: uv build --clear --python ${{ matrix.python-version }}

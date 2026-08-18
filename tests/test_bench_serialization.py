@@ -1,26 +1,9 @@
-"""Benchmarks for the request-serialization hot path (round-8 F4 + F1-SER).
+"""Benchmarks for request serialization without backend I/O.
 
-The scientist pass measured ``BackendQueue.push`` at ~4.30 µs and ``pop`` at
-~2.81 µs per op; the dominant cost is ``_request_to_dict`` + ``JSONSerializer``
-(``json.dumps``), not the broker round-trip. These benchmarks pin the CPU cost
-of that pure-Python transform so a future regression (slower serialization,
-heavier request dict) shows up as a defensible number rather than a vibe.
-
-Scope — what is measured here:
-  - ``_request_to_dict`` (manual Request → dict, including base64 body).
-  - ``JSONSerializer.serialize`` / ``.deserialize`` (``json.dumps`` / ``json.loads``).
-  - The lossless round-trip through ``request_from_dict``.
-
-Scope — what is NOT measured here:
-  - Any backend / broker I/O. The connection manager is never touched on the
-    serialize path; pop's deserialization uses a pre-built ``bytes`` payload.
-  - Queue strategy cost (see ``test_bench_push_pop.py``).
-
-Opt-in: every test carries ``@pytest.mark.benchmark`` and is skipped by the
-root ``conftest.py`` unless ``--benchmark-only`` / ``--benchmark-enable`` is
-passed. No hard perf thresholds are asserted — the gate is "runs and reports a
-defensible number"; baselines come first. One non-perf sanity assertion pins
-correctness alongside the measurement (lossless round-trip on key fields).
+The two opt-in measurements cover Scrapy request-to-dict conversion and the
+JSON encode/decode pair. Representative objects are prepared before the timed
+caliper. A separate deterministic full round-trip check remains in the
+ordinary suite. No performance thresholds are asserted.
 """
 
 from __future__ import annotations
@@ -28,35 +11,49 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from scrapy.http import Request
+from scrapy import Spider
+from scrapy.http import Request, Response
 from scrapy.utils.request import request_from_dict
 
 from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.queue.queue import BackendQueue
 
-#: Module-level marker so every test in this file is opted-in together.
-pytestmark = pytest.mark.benchmark
+_BENCHMARK_ROUNDS = 5
 
 
 class _NullConnectionManager:
-    """Stand-in so ``BackendQueue`` builds without a backend.
+    """Stand-in unused by the pure serialization path."""
 
-    The serialization path (``_request_to_dict`` + ``JSONSerializer``) never
-    touches the connection manager — it's a pure transform. Reused verbatim from
-    ``tests/test_property_serialization.py`` to avoid importing test code.
-    """
+
+class _BenchSpider(Spider):
+    """Spider owning the callback serialized by the representative request."""
+
+    name = "benchmark-serialization"
+
+    def parse_item(self, response: Response, tag: str) -> Any:
+        """Provide a callback target; benchmark tests never invoke it."""
+        del response, tag
+        return None
 
 
 @pytest.fixture(scope="module")
-def backend_queue() -> BackendQueue:
-    """A ``BackendQueue`` whose serialize path is exercised; backend never called."""
-    return BackendQueue(_NullConnectionManager(), "bench-serialization")
+def bench_spider() -> _BenchSpider:
+    """Return the spider used to resolve the representative callback."""
+    return _BenchSpider()
 
 
-def _make_request() -> Request:
-    """Representative Scrapy request: URL + headers + binary body + meta + callback."""
-    # ``callback`` is set to a module-level function so ``request_from_dict`` can
-    # resolve it back by qualified name during the round-trip sanity assertion.
+@pytest.fixture(scope="module")
+def backend_queue(bench_spider: _BenchSpider) -> BackendQueue:
+    """Build a queue whose pure serialization methods are exercised."""
+    return BackendQueue(
+        _NullConnectionManager(),  # type: ignore[arg-type]
+        "bench-serialization",
+        spider=bench_spider,
+    )
+
+
+def _make_request(spider: _BenchSpider) -> Request:
+    """Build a representative request with a spider-bound callback."""
     return Request(
         url="https://example.com/path/to/resource?query=value&page=42",
         method="POST",
@@ -67,7 +64,7 @@ def _make_request() -> Request:
             "User-Agent": "scrapy-extension-bench/1.0",
         },
         body=b'{"key": "value", "nested": {"n": 7}, "list": [1, 2, 3]}',
-        cookies={"session": "s3cr3t", "region": "us-west-2"},
+        cookies={"session": "benchmark-cookie", "region": "us-west-2"},
         meta={
             "depth": 3,
             "download_timeout": 30.0,
@@ -78,91 +75,71 @@ def _make_request() -> Request:
         priority=100,
         encoding="utf-8",
         dont_filter=False,
-        callback=_roundtrip_callback,
+        callback=spider.parse_item,
     )
 
 
-def _roundtrip_callback(
-    request: Request,
-) -> Any:  # pragma: no cover - referenced by name only
-    """Callback target resolvable by ``request_from_dict`` during round-trip."""
-    del request
-    return None
+@pytest.mark.benchmark
+def test_request_to_dict(
+    benchmark,
+    backend_queue: BackendQueue,
+    bench_spider: _BenchSpider,
+) -> None:
+    """Measure request-to-dict conversion with request creation untimed."""
+    request = _make_request(bench_spider)
 
-
-def test_request_to_dict(benchmark, backend_queue: BackendQueue) -> None:
-    """Measure ``_request_to_dict`` (Request → JSON-encodable dict, no I/O).
-
-    No threshold asserted — the gate is "runs and reports a number". Future
-    regressions surface as a slower reported mean, not a red test.
-    """
-    request = _make_request()
-
-    result = benchmark(backend_queue._request_to_dict, request)
+    result = benchmark.pedantic(
+        backend_queue._request_to_dict,
+        args=(request,),
+        rounds=_BENCHMARK_ROUNDS,
+    )
 
     assert isinstance(result, dict)
     assert result["url"] == request.url
     assert result["method"] == "POST"
-    assert result["body"] is not None  # base64 string
+    assert result["body"] is not None
 
 
-def test_serialize_deserialize_roundtrip(benchmark) -> None:
-    """Measure ``JSONSerializer.serialize`` + ``.deserialize`` of the request dict.
-
-    Pairs with ``test_request_to_dict`` to isolate JSON cost from manual-dict
-    cost. No threshold asserted.
-    """
-    queue = BackendQueue(_NullConnectionManager(), "bench-serialization")
-    request = _make_request()
-    request_dict = queue._request_to_dict(request)
+@pytest.mark.benchmark
+def test_serialize_deserialize_roundtrip(
+    benchmark,
+    backend_queue: BackendQueue,
+    bench_spider: _BenchSpider,
+) -> None:
+    """Measure one JSON serialization/deserialization pair."""
+    request = _make_request(bench_spider)
+    request_dict = backend_queue._request_to_dict(request)
     serializer = JSONSerializer()
 
     def roundtrip() -> Any:
-        data = serializer.serialize(request_dict)
-        return serializer.deserialize(data)
+        return serializer.deserialize(serializer.serialize(request_dict))
 
-    result = benchmark(roundtrip)
+    result = benchmark.pedantic(roundtrip, rounds=_BENCHMARK_ROUNDS)
 
     assert result == request_dict
 
 
-class _StubSpider:
-    """Minimal stand-in so ``request_from_dict`` can resolve the callback name.
-
-    ``request_from_dict`` looks up ``callback``/``errback`` as attributes on the
-    spider by their stored function name; a bare object with the attribute set
-    is sufficient (the real ``scrapy.Spider`` is overkill for this sanity test).
-    """
-
-    def __init__(self) -> None:
-        self._roundtrip_callback = _roundtrip_callback
-
-
-def test_full_roundtrip_is_lossless() -> None:
-    """Sanity (NOT perf): full encode → decode restores key request fields.
-
-    Pins correctness alongside the measurements above. This is the only
-    non-perf-dependent assertion in the file and does not use the ``benchmark``
-    fixture, but keeps the ``benchmark`` module marker so it lives with its
-    peers and is skipped by the same opt-in gate during default runs.
-    """
-    queue = BackendQueue(_NullConnectionManager(), "bench-serialization")
-    request = _make_request()
-
-    request_dict = queue._request_to_dict(request)
+def test_full_roundtrip_is_lossless(
+    backend_queue: BackendQueue,
+    bench_spider: _BenchSpider,
+) -> None:
+    """Keep full serialization correctness deterministic in the ordinary suite."""
+    request = _make_request(bench_spider)
     serializer = JSONSerializer()
-    data = serializer.serialize(request_dict)
-    restored_dict = serializer.deserialize(data)
-    # Mirror the production decode path so the body is raw bytes for Scrapy.
-    queue._decode_body(restored_dict)
 
-    restored = request_from_dict(restored_dict, spider=_StubSpider())  # type: ignore[arg-type]
+    restored_dict = serializer.deserialize(
+        serializer.serialize(backend_queue._request_to_dict(request))
+    )
+    backend_queue._decode_body(restored_dict)
+    restored = request_from_dict(restored_dict, spider=bench_spider)
 
     assert restored.url == request.url
     assert restored.method == request.method
     assert restored.body == request.body
     assert restored.priority == request.priority
     assert restored.encoding == request.encoding
+    assert restored.callback == bench_spider.parse_item
+    assert restored.cb_kwargs == request.cb_kwargs
     assert dict(restored.headers.to_unicode_dict()) == dict(
         request.headers.to_unicode_dict(),
     )
