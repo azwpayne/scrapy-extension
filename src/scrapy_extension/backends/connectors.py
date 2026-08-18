@@ -3207,37 +3207,45 @@ class ConnectionManager:
         Returns:
             The QueueBackend interface of the backend.
         """
-        backend, breaker = self._get_backend_breaker_snapshot()
-        if not isinstance(backend, QueueBackend):
-            msg = f"Backend {backend.__class__.__name__} does not support queue operations"
-            raise NotImplementedError(msg)
-        published_backend: QueueBackend
-        if breaker is None:
-            published_backend = backend
-        else:
-            from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
+        while True:
+            backend, breaker = self._get_backend_breaker_snapshot()
+            if not isinstance(backend, QueueBackend):
+                msg = f"Backend {backend.__class__.__name__} does not support queue operations"
+                raise NotImplementedError(msg)
+            published_backend: QueueBackend
+            if breaker is None:
+                published_backend = backend
+            else:
+                from scrapy_extension.backends.circuit_breaker import wrap_queue_backend
 
-            published_backend = wrap_queue_backend(backend, breaker)
-        if not self._deferred_ack_plugin:
-            return published_backend
+                published_backend = wrap_queue_backend(backend, breaker)
+            if not self._deferred_ack_plugin:
+                return published_backend
 
-        source = (backend, breaker)
-        with self._lock:
-            cached_source = self._plugin_queue_backend_source
-            if (
-                cached_source is not None
-                and cached_source[0] is backend
-                and cached_source[1] is breaker
-            ):
-                assert self._plugin_queue_backend is not None
-                return self._plugin_queue_backend
-            contract_backend = _DeferredAckPluginQueueBackend(
-                published_backend,
-                supports_concurrent_ack=self._plugin_supports_concurrent_ack,
-            )
-            self._plugin_queue_backend_source = source
-            self._plugin_queue_backend = contract_backend
-            return contract_backend
+            source = (backend, breaker)
+            with self._lock:
+                if self._retired:
+                    raise BackendConnectionError(
+                        "Cannot access a released ConnectionManager",
+                        backend_type=str(self._backend_type_for_operations()),
+                    )
+                if backend is not self._backend or breaker is not self._breaker:
+                    continue
+                cached_source = self._plugin_queue_backend_source
+                if (
+                    cached_source is not None
+                    and cached_source[0] is backend
+                    and cached_source[1] is breaker
+                ):
+                    assert self._plugin_queue_backend is not None
+                    return self._plugin_queue_backend
+                contract_backend = _DeferredAckPluginQueueBackend(
+                    published_backend,
+                    supports_concurrent_ack=self._plugin_supports_concurrent_ack,
+                )
+                self._plugin_queue_backend_source = source
+                self._plugin_queue_backend = contract_backend
+                return contract_backend
 
     @_durable_push_queue_error_boundary
     @_manager_terminal_error_boundary()

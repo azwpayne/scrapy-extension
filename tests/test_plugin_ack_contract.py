@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import sys
+import threading
 import traceback
 import weakref
 from collections import defaultdict, deque
@@ -183,6 +184,29 @@ def _install_descriptor(
         lambda *, group: [_DescriptorEntryPoint()],
     )
     _reset_registry_cache()
+
+
+def _pause_after_next_generation_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    manager: ConnectionManager,
+) -> tuple[threading.Barrier, threading.Barrier]:
+    """Pause one accessor after its coherent snapshot but before publication."""
+    snapshot_taken = threading.Barrier(2)
+    resume_publication = threading.Barrier(2)
+    original_snapshot = manager._get_backend_breaker_snapshot
+    pause_next = True
+
+    def paused_snapshot() -> tuple[Backend, CircuitBreaker | None]:
+        nonlocal pause_next
+        snapshot = original_snapshot()
+        if pause_next:
+            pause_next = False
+            snapshot_taken.wait(timeout=5)
+            resume_publication.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(manager, "_get_backend_breaker_snapshot", paused_snapshot)
+    return snapshot_taken, resume_publication
 
 
 @pytest.mark.parametrize(
@@ -525,6 +549,147 @@ def test_forced_teardown_releases_manager_adapter_and_backend_config(
     assert adapter_ref() is None
     assert backend_ref() is None
     assert settings_ref() is None
+
+
+@pytest.mark.parametrize("teardown", ["close", "clear_registry"])
+def test_teardown_race_cannot_publish_retired_plugin_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    teardown: str,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager.get_manager("ackplugin")
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    manager._backend = backend
+    manager._breaker_configured = True
+    backend_ref = weakref.ref(backend)
+    settings_ref = weakref.ref(backend.settings)
+    snapshot_taken, resume_publication = _pause_after_next_generation_snapshot(
+        monkeypatch,
+        manager,
+    )
+    outcomes: list[tuple[str, str]] = []
+
+    def access_queue_backend() -> None:
+        try:
+            manager.get_queue_backend()
+        except BaseException as error:
+            outcomes.append((type(error).__name__, str(error)))
+        else:
+            outcomes.append(("returned", ""))
+
+    accessor = threading.Thread(target=access_queue_backend)
+    accessor.start()
+    snapshot_taken.wait(timeout=5)
+
+    if teardown == "close":
+        manager.close()
+    else:
+        ConnectionManager.clear_registry()
+
+    assert manager._retired is True
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+    resume_publication.wait(timeout=5)
+    accessor.join(timeout=5)
+
+    assert not accessor.is_alive()
+    assert outcomes == [
+        ("BackendConnectionError", "Cannot access a released ConnectionManager")
+    ]
+    assert manager._plugin_queue_backend is None
+    assert manager._plugin_queue_backend_source is None
+    del backend
+    del accessor
+    gc.collect()
+    assert backend_ref() is None
+    assert settings_ref() is None
+
+
+def test_backend_replacement_race_publishes_only_replacement_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+    retired_backend = manager._create_backend()
+    assert isinstance(retired_backend, _DeferredPlugin)
+    manager._backend = retired_backend
+    manager._breaker_configured = True
+    retired_ref = weakref.ref(retired_backend)
+    settings_ref = weakref.ref(retired_backend.settings)
+    snapshot_taken, resume_publication = _pause_after_next_generation_snapshot(
+        monkeypatch,
+        manager,
+    )
+    adapters: list[QueueBackend] = []
+
+    accessor = threading.Thread(
+        target=lambda: adapters.append(manager.get_queue_backend())
+    )
+    accessor.start()
+    snapshot_taken.wait(timeout=5)
+    replacement = manager._create_backend()
+    with manager._lock:
+        manager._backend = replacement
+        manager._clear_plugin_queue_backend_under_lock()
+    resume_publication.wait(timeout=5)
+    accessor.join(timeout=5)
+
+    assert not accessor.is_alive()
+    assert len(adapters) == 1
+    adapter = adapters[0]
+    assert isinstance(adapter, _DeferredAckPluginQueueBackend)
+    assert adapter._delegate is replacement
+    assert manager._plugin_queue_backend is adapter
+    assert manager._plugin_queue_backend_source == (replacement, None)
+    del retired_backend
+    del accessor
+    gc.collect()
+    assert retired_ref() is None
+    assert settings_ref() is None
+
+
+def test_breaker_replacement_race_publishes_only_replacement_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_plugin(monkeypatch, _DeferredPlugin)
+    manager = ConnectionManager("ackplugin")
+    backend = manager._create_backend()
+    assert isinstance(backend, _DeferredPlugin)
+    retired_breaker = CircuitBreaker("retired-plugin-generation")
+    manager._backend = backend
+    manager._breaker = retired_breaker
+    manager._breaker_configured = True
+    retired_ref = weakref.ref(retired_breaker)
+    snapshot_taken, resume_publication = _pause_after_next_generation_snapshot(
+        monkeypatch,
+        manager,
+    )
+    adapters: list[QueueBackend] = []
+
+    accessor = threading.Thread(
+        target=lambda: adapters.append(manager.get_queue_backend())
+    )
+    accessor.start()
+    snapshot_taken.wait(timeout=5)
+    replacement = retired_breaker.new_generation()
+    with manager._lock:
+        manager._breaker = replacement
+        manager._clear_plugin_queue_backend_under_lock()
+    resume_publication.wait(timeout=5)
+    accessor.join(timeout=5)
+
+    assert not accessor.is_alive()
+    assert len(adapters) == 1
+    adapter = adapters[0]
+    assert isinstance(adapter, _DeferredAckPluginQueueBackend)
+    assert adapter._delegate._breaker is replacement  # type: ignore[attr-defined]
+    assert manager._plugin_queue_backend is adapter
+    assert manager._plugin_queue_backend_source == (backend, replacement)
+    del retired_breaker
+    del accessor
+    gc.collect()
+    assert retired_ref() is None
 
 
 def test_failed_generation_replacement_releases_retired_plugin_delegate(
