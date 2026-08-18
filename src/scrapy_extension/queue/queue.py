@@ -1568,62 +1568,73 @@ class BackendQueue:
         if storage is None:
             return
         repository = self._snapshot_repository(storage)
-        read_failed = False
+        result = None
+        tombstone: object = None
+        state: bytes | None = None
         try:
-            result = repository.read(self._snapshot_key())
-        except SnapshotRepositoryError:
-            read_failed = True
-            result = None
-        if read_failed:
+            read_failed = False
             try:
-                logger.error("Failed to read strategy snapshot; starting clean")
-            except BaseException:
-                pass
-            return
-        assert result is not None
+                result = repository.read(self._snapshot_key())
+            except SnapshotRepositoryError:
+                read_failed = True
+            if read_failed:
+                try:
+                    logger.error("Failed to read strategy snapshot; starting clean")
+                except BaseException:
+                    pass
+                return
+            assert result is not None
 
-        if not result.found:
-            legacy_key = self._legacy_snapshot_key()
-            if legacy_key is not None:
-                tombstone_failed = False
-                try:
-                    tombstone = storage.retrieve(self._empty_snapshot_tombstone_key())
-                except Exception:
-                    tombstone_failed = True
-                    tombstone = None
-                if tombstone_failed:
+            if not result.found:
+                legacy_key = self._legacy_snapshot_key()
+                if legacy_key is not None:
+                    tombstone_failed = False
                     try:
-                        logger.error(
-                            "Failed to retrieve empty strategy snapshot tombstone; "
-                            "starting clean"
+                        tombstone = storage.retrieve(
+                            self._empty_snapshot_tombstone_key()
                         )
-                    except BaseException:
-                        pass
-                    return
-                if tombstone is not None:
-                    return
-                legacy_read_failed = False
-                try:
-                    result = repository.read(legacy_key)
-                except SnapshotRepositoryError:
-                    legacy_read_failed = True
-                if legacy_read_failed:
+                    except Exception:
+                        tombstone_failed = True
+                    if tombstone_failed:
+                        try:
+                            logger.error(
+                                "Failed to retrieve empty strategy snapshot tombstone; "
+                                "starting clean"
+                            )
+                        except BaseException:
+                            pass
+                        return
+                    if tombstone is not None:
+                        return
+                    legacy_read_failed = False
                     try:
-                        logger.error(
-                            "Failed to read legacy strategy snapshot; starting clean"
-                        )
-                    except BaseException:
-                        pass
-                    return
-        if not result.found or result.state is None:
-            return
-        restore_failed = False
-        try:
-            self._strategy.restore(result.state)
-        except Exception:
-            restore_failed = True
-        if restore_failed:
+                        result = repository.read(legacy_key)
+                    except SnapshotRepositoryError:
+                        legacy_read_failed = True
+                    if legacy_read_failed:
+                        try:
+                            logger.error(
+                                "Failed to read legacy strategy snapshot; starting clean"
+                            )
+                        except BaseException:
+                            pass
+                        return
+            if not result.found or result.state is None:
+                return
+            state = result.state
+            result = None
+            tombstone = None
+            restore_failed = False
             try:
-                logger.error("Strategy snapshot restore failed; starting clean")
-            except BaseException:
-                pass
+                self._strategy.restore(state)
+            except Exception:
+                restore_failed = True
+            if restore_failed:
+                try:
+                    logger.error("Strategy snapshot restore failed; starting clean")
+                except BaseException:
+                    pass
+        finally:
+            result = None
+            state = None
+            tombstone = None

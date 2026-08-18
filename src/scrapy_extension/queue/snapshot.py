@@ -383,12 +383,16 @@ class SnapshotRepository:
 
     def read(self, key: str) -> SnapshotRead:
         """Read and fully validate one committed logical snapshot."""
-        self._validate_logical_key(key)
-        result, failure_message = self._read_terminal(key)
-        if failure_message is not None:
-            raise SnapshotRepositoryError(failure_message) from None
-        assert result is not None
-        return result
+        result: SnapshotRead | None = None
+        try:
+            self._validate_logical_key(key)
+            result, failure_message = self._read_terminal(key)
+            if failure_message is not None:
+                raise SnapshotRepositoryError(failure_message) from None
+            assert result is not None
+            return result
+        finally:
+            result = None
 
     def _commit_terminal(self, key: str, state: bytes | None) -> str | None:
         """Write a snapshot and return only a static failure status."""

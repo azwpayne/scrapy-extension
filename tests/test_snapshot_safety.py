@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dis
 import logging
 import sys
 import traceback
@@ -23,6 +24,7 @@ from scrapy_extension.monitor import NullMonitor
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.snapshot import (
     MAX_SNAPSHOT_CHUNK_BYTES,
+    SnapshotRead,
     SnapshotRepository,
     SnapshotRepositoryError,
 )
@@ -95,6 +97,51 @@ def _assert_public_error_graph_isolated(error: BaseException) -> None:
             trace = trace.tb_next
 
 
+def _assert_no_owned_payload(value: object, seen: set[int]) -> None:
+    if id(value) in seen:
+        return
+    seen.add(id(value))
+    if isinstance(value, (str, bytes, bytearray)):
+        assert _MARKER not in repr(value)
+    elif isinstance(value, memoryview):
+        assert _MARKER.encode() not in value.tobytes()
+    elif isinstance(value, SnapshotRead):
+        _assert_no_owned_payload(value.state, seen)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _assert_no_owned_payload(key, seen)
+            _assert_no_owned_payload(item, seen)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _assert_no_owned_payload(item, seen)
+
+
+def _assert_package_frame_payloads_cleared(error: BaseException) -> None:
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            for name, value in frame.f_locals.items():
+                if name != "self":
+                    _assert_no_owned_payload(value, set())
+        trace = trace.tb_next
+
+
+def _instruction_after_result_assignment(function: object) -> int:
+    instructions = list(dis.get_instructions(function))
+    stores = [
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "STORE_FAST" and instruction.argval == "result"
+    ]
+    assert len(stores) >= 2
+    return instructions[stores[1] + 1].offset
+
+
+class _SnapshotControlFlow(BaseException):
+    pass
+
+
 class _Storage:
     def __init__(
         self,
@@ -147,6 +194,65 @@ def _queue(storage: _Storage, strategy: MagicMock | None = None) -> BackendQueue
         snapshot_max_bytes=64,
         snapshot_chunk_bytes=4,
     )
+
+
+@pytest.mark.parametrize(
+    ("function", "invoke"),
+    [
+        (
+            SnapshotRepository.read,
+            lambda repository, queue: repository.read(_KEY),
+        ),
+        (
+            BackendQueue._restore_snapshot,
+            lambda repository, queue: queue._restore_snapshot(),
+        ),
+    ],
+    ids=["repository-read", "queue-restore"],
+)
+def test_snapshot_result_assignment_interruption_clears_owned_payload(
+    function: object, invoke: Any
+) -> None:
+    storage = _Storage()
+    strategy = MagicMock(name="QueueStrategy")
+    queue = _queue(storage, strategy)
+    storage.values[_KEY] = _MARKER.encode()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+    interruption = _SnapshotControlFlow("result assignment interrupted")
+    target_offset = _instruction_after_result_assignment(function)
+
+    def inject(frame: object, event: str, _arg: object) -> object:
+        if getattr(frame, "f_code", None) is getattr(function, "__code__", None):
+            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                raise interruption
+        return inject
+
+    sys.settrace(inject)
+    try:
+        with pytest.raises(_SnapshotControlFlow) as exc_info:
+            invoke(repository, queue)
+    finally:
+        sys.settrace(None)
+
+    assert exc_info.value is interruption
+    _assert_package_frame_payloads_cleared(interruption)
+
+
+def test_restore_control_error_clears_state_without_mutating_exception() -> None:
+    strategy = MagicMock(name="QueueStrategy")
+    interruption = _SnapshotControlFlow("strategy restore interrupted")
+    sentinel = object()
+    interruption.metadata = {"sentinel": sentinel}  # type: ignore[attr-defined]
+    strategy.restore.side_effect = interruption
+
+    with pytest.raises(_SnapshotControlFlow) as exc_info:
+        _queue(_Storage({_KEY: _MARKER.encode()}), strategy)
+
+    assert exc_info.value is interruption
+    assert interruption.args == ("strategy restore interrupted",)
+    assert interruption.metadata == {"sentinel": sentinel}  # type: ignore[attr-defined]
+    _assert_package_frame_payloads_cleared(interruption)
 
 
 def test_commit_queue_error_and_log_have_no_backend_exception_graph() -> None:
@@ -309,6 +415,13 @@ def test_dynamodb_contract_accepts_maximum_snapshot_chunk(mocker: Any) -> None:
 def test_elasticsearch_contract_accepts_maximum_snapshot_chunk() -> None:
     backend = ElasticSearchBackend(ElasticSearchSettings())
     client = MagicMock()
+    client.options.return_value = client
+    client.index.side_effect = lambda **kwargs: {
+        "_id": kwargs["id"],
+        "_index": kwargs["index"],
+        "_shards": {"failed": 0, "successful": 1, "total": 1},
+        "result": "created",
+    }
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
 
