@@ -823,21 +823,11 @@ class PulsarBackend(Backend, QueueBackend):
         )
         terminal_error = close_error or retirement_error or join_error
         if terminal_error is not None:
-            # Close workers retain the exact process-control object, but none of
-            # their SDK frames or causal exception graph may cross this terminal
-            # lifecycle boundary. Raise only after every pump buffer and detached
-            # handle has completed its bookkeeping.
-            terminal_error = self._redact_teardown_control_error(terminal_error)
-            raise terminal_error from None
-
-    @staticmethod
-    def _redact_teardown_control_error(error: BaseException) -> BaseException:
-        """Strip private close frames/chains while preserving control identity."""
-        error.__traceback__ = None
-        error.__cause__ = None
-        error.__context__ = None
-        error.__suppress_context__ = True
-        return error
+            # Raise only after every pump buffer and detached handle has completed
+            # its bookkeeping. The exception and its graph are caller/SDK-owned:
+            # teardown may preserve and re-raise the exact control object, but must
+            # not rewrite its traceback, cause, context, or suppression state.
+            raise terminal_error
 
     @staticmethod
     def _log_receive_shutdown_timeout() -> None:
