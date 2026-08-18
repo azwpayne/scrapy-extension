@@ -1417,6 +1417,14 @@ class ConnectionManager:
             else normalized_backend_type
         )
         self.settings = settings if settings is not None else {}
+        # ``get_manager()`` fills these fields when it inserts the instance into
+        # the shared registry. Pooled managers use the acquire-time values for
+        # every operation and for eventual eviction, so mutations of the public
+        # compatibility attributes cannot retarget or strand them. Bare direct
+        # constructors leave the fields unset and retain their dynamic behavior.
+        self._registry_token: str | None = None
+        self._registry_backend_type: str | None = None
+        self._registry_settings: dict[str, Any] | None = None
         self._backend: Backend | None = None
         self._lock = threading.Lock()
         # Serialize the complete create/connect/publish transaction. The lazy
@@ -1468,6 +1476,20 @@ class ConnectionManager:
         # observability contract is in place the moment a monitor is attached.
         self._monitor: Monitor = NullMonitor()
 
+    def _backend_type_for_operations(self) -> str:
+        """Return the pinned pooled type or the direct constructor's public type."""
+        if self._registry_token is not None:
+            assert self._registry_backend_type is not None
+            return self._registry_backend_type
+        return self.backend_type
+
+    def _settings_for_operations(self) -> dict[str, Any]:
+        """Return pinned pooled settings or direct constructor public settings."""
+        if self._registry_token is not None:
+            assert self._registry_settings is not None
+            return self._registry_settings
+        return self.settings
+
     @classmethod
     def get_manager(
         cls,
@@ -1493,9 +1515,10 @@ class ConnectionManager:
         Returns:
             A ConnectionManager instance for the given backend.
         """
-        # Hash and retain the same deep snapshot. Otherwise a caller can mutate a
-        # nested value after hashing and make the old registry key point at new
-        # connection settings.  Do not invoke truthiness, hashing, deepcopy, or
+        # Hash and retain one operational deep snapshot, with a separate public
+        # copy. Otherwise a caller can mutate a nested value after hashing and make
+        # the old registry key point at new connection settings. Do not invoke
+        # truthiness, hashing, deepcopy, or
         # normalisation on arbitrary container/type subclasses before this public
         # configuration boundary has verified their outer shape.
         normalized_backend_type = _normalized_manager_backend_type(backend_type)
@@ -1511,10 +1534,14 @@ class ConnectionManager:
             raise input_error
 
         settings_snapshot: dict[str, Any] | None = None
+        public_settings_snapshot: dict[str, Any] | None = None
         key: str | None = None
         snapshot_failed = False
         try:
             settings_snapshot = deepcopy(settings) if settings is not None else {}
+            # The public mapping remains mutable for compatibility, but it must not
+            # alias the operational snapshot retained by a pooled manager.
+            public_settings_snapshot = deepcopy(settings_snapshot)
             key = cls._registry_key(normalized_backend_type, settings_snapshot)
         except Exception:  # noqa: BLE001 - nested config values are untrusted
             snapshot_failed = True
@@ -1526,14 +1553,24 @@ class ConnectionManager:
             del backend_type
             del settings
             del settings_snapshot
+            del public_settings_snapshot
             del key
             raise input_error
         assert settings_snapshot is not None
+        assert public_settings_snapshot is not None
         assert key is not None
 
         victims: list[ConnectionManager] = []
         with cls._registry_lock:
             manager = cls._managers.get(key)
+            if manager is not None and manager._retired:
+                # A teardown race or externally restored stale registry entry must
+                # never become live again. Remove by key *and identity* before
+                # creating the replacement, then dispose it outside the lock.
+                if cls._managers.get(key) is manager:
+                    cls._managers.pop(key)
+                    victims.append(manager)
+                manager = None
             if manager is None:
                 # R14-E: before inserting a brand-new entry, evict from the FRONT
                 # of the LRU until we're under the cap. Only genuinely-orphaned
@@ -1546,8 +1583,11 @@ class ConnectionManager:
                 # Victims are collected (popped) UNDER the lock but disconnected
                 # AFTER release (see the loop below) so a slow victim disconnect
                 # does not serialize peer get_manager() calls.
-                victims = cls._collect_orphans_under_lock()
-                manager = cls(backend_type, settings_snapshot)
+                victims.extend(cls._collect_orphans_under_lock())
+                manager = cls(backend_type, public_settings_snapshot)
+                manager._registry_backend_type = manager.backend_type
+                manager._registry_settings = settings_snapshot
+                manager._registry_token = key
                 cls._managers[key] = manager
             else:
                 # LRU touch — recently-used entries move to the back (newest).
@@ -1555,11 +1595,11 @@ class ConnectionManager:
             manager._users += 1
 
         # Disconnect evicted victims OUTSIDE _registry_lock via the shared
-        # teardown primitive. Victims are already popped (peers can't see them)
-        # and have _users <= 0 (no outstanding acquire) — same invariant close()
-        # relies on (L587-615). Disconnecting here rather than under the lock
-        # avoids serializing every get_manager() on the slowest backend
-        # disconnect during overflow.
+        # teardown primitive. Victims are already popped (peers can't see them).
+        # Ordinary LRU victims have no outstanding acquire; a stale retired entry
+        # may retain an old refcount, but is terminal and cannot be reacquired.
+        # Disconnecting here rather than under the lock avoids serializing every
+        # get_manager() on the slowest backend disconnect during overflow.
         for victim in victims:
             cls._disconnect_backend_safely(victim)
 
@@ -1729,10 +1769,11 @@ class ConnectionManager:
         Raises:
             ConfigurationError: If the backend type is not registered.
         """
+        backend_type = self._backend_type_for_operations()
         descriptor: BackendDescriptor = get_descriptor(
-            self.backend_type.value
-            if isinstance(self.backend_type, BackendType)
-            else self.backend_type
+            backend_type.value
+            if isinstance(backend_type, BackendType)
+            else backend_type
         )
         backend_cls = _load_descriptor_object(descriptor, descriptor.backend_cls_path)
         settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
@@ -1743,7 +1784,7 @@ class ConnectionManager:
         manager_only_names = _CONNECTION_MANAGER_SETTING_NAMES - backend_field_names
         backend_settings = {
             name: value
-            for name, value in self.settings.items()
+            for name, value in self._settings_for_operations().items()
             if name not in _CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS
             and name not in manager_only_names
         }
@@ -1926,7 +1967,7 @@ class ConnectionManager:
             if connect_error is None and self._retired:
                 connect_error = BackendConnectionError(
                     "ConnectionManager was released while connecting",
-                    backend_type=str(self.backend_type),
+                    backend_type=str(self._backend_type_for_operations()),
                 )
 
             if connect_error is None:
@@ -1937,7 +1978,7 @@ class ConnectionManager:
                 if self._backend is None:
                     connect_error = BackendConnectionError(
                         "connect() did not produce a backend",
-                        backend_type=str(self.backend_type),
+                        backend_type=str(self._backend_type_for_operations()),
                     )
 
             attempt.error = connect_error
@@ -1963,14 +2004,14 @@ class ConnectionManager:
             if self._retired:
                 raise BackendConnectionError(
                     "ConnectionManager was released while connecting",
-                    backend_type=str(self.backend_type),
+                    backend_type=str(self._backend_type_for_operations()),
                 )
             backend = self._backend
         if backend is not None:
             return backend
         raise BackendConnectionError(
             "connect() did not produce a backend",
-            backend_type=str(self.backend_type),
+            backend_type=str(self._backend_type_for_operations()),
         )
 
     def _connect_with_retries(self, monitor_events: list[_MonitorEvent]) -> None:
@@ -1981,7 +2022,7 @@ class ConnectionManager:
                 if self._retired:
                     raise BackendConnectionError(
                         "Cannot connect a released ConnectionManager",
-                        backend_type=str(self.backend_type),
+                        backend_type=str(self._backend_type_for_operations()),
                     )
                 backend = self._backend
             if backend is None:
@@ -2010,7 +2051,7 @@ class ConnectionManager:
                 if self._retired:
                     raise BackendConnectionError(
                         "Cannot connect a released ConnectionManager",
-                        backend_type=str(self.backend_type),
+                        backend_type=str(self._backend_type_for_operations()),
                     )
                 # Re-check identity after the unlocked health probe. A lifecycle race
                 # may have detached the inspected backend; retry against current state
@@ -2038,7 +2079,9 @@ class ConnectionManager:
                 stale_disconnect_failed = True
             if stale_disconnect_failed:
                 _log_diagnostic(logger.warning, "Error disconnecting stale backend")
-            monitor_events.append(("on_disconnect", (str(self.backend_type), None)))
+            monitor_events.append(
+                ("on_disconnect", (str(self._backend_type_for_operations()), None))
+            )
 
         retry_attempts, retry_delay = self._retry_policy()
         total_attempts = retry_attempts + 1
@@ -2082,21 +2125,28 @@ class ConnectionManager:
                     # ``attempt`` here is the 0-based just-failed index, so the public
                     # retry number is 1-based.
                     monitor_events.append(
-                        ("on_retry", (str(self.backend_type), attempt + 1))
+                        (
+                            "on_retry",
+                            (str(self._backend_type_for_operations()), attempt + 1),
+                        )
                     )
                     time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
                 continue
 
-            _log_diagnostic(logger.debug, "Connected to %s", self.backend_type)
+            _log_diagnostic(
+                logger.debug, "Connected to %s", self._backend_type_for_operations()
+            )
             # Preserve transaction order, then dispatch outside ``_connect_lock``.
-            monitor_events.append(("on_connect", (str(self.backend_type),)))
+            monitor_events.append(
+                ("on_connect", (str(self._backend_type_for_operations()),))
+            )
             return
 
         if failed_attempt:
             attempt_word = "attempt" if total_attempts == 1 else "attempts"
             raise BackendConnectionError(
                 f"Failed to connect after {total_attempts} {attempt_word}.",
-                backend_type=str(self.backend_type),
+                backend_type=str(self._backend_type_for_operations()),
             )
 
     def _retry_policy(self) -> tuple[int, float]:
@@ -2113,22 +2163,24 @@ class ConnectionManager:
         Raises:
             ConfigurationError: If either raw setting is invalid.
         """
+        backend_type = self._backend_type_for_operations()
+        settings = self._settings_for_operations()
         descriptor = get_descriptor(
-            self.backend_type.value
-            if isinstance(self.backend_type, BackendType)
-            else self.backend_type
+            backend_type.value
+            if isinstance(backend_type, BackendType)
+            else backend_type
         )
         settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
         backend_field_names = _model_field_names(settings_cls)
 
-        raw_attempts = self.settings.get(
+        raw_attempts = settings.get(
             _CONNECTION_MANAGER_INTERNAL_KEYS["retry_attempts"],
-            self.settings.get(
+            settings.get(
                 _CONNECTION_MANAGER_DIRECT_KEYS["retry_attempts"],
                 (
                     _CONNECTION_MANAGER_DEFAULTS["retry_attempts"]
                     if "retry_attempts" in backend_field_names
-                    else self.settings.get(
+                    else settings.get(
                         "retry_attempts", _CONNECTION_MANAGER_DEFAULTS["retry_attempts"]
                     )
                 ),
@@ -2160,14 +2212,14 @@ class ConnectionManager:
             del raw_attempts
             raise policy_error
 
-        raw_delay = self.settings.get(
+        raw_delay = settings.get(
             _CONNECTION_MANAGER_INTERNAL_KEYS["retry_delay"],
-            self.settings.get(
+            settings.get(
                 _CONNECTION_MANAGER_DIRECT_KEYS["retry_delay"],
                 (
                     _CONNECTION_MANAGER_DEFAULTS["retry_delay"]
                     if "retry_delay" in backend_field_names
-                    else self.settings.get(
+                    else settings.get(
                         "retry_delay", _CONNECTION_MANAGER_DEFAULTS["retry_delay"]
                     )
                 ),
@@ -2219,7 +2271,7 @@ class ConnectionManager:
             if self._retired:
                 raise BackendConnectionError(
                     "Cannot connect a released ConnectionManager",
-                    backend_type=str(self.backend_type),
+                    backend_type=str(self._backend_type_for_operations()),
                 )
         backend = self._create_backend()
         try:
@@ -2253,7 +2305,7 @@ class ConnectionManager:
             _log_diagnostic(logger.warning, "Error disconnecting released backend")
         raise BackendConnectionError(
             "Connection completed after ConnectionManager release; backend discarded",
-            backend_type=str(self.backend_type),
+            backend_type=str(self._backend_type_for_operations()),
         )
 
     @configuration_error_boundary(
@@ -2278,7 +2330,11 @@ class ConnectionManager:
         the close chain.
         """
         cls = type(self)
-        key = cls._registry_key(self.backend_type, self.settings)
+        token = self._registry_token
+        if token is None:
+            # Preserve direct-constructor validation behavior without allowing a
+            # bare manager to derive an eviction target from mutable public state.
+            cls._registry_key(self.backend_type, self.settings)
         with cls._registry_lock:
             # A ``close()`` without a matching ``get_manager()`` (e.g. a bare
             # ``ConnectionManager(...)`` constructed in tests) has _users == 0;
@@ -2288,14 +2344,14 @@ class ConnectionManager:
                 self._users -= 1
             is_last_holder = self._users <= 0
             if is_last_holder:
-                # Evict by IDENTITY, not key — a bare ``ConnectionManager(...)`` (not
-                # inserted via get_manager) sharing this key must not evict a registered
-                # peer. A plain pop(key, None) would silently remove the peer while it's
-                # still held, so the next get_manager(same key) creates a second live
-                # manager (split-brain / connection leak). See
+                # Evict the saved acquire token by IDENTITY. A bare
+                # ``ConnectionManager(...)`` has no token and must not evict a
+                # registered peer with equivalent settings. A plain pop without the
+                # identity guard could remove a fresh replacement while it is held,
+                # creating a split-brain manager/connection leak. See
                 # test_close_bare_instance_does_not_evict_registered_peer.
-                if cls._managers.get(key) is self:
-                    cls._managers.pop(key, None)
+                if token is not None and cls._managers.get(token) is self:
+                    cls._managers.pop(token, None)
 
         if not is_last_holder:
             return
@@ -2336,16 +2392,22 @@ class ConnectionManager:
         if disconnect_failed:
             _log_diagnostic(logger.warning, "Error during disconnect")
         else:
-            _log_diagnostic(logger.debug, "Disconnected from %s", self.backend_type)
+            _log_diagnostic(
+                logger.debug,
+                "Disconnected from %s",
+                self._backend_type_for_operations(),
+            )
 
         # Lifecycle callbacks are user code. Dispatch after both registry and
         # manager locks are released so re-entry observes the terminal state and
         # receives a typed error instead of self-deadlocking. The outcome is a
         # bounded boolean, never backend configuration or exception details.
-        self._notify_monitor("on_disconnect", str(self.backend_type), None)
+        self._notify_monitor(
+            "on_disconnect", str(self._backend_type_for_operations()), None
+        )
         self._notify_monitor(
             "on_disconnect_result",
-            str(self.backend_type),
+            str(self._backend_type_for_operations()),
             not disconnect_failed,
         )
 
@@ -2486,7 +2548,7 @@ class ConnectionManager:
                 if self._retired:
                     raise BackendConnectionError(
                         "Cannot access a released ConnectionManager",
-                        backend_type=str(self.backend_type),
+                        backend_type=str(self._backend_type_for_operations()),
                     )
                 # Re-check under lock: another thread may have connected while we
                 # were waiting on _lock.
@@ -2548,7 +2610,9 @@ class ConnectionManager:
         # future refactors and ``python -O`` as well as in the static type system.
         if published_backend is None:
             msg = "connect() did not produce a backend"
-            raise BackendConnectionError(msg, backend_type=str(self.backend_type))
+            raise BackendConnectionError(
+                msg, backend_type=str(self._backend_type_for_operations())
+            )
         return published_backend
 
     @_manager_terminal_error_boundary()
@@ -2596,11 +2660,12 @@ class ConnectionManager:
         if self._breaker_configured:
             return self._breaker
         policy_keys = _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS
-        if all(key in self.settings for key in policy_keys.values()):
+        operational_settings = self._settings_for_operations()
+        if all(key in operational_settings for key in policy_keys.values()):
             enabled, failure_threshold, reset_timeout = _parse_circuit_breaker_policy(
-                self.settings[policy_keys["enabled"]],
-                self.settings[policy_keys["failure_threshold"]],
-                self.settings[policy_keys["reset_timeout"]],
+                operational_settings[policy_keys["enabled"]],
+                operational_settings[policy_keys["failure_threshold"]],
+                operational_settings[policy_keys["reset_timeout"]],
             )
         else:
             # Read the breaker config OUTSIDE self._lock (#15). Imported lazily
@@ -2615,10 +2680,11 @@ class ConnectionManager:
         with self._lock:
             if self._breaker_configured:
                 return self._breaker
+            backend_type = self._backend_type_for_operations()
             bt_key = (
-                self.backend_type.value
-                if isinstance(self.backend_type, BackendType)
-                else self.backend_type
+                backend_type.value
+                if isinstance(backend_type, BackendType)
+                else backend_type
             )
             if enabled:
                 self._breaker = CircuitBreaker(
@@ -2668,14 +2734,14 @@ class ConnectionManager:
                 # coherent generation and build a misleading NoneType proxy error.
                 raise BackendConnectionError(
                     "connect() did not produce a backend",
-                    backend_type=str(self.backend_type),
+                    backend_type=str(self._backend_type_for_operations()),
                 )
             breaker = self._get_breaker()
             with self._lock:
                 if self._retired:
                     raise BackendConnectionError(
                         "Cannot access a released ConnectionManager",
-                        backend_type=str(self.backend_type),
+                        backend_type=str(self._backend_type_for_operations()),
                     )
                 if backend is self._backend and breaker is self._breaker:
                     return backend, breaker

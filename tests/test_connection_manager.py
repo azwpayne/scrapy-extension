@@ -259,6 +259,110 @@ def test_close_bare_instance_does_not_evict_registered_peer():
     registered.close()
 
 
+def test_pooled_manager_pins_top_level_settings_and_registry_token(mocker):
+    """Public setting mutation cannot retarget or strand a pooled manager."""
+    original_settings = {"host": "acquired-host"}
+    manager = ConnectionManager.get_manager(BackendType.REDIS, original_settings)
+    original_key = ConnectionManager._registry_key(BackendType.REDIS, original_settings)
+
+    manager.settings["host"] = "mutated-host"
+
+    settings_cls = mocker.patch("scrapy_extension.settings.RedisSettings")
+    settings_cls.model_fields = {"host": object()}
+    settings_obj = mocker.MagicMock(name="RedisSettings")
+    settings_cls.return_value = settings_obj
+    backend_cls = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
+
+    manager._create_backend()
+    reacquired = ConnectionManager.get_manager(BackendType.REDIS, original_settings)
+
+    settings_cls.assert_called_once_with(host="acquired-host")
+    backend_cls.assert_called_once_with(settings_obj)
+    assert reacquired is manager
+    assert manager._users == 2
+
+    manager.close()
+    assert ConnectionManager._managers.get(original_key) is manager
+    reacquired.close()
+    assert original_key not in ConnectionManager._managers
+
+
+def test_pooled_manager_pins_nested_settings_snapshot(mocker):
+    """Nested public mutations cannot alter pooled backend construction."""
+    original_settings = {"sentinels": ["127.0.0.1:26379"]}
+    manager = ConnectionManager.get_manager(BackendType.REDIS, original_settings)
+
+    manager.settings["sentinels"].append("mutated.invalid:26379")
+
+    settings_cls = mocker.patch("scrapy_extension.settings.RedisSettings")
+    settings_cls.model_fields = {"sentinels": object()}
+    settings_obj = mocker.MagicMock(name="RedisSettings")
+    settings_cls.return_value = settings_obj
+    backend_cls = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
+
+    manager._create_backend()
+
+    settings_cls.assert_called_once_with(sentinels=["127.0.0.1:26379"])
+    backend_cls.assert_called_once_with(settings_obj)
+    assert manager.settings == {
+        "sentinels": ["127.0.0.1:26379", "mutated.invalid:26379"]
+    }
+
+
+def test_pooled_manager_pins_backend_type_for_registry_and_operations(mocker):
+    """Public backend-type mutation cannot retarget a pooled manager."""
+    settings = {"host": "backend-type-pin-host"}
+    manager = ConnectionManager.get_manager(BackendType.REDIS, settings)
+    original_key = ConnectionManager._registry_key(BackendType.REDIS, settings)
+
+    manager.backend_type = BackendType.MONGODB
+
+    settings_cls = mocker.patch("scrapy_extension.settings.RedisSettings")
+    settings_cls.model_fields = {"host": object()}
+    settings_obj = mocker.MagicMock(name="RedisSettings")
+    settings_cls.return_value = settings_obj
+    redis_backend_cls = mocker.patch("scrapy_extension.backends.redis.RedisBackend")
+    mongodb_backend_cls = mocker.patch(
+        "scrapy_extension.backends.mongodb.MongoDBBackend"
+    )
+
+    manager._create_backend()
+    reacquired = ConnectionManager.get_manager(BackendType.REDIS, settings)
+
+    settings_cls.assert_called_once_with(host="backend-type-pin-host")
+    redis_backend_cls.assert_called_once_with(settings_obj)
+    mongodb_backend_cls.assert_not_called()
+    assert reacquired is manager
+
+    manager.close()
+    reacquired.close()
+    assert original_key not in ConnectionManager._managers
+
+
+def test_get_manager_replaces_retired_stale_registry_entry(mocker):
+    """A retired entry left in the registry is never reacquired."""
+    settings = {"host": "retired-stale-host"}
+    stale = ConnectionManager.get_manager(BackendType.REDIS, settings)
+    stale_backend = mocker.MagicMock(name="stale-backend")
+    stale._backend = stale_backend
+    stale._retired = True
+    key = ConnectionManager._registry_key(BackendType.REDIS, settings)
+    assert ConnectionManager._managers.get(key) is stale
+
+    fresh = ConnectionManager.get_manager(BackendType.REDIS, settings)
+
+    assert fresh is not stale
+    assert fresh._retired is False
+    assert fresh._users == 1
+    assert ConnectionManager._managers.get(key) is fresh
+    stale_backend.disconnect.assert_called_once_with()
+
+    # The stale holder still releases its own refcount, but its saved token and
+    # the identity guard prevent it from evicting the fresh replacement.
+    stale.close()
+    assert ConnectionManager._managers.get(key) is fresh
+
+
 def test_connection_manager_clear_registry():
     """R1-P1-8: clear_registry() wipes all managers — for test isolation."""
     ConnectionManager.get_manager(BackendType.REDIS, {"host": "h1"})
