@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- **Cuckoo item-level deletion is now fail-safe unsupported.** Calling
+  `CuckooMembershipFilter.remove()` now raises `NotImplementedError` without
+  mutating the filter. The former behavior could delete a resident item when an
+  arbitrary, never-inserted item had the same fingerprint and bucket pair,
+  creating a false negative. Bundled `BackendDupeFilter` failed-push
+  compensation now retains the Cuckoo marker and grants the same bounded,
+  concurrent one-shot retry allowance used by Bloom filters. To migrate direct
+  callers, use `clear()` for an intentional whole-filter reset or choose an
+  exact `memory`/`set` strategy when item-level removal is required. Cuckoo
+  state is process-local, so existing tables require no persisted-state drain
+  and disappear when old workers stop; successful insertion, `FilterFull`, and
+  wire behavior are unchanged.
 - **`JSONSerializer` now rejects Pydantic `SecretStr` and `SecretBytes`.**
   These wrappers previously became recoverable queue/storage payload values.
   Explicitly encrypt a value before serialization, or intentionally unwrap it

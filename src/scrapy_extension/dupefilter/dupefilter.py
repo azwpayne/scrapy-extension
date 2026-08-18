@@ -75,8 +75,8 @@ _backend_error_warned: bool = False
 _DEDUP_BACKEND_FAILURE_MESSAGE = "Dedup backend is unavailable."
 _DEDUP_CIRCUIT_BREAKER_NAME = "dedup"
 
-# Non-removable filters (notably Bloom) cannot compensate a successful add
-# after the scheduler's later queue push fails. Keep a bounded, one-shot retry
+# Non-removable filters (notably Bloom and Cuckoo) cannot compensate a successful
+# add after the scheduler's later queue push fails. Keep a bounded, one-shot retry
 # allowance per fingerprint instead. 1,024 limits failure-path memory while
 # covering a useful transient queue-outage window; overflow evicts FIFO.
 _DEFAULT_RETRY_ALLOWANCE_LIMIT = 1_024
@@ -1366,9 +1366,9 @@ class BackendDupeFilter:
     def forget(self, request: Request) -> None:
         """Compensate a new fingerprint whose subsequent queue push failed.
 
-        Filters with atomic deletion remove the reservation immediately. Filters
-        such as Bloom that raise ``NotImplementedError`` retain their marker and
-        receive one bounded retry allowance instead. The next matching
+        Filters with exact atomic deletion remove the reservation immediately.
+        Filters such as Bloom and Cuckoo that raise ``NotImplementedError`` retain
+        their marker and receive one bounded retry allowance instead. The next matching
         :meth:`request_seen` atomically consumes that allowance and returns a miss;
         a successful queue push consumes no further state, while another push
         failure calls ``forget`` again and re-arms one allowance.

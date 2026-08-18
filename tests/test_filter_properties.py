@@ -94,59 +94,26 @@ def test_cuckoo_never_false_negative_within_capacity(items: list[bytes]) -> None
 
 
 # ---------------------------------------------------------------------------
-# Cuckoo filter: remove correctness (deletion makes contains False)
+# Cuckoo filter: item deletion is fail-safe unsupported
 # ---------------------------------------------------------------------------
 
 
 @settings(max_examples=50, deadline=None)
 @given(items=distinct_items(max_count=20))
-def test_cuckoo_remove_makes_item_absent(items: list[bytes]) -> None:
-    """After remove(item), contains(item) is False for that specific item.
-
-    Verifies remove() deletes the RIGHT fingerprint (not a colliding one). A
-    wrong removal would cause a false-negative on a DIFFERENT still-present item
-    — caught here because we re-check all OTHER added items stay present after
-    each remove. (Fingerprint collisions mean remove CAN affect a different
-    item's presence only if fingerprints match — the property catches that.)
-    """
+def test_cuckoo_remove_preserves_all_membership(items: list[bytes]) -> None:
+    """Arbitrary item deletion cannot create false negatives."""
     if not items:
         return
     f = CuckooMembershipFilter(capacity=max(len(items) * 3, 100), error_rate=0.01)
-    added: list[bytes] = []
-    for item in items:
-        try:
-            if f.add(item):
-                added.append(item)
-        except FilterFull:
-            break
-    if not added:
-        return
-    # Remove the first added item, then assert it's absent AND the rest stay present.
+    added = [item for item in items if f.add(item)]
     target = added[0]
-    f.remove(target)
-    assert target not in f, f"remove({target!r}) did not make it absent"
-    for other in added[1:]:
-        # A fingerprint collision could legitimately make `other` absent after
-        # removing `target` only if they share a fingerprint bucket slot. That is
-        # a known cuckoo tradeoff (fingerprint, not item, granularity) — but the
-        # dupefilter contract treats remove as item-exact. If this asserts, the
-        # filter's remove granularity is coarser than the dedup contract assumes.
-        # Documented as acceptable for the probabilistic filter; flagged here so a
-        # future change is deliberate, not silent.
-        assert other in f or _shares_fingerprint(target, other), (
-            f"remove({target!r}) made unrelated item {other!r} absent — fingerprint "
-            f"granularity coarser than item-granular dedup contract assumes"
-        )
 
+    try:
+        f.remove(target)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("cuckoo item removal unexpectedly succeeded")
 
-def _shares_fingerprint(a: bytes, b: bytes) -> bool:
-    """Helper: do two items hash to the same cuckoo fingerprint?
-
-    Cuckoo stores fingerprints, not items — two distinct items with the same
-    fingerprint are indistinguishable to remove(). This helper documents that the
-    `test_cuckoo_remove_makes_item_absent` assertion tolerates ONLY that case
-    (genuine fingerprint collision), not a wrong-bucket removal.
-    """
-    import hashlib
-
-    return hashlib.sha256(a).hexdigest()[:8] == hashlib.sha256(b).hexdigest()[:8]
+    for item in added:
+        assert item in f, f"remove attempt created a false negative for {item!r}"

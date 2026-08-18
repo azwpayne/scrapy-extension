@@ -1,9 +1,10 @@
 """Stdlib Cuckoo-filter membership strategy (subsystem ①).
 
-Probabilistic, in-process, space-efficient, and supports deletion (unlike
-Bloom). Never produces false negatives: fingerprints are only ever moved
-between their two valid buckets during eviction, never dropped. State is
-per-process, not shared across workers.
+Probabilistic, in-process, and space-efficient. Successful inserts never
+produce false negatives: fingerprints are only ever moved between their two
+valid buckets during eviction, never dropped. Item-level deletion is
+intentionally unsupported because distinct items can have indistinguishable
+fingerprints. State is per-process, not shared across workers.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ __all__ = ["CuckooMembershipFilter"]
 import hashlib
 import math
 import random
+from typing import NoReturn
 
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 
@@ -29,7 +31,9 @@ class CuckooMembershipFilter(MembershipFilter):
     full it evicts a random occupant (a "kick") and re-inserts that
     occupant into its alternate bucket, bounded by ``_MAX_KICKS``. Because
     every placement lives in one of the fingerprint's two valid buckets,
-    ``contains`` and ``remove`` always find a previously-inserted item.
+    ``contains`` always finds a successfully inserted item. ``remove`` is
+    fail-safe unsupported: an arbitrary item can false-positive against a
+    resident fingerprint, so deleting that slot could create a false negative.
 
     Attributes:
         _num_buckets: Bucket count ``m`` (power of two).
@@ -269,24 +273,20 @@ class CuckooMembershipFilter(MembershipFilter):
         self._buckets = [[] for _ in range(self._num_buckets)]
         self._count = 0
 
-    def remove(self, item: bytes) -> bool:
-        """Remove an item.
+    def remove(self, item: bytes) -> NoReturn:
+        """Reject item-level deletion without mutating the filter.
+
+        Cuckoo fingerprints are not item identities. A never-inserted item can
+        match the same fingerprint and bucket pair as a resident item, making
+        arbitrary deletion unsafe. Use :meth:`clear` for a wholesale reset.
 
         Args:
-            item: Fingerprint bytes.
+            item: Fingerprint bytes. The value is never retained or disclosed.
 
-        Returns:
-            True if the fingerprint was found and removed, False otherwise.
+        Raises:
+            NotImplementedError: Always; item-level removal is unsupported.
         """
-        fp, i1 = self._fingerprint(item)
-        i2 = self._alt_index(i1, fp)
-        buckets = self._buckets
-        if fp in buckets[i1]:
-            buckets[i1].remove(fp)
-            self._count -= 1
-            return True
-        if fp in buckets[i2]:
-            buckets[i2].remove(fp)
-            self._count -= 1
-            return True
-        return False
+        del item
+        raise NotImplementedError(
+            "CuckooMembershipFilter does not support item removal"
+        )

@@ -93,16 +93,20 @@ class MembershipFilter(ABC):
         """Lifecycle hook — release resources. Default no-op."""
 
     def remove(self, item: bytes) -> bool:
-        """Remove an item.
+        """Remove an item when the strategy supports exact item identity.
+
+        Removal is an optional capability, not a guarantee of the membership
+        filter interface. Probabilistic strategies may reject it when a stored
+        marker cannot distinguish the requested item from a false positive.
 
         Args:
             item: The item to remove.
 
         Returns:
-            True if the item was present and removed.
+            True if the item was present and removed, False if it was absent.
 
         Raises:
-            NotImplementedError: If this strategy does not support removal.
+            NotImplementedError: If this strategy does not support safe removal.
         """
         del item
         raise NotImplementedError(

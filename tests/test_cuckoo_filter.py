@@ -1,4 +1,4 @@
-"""Tests for CuckooMembershipFilter — stdlib probabilistic dedup with deletion (subsystem ①)."""
+"""Tests for CuckooMembershipFilter — stdlib probabilistic dedup (subsystem ①)."""
 
 from __future__ import annotations
 
@@ -61,22 +61,34 @@ class TestCuckooMembershipFilterOps:
         for it in items:
             assert it in flt, f"false negative for {it!r}"
 
-    def test_remove_present(self) -> None:
+    def test_remove_is_unsupported_and_preserves_present_item(self) -> None:
         flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
         flt.add(b"a")
-        assert flt.remove(b"a") is True
-        assert b"a" not in flt
 
-    def test_remove_absent(self) -> None:
-        flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
-        assert flt.remove(b"a") is False
+        with pytest.raises(NotImplementedError, match="does not support item removal"):
+            flt.remove(b"a")
 
-    def test_remove_then_readd_reports_new(self) -> None:
-        """Deletion is real: a removed item is forgotten and re-added as new."""
-        flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
-        flt.add(b"a")
-        flt.remove(b"a")
-        assert flt.add(b"a") is True
+        assert b"a" in flt
+        assert len(flt) == 1
+
+    def test_remove_false_positive_cannot_delete_colliding_resident(self) -> None:
+        """Attested two-byte collision cannot turn arbitrary removal into an FN."""
+        flt = CuckooMembershipFilter(capacity=8, error_rate=0.01)
+        resident = b"collision-23"
+        false_positive = b"collision-313"
+        resident_fp, resident_index = flt._fingerprint(resident)
+        false_positive_fp, false_positive_index = flt._fingerprint(false_positive)
+        assert resident_fp == false_positive_fp == bytes.fromhex("d95d")
+        assert resident_index == false_positive_index == 2
+        assert flt.add(resident) is True
+        assert false_positive in flt
+
+        with pytest.raises(NotImplementedError, match="does not support item removal"):
+            flt.remove(false_positive)
+
+        assert resident in flt
+        assert len(flt) == 1
+        assert flt.add(resident) is False
 
     def test_clear(self) -> None:
         flt = CuckooMembershipFilter(capacity=100, error_rate=0.01)
@@ -92,8 +104,6 @@ class TestCuckooMembershipFilterOps:
         flt.add(b"b")
         flt.add(b"a")  # duplicate
         assert len(flt) == 2
-        flt.remove(b"a")
-        assert len(flt) == 1
 
     def test_full_filter_raises(self) -> None:
         """Massively overfilling a tiny filter surfaces a 'full' error."""

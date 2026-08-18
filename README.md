@@ -613,7 +613,7 @@ What the library contractually promises — and just as importantly, what it doe
 | Dedup | `set` (default) | Yes — exact stored membership | The bundled scheduler checks membership, durably pushes, then publishes the backend marker. Two workers concurrently observing an absent marker may both enqueue; after publication, backend membership is exact. |
 | Dedup | `memory` | Per-process | In-process; optional LRU cap via `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000; round-9 U5). |
 | Dedup | `bloom` | Per-process | Pure-stdlib bit-vector; **never produces false negatives** (a seen URL is always reported seen); false-positive rate is configurable. |
-| Dedup | `cuckoo` | Per-process | Pure-stdlib; **never produces false negatives**; supports deletion; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
+| Dedup | `cuckoo` | Per-process | Pure-stdlib; successful inserts **never produce false negatives**; item-level deletion is fail-safe unsupported because fingerprints can collide; failed-push compensation uses one bounded retry allowance; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
 | Storage | all storage-capable backends | Yes | Via the `StorageBackend` KV+TTL contract. |
 
 **Defaults are distributed and crash-safe at-least-once.** `set` dedup +

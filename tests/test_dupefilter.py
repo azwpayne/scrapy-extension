@@ -674,10 +674,15 @@ class TestBackendDupeFilterForget:
         assert len(membership_filter) == 0
         assert dupefilter.request_seen(request) is False
 
-    def test_bloom_filter_grants_exactly_one_retry_allowance(
-        self, mock_connection_manager
+    @pytest.mark.parametrize("strategy", ["bloom", "cuckoo"])
+    def test_non_removing_filter_grants_exactly_one_retry_allowance(
+        self, mock_connection_manager, strategy
     ):
-        membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+        membership_filter = (
+            BloomMembershipFilter(capacity=100, error_rate=1e-9)
+            if strategy == "bloom"
+            else CuckooMembershipFilter(capacity=100, error_rate=1e-9)
+        )
         dupefilter = BackendDupeFilter(
             connection_manager=mock_connection_manager,
             membership_filter=membership_filter,
@@ -687,13 +692,20 @@ class TestBackendDupeFilterForget:
         assert dupefilter.request_seen(request) is False
         dupefilter.forget(request)
 
+        assert len(membership_filter) == 1
+        assert len(dupefilter._retry_allowances) == 1
         assert dupefilter.request_seen(request) is False
         assert dupefilter.request_seen(request) is True
 
+    @pytest.mark.parametrize("strategy", ["bloom", "cuckoo"])
     def test_retry_allowance_has_single_linearized_concurrent_consumer(
-        self, mock_connection_manager
+        self, mock_connection_manager, strategy
     ):
-        membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
+        membership_filter = (
+            BloomMembershipFilter(capacity=100, error_rate=1e-9)
+            if strategy == "bloom"
+            else CuckooMembershipFilter(capacity=100, error_rate=1e-9)
+        )
         dupefilter = BackendDupeFilter(
             connection_manager=mock_connection_manager,
             membership_filter=membership_filter,
@@ -701,6 +713,8 @@ class TestBackendDupeFilterForget:
         request = Request("https://example.com/concurrent-allowance")
         assert dupefilter.request_seen(request) is False
         dupefilter.forget(request)
+        assert len(membership_filter) == 1
+        assert len(dupefilter._retry_allowances) == 1
         worker_count = 8
         barrier = threading.Barrier(worker_count)
 

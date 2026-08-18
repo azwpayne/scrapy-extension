@@ -21,6 +21,25 @@ Do not use a rolling dual-write deployment. There is no supported transaction
 across the old and new layouts, and message bodies from different codec
 generations are not always distinguishable.
 
+## Cuckoo Item-Deletion Contract
+
+`CuckooMembershipFilter.remove()` now raises `NotImplementedError` without
+mutating the filter. Cuckoo stores truncated fingerprints rather than item
+identities, so a never-inserted item can be indistinguishable from a resident
+item; deleting that slot could make the resident item a false negative.
+
+Direct callers that need an intentional whole-filter reset should use
+`clear()`. Callers that require exact per-item removal should select the
+`memory` or `set` strategy instead. `BackendDupeFilter.forget()` needs no caller
+change: after a failed queue push it retains the Cuckoo fingerprint and grants
+one bounded retry allowance, exactly as it does for Bloom filters. Concurrent
+matching requests can consume that allowance only once.
+
+No persisted-state migration or legacy drain is required because Cuckoo state
+is process-local. Stop old workers normally; their tables disappear with the
+process. Successful inserts, the no-false-negative guarantee for those inserts,
+and `FilterFull` behavior are unchanged.
+
 ## Pulsar TLS Hostname Validation
 
 Pulsar TLS client construction now uses the keyword names accepted by
