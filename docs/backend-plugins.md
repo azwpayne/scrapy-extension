@@ -145,12 +145,21 @@ class BrokerBackend(Backend, QueueBackend):
     def nack(self, queue_name, *, token=None): ...
 ```
 
-Every non-empty delivery must return a non-`None`, non-empty opaque token.
-Tokens remain active until successful `ack`/`nack`, must not be reused for an
-overlapping delivery on the same physical queue, and cannot be settled against
-a different queue. The manager validates metadata and overrides at construction,
-before a plugin constructor, `connect()`, or broker operation runs; runtime token
-violations fail closed as `QueueError` and leave the delivery unacknowledged.
+Every `pop_with_ack` call must return an eager, exact two-item `tuple`; every
+non-empty delivery in that tuple must carry a non-`None`, non-empty opaque token.
+`ack` and `nack` must complete eagerly and return exactly `None`. These three hooks
+must be ordinary synchronous functions: coroutine, async-generator, and generator
+functions are rejected before plugin construction. A synchronous wrapper also
+must not return a coroutine, awaitable, async generator, generator, or iterator;
+the adapter rejects such lazy results without advancing them.
+
+Tokens remain active until an `ack`/`nack` hook successfully returns `None`, must
+not be reused for an overlapping delivery on the same physical queue, and cannot
+be settled against a different queue. A raised exception or any non-`None`
+settlement result retains the token so callers can retry. The manager validates
+metadata and overrides at construction, before a plugin constructor, `connect()`,
+or broker operation runs; runtime contract violations fail closed as `QueueError`
+and leave the delivery unacknowledged.
 
 Migration choices are explicit—there is no silent downgrade:
 

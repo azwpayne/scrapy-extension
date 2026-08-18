@@ -25,7 +25,7 @@ import os
 import threading
 from abc import ABC
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
@@ -39,11 +39,12 @@ from inspect import (
     isasyncgenfunction,
     isawaitable,
     iscoroutinefunction,
+    isgeneratorfunction,
     signature,
 )
 from json import JSONEncoder
 from pathlib import PurePath
-from types import CoroutineType, FunctionType, ModuleType
+from types import CoroutineType, FunctionType, GeneratorType, ModuleType
 from typing import Any, ClassVar, NamedTuple, ParamSpec, TypeVar, cast
 from uuid import UUID
 
@@ -509,6 +510,7 @@ def _validate_plugin_ack_class(
             or getattr_static(method, "__isabstractmethod__", False) is True
             or iscoroutinefunction(method)
             or isasyncgenfunction(method)
+            or isgeneratorfunction(method)
         ):
             raise _invalid_plugin_ack_contract()
         try:
@@ -584,6 +586,8 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
     "pop": frozenset(
         {
             "Deferred-ack backend returned an invalid delivery result",
+            "Deferred-ack backend returned a generator delivery result",
+            "Deferred-ack backend returned an iterator delivery result",
             "Deferred-ack backend returned an awaitable delivery result",
             "Deferred-ack backend returned an asynchronous-generator delivery result",
             "Deferred-ack backend returned a delivery without an acknowledgement token",
@@ -595,6 +599,9 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
         {
             "Deferred-ack settlement requires an issued acknowledgement token",
             "Deferred-ack settlement rejected an unknown acknowledgement token",
+            "Deferred-ack backend returned a non-None settlement result",
+            "Deferred-ack backend returned a generator settlement result",
+            "Deferred-ack backend returned an iterator settlement result",
             "Deferred-ack backend returned an awaitable settlement result",
             "Deferred-ack backend returned an asynchronous-generator settlement result",
         }
@@ -603,6 +610,9 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
         {
             "Deferred-ack settlement requires an issued acknowledgement token",
             "Deferred-ack settlement rejected an unknown acknowledgement token",
+            "Deferred-ack backend returned a non-None settlement result",
+            "Deferred-ack backend returned a generator settlement result",
+            "Deferred-ack backend returned an iterator settlement result",
             "Deferred-ack backend returned an awaitable settlement result",
             "Deferred-ack backend returned an asynchronous-generator settlement result",
         }
@@ -610,23 +620,36 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
 }
 
 
-def _reject_asynchronous_delivery_result(result: object, operation: str) -> None:
-    """Reject async plugin results without advancing plugin-controlled code."""
+def _reject_lazy_ack_result(result: object, operation: str) -> None:
+    """Reject lazy plugin results without advancing plugin-controlled code."""
     if type(result) is CoroutineType:
         # Closing an unstarted native coroutine only releases its frame; it does
         # not execute the body and prevents a later ``never awaited`` warning.
         CoroutineType.close(result)
-    if isawaitable(result):
+    if type(result) is GeneratorType:
+        # Likewise, closing a never-started native generator releases its frame
+        # without executing the generator body or broker side effects in it.
+        GeneratorType.close(result)
+        result_kind = "generator"
+    elif isawaitable(result):
         result_kind = "awaitable"
     elif isasyncgen(result):
         # Do not call ``aclose``: that would manufacture another awaitable which
         # synchronous callers cannot consume without leaking a warning.
         result_kind = "asynchronous-generator"
+    elif isinstance(result, Iterator):
+        # Never call ``next`` or an untrusted iterator's optional ``close`` hook.
+        result_kind = "iterator"
     else:
         return
     result_role = "delivery" if operation == "pop" else "settlement"
+    article = (
+        "an"
+        if result_kind in {"awaitable", "asynchronous-generator", "iterator"}
+        else "a"
+    )
     raise QueueError(
-        f"Deferred-ack backend returned an {result_kind} {result_role} result",
+        f"Deferred-ack backend returned {article} {result_kind} {result_role} result",
         operation=operation,
     )
 
@@ -718,7 +741,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         timeout: float = 0.0,
     ) -> tuple[bytes | None, Any | None]:
         result = self._delegate.pop_with_ack(queue_name, timeout)
-        _reject_asynchronous_delivery_result(result, "pop")
+        _reject_lazy_ack_result(result, "pop")
         if type(result) is not tuple or len(result) != 2:
             raise QueueError(
                 "Deferred-ack backend returned an invalid delivery result",
@@ -780,7 +803,12 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
                     self._delegate.ack if operation == "ack" else self._delegate.nack,
                 )
                 result = settle_hook(queue_name, token=token)
-                _reject_asynchronous_delivery_result(result, operation)
+                _reject_lazy_ack_result(result, operation)
+                if result is not None:
+                    raise QueueError(
+                        "Deferred-ack backend returned a non-None settlement result",
+                        operation=operation,
+                    )
             except BaseException:
                 raise
             else:

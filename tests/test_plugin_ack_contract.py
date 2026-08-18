@@ -130,7 +130,24 @@ async def _tracked_delivery_async_generator(broker_events: list[str]) -> Any:
     yield None
 
 
-def _wrapped_asynchronous_result(
+def _tracked_delivery_generator(broker_events: list[str]) -> Any:
+    broker_events.append("generator-advanced")
+    yield None
+
+
+class _TrackedIterator:
+    def __init__(self, broker_events: list[str]) -> None:
+        self._broker_events = broker_events
+
+    def __iter__(self) -> _TrackedIterator:
+        return self
+
+    def __next__(self) -> object:
+        self._broker_events.append("iterator-advanced")
+        raise StopIteration
+
+
+def _wrapped_lazy_result(
     result_kind: str,
     broker_events: list[str],
 ) -> object:
@@ -138,7 +155,11 @@ def _wrapped_asynchronous_result(
         return _tracked_delivery_coroutine(broker_events)
     if result_kind == "awaitable":
         return _CustomAwaitable(broker_events)
-    return _tracked_delivery_async_generator(broker_events)
+    if result_kind == "async-generator":
+        return _tracked_delivery_async_generator(broker_events)
+    if result_kind == "generator":
+        return _tracked_delivery_generator(broker_events)
+    return _TrackedIterator(broker_events)
 
 
 class _HostileMethodDescriptor:
@@ -376,8 +397,8 @@ def test_later_manager_revalidates_mutated_flags_with_static_redaction(
 
 @pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
-@pytest.mark.parametrize("function_kind", ["coroutine", "async-generator"])
-def test_manager_statically_rejects_asynchronous_delivery_hooks_without_io(
+@pytest.mark.parametrize("function_kind", ["coroutine", "async-generator", "generator"])
+def test_manager_statically_rejects_lazy_delivery_hooks_without_io(
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
     function_kind: str,
@@ -387,7 +408,7 @@ def test_manager_statically_rejects_asynchronous_delivery_hooks_without_io(
 
     if function_kind == "coroutine":
 
-        async def asynchronous_hook(
+        async def lazy_hook(
             self: object,
             *args: object,
             **kwargs: object,
@@ -395,9 +416,9 @@ def test_manager_statically_rejects_asynchronous_delivery_hooks_without_io(
             del self, args, kwargs
             broker_events.append("coroutine-advanced")
 
-    else:
+    elif function_kind == "async-generator":
 
-        async def asynchronous_hook(  # type: ignore[misc]
+        async def lazy_hook(  # type: ignore[misc]
             self: object,
             *args: object,
             **kwargs: object,
@@ -406,13 +427,24 @@ def test_manager_statically_rejects_asynchronous_delivery_hooks_without_io(
             broker_events.append("async-generator-advanced")
             yield None
 
+    else:
+
+        def lazy_hook(  # type: ignore[misc]
+            self: object,
+            *args: object,
+            **kwargs: object,
+        ) -> Any:
+            del self, args, kwargs
+            broker_events.append("generator-advanced")
+            yield None
+
     def reject_construction(self: object, settings: object | None = None) -> None:
         del self, settings
         nonlocal constructed
         constructed = True
         raise AssertionError("plugin must not be constructed")
 
-    monkeypatch.setattr(_DeferredPlugin, method_name, asynchronous_hook)
+    monkeypatch.setattr(_DeferredPlugin, method_name, lazy_hook)
     monkeypatch.setattr(_DeferredPlugin, "__init__", reject_construction)
     _install_plugin(monkeypatch, _DeferredPlugin)
 
@@ -500,9 +532,9 @@ def test_manager_statically_rejects_noncallable_method_descriptors(
 @pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
 @pytest.mark.parametrize(
     "result_kind",
-    ["coroutine", "awaitable", "async-generator"],
+    ["coroutine", "awaitable", "async-generator", "generator", "iterator"],
 )
-def test_wrapped_asynchronous_delivery_results_fail_without_broker_settlement(
+def test_wrapped_lazy_results_fail_without_advancing_or_broker_settlement(
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
     result_kind: str,
@@ -522,7 +554,7 @@ def test_wrapped_asynchronous_delivery_results_fail_without_broker_settlement(
 
     def wrapped_hook(*args: object, **kwargs: object) -> object:
         del args, kwargs
-        return _wrapped_asynchronous_result(result_kind, broker_events)
+        return _wrapped_lazy_result(result_kind, broker_events)
 
     monkeypatch.setattr(backend, method_name, wrapped_hook)
     with pytest.raises(QueueError) as exc_info:
@@ -545,13 +577,84 @@ def test_wrapped_asynchronous_delivery_results_fail_without_broker_settlement(
         contract.ack("q", token=marker)
         assert backend.ack_calls == [("q", marker)]
     else:
-        # The failed asynchronous settlement must leave ownership with the
-        # adapter so the same delivery can be synchronously retried.
+        # The failed lazy settlement must leave ownership with the adapter so
+        # the same delivery can be synchronously retried.
         getattr(contract, method_name)("q", token=marker)
         expected = [("q", marker)]
         assert backend.ack_calls == (expected if method_name == "ack" else [])
         assert backend.nack_calls == (expected if method_name == "nack" else [])
         assert contract._active_ack_tokens == {}
+
+
+@pytest.mark.parametrize("method_name", ["ack", "nack"])
+def test_non_none_settlement_result_is_terminal_redacted_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    marker = f"private-non-none-{method_name}"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    backend.pop_results["q"].append((b"item", marker))
+    contract.pop_with_ack("q")
+    original_hook = getattr(backend, method_name)
+    invalid_calls = 0
+
+    def non_none_hook(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        nonlocal invalid_calls
+        invalid_calls += 1
+        return marker
+
+    monkeypatch.setattr(backend, method_name, non_none_hook)
+    with pytest.raises(QueueError, match="non-None") as exc_info:
+        getattr(contract, method_name)("q", token=marker)
+
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
+    assert invalid_calls == 1
+    assert contract._active_ack_tokens
+
+    monkeypatch.setattr(backend, method_name, original_hook)
+    getattr(contract, method_name)("q", token=marker)
+    expected = [("q", marker)]
+    assert backend.ack_calls == (expected if method_name == "ack" else [])
+    assert backend.nack_calls == (expected if method_name == "nack" else [])
+    assert contract._active_ack_tokens == {}
+
+
+@pytest.mark.parametrize(
+    "result_kind",
+    ["list", "tuple-subclass", "short-tuple", "long-tuple"],
+)
+def test_pop_with_ack_requires_an_exact_two_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+    result_kind: str,
+) -> None:
+    marker = f"private-delivery-shape-{result_kind}"
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+
+    class TupleSubclass(tuple[object, ...]):
+        pass
+
+    results: dict[str, object] = {
+        "list": [b"item", marker],
+        "tuple-subclass": TupleSubclass((b"item", marker)),
+        "short-tuple": (marker,),
+        "long-tuple": (b"item", marker, None),
+    }
+    monkeypatch.setattr(backend, "pop_with_ack", lambda *args: results[result_kind])
+
+    with pytest.raises(QueueError, match="invalid delivery") as exc_info:
+        contract.pop_with_ack("q")
+
+    _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
+    assert contract._active_ack_tokens == {}
 
 
 def test_non_value_tokens_are_owned_and_settled_by_identity(
