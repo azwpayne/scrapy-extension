@@ -16,12 +16,26 @@ from scrapy_extension.backends.pulsar import (
 from scrapy_extension.exceptions import ConfigurationError, QueueError
 from scrapy_extension.settings import PulsarSettings
 
+_CONNECTED_BACKENDS: list[PulsarBackend] = []
+
+
+@pytest.fixture(autouse=True)
+def _disconnect_receive_pumps_after_test():
+    yield
+    while _CONNECTED_BACKENDS:
+        backend = _CONNECTED_BACKENDS.pop()
+        try:
+            backend.disconnect()
+        except BaseException:
+            pass
+
 
 def _connected(mocker, **overrides):
     b = PulsarBackend(PulsarSettings(**overrides))
     client = mocker.MagicMock()
     mocker.patch.object(pulsar, "Client", return_value=client)
     b.connect()
+    _CONNECTED_BACKENDS.append(b)
     return b, client
 
 
@@ -70,7 +84,7 @@ class TestPulsarErrorPaths:
         consumer.receive.return_value = _msg(mocker)
         consumer.acknowledge.side_effect = [RuntimeError("ack fail"), None]
         client.subscribe.return_value = consumer
-        b.pop("q")
+        b.pop("q", timeout=1.0)
         with pytest.raises(QueueError) as exc_info:
             b.ack("q")
         assert exc_info.value.operation == "ack"
@@ -85,7 +99,7 @@ class TestPulsarErrorPaths:
         consumer.receive.return_value = _msg(mocker)
         consumer.negative_acknowledge.side_effect = [RuntimeError("nack fail"), None]
         client.subscribe.return_value = consumer
-        b.pop("q")
+        b.pop("q", timeout=1.0)
         with pytest.raises(QueueError) as exc_info:
             b.nack("q")
         assert exc_info.value.operation == "nack"
@@ -100,7 +114,7 @@ class TestPulsarErrorPaths:
         consumer.receive.return_value = _msg(mocker)
         consumer.close.side_effect = RuntimeError("close fail")
         client.subscribe.return_value = consumer
-        b.pop("q")
+        b.pop("q", timeout=1.0)
         b.disconnect()  # _suppress catches consumer.close failure
 
     def test_clear_queue_reports_unsupported(self, mocker) -> None:

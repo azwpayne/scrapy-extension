@@ -95,8 +95,23 @@ def _assert_capability_error_is_redacted(error: BaseException, marker: str) -> N
         trace = trace.tb_next
 
 
+_CONNECTED_BACKENDS: list[PulsarBackend] = []
+
+
 def _make_backend(**overrides) -> PulsarBackend:
     return PulsarBackend(PulsarSettings(**overrides))
+
+
+@pytest.fixture(autouse=True)
+def _disconnect_receive_pumps_after_test():
+    """Keep receive-worker lifetime inside the unit test that created it."""
+    yield
+    while _CONNECTED_BACKENDS:
+        backend = _CONNECTED_BACKENDS.pop()
+        try:
+            backend.disconnect()
+        except BaseException:
+            pass
 
 
 def _connected(mocker, **client_children):
@@ -107,6 +122,7 @@ def _connected(mocker, **client_children):
         getattr(client, attr).return_value = val
     mocker.patch.object(pulsar, "Client", return_value=client)
     b.connect()
+    _CONNECTED_BACKENDS.append(b)
     return b, client
 
 
@@ -743,8 +759,15 @@ class TestPulsarPop:
         logger_debug = mocker.patch("scrapy_extension.backends.pulsar.logger.debug")
 
         assert b.pop(f"{marker}-queue") is None
+        pump = b._receive_pumps[f"scrapy-{marker}-queue"]
+        assert pump.receive_started.wait(timeout=0.5)
+        assert b.pop(f"{marker}-queue", timeout=0.02) is None
 
-        logger_debug.assert_called_once_with("Pulsar receive returned no message.")
+        assert logger_debug.call_count >= 1
+        assert all(
+            call.args == ("Pulsar receive returned no message.",)
+            for call in logger_debug.call_args_list
+        )
         assert marker not in repr(logger_debug.call_args_list)
 
     def test_empty_timeout_log_has_no_active_driver_exception(self, mocker) -> None:
@@ -759,14 +782,19 @@ class TestPulsarPop:
         logger.addHandler(probe)
         try:
             assert b.pop("queue1") is None
+            pump = b._receive_pumps["scrapy-queue1"]
+            assert pump.receive_started.wait(timeout=0.5)
+            assert b.pop("queue1", timeout=0.02) is None
         finally:
             logger.removeHandler(probe)
             logger.setLevel(old_level)
 
-        assert [record.getMessage() for record in probe.records] == [
-            "Pulsar receive returned no message."
-        ]
-        assert probe.contexts == [(None, None, None)]
+        assert probe.records
+        assert all(
+            record.getMessage() == "Pulsar receive returned no message."
+            for record in probe.records
+        )
+        assert all(context == (None, None, None) for context in probe.contexts)
         assert marker not in repr(probe.records)
 
     @pytest.mark.parametrize(
@@ -795,7 +823,7 @@ class TestPulsarPop:
         b, _ = _connected(mocker, subscribe=consumer)
 
         with pytest.raises(QueueError) as exc_info:
-            b.pop("queue1")
+            b.pop("queue1", timeout=1.0)
 
         assert exc_info.value.queue_name is None
         assert exc_info.value.operation == "pop"
@@ -834,7 +862,7 @@ class TestPulsarPop:
         assert b._subscribed_topic == "scrapy-queue1"
         assert b._consumers == {"scrapy-queue1": consumer}
         assert b.pop("queue1") is None
-        assert consumer.receive.call_count == 2
+        assert consumer.receive.call_count >= 1
 
     def test_concurrent_first_pop_creates_one_consumer_per_topic(self, mocker) -> None:
         first_subscribe_started = Event()
@@ -935,7 +963,7 @@ class TestPulsarPop:
         consumer = mocker.MagicMock(name="unpublished_consumer")
         consumer.close.side_effect = SystemExit("cleanup must not mask interrupt")
         b, _ = _connected(mocker, subscribe=consumer)
-        b._lifecycle_lock = _InterruptOnLifecycleEntry(b._lifecycle_lock, 2)
+        b._lifecycle_lock = _InterruptOnLifecycleEntry(b._lifecycle_lock, 3)
 
         with pytest.raises(KeyboardInterrupt, match="publication interrupted"):
             b.pop("queue")
@@ -953,7 +981,7 @@ class TestPulsarAckNack:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        b.pop("queue1")
+        b.pop("queue1", timeout=1.0)
         b.ack("queue1")
         consumer.acknowledge.assert_called_once_with(msg)
         assert b._last_msg is None
@@ -968,7 +996,7 @@ class TestPulsarAckNack:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        b.pop("queue1")
+        b.pop("queue1", timeout=1.0)
 
         b.ack("queue1", token=object())
 
@@ -984,7 +1012,7 @@ class TestPulsarAckNack:
         consumer_b.receive.side_effect = pulsar.Timeout("empty b")
         b, client = _connected(mocker)
         client.subscribe.side_effect = [consumer_a, consumer_b]
-        assert b.pop("queue_a") == b"a"
+        assert b.pop("queue_a", timeout=1.0) == b"a"
         assert b.pop("queue_b") is None
 
         b.ack("queue_a")
@@ -998,7 +1026,7 @@ class TestPulsarAckNack:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        b.pop("queue1")
+        b.pop("queue1", timeout=1.0)
         b.nack("queue1")
         consumer.negative_acknowledge.assert_called_once_with(msg)
         assert b._last_msg is None
@@ -1009,7 +1037,7 @@ class TestPulsarAckNack:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        b.pop("queue1")
+        b.pop("queue1", timeout=1.0)
 
         b.nack("queue1", token=object())
 
@@ -1027,7 +1055,7 @@ class TestPulsarAckNack:
         consumer_b.receive.side_effect = pulsar.Timeout("empty b")
         b, client = _connected(mocker)
         client.subscribe.side_effect = [consumer_a, consumer_b]
-        assert b.pop("queue_a") == b"a"
+        assert b.pop("queue_a", timeout=1.0) == b"a"
         assert b.pop("queue_b") is None
 
         b.nack("queue_a")
@@ -1130,8 +1158,8 @@ class TestPulsarRealAck:
         b, client = _connected(mocker)
         client.subscribe.side_effect = [consumer_a, consumer_b]
 
-        _, token_a = b.pop_with_ack("queue_a")
-        b.pop_with_ack("queue_b")
+        _, token_a = b.pop_with_ack("queue_a", timeout=1.0)
+        b.pop_with_ack("queue_b", timeout=1.0)
         b.ack("queue_a", token=token_a)
 
         consumer_a.close.assert_not_called()
@@ -1155,8 +1183,8 @@ class TestPulsarRealAck:
         b, client = _connected(mocker)
         client.subscribe.side_effect = [consumer_a, consumer_b]
 
-        _, token_a = b.pop_with_ack("queue_a")
-        b.pop_with_ack("queue_b")
+        _, token_a = b.pop_with_ack("queue_a", timeout=1.0)
+        b.pop_with_ack("queue_b", timeout=1.0)
         b.nack("queue_a", token=token_a)
 
         consumer_a.negative_acknowledge.assert_called_once_with(msg_id_a)
@@ -1169,7 +1197,7 @@ class TestPulsarRealAck:
         old_consumer = mocker.MagicMock(name="old_consumer")
         old_consumer.receive.return_value = old_msg
         b, _ = _connected(mocker, subscribe=old_consumer)
-        _, old_token = b.pop_with_ack("queue")
+        _, old_token = b.pop_with_ack("queue", timeout=1.0)
         b.disconnect()
 
         new_msg = mocker.MagicMock(name="new_msg")
@@ -1181,7 +1209,7 @@ class TestPulsarRealAck:
         new_client.subscribe.return_value = new_consumer
         pulsar.Client.return_value = new_client
         b.connect()
-        b.pop_with_ack("queue")
+        b.pop_with_ack("queue", timeout=1.0)
 
         b.ack("queue", token=old_token)
 
@@ -1201,12 +1229,11 @@ class TestPulsarRealAck:
 
         consumer.receive.side_effect = receive_and_disconnect
 
-        value, token = b.pop_with_ack("queue")
+        value, token = b.pop_with_ack("queue", timeout=1.0)
         b.ack("queue", token=token)
 
-        assert value == b"payload"
-        assert isinstance(token, _PulsarAckToken)
-        assert token.consumer is consumer
+        assert value is None
+        assert token is None
         consumer.acknowledge.assert_not_called()
         assert token not in b._in_flight
 
@@ -1218,7 +1245,7 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
         assert token is not None
         assert len(b._in_flight) == 1
         b.ack("q", token=token)
@@ -1233,7 +1260,7 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
         b.ack("q", token=token)
         b.ack("q", token=token)
         assert consumer.acknowledge.call_count == 1
@@ -1246,7 +1273,7 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
 
         b.ack("q", token=token)
         b.nack("q", token=token)
@@ -1261,7 +1288,7 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
 
         b.nack("q", token=token)
         b.ack("q", token=token)
@@ -1277,7 +1304,7 @@ class TestPulsarRealAck:
         consumer.receive.return_value = msg
         consumer.acknowledge.side_effect = [RuntimeError("ack failed"), None]
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
 
         with pytest.raises(QueueError, match="Failed to ack Pulsar message"):
             b.ack("q", token=token)
@@ -1298,7 +1325,7 @@ class TestPulsarRealAck:
         consumer.receive.return_value = msg
         consumer.negative_acknowledge.side_effect = [RuntimeError("nack failed"), None]
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
 
         with pytest.raises(QueueError, match="Failed to nack Pulsar message"):
             b.nack("q", token=token)
@@ -1326,7 +1353,7 @@ class TestPulsarRealAck:
 
         consumer.acknowledge.side_effect = blocking_ack
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
         errors: list[BaseException] = []
 
         def settle(action) -> None:
@@ -1361,7 +1388,7 @@ class TestPulsarRealAck:
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
 
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
 
         assert b._last_msg is None
         assert b._last_delivery is None
@@ -1378,7 +1405,7 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
         b.nack("q", token=token)
         consumer.negative_acknowledge.assert_called_once_with(msg_id)
         assert b._in_flight == set()
@@ -1393,7 +1420,7 @@ class TestPulsarRealAck:
         # Remove negative_acknowledge to simulate older client.
         del consumer.negative_acknowledge
         b, _ = _connected(mocker, subscribe=consumer)
-        _, token = b.pop_with_ack("q")
+        _, token = b.pop_with_ack("q", timeout=1.0)
         b.nack("q", token=token)  # must not raise
         b.ack("q", token=token)
         consumer.acknowledge.assert_not_called()
@@ -1415,8 +1442,8 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.side_effect = msgs
         b, _ = _connected(mocker, subscribe=consumer)
-        b.pop_with_ack("q")
-        b.pop_with_ack("q")
+        b.pop_with_ack("q", timeout=1.0)
+        b.pop_with_ack("q", timeout=1.0)
         # No acks — both remain in-flight.
         assert len(b._in_flight) == 2
         consumer.acknowledge.assert_not_called()
@@ -1428,7 +1455,7 @@ class TestPulsarRealAck:
         consumer = mocker.MagicMock()
         consumer.receive.return_value = msg
         b, _ = _connected(mocker, subscribe=consumer)
-        value = b.pop("q")
+        value = b.pop("q", timeout=1.0)
         assert value == b"legacy"
         assert b._last_msg is msg
         b.ack("q")  # no token — legacy path

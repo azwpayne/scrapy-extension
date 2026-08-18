@@ -18,9 +18,11 @@ API verified against the pulsar-client sync Python client:
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
-from threading import Lock
+from dataclasses import dataclass, field
+from threading import Condition, Event, Lock, Thread, current_thread
+from time import monotonic
 from typing import Any, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -82,6 +84,11 @@ _PULSAR_QUEUE_LEN_UNSUPPORTED_MESSAGE = (
 # broker, not in this set). The POP itself is never dropped. 10k is generous
 # for normal CONCURRENT_REQUESTS backpressure and tight enough to flag a leak.
 _MAX_IN_FLIGHT = 10_000
+
+# One sync-SDK receive worker is admitted per topic. The worker never receives
+# beyond this local bound, keeping background prefetch independent between topics.
+_PULSAR_RECEIVE_BUFFER_SIZE = 100
+_PULSAR_RECEIVE_TIMEOUT_MS = 1_000
 
 
 def _validate_queue_name_argument(
@@ -188,6 +195,72 @@ class _PulsarAckToken:
 
     def __repr__(self) -> str:
         return f"_PulsarAckToken(topic={self.topic!r}, message_id={self.message_id!r})"
+
+
+@dataclass(frozen=True)
+class _BufferedPulsarRecord:
+    """One broker delivery retained with its exact settlement identity."""
+
+    message: Any
+    message_id: Any
+    consumer: Any
+
+
+@dataclass
+class _PulsarReceivePump:
+    """Bounded local delivery buffer owned by one topic/client generation."""
+
+    topic: str
+    consumer: Any
+    generation: int
+    capacity: int
+    condition: Condition = field(default_factory=Condition)
+    records: deque[_BufferedPulsarRecord] = field(default_factory=deque)
+    accepting: bool = True
+    failed: bool = False
+    control_error: BaseException | None = None
+    receive_started: Event = field(default_factory=Event)
+    buffered: Event = field(default_factory=Event)
+    stopped: Event = field(default_factory=Event)
+    worker: Thread | None = None
+
+    def stop_admission(self) -> None:
+        """Fence this pump and wake local waiters before its consumer closes."""
+        with self.condition:
+            self.accepting = False
+            self.condition.notify_all()
+
+    def take(self, timeout: float) -> _BufferedPulsarRecord | None:
+        """Return a buffered record without exceeding the caller's wait budget."""
+        deadline = monotonic() + timeout if timeout > 0 else None
+        with self.condition:
+            while True:
+                if self.records:
+                    record = self.records.popleft()
+                    self.condition.notify_all()
+                    return record
+                if not self.accepting:
+                    return None
+                if self.control_error is not None:
+                    raise self.control_error
+                if self.failed:
+                    raise QueueError(
+                        "Pulsar receive pump failed.",
+                        queue_name=self.topic,
+                        operation="pop",
+                    )
+                if deadline is None:
+                    return None
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return None
+                self.condition.wait(remaining)
+
+    def discard_buffered(self) -> None:
+        """Release local references; broker deliveries intentionally remain unacked."""
+        with self.condition:
+            self.records.clear()
+            self.condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -320,6 +393,11 @@ class PulsarBackend(Backend, QueueBackend):
         self._lifecycle_generation = 0
         self._producer_creation_lock = Lock()
         self._consumer_creation_lock = Lock()
+        self._receive_pump_creation_lock = Lock()
+        self._receive_pumps: dict[str, _PulsarReceivePump] = {}
+        # Kept as an instance attribute so live tests can exercise backpressure
+        # with a deliberately small bound without changing production behavior.
+        self._receive_buffer_size = _PULSAR_RECEIVE_BUFFER_SIZE
         # Compatibility view for callers/tests that inspect the historical
         # single-consumer state. Message-token routing uses ``_consumers``.
         self._consumer: Any = None
@@ -542,6 +620,7 @@ class PulsarBackend(Backend, QueueBackend):
             return 0
 
         handles: list[Any] = []
+        pumps: list[_PulsarReceivePump] = []
         if published_generation is None:
             # Construction completed but publication did not.  No public teardown
             # could have claimed this private candidate, so this connect owns it.
@@ -560,6 +639,10 @@ class PulsarBackend(Backend, QueueBackend):
                     producers = {
                         id(producer): producer for producer in self._producers.values()
                     }
+                    pumps = list(self._receive_pumps.values())
+                    for pump in pumps:
+                        pump.stop_admission()
+                    self._receive_pumps.clear()
                     self._consumers.clear()
                     self._consumer = None
                     self._subscribed_topic = None
@@ -584,10 +667,18 @@ class PulsarBackend(Backend, QueueBackend):
                 # A driver close must never replace the connection failure currently
                 # being handled. The normal failure path logs after this helper returns.
                 cleanup_failure_count += 1
+        for pump in pumps:
+            worker = pump.worker
+            if worker is not None and worker is not current_thread():
+                try:
+                    worker.join()
+                except BaseException:
+                    cleanup_failure_count += 1
+            pump.discard_buffered()
         return cleanup_failure_count
 
     def disconnect(self) -> None:
-        """Close the Pulsar client and release producers/consumers."""
+        """Fence receive pumps, interrupt them, and release all SDK handles."""
         with self._lifecycle_lock:
             consumers = {
                 id(consumer): consumer for consumer in self._consumers.values()
@@ -599,8 +690,14 @@ class PulsarBackend(Backend, QueueBackend):
             producers = {
                 id(producer): producer for producer in self._producers.values()
             }
+            pumps = list(self._receive_pumps.values())
+            # Admission is stopped at the lifecycle linearization point. A receive
+            # that completes after this fence cannot publish into its old buffer.
+            for pump in pumps:
+                pump.stop_admission()
             client = self._client
             self._lifecycle_generation += 1
+            self._receive_pumps.clear()
             self._consumers.clear()
             self._consumer = None
             self._subscribed_topic = None
@@ -615,7 +712,29 @@ class PulsarBackend(Backend, QueueBackend):
         handles = [*consumers.values(), *producers.values()]
         if client is not None:
             handles.append(client)
-        self._close_detached_handles(*handles)
+        close_error: BaseException | None = None
+        try:
+            # Consumers are first so close() interrupts any blocked sync receive.
+            self._close_detached_handles(*handles)
+        except BaseException as error:
+            close_error = error
+
+        join_error: BaseException | None = None
+        for pump in pumps:
+            worker = pump.worker
+            if worker is not None and worker is not current_thread():
+                try:
+                    worker.join()
+                except BaseException as error:
+                    if join_error is None:
+                        join_error = error
+            # These records were received but never returned. Dropping only the
+            # local references (without ACK/NACK) leaves them for broker redelivery.
+            pump.discard_buffered()
+        if close_error is not None:
+            raise close_error
+        if join_error is not None:
+            raise join_error
 
     @staticmethod
     def _close_detached_handles(*handles: Any) -> None:
@@ -803,12 +922,12 @@ class PulsarBackend(Backend, QueueBackend):
             QueueError: If the receive fails for a non-timeout reason.
             ValueError: If queue_name contains invalid characters.
         """
-        msg, consumer = self._receive(queue_name, timeout)
-        if msg is None:
+        record = self._receive(queue_name, timeout)
+        if record is None:
             return None
-        self._last_msg = msg
-        self._last_delivery = (consumer, msg)
-        return _message_bytes(msg)
+        self._last_msg = record.message
+        self._last_delivery = (record.consumer, record.message)
+        return _message_bytes(record.message)
 
     @queue_operation_error_boundary(
         "pop",
@@ -842,16 +961,16 @@ class PulsarBackend(Backend, QueueBackend):
             ValueError: If queue_name contains invalid characters.
         """
         topic = self._topic_name(queue_name)
-        msg, consumer = self._receive(queue_name, timeout)
-        if msg is None:
+        record = self._receive(queue_name, timeout)
+        if record is None:
             return (None, None)
         token = _PulsarAckToken(
-            message_id=msg.message_id(),
+            message_id=record.message_id,
             topic=topic,
-            consumer=consumer,
+            consumer=record.consumer,
         )
         self._track_in_flight(token)
-        return (_message_bytes(msg), token)
+        return (_message_bytes(record.message), token)
 
     def _track_in_flight(self, token: _PulsarAckToken) -> None:
         """Add ``token`` to the diagnostic in-flight set, bounded.
@@ -887,57 +1006,132 @@ class PulsarBackend(Backend, QueueBackend):
                 except BaseException:
                     pass
 
-    def _receive(self, queue_name: str, timeout: float) -> tuple[Any, Any]:
-        """Receive one message and return it with the consumer that delivered it.
+    def _receive(self, queue_name: str, timeout: float) -> _BufferedPulsarRecord | None:
+        """Take one delivery from the topic pump within the caller's budget.
 
-        Shared by :meth:`pop` and :meth:`pop_with_ack` so consumer
-        subscription, topic validation, and error wrapping live in one place.
-        Only the receive call maps a no-message result to None; subscribe
-        errors propagate as :class:`QueueError`.
-
-        Args:
-            queue_name: Name of the queue (validated here).
-            timeout: Seconds to wait (0 = a short non-blocking poll).
-
-        Returns:
-            ``(message, consumer)``. ``message`` is None if no message arrived
-            in time; ``consumer`` is the topic-specific consumer used to poll.
-
-        Raises:
-            QueueError: If the receive fails at the Pulsar layer for a
-                non-timeout reason (subscribe failure).
-            ValueError: If queue_name contains invalid characters.
+        Sync SDK receives happen only on the per-topic worker. In particular,
+        ``timeout=0`` never enters ``consumer.receive`` on the caller/reactor
+        thread; it checks the local buffer once and returns immediately.
         """
+        deadline = monotonic() + timeout if timeout > 0 else None
         topic = self._topic_name(queue_name)
-        # Subscribe errors must propagate (not be masked as "empty"); only the
-        # receive call maps a no-message result to None.
-        consumer = self._ensure_consumer(topic)
-        timed_out = False
-        try:
-            # timeout=0 -> a short poll; Pulsar needs a positive timeout_millis.
-            timeout_ms = int(timeout * 1000) if timeout > 0 else 100
-            message = consumer.receive(timeout_millis=timeout_ms)
-        except pulsar.Timeout:
-            timed_out = True
-        except Exception as e:
-            # Broker disconnects, authorization failures, and invalid consumer state
-            # are operational failures, not evidence that the queue is empty. A
-            # false empty result can make Scrapy close an active crawl prematurely.
-            raise QueueError(
-                f"Failed to pop from Pulsar queue {queue_name}: {e}",
-                queue_name=queue_name,
-                operation="pop",
-            ) from e
+        pump = self._ensure_receive_pump(topic)
+        if deadline is None:
+            return pump.take(0.0)
+        return pump.take(max(0.0, deadline - monotonic()))
 
-        if timed_out:
-            # The timeout handler above has unwound, so a synchronous log handler
-            # cannot recover the driver's exception through ``sys.exc_info``.
-            try:
-                logger.debug("Pulsar receive returned no message.")
-            except BaseException:
-                pass
-            return (None, consumer)
-        return (message, consumer)
+    def _ensure_receive_pump(self, topic: str) -> _PulsarReceivePump:
+        """Create or return the single bounded receive pump for ``topic``."""
+        with self._receive_pump_creation_lock:
+            with self._lifecycle_lock:
+                pump = self._receive_pumps.get(topic)
+                if pump is not None:
+                    return pump
+            consumer = self._ensure_consumer(topic)
+            with self._lifecycle_lock:
+                existing = self._receive_pumps.get(topic)
+                if existing is not None:
+                    return existing
+                if self._consumers.get(topic) is not consumer:
+                    raise QueueError(
+                        "Pulsar connection changed while starting receive pump.",
+                        queue_name=topic,
+                        operation="pop",
+                    )
+                generation = self._lifecycle_generation
+                pump = _PulsarReceivePump(
+                    topic=topic,
+                    consumer=consumer,
+                    generation=generation,
+                    capacity=self._receive_buffer_size,
+                )
+                worker = Thread(
+                    target=self._run_receive_pump,
+                    args=(pump,),
+                    name=f"scrapy-pulsar-receive-{generation}-{topic}",
+                    daemon=True,
+                )
+                pump.worker = worker
+                self._receive_pumps[topic] = pump
+                try:
+                    worker.start()
+                except BaseException:
+                    pump.stop_admission()
+                    self._receive_pumps.pop(topic, None)
+                    raise
+                return pump
+
+    def _run_receive_pump(self, pump: _PulsarReceivePump) -> None:
+        """Receive synchronously off-reactor and publish only into this generation."""
+        try:
+            while True:
+                with pump.condition:
+                    while pump.accepting and len(pump.records) >= pump.capacity:
+                        pump.condition.wait()
+                    if not pump.accepting:
+                        return
+                pump.receive_started.set()
+                timed_out = False
+                failed = False
+                control_error: BaseException | None = None
+                message: Any = None
+                message_id: Any = None
+                try:
+                    message = pump.consumer.receive(
+                        timeout_millis=_PULSAR_RECEIVE_TIMEOUT_MS
+                    )
+                    message_id = message.message_id()
+                except pulsar.Timeout:
+                    timed_out = True
+                except Exception:
+                    failed = True
+                except BaseException as error:
+                    # Process-control exceptions retain their historical identity,
+                    # but cross the worker boundary through the waiting public poll
+                    # instead of becoming an unhandled thread exception.
+                    control_error = error
+
+                if timed_out:
+                    # Avoid a hot loop with test doubles or SDKs that return timeout
+                    # immediately. The condition also wakes teardown without delay.
+                    with pump.condition:
+                        if pump.accepting:
+                            pump.condition.wait(0.01)
+                    try:
+                        logger.debug("Pulsar receive returned no message.")
+                    except BaseException:
+                        pass
+                    continue
+
+                with self._lifecycle_lock:
+                    generation_is_live = (
+                        pump.accepting
+                        and self._lifecycle_generation == pump.generation
+                        and self._receive_pumps.get(pump.topic) is pump
+                        and self._consumers.get(pump.topic) is pump.consumer
+                    )
+                with pump.condition:
+                    if not generation_is_live or not pump.accepting:
+                        return
+                    if control_error is not None:
+                        pump.control_error = control_error
+                        pump.condition.notify_all()
+                        return
+                    if failed:
+                        pump.failed = True
+                        pump.condition.notify_all()
+                        return
+                    pump.records.append(
+                        _BufferedPulsarRecord(
+                            message=message,
+                            message_id=message_id,
+                            consumer=pump.consumer,
+                        )
+                    )
+                    pump.buffered.set()
+                    pump.condition.notify_all()
+        finally:
+            pump.stopped.set()
 
     @queue_operation_error_boundary(
         "ack",

@@ -56,8 +56,14 @@ def test_push_pop_round_trip() -> None:
     try:
         topic = f"inttest-{uuid.uuid4().hex[:8]}"
         payload = b'{"v":1}'
+        # Start the sync receive pump before publishing. Its Event is a live-test
+        # hook proving the SDK receive is active off the caller thread while the
+        # zero-time public poll remains local and immediate.
+        assert backend.pop(topic, timeout=0) is None
+        pump = backend._receive_pumps[f"scrapy-{topic}"]
+        assert pump.receive_started.wait(timeout=5.0)
         backend.push(topic, payload)
-        # pop blocks on the timeout param for up to 10s for the message to arrive.
+        # Positive polls wait only on the local pump buffer for this budget.
         popped = backend.pop(topic, timeout=10.0)
         assert popped == payload
     finally:

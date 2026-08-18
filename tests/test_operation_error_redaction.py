@@ -129,7 +129,7 @@ def test_pulsar_pop_rebuilds_driver_error_without_topic_or_config_state(
     client.subscribe.return_value = consumer
 
     with pytest.raises(QueueError) as exc_info:
-        backend.pop(_MARKER)
+        backend.pop(_MARKER, timeout=1.0)
 
     error = exc_info.value
     assert error.operation == "pop"
@@ -176,7 +176,7 @@ def test_operation_boundary_leaves_input_validation_and_base_exception_untouched
     with pytest.raises(ValueError, match="queue_name"):
         backend.pop("invalid queue name")
     with pytest.raises(KeyboardInterrupt) as exc_info:
-        backend.pop(_MARKER)
+        backend.pop(_MARKER, timeout=1.0)
 
     assert exc_info.value is interrupt
 
