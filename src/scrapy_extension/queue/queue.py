@@ -1399,6 +1399,67 @@ class BackendQueue:
                 if interrupted is None:
                     interrupted = exc
 
+    def _repair_close_finalization(
+        self,
+        attempt: int,
+        owner_token: object,
+        *,
+        succeeded: bool,
+    ) -> tuple[BaseException | None, BaseException | None, BaseException | None]:
+        """Repair every owned-attempt terminal invariant before returning.
+
+        The loop deliberately includes state evaluation as well as both publication
+        calls in its exception boundary.  An asynchronous exception may therefore
+        land at any opcode in finalization without leaving ownership, an in-progress
+        marker, or a waiter stranded.  The first such interruption is deferred until
+        publication has made the attempt terminal.
+        """
+        cleanup_publication_failure: BaseException | None = None
+        publication_failure: BaseException | None = None
+        interrupted: BaseException | None = None
+        cleanup_publication_complete = False
+        close_publication_complete = False
+        while True:
+            try:
+                if (
+                    not cleanup_publication_complete
+                    and self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED
+                ):
+                    candidate = self._publish_strategy_cleanup_outcome(
+                        _STRATEGY_CLEANUP_INDETERMINATE
+                    )
+                    if cleanup_publication_failure is None:
+                        cleanup_publication_failure = candidate
+                    cleanup_publication_complete = True
+                if (
+                    not close_publication_complete
+                    and self._close_owner_token is owner_token
+                ):
+                    candidate = self._publish_close_attempt(
+                        attempt, owner_token, succeeded=succeeded
+                    )
+                    if publication_failure is None:
+                        publication_failure = candidate
+                    close_publication_complete = True
+                # Re-evaluate inside the guarded region.  ``_publish_close_attempt``
+                # clears ownership last, after completion/outcome notification and
+                # the in-progress marker, so loss of ownership is the commit proof.
+                if (
+                    cleanup_publication_complete
+                    or self._strategy_cleanup_state != _STRATEGY_CLEANUP_STARTED
+                ) and (
+                    close_publication_complete
+                    or self._close_owner_token is not owner_token
+                ):
+                    return (
+                        cleanup_publication_failure,
+                        publication_failure,
+                        interrupted,
+                    )
+            except BaseException as exc:
+                if interrupted is None:
+                    interrupted = exc
+
     def close(self, *, lossy: bool = False) -> None:
         """Transactionally checkpoint and close the strategy.
 
@@ -1413,6 +1474,7 @@ class BackendQueue:
         failure: BaseException | None = None
         publication_failure: BaseException | None = None
         cleanup_publication_failure: BaseException | None = None
+        finalization_interruption: BaseException | None = None
         succeeded = False
         try:
             try:
@@ -1467,28 +1529,42 @@ class BackendQueue:
             except BaseException as exc:
                 failure = exc
         finally:
-            # An interruption can land after ``started`` but before the nested
-            # cleanup suite begins. Repair that gap to an explicit terminal state
-            # before publishing the close attempt.
-            if self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
-                cleanup_publication_failure = self._publish_strategy_cleanup_outcome(
-                    _STRATEGY_CLEANUP_INDETERMINATE
-                )
-            # Once this call records ownership, every exit path must publish a
-            # terminal result. In particular, tracing/profiling callbacks can
-            # raise between handler bytecodes, before normal control reaches the
-            # code following an ``except`` suite.
-            if self._close_owner_token is owner_token:
-                publication_failure = self._publish_close_attempt(
-                    attempt, owner_token, succeeded=succeeded
-                )
+            # The call itself is also inside a retrying exception boundary: opcode
+            # tracing can interrupt argument loading or dispatch before the helper
+            # frame starts.  Once attempt ownership exists, do not leave this loop
+            # until cleanup state and close-attempt publication are terminal.
+            while True:
+                try:
+                    (
+                        cleanup_publication_failure,
+                        publication_failure,
+                        repair_interruption,
+                    ) = self._repair_close_finalization(
+                        attempt, owner_token, succeeded=succeeded
+                    )
+                except BaseException as exc:
+                    if finalization_interruption is None:
+                        finalization_interruption = exc
+                else:
+                    if finalization_interruption is None:
+                        finalization_interruption = repair_interruption
+                    break
 
+        # Preserve the originating control-flow exception ahead of errors raised
+        # while repairing it.  Otherwise a control-flow interruption encountered by
+        # finalization is selected ahead of ordinary operation/publication failures.
         if failure is not None and not isinstance(failure, Exception):
             raise failure
+        if finalization_interruption is not None and not isinstance(
+            finalization_interruption, Exception
+        ):
+            raise finalization_interruption
         if cleanup_publication_failure is not None:
             raise cleanup_publication_failure
         if publication_failure is not None:
             raise publication_failure
+        if finalization_interruption is not None:
+            raise finalization_interruption
         if failure is not None:
             raise failure
 

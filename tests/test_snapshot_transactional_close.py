@@ -14,6 +14,7 @@ from scrapy_extension.queue.queue import (
     _STRATEGY_CLEANUP_FAILED,
     _STRATEGY_CLEANUP_INDETERMINATE,
     _STRATEGY_CLEANUP_NOT_STARTED,
+    _STRATEGY_CLEANUP_STARTED,
     BackendQueue,
 )
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -603,6 +604,93 @@ def test_opcode_interruption_at_former_owner_clear_boundary_is_terminal() -> Non
 
     strategy.close.assert_called_once_with()
     assert queue._close_owner_token is None
+
+
+@pytest.mark.timeout(10)
+def test_every_executed_finalization_opcode_repairs_owned_attempt() -> None:
+    """Stress every opcode on the started-cleanup/waiter publication path."""
+
+    def prepared_queue() -> tuple[BackendQueue, object, object]:
+        queue = _queue_with_storage(MagicMock(), MagicMock())
+        owner_token = object()
+        waiter_token = object()
+        queue._close_attempt = 1
+        queue._close_owner_token = owner_token
+        queue._close_in_progress = True
+        queue._strategy_cleanup_state = _STRATEGY_CLEANUP_STARTED
+        queue._close_attempt_waiters = {1: {waiter_token}}
+        return queue, owner_token, waiter_token
+
+    observed_offsets: list[int] = []
+    baseline, baseline_owner, _ = prepared_queue()
+
+    def observe(frame: object, event: str, _arg: object) -> object:
+        if (
+            getattr(frame, "f_code", None)
+            is BackendQueue._repair_close_finalization.__code__
+        ):
+            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            if event == "opcode":
+                observed_offsets.append(frame.f_lasti)  # type: ignore[attr-defined]
+        return observe
+
+    sys.settrace(observe)
+    try:
+        assert baseline._repair_close_finalization(
+            1, baseline_owner, succeeded=False
+        ) == (None, None, None)
+    finally:
+        sys.settrace(None)
+
+    for target_offset in dict.fromkeys(observed_offsets):
+        queue, owner_token, waiter_token = prepared_queue()
+        interruption = _PublicationBoundaryInterruption(
+            f"finalization opcode {target_offset}"
+        )
+        escaped: BaseException | None = None
+        result: tuple[BaseException | None, BaseException | None, BaseException | None]
+
+        def inject(
+            frame: object,
+            event: str,
+            _arg: object,
+            *,
+            target_offset: int = target_offset,
+            interruption: BaseException = interruption,
+        ) -> object:
+            if (
+                getattr(frame, "f_code", None)
+                is BackendQueue._repair_close_finalization.__code__
+            ):
+                frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+                if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                    raise interruption
+            return inject
+
+        sys.settrace(inject)
+        try:
+            try:
+                result = queue._repair_close_finalization(
+                    1, owner_token, succeeded=False
+                )
+            except BaseException as exc:
+                escaped = exc
+                result = queue._repair_close_finalization(
+                    1, owner_token, succeeded=False
+                )
+        finally:
+            sys.settrace(None)
+
+        assert escaped is interruption or interruption in result
+        assert queue._strategy_cleanup_state == _STRATEGY_CLEANUP_INDETERMINATE
+        assert queue._close_complete is True
+        assert queue._close_in_progress is False
+        assert queue._close_owner_token is None
+        assert queue._close_attempt_outcomes == {1: False}
+        with queue._operation_gate:
+            assert queue._cleanup_close_waiter_locked(1, waiter_token) is None
+        assert queue._close_attempt_waiters == {}
+        assert queue._close_attempt_outcomes == {}
 
 
 @pytest.mark.parametrize(
