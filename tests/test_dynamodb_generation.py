@@ -888,9 +888,15 @@ def test_paginated_clear_drains_before_generation_rollover(mocker) -> None:
     delete_entered = threading.Event()
     delete_release = threading.Event()
 
-    def blocked_delete(**_kwargs: object) -> None:
+    def blocked_delete(**kwargs: Any) -> dict[str, Any]:
         delete_entered.set()
         assert delete_release.wait(timeout=5)
+        return {
+            "Attributes": {
+                "pk": kwargs["Key"]["pk"],
+                "_scrapy_revision": kwargs["ExpressionAttributeValues"][":revision"],
+            }
+        }
 
     table_a.delete_item.side_effect = blocked_delete
     table_a.scan.side_effect = [

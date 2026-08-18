@@ -750,24 +750,35 @@ Ambient credentials continue to work; only endpoint routing is isolated.
 DynamoDB package writes now include the reserved `_scrapy_revision` string
 attribute. Its 32-byte opaque value and attribute name count toward the 400 KiB
 item limit, so payloads that sat exactly at the previous maximum must shrink by
-48 bytes. No eager migration is required for existing rows: during clear, a
-legacy row without the attribute is conditionally claimed with a new revision
-before deletion. If another writer replaced that row, the replacement survives
-and clear raises `StorageError(operation="clear_storage", key=None)` as an
-explicit possibly-partial outcome. Applications that write directly to the
-table must generate a fresh opaque revision on each replacement or remove the
-old attribute; preserving a prior revision opts out of replacement detection.
+48 bytes. Revision-fenced rows need no migration and normal clear safely fences
+each observed revision. A legacy row without the attribute is different:
+default clear preserves it and raises
+`StorageError(operation="clear_storage", key=None)` because identical-value ABA
+cannot be detected from its attributes.
 
-Clear now uses one revision-conditioned `DeleteItem` per observed row. The old
-key-only BatchWrite path and its application-level `UnprocessedItems` retry
-budget were removed because BatchWrite cannot express conditions. Botocore's
-configured retries/timeouts still apply to each claim/delete RPC. A condition
-loss, Scan/claim/delete failure, malformed response, or repeated cursor raises
-the typed partial-result error instead of claiming success. Earlier deletes may
-already be committed, no rollback occurs, and retrying starts a new convergent
-clear. Operators requiring an empty result must still stop all external writers
-for the whole operation because Scan cannot fence newly inserted, unobserved
-keys.
+Migrate revisionless rows only in a stopped-writer window. Prefer reading each
+legacy item and rewriting it through the current package with a smaller payload
+where necessary, which installs a fresh revision. For rows that cannot be
+enlarged—especially pre-existing exact-400-KiB items—start one maintenance
+generation with
+`SCRAPY_DYNAMODB_ALLOW_UNFENCED_LEGACY_CLEAR=True`, run the intended clear while
+all writers remain stopped, then disable the setting and reconnect before
+resuming work. This high-risk override conditionally deletes the observed legacy
+attributes directly, so it does not add bytes, but identical-value ABA remains
+indistinguishable and is safe only because writers are quiesced. Applications
+writing directly to the table must generate a fresh opaque revision on every
+replacement; preserving a prior revision defeats replacement detection.
+
+Clear now uses one conditional `DeleteItem(ALL_OLD)` per observed row and
+validates the returned old-item identity. The old key-only BatchWrite path and
+its application-level `UnprocessedItems` retry budget were removed because
+BatchWrite cannot express conditions. Botocore's configured retries/timeouts
+still apply to each delete RPC. A condition loss, Scan/delete failure, malformed
+response, legacy fail-closed stop, or repeated cursor raises the typed
+partial-result error instead of claiming success. Earlier deletes may already
+be committed, no rollback occurs, and retrying starts a new convergent clear.
+Operators requiring an empty result must still stop all external writers for the
+whole operation because Scan cannot fence newly inserted, unobserved keys.
 
 The shared SQS/DynamoDB region check now accepts multi-label region identifiers
 used across AWS partitions, such as `us-gov-west-1`, `us-iso-east-1`, and

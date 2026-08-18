@@ -164,20 +164,22 @@ def test_direct_dynamodb_storage_operation_rebuilds_private_error_graph(
     _assert_terminal_error_is_redacted(error, _MARKER)
 
 
-def test_direct_dynamodb_clear_rebuilds_malformed_legacy_claim_graph(
+def test_direct_dynamodb_clear_rebuilds_malformed_conditional_delete_graph(
     mocker: Any,
 ) -> None:
     backend, table = _backend(mocker)
-    table.scan.return_value = {"Items": [{"pk": _MARKER, "value": b"old"}]}
-    table.update_item.return_value = {"unexpected": _MARKER}
+    table.scan.return_value = {
+        "Items": [{"pk": _MARKER, "value": b"old", "_scrapy_revision": "0" * 32}]
+    }
+    table.delete_item.return_value = {"unexpected": _MARKER}
 
     with pytest.raises(StorageError) as exc_info:
         backend.clear_storage(_MARKER)
 
     error = exc_info.value
     assert str(error) == (
-        "DynamoDB returned a malformed legacy-claim response; the clear may be "
-        "partially complete"
+        "DynamoDB returned a malformed conditional DeleteItem response; the clear "
+        "may be partially complete"
     )
     assert error.operation == "clear_storage"
     assert error.key is None

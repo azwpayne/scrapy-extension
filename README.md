@@ -521,17 +521,20 @@ endpoints are ignored, so they cannot redirect cloud mode around its HTTPS
 guard. Botocore's credential provider chain and normal FIPS/dual-stack endpoint
 selection are unchanged.
 
-`clear_storage()` issues one conditional `DeleteItem` per observed row, fenced
-on the exact `_scrapy_revision` returned by the strongly consistent Scan. It
-never uses key-only BatchWrite deletes. A legacy row without a revision is
-conditionally claimed with one before deletion; if the row was replaced, the
-replacement is retained and clear raises an explicit partial-result
-`StorageError` rather than reporting false success. SDK failures and malformed
-responses have the same partial-result contract, and accepted earlier deletes
-are not rolled back. Botocore's retry/timeout policy remains the only RPC retry
-layer. Stop external writers before a deterministic maintenance clear: Scan is
-not a cross-page snapshot and a successful clear cannot exclude newly inserted,
-unobserved rows.
+`clear_storage()` issues one conditional `DeleteItem(ALL_OLD)` per observed
+revision-fenced row, using the exact `_scrapy_revision` returned by the strongly
+consistent Scan and validating the returned old-item identity. It never uses
+key-only BatchWrite deletes. A revisionless legacy row fails closed and remains
+present: an identical-value delete/recreate (ABA) cannot be distinguished from
+the scanned row. Migrate such rows while writers are stopped, or enable the
+high-risk `SCRAPY_DYNAMODB_ALLOW_UNFENCED_LEGACY_CLEAR=True` override for one
+quiesced maintenance generation. The override conditionally deletes legacy
+rows without enlarging them, including pre-existing 400 KiB items, but cannot
+make identical-value ABA safe. Disable it and reconnect before resuming writers.
+SDK failures, condition loss, and malformed responses have an explicit
+partial-result `StorageError` contract; accepted earlier deletes are not rolled
+back. Scan is not a cross-page snapshot, so even normal revision fencing cannot
+exclude newly inserted, unobserved rows.
 
 `delete()` returns `False` only when `DeleteItem(ALL_OLD)` omits `Attributes`,
 which is AWS's missing-item result. A present old item must contain the exact

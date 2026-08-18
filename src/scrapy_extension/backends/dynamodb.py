@@ -10,7 +10,7 @@ boto3 resource API (stable):
 - ``resource.Table(name)`` / ``resource.create_table(...)``
 - ``table.load()`` / ``table.wait_until_exists()``
 - ``table.put_item(Item=)`` / ``get_item(Key=)`` / conditional ``delete_item(...)``
-- ``table.scan()`` / conditional ``update_item(...)`` for legacy-row claims
+- ``table.scan()`` / revision-conditioned ``delete_item(...)`` for clears
 """
 
 from __future__ import annotations
@@ -94,12 +94,20 @@ _DYNAMODB_CLEAR_CONCURRENT_WRITE = (
     "DynamoDB clear is partially complete: an observed item changed before "
     "conditional deletion"
 )
+_DYNAMODB_CLEAR_UNFENCED_LEGACY = (
+    "DynamoDB clear is partially complete: stopped at an unfenced legacy item; "
+    "the item was preserved"
+)
+_DYNAMODB_CLEAR_MALFORMED_DELETE = (
+    "DynamoDB returned a malformed conditional DeleteItem response; the clear may "
+    "be partially complete"
+)
 _DYNAMODB_SAFE_STORAGE_MESSAGES: frozenset[str] = frozenset(
     {
         "DynamoDB backend is not connected",
         _DYNAMODB_CLEAR_CONCURRENT_WRITE,
-        "DynamoDB returned a malformed legacy-claim response; the clear may be "
-        "partially complete",
+        _DYNAMODB_CLEAR_UNFENCED_LEGACY,
+        _DYNAMODB_CLEAR_MALFORMED_DELETE,
         "DynamoDB returned a malformed scan response; the clear may be "
         "partially complete",
         "DynamoDB returned a malformed out-of-scope scan response; the clear may "
@@ -133,6 +141,7 @@ class _DynamoDBConnectionSnapshot:
     table_name: str
     region_name: str
     endpoint_url: str | None
+    allow_unfenced_legacy_clear: bool
 
 
 @dataclass(frozen=True)
@@ -341,6 +350,7 @@ class DynamoDBBackend(Backend, StorageBackend):
             table_name=table_name,
             region_name=region_name,
             endpoint_url=endpoint_url,
+            allow_unfenced_legacy_clear=self.config.allow_unfenced_legacy_clear,
         )
         kwargs: dict[str, Any] = {
             "region_name": region_name,
@@ -551,74 +561,90 @@ class DynamoDBBackend(Backend, StorageBackend):
             key=None,
         )
 
+    @staticmethod
+    def _validate_clear_delete_response(response: Any, item: dict[str, Any]) -> None:
+        """Require ``ALL_OLD`` to identify the conditionally deleted row."""
+        malformed = StorageError(
+            _DYNAMODB_CLEAR_MALFORMED_DELETE,
+            operation="clear_storage",
+            key=None,
+        )
+        if not isinstance(response, dict):
+            raise malformed
+        attributes = response.get("Attributes", _MISSING)
+        if not isinstance(attributes, dict):
+            raise malformed
+        returned_key = attributes.get("pk", _MISSING)
+        if not isinstance(returned_key, str) or returned_key != item["pk"]:
+            raise malformed
+        expected_revision = item.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
+        returned_revision = attributes.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
+        if expected_revision is _MISSING:
+            if returned_revision is not _MISSING:
+                raise malformed
+        elif (
+            not isinstance(expected_revision, str)
+            or not isinstance(returned_revision, str)
+            or returned_revision != expected_revision
+        ):
+            raise malformed
+
     @classmethod
-    def _claim_legacy_clear_item(
+    def _delete_clear_item(
         cls,
         table: Any,
         item: dict[str, Any],
-        revision: str,
+        *,
+        allow_unfenced_legacy_clear: bool,
     ) -> None:
-        """Attach ``revision`` iff the scanned legacy row is still observable.
-
-        Conditions compare every attribute observed by Scan. ``ALL_OLD`` then
-        catches additions that DynamoDB expressions cannot enumerate: if an
-        external writer replaced the row before the claim, that replacement is
-        retained (with the new revision) and clear reports a partial outcome.
-        """
-        names = {"#revision": _DDB_REVISION_ATTRIBUTE}
-        values: dict[str, Any] = {":revision": revision}
-        conditions = ["attribute_exists(pk)", "attribute_not_exists(#revision)"]
-        for index, (name, value) in enumerate(item.items()):
-            if name in {"pk", _DDB_REVISION_ATTRIBUTE}:
-                continue
-            name_token = f"#item{index}"
-            value_token = f":item{index}"
-            names[name_token] = name
-            values[value_token] = value
-            conditions.append(f"{name_token} = {value_token}")
-        try:
-            response = table.update_item(
-                Key={"pk": item["pk"]},
-                UpdateExpression="SET #revision = :revision",
-                ConditionExpression=" AND ".join(conditions),
-                ExpressionAttributeNames=names,
-                ExpressionAttributeValues=values,
-                ReturnValues="ALL_OLD",
-            )
-        except Exception as exc:
-            if _is_conditional_check_failed(exc):
-                raise cls._clear_concurrent_write_error() from None
-            raise
-        if not isinstance(response, dict) or not isinstance(
-            response.get("Attributes"), dict
-        ):
-            raise StorageError(
-                "DynamoDB returned a malformed legacy-claim response; the clear may "
-                "be partially complete",
-                operation="clear_storage",
-                key=None,
-            )
-        if response["Attributes"] != item:
-            raise cls._clear_concurrent_write_error()
-
-    @classmethod
-    def _delete_clear_item(cls, table: Any, item: dict[str, Any]) -> None:
-        """Conditionally delete exactly the revision observed (or safely claimed)."""
+        """Conditionally delete one observed row under the selected safety policy."""
         revision = item.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
+        delete_kwargs: dict[str, Any]
         if revision is _MISSING:
-            revision = uuid.uuid4().hex
-            cls._claim_legacy_clear_item(table, item, revision)
+            if not allow_unfenced_legacy_clear:
+                raise StorageError(
+                    _DYNAMODB_CLEAR_UNFENCED_LEGACY,
+                    operation="clear_storage",
+                    key=None,
+                )
+            # This explicit maintenance-only path deliberately does not add a
+            # revision first: a legacy item may already occupy the exact 400 KiB
+            # DynamoDB limit. Attribute equality narrows ordinary races, but cannot
+            # distinguish identical-value ABA; operators must stop every writer.
+            names = {"#revision": _DDB_REVISION_ATTRIBUTE}
+            values: dict[str, Any] = {}
+            conditions = ["attribute_exists(pk)", "attribute_not_exists(#revision)"]
+            for index, (name, value) in enumerate(item.items()):
+                if name in {"pk", _DDB_REVISION_ATTRIBUTE}:
+                    continue
+                name_token = f"#item{index}"
+                value_token = f":item{index}"
+                names[name_token] = name
+                values[value_token] = value
+                conditions.append(f"{name_token} = {value_token}")
+            delete_kwargs = {
+                "Key": {"pk": item["pk"]},
+                "ConditionExpression": " AND ".join(conditions),
+                "ExpressionAttributeNames": names,
+                "ReturnValues": "ALL_OLD",
+            }
+            if values:
+                delete_kwargs["ExpressionAttributeValues"] = values
+        else:
+            delete_kwargs = {
+                "Key": {"pk": item["pk"]},
+                "ConditionExpression": "#revision = :revision",
+                "ExpressionAttributeNames": {"#revision": _DDB_REVISION_ATTRIBUTE},
+                "ExpressionAttributeValues": {":revision": revision},
+                "ReturnValues": "ALL_OLD",
+            }
         try:
-            table.delete_item(
-                Key={"pk": item["pk"]},
-                ConditionExpression="#revision = :revision",
-                ExpressionAttributeNames={"#revision": _DDB_REVISION_ATTRIBUTE},
-                ExpressionAttributeValues={":revision": revision},
-            )
+            response = table.delete_item(**delete_kwargs)
         except Exception as exc:
             if _is_conditional_check_failed(exc):
                 raise cls._clear_concurrent_write_error() from None
             raise
+        cls._validate_clear_delete_response(response, item)
 
     @backend_connection_error_boundary(
         "Failed to connect to DynamoDB.",
@@ -1078,10 +1104,11 @@ class DynamoDBBackend(Backend, StorageBackend):
     def clear_storage(self, prefix: str | None = None) -> None:
         """Clear observed item revisions, optionally restricted by key prefix.
 
-        Every delete is conditional on the opaque revision observed by Scan.
-        Legacy rows are first conditionally claimed with a revision. Success means
-        every observed revision was deleted; it does not prove the table/prefix is
-        empty because DynamoDB Scan has no cross-page snapshot isolation.
+        Every normal delete is conditional on the opaque revision observed by
+        Scan. Revisionless legacy rows fail closed and remain present unless the
+        connected generation captured the explicit stopped-writer maintenance
+        override. Success does not prove the table/prefix is empty because
+        DynamoDB Scan has no cross-page snapshot isolation.
 
         Args:
             prefix: If provided, only clear keys whose ``pk`` starts with this
@@ -1150,7 +1177,13 @@ class DynamoDBBackend(Backend, StorageBackend):
                             )
                         seen_cursor_digests.add(cursor_digest)
                     for item in items:
-                        self._delete_clear_item(table, item)
+                        self._delete_clear_item(
+                            table,
+                            item,
+                            allow_unfenced_legacy_clear=(
+                                generation.snapshot.allow_unfenced_legacy_clear
+                            ),
+                        )
                     last_key = next_key
                     if not last_key:
                         break

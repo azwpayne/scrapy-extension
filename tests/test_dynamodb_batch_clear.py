@@ -17,13 +17,22 @@ _OLD_REVISION = "0" * 32
 _NEW_REVISION = "1" * 32
 
 
-def _connected(mocker) -> tuple[DynamoDBBackend, Any, Any]:
-    backend = DynamoDBBackend(DynamoDBSettings())
+def _connected(mocker, **settings: Any) -> tuple[DynamoDBBackend, Any, Any]:
+    backend = DynamoDBBackend(DynamoDBSettings(**settings))
     session = mocker.MagicMock()
     resource = mocker.MagicMock()
     table = mocker.MagicMock()
     table.load.return_value = None
     table.table_status = "ACTIVE"
+
+    def successful_conditional_delete(**kwargs: Any) -> dict[str, Any]:
+        attributes = {"pk": kwargs["Key"]["pk"]}
+        revision = kwargs.get("ExpressionAttributeValues", {}).get(":revision")
+        if revision is not None:
+            attributes[_REVISION] = revision
+        return {"Attributes": attributes}
+
+    table.delete_item.side_effect = successful_conditional_delete
     resource.Table.return_value = table
     table.meta.client = resource.meta.client
     session.resource.return_value = resource
@@ -54,6 +63,7 @@ def _assert_revision_delete(call: Any, key: str, revision: Any) -> None:
         "ConditionExpression": "#revision = :revision",
         "ExpressionAttributeNames": {"#revision": _REVISION},
         "ExpressionAttributeValues": {":revision": revision},
+        "ReturnValues": "ALL_OLD",
     }
 
 
@@ -110,129 +120,115 @@ def test_external_same_key_replacement_survives_stale_clear(
     assert table.delete_item.call_count == 1
 
 
-def test_legacy_row_is_claimed_before_revision_delete(mocker) -> None:
+def test_default_clear_preserves_revisionless_row_and_fails_closed(mocker) -> None:
     backend, table, _resource = _connected(mocker)
     legacy = {"pk": "legacy", "value": b"old", "expire_at": 123}
     table.scan.return_value = {"Items": [legacy]}
-    table.update_item.return_value = {"Attributes": legacy.copy()}
-    mocker.patch.object(
-        dynamodb_module.uuid,
-        "uuid4",
-        return_value=mocker.Mock(hex=_NEW_REVISION),
-    )
+
+    with pytest.raises(StorageError, match="unfenced legacy item") as exc_info:
+        backend.clear_storage()
+
+    assert exc_info.value.operation == "clear_storage"
+    assert exc_info.value.key is None
+    table.update_item.assert_not_called()
+    table.delete_item.assert_not_called()
+
+
+def test_identical_attribute_aba_is_not_claimed_or_deleted_by_default(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    observed = {"pk": "key", "value": b"identical", "expire_at": 123}
+    current = observed.copy()
+
+    def scan_then_identical_aba(**_kwargs: Any) -> dict[str, Any]:
+        scanned = current.copy()
+        current.clear()  # an external writer deletes the scanned legacy row
+        current.update(observed)  # then recreates byte-for-byte identical attributes
+        return {"Items": [scanned]}
+
+    table.scan.side_effect = scan_then_identical_aba
+
+    with pytest.raises(StorageError, match="item was preserved"):
+        backend.clear_storage()
+
+    assert current == observed
+    table.update_item.assert_not_called()
+    table.delete_item.assert_not_called()
+
+
+def test_quiesced_override_conditionally_deletes_legacy_row_without_claim(
+    mocker,
+) -> None:
+    backend, table, _resource = _connected(mocker, allow_unfenced_legacy_clear=True)
+    legacy = {"pk": "legacy", "value": b"old", "expire_at": 123}
+    table.scan.return_value = {"Items": [legacy]}
 
     backend.clear_storage()
 
-    table.update_item.assert_called_once_with(
-        Key={"pk": "legacy"},
-        UpdateExpression="SET #revision = :revision",
-        ConditionExpression=(
+    table.update_item.assert_not_called()
+    assert table.delete_item.call_args.kwargs == {
+        "Key": {"pk": "legacy"},
+        "ConditionExpression": (
             "attribute_exists(pk) AND attribute_not_exists(#revision) "
             "AND #item1 = :item1 AND #item2 = :item2"
         ),
-        ExpressionAttributeNames={
+        "ExpressionAttributeNames": {
             "#revision": _REVISION,
             "#item1": "value",
             "#item2": "expire_at",
         },
-        ExpressionAttributeValues={
-            ":revision": _NEW_REVISION,
-            ":item1": b"old",
-            ":item2": 123,
-        },
-        ReturnValues="ALL_OLD",
-    )
-    _assert_revision_delete(table.delete_item.call_args, "legacy", _NEW_REVISION)
+        "ExpressionAttributeValues": {":item1": b"old", ":item2": 123},
+        "ReturnValues": "ALL_OLD",
+    }
 
 
-@pytest.mark.parametrize("replacement_has_revision", [True, False])
-def test_replacement_wins_legacy_claim_race_without_delete(
-    mocker, replacement_has_revision: bool
+def test_quiesced_override_handles_exact_400_kib_legacy_row_without_update(
+    mocker,
 ) -> None:
-    backend, table, _resource = _connected(mocker)
-    legacy = {"pk": "key", "value": b"old"}
-    replacement = {"pk": "key", "value": b"replacement"}
-    if replacement_has_revision:
-        replacement[_REVISION] = _NEW_REVISION
-    current = replacement.copy()
-    table.scan.return_value = {"Items": [legacy]}
-    table.update_item.side_effect = _condition_failed()
-
-    with pytest.raises(StorageError, match="partially complete"):
-        backend.clear_storage()
-
-    assert current == replacement
-    table.delete_item.assert_not_called()
-    assert table.update_item.call_count == 1
-
-
-def test_legacy_claim_all_old_check_catches_added_external_attribute(mocker) -> None:
-    backend, table, _resource = _connected(mocker)
-    observed = {"pk": "key", "value": b"old"}
-    replacement = {"pk": "key", "value": b"old", "external": "added"}
-    table.scan.return_value = {"Items": [observed]}
-    table.update_item.return_value = {"Attributes": replacement.copy()}
-
-    with pytest.raises(StorageError, match="partially complete"):
-        backend.clear_storage()
-
-    table.delete_item.assert_not_called()
-
-
-def test_direct_replacement_after_legacy_claim_survives_delete(mocker) -> None:
-    backend, table, _resource = _connected(mocker)
-    legacy = {"pk": "key", "value": b"old"}
-    replacement = {"pk": "key", "value": b"external"}
-    current = legacy.copy()
+    backend, table, _resource = _connected(mocker, allow_unfenced_legacy_clear=True)
+    # This pre-existing item is exactly 400 KiB under DynamoDB's names+values
+    # accounting and cannot accept even a one-byte revision attribute.
+    value = b"x" * (400 * 1024 - len("pk") - len("k") - len("value"))
+    legacy = {"pk": "k", "value": value}
     table.scan.return_value = {"Items": [legacy]}
 
-    def claim(**kwargs: Any) -> dict[str, Any]:
-        current[_REVISION] = kwargs["ExpressionAttributeValues"][":revision"]
-        return {"Attributes": legacy.copy()}
+    backend.clear_storage()
 
-    def replace_then_delete(**_kwargs: Any) -> None:
-        nonlocal current
-        current = replacement.copy()
-        raise _condition_failed()
-
-    table.update_item.side_effect = claim
-    table.delete_item.side_effect = replace_then_delete
-
-    with pytest.raises(StorageError, match="partially complete"):
-        backend.clear_storage()
-
-    assert current == replacement
-    assert table.update_item.call_count == 1
+    table.update_item.assert_not_called()
     assert table.delete_item.call_count == 1
+    assert table.delete_item.call_args.kwargs["ExpressionAttributeValues"] == {
+        ":item1": value
+    }
 
 
-@pytest.mark.parametrize("response", [None, [], {}, {"Attributes": []}])
-def test_malformed_legacy_claim_response_is_partial_failure(
-    mocker, response: Any
-) -> None:
-    backend, table, _resource = _connected(mocker)
-    table.scan.return_value = {"Items": [{"pk": "legacy", "value": b"old"}]}
-    table.update_item.return_value = response
+def test_quiesced_override_condition_loss_preserves_replacement(mocker) -> None:
+    backend, table, _resource = _connected(mocker, allow_unfenced_legacy_clear=True)
+    table.scan.return_value = {"Items": [{"pk": "key", "value": b"old"}]}
+    table.delete_item.side_effect = _condition_failed()
 
     with pytest.raises(StorageError, match="partially complete") as exc_info:
         backend.clear_storage()
 
-    assert exc_info.value.operation == "clear_storage"
+    assert exc_info.value.__cause__ is None
+    assert table.delete_item.call_count == 1
+    table.update_item.assert_not_called()
+
+
+def test_override_is_captured_by_connected_generation(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {"Items": [{"pk": "legacy", "value": b"old"}]}
+    backend.config.allow_unfenced_legacy_clear = True
+
+    with pytest.raises(StorageError, match="item was preserved"):
+        backend.clear_storage()
+
     table.delete_item.assert_not_called()
 
 
-@pytest.mark.parametrize("operation", ["claim", "delete"])
-def test_clear_wraps_conditional_rpc_transport_failure(mocker, operation: str) -> None:
+def test_clear_wraps_conditional_delete_transport_failure(mocker) -> None:
     backend, table, _resource = _connected(mocker)
     marker = "tenant-secret https://user:password@example.test"
-    failure = RuntimeError(marker)
-    if operation == "claim":
-        legacy = {"pk": "key", "value": b"old"}
-        table.scan.return_value = {"Items": [legacy]}
-        table.update_item.side_effect = failure
-    else:
-        table.scan.return_value = {"Items": [_revision_item("key")]}
-        table.delete_item.side_effect = failure
+    table.scan.return_value = {"Items": [_revision_item("key")]}
+    table.delete_item.side_effect = RuntimeError(marker)
 
     with pytest.raises(StorageError) as exc_info:
         backend.clear_storage()
@@ -243,6 +239,105 @@ def test_clear_wraps_conditional_rpc_transport_failure(mocker, operation: str) -
     assert marker not in repr(vars(exc_info.value))
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        [],
+        {},
+        {"Attributes": None},
+        {"Attributes": {}},
+        {"Attributes": {"pk": "different", _REVISION: _OLD_REVISION}},
+        {"Attributes": {"pk": "key"}},
+        {"Attributes": {"pk": "key", _REVISION: _NEW_REVISION}},
+    ],
+)
+def test_clear_rejects_malformed_conditional_delete_response(
+    mocker, response: Any
+) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {"Items": [_revision_item("key")]}
+    table.delete_item.side_effect = None
+    table.delete_item.return_value = response
+
+    with pytest.raises(StorageError, match="malformed conditional DeleteItem") as exc:
+        backend.clear_storage()
+
+    assert exc.value.operation == "clear_storage"
+    assert exc.value.key is None
+    assert exc.value.__cause__ is None
+
+
+def test_real_resource_conditional_delete_api_shape_with_stubber() -> None:
+    """Pin Resource serialization and ALL_OLD deserialization for clear CAS."""
+    import subprocess
+    import sys
+
+    script = "\n".join(
+        (
+            "import boto3",
+            "from botocore.stub import Stubber",
+            "from scrapy_extension.backends.dynamodb import DynamoDBBackend",
+            "resource = boto3.session.Session().resource(",
+            "  'dynamodb', region_name='us-east-1',",
+            "  endpoint_url='http://localhost:4566',",
+            "  aws_access_key_id='x', aws_secret_access_key='y',",
+            ")",
+            "client = resource.meta.client",
+            "table = resource.Table('scrapy-extension')",
+            "revision = '0' * 32",
+            "item = {'pk': 'key', 'value': b'payload', '_scrapy_revision': revision}",
+            "expected = {",
+            "  'TableName': 'scrapy-extension',",
+            "  'Key': {'pk': 'key'},",
+            "  'ConditionExpression': '#revision = :revision',",
+            "  'ExpressionAttributeNames': {'#revision': '_scrapy_revision'},",
+            "  'ExpressionAttributeValues': {':revision': revision},",
+            "  'ReturnValues': 'ALL_OLD',",
+            "}",
+            "wire = {'Attributes': {",
+            "  'pk': {'S': 'key'}, 'value': {'B': b'payload'},",
+            "  '_scrapy_revision': {'S': revision},",
+            "}}",
+            "legacy = {'pk': 'legacy', 'value': b'payload'}",
+            "legacy_expected = {",
+            "  'TableName': 'scrapy-extension',",
+            "  'Key': {'pk': 'legacy'},",
+            "  'ConditionExpression': 'attribute_exists(pk) AND '",
+            "    'attribute_not_exists(#revision) AND #item1 = :item1',",
+            "  'ExpressionAttributeNames': {",
+            "    '#revision': '_scrapy_revision', '#item1': 'value',",
+            "  },",
+            "  'ExpressionAttributeValues': {':item1': b'payload'},",
+            "  'ReturnValues': 'ALL_OLD',",
+            "}",
+            "legacy_wire = {'Attributes': {",
+            "  'pk': {'S': 'legacy'}, 'value': {'B': b'payload'},",
+            "}}",
+            "with Stubber(client) as stubber:",
+            "  stubber.add_response('delete_item', wire, expected)",
+            "  stubber.add_response('delete_item', legacy_wire, legacy_expected)",
+            "  DynamoDBBackend._delete_clear_item(",
+            "    table, item, allow_unfenced_legacy_clear=False",
+            "  )",
+            "  DynamoDBBackend._delete_clear_item(",
+            "    table, legacy, allow_unfenced_legacy_clear=True",
+            "  )",
+            "  stubber.assert_no_pending_responses()",
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_partial_delete_failure_stops_before_later_observed_items(mocker) -> None:
@@ -336,11 +431,17 @@ def test_disconnect_drains_conditional_delete_before_closing(mocker) -> None:
     delete_release = threading.Event()
     timeline: list[str] = []
 
-    def blocked_delete(**_kwargs: Any) -> None:
+    def blocked_delete(**kwargs: Any) -> dict[str, Any]:
         timeline.append("delete-enter")
         delete_entered.set()
         assert delete_release.wait(timeout=5)
         timeline.append("delete-exit")
+        return {
+            "Attributes": {
+                "pk": kwargs["Key"]["pk"],
+                _REVISION: kwargs["ExpressionAttributeValues"][":revision"],
+            }
+        }
 
     table.delete_item.side_effect = blocked_delete
     resource.meta.client.close.side_effect = lambda: timeline.append("close")

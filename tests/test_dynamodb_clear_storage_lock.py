@@ -41,9 +41,15 @@ def _park_clear(table: Any) -> tuple[threading.Event, threading.Event]:
     delete_entered = threading.Event()
     delete_release = threading.Event()
 
-    def blocked_delete(**_kwargs: Any) -> None:
+    def blocked_delete(**kwargs: Any) -> dict[str, Any]:
         delete_entered.set()
         assert delete_release.wait(timeout=5)
+        return {
+            "Attributes": {
+                "pk": kwargs["Key"]["pk"],
+                "_scrapy_revision": kwargs["ExpressionAttributeValues"][":revision"],
+            }
+        }
 
     table.delete_item.side_effect = blocked_delete
     return delete_entered, delete_release

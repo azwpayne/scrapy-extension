@@ -543,24 +543,28 @@ cloud mode therefore cannot be silently redirected to an ambient HTTP target.
 
 For a deterministic DynamoDB maintenance clear, first quiesce every external
 writer, then call `clear_storage()`, and resume writers only after it succeeds.
-The backend sends one conditional `DeleteItem` per observed row; key-only
-BatchWrite cannot express the revision fence and is not used. Botocore owns RPC
-retries and network timeouts, so page/item count and SDK policy determine the
-unbounded whole-clear and disconnect-drain budget. The operation lock covers
-Scan, legacy claims, and deletes so local writes cannot interleave. A condition
-loss, malformed response, or SDK failure raises `StorageError` with an explicit
-possibly-partial contract; after fixing the cause, rerun clear as a new
-idempotent convergence pass rather than attempting rollback. Never call
-`disconnect()` re-entrantly from a synchronous logging hook or signal handler;
-schedule teardown on another thread.
+The backend sends one conditional `DeleteItem(ALL_OLD)` per observed row and
+validates the returned identity; key-only BatchWrite cannot express the revision
+fence and is not used. Botocore owns RPC retries and network timeouts, so
+page/item count and SDK policy determine the unbounded whole-clear and
+disconnect-drain budget. The operation lock covers Scan and deletes so local
+writes cannot interleave. A condition loss, malformed response, or SDK failure
+raises `StorageError` with an explicit possibly-partial contract; after fixing
+the cause, rerun clear as a new idempotent convergence pass rather than
+attempting rollback. Never call `disconnect()` re-entrantly from a synchronous
+logging hook or signal handler; schedule teardown on another thread.
 
 The stored schema reserves `_scrapy_revision` alongside `pk`, `value`, and the
-optional `expire_at`. Direct writers must replace it with a fresh opaque value
-(or omit it and become a legacy row), never preserve an old row's revision.
-Legacy rows need no eager migration: clear conditionally claims each row before
-its fenced delete. A claim race leaves the replacement in place and reports the
-partial outcome; a retained claimed replacement is safe to process on a later
-clear.
+optional `expire_at`. Direct writers must replace it with a fresh opaque value,
+never preserve an old row's revision. Normal revision-fenced rows are safe from
+stale same-key clear deletion. Revisionless legacy rows fail closed and remain
+present because identical-value ABA is indistinguishable. In a stopped-writer
+maintenance window, either rewrite them through the current package or connect
+one generation with
+`SCRAPY_DYNAMODB_ALLOW_UNFENCED_LEGACY_CLEAR=True`. The high-risk override
+deletes legacy rows directly (so exact-400-KiB rows are supported without an
+update) but is unsafe with active writers. Disable it, reconnect, and only then
+resume writers.
 
 A DynamoDB `StorageError` whose public message says the `DeleteItem` response
 was malformed means the deletion result is uncertain: do not reinterpret it as

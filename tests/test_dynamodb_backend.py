@@ -42,6 +42,14 @@ def _patch_resource(mocker, *, return_value=None, side_effect=None):
     return session_factory, session.resource
 
 
+def _successful_conditional_delete(**kwargs: Any) -> dict[str, Any]:
+    attributes = {"pk": kwargs["Key"]["pk"]}
+    revision = kwargs.get("ExpressionAttributeValues", {}).get(":revision")
+    if revision is not None:
+        attributes["_scrapy_revision"] = revision
+    return {"Attributes": attributes}
+
+
 def _connected(mocker):
     b = _make_backend()
     resource = mocker.MagicMock()
@@ -69,6 +77,7 @@ class TestDynamoDBBackendType:
         s = DynamoDBSettings()
         assert s.mode is DynamoDBMode.STANDALONE
         assert s.table_name == "scrapy-extension"
+        assert s.allow_unfenced_legacy_clear is False
 
 
 class TestDynamoDBConnect:
@@ -618,6 +627,7 @@ class TestDynamoDBStorageOps:
                 {"pk": "b", "_scrapy_revision": "b" * 32},
             ]
         }
+        table.delete_item.side_effect = _successful_conditional_delete
         b.clear_storage()
         assert table.delete_item.call_count == 2
         assert [
@@ -636,6 +646,7 @@ class TestDynamoDBStorageOps:
             },
             {"Items": [{"pk": "tenant_a:second", "_scrapy_revision": "b" * 32}]},
         ]
+        table.delete_item.side_effect = _successful_conditional_delete
         b.clear_storage(prefix="tenant_a:")
 
         assert [call.kwargs["Key"] for call in table.delete_item.call_args_list] == [

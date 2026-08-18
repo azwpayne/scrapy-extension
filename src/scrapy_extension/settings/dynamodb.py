@@ -72,6 +72,13 @@ class DynamoDBSettings(RedactedBaseSettings):
     aws_secret_access_key: SecretStr | None = Field(
         default=None, description="AWS secret access key"
     )
+    allow_unfenced_legacy_clear: bool = Field(
+        default=False,
+        description=(
+            "High-risk maintenance override permitting clear_storage() to delete "
+            "revisionless legacy rows. Enable only while every table writer is stopped."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_endpoint_url_scheme(self) -> Self:
