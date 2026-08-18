@@ -13,7 +13,7 @@ from scrapy_extension.backends import registry
 
 def test_core_package_imports_do_not_enumerate_entry_points() -> None:
     root = Path(__file__).resolve().parents[1]
-    script = r'''
+    script = r"""
 import importlib.metadata
 
 def hostile(*args, **kwargs):
@@ -24,7 +24,7 @@ import scrapy_extension
 import scrapy_extension.backends
 import scrapy_extension.backends.connectors
 print("imports-ok")
-'''
+"""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=root,

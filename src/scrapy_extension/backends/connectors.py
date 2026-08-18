@@ -374,6 +374,22 @@ def _bundled_optional_dependency_boundary(
     return wrapped
 
 
+def _load_static_ack_capabilities(
+    descriptor: BackendDescriptor,
+) -> tuple[bool, bool]:
+    """Load and sanitize exact class-level acknowledgement declarations."""
+    backend_cls = _load_descriptor_object(descriptor, descriptor.backend_cls_path)
+    requires_ack = getattr_static(backend_cls, "requires_ack", False)
+    supports_concurrent = getattr_static(
+        backend_cls,
+        "supports_concurrent_ack",
+        False,
+    )
+    if type(requires_ack) is not bool or type(supports_concurrent) is not bool:
+        raise _invalid_plugin_ack_contract()
+    return requires_ack, supports_concurrent
+
+
 def _load_resolver_settings_class(descriptor: BackendDescriptor) -> Any:
     """Load a resolver model while tagging only bundled missing dependencies."""
     try:
@@ -511,7 +527,10 @@ def _ack_token_key(token: Any) -> tuple[object, ...]:
 
 def _is_empty_ack_token(token: Any) -> bool:
     """Recognize only exact empty built-in containers; never call plugin hooks."""
-    return type(token) in {str, bytes, tuple, list, dict, set, frozenset} and len(token) == 0
+    return (
+        type(token) in {str, bytes, tuple, list, dict, set, frozenset}
+        and len(token) == 0
+    )
 
 
 class _DeferredAckPluginQueueBackend(QueueBackend):
@@ -525,29 +544,33 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         *,
         supports_concurrent_ack: bool,
     ) -> None:
-        self._backend = backend
+        # Deliberately not named ``_backend``: queue strategies reserve that
+        # attribute for unwrapping the circuit-breaker proxy. Exposing it here
+        # would make a breaker-enabled strategy skip this token-validating
+        # ``pop_with_ack`` override and fall back to tokenless ``pop``.
+        self._delegate = backend
         self.supports_concurrent_ack = supports_concurrent_ack
         self._ack_contract_lock = threading.Lock()
         self._active_ack_tokens: dict[str, set[tuple[object, ...]]] = {}
 
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
-        self._backend.push(queue_name, item, priority)
+        self._delegate.push(queue_name, item, priority)
 
     def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
-        return self._backend.pop(queue_name, timeout)
+        return self._delegate.pop(queue_name, timeout)
 
     def queue_len(self, queue_name: str) -> int:
-        return self._backend.queue_len(queue_name)
+        return self._delegate.queue_len(queue_name)
 
     def clear_queue(self, queue_name: str) -> None:
-        self._backend.clear_queue(queue_name)
+        self._delegate.clear_queue(queue_name)
 
     def pop_with_ack(
         self,
         queue_name: str,
         timeout: float = 0.0,
     ) -> tuple[bytes | None, Any | None]:
-        result = self._backend.pop_with_ack(queue_name, timeout)
+        result = self._delegate.pop_with_ack(queue_name, timeout)
         if type(result) is not tuple or len(result) != 2:
             raise QueueError(
                 "Deferred-ack backend returned an invalid delivery result",
@@ -599,9 +622,9 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
                 )
             try:
                 if operation == "ack":
-                    self._backend.ack(queue_name, token=token)
+                    self._delegate.ack(queue_name, token=token)
                 else:
-                    self._backend.nack(queue_name, token=token)
+                    self._delegate.nack(queue_name, token=token)
             except BaseException:
                 raise
             else:

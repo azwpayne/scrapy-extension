@@ -1301,13 +1301,11 @@ class BackendScheduler:
                 concurrent ack, ``CONCURRENT_REQUESTS > 1``, and the opt-out
                 is not set.
         """
-        from scrapy_extension.backends.connectors import _load_object
+        from scrapy_extension.backends.connectors import _load_static_ack_capabilities
         from scrapy_extension.backends.registry import get_descriptor
 
         descriptor = get_descriptor(str(backend_type))
-        backend_cls = _load_object(descriptor.backend_cls_path)
-        requires_ack = getattr(backend_cls, "requires_ack", False)
-        supports_concurrent = getattr(backend_cls, "supports_concurrent_ack", True)
+        requires_ack, supports_concurrent = _load_static_ack_capabilities(descriptor)
         if not requires_ack or supports_concurrent:
             return
         concurrent = parse_int_setting(
@@ -1363,12 +1361,12 @@ class BackendScheduler:
         # Strategies that override pop_with_ack thread the MQ token — no warning.
         if "pop_with_ack" in type(queue_strategy).__dict__:
             return
-        from scrapy_extension.backends.connectors import _load_object
+        from scrapy_extension.backends.connectors import _load_static_ack_capabilities
         from scrapy_extension.backends.registry import get_descriptor
 
         descriptor = get_descriptor(str(backend_type))
-        backend_cls = _load_object(descriptor.backend_cls_path)
-        if not getattr(backend_cls, "requires_ack", False):
+        requires_ack, _supports_concurrent = _load_static_ack_capabilities(descriptor)
+        if not requires_ack:
             return
         bt_name = (
             backend_type.value

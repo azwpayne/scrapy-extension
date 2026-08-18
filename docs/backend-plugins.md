@@ -243,6 +243,10 @@ class MySettings(BaseModel):
 ### `mybackend_plugin/backends.py` (stub implementing the three interfaces)
 
 ```python
+import math
+import time
+from collections.abc import Callable
+
 from scrapy_extension.backends.base import (
     Backend,
     QueueBackend,
@@ -257,11 +261,17 @@ class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     backend_type = "mybackend"
 
-    def __init__(self, settings: MySettings) -> None:
+    def __init__(
+        self,
+        settings: MySettings,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._settings = settings
+        self._clock = clock
         self._queues: dict[str, list[tuple[float, bytes]]] = {}
         self._seen: set[str] = set()
-        self._store: dict[str, bytes] = {}
+        self._store: dict[str, tuple[bytes, float | None]] = {}
 
     # -- lifecycle -----------------------------------------------------------
     def connect(self) -> None: ...
@@ -317,23 +327,40 @@ class MyBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._seen = {key for key in self._seen if not key.startswith(prefix)}
 
     # -- StorageBackend ------------------------------------------------------
+    def _live_entry(self, key: str) -> tuple[bytes, float | None] | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        _data, expires_at = entry
+        if expires_at is not None and expires_at <= self._clock():
+            self._store.pop(key, None)  # purge lazily on every read operation
+            return None
+        return entry
+
     def store(self, key: str, data: bytes, ttl: int | None = None) -> None:
-        self._store[key] = data
+        if ttl is not None and ttl < 0:
+            raise ValueError("ttl must be non-negative or None")
+        expires_at = None if ttl is None else self._clock() + ttl
+        self._store[key] = (data, expires_at)
 
     def retrieve(self, key: str) -> bytes | None:
-        return self._store.get(key)
+        entry = self._live_entry(key)
+        return entry[0] if entry is not None else None
 
     def delete(self, key: str) -> bool:
-        if key not in self._store:
+        if self._live_entry(key) is None:
             return False
-        del self._store[key]
+        self._store.pop(key)
         return True
 
     def exists(self, key: str) -> bool:
-        return key in self._store
+        return self._live_entry(key) is not None
 
     def ttl(self, key: str) -> int | None:
-        return None  # demo only — real backends honour the TTL
+        entry = self._live_entry(key)
+        if entry is None or entry[1] is None:
+            return None
+        return max(0, math.ceil(entry[1] - self._clock()))
 
     def clear_storage(self, prefix: str | None = None) -> None:
         if prefix is None:

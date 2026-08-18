@@ -20,6 +20,7 @@ This test RED-first pins the gate. It does NOT instantiate real backends
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import Mock
 
 import pytest
@@ -67,6 +68,29 @@ def _make_settings(
 
 class TestAckCapabilityGate:
     """A3: scheduler.from_settings gates single-slot-ack backends under concurrency."""
+
+    def test_gate_loads_capabilities_through_descriptor_sanitizer(self, mocker) -> None:
+        class _SingleSlotStub:
+            requires_ack = True
+            supports_concurrent_ack = False
+
+        sanitized_loader = mocker.patch(
+            "scrapy_extension.backends.connectors._load_descriptor_object",
+            return_value=_SingleSlotStub,
+        )
+        raw_loader = mocker.patch(
+            "scrapy_extension.backends.connectors._load_object",
+            side_effect=AssertionError("scheduler bypassed descriptor sanitizer"),
+        )
+
+        with pytest.raises(ConfigurationError):
+            BackendScheduler._enforce_ack_concurrency_gate(
+                _make_settings("sqs", concurrent=2),
+                "sqs",
+            )
+
+        sanitized_loader.assert_called_once()
+        raw_loader.assert_not_called()
 
     def test_sqs_with_concurrency_gt_1_passes(self, mocker) -> None:
         """SQS has a real in-flight set (round-3) -> concurrency-safe, no raise."""
@@ -398,6 +422,35 @@ class TestStrategyMqAckBypassWarning:
     Built-in strategy overrides preserve MQ per-message tokens. The warning is a
     diagnostic for custom or local-only strategies that would otherwise drop one.
     """
+
+    def test_bypass_check_loads_capabilities_through_descriptor_sanitizer(
+        self, mocker, caplog
+    ) -> None:
+        class _DeferredStub:
+            requires_ack = True
+            supports_concurrent_ack = True
+
+        class _LocalStrategy:
+            pass
+
+        sanitized_loader = mocker.patch(
+            "scrapy_extension.backends.connectors._load_descriptor_object",
+            return_value=_DeferredStub,
+        )
+        raw_loader = mocker.patch(
+            "scrapy_extension.backends.connectors._load_object",
+            side_effect=AssertionError("scheduler bypassed descriptor sanitizer"),
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="scrapy_extension.schedule.scheduler",
+        ):
+            BackendScheduler._warn_strategy_mq_ack_bypass(_LocalStrategy(), "kafka")
+
+        sanitized_loader.assert_called_once()
+        raw_loader.assert_not_called()
+        assert any("pop_with_ack" in record.message for record in caplog.records)
 
     def test_no_warn_when_delay_threads_ack_with_kafka(self, mocker, caplog) -> None:
         """R2-2: delay now overrides pop_with_ack (threads the MQ token), so the

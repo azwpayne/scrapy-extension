@@ -17,8 +17,12 @@ _BACKEND_EXAMPLE = re.compile(
 )
 
 
-def _load_documented_backend(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Load the guide's backend block without requiring a separate plugin wheel."""
+def _load_documented_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    clock: Any | None = None,
+) -> Any:
+    """Load the guide's exact backend block without a separate plugin wheel."""
     match = _BACKEND_EXAMPLE.search(_GUIDE_PATH.read_text(encoding="utf-8"))
     assert match is not None, "Could not find the documented MyBackend code block."
 
@@ -36,7 +40,8 @@ def _load_documented_backend(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     namespace: dict[str, Any] = {}
     exec(compile(match.group(1), str(_GUIDE_PATH), "exec"), namespace)
-    return namespace["MyBackend"](MySettings())
+    constructor_kwargs = {} if clock is None else {"clock": clock}
+    return namespace["MyBackend"](MySettings(), **constructor_kwargs)
 
 
 def test_documented_backend_example_honors_backend_contracts(
@@ -64,11 +69,50 @@ def test_documented_backend_example_honors_backend_contracts(
 
     assert backend.remove("seen", b"item") is False
     assert backend.add("seen", b"item") is True
+    assert backend.contains("seen", b"item") is True
+    assert backend.add("seen", b"other") is True
+    backend.clear_set("seen")
+    assert backend.contains("seen", b"item") is False
+    assert backend.contains("seen", b"other") is False
+    assert backend.add("seen", b"item") is True
     assert backend.remove("seen", b"item") is True
     assert backend.remove("seen", b"item") is False
 
     assert backend.delete("stored") is False
     backend.store("stored", b"payload")
+    assert backend.exists("stored") is True
+    assert backend.retrieve("stored") == b"payload"
+    assert backend.ttl("stored") is None
     assert backend.delete("stored") is True
     assert backend.retrieve("stored") is None
     assert backend.delete("stored") is False
+
+    backend.store("prefix:one", b"one")
+    backend.store("prefix:two", b"two")
+    backend.store("keep", b"three")
+    backend.clear_storage("prefix:")
+    assert backend.exists("prefix:one") is False
+    assert backend.exists("prefix:two") is False
+    assert backend.retrieve("keep") == b"three"
+    backend.clear_storage()
+    assert backend.exists("keep") is False
+
+
+def test_documented_backend_example_honors_ttl_and_purges_on_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    backend = _load_documented_backend(monkeypatch, clock=lambda: now[0])
+
+    backend.store("expiring", b"payload", ttl=3)
+    assert backend.exists("expiring") is True
+    assert backend.retrieve("expiring") == b"payload"
+    assert backend.ttl("expiring") == 3
+
+    now[0] = 102.2
+    assert backend.ttl("expiring") == 1
+    now[0] = 103.0
+    assert backend.retrieve("expiring") is None
+    assert backend.exists("expiring") is False
+    assert backend.ttl("expiring") is None
+    assert "expiring" not in backend._store

@@ -8,12 +8,14 @@ from typing import Any
 import pytest
 
 from scrapy_extension.backends.base import Backend, QueueBackend
+from scrapy_extension.backends.circuit_breaker import CircuitBreaker, wrap_queue_backend
 from scrapy_extension.backends.connectors import (
     ConnectionManager,
     _DeferredAckPluginQueueBackend,
 )
 from scrapy_extension.backends.registry import BackendDescriptor, _reset_registry_cache
 from scrapy_extension.exceptions import ConfigurationError, QueueError
+from scrapy_extension.queue.strategies.base import QueueStrategy, _BoundQueueAckToken
 
 
 class _Settings:
@@ -26,7 +28,9 @@ class _QueuePlugin(Backend, QueueBackend):
 
     def __init__(self, settings: _Settings | None = None) -> None:
         self.settings = settings
-        self.pop_results: dict[str, deque[tuple[bytes | None, object | None]]] = defaultdict(deque)
+        self.pop_results: dict[str, deque[tuple[bytes | None, object | None]]] = (
+            defaultdict(deque)
+        )
         self.ack_calls: list[tuple[str, object]] = []
         self.nack_calls: list[tuple[str, object]] = []
 
@@ -111,7 +115,9 @@ class _EntryPoint:
         return _register_ackplugin
 
 
-def _install_plugin(monkeypatch: pytest.MonkeyPatch, plugin_class: type[_QueuePlugin]) -> None:
+def _install_plugin(
+    monkeypatch: pytest.MonkeyPatch, plugin_class: type[_QueuePlugin]
+) -> None:
     global _PLUGIN_CLASS
     _PLUGIN_CLASS = plugin_class
     monkeypatch.setattr(
@@ -183,6 +189,24 @@ def test_deferred_plugin_rejects_forged_and_cross_queue_tokens() -> None:
 
     contract.ack("q-a", token="issued")
     assert backend.ack_calls == [("q-a", "issued")]
+
+
+def test_deferred_plugin_token_contract_survives_circuit_breaker() -> None:
+    backend = _DeferredPlugin()
+    backend.pop_results["q"].append((b"item", "issued"))
+    published = wrap_queue_backend(backend, CircuitBreaker("plugin-test"))
+    contract = _DeferredAckPluginQueueBackend(
+        published,
+        supports_concurrent_ack=True,
+    )
+
+    data, token = QueueStrategy._pop_backend_instance_with_ack(contract, "q")
+
+    assert data == b"item"
+    assert isinstance(token, _BoundQueueAckToken)
+    assert token.backend is contract
+    token.ack()
+    assert backend.ack_calls == [("q", "issued")]
 
 
 def test_deferred_plugin_overlap_is_scoped_per_queue() -> None:
