@@ -8,7 +8,7 @@ import traceback
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -95,7 +95,8 @@ def test_commit_writes_chunks_before_manifest_and_round_trips() -> None:
     assert len({len(key) for key in keys[:-1]}) == 1
     assert repository.read(_KEY).state == b"abcdefghij"
     manifest = json.loads(values[_KEY])
-    assert manifest["version"] == 5
+    assert manifest["version"] == 6
+    assert manifest["state"] == "bytes"
     assert manifest["length"] == 10
     assert manifest["chunks"] == 3
 
@@ -274,17 +275,44 @@ def test_construction_control_errors_propagate_only_after_payload_cleanup(
     _assert_package_frames_cleared(exc_info.value)
 
 
-def test_empty_state_is_a_committed_authoritative_manifest() -> None:
+@pytest.mark.parametrize(
+    ("state", "discriminator"),
+    [(None, "none"), (b"", "bytes")],
+)
+def test_zero_length_states_are_distinct_authoritative_manifests(
+    state: bytes | None, discriminator: str
+) -> None:
     storage, values = _storage({_KEY: b"legacy raw state"})
     repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
 
-    repository.commit(_KEY, None)
+    repository.commit(_KEY, state)
 
     result = repository.read(_KEY)
     assert result.found is True
     assert result.manifest is True
-    assert result.state is None
-    assert json.loads(values[_KEY])["chunks"] == 0
+    if state is None:
+        assert result.state is None
+    else:
+        assert result.state == b""
+        assert result.state is not None
+    manifest = json.loads(values[_KEY])
+    assert manifest["version"] == 6
+    assert manifest["state"] == discriminator
+    assert manifest["chunks"] == 0
+
+
+def test_empty_bytes_checksum_corruption_is_rejected_and_redacted() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"")
+    manifest = json.loads(values[_KEY])
+    manifest["sha256"] = "0" * 64
+    values[_KEY] = json.dumps(manifest).encode()
+
+    with pytest.raises(SnapshotRepositoryError, match="checksum") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
 
 
 def test_checksum_corruption_is_rejected() -> None:
@@ -327,6 +355,30 @@ def test_manifest_schema_failure_has_no_recursive_secret_graph() -> None:
     with pytest.raises(SnapshotRepositoryError, match="schema") as exc_info:
         repository.read(_KEY)
 
+    _assert_static_repository_error(exc_info.value)
+
+
+@pytest.mark.parametrize("malformation", ["missing", "unknown", "none-with-bytes"])
+def test_v6_discriminator_is_strictly_validated_before_chunk_retrieval(
+    malformation: str,
+) -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+    repository.commit(_KEY, _SECRET_MARKER.encode())
+    manifest = json.loads(values[_KEY])
+    if malformation == "missing":
+        del manifest["state"]
+    elif malformation == "unknown":
+        manifest["state"] = _SECRET_MARKER
+    else:
+        manifest["state"] = "none"
+    values[_KEY] = json.dumps(manifest).encode()
+    storage.retrieve.reset_mock()
+
+    with pytest.raises(SnapshotRepositoryError, match="schema") as exc_info:
+        repository.read(_KEY)
+
+    assert storage.retrieve.call_args_list == [call(_KEY)]
     _assert_static_repository_error(exc_info.value)
 
 
@@ -396,6 +448,38 @@ def test_legacy_raw_value_remains_readable() -> None:
     assert result.found is True
     assert result.manifest is False
     assert result.state == b"legacy-v3-or-v2-payload"
+
+
+@pytest.mark.parametrize("version", [4, 5])
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [(b"migrated-state", b"migrated-state"), (b"", None)],
+)
+def test_v4_and_v5_manifests_remain_readable_and_next_commit_rewrites_v6(
+    version: int, payload: bytes, expected: bytes | None
+) -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, payload)
+    manifest = json.loads(values[_KEY])
+    generation = manifest["generation"]
+    if version == 4:
+        for index in range(manifest["chunks"]):
+            current_key = repository._chunk_key(_KEY, generation, index)
+            legacy_key = repository._v4_chunk_key(_KEY, generation, index)
+            values[legacy_key] = values.pop(current_key)
+    manifest["version"] = version
+    del manifest["state"]
+    values[_KEY] = json.dumps(manifest).encode()
+
+    result = repository.read(_KEY)
+
+    assert result.manifest is True
+    assert result.state == expected
+    repository.commit(_KEY, result.state)
+    rewritten = json.loads(values[_KEY])
+    assert rewritten["version"] == 6
+    assert rewritten["state"] == ("bytes" if expected is not None else "none")
 
 
 class _CopyBombBytearray(bytearray):

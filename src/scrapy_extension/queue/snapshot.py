@@ -16,7 +16,10 @@ MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024
 DEFAULT_SNAPSHOT_CHUNK_BYTES = MAX_SNAPSHOT_CHUNK_BYTES
 
 _MANIFEST_SCHEMA = "scrapy-extension.queue-strategy-snapshot"
-_MANIFEST_VERSION = 5
+_MANIFEST_VERSION = 6
+_READABLE_MANIFEST_VERSIONS = frozenset({4, 5, _MANIFEST_VERSION})
+_STATE_NONE = "none"
+_STATE_BYTES = "bytes"
 _MAX_MANIFEST_BYTES = 64 * 1024
 _CHUNK_KEY_PREFIX = "queue:snapshot-chunk:v1:"
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -49,11 +52,13 @@ class SnapshotRead:
 
 @dataclass(frozen=True, slots=True)
 class _Manifest:
+    version: int
     generation: str
     length: int
     chunk_bytes: int
     chunks: int
     checksum: str
+    state_present: bool
 
 
 class SnapshotRepository:
@@ -62,7 +67,7 @@ class SnapshotRepository:
     The logical snapshot key contains only the authoritative manifest. A failed
     chunk write cannot replace it, and a failed manifest write leaves the prior
     manifest authoritative. Existing raw values remain readable for in-place
-    migration and are replaced only by a successful v5 commit.
+    migration and are replaced only by a successful v6 commit.
     """
 
     def __init__(
@@ -124,6 +129,11 @@ class SnapshotRepository:
             separators=(",", ":"),
         ).encode("utf-8")
         return f"{_CHUNK_KEY_PREFIX}{hashlib.sha256(identity).hexdigest()}"
+
+    @staticmethod
+    def _v4_chunk_key(key: str, generation: str, index: int) -> str:
+        """Return the physical chunk key used by the historical v4 format."""
+        return f"{key}:generation:{generation}:chunk:{index}"
 
     def _retrieve(self, key: str) -> tuple[Any, bool]:
         """Return backend data or a non-sensitive ordinary-failure status."""
@@ -226,7 +236,8 @@ class SnapshotRepository:
                     or decoded.get("schema") != _MANIFEST_SCHEMA
                 ):
                     return None, None
-                required = {
+                version = decoded.get("version")
+                legacy_required = {
                     "schema",
                     "version",
                     "generation",
@@ -235,9 +246,16 @@ class SnapshotRepository:
                     "chunks",
                     "sha256",
                 }
+                required = (
+                    legacy_required | {"state"}
+                    if version == _MANIFEST_VERSION
+                    else legacy_required
+                )
                 if (
-                    set(decoded) != required
-                    or decoded.get("version") != _MANIFEST_VERSION
+                    isinstance(version, bool)
+                    or not isinstance(version, int)
+                    or version not in _READABLE_MANIFEST_VERSIONS
+                    or set(decoded) != required
                 ):
                     return None, "Snapshot manifest schema is invalid."
                 generation = decoded.get("generation")
@@ -245,6 +263,9 @@ class SnapshotRepository:
                 chunk_bytes = decoded.get("chunk_bytes")
                 chunks = decoded.get("chunks")
                 checksum = decoded.get("sha256")
+                state_kind = (
+                    decoded.get("state") if version == _MANIFEST_VERSION else None
+                )
                 if (
                     not isinstance(generation, str)
                     or _GENERATION_RE.fullmatch(generation) is None
@@ -260,10 +281,25 @@ class SnapshotRepository:
                     or not isinstance(checksum, str)
                     or _CHECKSUM_RE.fullmatch(checksum) is None
                     or chunks != ((length + chunk_bytes - 1) // chunk_bytes)
+                    or (
+                        version == _MANIFEST_VERSION
+                        and state_kind not in {_STATE_NONE, _STATE_BYTES}
+                    )
+                    or (state_kind == _STATE_NONE and length != 0)
                 ):
                     return None, "Snapshot manifest schema is invalid."
                 return (
-                    _Manifest(generation, length, chunk_bytes, chunks, checksum),
+                    _Manifest(
+                        version,
+                        generation,
+                        length,
+                        chunk_bytes,
+                        chunks,
+                        checksum,
+                        state_kind == _STATE_BYTES
+                        if version == _MANIFEST_VERSION
+                        else length > 0,
+                    ),
                     None,
                 )
             except Exception:
@@ -283,6 +319,7 @@ class SnapshotRepository:
                 "chunk_bytes": manifest.chunk_bytes,
                 "chunks": manifest.chunks,
                 "sha256": manifest.checksum,
+                "state": _STATE_BYTES if manifest.state_present else _STATE_NONE,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -333,12 +370,16 @@ class SnapshotRepository:
             if manifest.length == 0:
                 if manifest.checksum != hashlib.sha256(b"").hexdigest():
                     return None, "Snapshot checksum validation failed."
-                return SnapshotRead(True, None, True), None
+                empty_state = b"" if manifest.state_present else None
+                return SnapshotRead(True, empty_state, True), None
             assembled = bytearray()
             for index in range(manifest.chunks):
-                chunk, retrieve_failed = self._retrieve(
-                    self._chunk_key(key, manifest.generation, index)
+                chunk_key = (
+                    self._v4_chunk_key(key, manifest.generation, index)
+                    if manifest.version == 4
+                    else self._chunk_key(key, manifest.generation, index)
                 )
+                chunk, retrieve_failed = self._retrieve(chunk_key)
                 if retrieve_failed:
                     return None, "Snapshot chunk retrieval failed."
                 expected = min(
@@ -401,6 +442,7 @@ class SnapshotRepository:
         chunk = b""
         manifest: _Manifest | None = None
         manifest_bytes = b""
+        state_present = state is not None
         try:
             buffer_error: str | None = None
             if state is not None:
@@ -430,11 +472,13 @@ class SnapshotRepository:
                     return "Snapshot chunk write failed."
                 chunk = b""
             manifest = _Manifest(
+                version=_MANIFEST_VERSION,
                 generation=generation,
                 length=length,
                 chunk_bytes=self._chunk_bytes,
                 chunks=chunks,
                 checksum=hashlib.sha256(payload).hexdigest(),
+                state_present=state_present,
             )
             payload = b""
             manifest_bytes = self._encode_manifest(manifest)

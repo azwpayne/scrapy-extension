@@ -1563,7 +1563,7 @@ class BackendQueue:
             state = None
 
     def _restore_snapshot(self) -> None:
-        """Restore a validated v5 manifest or a compatible v3/v2/raw value."""
+        """Restore a validated v6/v5/v4 manifest or compatible raw value."""
         storage = self._snapshot_storage()
         if storage is None:
             return

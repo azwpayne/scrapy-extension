@@ -273,7 +273,7 @@ def _legacy_delay_snapshot() -> bytes:
 
 
 def _stored_snapshot_payload(storage, key: str = _SNAPSHOT_KEY) -> bytes | None:
-    """Reassemble the v5 payload from captured mock store calls."""
+    """Reassemble the v6 payload from captured mock store calls."""
     values = {args.args[0]: args.args[1] for args in storage.store.call_args_list}
     reader = MagicMock()
     reader.retrieve.side_effect = lambda stored_key: values.get(stored_key)
@@ -574,6 +574,27 @@ def test_backends_queue_restores_marker_like_v3_snapshot_bytes():
     )
 
     strategy.restore.assert_called_once_with(marker_like_state)
+
+
+@pytest.mark.parametrize("state", [None, b""])
+def test_backends_queue_distinguishes_clean_checkpoint_from_empty_bytes(
+    state: bytes | None,
+) -> None:
+    storage, _ = _stateful_storage({})
+    SnapshotRepository(storage).commit(_SNAPSHOT_KEY, state)
+    strategy = MagicMock(name="OpaqueBytesStrategy")
+
+    BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    if state is None:
+        strategy.restore.assert_not_called()
+    else:
+        strategy.restore.assert_called_once_with(b"")
 
 
 def test_backends_queue_marker_retrieval_failure_skips_legacy_fallback():

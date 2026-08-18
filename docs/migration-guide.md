@@ -537,15 +537,20 @@ v2 identity:
 queue:snapshot:v2:<owner-length>:<owner>:<spider-length>:<spider>:<queue>
 ```
 
-The v3/v2 strings above remain the logical keys. New writes place a v5
+The v3/v2 strings above remain the logical keys. New writes place a v6
 manifest at that key and immutable generation chunks in the fixed-length
 `queue:snapshot-chunk:v1:<sha256>` namespace. Each chunk key hashes the complete
 logical key, generation, and index, so v2/v3 identities cannot alias chunks and
 backend key limits do not depend on identity length. The manifest is written
-last and includes schema version, logical length, chunk geometry, and SHA-256;
-a committed zero-length manifest represents a clean drain. Raw
-payloads already stored at either logical key remain readable and are migrated
-without an offline rewrite.
+last and includes schema version, logical length, chunk geometry, SHA-256, and a
+strict `state` discriminator. `state="none"` is an authoritative clean
+checkpoint, while `state="bytes"` means a bytes payload is present and may have
+zero length. Existing v5 and v4 manifests retain their historical zero-length
+meaning (`None`), and raw payloads already stored at either logical key remain
+readable. No offline rewrite is required: the next successful clean close
+rewrites any recovered old format as v6. Stop old writers before upgrading so a
+v5 writer cannot erase the distinction after a v6 writer has committed empty
+bytes.
 
 The package automatically checks the old `queue:snapshot:<queue>` raw form only
 when there is no named spider and the queue name contains no `:`. A successful

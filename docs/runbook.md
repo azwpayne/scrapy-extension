@@ -158,15 +158,17 @@ drain. A crash after restore can therefore replay already-processed entries,
 but cannot lose the only copy of entries not yet processed. Hard crashes can
 still lose changes since the last clean checkpoint.
 
-Snapshots use a v5 manifest-last repository. Each generation is written as
+Snapshots use a v6 manifest-last repository. Each generation is written as
 immutable chunks (256 KiB by default) under fixed-length
 `queue:snapshot-chunk:v1:<sha256>` keys that hash the complete logical identity,
 generation, and index. The checksum/length/schema manifest is then stored at the
-logical snapshot key as the commit point. An interrupted chunk or
-manifest write leaves the previous manifest authoritative. Empty state is also a
-committed manifest, so stale state cannot replay after a clean drain. Existing
-raw payloads at v3/v2 keys and the safely attributable pre-v3 raw key remain
-readable and are migrated by the next successful close.
+logical snapshot key as the commit point. An interrupted chunk or manifest write
+leaves the previous manifest authoritative. Its strict `state` discriminator
+separates an authoritative clean checkpoint (`none`) from a present bytes
+payload (`bytes`), including `b""`; only the clean checkpoint skips strategy
+restore. Existing v5/v4 manifests keep their old zero-length-is-clean meaning,
+and raw payloads at v3/v2 keys and the safely attributable pre-v3 raw key remain
+readable. The next successful close rewrites an old format as v6.
 
 The logical cap is **128 MiB** by default and is enforced symmetrically before
 any write and before restore allocation. Configure
