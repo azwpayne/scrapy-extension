@@ -19,6 +19,20 @@ def _false_positive_upper_bound(flt: BloomMembershipFilter) -> float:
     return (1.0 - unset_probability) ** flt.num_hashes
 
 
+def _exhaustive_sizing_oracle(
+    capacity: int, error_rate: float, max_bits: int
+) -> tuple[int, int] | None:
+    """Brute-force the smallest valid (m, k), independently of production."""
+    candidates: list[tuple[int, int]] = []
+    for num_hashes in range(1, 65):
+        for num_bits in range(num_hashes + 1, max_bits + 1):
+            unset_probability = (1.0 - num_hashes / num_bits) ** capacity
+            if (1.0 - unset_probability) ** num_hashes <= error_rate:
+                candidates.append((num_bits, num_hashes))
+                break
+    return min(candidates) if candidates else None
+
+
 class TestBloomMembershipFilterSizing:
     """Capacity/error-rate validation and derived m, k."""
 
@@ -112,6 +126,25 @@ class TestBloomMembershipFilterSizing:
         with pytest.raises(ValueError, match=r"2 bytes.*1-byte memory budget"):
             BloomMembershipFilter(capacity=1, error_rate=0.0442)
 
+    def test_discrete_sizing_matches_small_exhaustive_oracle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every k is compared; ties choose the smaller hash count."""
+        monkeypatch.setattr(bloom_filter_module, "_MAX_FILTER_BYTES", 4)
+        max_bits = bloom_filter_module._MAX_FILTER_BYTES * 8
+
+        for capacity in range(1, 13):
+            for error_rate in (0.1, 0.25, 0.37, 0.5, 0.75, 0.9):
+                expected = _exhaustive_sizing_oracle(capacity, error_rate, max_bits)
+                if expected is None:
+                    with pytest.raises(ValueError, match="memory budget"):
+                        BloomMembershipFilter(capacity=capacity, error_rate=error_rate)
+                else:
+                    flt = BloomMembershipFilter(
+                        capacity=capacity, error_rate=error_rate
+                    )
+                    assert (flt.num_bits, flt.num_hashes) == expected
+
     def test_high_error_capacity_can_exceed_budget_bits(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -144,6 +177,27 @@ class TestBloomMembershipFilterSizing:
         assert requested_sizes == [expected_bytes]
         assert bloom_filter_module._MAX_FILTER_BYTES // 2 < expected_bytes
         assert expected_bytes <= bloom_filter_module._MAX_FILTER_BYTES
+
+    def test_real_budget_counterexample_selects_two_hashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rounded continuous k=1 misses a valid k=2 budget fit."""
+        requested_sizes: list[int] = []
+
+        def record_allocation(size: int) -> bytearray:
+            requested_sizes.append(size)
+            return builtins.bytearray()
+
+        monkeypatch.setattr(
+            bloom_filter_module, "bytearray", record_allocation, raising=False
+        )
+
+        flt = BloomMembershipFilter(capacity=500_000_000, error_rate=0.37)
+
+        assert flt.num_hashes == 2
+        assert flt.num_bits == 1_067_009_916
+        assert requested_sizes == [133_376_240]
+        assert requested_sizes[0] <= bloom_filter_module._MAX_FILTER_BYTES
 
     def test_hostile_huge_capacity_is_rejected_before_allocation(
         self, monkeypatch: pytest.MonkeyPatch

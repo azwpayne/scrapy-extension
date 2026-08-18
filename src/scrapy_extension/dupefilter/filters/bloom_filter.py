@@ -1,15 +1,18 @@
 """Stdlib Bloom-filter membership strategy (subsystem ①).
 
 Probabilistic, in-process, space-efficient. Never produces false negatives;
-false-positive rate is bounded by ``error_rate`` at ``capacity`` items. Does
-not support deletion — use the cuckoo strategy for that. State is per-process,
-not shared across workers.
+false-positive rate is bounded by ``error_rate`` at ``capacity`` items. Neither
+Bloom nor Cuckoo supports item-level removal; use the exact memory or set
+strategy when that is required. Cuckoo supports only a whole-filter ``clear()``.
+State is per-process, not shared across workers.
 
 Each item maps to ``k`` distinct positions. The sizing bound therefore uses
 sampling without replacement within an item rather than assuming that repeated
-hash positions provide ``k`` independent checks. Allocations are capped at a
-conservative 128 MiB per filter so extreme, otherwise-valid settings fail before
-``bytearray`` can exhaust the process.
+hash positions provide ``k`` independent checks. Sizing tests every supported
+hash count from 1 through 64 and deterministically chooses the smallest valid
+bit vector. Allocations are capped at a conservative 128 MiB per filter so
+extreme, otherwise-valid settings fail before ``bytearray`` can exhaust the
+process.
 """
 
 from __future__ import annotations
@@ -76,36 +79,11 @@ class BloomMembershipFilter(MembershipFilter):
                 f"got {error_rate}"
             )
 
-        # The continuous optimum is -log2(p). Choose an integer k first, cap
-        # hash work at a practical constant, and then solve m for that exact k.
-        # Capping k does not relax the requested bound: m grows as necessary.
-        k = min(_MAX_HASHES, max(1, round(-math.log2(error_rate))))
         max_bits = _MAX_FILTER_BYTES * 8
-        target_root = math.exp(math.log(error_rate) / k)
-
-        # Bound capacity before any operation could coerce a hostile-size int to
-        # float. For every m <= max_bits,
-        #
-        #   (1 - k/m) ** n <= exp(-k*n/max_bits).
-        #
-        # Consequently no vector within the budget can meet the target once n
-        # exceeds -max_bits*log(1 - p**(1/k))/k. Round that multiplier up and
-        # add one whole max_bits interval so floating-point rounding can only
-        # make this precheck more permissive, never reject a viable vector.
-        capacity_intervals = math.ceil(-math.log1p(-target_root) / k) + 1
-        if capacity > max_bits * capacity_intervals:
-            self._raise_allocation_error(max_bits + 1)
-
-        denominator = -math.expm1(math.log1p(-target_root) / capacity)
-        m = max(k + 1, math.ceil(k / denominator))
+        m, k = self._select_sizing(capacity, error_rate, max_bits)
+        # Apply the allocation fence only after all supported hash counts have
+        # been considered; a non-optimal k may exceed it while the optimum fits.
         self._check_allocation(m)
-
-        # Guard against downward floating-point rounding at the boundary.
-        # Compare in log space so very small representable rates stay stable.
-        log_error_rate = math.log(error_rate)
-        while self._log_false_positive_bound(capacity, m, k) > log_error_rate:
-            m += 1
-            self._check_allocation(m)
 
         self._num_bits = m
         self._num_hashes = k
@@ -166,6 +144,68 @@ class BloomMembershipFilter(MembershipFilter):
         log_unset_probability = capacity * math.log1p(-num_hashes / num_bits)
         set_probability = -math.expm1(log_unset_probability)
         return num_hashes * math.log(set_probability)
+
+    @classmethod
+    def _select_sizing(
+        cls, capacity: int, error_rate: float, max_bits: int
+    ) -> tuple[int, int]:
+        """Return the smallest valid ``(m, k)`` across every supported k.
+
+        Candidates are compared by bit count and then hash count, so equal-size
+        vectors deterministically prefer fewer hashes. A ``max_bits + 1``
+        sentinel lets the caller apply the byte-rounded allocation fence once,
+        after every k has been evaluated.
+        """
+        log_error_rate = math.log(error_rate)
+        best = (max_bits + 1, 1)
+        for num_hashes in range(1, _MAX_HASHES + 1):
+            num_bits = cls._minimum_num_bits(
+                capacity, log_error_rate, num_hashes, max_bits
+            )
+            best = min(best, (num_bits, num_hashes))
+        return best
+
+    @classmethod
+    def _minimum_num_bits(
+        cls,
+        capacity: int,
+        log_error_rate: float,
+        num_hashes: int,
+        max_bits: int,
+    ) -> int:
+        """Find the exact minimum m for one k, bounded by the allocation fence."""
+        over_budget = max_bits + 1
+        if max_bits <= num_hashes:
+            return over_budget
+
+        # Avoid coercing a hostile-size Python int to float. For m <= max_bits
+        # and n > 64*m, even k=1 has FPR above the largest float below 1;
+        # larger k only strengthens that conclusion. The sentinel still flows
+        # through the common post-selection budget check.
+        if capacity > _MAX_HASHES * max_bits:
+            return over_budget
+
+        if (
+            cls._log_false_positive_bound(capacity, max_bits, num_hashes)
+            > log_error_rate
+        ):
+            return over_budget
+
+        # The bound decreases monotonically with m. Binary search avoids a
+        # rounded continuous approximation and returns the exact integral size
+        # according to the stable log-space comparison.
+        lower = num_hashes + 1
+        upper = max_bits
+        while lower < upper:
+            midpoint = (lower + upper) // 2
+            if (
+                cls._log_false_positive_bound(capacity, midpoint, num_hashes)
+                <= log_error_rate
+            ):
+                upper = midpoint
+            else:
+                lower = midpoint + 1
+        return lower
 
     @staticmethod
     def _raise_allocation_error(num_bits: int) -> None:

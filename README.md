@@ -712,15 +712,14 @@ Three strategy layers sit above the backend interfaces, selected via Scrapy sett
 | `bloom` | no (FP) | no | no | pure-stdlib bit-vector; `SCRAPY_DEDUP_BLOOM_CAPACITY` / `_ERROR_RATE` |
 | `cuckoo` | no (FP) | no | no (clear only) | pure-stdlib; `SCRAPY_DEDUP_CUCKOO_CAPACITY` / `_ERROR_RATE` |
 
-<<<<<<< HEAD
-Probabilistic filters never produce false negatives; in-memory filters are per-process (single-worker). Use `set` for multi-worker exact dedup. If item-level removal is required, choose the exact `memory` or `set` strategy; Cuckoo supports only `clear()` for a whole-filter reset.
-=======
 Probabilistic filters never produce false negatives; in-memory filters are
-per-process (single-worker). Use `set` for multi-worker exact dedup. A Bloom
-filter is limited to a conservative 128 MiB bit-vector per instance;
-capacity/error-rate combinations that require more fail during configuration
+per-process (single-worker). Use `set` for multi-worker exact dedup. If item-level removal is required, choose the exact `memory` or `set` strategy; Cuckoo supports only `clear()` for a whole-filter reset.
+
+A Bloom filter tests all supported hash counts from 1 through the 64-hash work
+cap, chooses the smallest valid bit vector (preferring fewer hashes on ties),
+and limits that vector to a conservative 128 MiB per instance.
+Capacity/error-rate combinations that require more fail during configuration
 before allocation.
->>>>>>> b1312de (fix(bloom): bound memory while honoring FPR targets)
 
 The default `set` strategy requires a set-capable backend. Queue-only backends
 can use a local `memory`, `bloom`, or `cuckoo` filter, but those filters do not
