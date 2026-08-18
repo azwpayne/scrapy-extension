@@ -235,6 +235,33 @@ def test_concurrent_contention_uses_one_atomic_command_per_pop(
     assert collection.documents == [poison]
 
 
+@pytest.mark.parametrize(
+    "priority",
+    [True, False, "1", float("nan"), float("inf"), float("-inf"), 10**10000],
+    ids=[
+        "true",
+        "false",
+        "text",
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "oversized-int",
+    ],
+)
+def test_push_rejects_undeliverable_priority_before_insert(
+    mocker: Any, priority: object
+) -> None:
+    collection = mocker.MagicMock()
+    backend = _backend(mocker, collection)
+
+    with pytest.raises(
+        ValueError, match="priority must be a finite non-boolean number"
+    ):
+        backend.push(_QUEUE, b"payload", priority=priority)  # type: ignore[arg-type]
+
+    collection.insert_one.assert_not_called()
+
+
 def test_pop_query_is_strict_and_accepts_bson_binary_result(mocker: Any) -> None:
     collection = mocker.MagicMock()
     document = _valid_document("binary", Binary(b"payload", subtype=128))

@@ -21,16 +21,28 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
+# Import the distribution's top-level package before its bundled ``bson``
+# namespace. When the optional extra is absent, this preserves the actionable
+# ``pymongo`` classification instead of failing first with ``No module named
+# 'bson'``.
 try:
-    from bson.binary import Binary
-    from bson.decimal128 import Decimal128
-    from bson.errors import BSONError
     from pymongo import ASCENDING, MongoClient, ReadPreference
     from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
     from pymongo.read_concern import ReadConcern
     from pymongo.write_concern import WriteConcern
 except ImportError as e:
     if not _is_missing_optional_dependency(e, "pymongo"):
+        raise
+    raise ImportError(
+        "MongoDB backend requires 'pymongo'. Install with: pip install scrapy-extension[mongodb]"
+    ) from e
+
+try:
+    from bson.binary import Binary
+    from bson.decimal128 import Decimal128
+    from bson.errors import BSONError
+except ImportError as e:
+    if not _is_missing_optional_dependency(e, "bson"):
         raise
     raise ImportError(
         "MongoDB backend requires 'pymongo'. Install with: pip install scrapy-extension[mongodb]"
@@ -147,6 +159,26 @@ def _validate_queue_name_argument(
 ) -> None:
     """Validate a direct MongoDB queue name outside its terminal boundary."""
     _validate_key_name(queue_name, "queue_name")
+
+
+def _validate_queue_push_arguments(
+    _backend: object,
+    queue_name: str,
+    _item: bytes,
+    priority: float = 0.0,
+) -> None:
+    """Reject priorities that a durable write would immediately quarantine."""
+    _validate_key_name(queue_name, "queue_name")
+    try:
+        valid_priority = (
+            not isinstance(priority, bool)
+            and isinstance(priority, (int, float))
+            and math.isfinite(priority)
+        )
+    except OverflowError:
+        valid_priority = False
+    if not valid_priority:
+        raise ValueError("priority must be a finite non-boolean number")
 
 
 def _active_queue_filter(queue_name: str) -> dict[str, Any]:
@@ -1086,7 +1118,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     @queue_operation_error_boundary(
         "push",
         _MONGODB_QUEUE_PUSH_ERROR,
-        validator=_validate_queue_name_argument,
+        validator=_validate_queue_push_arguments,
         handled_exception_types=(QueueError, BackendConnectionError),
     )
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:

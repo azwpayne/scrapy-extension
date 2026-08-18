@@ -32,9 +32,13 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Barrier
 
 import pytest
+from bson.decimal128 import Decimal128
+from bson.int64 import Int64
 
 pytestmark = [
     pytest.mark.integration,
@@ -95,6 +99,34 @@ def test_push_pop_round_trip_atomic(mongo_backend, unique_prefix):
     assert mongo_backend.queue_len(queue) == 0
 
 
+def test_concurrent_live_pop_has_one_winner_and_conserves_the_item(
+    mongo_backend, unique_prefix
+):
+    """Concurrent live-server deletes deliver one document exactly once."""
+    queue = f"{unique_prefix}:contended"
+    payload = b"single-winner"
+    caller_count = 24
+    mongo_backend.push(queue, payload)
+    start = Barrier(caller_count)
+
+    def pop_once(_index):  # type: ignore[no-untyped-def]
+        start.wait(timeout=10)
+        return mongo_backend.pop(queue, timeout=0.0)
+
+    try:
+        with ThreadPoolExecutor(max_workers=caller_count) as executor:
+            results = list(executor.map(pop_once, range(caller_count)))
+
+        delivered = [result for result in results if result is not None]
+        remaining = mongo_backend.queue_len(queue)
+        assert delivered == [payload]
+        assert results.count(None) == caller_count - 1
+        assert len(delivered) + remaining == 1
+        assert remaining == 0
+    finally:
+        mongo_backend.clear_queue(queue)
+
+
 def test_priority_ordering(mongo_backend, unique_prefix):
     """Higher priority pops first (priority negated on push, ASC sort on pop)."""
     queue = f"{unique_prefix}:prio"
@@ -151,6 +183,24 @@ def test_poison_records_are_durable_and_excluded_from_active_length(
         },
         {
             "queue_name": queue,
+            "item": b"decimal-nan-priority",
+            "priority": Decimal128("NaN"),
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"decimal-positive-infinity-priority",
+            "priority": Decimal128("Infinity"),
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"decimal-negative-infinity-priority",
+            "priority": Decimal128("-Infinity"),
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
             "item": b"bad-created-at",
             "priority": -100.0,
             "created_at": "not-a-date",
@@ -166,6 +216,51 @@ def test_poison_records_are_durable_and_excluded_from_active_length(
 
     mongo_backend.clear_queue(queue)
     assert collection.count_documents({"queue_name": queue}) == 0
+
+
+def test_active_filter_accepts_all_finite_bson_numeric_types(
+    mongo_backend, unique_prefix
+):
+    """Double, int32, int64, and Decimal128 priorities remain deliverable."""
+    queue = f"{unique_prefix}:numeric-types"
+    collection = mongo_backend._queue_collection
+    assert collection is not None
+    now = datetime.now(tz=timezone.utc)
+    documents = [
+        {
+            "queue_name": queue,
+            "item": b"double",
+            "priority": 1.5,
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"int32",
+            "priority": 1,
+            "created_at": now + timedelta(microseconds=1),
+        },
+        {
+            "queue_name": queue,
+            "item": b"int64",
+            "priority": Int64(2**40),
+            "created_at": now + timedelta(microseconds=2),
+        },
+        {
+            "queue_name": queue,
+            "item": b"decimal128",
+            "priority": Decimal128("2.5"),
+            "created_at": now + timedelta(microseconds=3),
+        },
+    ]
+    collection.insert_many(documents)
+
+    try:
+        assert mongo_backend.queue_len(queue) == len(documents)
+        delivered = [mongo_backend.pop(queue) for _document in documents]
+        assert set(delivered) == {b"double", b"int32", b"int64", b"decimal128"}
+        assert mongo_backend.queue_len(queue) == 0
+    finally:
+        mongo_backend.clear_queue(queue)
 
 
 def test_set_add_duplicate_contract(mongo_backend, unique_prefix):

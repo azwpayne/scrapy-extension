@@ -506,6 +506,38 @@ class TestBackendImportErrorMessage:
             if cached is not None:
                 sys.modules[module_path] = cached
 
+    def test_mongodb_hint_survives_when_bson_and_pymongo_are_both_absent(
+        self, mocker
+    ) -> None:
+        """The bundled bson namespace must not mask the missing-extra hint."""
+        import builtins
+        import importlib
+        import sys
+
+        original_import = builtins.__import__
+
+        def blocking_import(name, *args, **kwargs):
+            if name == "pymongo" or name.startswith("pymongo."):
+                raise ModuleNotFoundError(
+                    "No module named 'pymongo' (mocked)", name="pymongo"
+                )
+            if name == "bson" or name.startswith("bson."):
+                raise ModuleNotFoundError(
+                    "No module named 'bson' (mocked)", name="bson"
+                )
+            return original_import(name, *args, **kwargs)
+
+        mocker.patch.object(builtins, "__import__", side_effect=blocking_import)
+        module_path = "scrapy_extension.backends.mongodb"
+        cached = sys.modules.pop(module_path, None)
+        try:
+            with pytest.raises(ImportError) as exc_info:
+                importlib.import_module(module_path)
+            assert "pip install scrapy-extension[mongodb]" in str(exc_info.value)
+        finally:
+            if cached is not None:
+                sys.modules[module_path] = cached
+
 
 class TestVersionFromPackageMetadata:
     """R26-D1: __version__ must come from package metadata, not hardcoded.
