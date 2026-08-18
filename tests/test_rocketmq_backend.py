@@ -601,6 +601,38 @@ def test_connect_revalidates_mutated_cloud_security_before_sdk_io(mocker) -> Non
     mock_consumer_cls.assert_not_called()
 
 
+@pytest.mark.parametrize("mutated_timeout", [True, 1.5, "1000", -1, 300_001])
+def test_connect_revalidates_mutated_send_timeout_before_sdk_io(
+    mocker, mutated_timeout: object
+) -> None:
+    (
+        mock_producer_cls,
+        mock_consumer_cls,
+        _,
+        mock_config_cls,
+        mock_credentials_cls,
+    ) = _patch_rocketmq(mocker)
+    config = RocketMQSettings()
+    backend = RocketMQBackend(config)
+    config.send_timeout = cast("int", mutated_timeout)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        backend.connect()
+
+    error = exc_info.value
+    assert str(error) == (
+        "RocketMQ send_timeout must be an integer between 0 and 300000 milliseconds."
+    )
+    assert error.setting_name == "send_timeout"
+    assert error.setting_value is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    mock_config_cls.assert_not_called()
+    mock_credentials_cls.assert_not_called()
+    mock_producer_cls.assert_not_called()
+    mock_consumer_cls.assert_not_called()
+
+
 def test_connect_uses_one_validated_settings_snapshot(mocker) -> None:
     (
         mock_producer_cls,

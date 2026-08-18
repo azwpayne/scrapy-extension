@@ -67,9 +67,13 @@ logger = logging.getLogger(__name__)
 _ROCKETMQ_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
     RocketMQSettings.model_fields
 )
+_ROCKETMQ_SEND_TIMEOUT_ERROR = (
+    "RocketMQ send_timeout must be an integer between 0 and 300000 milliseconds."
+)
 _ROCKETMQ_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     {
         ROCKETMQ_NAMESRV_ENDPOINTS_ERROR,
+        _ROCKETMQ_SEND_TIMEOUT_ERROR,
         "Unsupported RocketMQ mode.",
         "Cloud mode requires access_key and secret_key.",
     }
@@ -152,6 +156,16 @@ def _validate_queue_name_argument(
 ) -> None:
     """Validate a public queue argument before its terminal error boundary."""
     _validate_key_name(queue_name, "queue_name")
+
+
+def _validate_send_timeout(send_timeout: object) -> int:
+    """Revalidate mutable settings before deriving an SDK timeout."""
+    if type(send_timeout) is not int or send_timeout < 0 or send_timeout > 300_000:
+        raise ConfigurationError(
+            _ROCKETMQ_SEND_TIMEOUT_ERROR,
+            setting_name="send_timeout",
+        )
+    return send_timeout
 
 
 class _RocketMQCleanupResult:
@@ -336,7 +350,7 @@ class RocketMQBackend(Backend, QueueBackend):
         access_key = self.config.access_key
         secret_key = self.config.secret_key
         consumer_group = self.config.consumer_group
-        send_timeout = self.config.send_timeout
+        send_timeout = _validate_send_timeout(self.config.send_timeout)
         tls_enabled = self.config.tls_enabled
         allow_remote_plaintext = self.config.allow_remote_plaintext
         _, namesrv_address, key_text, secret_text, tls_enabled = (
