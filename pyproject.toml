@@ -306,6 +306,7 @@ markers = [
     "integration: complete live-broker tier under tests/integration",
     "e2e: descriptive label on selected end-to-end contracts; not a complete tier",
     "benchmark: opt-in pytest-benchmark measurements",
+    "reference_model: local model checks with no production backend evidence",
 ]
 [tool.coverage.run]
 source = ["src"]

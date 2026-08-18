@@ -26,7 +26,7 @@ dedup-saturated / worker-crash. Monitor emits push/pop/dedup/store counters + on
 
 **TDD:**
 - `test_monitor.py`: `on_pop_rate` sets `queue/pop_rate_1m`; `on_filter_saturation` sets `dupefilter/filter_saturation` (extend the existing per-hook stat tests + parametrize table).
-- `test_load_scale.py` or new `test_operability.py`: drive 100 pops within a mocked 60s window → assert `queue/pop_rate_1m` reflects ~100/min; drive cuckoo near capacity → assert `dupefilter/filter_saturation` rises.
+- `test_monitor.py`: drive 100 pop attempts inside the rolling window and assert `queue/pop_rate_1m`; drive Cuckoo toward its configured target and assert `dupefilter/filter_saturation` rises. These are component/monitor tests, not production-backend load evidence.
 - Default-off safety: `NullMonitor` + a bare `Monitor()` are no-op (no crash when no crawler).
 
 **Acceptance:** a simulated stuck crawl (no pops for 60s) produces `queue/pop_rate_1m=0`; a cuckoo at 95% capacity produces `dupefilter/filter_saturation=0.95`. Operator can diagnose from stats alone.

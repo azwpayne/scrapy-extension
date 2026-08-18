@@ -472,9 +472,7 @@ def test_cuckoo_digest_budget_error_is_attributed_to_error_rate(
     with pytest.raises(ConfigurationError, match="32-byte SHA-256 digest") as exc_info:
         BackendDupeFilter.from_settings(settings)
 
-    assert (
-        exc_info.value.setting_name == "SCRAPY_DEDUP_CUCKOO_ERROR_RATE"
-    )
+    assert exc_info.value.setting_name == "SCRAPY_DEDUP_CUCKOO_ERROR_RATE"
 
 
 def test_dupefilter_accepts_numeric_environment_strings(

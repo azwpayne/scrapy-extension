@@ -1124,7 +1124,11 @@ uv run pytest --cov=scrapy_extension --cov-report=term-missing \
 uv run poe test
 ```
 
-Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov, pytest-timeout, and pytest-socket (the default suite runs with sockets disabled). CI emits `coverage.json` and independently requires at least 95% statement coverage and 91% branch coverage; it does not report a misleading blended floor. Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and an explicit loopback boundary, for example `uv run --no-sync pytest tests/integration -m integration --allow-hosts=localhost,127.0.0.1,::1`.
+Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov, pytest-timeout, and pytest-socket (the default suite runs with sockets disabled). CI emits `coverage.json` and independently requires at least 95% statement coverage and 91% branch coverage; it does not report a misleading blended floor. Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins.
+
+`tests/test_reference_model_token_concurrency.py` and `tests/test_reference_model_list_queue.py` are collected under `-m reference_model`. They execute local token/set/list models and provide **no production backend evidence**. Run them with `uv run pytest -m reference_model`; do not cite them for Kafka, RabbitMQ, SQS, Redis, MongoDB, or `BackendQueue` load/concurrency claims. `tests/test_memory_membership_filter_scale.py` separately executes the production `MemoryMembershipFilter`, but still supplies no shared-backend or multi-process evidence.
+
+Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and an explicit loopback boundary, for example `uv run --no-sync pytest tests/integration -m integration --allow-hosts=localhost,127.0.0.1,::1`.
 
 ## License
 

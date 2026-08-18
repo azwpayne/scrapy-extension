@@ -12,6 +12,8 @@ from hypothesis import strategies as st
 from scrapy_extension.dupefilter.filters.base import FilterFull
 from scrapy_extension.dupefilter.filters.cuckoo_filter import CuckooMembershipFilter
 
+_HYPOTHESIS_DEFAULT_BEFORE_CUCKOO_LOCAL_SETTINGS = settings.default
+
 
 class TestCuckooMembershipFilterSizing:
     def test_invalid_capacity(self) -> None:
@@ -248,24 +250,17 @@ class TestCuckooMembershipFilterProperties:
       bounded by a generous multiple of ``error_rate`` — probabilistic filters
       must never false-negative and their FP must stay within design bounds.
 
-    Uses ``hypothesis`` with a ``derandomize``-style seeded profile so CI is
-    reproducible: the same ``--hYPOTHESIS_SEED`` / fixed ``random_factory``
-    produces the same generated cases every run.
+    The generated property has local ``@settings`` so importing or executing
+    this module never replaces Hypothesis' process-wide default profile.
     """
 
-    @pytest.fixture(autouse=True)
-    def _derandomize_profile(self) -> None:
-        """Pin hypothesis to a derandomized profile for deterministic FP-rate checks."""
-        settings.register_profile(
-            "ci_derandomized",
-            derandomize=True,
-            max_examples=50,
-            deadline=None,
-            suppress_health_check=[HealthCheck.too_slow],
-            verbosity=Verbosity.normal,
-        )
-        settings.load_profile("ci_derandomized")
-
+    @settings(
+        derandomize=True,
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow],
+        verbosity=Verbosity.normal,
+    )
     @given(
         items=st.lists(
             st.binary(min_size=1, max_size=32),
@@ -287,6 +282,15 @@ class TestCuckooMembershipFilterProperties:
             flt.add(item)
         for item in items:
             assert item in flt, f"cuckoo false negative for {item!r}"
+
+    def test_local_hypothesis_settings_do_not_mutate_global_default(self) -> None:
+        local = getattr(
+            type(self).test_no_false_negatives_property,
+            "_hypothesis_internal_use_settings",
+        )
+        assert local.derandomize is True
+        assert local.max_examples == 50
+        assert settings.default is _HYPOTHESIS_DEFAULT_BEFORE_CUCKOO_LOCAL_SETTINGS
 
     def test_false_positive_rate_property(self) -> None:
         """FP rate over unseen keys stays within 5x target (derandomized, deterministic).

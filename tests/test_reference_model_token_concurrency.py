@@ -1,23 +1,15 @@
-"""Round-8 concurrency correctness tests — in-flight-set thread safety.
+"""Threaded reference-model tests for token/in-flight bookkeeping.
 
-HONEST SCOPE: this module pins the round-3 ``Not-tested: concurrent
-next_request under true thread parallelism`` gap. The broker I/O is mocked;
-the in-flight-set data structure under test is REAL and shared across
-threads. This is genuine thread parallelism (``threading.Thread`` +
-``ThreadPoolExecutor``), NOT asyncio — Scrapy is Twisted, but the in-flight
-ack set must be thread-safe regardless of the runtime concurrency model.
+These tests exercise only local classes defined in this module. They provide
+**no production backend evidence** for Kafka, RabbitMQ, SQS, their SDK tokens,
+or ``BackendQueue``. The model is inspired by their add/discard bookkeeping,
+but it does not import or execute any production backend code and cannot prove
+production locking, broker, retry, ack, or redelivery behavior.
 
-WHAT THIS CATCHES:
-- Token lost (popped but never acked under contention)
-- Double-ack (same token acked twice — KeyError or silent miscount)
-- ``_in_flight`` not emptying after all acks complete
-- Race in the pop-then-add / discard-then-commit interleaving
-
-MOCK FIDELITY: the mock mirrors the real Kafka/RabbitMQ/SQS backends' locking
-granularity — a plain ``set`` + ``discard`` for the in-flight set, with NO
-extra synchronization added by the mock. If the in-flight-set pattern has a
-real race, this test MUST catch it. We do NOT paper over races by adding
-locks to the mock that the real backends don't have.
+Within that deliberately narrow model, real ``ThreadPoolExecutor`` contention
+checks count conservation, duplicate commits, and cleanup of a shared Python
+``set``. Failures diagnose the reference model; production concurrency claims
+require backend-specific tests or live-broker integration evidence.
 """
 
 from __future__ import annotations
@@ -27,14 +19,13 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 
-class _AckToken:
-    """Opaque ack token mirroring ``_KafkaAckToken`` / ``_SqsAckToken``.
+pytestmark = pytest.mark.reference_model
 
-    Carries a monotonically-increasing sequence number so the concurrency test
-    can verify every popped token is acked exactly once. Hashable + equality
-    by sequence (matches the real tokens' value semantics).
-    """
+
+class _ReferenceAckToken:
+    """Local sequence token used only by the reference model."""
 
     __slots__ = ("seq",)
 
@@ -42,7 +33,7 @@ class _AckToken:
         self.seq = seq
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _AckToken):
+        if not isinstance(other, _ReferenceAckToken):
             return NotImplemented
         return self.seq == other.seq
 
@@ -50,26 +41,16 @@ class _AckToken:
         return hash(self.seq)
 
     def __repr__(self) -> str:
-        return f"_AckToken(seq={self.seq})"
+        return f"_ReferenceAckToken(seq={self.seq})"
 
 
-class _MockInFlightQueueBackend:
-    """Mock queue backend mirroring the real in-flight-set ack pattern.
+class _ReferenceInFlightQueue:
+    """Local list/set token model; not a ``QueueBackend`` implementation.
 
-    IMPORTANT — locking granularity: this mock uses a plain ``set`` for
-    ``_in_flight`` and ``set.add`` / ``set.discard`` for pop-track / ack-clear,
-    matching the real Kafka (``_in_flight[p].add(offset)`` / ``in_flight.discard(o)``),
-    RabbitMQ (``_in_flight_tags.add(t)`` / ``_in_flight_tags.discard(t)``), and
-    SQS (``_in_flight.add(token)`` / ``_in_flight.discard(token)``) backends. We
-    deliberately do NOT add a lock around pop/ack here: if a race exists in the
-    pattern, the test must catch it (the real backends have no lock either —
-    they rely on the GIL for individual set ops, and on Twisted's single-thread
-    reactor for pop/ack interleaving). Adding a mock-side lock would hide a
-    real bug.
-
-    The only lock here guards the source queue (the producer side), so the
-    sequence numbers are handed out without duplicates — that's the mock's I/O
-    substrate, not the data structure under test.
+    A source-list lock makes sequence allocation deterministic. The separate
+    in-flight set intentionally uses bare ``add``/``discard`` so the tests can
+    characterize that local Python model under thread contention. Production
+    backend classes, SDK calls, and their synchronization are not exercised.
     """
 
     requires_ack = True
@@ -83,9 +64,8 @@ class _MockInFlightQueueBackend:
         """
         self._source: list[int] = list(range(total_items))
         self._source_lock = threading.Lock()  # guards the source list only
-        # In-flight set — the data structure under test. No lock on this set;
-        # mirrors the real backends. pop adds, ack/nack discards.
-        self._in_flight: set[_AckToken] = set()
+        # In-flight set under reference-model test. Pop adds; ack/nack discards.
+        self._in_flight: set[_ReferenceAckToken] = set()
         # Commit log — records each ack in arrival order so the test can assert
         # exactly-once. Guarded by its own lock so the assertion isn't itself
         # the source of a race.
@@ -97,28 +77,21 @@ class _MockInFlightQueueBackend:
 
     def pop_with_ack(
         self, queue_name: str, timeout: float = 0.0
-    ) -> tuple[bytes | None, _AckToken | None]:
-        """Pop the next item + record its token in the in-flight set.
-
-        Mirrors the real backends' pop_with_ack: get next message, build token,
-        ``_in_flight.add(token)``. The add is intentionally not inside the source
-        lock — that's how the real backends behave (lock around consumer poll,
-        not around the in-flight bookkeeping).
-        """
+    ) -> tuple[bytes | None, _ReferenceAckToken | None]:
+        """Pop one local item and record its reference token as in flight."""
         del queue_name, timeout
         with self._source_lock:
             if not self._source:
                 return (None, None)
             seq = self._source.pop(0)
-        token = _AckToken(seq)
-        # In-flight add — NOT under the source lock. This is the exact
-        # interleaving surface the real backends expose.
+        token = _ReferenceAckToken(seq)
+        # Deliberately outside the source lock to exercise the model's interleaving.
         self._in_flight.add(token)
         if self.pop_delay:
             time.sleep(self.pop_delay)
         return (str(seq).encode(), token)
 
-    def ack(self, queue_name: str, *, token: _AckToken | None = None) -> None:
+    def ack(self, queue_name: str, *, token: _ReferenceAckToken | None = None) -> None:
         """Ack a token — discard from in-flight + record the commit."""
         del queue_name
         if token is None:
@@ -127,12 +100,8 @@ class _MockInFlightQueueBackend:
         with self._commits_lock:
             self._commits.append(token.seq)
 
-    def nack(self, queue_name: str, *, token: _AckToken | None = None) -> None:
-        """Nack a token — discard from in-flight WITHOUT recording a commit.
-
-        Mirrors the real nack semantics (message left uncommitted so it
-        re-delivers; in-flight bookkeeping cleared either way).
-        """
+    def nack(self, queue_name: str, *, token: _ReferenceAckToken | None = None) -> None:
+        """Discard a reference token without recording a model commit."""
         del queue_name
         if token is None:
             return
@@ -150,11 +119,11 @@ class _MockInFlightQueueBackend:
             return list(self._commits)
 
 
-def _worker_pop_then_ack(
-    backend: _MockInFlightQueueBackend,
+def _reference_worker_pop_then_ack(
+    model: _ReferenceInFlightQueue,
     ops: int,
     barrier: threading.Barrier,
-    results: list[tuple[int, _AckToken | None]],
+    results: list[tuple[int, _ReferenceAckToken | None]],
     results_lock: threading.Lock,
 ) -> None:
     """Worker: wait on the barrier, then do ``ops`` pop-then-ack cycles.
@@ -166,25 +135,25 @@ def _worker_pop_then_ack(
     wid = threading.get_ident()
     barrier.wait()  # release all threads simultaneously
     for _ in range(ops):
-        _data, token = backend.pop_with_ack("queue")
+        _data, token = model.pop_with_ack("queue")
         if token is None:
             # Queue drained before this thread finished its quota — record + exit.
             with results_lock:
                 results.append((wid, None))
             return
         # Ack immediately (the common Scrapy path: pop -> process -> ack).
-        backend.ack("queue", token=token)
+        model.ack("queue", token=token)
         with results_lock:
             results.append((wid, token))
 
 
-class TestInFlightSetConcurrency:
-    """In-flight-set is correct under true thread parallelism."""
+class TestReferenceInFlightSetConcurrency:
+    """Characterize the local in-flight set under true thread parallelism."""
 
-    def test_acked_exactly_once_16x100(self) -> None:
+    def test_reference_model_acked_exactly_once_16x100(self) -> None:
         """16 threads x 100 ops = 1600 pop+ack cycles; every token acked exactly once.
 
-        Pins the round-3 Not-tested gap. Asserts:
+        Characterizes only the local model. Asserts:
         - 1600 tokens popped == 1600 acks recorded (no token lost)
         - every acked seq is unique (no double-ack)
         - the in-flight set empties after all threads join (no leak)
@@ -193,16 +162,16 @@ class TestInFlightSetConcurrency:
         n_threads = 16
         ops_per_thread = 100
         total = n_threads * ops_per_thread
-        backend = _MockInFlightQueueBackend(total_items=total)
+        model = _ReferenceInFlightQueue(total_items=total)
         barrier = threading.Barrier(n_threads)
-        results: list[tuple[int, _AckToken | None]] = []
+        results: list[tuple[int, _ReferenceAckToken | None]] = []
         results_lock = threading.Lock()
 
         with ThreadPoolExecutor(max_workers=n_threads) as ex:
             futures = [
                 ex.submit(
-                    _worker_pop_then_ack,
-                    backend,
+                    _reference_worker_pop_then_ack,
+                    model,
                     ops_per_thread,
                     barrier,
                     results,
@@ -215,7 +184,7 @@ class TestInFlightSetConcurrency:
             for f in futures:
                 f.result()
 
-        commits = backend.commits
+        commits = model.commits
         counter = Counter(commits)
 
         # (1) No token lost: every seq 0..total-1 was acked exactly once.
@@ -232,8 +201,8 @@ class TestInFlightSetConcurrency:
         )
 
         # (3) In-flight set empties — no token leaked (popped but never acked/nacked).
-        assert backend.in_flight_size == 0, (
-            f"in-flight set not empty after all acks: {backend.in_flight_size} leaked"
+        assert model.in_flight_size == 0, (
+            f"in-flight set not empty after all acks: {model.in_flight_size} leaked"
         )
 
         # (4) Count conservation: total acks == total items.
@@ -247,7 +216,7 @@ class TestInFlightSetConcurrency:
             f"popped {len(popped_tokens)} tokens, expected {total}"
         )
 
-    def test_acked_exactly_once_32x50_high_contention(self) -> None:
+    def test_reference_model_acked_exactly_once_32x50_high_contention(self) -> None:
         """32 threads x 50 ops with a small pop delay — widens the race window.
 
         A tiny ``pop_delay`` between pop-return and the next op widens the
@@ -258,17 +227,17 @@ class TestInFlightSetConcurrency:
         n_threads = 32
         ops_per_thread = 50
         total = n_threads * ops_per_thread
-        backend = _MockInFlightQueueBackend(total_items=total)
-        backend.pop_delay = 0.0002  # 200us — widens the window without slowing CI much
+        model = _ReferenceInFlightQueue(total_items=total)
+        model.pop_delay = 0.0002  # 200us — widens the window without slowing CI much
         barrier = threading.Barrier(n_threads)
-        results: list[tuple[int, _AckToken | None]] = []
+        results: list[tuple[int, _ReferenceAckToken | None]] = []
         results_lock = threading.Lock()
 
         with ThreadPoolExecutor(max_workers=n_threads) as ex:
             futures = [
                 ex.submit(
-                    _worker_pop_then_ack,
-                    backend,
+                    _reference_worker_pop_then_ack,
+                    model,
                     ops_per_thread,
                     barrier,
                     results,
@@ -279,80 +248,79 @@ class TestInFlightSetConcurrency:
             for f in futures:
                 f.result()  # will raise if any worker threw
 
-        commits = backend.commits
+        commits = model.commits
         counter = Counter(commits)
 
         assert len(commits) == total, f"commit count {len(commits)} != total {total}"
-        assert backend.in_flight_size == 0, (
-            f"in-flight leak: {backend.in_flight_size} unacked"
+        assert model.in_flight_size == 0, (
+            f"in-flight leak: {model.in_flight_size} unacked"
         )
         assert not [s for s, c in counter.items() if c > 1], "double-ack detected"
         assert not [s for s in range(total) if counter[s] == 0], "token lost"
 
-    def test_nack_returns_token_to_in_flight_under_contention(self) -> None:
+    def test_reference_model_nack_clears_in_flight_under_contention(self) -> None:
         """Nack under contention discards from in-flight without committing.
 
-        Mirrors the at-least-once nack contract: a nacked token is NOT committed
-        (so it re-delivers), and the in-flight set must still drain without
-        leaking or double-discarding. Mixes ack and nack across threads.
+        In this model a nacked token is not appended to the commit log, while
+        both ack and nack discard in-flight bookkeeping. No redelivery occurs or
+        is proved here. The test mixes model ack/nack operations across threads.
         """
         n_threads = 8
         ops_per_thread = 25
         total = n_threads * ops_per_thread
-        backend = _MockInFlightQueueBackend(total_items=total)
+        model = _ReferenceInFlightQueue(total_items=total)
         barrier = threading.Barrier(n_threads)
 
         def mixed_worker() -> None:
             """Pop; ack even seqs, nack odd seqs — half commit, half don't."""
             barrier.wait()
             for _ in range(ops_per_thread):
-                _data, token = backend.pop_with_ack("queue")
+                _data, token = model.pop_with_ack("queue")
                 if token is None:
                     return
                 if token.seq % 2 == 0:
-                    backend.ack("queue", token=token)
+                    model.ack("queue", token=token)
                 else:
-                    backend.nack("queue", token=token)
+                    model.nack("queue", token=token)
 
         with ThreadPoolExecutor(max_workers=n_threads) as ex:
             futures = [ex.submit(mixed_worker) for _ in range(n_threads)]
             for f in futures:
                 f.result()
 
-        commits = backend.commits
+        commits = model.commits
         # Every committed seq must be even (odd seqs were nacked, not committed).
         assert all(s % 2 == 0 for s in commits), "odd (nacked) seq leaked into commits"
         # In-flight set must be empty: both ack and nack discard from it.
-        assert backend.in_flight_size == 0, (
-            f"in-flight leak after mixed ack/nack: {backend.in_flight_size}"
+        assert model.in_flight_size == 0, (
+            f"in-flight leak after mixed ack/nack: {model.in_flight_size}"
         )
         # Exactly half the items committed (the even seqs), half were nacked.
         assert len(commits) == total // 2, (
             f"expected {total // 2} commits (even seqs), got {len(commits)}"
         )
 
-    def test_repeated_runs_are_stable(self) -> None:
+    def test_reference_model_repeated_runs_are_stable(self) -> None:
         """Run the 16x100 case 5 times — a subtle race surfaces as flakiness.
 
-        A genuine race condition is non-deterministic: it may not fire on every
-        run. Repeating the contention test catches races that pass on a single
-        invocation but fail on repeat. If this test is flaky, INVESTIGATE — it
-        is almost certainly catching a real race, not a test bug.
+        A race in this local model is non-deterministic and may not fire on every
+        run. Repetition increases the chance of detecting reference-model drift;
+        it still supplies no production backend concurrency evidence.
         """
         for run in range(5):
             n_threads = 16
             ops_per_thread = 100
             total = n_threads * ops_per_thread
-            backend = _MockInFlightQueueBackend(total_items=total)
+            model = _ReferenceInFlightQueue(total_items=total)
             barrier = threading.Barrier(n_threads)
-            results: list[tuple[int, _AckToken | None]] = []
+            results: list[tuple[int, _ReferenceAckToken | None]] = []
             results_lock = threading.Lock()
 
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
                 futures = [
                     ex.submit(
-                        _worker_pop_then_ack,
-                        backend,
+                        _reference_worker_pop_then_ack,
+                        model,
                         ops_per_thread,
                         barrier,
                         results,
@@ -363,10 +331,10 @@ class TestInFlightSetConcurrency:
                 for f in futures:
                     f.result()
 
-            commits = backend.commits
+            commits = model.commits
             counter = Counter(commits)
             assert len(commits) == total, f"run {run}: commit count drift"
-            assert backend.in_flight_size == 0, f"run {run}: in-flight leak"
+            assert model.in_flight_size == 0, f"run {run}: in-flight leak"
             assert not [s for s, c in counter.items() if c > 1], (
                 f"run {run}: double-ack"
             )

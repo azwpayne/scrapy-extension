@@ -89,7 +89,33 @@ def test_marker_registry_is_strict_and_contains_only_used_labels() -> None:
 
     assert pytest_config["strict_markers"] is True
     registered = {entry.split(":", 1)[0] for entry in pytest_config["markers"]}
-    assert registered == {"unit", "integration", "e2e", "benchmark"}
+    assert registered == {
+        "unit",
+        "integration",
+        "e2e",
+        "benchmark",
+        "reference_model",
+    }
+
+
+def test_reference_model_marker_matches_honest_collection_boundary() -> None:
+    """Only local model modules carry the marker; production Memory stays separate."""
+    tests_dir = Path(__file__).resolve().parent
+    reference_modules = {
+        "test_reference_model_list_queue.py",
+        "test_reference_model_token_concurrency.py",
+    }
+
+    for module_name in reference_modules:
+        source = (tests_dir / module_name).read_text(encoding="utf-8")
+        assert "pytestmark = pytest.mark.reference_model" in source
+        assert "no production backend evidence" in source.lower()
+
+    production_memory = (
+        tests_dir / "test_memory_membership_filter_scale.py"
+    ).read_text(encoding="utf-8")
+    assert "MemoryMembershipFilter" in production_memory
+    assert "pytest.mark.reference_model" not in production_memory
 
 
 def test_ci_uses_only_complete_tier_selectors() -> None:

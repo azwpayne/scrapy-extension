@@ -66,18 +66,23 @@ hold under adversarial input, scale, and real backends."
   and reports; `--benchmark-disable` still lets the suite pass (benchmarks are
   opt-in, never block CI default).
 
-### Load (Tier L)
-- `tests/test_load_scale.py` — push/pop 10k items against a mock backend;
-  `tracemalloc` asserts memory stays bounded (no O(n) leak per op); dedup-set
-  at 10k fingerprints stays under a documented ceiling.
-- `tests/test_load_concurrency.py` — N threads concurrently push/pop/ack against
-  a mock `QueueBackend` with a real in-flight-set (Kafka/RabbitMQ/SQS pattern);
-  assert no token lost/duplicated (the in-flight-set contract under true
-  `threading` parallelism — pins what round-3 marked `Not-tested: concurrent
-  next_request under true thread parallelism`).
-- **Acceptance:** green; `tracemalloc` ceiling documented; concurrency test
-  honestly exercises `threading` (not asyncio — Scrapy's reactor is Twisted but
-  the in-flight-set must be thread-safe regardless).
+### Reference models and production-memory scale
+
+> Credibility correction: the former `test_load_scale.py` and
+> `test_load_concurrency.py` names overstated what their local classes proved.
+
+- `tests/test_reference_model_list_queue.py` — local Python-list memory and mass
+  conservation only. It imports no production queue/backend code.
+- `tests/test_reference_model_token_concurrency.py` — local token/set model under
+  real Python threads. It imports no Kafka/RabbitMQ/SQS backend or SDK token.
+- Both are marked `reference_model`, selected with `pytest -m reference_model`,
+  and provide **no production backend evidence**.
+- `tests/test_memory_membership_filter_scale.py` separately executes the
+  production `MemoryMembershipFilter` at 10k entries. It provides evidence only
+  for that in-process class, not shared-backend or multi-process behavior.
+- **Acceptance:** reference-model collection and production-memory cases remain
+  green, while filenames, symbols, marker contracts, and documentation make the
+  evidence boundary explicit.
 
 ### Integration (Tier I)
 - `tests/integration/test_multi_backend_e2e.py` — enqueue N requests →
