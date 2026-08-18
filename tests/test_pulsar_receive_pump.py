@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from threading import Condition, Event, Thread, current_thread
+from threading import enumerate as enumerate_threads
 from time import monotonic
 from typing import Any
 from unittest.mock import MagicMock, call
@@ -12,6 +13,7 @@ import pulsar
 import pytest
 
 from scrapy_extension.backends.pulsar import PulsarBackend, _PulsarAckToken
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import PulsarSettings
 
@@ -111,9 +113,7 @@ def _message(payload: bytes, message_id: Any) -> MagicMock:
     return message
 
 
-def _connected_backend(
-    mocker: Any, consumers: list[_ControllableConsumer]
-) -> PulsarBackend:
+def _connected_backend(mocker: Any, consumers: list[Any]) -> PulsarBackend:
     client = MagicMock(name="pulsar-client")
     client.subscribe.side_effect = consumers
     mocker.patch.object(pulsar, "Client", return_value=client)
@@ -164,6 +164,105 @@ def test_first_poll_never_waits_outside_budget_for_blocked_subscribe(
         assert not consumer.receive_started.is_set()
     finally:
         release_subscribe.set()
+        backend.disconnect()
+
+
+def test_transient_subscribe_failure_is_retired_for_next_poll(mocker: Any) -> None:
+    subscribe_started = Event()
+    release_failure = Event()
+    recovered_consumer = _ControllableConsumer()
+    client = MagicMock(name="transient-subscribe-client")
+    subscribe_calls = 0
+
+    def subscribe(*_args: Any, **_kwargs: Any) -> _ControllableConsumer:
+        nonlocal subscribe_calls
+        subscribe_calls += 1
+        if subscribe_calls == 1:
+            subscribe_started.set()
+            release_failure.wait(timeout=2.0)
+            raise RuntimeError("transient subscribe failure")
+        return recovered_consumer
+
+    client.subscribe.side_effect = subscribe
+    mocker.patch.object(pulsar, "Client", return_value=client)
+    backend = PulsarBackend(PulsarSettings())
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    topic = "scrapy-subscribe-recovery"
+    try:
+        assert backend.pop("subscribe-recovery", timeout=0) is None
+        failed_pump = backend._receive_pumps[topic]
+        assert subscribe_started.wait(timeout=0.5)
+        release_failure.set()
+        assert failed_pump.stopped.wait(timeout=0.5)
+
+        with pytest.raises(QueueError):
+            backend.pop("subscribe-recovery", timeout=0.1)
+        assert topic not in backend._receive_pumps
+        assert topic not in backend._consumers
+
+        assert backend.pop("subscribe-recovery", timeout=0) is None
+        recovered_pump = backend._receive_pumps[topic]
+        assert recovered_pump is not failed_pump
+        assert recovered_consumer.receive_started.wait(timeout=0.5)
+        recovered_consumer.deliver(_message(b"recovered", object()))
+        assert backend.pop("subscribe-recovery", timeout=1.0) == b"recovered"
+        assert client.subscribe.call_count == 2
+    finally:
+        release_failure.set()
+        backend.disconnect()
+
+
+def test_transient_receive_failure_is_retired_for_next_poll(mocker: Any) -> None:
+    receive_started = Event()
+    release_failure = Event()
+    failed_consumer = MagicMock(name="failed-consumer")
+    recovered_consumer = _ControllableConsumer()
+
+    def receive(*, timeout_millis: int) -> Any:
+        del timeout_millis
+        receive_started.set()
+        release_failure.wait(timeout=2.0)
+        raise RuntimeError("transient receive failure")
+
+    failed_consumer.receive.side_effect = receive
+    backend = _connected_backend(mocker, [failed_consumer, recovered_consumer])
+    topic = "scrapy-receive-recovery"
+    try:
+        assert backend.pop("receive-recovery", timeout=0) is None
+        failed_pump = backend._receive_pumps[topic]
+        assert receive_started.wait(timeout=0.5)
+        release_failure.set()
+        assert failed_pump.stopped.wait(timeout=0.5)
+
+        with pytest.raises(QueueError):
+            backend.pop("receive-recovery", timeout=0.1)
+        failed_consumer.close.assert_called_once_with()
+        assert topic not in backend._receive_pumps
+        assert topic not in backend._consumers
+
+        assert backend.pop("receive-recovery", timeout=0) is None
+        recovered_pump = backend._receive_pumps[topic]
+        assert recovered_pump is not failed_pump
+        assert recovered_consumer.receive_started.wait(timeout=0.5)
+        recovered_consumer.deliver(_message(b"recovered", object()))
+        assert backend.pop("receive-recovery", timeout=1.0) == b"recovered"
+    finally:
+        release_failure.set()
+        backend.disconnect()
+
+
+def test_receive_worker_name_does_not_expose_private_topic(mocker: Any) -> None:
+    private_marker = "private-thread-topic-marker"
+    consumer = _ControllableConsumer()
+    backend = _connected_backend(mocker, [consumer])
+    try:
+        assert backend.pop(private_marker, timeout=0) is None
+        pump = backend._receive_pumps[f"scrapy-{private_marker}"]
+        assert consumer.receive_started.wait(timeout=0.5)
+        assert pump.worker is not None and pump.worker.is_alive()
+        assert all(private_marker not in thread.name for thread in enumerate_threads())
+    finally:
         backend.disconnect()
 
 
@@ -354,13 +453,17 @@ def test_disconnect_is_bounded_when_close_does_not_interrupt_receive(
 def test_disconnect_is_bounded_when_sdk_close_never_returns(mocker: Any) -> None:
     release_close = Event()
     close_started = Event()
+    close_finished = Event()
     consumer = _ControllableConsumer()
     real_close = consumer.close
 
     def close_that_never_returns() -> None:
         close_started.set()
-        release_close.wait()
-        real_close()
+        try:
+            release_close.wait()
+            real_close()
+        finally:
+            close_finished.set()
 
     consumer.close = close_that_never_returns  # type: ignore[method-assign]
     backend = _connected_backend(mocker, [consumer])
@@ -388,6 +491,7 @@ def test_disconnect_is_bounded_when_sdk_close_never_returns(mocker: Any) -> None
     finally:
         release_close.set()
 
+    assert close_finished.wait(timeout=0.5)
     assert pump.stopped.wait(timeout=0.5)
     assert backend._client is None
     assert backend._consumers == {}

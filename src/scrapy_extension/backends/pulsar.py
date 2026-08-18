@@ -402,6 +402,10 @@ class PulsarBackend(Backend, QueueBackend):
         self._consumer_creation_lock = Lock()
         self._receive_pump_creation_lock = Lock()
         self._receive_pumps: dict[str, _PulsarReceivePump] = {}
+        # Worker names must never expose broker topic names. This monotonic opaque
+        # identifier is allocated under the lifecycle lock and paired with the
+        # client generation in each receive worker's diagnostic name.
+        self._receive_pump_counter = 0
         # Kept as an instance attribute so live tests can exercise backpressure
         # with a deliberately small bound without changing production behavior.
         self._receive_buffer_size = _PULSAR_RECEIVE_BUFFER_SIZE
@@ -1118,6 +1122,8 @@ class PulsarBackend(Backend, QueueBackend):
         while True:
             lifecycle_held = False
             condition_held = False
+            terminal_error: BaseException | None = None
+            retired_consumer: Any = None
             self._lifecycle_lock.acquire()
             lifecycle_held = True
             pump.condition.acquire()
@@ -1146,30 +1152,66 @@ class PulsarBackend(Backend, QueueBackend):
                     pump.condition.notify_all()
                     return result
                 if pump.control_error is not None:
-                    raise pump.control_error
-                if pump.failed:
-                    raise QueueError(
+                    terminal_error = pump.control_error
+                elif pump.failed:
+                    terminal_error = QueueError(
                         "Pulsar receive pump failed.",
                         queue_name=topic,
                         operation="pop",
                     )
-                if deadline is None:
-                    return None
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    return None
 
-                # Retain the condition across lifecycle release and wait so worker
-                # publication cannot be missed. Lock acquisition everywhere else is
-                # lifecycle -> condition, while the wait holds no lifecycle lock.
-                self._lifecycle_lock.release()
-                lifecycle_held = False
-                pump.condition.wait(remaining)
+                if terminal_error is not None:
+                    # Terminal worker state belongs to this exact live pump. Retire
+                    # it under the same lifecycle/condition fence used for record
+                    # extraction so a later poll can create a fresh consumer without
+                    # an old worker or disconnect removing its replacement.
+                    pump.accepting = False
+                    pump.records.clear()
+                    self._receive_pumps.pop(topic, None)
+                    retired_consumer = pump.consumer
+                    if (
+                        retired_consumer is not None
+                        and self._consumers.get(topic) is retired_consumer
+                    ):
+                        self._consumers.pop(topic, None)
+                    if (
+                        retired_consumer is not None
+                        and self._consumer is retired_consumer
+                    ):
+                        self._consumer = None
+                        self._subscribed_topic = None
+                        for active_topic, active_consumer in self._consumers.items():
+                            self._consumer = active_consumer
+                            self._subscribed_topic = active_topic
+                            break
+                    pump.condition.notify_all()
+                elif deadline is None:
+                    return None
+                else:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return None
+
+                    # Retain the condition across lifecycle release and wait so worker
+                    # publication cannot be missed. Lock acquisition everywhere else
+                    # is lifecycle -> condition, while the wait holds no lifecycle.
+                    self._lifecycle_lock.release()
+                    lifecycle_held = False
+                    pump.condition.wait(remaining)
             finally:
                 if condition_held:
                     pump.condition.release()
                 if lifecycle_held:
                     self._lifecycle_lock.release()
+
+            if terminal_error is not None:
+                if retired_consumer is not None:
+                    # The failed pump no longer appears in any live-generation map,
+                    # so this poll owns its detached SDK handle. Cleanup is bounded
+                    # and must not replace either a static QueueError or a preserved
+                    # process-control exception crossing the worker boundary.
+                    self._close_aborted_handle(retired_consumer)
+                raise terminal_error
 
     def _ensure_receive_pump(self, topic: str) -> _PulsarReceivePump:
         """Create or return the single bounded receive pump for ``topic``."""
@@ -1198,10 +1240,12 @@ class PulsarBackend(Backend, QueueBackend):
                     generation=generation,
                     capacity=self._receive_buffer_size,
                 )
+                self._receive_pump_counter += 1
+                pump_identifier = self._receive_pump_counter
                 worker = Thread(
                     target=self._run_receive_pump,
                     args=(pump,),
-                    name=f"scrapy-pulsar-receive-{generation}-{topic}",
+                    name=f"scrapy-pulsar-receive-{generation}-{pump_identifier}",
                     daemon=True,
                 )
                 pump.worker = worker
