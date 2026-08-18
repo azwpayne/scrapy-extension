@@ -1385,9 +1385,9 @@ class BackendQueue:
                 publication_failure = self._publish_close_attempt(
                     attempt, owner_token, succeeded=False
                 )
-                if publication_failure is not None and not isinstance(
-                    exc, (KeyboardInterrupt, SystemExit)
-                ):
+                if publication_failure is not None:
+                    if not isinstance(exc, Exception):
+                        raise
                     raise publication_failure
             raise
 
@@ -1410,9 +1410,9 @@ class BackendQueue:
         publication_failure = self._publish_close_attempt(
             attempt, owner_token, succeeded=failure is None
         )
-        if publication_failure is not None and (
-            failure is None or not isinstance(failure, (KeyboardInterrupt, SystemExit))
-        ):
+        if failure is not None and not isinstance(failure, Exception):
+            raise failure
+        if publication_failure is not None:
             raise publication_failure
         if failure is not None:
             raise failure

@@ -12,6 +12,10 @@ from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
+class _CustomControlFlow(BaseException):
+    pass
+
+
 def _queue_with_storage(strategy: MagicMock, storage: MagicMock) -> BackendQueue:
     manager = MagicMock(name="queue-manager")
     manager.get_storage_backend.return_value = storage
@@ -341,6 +345,49 @@ def test_interrupted_owner_publication_repairs_waiters_and_allows_retry() -> Non
     assert queue._close_attempt_waiters == {}
     assert queue._close_attempt_outcomes == {}
     strategy.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "control_error",
+    [GeneratorExit("generator closing"), _CustomControlFlow("custom control flow")],
+)
+def test_close_control_error_is_not_replaced_by_publication_failure(
+    control_error: BaseException,
+) -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.begin_close.side_effect = control_error
+    queue = _queue_with_storage(strategy, storage)
+    publication_error = RuntimeError("publication failed")
+    queue._publish_close_attempt = MagicMock(return_value=publication_error)  # type: ignore[method-assign]
+
+    with pytest.raises(type(control_error)) as exc_info:
+        queue.close()
+
+    assert exc_info.value is control_error
+
+
+def test_initial_close_control_error_is_not_replaced_by_publication_failure() -> None:
+    control_error = _CustomControlFlow("condition exit interrupted")
+
+    class _InterruptingExitCondition(threading.Condition):
+        def __exit__(self, *args: object) -> None:
+            super().__exit__(*args)
+            raise control_error
+
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    queue = _queue_with_storage(strategy, storage)
+    queue._operation_gate = _InterruptingExitCondition()
+    publication_error = RuntimeError("publication failed")
+    queue._publish_close_attempt = MagicMock(return_value=publication_error)  # type: ignore[method-assign]
+
+    with pytest.raises(_CustomControlFlow) as exc_info:
+        queue.close()
+
+    assert exc_info.value is control_error
 
 
 def test_nonempty_state_without_storage_requires_explicit_lossy_abort() -> None:
