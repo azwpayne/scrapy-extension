@@ -56,9 +56,9 @@ def test_v2_owner_is_stable_and_bound_to_complete_tuple() -> None:
 def test_v2_owner_distinguishes_a_legacy_direct_alias() -> None:
     v2_name = _physical_queue_name("a", "bc", SqsQueueNameGeneration.V2)
 
-    assert _physical_queue_name(
-        "", v2_name, SqsQueueNameGeneration.LEGACY_V1
-    ) == v2_name
+    assert (
+        _physical_queue_name("", v2_name, SqsQueueNameGeneration.LEGACY_V1) == v2_name
+    )
     assert _v2_queue_owner("a", "bc") != _v2_queue_owner("", v2_name)
 
 
@@ -105,9 +105,7 @@ def test_settings_select_v2_by_default_and_explicit_legacy_drain_mode() -> None:
 
 def test_queue_name_generation_loads_from_sqs_environment(monkeypatch) -> None:
     monkeypatch.setenv("SCRAPY_SQS_QUEUE_NAME_GENERATION", "legacy_v1")
-    assert (
-        SqsSettings().queue_name_generation is SqsQueueNameGeneration.LEGACY_V1
-    )
+    assert SqsSettings().queue_name_generation is SqsQueueNameGeneration.LEGACY_V1
 
     monkeypatch.setenv("SCRAPY_SQS_QUEUE_NAME_GENERATION", "v2")
     assert SqsSettings().queue_name_generation is SqsQueueNameGeneration.V2

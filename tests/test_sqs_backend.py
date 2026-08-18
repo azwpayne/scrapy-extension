@@ -943,9 +943,7 @@ class TestSqsPushPop:
 
         assert base64.b64decode(kwargs["MessageBody"]) == b"payload"
 
-    def test_push_caches_queue_url_only_after_v2_owner_validation(
-        self, mocker
-    ) -> None:
+    def test_push_caches_queue_url_only_after_v2_owner_validation(self, mocker) -> None:
         b, client = _connected(mocker)
         b.push("queue1", b"a")
         b.push("queue1", b"b")

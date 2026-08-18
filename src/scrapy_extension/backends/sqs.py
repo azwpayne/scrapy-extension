@@ -160,7 +160,9 @@ def _length_prefixed_digest(
 def _v2_queue_owner(prefix: str, queue_name: str) -> str:
     """Return stable package ownership metadata for one complete v2 tuple."""
     physical_name = _physical_queue_name(prefix, queue_name, SqsQueueNameGeneration.V2)
-    return f"{_V2_QUEUE_OWNER_PREFIX}{physical_name.removeprefix(_V2_QUEUE_NAME_PREFIX)}"
+    return (
+        f"{_V2_QUEUE_OWNER_PREFIX}{physical_name.removeprefix(_V2_QUEUE_NAME_PREFIX)}"
+    )
 
 
 def _physical_queue_name(
