@@ -40,9 +40,12 @@ from scrapy_extension.exceptions import (
     BackendError,
     ConfigurationError,
     QueueError,
+    QueueOutcomeIndeterminateError,
     SerializationError,
+    SetOutcomeIndeterminateError,
     StorageBackpressureError,
     StorageError,
+    StorageOutcomeIndeterminateError,
 )
 from scrapy_extension.monitor import Monitor, NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.pipeline.pipeline import BackendPipeline
@@ -314,6 +317,7 @@ __all__ = [
     "PulsarSettings",
     "QueueBackend",
     "QueueError",
+    "QueueOutcomeIndeterminateError",
     "RabbitMQBackend",
     "RabbitMQMode",
     "RabbitMQSettings",
@@ -329,6 +333,7 @@ __all__ = [
     "Serializer",
     "SetBackend",
     "SetMembershipFilter",
+    "SetOutcomeIndeterminateError",
     # Configuration
     "Settings",
     "SqsBackend",
@@ -338,6 +343,7 @@ __all__ = [
     "StorageBackend",
     "StorageBackpressureError",
     "StorageError",
+    "StorageOutcomeIndeterminateError",
     "build_membership_filter",
     "resolve_backend_config",
 ]

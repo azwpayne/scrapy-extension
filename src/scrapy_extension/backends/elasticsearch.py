@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import logging
 import threading
+import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,7 +49,10 @@ from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
+    QueueOutcomeIndeterminateError,
+    SetOutcomeIndeterminateError,
     StorageError,
+    StorageOutcomeIndeterminateError,
 )
 from scrapy_extension.exceptions._redaction import (
     backend_connection_error_boundary,
@@ -178,9 +182,10 @@ class _ElasticSearchConnectionSnapshot:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class _ElasticSearchGeneration:
-    """One atomically published Elasticsearch client and immutable snapshot."""
+    """One root client, its no-replay mutation view, and immutable snapshot."""
 
     client: Elasticsearch
+    mutation_client: Elasticsearch
     snapshot: _ElasticSearchConnectionSnapshot
 
 
@@ -248,6 +253,25 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # Internal operations use only the authoritative leased generation.
         self._client: Elasticsearch | None = None
         self._connection_snapshot: _ElasticSearchConnectionSnapshot | None = None
+
+    @staticmethod
+    def _build_generation(
+        client: Elasticsearch, snapshot: _ElasticSearchConnectionSnapshot
+    ) -> _ElasticSearchGeneration:
+        """Bind a no-replay mutation view to the root client's transport."""
+        mutation_client = client.options(
+            max_retries=0,
+            retry_on_timeout=False,
+            retry_on_status=(),
+        )
+        # ``MagicMock.options()`` creates an unrelated child. Keeping legacy test
+        # doubles usable does not weaken real clients: an Elasticsearch options
+        # view always shares the exact root transport.
+        if getattr(mutation_client, "transport", None) is not getattr(
+            client, "transport", None
+        ):
+            mutation_client = client
+        return _ElasticSearchGeneration(client, mutation_client, snapshot)
 
     @configuration_error_boundary(
         "Elasticsearch configuration is invalid.",
@@ -423,7 +447,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 # historical private mirrors. Adopt both into one atomic generation.
                 if injected_client is not None:
                     snapshot = injected_snapshot or self._capture_connection_snapshot()
-                    injected_generation = _ElasticSearchGeneration(
+                    injected_generation = self._build_generation(
                         injected_client, snapshot
                     )
                     try:
@@ -466,7 +490,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                             backend_type="elasticsearch",
                         )
                     self._ensure_indices(snapshot, client=candidate)
-                    generation = _ElasticSearchGeneration(candidate, snapshot)
+                    generation = self._build_generation(candidate, snapshot)
                     with self._generation_condition:
                         if (
                             self._connect_owner != current_thread
@@ -738,7 +762,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 snapshot = (
                     self._connection_snapshot or self._capture_connection_snapshot()
                 )
-                generation = _ElasticSearchGeneration(self._client, snapshot)
+                generation = self._build_generation(self._client, snapshot)
                 self._generation = generation
                 self._connection_snapshot = snapshot
             if generation is not None:
@@ -871,7 +895,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         "push",
         _ELASTICSEARCH_QUEUE_PUSH_ERROR,
         validator=_validate_queue_name_argument,
-        handled_exception_types=(QueueError, BackendConnectionError),
+        handled_exception_types=(
+            QueueError,
+            QueueOutcomeIndeterminateError,
+            BackendConnectionError,
+        ),
     )
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
         """Push item to priority queue.
@@ -886,6 +914,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ValueError: If queue_name contains invalid characters.
         """
         _validate_key_name(queue_name, "queue_name")
+        document_id = uuid.uuid4().hex
         doc = {
             "queue_name": queue_name,
             "item": _b64encode(item),
@@ -901,17 +930,27 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # ``wait_for`` across consecutive pushes, so each one pays the full
             # refresh-interval wait.
             with self._lease_generation("push") as generation:
-                generation.client.index(
-                    index=generation.snapshot.queue_index, document=doc
+                generation.mutation_client.index(
+                    index=generation.snapshot.queue_index,
+                    id=document_id,
+                    document=doc,
                 )
-        except (ApiError, TransportError) as e:
+        except TransportError:
+            raise QueueOutcomeIndeterminateError(
+                _ELASTICSEARCH_QUEUE_PUSH_ERROR, operation="push"
+            ) from None
+        except ApiError as e:
             raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
     @queue_operation_error_boundary(
         "pop",
         _ELASTICSEARCH_QUEUE_POP_ERROR,
         validator=_validate_queue_name_argument,
-        handled_exception_types=(QueueError, BackendConnectionError),
+        handled_exception_types=(
+            QueueError,
+            QueueOutcomeIndeterminateError,
+            BackendConnectionError,
+        ),
     )
     def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
         """Pop highest priority item from queue.
@@ -973,7 +1012,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     try:
                         # No ``refresh`` on delete — the NEXT pop's pre-search refresh
                         # (above) flushes this delete, so the search won't re-find the doc.
-                        generation.client.delete(
+                        generation.mutation_client.delete(
                             index=generation.snapshot.queue_index,
                             id=document_id,
                             if_seq_no=sequence_number,
@@ -982,6 +1021,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     except ConflictError:
                         # Lost the race to another worker — retry to find the next item.
                         continue
+                    except TransportError:
+                        raise QueueOutcomeIndeterminateError(
+                            _ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop"
+                        ) from None
                     return item
                 except NotFoundError:
                     return None
@@ -1000,7 +1043,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         "pop",
         _ELASTICSEARCH_QUEUE_POP_ERROR,
         validator=_validate_queue_name_argument,
-        handled_exception_types=(QueueError, BackendConnectionError),
+        handled_exception_types=(
+            QueueError,
+            QueueOutcomeIndeterminateError,
+            BackendConnectionError,
+        ),
     )
     def pop_with_ack(
         self, queue_name: str, timeout: float = 0.0
@@ -1012,7 +1059,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         "queue_len",
         _ELASTICSEARCH_QUEUE_LENGTH_ERROR,
         validator=_validate_queue_name_argument,
-        handled_exception_types=(QueueError, BackendConnectionError),
+        handled_exception_types=(
+            QueueError,
+            QueueOutcomeIndeterminateError,
+            BackendConnectionError,
+        ),
     )
     def queue_len(self, queue_name: str) -> int:
         """Get queue length.
@@ -1045,7 +1096,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         "clear_queue",
         _ELASTICSEARCH_QUEUE_CLEAR_ERROR,
         validator=_validate_queue_name_argument,
-        handled_exception_types=(QueueError, BackendConnectionError),
+        handled_exception_types=(
+            QueueError,
+            QueueOutcomeIndeterminateError,
+            BackendConnectionError,
+        ),
     )
     def clear_queue(self, queue_name: str) -> None:
         """Clear all items from queue.
@@ -1066,7 +1121,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     "queue_name",
                     queue_name,
                 )
-        except (ApiError, TransportError) as e:
+        except TransportError:
+            raise QueueOutcomeIndeterminateError(
+                _ELASTICSEARCH_QUEUE_CLEAR_ERROR, operation="clear_queue"
+            ) from None
+        except ApiError as e:
             msg = f"Failed to clear ElasticSearch queue {queue_name!r}: {e}"
             raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
 
@@ -1122,7 +1181,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # consistent); ``set_len`` refreshes in ``_count``. Same amortized
             # read-refresh rationale as push.
             with self._lease_generation("add") as generation:
-                generation.client.index(
+                generation.mutation_client.index(
                     index=generation.snapshot.set_index,
                     id=doc_id,
                     document=doc,
@@ -1142,17 +1201,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 _ELASTICSEARCH_SET_REQUEST_ERROR,
                 setting_name="operation",
             ) from e
-        except TransportError as e:
-            # R-dupe-1 (option b): wrap transient TransportError so BackendDupeFilter's
-            # graceful-degradation arm catches it (degrade to not-seen) instead of
-            # crashing the crawl. ConflictError + version-conflict RequestError (the
-            # "already existed" signals) stay first; other API rejections are a
-            # non-transient ConfigurationError rather than a retryable connection
-            # failure. Supersedes R31-A1.
-            raise BackendConnectionError(
-                f"ElasticSearch set add failed for {set_name!r}: {e}",
-                backend_type="elasticsearch",
-            ) from e
+        except TransportError:
+            raise SetOutcomeIndeterminateError(
+                _ELASTICSEARCH_SET_ADD_ERROR, backend_type="elasticsearch"
+            ) from None
         return True
 
     @configuration_error_boundary(
@@ -1188,11 +1240,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     generation.snapshot.set_index,
                     self._set_doc_id(set_name, item),
                 )
-        except TransportError as e:
-            raise BackendConnectionError(
-                f"ElasticSearch set remove failed for {set_name!r}: {e}",
-                backend_type="elasticsearch",
-            ) from e
+        except TransportError:
+            raise SetOutcomeIndeterminateError(
+                _ELASTICSEARCH_SET_REMOVE_ERROR, backend_type="elasticsearch"
+            ) from None
         except ApiError as e:
             raise ConfigurationError(
                 _ELASTICSEARCH_SET_REQUEST_ERROR,
@@ -1312,11 +1363,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 self._delete_by_term(
                     generation, generation.snapshot.set_index, "set_name", set_name
                 )
-        except TransportError as e:
-            raise BackendConnectionError(
-                f"ElasticSearch set clear failed for {set_name!r}: {e}",
-                backend_type="elasticsearch",
-            ) from e
+        except TransportError:
+            raise SetOutcomeIndeterminateError(
+                _ELASTICSEARCH_SET_CLEAR_ERROR, backend_type="elasticsearch"
+            ) from None
         except ApiError as e:
             raise ConfigurationError(
                 _ELASTICSEARCH_SET_REQUEST_ERROR,
@@ -1352,10 +1402,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ).isoformat()
         try:
             with self._lease_generation("store") as generation:
-                generation.client.index(
+                generation.mutation_client.index(
                     index=generation.snapshot.storage_index, id=key, document=doc
                 )
-        except (ApiError, TransportError) as e:
+        except TransportError:
+            raise StorageOutcomeIndeterminateError(
+                _ELASTICSEARCH_STORAGE_STORE_ERROR, operation="store"
+            ) from None
+        except ApiError as e:
             msg = f"Failed to store key {key!r} in ElasticSearch: {e}"
             raise StorageError(msg, operation="store", key=key) from e
 
@@ -1453,7 +1507,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             return True
         reap_failed = False
         try:
-            generation.client.delete(
+            generation.mutation_client.delete(
                 index=generation.snapshot.storage_index,
                 id=key,
                 if_seq_no=seq_no,
@@ -1461,7 +1515,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             )
         except (ConflictError, NotFoundError):
             pass
-        except (ApiError, TransportError):
+        except TransportError:
+            raise StorageOutcomeIndeterminateError(
+                _ELASTICSEARCH_STORAGE_DELETE_ERROR, operation=operation
+            ) from None
+        except ApiError:
             reap_failed = True
 
         if reap_failed:
@@ -1541,7 +1599,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 return self._delete_by_id_on_generation(
                     generation, generation.snapshot.storage_index, key
                 )
-        except (ApiError, TransportError) as e:
+        except TransportError:
+            raise StorageOutcomeIndeterminateError(
+                _ELASTICSEARCH_STORAGE_DELETE_ERROR, operation="delete"
+            ) from None
+        except ApiError as e:
             msg = f"Failed to delete key {key!r} from ElasticSearch: {e}"
             raise StorageError(msg, operation="delete", key=key) from e
 
@@ -1658,7 +1720,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 self._delete_by_query_on_generation(
                     generation, generation.snapshot.storage_index, query
                 )
-        except (ApiError, TransportError) as e:
+        except TransportError:
+            raise StorageOutcomeIndeterminateError(
+                _ELASTICSEARCH_STORAGE_CLEAR_ERROR, operation="clear_storage"
+            ) from None
+        except ApiError as e:
             msg = f"Failed to clear ElasticSearch storage: {e}"
             raise StorageError(msg, operation="clear_storage", key=None) from e
 
@@ -1710,7 +1776,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     ) -> bool:
         """Delete a document by ID using only the supplied generation."""
         try:
-            generation.client.delete(index=index, id=doc_id)
+            generation.mutation_client.delete(index=index, id=doc_id)
         except NotFoundError:
             return False
         return True
@@ -1746,4 +1812,4 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         query: dict[str, Any],
     ) -> None:
         """Delete matching documents using only the supplied generation."""
-        generation.client.delete_by_query(index=index, query=query)
+        generation.mutation_client.delete_by_query(index=index, query=query)

@@ -3,9 +3,12 @@ from scrapy_extension.exceptions.base import (
     BackendError,
     ConfigurationError,
     QueueError,
+    QueueOutcomeIndeterminateError,
     SerializationError,
+    SetOutcomeIndeterminateError,
     StorageBackpressureError,
     StorageError,
+    StorageOutcomeIndeterminateError,
 )
 
 __all__ = [
@@ -13,7 +16,10 @@ __all__ = [
     "BackendError",
     "ConfigurationError",
     "QueueError",
+    "QueueOutcomeIndeterminateError",
     "SerializationError",
+    "SetOutcomeIndeterminateError",
     "StorageBackpressureError",
     "StorageError",
+    "StorageOutcomeIndeterminateError",
 ]

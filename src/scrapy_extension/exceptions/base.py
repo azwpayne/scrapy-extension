@@ -77,6 +77,14 @@ class QueueError(BackendError):
         self.operation = operation
 
 
+class QueueOutcomeIndeterminateError(QueueError):
+    """A queue mutation may have committed before its response was lost."""
+
+
+class SetOutcomeIndeterminateError(BackendConnectionError):
+    """A set mutation may have committed before its response was lost."""
+
+
 class StorageError(BackendError):
     """Exception raised for storage operation errors.
 
@@ -105,6 +113,10 @@ class StorageError(BackendError):
         super().__init__(message)
         self.operation = operation
         self.key = key
+
+
+class StorageOutcomeIndeterminateError(StorageError):
+    """A storage mutation may have committed before its response was lost."""
 
 
 class StorageBackpressureError(StorageError):

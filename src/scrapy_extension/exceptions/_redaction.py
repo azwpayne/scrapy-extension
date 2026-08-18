@@ -12,8 +12,11 @@ from scrapy_extension.exceptions.base import (
     BackendError,
     ConfigurationError,
     QueueError,
+    QueueOutcomeIndeterminateError,
     SerializationError,
+    SetOutcomeIndeterminateError,
     StorageError,
+    StorageOutcomeIndeterminateError,
 )
 
 _P = ParamSpec("_P")
@@ -40,7 +43,7 @@ def sanitize_backend_error(
     untrusted object graph.
     """
     error_type = type(error)
-    if error_type is QueueError:
+    if error_type in (QueueError, QueueOutcomeIndeterminateError):
         queue_error = cast(QueueError, error)
         operation = queue_error.operation
         safe_operation = (
@@ -52,8 +55,10 @@ def sanitize_backend_error(
                 else None
             )
         )
+        if error_type is QueueOutcomeIndeterminateError:
+            return QueueOutcomeIndeterminateError(message, operation=safe_operation)
         return QueueError(message, operation=safe_operation)
-    if error_type is StorageError:
+    if error_type in (StorageError, StorageOutcomeIndeterminateError):
         storage_error = cast(StorageError, error)
         operation = storage_error.operation
         safe_operation = (
@@ -65,8 +70,12 @@ def sanitize_backend_error(
                 else None
             )
         )
+        if error_type is StorageOutcomeIndeterminateError:
+            return StorageOutcomeIndeterminateError(message, operation=safe_operation)
         return StorageError(message, operation=safe_operation)
-    if error_type is BackendConnectionError:
+    if error_type in (BackendConnectionError, SetOutcomeIndeterminateError):
+        if error_type is SetOutcomeIndeterminateError:
+            return SetOutcomeIndeterminateError(message)
         return BackendConnectionError(message)
     if error_type is SerializationError:
         return SerializationError(message)
@@ -133,7 +142,8 @@ def queue_operation_error_boundary(
 
             replacement_message = message
             raw_args: object = None
-            if type(caught_error) is QueueError:
+            caught_type = type(caught_error)
+            if caught_type in (QueueError, QueueOutcomeIndeterminateError):
                 raw_args = caught_error.args
                 if (
                     type(raw_args) is tuple
@@ -142,12 +152,18 @@ def queue_operation_error_boundary(
                     and raw_args[0] in safe_messages
                 ):
                     replacement_message = raw_args[0]
-            sanitized_error = QueueError(replacement_message, operation=operation)
+            if caught_type is QueueOutcomeIndeterminateError:
+                sanitized_error: QueueError = QueueOutcomeIndeterminateError(
+                    replacement_message, operation=operation
+                )
+            else:
+                sanitized_error = QueueError(replacement_message, operation=operation)
             del args
             del kwargs
             del caught_error
             del raw_args
             del replacement_message
+            del caught_type
             raise sanitized_error
 
         return wrapped
@@ -185,7 +201,10 @@ def set_operation_error_boundary(
             try:
                 return function(*args, **kwargs)
             except BackendConnectionError as error:
-                if type(error) is not BackendConnectionError:
+                if type(error) not in (
+                    BackendConnectionError,
+                    SetOutcomeIndeterminateError,
+                ):
                     del args
                     del kwargs
                     raise
@@ -205,9 +224,14 @@ def set_operation_error_boundary(
                 and raw_args[0] in safe_messages
             ):
                 replacement_message = raw_args[0]
-            sanitized_error = BackendConnectionError(
-                replacement_message, backend_type=backend_type
-            )
+            if type(caught_connection_error) is SetOutcomeIndeterminateError:
+                sanitized_error: BackendConnectionError = SetOutcomeIndeterminateError(
+                    replacement_message, backend_type=backend_type
+                )
+            else:
+                sanitized_error = BackendConnectionError(
+                    replacement_message, backend_type=backend_type
+                )
             del args
             del kwargs
             del caught_connection_error
@@ -332,7 +356,10 @@ def storage_operation_error_boundary(
             try:
                 return function(*args, **kwargs)
             except StorageError as error:
-                if type(error) is not StorageError:
+                if type(error) not in (
+                    StorageError,
+                    StorageOutcomeIndeterminateError,
+                ):
                     del args
                     del kwargs
                     raise
@@ -368,11 +395,18 @@ def storage_operation_error_boundary(
                     and (raw_args[0] in safe_messages or predicate_matches)
                 ):
                     replacement_message = raw_args[0]
-                sanitized_error: BackendError = StorageError(
-                    replacement_message,
-                    operation=operation,
-                    key=None,
-                )
+                if type(caught_storage_error) is StorageOutcomeIndeterminateError:
+                    sanitized_error: BackendError = StorageOutcomeIndeterminateError(
+                        replacement_message,
+                        operation=operation,
+                        key=None,
+                    )
+                else:
+                    sanitized_error = StorageError(
+                        replacement_message,
+                        operation=operation,
+                        key=None,
+                    )
             else:
                 assert caught_connection_error is not None
                 raw_args = caught_connection_error.args

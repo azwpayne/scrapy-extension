@@ -14,6 +14,7 @@ from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
+    StorageOutcomeIndeterminateError,
 )
 from scrapy_extension.settings.elasticsearch import (
     ElasticSearchMode,
@@ -834,10 +835,10 @@ class TestStorage:
             SystemExit("warning handler exited"),
         ],
     )
-    def test_expired_reap_delete_failure_keeps_absent_result_when_warning_fails(
+    def test_expired_reap_transport_failure_is_indeterminate_without_warning(
         self, mocker, diagnostic_error
     ):
-        """A caught reaping failure's warning cannot override logical expiry."""
+        """A lost reap response is surfaced instead of becoming absent success."""
         b = _mock_backend(mocker)
         past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
         b._client.get.return_value = {
@@ -851,12 +852,14 @@ class TestStorage:
             side_effect=diagnostic_error,
         )
 
-        assert b.retrieve("k") is None
+        with pytest.raises(StorageOutcomeIndeterminateError) as exc_info:
+            b.retrieve("k")
 
+        assert exc_info.value.operation == "retrieve"
         b._client.delete.assert_called_once_with(
             index="scrapy_storage", id="k", if_seq_no=4, if_primary_term=2
         )
-        warning.assert_called_once()
+        warning.assert_not_called()
 
     @pytest.mark.parametrize(
         "control_error",
