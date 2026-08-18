@@ -827,7 +827,9 @@ class TestBackendScheduler:
         mock_settings.getdict.return_value = {}
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=mocker.Mock(manager=mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(mock_settings)
@@ -848,7 +850,9 @@ class TestBackendScheduler:
         mock_crawler.stats = mocker.Mock()
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=mocker.Mock(manager=mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_crawler(mock_crawler)
@@ -869,7 +873,9 @@ class TestBackendScheduler:
         mock_crawler.stats = mocker.Mock()
 
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=mocker.Mock(manager=mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_crawler(mock_crawler)
@@ -890,12 +896,12 @@ class TestBackendScheduler:
         def fail_connect(_spider: object) -> None:
             raise original_error
 
-        def fail_close(_reason: str) -> None:
+        def fail_close(_reason: str, **_kwargs: object) -> None:
             cleanup_contexts.append(sys.exc_info())
             raise RuntimeError("cleanup failed")
 
         mocker.patch.object(scheduler, "_connect_ack_signals", side_effect=fail_connect)
-        mocker.patch.object(scheduler, "_close_locked", side_effect=fail_close)
+        mocker.patch.object(scheduler, "_close_attempt", side_effect=fail_close)
         records: list[logging.LogRecord] = []
 
         class Handler(logging.Handler):
@@ -1000,7 +1006,9 @@ class TestSchedulerAckConcurrencyCorrect:
 
         settings = self._make_settings("kafka", concurrent=16)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=mocker.Mock(manager=mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -1013,7 +1021,9 @@ class TestSchedulerAckConcurrencyCorrect:
 
         settings = self._make_settings("rabbitmq", concurrent=4)
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=mocker.Mock(manager=mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_settings(settings)  # must not raise
@@ -1041,7 +1051,9 @@ class TestSchedulerAckConcurrencyCorrect:
         mock_crawler.settings = self._make_settings("kafka", concurrent=8)
         mock_crawler.stats = mocker.Mock()
         mocker.patch.object(
-            ConnectionManager, "get_manager", return_value=mocker.Mock()
+            ConnectionManager,
+            "acquire_lease",
+            return_value=mocker.Mock(manager=mocker.Mock()),
         )
 
         scheduler = BackendScheduler.from_crawler(mock_crawler)  # must not raise

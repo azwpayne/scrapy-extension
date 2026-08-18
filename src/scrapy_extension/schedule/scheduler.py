@@ -67,6 +67,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _LIFECYCLE_NEW = "new"
+_LIFECYCLE_OPENING = "opening"
 _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSING = "closing"
 _LIFECYCLE_CLOSED = "closed"
@@ -1072,6 +1073,8 @@ class BackendScheduler:
         # through construction.
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_state = _LIFECYCLE_NEW
+        self._close_attempt_owner: object | None = None
+        self._close_attempt_thread_id: int | None = None
 
     @classmethod
     def from_settings(
@@ -1533,129 +1536,85 @@ class BackendScheduler:
         return None
 
     def open(self, spider: Spider) -> Deferred[None] | None:
-        """Open the scheduler for a spider and wire ack/nack signals.
-
-        Return type matches Scrapy's ``Scheduler.open`` protocol
-        (``Deferred[None] | None``). This implementation is synchronous —
-        returns ``None`` — which Scrapy's engine handles correctly via
-        ``yield self.scheduler.open(spider)`` (yielding None is a no-op in
-        both inlineCallbacks and async-first reactor modes).
-
-        **Queue-key templating (round-2, C8 fix).** If ``self.queue_key``
-        contains the literal token ``{spider}``, the token is substituted with
-        ``spider.name`` BEFORE constructing the BackendQueue. This lets two
-        spiders on the same backend use disjoint queues
-        (``SCRAPY_QUEUE_KEY="q:{spider}"``) — without it, the default
-        ``scheduler-queue`` is shared across spiders (silent cross-spider
-        request leakage / contamination). Default key unchanged → existing
-        single-spider deployments are unaffected. Multi-spider footgun: with
-        templating, the dedup set is still shared unless separately templated
-        (see dupefilter_key in BackendDupeFilter).
-
-        Args:
-            spider: The spider instance.
-
-        Raises:
-            ValueError: If ``spider.name`` contains characters unsafe for use as
-                a backend key (only ``[a-zA-Z0-9._:-]`` allowed). Surfaces the
-                misconfiguration at open time rather than as a confusing
-                "_validate_key_name" failure deep inside the first push.
-        """
+        """Open one scheduler lifecycle without running callbacks under its lock."""
         with self._lifecycle_lock:
             if self._lifecycle_state == _LIFECYCLE_CLOSED:
                 raise RuntimeError("Scheduler is closed and cannot be reopened")
-            if self._lifecycle_state == _LIFECYCLE_CLOSING:
-                raise RuntimeError("Scheduler is closing and cannot be reopened")
+            if self._lifecycle_state in {_LIFECYCLE_OPENING, _LIFECYCLE_CLOSING}:
+                raise RuntimeError(
+                    "Scheduler lifecycle transition is already in progress"
+                )
             if self._lifecycle_state == _LIFECYCLE_OPEN:
                 if self._spider is spider:
                     return None
                 raise RuntimeError("Scheduler is already open for a different spider")
+            self._lifecycle_state = _LIFECYCLE_OPENING
+            self._spider = spider
 
-            open_failure: BaseException | None = None
-            try:
-                _validate_key_name(spider.name, field_name="spider.name")
-                self._spider = spider
-                # Resolve {spider} template in queue_key at open() (round-2 C8 fix).
-                # str.replace (not str.format) so brace-bearing keys like
-                # "q:{spider}-{date}" don't raise KeyError on the unrelated {date};
-                # matches the dupefilter path's .replace() substitution.
-                self.queue_key = self._queue_key_template.replace(
-                    "{spider}", spider.name
-                )
-                if (
-                    self._owns_dupefilter
-                    and self.dupefilter is not None
-                    and not self._dupefilter_open
-                    and not self._dupefilter_released
-                ):
-                    self.dupefilter.open(spider)
+        open_failure: BaseException | None = None
+        try:
+            _validate_key_name(spider.name, field_name="spider.name")
+            queue_key = self._queue_key_template.replace("{spider}", spider.name)
+            if (
+                self._owns_dupefilter
+                and self.dupefilter is not None
+                and not self._dupefilter_open
+                and not self._dupefilter_released
+            ):
+                self.dupefilter.open(spider)
+                with self._lifecycle_lock:
                     self._dupefilter_open = True
-                # R14-C: resolve the monitor FIRST so it can be threaded into BackendQueue
-                # with the operator-tuned backpressure_threshold + pop_rate_window_s.
-                # Pre-R14-C the BackendQueue resolved its own monitor internally (default
-                # ScrapyStatsMonitor with constructor defaults) — but that path could not
-                # see the SCRAPY_MONITOR_* settings, so the U2 knobs were stuck at
-                # defaults. Resolving here + passing explicitly closes the loop.
-                monitor = BackendScheduler._resolve_monitor_for_spider(
-                    spider,
-                    backpressure_threshold=self._monitor_backpressure_threshold,
-                    pop_rate_window_s=self._monitor_pop_rate_window_s,
-                )
-                # R14-D follow-up: thread the resolved monitor into the ConnectionManager
-                # so the connection-lifecycle hooks (on_connect/on_disconnect/on_retry →
-                # backend/{connect,disconnect,retry}_count) actually fire in production.
-                # Without this, ConnectionManager defaults to NullMonitor and the hooks
-                # R14-D wired are dead observability outside the queue path.
-                self.connection_manager.set_monitor(monitor)
-                # R55: thread the resolved monitor into the snapshot manager too,
-                # so the snapshot backend's connect/disconnect/retry hooks (→
-                # backend/{connect,disconnect,retry}_count) fire — the same R14-D
-                # visibility fix as the queue manager. Guarded: the snapshot
-                # manager is None when no stateful-snapshot pairing is configured.
-                if self._snapshot_connection_manager is not None:
-                    self._snapshot_connection_manager.set_monitor(monitor)
-                self._queue = BackendQueue(
-                    connection_manager=self.connection_manager,
-                    queue_name=self.queue_key,
-                    spider=spider,
-                    queue_strategy=self._queue_strategy,
-                    max_item_bytes=self._queue_max_item_bytes,
-                    monitor=monitor,
-                    depth_sample_every=self._queue_depth_sample_every,
-                    pop_rate_window_s=self._monitor_pop_rate_window_s,
-                    snapshot_owner=self._queue_snapshot_owner,
-                    snapshot_connection_manager=self._snapshot_connection_manager,
-                    snapshot_max_bytes=self._queue_snapshot_max_bytes,
-                    snapshot_chunk_bytes=self._queue_snapshot_chunk_bytes,
-                )
-                self._connect_ack_signals(spider)
-            except BaseException as exc:
-                open_failure = exc
-            if open_failure is not None:
-                cleanup_failed = False
-                try:
-                    self._close_locked("open-failed")
-                except BaseException:
-                    cleanup_failed = True
-                if cleanup_failed:
-                    try:
-                        logger.error("Failed to clean up scheduler after open failure")
-                    except BaseException:
-                        pass
-                raise open_failure
+            monitor = BackendScheduler._resolve_monitor_for_spider(
+                spider,
+                backpressure_threshold=self._monitor_backpressure_threshold,
+                pop_rate_window_s=self._monitor_pop_rate_window_s,
+            )
+            self.connection_manager.set_monitor(monitor)
+            if self._snapshot_connection_manager is not None:
+                self._snapshot_connection_manager.set_monitor(monitor)
+            queue = BackendQueue(
+                connection_manager=self.connection_manager,
+                queue_name=queue_key,
+                spider=spider,
+                queue_strategy=self._queue_strategy,
+                max_item_bytes=self._queue_max_item_bytes,
+                monitor=monitor,
+                depth_sample_every=self._queue_depth_sample_every,
+                pop_rate_window_s=self._monitor_pop_rate_window_s,
+                snapshot_owner=self._queue_snapshot_owner,
+                snapshot_connection_manager=self._snapshot_connection_manager,
+                snapshot_max_bytes=self._queue_snapshot_max_bytes,
+                snapshot_chunk_bytes=self._queue_snapshot_chunk_bytes,
+            )
+            with self._lifecycle_lock:
+                self.queue_key = queue_key
+                self._queue = queue
+            self._connect_ack_signals(spider)
+        except BaseException as exc:
+            open_failure = exc
 
-            # Reset backpressure gate for a clean per-spider start (round-4 BP-2).
+        if open_failure is not None:
+            cleanup_failed = False
+            try:
+                self._close_attempt("open-failed", allow_opening=True)
+            except BaseException:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    logger.error("Failed to clean up scheduler after open failure")
+                except BaseException:
+                    pass
+            raise open_failure
+
+        with self._lifecycle_lock:
             self._backpressure_paused = False
             self._backpressure_probe_due = False
             self._lifecycle_state = _LIFECYCLE_OPEN
-            # OPEN is the lifecycle linearization point. Success telemetry is
-            # observational and must not make a fully published scheduler appear to
-            # have failed when a custom logging handler raises BaseException.
-            try:
-                logger.info("Scheduler opened for spider %s", spider.name)
-            except BaseException:
-                pass
-            return None
+        try:
+            logger.info("Scheduler opened for spider %s", spider.name)
+        except BaseException:
+            pass
+        return None
 
     def _connect_ack_signals(self, spider: Spider) -> None:
         """Wire response_received → ack, spider_error → nack.
@@ -1712,17 +1671,22 @@ class BackendScheduler:
         self._signals_connected = True
 
     def _disconnect_signal_leases(self) -> None:
-        """Release signal registrations one at a time, retaining failures."""
-        while self._signal_leases:
-            lease = self._signal_leases[0]
+        """Release signal registrations without invoking managers under the lock."""
+        while True:
+            with self._lifecycle_lock:
+                if not self._signal_leases:
+                    return
+                lease = self._signal_leases[0]
             try:
                 lease.manager.disconnect(lease.receiver, signal=lease.signal)
             except DispatcherKeyError:
                 # The unique registration is already absent: this is the successful
                 # retry result for an effect-then-raise disconnect.
                 pass
-            self._signal_leases.pop(0)
-            self._sync_signal_compatibility_views()
+            with self._lifecycle_lock:
+                if self._signal_leases and self._signal_leases[0] is lease:
+                    self._signal_leases.pop(0)
+                self._sync_signal_compatibility_views()
 
     def _on_response_received(
         self,
@@ -1844,20 +1808,50 @@ class BackendScheduler:
 
     def close(self, reason: str) -> Deferred[None] | None:
         """Close the scheduler, surfacing a retryable checkpoint failure."""
-        with self._lifecycle_lock:
-            self._close_locked(reason)
+        self._close_attempt(reason)
         return None
 
     def abort(self, reason: str) -> None:
         """Explicitly discard uncheckpointed queue state and finish teardown."""
+        self._close_attempt(reason, lossy=True)
+
+    def _close_attempt(
+        self,
+        reason: str,
+        *,
+        lossy: bool = False,
+        allow_opening: bool = False,
+    ) -> None:
+        """Reserve one bounded close pass, run callbacks unlocked, then publish."""
+        owner_token = object()
+        thread_id = threading.get_ident()
         with self._lifecycle_lock:
-            self._close_locked(reason, lossy=True)
+            if self._lifecycle_state == _LIFECYCLE_CLOSED:
+                return
+            if self._lifecycle_state == _LIFECYCLE_OPENING and not allow_opening:
+                raise RuntimeError("Scheduler open is already in progress")
+            if self._lifecycle_state == _LIFECYCLE_CLOSING:
+                if self._close_attempt_owner is not None:
+                    if self._close_attempt_thread_id == thread_id:
+                        # Re-entrant close from an untrusted callback is bounded and
+                        # leaves the outer attempt authoritative.
+                        return
+                    raise RuntimeError("Scheduler close is already in progress")
+            self._lifecycle_state = _LIFECYCLE_CLOSING
+            self._close_attempt_owner = owner_token
+            self._close_attempt_thread_id = thread_id
+        try:
+            self._close_locked(reason, lossy=lossy)
+        finally:
+            with self._lifecycle_lock:
+                if self._close_attempt_owner is owner_token:
+                    self._close_attempt_owner = None
+                    self._close_attempt_thread_id = None
 
     def _close_locked(self, reason: str, *, lossy: bool = False) -> None:
-        """Advance one retryable ``CLOSING`` teardown state-machine pass."""
+        """Run one reserved teardown pass; extension callbacks run unlocked."""
         if self._lifecycle_state == _LIFECYCLE_CLOSED:
             return
-        self._lifecycle_state = _LIFECYCLE_CLOSING
 
         if not self._queue_terminal:
             queue_failure: BaseException | None = None
@@ -1939,17 +1933,17 @@ class BackendScheduler:
                 self.connection_manager.close()
             self._manager_released = True
 
-        # No ownership handle remains. Clear compatibility references before the
-        # final lifecycle publication; interruption here is repairable because all
-        # provider operations above are already terminal/idempotent.
-        self._queue = None
-        self._spider = None
-        self._connected_signals = None
-        self._connected_ack_signal_handlers = None
-        self._signals_connected = False
-        self._backpressure_paused = False
-        self._backpressure_probe_due = False
-        self._lifecycle_state = _LIFECYCLE_CLOSED
+        # No ownership handle remains. Publish final package state under the lock;
+        # every provider callback above completed while it was released.
+        with self._lifecycle_lock:
+            self._queue = None
+            self._spider = None
+            self._connected_signals = None
+            self._connected_ack_signal_handlers = None
+            self._signals_connected = False
+            self._backpressure_paused = False
+            self._backpressure_probe_due = False
+            self._lifecycle_state = _LIFECYCLE_CLOSED
         try:
             logger.info("Scheduler closed: %s", reason)
         except BaseException:
