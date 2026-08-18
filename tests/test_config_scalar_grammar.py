@@ -271,6 +271,51 @@ def test_programmatic_scalar_strings_are_rejected_by_model_validate() -> None:
     assert exc_info.value.setting_value is None
 
 
+def test_model_validate_redacts_rejected_scalar_without_mutating_input() -> None:
+    marker = "model-validate-scalar-private-marker"
+    supplied = {"retries": f"8-{marker}"}
+    original = supplied.copy()
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        KafkaSettings.model_validate(supplied, strict=True)
+
+    error = exc_info.value
+    assert supplied == original
+    assert str(error) == "Settings contain an invalid configuration value."
+    assert error.setting_name == "retries"
+    assert error.setting_value is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    for frame, _ in traceback.walk_tb(error.__traceback__):
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            assert marker not in repr(frame.f_locals)
+
+
+def test_model_validate_redacts_pydantic_input_for_rejected_scalar() -> None:
+    marker = "model-validate-pydantic-private-marker"
+    supplied = {"retry_delay": marker}
+    original = supplied.copy()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings.model_validate(supplied, strict=True)
+
+    error = exc_info.value
+    assert supplied == original
+    assert all(detail["input"] is None for detail in error.errors())
+    assert {detail["msg"] for detail in error.errors()} == {
+        "Value error, Invalid configuration value."
+    }
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in error.json()
+    assert marker not in "".join(traceback.format_exception(error))
+    for frame, _ in traceback.walk_tb(error.__traceback__):
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            assert marker not in repr(frame.f_locals)
+
+
 def test_documented_negative_integer_text_remains_available_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

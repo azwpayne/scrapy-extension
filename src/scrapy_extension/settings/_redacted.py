@@ -8,12 +8,14 @@ from importlib import import_module
 from typing import Annotated, Any, NoReturn, cast, get_args, get_origin
 
 from pydantic import SecretBytes, SecretStr, ValidationError, model_validator
+from pydantic.config import ExtraValues
 from pydantic_core import InitErrorDetails
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsError,
 )
+from typing_extensions import Self
 
 from scrapy_extension.exceptions._redaction import sanitize_configuration_error
 from scrapy_extension.exceptions.base import ConfigurationError
@@ -527,6 +529,100 @@ class RedactedBaseSettings(BaseSettings):
                     normalized[field_name],
                 )
         return normalized
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate without retaining rejected input in the public error graph."""
+        validation_error: ValidationError | None = None
+        source_error: SettingsError | None = None
+        configuration_error: ConfigurationError | None = None
+        unexpected_failure = False
+        try:
+            return super().model_validate(
+                obj,
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationError as error:
+            validation_error = error
+        except SettingsError as error:
+            source_error = error
+        except ConfigurationError as error:
+            configuration_error = error
+        except Exception:  # noqa: BLE001 - settings inputs are untrusted
+            unexpected_failure = True
+
+        fields = _trusted_settings_fields(cls)
+        field_names = (
+            frozenset(name for name in fields if type(name) is str)
+            if fields is not None
+            else frozenset()
+        )
+        if validation_error is not None:
+            sanitized_error: ValidationError | ConfigurationError = (
+                _redacted_validation_error(validation_error, field_names)
+            )
+        elif source_error is not None:
+            sanitized_error = ConfigurationError(
+                "Settings source contains an invalid configuration value.",
+                setting_name="settings",
+            )
+        elif configuration_error is not None:
+            if type(configuration_error) is ConfigurationError:
+                original_message = (
+                    configuration_error.args[0] if configuration_error.args else None
+                )
+                sanitized_error = sanitize_configuration_error(
+                    configuration_error,
+                    field_names | _SAFE_SETTINGS_ERROR_NAMES,
+                    message=(
+                        original_message
+                        if (
+                            field_names
+                            and type(original_message) is str
+                            and original_message
+                            in _SAFE_SETTINGS_CONFIGURATION_MESSAGES
+                        )
+                        else "Settings contain an invalid configuration value."
+                    ),
+                    fallback_setting_name="settings",
+                )
+                del original_message
+            else:
+                sanitized_error = ConfigurationError(
+                    "Settings contain an invalid configuration value.",
+                    setting_name="settings",
+                )
+        else:
+            assert unexpected_failure
+            sanitized_error = ConfigurationError(
+                "Settings contain an invalid configuration value.",
+                setting_name="settings",
+            )
+
+        # Never mutate caller-owned input to achieve redaction. Releasing these
+        # references and the caught error is sufficient because the replacement
+        # is raised only after the original exception handler has unwound.
+        del obj
+        del context
+        del validation_error
+        del source_error
+        del configuration_error
+        raise sanitized_error
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Wrap exact secret fields before publishing an assigned value."""
