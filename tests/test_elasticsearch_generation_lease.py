@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-from scrapy_extension.exceptions import BackendConnectionError
+from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 
@@ -25,6 +25,13 @@ def _thread(target: Any) -> threading.Thread:
     thread = threading.Thread(target=target)
     thread.start()
     return thread
+
+
+def _wait_for_disconnect_entry(backend: ElasticSearchBackend) -> None:
+    with backend._generation_condition:
+        assert backend._generation_condition.wait_for(
+            lambda: backend._disconnecting, timeout=2
+        )
 
 
 def test_push_lease_keeps_client_open_until_sdk_call_finishes(mocker: Any) -> None:
@@ -179,6 +186,7 @@ def test_reconnect_fences_retired_client_and_snapshot(mocker: Any) -> None:
     pushing = _thread(lambda: backend.push("jobs", b"old"))
     assert entered.wait(timeout=2)
     disconnecting = _thread(backend.disconnect)
+    _wait_for_disconnect_entry(backend)
     first.close.assert_not_called()
     release.set()
     pushing.join(timeout=2)
@@ -236,3 +244,66 @@ def test_reentrant_disconnect_is_rejected_without_deadlock(mocker: Any) -> None:
     assert len(rejection) == 1
     assert "re-entrantly" in str(rejection[0])
     client.close.assert_not_called()
+
+
+@pytest.mark.parametrize("startup_callback", ["ping", "ensure_indices", "close"])
+@pytest.mark.parametrize("nested_action", ["connect", "disconnect", "lazy_push"])
+def test_private_candidate_rejects_same_thread_reentrant_lifecycle(
+    mocker: Any, startup_callback: str, nested_action: str
+) -> None:
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    candidate = mocker.MagicMock()
+    rejections: list[Exception] = []
+    callback_count = 0
+
+    def invoke_nested_action() -> None:
+        nonlocal callback_count
+        callback_count += 1
+        expected_error = (
+            QueueError if nested_action == "lazy_push" else BackendConnectionError
+        )
+        with pytest.raises(expected_error) as exc_info:
+            if nested_action == "connect":
+                backend.connect()
+            elif nested_action == "disconnect":
+                backend.disconnect()
+            else:
+                backend.push("jobs", b"nested")
+        rejections.append(exc_info.value)
+
+    if startup_callback == "ping":
+
+        def ping() -> bool:
+            invoke_nested_action()
+            return False
+
+        candidate.ping.side_effect = ping
+    elif startup_callback == "ensure_indices":
+        candidate.ping.return_value = True
+
+        def create_index(**_kwargs: Any) -> None:
+            invoke_nested_action()
+            raise RuntimeError("index setup failed")
+
+        candidate.indices.create.side_effect = create_index
+    else:
+        candidate.ping.return_value = False
+        candidate.close.side_effect = invoke_nested_action
+
+    factory = mocker.patch(
+        "scrapy_extension.backends.elasticsearch.Elasticsearch",
+        return_value=candidate,
+    )
+
+    with pytest.raises(BackendConnectionError):
+        backend.connect()
+
+    assert callback_count == 1
+    assert len(rejections) == 1
+    factory.assert_called_once()
+    candidate.close.assert_called_once_with()
+    assert backend._generation is None
+    assert backend._client is None
+    assert backend._connection_snapshot is None
+    assert backend._connecting is False
+    assert backend._connect_owner is None

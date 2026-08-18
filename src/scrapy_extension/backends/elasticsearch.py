@@ -235,6 +235,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._generation_condition = threading.Condition()
         self._lease_local = threading.local()
         self._lifecycle_epoch = 0
+        self._connecting = False
+        self._connect_owner: int | None = None
         self._disconnecting = False
         self._disconnect_owner: int | None = None
         self._generation: _ElasticSearchGeneration | None = None
@@ -355,100 +357,144 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """Privately build and atomically publish one client generation."""
         current_thread = threading.get_ident()
         with self._generation_condition:
-            if self._disconnect_owner == current_thread:
-                raise BackendConnectionError(
-                    "Cannot connect to Elasticsearch re-entrantly during disconnect.",
-                    backend_type="elasticsearch",
-                )
-            while self._disconnecting:
-                if int(getattr(self._lease_local, "depth", 0)):
+            while True:
+                if self._connect_owner == current_thread:
                     raise BackendConnectionError(
-                        "Cannot connect to Elasticsearch during an active operation.",
+                        "Cannot connect to Elasticsearch re-entrantly during connect.",
                         backend_type="elasticsearch",
                     )
-                self._generation_condition.wait()
-            if self._generation is not None:
-                return
-
-        with self._lifecycle_lock:
-            with self._generation_condition:
+                if self._disconnect_owner == current_thread:
+                    raise BackendConnectionError(
+                        "Cannot connect to Elasticsearch re-entrantly during disconnect.",
+                        backend_type="elasticsearch",
+                    )
                 if self._generation is not None:
                     return
                 if self._disconnecting:
-                    raise BackendConnectionError(
-                        "Cannot connect while Elasticsearch is disconnecting.",
-                        backend_type="elasticsearch",
-                    )
-                injected_client = self._client
-                injected_snapshot = self._connection_snapshot
+                    if int(getattr(self._lease_local, "depth", 0)):
+                        raise BackendConnectionError(
+                            "Cannot connect to Elasticsearch during an active operation.",
+                            backend_type="elasticsearch",
+                        )
+                    self._generation_condition.wait()
+                    continue
+                if self._connecting:
+                    self._generation_condition.wait()
+                    continue
+                break
 
-            # Preserve narrowly scoped compatibility for code that populated the
-            # historical private mirrors. Adopt both into one atomic generation.
-            if injected_client is not None:
-                snapshot = injected_snapshot or self._capture_connection_snapshot()
-                generation = _ElasticSearchGeneration(injected_client, snapshot)
-                with self._generation_condition:
-                    self._generation = generation
-                    self._client = generation.client
-                    self._connection_snapshot = generation.snapshot
-                    self._generation_condition.notify_all()
-                return
-
-            snapshot = self._capture_connection_snapshot()
-            candidate: Elasticsearch | None = None
-            startup_error: BackendConnectionError | None = None
-            cleanup_diagnostic_pending = False
+        with self._lifecycle_lock:
+            owns_startup = False
             try:
-                kwargs = self._build_kwargs(snapshot)
-                if snapshot.mode == ElasticSearchMode.CLOUD:
-                    if not snapshot.cloud_id:
-                        msg = "Cloud mode requires 'cloud_id'"
-                        raise BackendConnectionError(msg, backend_type="elasticsearch")
-                    kwargs["cloud_id"] = snapshot.cloud_id
-                else:
-                    kwargs["hosts"] = snapshot.hosts
-                    kwargs["verify_certs"] = snapshot.verify_certs
-                    if snapshot.ca_certs:
-                        kwargs["ca_certs"] = snapshot.ca_certs
-                candidate = Elasticsearch(**kwargs)
-                if not candidate.ping():
-                    raise BackendConnectionError(
-                        "ElasticSearch health check returned false during connect",
+                with self._generation_condition:
+                    if self._connect_owner == current_thread:
+                        raise BackendConnectionError(
+                            "Cannot connect to Elasticsearch re-entrantly during connect.",
+                            backend_type="elasticsearch",
+                        )
+                    if self._generation is not None:
+                        return
+                    if self._disconnecting:
+                        raise BackendConnectionError(
+                            "Cannot connect while Elasticsearch is disconnecting.",
+                            backend_type="elasticsearch",
+                        )
+                    if self._connecting:
+                        raise BackendConnectionError(
+                            "Another Elasticsearch connection startup is in progress.",
+                            backend_type="elasticsearch",
+                        )
+                    self._connecting = True
+                    self._connect_owner = current_thread
+                    owns_startup = True
+                    injected_client = self._client
+                    injected_snapshot = self._connection_snapshot
+
+                # Preserve narrowly scoped compatibility for code that populated the
+                # historical private mirrors. Adopt both into one atomic generation.
+                if injected_client is not None:
+                    snapshot = injected_snapshot or self._capture_connection_snapshot()
+                    generation = _ElasticSearchGeneration(injected_client, snapshot)
+                    with self._generation_condition:
+                        self._generation = generation
+                        self._client = generation.client
+                        self._connection_snapshot = generation.snapshot
+                        self._generation_condition.notify_all()
+                    return
+
+                snapshot = self._capture_connection_snapshot()
+                candidate: Elasticsearch | None = None
+                startup_error: BackendConnectionError | None = None
+                cleanup_diagnostic_pending = False
+                try:
+                    kwargs = self._build_kwargs(snapshot)
+                    if snapshot.mode == ElasticSearchMode.CLOUD:
+                        if not snapshot.cloud_id:
+                            msg = "Cloud mode requires 'cloud_id'"
+                            raise BackendConnectionError(
+                                msg, backend_type="elasticsearch"
+                            )
+                        kwargs["cloud_id"] = snapshot.cloud_id
+                    else:
+                        kwargs["hosts"] = snapshot.hosts
+                        kwargs["verify_certs"] = snapshot.verify_certs
+                        if snapshot.ca_certs:
+                            kwargs["ca_certs"] = snapshot.ca_certs
+                    candidate = Elasticsearch(**kwargs)
+                    if not candidate.ping():
+                        raise BackendConnectionError(
+                            "ElasticSearch health check returned false during connect",
+                            backend_type="elasticsearch",
+                        )
+                    self._ensure_indices(snapshot, client=candidate)
+                    generation = _ElasticSearchGeneration(candidate, snapshot)
+                    with self._generation_condition:
+                        if (
+                            self._connect_owner != current_thread
+                            or not self._connecting
+                            or self._disconnecting
+                            or self._generation is not None
+                        ):
+                            raise BackendConnectionError(
+                                "Elasticsearch connection changed during startup.",
+                                backend_type="elasticsearch",
+                            )
+                        self._generation = generation
+                        self._client = generation.client
+                        self._connection_snapshot = generation.snapshot
+                        self._generation_condition.notify_all()
+                    try:
+                        logger.debug(
+                            "Connected to ElasticSearch in %s mode", snapshot.mode.value
+                        )
+                    except BaseException:
+                        pass
+                except (BackendConnectionError, ApiError, TransportError):
+                    cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
+                    startup_error = BackendConnectionError(
+                        f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
                         backend_type="elasticsearch",
                     )
-                self._ensure_indices(snapshot, client=candidate)
-                generation = _ElasticSearchGeneration(candidate, snapshot)
-                with self._generation_condition:
-                    self._generation = generation
-                    self._client = generation.client
-                    self._connection_snapshot = generation.snapshot
-                    self._generation_condition.notify_all()
-                try:
-                    logger.debug(
-                        "Connected to ElasticSearch in %s mode", snapshot.mode.value
+                except Exception:
+                    cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
+                    startup_error = BackendConnectionError(
+                        f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
+                        backend_type="elasticsearch",
                     )
                 except BaseException:
-                    pass
-            except (BackendConnectionError, ApiError, TransportError):
-                cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
-                startup_error = BackendConnectionError(
-                    f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
-                    backend_type="elasticsearch",
-                )
-            except Exception:
-                cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
-                startup_error = BackendConnectionError(
-                    f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
-                    backend_type="elasticsearch",
-                )
-            except BaseException:
-                self._abort_failed_connect(candidate)
-                raise
+                    self._abort_failed_connect(candidate)
+                    raise
 
-            if cleanup_diagnostic_pending:
-                self._log_failed_connect_cleanup_diagnostic()
-            if startup_error is not None:
-                raise startup_error
+                if cleanup_diagnostic_pending:
+                    self._log_failed_connect_cleanup_diagnostic()
+                if startup_error is not None:
+                    raise startup_error
+            finally:
+                if owns_startup:
+                    with self._generation_condition:
+                        self._connecting = False
+                        self._connect_owner = None
+                        self._generation_condition.notify_all()
 
     @staticmethod
     def _log_failed_connect_cleanup_diagnostic() -> None:
@@ -560,7 +606,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     @contextlib.contextmanager
     def _lease_generation(self, operation: str) -> Iterator[_ElasticSearchGeneration]:
         """Lease one complete generation, lazily connecting in the same epoch."""
+        current_thread = threading.get_ident()
         with self._generation_condition:
+            if self._connect_owner == current_thread and self._generation is None:
+                raise BackendConnectionError(
+                    f"Cannot {operation} while Elasticsearch connect is in progress.",
+                    backend_type="elasticsearch",
+                )
             if self._disconnecting:
                 raise BackendConnectionError(
                     f"Cannot {operation} while Elasticsearch is disconnecting.",
@@ -650,13 +702,19 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
 
     def disconnect(self) -> None:
         """Stop admission, drain leases, detach, then close the root client."""
+        current_thread = threading.get_ident()
+        with self._generation_condition:
+            if self._connect_owner == current_thread:
+                raise BackendConnectionError(
+                    "Cannot disconnect Elasticsearch re-entrantly during connect.",
+                    backend_type="elasticsearch",
+                )
         if int(getattr(self._lease_local, "depth", 0)):
             raise BackendConnectionError(
                 "Cannot disconnect Elasticsearch re-entrantly from an active operation.",
                 backend_type="elasticsearch",
             )
 
-        current_thread = threading.get_ident()
         pending_interrupt: BaseException | None = None
         owns_barrier = False
         generation: _ElasticSearchGeneration | None = None
