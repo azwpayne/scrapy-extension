@@ -433,6 +433,38 @@ class TestThirdPartyDiscovered:
             ConnectionManager("mybackend")._create_backend(), _StubBackend
         )
 
+    def test_spider_mixin_accepts_plugin_registry_identifier(self, monkeypatch):
+        """A plugin registry key is a valid runtime spider backend identifier."""
+        from scrapy_extension.backends.registry import _ENTRY_POINT_GROUP
+        from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
+
+        _patch_entry_points(
+            monkeypatch,
+            [
+                _FakeEntryPoint(
+                    name="mybackend",
+                    value="tests.test_registry._register_mybackend",
+                    group=_ENTRY_POINT_GROUP,
+                )
+            ],
+        )
+        _reset_registry_cache()
+
+        class PluginSpider(BackendSpiderMixin):
+            name = "plugin-spider"
+            backend_type = "mybackend"
+            backend_settings = {"host": "plugin.local"}
+
+        spider = PluginSpider()
+        try:
+            manager = spider.setup_backend()
+            backend = manager.get_queue_backend()
+            assert isinstance(backend, _StubBackend)
+            assert backend.settings.kwargs == {"host": "plugin.local"}
+        finally:
+            spider.close_backend()
+            _reset_registry_cache()
+
 
 class TestDescriptorBoundary:
     """Malformed or ambiguous plugins never enter or abort the registry."""

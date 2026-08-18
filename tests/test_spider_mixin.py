@@ -1083,10 +1083,8 @@ class TestBuildBackendSettings:
 
         class TestSpider(BackendSpiderMixin, Spider):
             name = "test_spider"
-            # plain string, not the enum — runtime dispatch accepts both (the
-            # class attr is typed BackendType | None, but _build_backend_settings
-            # deliberately handles plain strings per round-5 R5-1).
-            backend_type = "redis"  # type: ignore[assignment]
+            # plain string, not the enum — runtime dispatch accepts both.
+            backend_type = "redis"
             redis_host = "redis.example.com"
 
         spider = TestSpider()

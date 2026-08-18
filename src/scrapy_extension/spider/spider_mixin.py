@@ -62,7 +62,7 @@ class BackendSpiderMixin(Spider):
     """
 
     # Class-level backend configuration attributes
-    backend_type: BackendType | None = None
+    backend_type: BackendType | str | None = None
     backend_settings: dict[str, Any] | None = None
 
     # Redis shortcut settings
