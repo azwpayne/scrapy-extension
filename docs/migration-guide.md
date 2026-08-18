@@ -40,6 +40,29 @@ is process-local. Stop old workers normally; their tables disappear with the
 process. Successful inserts, the no-false-negative guarantee for those inserts,
 and `FilterFull` behavior are unchanged.
 
+## Pulsar Polling and Teardown Semantics
+
+Pulsar's Stable queue backend now performs synchronous SDK subscription and
+receive calls on one background pump per topic. The first `timeout=0` poll starts
+that pump and returns immediately, even when `subscribe()` or `receive()` is
+blocked; callers must continue normal scheduler polling to observe a delivery.
+Each topic prefetches at most 100 unreturned deliveries in process memory.
+Account for that bounded local ownership when sizing worker concurrency and when
+observing broker backlog.
+
+A transient subscription or receive failure is surfaced once and the failed
+pump is recycled on a later poll. For Exclusive and Failover subscriptions, a
+replacement is not published until the old consumer's close has actually
+finished, including across disconnect/reconnect. Close and worker joins have
+bounded caller waits, so a defective SDK handle can leave a daemon cleanup task
+running after `disconnect()` returns. Unreturned buffered messages are dropped
+locally without ACK/NACK and remain eligible for broker redelivery.
+
+No setting or persisted-data migration is required. During a rolling upgrade,
+expect temporary redistribution as old foreground receivers and new bounded
+pumps coexist. For the clearest operational boundary, stop old workers, allow
+consumer closes to complete, and then start upgraded workers.
+
 ## Pulsar TLS Hostname Validation
 
 Pulsar TLS client construction now uses the keyword names accepted by

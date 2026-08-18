@@ -14,6 +14,30 @@ ports and the discovered Redis master accept TLS using the configured CA.
 verification is enabled by default. The backend never downgrades Sentinel
 discovery to plaintext when the Redis data-plane TLS flag is set.
 
+## Operate Pulsar receive pumps
+
+Pulsar polling owns one background receive pump and a buffer of at most 100
+unreturned deliveries per active topic. A first zero-time poll only starts the
+pump; continued empty results while the worker is subscribing are expected.
+Use broker consumer/subscription metrics together with application poll and
+settlement metrics rather than treating that first result as broker emptiness.
+
+On a receive or subscription failure, one poll reports the failure and a later
+poll recycles the pump. Exclusive and Failover consumers deliberately delay the
+replacement subscribe until the failed consumer close exits. If the SDK close
+blocks, teardown returns after its bounded wait and logs
+`Pulsar SDK handle close did not finish within the shutdown timeout.`; the daemon
+retirement and its per-topic replacement fence remain active across disconnect
+and reconnect. Do not repeatedly restart workers to bypass that fence. Diagnose
+the broker/client close, then verify the old consumer disappears and normal
+polling creates exactly one replacement.
+
+Disconnect also fences the old client generation, bounds receive-worker joins,
+and discards unreturned local records without acknowledging them. Expect those
+records to be redelivered. Before planned maintenance, pause producers, allow
+in-flight requests to settle, disconnect workers, and confirm broker consumers
+have closed before declaring the drain complete.
+
 ## Switch dedup strategy
 
 Select a `MembershipFilter` via `SCRAPY_DEDUP_STRATEGY` — no code change

@@ -252,6 +252,103 @@ def test_transient_receive_failure_is_retired_for_next_poll(mocker: Any) -> None
         backend.disconnect()
 
 
+@pytest.mark.parametrize("consumer_type", ["Exclusive", "Failover"])
+@pytest.mark.parametrize(
+    "receive_error",
+    [RuntimeError("failed receive"), KeyboardInterrupt("cancelled receive")],
+    ids=["exception", "base-exception"],
+)
+def test_failed_consumer_close_fences_concurrent_replacement_across_disconnect(
+    mocker: Any, consumer_type: str, receive_error: BaseException
+) -> None:
+    """A blocked failed close conserves one subscription until it truly exits."""
+    receive_started = Event()
+    close_started = Event()
+    release_close = Event()
+    failed_consumer = MagicMock(name="failed-exclusive-consumer")
+    recovered_consumer = _ControllableConsumer()
+
+    def failed_receive(*, timeout_millis: int) -> Any:
+        del timeout_millis
+        receive_started.set()
+        raise receive_error
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    failed_consumer.receive.side_effect = failed_receive
+    failed_consumer.close.side_effect = blocked_close
+    old_client = MagicMock(name="old-client")
+    old_client.subscribe.return_value = failed_consumer
+    new_client = MagicMock(name="new-client")
+    new_client.subscribe.return_value = recovered_consumer
+    client_factory = mocker.patch.object(
+        pulsar, "Client", side_effect=[old_client, new_client]
+    )
+    backend = PulsarBackend(PulsarSettings(consumer_type=consumer_type))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    topic = "scrapy-serialized-retirement"
+    observed_errors: list[BaseException] = []
+
+    assert backend.pop("serialized-retirement", timeout=0) is None
+    failed_pump = backend._receive_pumps[topic]
+    assert receive_started.wait(timeout=0.5)
+    assert failed_pump.stopped.wait(timeout=0.5)
+
+    def observe_failure() -> None:
+        try:
+            backend.pop("serialized-retirement", timeout=0.5)
+        except BaseException as error:
+            observed_errors.append(error)
+
+    observer = Thread(target=observe_failure, name="failed-pump-observer")
+    observer.start()
+    assert close_started.wait(timeout=0.5)
+
+    # This poll races the bounded failed-close wait. It must not publish a
+    # replacement subscribe while an Exclusive/Failover consumer may remain live.
+    assert backend.pop("serialized-retirement", timeout=0) is None
+    assert old_client.subscribe.call_count == 1
+    assert new_client.subscribe.call_count == 0
+    assert list(backend._consumer_retirements) == [topic]
+
+    observer.join(timeout=0.5)
+    assert not observer.is_alive()
+    assert len(observed_errors) == 1
+    if isinstance(receive_error, Exception):
+        assert isinstance(observed_errors[0], QueueError)
+    else:
+        assert observed_errors[0] is receive_error
+
+    # A disconnect/reconnect changes the client generation but cannot erase the
+    # topic retirement fence or admit another broker subscription.
+    backend.disconnect()
+    backend.connect()
+    assert backend.pop("serialized-retirement", timeout=0) is None
+    assert old_client.subscribe.call_count == 1
+    assert new_client.subscribe.call_count == 0
+    assert list(backend._consumer_retirements) == [topic]
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("serialized-retirement", timeout=0) is None
+    assert recovered_consumer.receive_started.wait(timeout=0.5)
+    recovered_consumer.deliver(_message(b"replacement", object()))
+    assert backend.pop("serialized-retirement", timeout=1.0) == b"replacement"
+
+    # Conservation: one failed close, one replacement subscribe, one active pump,
+    # and no leaked retirement after the old handle has actually finished.
+    assert failed_consumer.close.call_count == 1
+    assert old_client.subscribe.call_count + new_client.subscribe.call_count == 2
+    assert client_factory.call_count == 2
+    assert list(backend._receive_pumps) == [topic]
+    assert backend._consumers == {topic: recovered_consumer}
+    assert backend._consumer_retirements == {}
+
+
 def test_receive_worker_name_does_not_expose_private_topic(mocker: Any) -> None:
     private_marker = "private-thread-topic-marker"
     consumer = _ControllableConsumer()

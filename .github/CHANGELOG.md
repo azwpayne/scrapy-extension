@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Stable Pulsar polling now uses bounded background receive pumps.** The first
+  zero-time poll starts subscription work and returns immediately; later polls
+  consume from a per-topic buffer capped at 100 deliveries. Failed pumps are
+  recycled, but Exclusive/Failover replacement subscription is fenced until the
+  old consumer's bounded daemon close actually exits. Disconnect fences stale
+  generations, drops unreturned local deliveries without settling them, and
+  bounds SDK-close and receive-worker teardown waits.
 - **DynamoDB clears fence every observed current-schema row with an opaque
   per-store revision.** Package writes now reserve `_scrapy_revision`; clear uses
   validated conditional `DeleteItem(ALL_OLD)` calls instead of key-only batches.

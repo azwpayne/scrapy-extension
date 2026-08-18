@@ -238,6 +238,18 @@ class _PulsarCloseTask:
 
 
 @dataclass
+class _PulsarConsumerRetirement:
+    """Failed consumer close that fences replacement subscription publication."""
+
+    topic: str
+    client: Any
+    generation: int
+    consumer: Any
+    completed: Event = field(default_factory=Event)
+    worker: Thread | None = None
+
+
+@dataclass
 class _PulsarReceivePump:
     """Bounded local delivery buffer owned by one topic/client generation."""
 
@@ -402,6 +414,10 @@ class PulsarBackend(Backend, QueueBackend):
         self._consumer_creation_lock = Lock()
         self._receive_pump_creation_lock = Lock()
         self._receive_pumps: dict[str, _PulsarReceivePump] = {}
+        # A failed consumer may still hold an Exclusive/Failover subscription while
+        # its bounded daemon close remains blocked. Topic tombstones survive
+        # disconnect/reconnect and prevent a replacement subscribe until close exits.
+        self._consumer_retirements: dict[str, _PulsarConsumerRetirement] = {}
         # Worker names must never expose broker topic names. This monotonic opaque
         # identifier is allocated under the lifecycle lock and paired with the
         # client generation in each receive worker's diagnostic name.
@@ -1117,13 +1133,15 @@ class PulsarBackend(Backend, QueueBackend):
         """
         deadline = monotonic() + timeout if timeout > 0 else None
         topic = self._topic_name(queue_name)
-        pump = self._ensure_receive_pump(topic)
+        pump = self._ensure_receive_pump(topic, deadline)
+        if pump is None:
+            return None
 
         while True:
             lifecycle_held = False
             condition_held = False
             terminal_error: BaseException | None = None
-            retired_consumer: Any = None
+            retirement: _PulsarConsumerRetirement | None = None
             self._lifecycle_lock.acquire()
             lifecycle_held = True
             pump.condition.acquire()
@@ -1184,6 +1202,10 @@ class PulsarBackend(Backend, QueueBackend):
                             self._consumer = active_consumer
                             self._subscribed_topic = active_topic
                             break
+                    if retired_consumer is not None:
+                        retirement = self._start_consumer_retirement_locked(
+                            pump, retired_consumer
+                        )
                     pump.condition.notify_all()
                 elif deadline is None:
                     return None
@@ -1205,58 +1227,122 @@ class PulsarBackend(Backend, QueueBackend):
                     self._lifecycle_lock.release()
 
             if terminal_error is not None:
-                if retired_consumer is not None:
-                    # The failed pump no longer appears in any live-generation map,
-                    # so this poll owns its detached SDK handle. Cleanup is bounded
-                    # and must not replace either a static QueueError or a preserved
-                    # process-control exception crossing the worker boundary.
-                    self._close_aborted_handle(retired_consumer)
+                if retirement is not None and not retirement.completed.wait(
+                    max(0.0, self._receive_shutdown_timeout)
+                ):
+                    self._log_close_shutdown_timeout()
+                # Retirement cleanup must not replace either a static QueueError or a
+                # preserved process-control exception crossing the worker boundary.
                 raise terminal_error
 
-    def _ensure_receive_pump(self, topic: str) -> _PulsarReceivePump:
-        """Create or return the single bounded receive pump for ``topic``."""
-        with self._receive_pump_creation_lock:
-            with self._lifecycle_lock:
-                pump = self._receive_pumps.get(topic)
-                if pump is not None:
-                    return pump
-                client = self._client
-                generation = self._lifecycle_generation
-                snapshot = self._connection_snapshot
-                if client is None:
-                    raise QueueError(
-                        f"Cannot subscribe to Pulsar topic {topic}: backend is disconnected",
-                        queue_name=topic,
-                        operation="pop",
-                    )
-                if snapshot is None:
-                    # Compatibility for direct private-client injection. Snapshot
-                    # capture is local and contains no SDK/network call.
-                    snapshot = self._capture_connection_snapshot()
-                pump = _PulsarReceivePump(
-                    topic=topic,
-                    client=client,
-                    snapshot=snapshot,
-                    generation=generation,
-                    capacity=self._receive_buffer_size,
-                )
-                self._receive_pump_counter += 1
-                pump_identifier = self._receive_pump_counter
-                worker = Thread(
-                    target=self._run_receive_pump,
-                    args=(pump,),
-                    name=f"scrapy-pulsar-receive-{generation}-{pump_identifier}",
-                    daemon=True,
-                )
-                pump.worker = worker
-                self._receive_pumps[topic] = pump
-                try:
-                    worker.start()
-                except BaseException:
-                    pump.stop_admission()
-                    self._receive_pumps.pop(topic, None)
-                    raise
-                return pump
+    def _start_consumer_retirement_locked(
+        self, pump: _PulsarReceivePump, consumer: Any
+    ) -> _PulsarConsumerRetirement:
+        """Publish and start one failed-consumer retirement under lifecycle lock."""
+        retirement = _PulsarConsumerRetirement(
+            topic=pump.topic,
+            client=pump.client,
+            generation=pump.generation,
+            consumer=consumer,
+        )
+        worker = Thread(
+            target=self._run_consumer_retirement,
+            args=(retirement,),
+            name="pulsar-failed-consumer-retirement",
+            daemon=True,
+        )
+        retirement.worker = worker
+        self._consumer_retirements[pump.topic] = retirement
+        try:
+            worker.start()
+        except BaseException:
+            self._consumer_retirements.pop(pump.topic, None)
+            retirement.completed.set()
+            raise
+        return retirement
+
+    def _run_consumer_retirement(self, retirement: _PulsarConsumerRetirement) -> None:
+        """Close one failed consumer and release its replacement fence."""
+        try:
+            retirement.consumer.close()
+        except BaseException:
+            # A close that exits by exception no longer blocks this process. Preserve
+            # the failed receive/subscribe error selected by the public poll.
+            pass
+        finally:
+            retirement.completed.set()
+            try:
+                with self._lifecycle_lock:
+                    if self._consumer_retirements.get(retirement.topic) is retirement:
+                        self._consumer_retirements.pop(retirement.topic, None)
+            except BaseException:
+                # The completed Event is authoritative. A later poll prunes a
+                # tombstone even if an injected lifecycle-lock fault hit cleanup.
+                pass
+
+    def _ensure_receive_pump(
+        self, topic: str, deadline: float | None
+    ) -> _PulsarReceivePump | None:
+        """Create one pump, waiting only within budget for failed retirement."""
+        while True:
+            retirement: _PulsarConsumerRetirement | None = None
+            with self._receive_pump_creation_lock:
+                with self._lifecycle_lock:
+                    retirement = self._consumer_retirements.get(topic)
+                    if retirement is not None and retirement.completed.is_set():
+                        self._consumer_retirements.pop(topic, None)
+                        retirement = None
+                    if retirement is None:
+                        pump = self._receive_pumps.get(topic)
+                        if pump is not None:
+                            return pump
+                        client = self._client
+                        generation = self._lifecycle_generation
+                        snapshot = self._connection_snapshot
+                        if client is None:
+                            raise QueueError(
+                                f"Cannot subscribe to Pulsar topic {topic}: backend is disconnected",
+                                queue_name=topic,
+                                operation="pop",
+                            )
+                        if snapshot is None:
+                            # Compatibility for direct private-client injection.
+                            snapshot = self._capture_connection_snapshot()
+                        pump = _PulsarReceivePump(
+                            topic=topic,
+                            client=client,
+                            snapshot=snapshot,
+                            generation=generation,
+                            capacity=self._receive_buffer_size,
+                        )
+                        self._receive_pump_counter += 1
+                        pump_identifier = self._receive_pump_counter
+                        worker = Thread(
+                            target=self._run_receive_pump,
+                            args=(pump,),
+                            name=(
+                                f"scrapy-pulsar-receive-{generation}-{pump_identifier}"
+                            ),
+                            daemon=True,
+                        )
+                        pump.worker = worker
+                        self._receive_pumps[topic] = pump
+                        try:
+                            worker.start()
+                        except BaseException:
+                            pump.stop_admission()
+                            self._receive_pumps.pop(topic, None)
+                            raise
+                        return pump
+
+            # Never hold the creation or lifecycle lock while a failed SDK close
+            # blocks. Zero-time polls remain immediate; positive polls spend only
+            # their remaining caller budget waiting for retirement completion.
+            if deadline is None:
+                return None
+            remaining = deadline - monotonic()
+            if remaining <= 0 or not retirement.completed.wait(remaining):
+                return None
 
     @staticmethod
     def _subscribe_pump_consumer(pump: _PulsarReceivePump) -> Any:
