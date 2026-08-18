@@ -160,6 +160,17 @@ def test_commit_queue_error_and_log_have_no_backend_exception_graph() -> None:
     _assert_public_error_graph_isolated(exc_info.value)
 
 
+def test_commit_queue_error_drops_the_complete_snapshot_payload() -> None:
+    strategy = MagicMock(name="QueueStrategy")
+    strategy.snapshot.return_value = _MARKER.encode()
+    queue = _queue(_Storage(fail_store=True), strategy)
+
+    with pytest.raises(QueueError, match="snapshot commit") as exc_info:
+        queue.close()
+
+    _assert_public_error_graph_isolated(exc_info.value)
+
+
 def test_snapshot_creation_queue_error_has_no_strategy_exception_graph() -> None:
     strategy = MagicMock(name="QueueStrategy")
     queue = _queue(_Storage(), strategy)

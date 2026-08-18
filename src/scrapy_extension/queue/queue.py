@@ -1524,40 +1524,43 @@ class BackendQueue:
             except BaseException:
                 pass
             raise QueueError("Strategy snapshot creation failed.") from None
-        storage = self._snapshot_storage(strict=True)
-        if storage is None:
-            if state is None:
-                return
-            raise QueueError("Nonempty strategy state requires snapshot storage.")
-        repository = self._snapshot_repository(storage)
-        commit_failed = False
         try:
-            repository.commit(self._snapshot_key(), state)
-        except SnapshotRepositoryError:
-            commit_failed = True
-        if commit_failed:
+            storage = self._snapshot_storage(strict=True)
+            if storage is None:
+                if state is None:
+                    return
+                raise QueueError("Nonempty strategy state requires snapshot storage.")
+            repository = self._snapshot_repository(storage)
+            commit_failed = False
             try:
-                logger.error("Strategy snapshot commit failed")
-            except BaseException:
-                pass
-            raise QueueError("Strategy snapshot commit failed.")
+                repository.commit(self._snapshot_key(), state)
+            except SnapshotRepositoryError:
+                commit_failed = True
+            if commit_failed:
+                try:
+                    logger.error("Strategy snapshot commit failed")
+                except BaseException:
+                    pass
+                raise QueueError("Strategy snapshot commit failed.")
 
-        # A committed manifest, including an empty manifest, is authoritative.
-        # Legacy cleanup therefore happens only after the manifest-last commit.
-        legacy_key = self._legacy_snapshot_key()
-        if legacy_key is None:
-            return
-        cleanup_failed = False
-        try:
-            storage.delete(legacy_key)
-            storage.delete(self._empty_snapshot_tombstone_key())
-        except Exception:
-            cleanup_failed = True
-        if cleanup_failed:
+            # A committed manifest, including an empty manifest, is authoritative.
+            # Legacy cleanup therefore happens only after the manifest-last commit.
+            legacy_key = self._legacy_snapshot_key()
+            if legacy_key is None:
+                return
+            cleanup_failed = False
             try:
-                logger.error("Failed to retire legacy strategy snapshot")
-            except BaseException:
-                pass
+                storage.delete(legacy_key)
+                storage.delete(self._empty_snapshot_tombstone_key())
+            except Exception:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    logger.error("Failed to retire legacy strategy snapshot")
+                except BaseException:
+                    pass
+        finally:
+            state = None
 
     def _restore_snapshot(self) -> None:
         """Restore a validated v5 manifest or a compatible v3/v2/raw value."""
