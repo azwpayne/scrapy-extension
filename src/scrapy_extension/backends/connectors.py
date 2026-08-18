@@ -121,10 +121,14 @@ _CONNECTION_MANAGER_DIRECT_KEYS: dict[str, str] = {
 # Registry-only discriminator used by components whose backend owns mutable
 # consumer state tied to one logical queue. It participates in ``_registry_key``
 # but is stripped before constructing the backend's Pydantic settings model.
-_CONNECTION_MANAGER_SCOPE_KEY = "__connection_manager_queue_scope"
-_CONSUMER_SCOPED_BACKENDS: frozenset[str] = frozenset(
+# Public since BackendSpiderMixin (a Stable component) consumes them; the
+# private aliases below remain for internal callers.
+CONNECTION_MANAGER_SCOPE_KEY = "__connection_manager_queue_scope"
+CONSUMER_SCOPED_BACKENDS: frozenset[str] = frozenset(
     {BackendType.KAFKA.value, BackendType.ROCKETMQ.value}
 )
+_CONNECTION_MANAGER_SCOPE_KEY = CONNECTION_MANAGER_SCOPE_KEY
+_CONSUMER_SCOPED_BACKENDS = CONSUMER_SCOPED_BACKENDS
 _CONNECTION_MANAGER_SCRAPY_KEYS: dict[str, str] = {
     "retry_attempts": "SCRAPY_RETRY_ATTEMPTS",
     "retry_delay": "SCRAPY_RETRY_DELAY",

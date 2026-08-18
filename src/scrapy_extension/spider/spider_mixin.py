@@ -162,15 +162,15 @@ class BackendSpiderMixin(Spider):
 
                 settings = self._build_backend_settings()
                 from scrapy_extension.backends.connectors import (
-                    _CONNECTION_MANAGER_SCOPE_KEY,
-                    _CONSUMER_SCOPED_BACKENDS,
+                    CONNECTION_MANAGER_SCOPE_KEY,
+                    CONSUMER_SCOPED_BACKENDS,
                     ConnectionManager,
                 )
 
-                if self._backend_type_name() in _CONSUMER_SCOPED_BACKENDS:
+                if self._backend_type_name() in CONSUMER_SCOPED_BACKENDS:
                     settings = {
                         **settings,
-                        _CONNECTION_MANAGER_SCOPE_KEY: (
+                        CONNECTION_MANAGER_SCOPE_KEY: (
                             f"spider-mixin-{self._consumer_manager_scope}"
                         ),
                     }
@@ -342,9 +342,9 @@ class BackendSpiderMixin(Spider):
 
     def _claim_consumer_queue(self, queue_name: str) -> None:
         """Bind single-consumer backends to one logical queue per mixin instance."""
-        from scrapy_extension.backends.connectors import _CONSUMER_SCOPED_BACKENDS
+        from scrapy_extension.backends.connectors import CONSUMER_SCOPED_BACKENDS
 
-        if self._backend_type_name() not in _CONSUMER_SCOPED_BACKENDS:
+        if self._backend_type_name() not in CONSUMER_SCOPED_BACKENDS:
             return
         from scrapy_extension.backends.base import _validate_key_name
 

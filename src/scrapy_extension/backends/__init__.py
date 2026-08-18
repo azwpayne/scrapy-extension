@@ -20,7 +20,11 @@ from scrapy_extension.backends.base import (
     SetBackend,
     StorageBackend,
 )
-from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.connectors import (
+    CONNECTION_MANAGER_SCOPE_KEY,
+    CONSUMER_SCOPED_BACKENDS,
+    ConnectionManager,
+)
 
 if TYPE_CHECKING:
     from scrapy_extension.backends.dynamodb import DynamoDBBackend
@@ -135,6 +139,8 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "CONNECTION_MANAGER_SCOPE_KEY",
+    "CONSUMER_SCOPED_BACKENDS",
     "Backend",
     "BackendType",
     "ConnectionManager",
