@@ -33,7 +33,7 @@ import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -112,6 +112,8 @@ _SQS_PURGE_WINDOW_SECONDS = 60.0
 _SQS_QUEUE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _V2_QUEUE_NAME_PREFIX = "scrapyext-v2-"
 _V2_QUEUE_NAME_DOMAIN = b"scrapy-extension:sqs:physical-queue:v2\x00"
+_V2_QUEUE_OWNER_TAG_KEY = "scrapy-extension:queue-owner"
+_V2_QUEUE_OWNER_PREFIX = "scrapy-extension:sqs:v2:"
 
 # MessageBody is capped at 1 MiB. This backend base64-encodes the raw bytes;
 # because 1 MiB is divisible by four, the largest encodable input is exactly
@@ -153,6 +155,12 @@ def _length_prefixed_digest(
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def _v2_queue_owner(prefix: str, queue_name: str) -> str:
+    """Return stable package ownership metadata for one complete v2 tuple."""
+    physical_name = _physical_queue_name(prefix, queue_name, SqsQueueNameGeneration.V2)
+    return f"{_V2_QUEUE_OWNER_PREFIX}{physical_name.removeprefix(_V2_QUEUE_NAME_PREFIX)}"
 
 
 def _physical_queue_name(
@@ -417,16 +425,6 @@ class SqsBackend(Backend, QueueBackend):
 
     def __init__(self, config: SqsSettings) -> None:
         self.config = config
-        if config.queue_name_generation is SqsQueueNameGeneration.LEGACY_V1:
-            warnings.warn(
-                (
-                    "SQS legacy_v1 physical queue-name mapping is deprecated and "
-                    "must be used only to drain existing queues before an atomic "
-                    "worker switch to v2."
-                ),
-                FutureWarning,
-                stacklevel=1,
-            )
         self._connect_lock = threading.Lock()
         self._generation_condition = threading.Condition()
         self._generation: _SqsClientGeneration | None = None
@@ -586,10 +584,23 @@ class SqsBackend(Backend, QueueBackend):
                 # Raise outside the driver exception handler so endpoint/credential
                 # text cannot survive through ``__cause__`` or ``__context__``.
                 raise startup_error
-            # Publication is the linearization point.  A success diagnostic runs
-            # strictly after that point, so even a control-flow failure from a
-            # logging extension must not make ``connect`` report failure or discard
-            # the now-authoritative generation.
+            # Publication is the linearization point. Deprecation is reported only
+            # for a validated legacy generation that actually became authoritative;
+            # constructor-only configuration and failed connection attempts do not
+            # warn. An explicit reconnect reports the newly captured generation.
+            if snapshot.queue_name_generation is SqsQueueNameGeneration.LEGACY_V1:
+                warnings.warn(
+                    (
+                        "SQS legacy_v1 physical queue-name mapping is deprecated and "
+                        "must be used only to drain existing queues before an atomic "
+                        "worker switch to v2."
+                    ),
+                    FutureWarning,
+                    stacklevel=1,
+                )
+            # A success diagnostic runs strictly after publication, so even a
+            # control-flow failure from a logging extension must not make ``connect``
+            # report failure or discard the now-authoritative generation.
             try:
                 logger.debug("Connected to SQS in %s mode", snapshot.mode.value)
             except BaseException:
@@ -744,29 +755,84 @@ class SqsBackend(Backend, QueueBackend):
             except Exception as lookup_error:
                 if not _is_queue_missing(lookup_error):
                     raise QueueError(
-                        f"Failed to resolve SQS queue URL for {queue_name}: {lookup_error}",
+                        "Failed to resolve SQS queue URL.",
                         queue_name=queue_name,
                         operation=operation,
                     ) from lookup_error
+                create_kwargs: dict[str, Any] = {"QueueName": name}
+                if (
+                    generation.snapshot.queue_name_generation
+                    is SqsQueueNameGeneration.V2
+                ):
+                    create_kwargs["tags"] = {
+                        _V2_QUEUE_OWNER_TAG_KEY: _v2_queue_owner(
+                            generation.snapshot.queue_name_prefix, queue_name
+                        )
+                    }
                 try:
-                    resp = generation.client.create_queue(QueueName=name)
+                    resp = generation.client.create_queue(**create_kwargs)
                 except Exception as create_error:
-                    raise QueueError(
-                        f"Failed to create missing SQS queue {queue_name}: {create_error}",
-                        queue_name=queue_name,
-                        operation=operation,
-                    ) from create_error
+                    # CreateQueue can commit before its response is lost, or another
+                    # creator can win after our missing lookup. Resolve once more and
+                    # subject the winner to the same ownership check. If no queue is
+                    # visible, preserve the original create failure.
+                    try:
+                        resp = generation.client.get_queue_url(QueueName=name)
+                    except Exception:
+                        raise QueueError(
+                            "Failed to create missing SQS queue.",
+                            queue_name=queue_name,
+                            operation=operation,
+                        ) from create_error
             try:
                 url = resp["QueueUrl"]
-            except Exception as e:
+                if not isinstance(url, str) or not url:
+                    raise TypeError("QueueUrl is missing or invalid")
+            except Exception as error:
                 raise QueueError(
-                    f"Failed to resolve SQS queue URL for {queue_name}: {e}",
+                    "Failed to resolve SQS queue URL.",
                     queue_name=queue_name,
                     operation=operation,
-                ) from e
+                ) from error
+            if generation.snapshot.queue_name_generation is SqsQueueNameGeneration.V2:
+                self._verify_v2_queue_owner(
+                    generation,
+                    url,
+                    queue_name,
+                    operation=operation,
+                )
             with generation.cache_lock:
                 generation.queue_urls[queue_name] = url
-            return cast(str, url)
+            return url
+
+    @staticmethod
+    def _verify_v2_queue_owner(
+        generation: _SqsClientGeneration,
+        queue_url: str,
+        queue_name: str,
+        *,
+        operation: str,
+    ) -> None:
+        """Fail closed unless an existing v2 queue has the exact package owner."""
+        expected_owner = _v2_queue_owner(
+            generation.snapshot.queue_name_prefix, queue_name
+        )
+        try:
+            response = generation.client.list_queue_tags(QueueUrl=queue_url)
+            if not isinstance(response, dict):
+                raise TypeError("tag response is not a mapping")
+            tags = response.get("Tags")
+            if not isinstance(tags, dict):
+                raise TypeError("queue tags are missing or invalid")
+            owner = tags.get(_V2_QUEUE_OWNER_TAG_KEY)
+            if owner != expected_owner:
+                raise ValueError("queue owner is absent or mismatched")
+        except Exception as error:
+            raise QueueError(
+                "SQS v2 queue ownership could not be verified.",
+                queue_name=queue_name,
+                operation=operation,
+            ) from error
 
     def _queue_lifecycle(self, queue_url: str) -> _SqsQueueLifecycle:
         """Return the stable lifecycle state for a physical SQS queue URL."""

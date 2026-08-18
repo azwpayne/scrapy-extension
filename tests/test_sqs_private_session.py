@@ -13,7 +13,9 @@ def test_real_private_session_client_works_with_botocore_stubber() -> None:
             "from unittest.mock import patch",
             "import boto3",
             "from botocore.stub import Stubber",
-            "from scrapy_extension.backends.sqs import SqsBackend, _physical_queue_name",
+            "from scrapy_extension.backends.sqs import (",
+            "  SqsBackend, _V2_QUEUE_OWNER_TAG_KEY, _physical_queue_name, _v2_queue_owner,",
+            ")",
             "from scrapy_extension.settings import SqsQueueNameGeneration, SqsSettings",
             "real_session = boto3.session.Session(",
             "  aws_access_key_id='x', aws_secret_access_key='y',",
@@ -35,6 +37,11 @@ def test_real_private_session_client_works_with_botocore_stubber() -> None:
             "  stubber.add_response(",
             "    'get_queue_url', {'QueueUrl': queue_url},",
             "    {'QueueName': physical_name},",
+            "  )",
+            "  stubber.add_response(",
+            "    'list_queue_tags',",
+            "    {'Tags': {_V2_QUEUE_OWNER_TAG_KEY: _v2_queue_owner('scrapy-', 'q')}},",
+            "    {'QueueUrl': queue_url},",
             "  )",
             "  stubber.add_response(",
             "    'send_message', {'MessageId': 'message-id'},",
@@ -68,6 +75,53 @@ def test_real_private_session_client_works_with_botocore_stubber() -> None:
             "    }",
             "    backend.disconnect()",
             "    close.assert_called_once_with()",
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_real_stubber_rejects_existing_v2_queue_owner_conflict() -> None:
+    """Pin fail-closed owner verification against botocore's real SQS model."""
+    script = "\n".join(
+        (
+            "from unittest.mock import patch",
+            "import boto3",
+            "from botocore.stub import Stubber",
+            "from scrapy_extension.backends.sqs import SqsBackend, _physical_queue_name",
+            "from scrapy_extension.exceptions import QueueError",
+            "from scrapy_extension.settings import SqsQueueNameGeneration, SqsSettings",
+            "session = boto3.session.Session(",
+            "  aws_access_key_id='x', aws_secret_access_key='y', region_name='us-east-1',",
+            ")",
+            "client = session.client('sqs', endpoint_url='http://localhost:4566')",
+            "name = _physical_queue_name('scrapy-', 'q', SqsQueueNameGeneration.V2)",
+            "url = f'http://localhost:4566/000000000000/{name}'",
+            "with Stubber(client) as stubber:",
+            "  stubber.add_response('get_queue_url', {'QueueUrl': url}, {'QueueName': name})",
+            "  stubber.add_response(",
+            "    'list_queue_tags', {'Tags': {'scrapy-extension:queue-owner': 'other'}},",
+            "    {'QueueUrl': url},",
+            "  )",
+            "  with patch('scrapy_extension.backends.sqs.boto3.session.Session', return_value=session), patch.object(session, 'client', return_value=client):",
+            "    backend = SqsBackend(SqsSettings())",
+            "    backend.connect()",
+            "    try:",
+            "      backend.push('q', b'x')",
+            "    except QueueError as error:",
+            "      assert error.operation == 'push'",
+            "      assert backend._queue_urls == {}",
+            "    else:",
+            "      raise AssertionError('owner conflict was accepted')",
+            "    stubber.assert_no_pending_responses()",
+            "    backend.disconnect()",
         )
     )
 

@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import scrapy_extension.backends.sqs as sqs_mod
 from scrapy_extension.backends.sqs import (
     _MAX_IN_FLIGHT,
     SqsBackend,
@@ -42,6 +43,20 @@ def _backend() -> SqsBackend:
 
 def _patch_client(mocker, client):
     """Patch one private SQS Session and guard the shared default alias."""
+
+    def list_queue_tags(*, QueueUrl):  # noqa: N803 - boto3 keyword
+        del QueueUrl
+        physical_name = client.get_queue_url.call_args.kwargs["QueueName"]
+        digest = physical_name.removeprefix(sqs_mod._V2_QUEUE_NAME_PREFIX)
+        return {
+            "Tags": {
+                sqs_mod._V2_QUEUE_OWNER_TAG_KEY: (
+                    f"{sqs_mod._V2_QUEUE_OWNER_PREFIX}{digest}"
+                )
+            }
+        }
+
+    client.list_queue_tags.side_effect = list_queue_tags
     session = mocker.MagicMock(name="private-sqs-session")
     session.client.return_value = client
     session_factory = mocker.patch(

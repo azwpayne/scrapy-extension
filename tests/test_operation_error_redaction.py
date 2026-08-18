@@ -29,7 +29,11 @@ from scrapy_extension.backends.circuit_breaker import (
     wrap_storage_backend,
 )
 from scrapy_extension.backends.pulsar import PulsarBackend
-from scrapy_extension.backends.sqs import SqsBackend
+from scrapy_extension.backends.sqs import (
+    _V2_QUEUE_OWNER_TAG_KEY,
+    SqsBackend,
+    _v2_queue_owner,
+)
 from scrapy_extension.exceptions import BackendError, QueueError, StorageError
 from scrapy_extension.settings import PulsarSettings, SqsSettings
 
@@ -128,6 +132,9 @@ def test_pulsar_pop_rebuilds_driver_error_without_topic_or_config_state(
 def test_sqs_token_ack_rebuilds_receipt_and_driver_failure(mocker: Any) -> None:
     backend, client = _connected_sqs_backend(mocker)
     client.get_queue_url.return_value = {"QueueUrl": f"https://{_MARKER}/queue"}
+    client.list_queue_tags.return_value = {
+        "Tags": {_V2_QUEUE_OWNER_TAG_KEY: _v2_queue_owner("scrapy-", _MARKER)}
+    }
     client.receive_message.return_value = {
         "Messages": [
             {

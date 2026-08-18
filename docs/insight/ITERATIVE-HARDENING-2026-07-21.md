@@ -408,11 +408,11 @@ speculative work.
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
   message limit before issuing network calls.
-- [x] **BACKEND-05B — injective SQS physical ownership.** Prevent an invalid
-  logical name's hashed form from aliasing a valid logical name preserved under
-  the same prefix. Bind a versioned complete logical identity to one physical
-  output namespace, with an explicit legacy generation available only for
-  controlled drains.
+- [x] **BACKEND-05B — bound SQS physical ownership.** Map every v2 tuple into a
+  collision-resistant physical namespace, bind the complete logical identity to
+  an SQS owner tag, and reject absent, mismatched, or unreadable ownership before
+  queue use. Keep the explicit untagged legacy generation only for controlled
+  drains.
 - [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
   default noreply mode so storage mutation success is based on a parsed server
   response rather than an unconfirmed socket write.
@@ -935,11 +935,19 @@ length-prefixed `(prefix, logical_name)` identity into one domain-separated
 `scrapyext-v2-*` namespace. Golden vectors and Hypothesis properties freeze the
 mapping, the 53-character SQS name boundary, and the known collision fixes.
 
+A name namespace alone cannot prevent a legacy direct queue from deliberately
+using a deterministic v2 name. Each newly created v2 queue therefore carries a
+stable package owner tag derived from the full tuple, and every resolved v2 URL
+must return that exact owner before it is cached or used. Missing, conflicting,
+malformed, and unreadable tags fail closed; create response-loss and competing
+creator races re-resolve and validate the winner. Legacy mode remains untagged.
+
 `queue_name_generation` is frozen with each connected client generation. The
 explicit deprecated `legacy_v1` value reproduces the prior wire mapping only for
-stop-producers/drain/switch migrations; there is no dual-read path. The focused
-322-test slice, full 5,257-item suite (5,208 passed, 49 documented skips), Ruff,
-and strict mypy remained green on Python 3.10.
+stop-producers/drain/switch migrations; there is no dual-read path. Its warning
+is emitted only after a validated legacy client generation is published, so a
+constructor does not warn and a mutate/disconnect/reconnect sequence reports the
+actual replacement generation.
 
 ### I14a — single-consumer manager scope across spiders
 

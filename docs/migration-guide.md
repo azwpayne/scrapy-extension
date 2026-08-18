@@ -620,10 +620,17 @@ SDK retry, or 60-second purge barrier.
 
 `SCRAPY_SQS_QUEUE_NAME_GENERATION` now defaults to `v2`. V2 hashes every
 length-prefixed `(queue_name_prefix, logical_queue_name)` tuple into the single
-`scrapyext-v2-*` namespace. This removes both prefix-boundary aliases and the
-legacy direct-name-versus-hashed-name collision. The output is always a valid
-53-character SQS Standard queue name. Message bodies, receipt handles, and the
-rest of the SQS wire behavior are unchanged.
+`scrapyext-v2-*` namespace. This removes prefix-boundary aliases within v2. The
+output is always a valid 53-character SQS Standard queue name. Because a legacy
+direct queue can still deliberately have that same name, each v2 queue is also
+bound to the full tuple with the package tag
+`scrapy-extension:queue-owner=scrapy-extension:sqs:v2:<40-hex-digest>`.
+Existing v2 QueueUrls are accepted and cached only after that exact owner is
+read back. A missing, different, malformed, or unreadable owner fails closed
+before push, pop, depth inspection, or clear; `legacy_v1` preserves its old
+untagged behavior. Grant v2 workers `sqs:ListQueueTags` and permission to tag a
+new queue as part of `CreateQueue`. Message bodies and receipt handles are
+unchanged.
 
 V2 deliberately does **not** auto-read the old queue. Existing deployments must
 migrate without concurrent generations:
@@ -646,6 +653,26 @@ queues; the backend will not dual-read or reconcile them. Rollback therefore
 uses the same boundary in reverse: stop producers and workers, drain the active
 v2 queue with v2 workers, and only then atomically restore legacy workers. Never
 use `legacy_v1` for a new deployment.
+
+If the v2 physical name already exists without the expected owner (including a
+legacy direct-name alias), keep every producer and consumer stopped and choose
+one explicit maintenance path:
+
+- **Drain/delete/recreate (preferred):** drain the existing queue with the
+  configuration that owns it, delete it, wait until SQS reports the name absent
+  and the post-delete reuse delay has elapsed, then let one v2 worker create the
+  tagged replacement before reopening traffic.
+- **Ownership adoption:** only after independently proving that the existing
+  queue and its redrive/dead-letter policy belong exclusively to the intended
+  full `(queue_name_prefix, logical_queue_name)` tuple, attach the exact owner
+  tag with trusted operator tooling and read it back. The `<40-hex-digest>` is
+  the suffix of the expected `scrapyext-v2-<40-hex-digest>` physical name. Never
+  adopt a non-empty ambiguous queue merely to bypass the check.
+
+A connection configured for `legacy_v1` emits its deprecation warning only
+after that validated client generation is connected. Constructing settings or
+a backend does not warn; an explicit disconnect/reconnect after changing the
+setting warns for the newly selected legacy generation.
 
 SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
 after PurgeQueue returns. AWS documents that the asynchronous purge can delete

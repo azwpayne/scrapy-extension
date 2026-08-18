@@ -6,6 +6,7 @@ import logging
 import sys
 import threading
 import traceback
+import warnings
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
@@ -43,8 +44,32 @@ def _physical_name(
     return sqs_mod._physical_queue_name(prefix, logical_name, generation)
 
 
+def _configure_v2_owner_tags(client: MagicMock) -> None:
+    """Make a mock return the owner matching its immediately preceding lookup."""
+
+    def list_queue_tags(*, QueueUrl):  # noqa: N803 - boto3 keyword
+        del QueueUrl
+        physical_name = client.get_queue_url.call_args.kwargs["QueueName"]
+        digest = physical_name.removeprefix(sqs_mod._V2_QUEUE_NAME_PREFIX)
+        return {
+            "Tags": {
+                sqs_mod._V2_QUEUE_OWNER_TAG_KEY: (
+                    f"{sqs_mod._V2_QUEUE_OWNER_PREFIX}{digest}"
+                )
+            }
+        }
+
+    client.list_queue_tags.side_effect = list_queue_tags
+
+
 def _patch_client(mocker, *, return_value=None, side_effect=None):
     """Patch one private Session and return its Session/client factories."""
+    if isinstance(return_value, MagicMock):
+        _configure_v2_owner_tags(return_value)
+    if isinstance(side_effect, (list, tuple)):
+        for candidate in side_effect:
+            if isinstance(candidate, MagicMock):
+                _configure_v2_owner_tags(candidate)
     session = mocker.MagicMock(name="private-sqs-session")
     if side_effect is not None:
         session.client.side_effect = side_effect
@@ -571,6 +596,49 @@ class TestSqsConnect:
         assert client_a.send_message.call_count == 2
         client_b.send_message.assert_not_called()
 
+    def test_legacy_warning_tracks_connected_generation_after_mutation(
+        self, mocker
+    ) -> None:
+        b = _make_backend()
+        client_a = mocker.MagicMock(name="client-a")
+        client_b = mocker.MagicMock(name="client-b")
+        _patch_client(mocker, side_effect=[client_a, client_b])
+
+        with warnings.catch_warnings(record=True) as initial_warnings:
+            warnings.simplefilter("always")
+            b.connect()
+        assert initial_warnings == []
+
+        b.config.queue_name_generation = SqsQueueNameGeneration.LEGACY_V1
+        b.disconnect()
+        with pytest.warns(FutureWarning, match="legacy_v1"):
+            b.connect()
+
+        assert b._generation is not None
+        assert (
+            b._generation.snapshot.queue_name_generation
+            is SqsQueueNameGeneration.LEGACY_V1
+        )
+
+    def test_legacy_constructor_does_not_warn_before_connection(self) -> None:
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            _make_backend(queue_name_generation=SqsQueueNameGeneration.LEGACY_V1)
+
+        assert recorded == []
+
+    def test_failed_legacy_connection_does_not_warn(self, mocker) -> None:
+        b = _make_backend(queue_name_generation=SqsQueueNameGeneration.LEGACY_V1)
+        _patch_client(mocker, side_effect=RuntimeError("client construction failed"))
+
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            with pytest.raises(BackendConnectionError):
+                b.connect()
+
+        assert recorded == []
+        assert b.is_connected() is False
+
     def test_connected_generation_keeps_operational_settings_snapshot(
         self, mocker
     ) -> None:
@@ -593,7 +661,8 @@ class TestSqsConnect:
         client_b.get_queue_url.return_value = {"QueueUrl": "https://sqs/b/q"}
         client_b.receive_message.return_value = {}
         _patch_client(mocker, return_value=client_b)
-        b.connect()
+        with pytest.warns(FutureWarning, match="legacy_v1"):
+            b.connect()
         b.push("q", b"replacement")
         assert b.pop("q") is None
 
@@ -874,13 +943,57 @@ class TestSqsPushPop:
 
         assert base64.b64decode(kwargs["MessageBody"]) == b"payload"
 
-    def test_push_caches_queue_url(self, mocker) -> None:
+    def test_push_caches_queue_url_only_after_v2_owner_validation(
+        self, mocker
+    ) -> None:
         b, client = _connected(mocker)
         b.push("queue1", b"a")
         b.push("queue1", b"b")
         client.get_queue_url.assert_called_once_with(
             QueueName=_physical_name("scrapy-", "queue1")
         )
+        client.list_queue_tags.assert_called_once_with(QueueUrl="https://sqs/test")
+
+    @pytest.mark.parametrize(
+        "tag_response",
+        [
+            {},
+            {"Tags": {}},
+            {"Tags": {sqs_mod._V2_QUEUE_OWNER_TAG_KEY: "another-owner"}},
+            {"Tags": []},
+        ],
+        ids=["missing-tags", "absent-owner", "mismatched-owner", "malformed-tags"],
+    )
+    def test_existing_v2_queue_owner_conflict_fails_before_mutation(
+        self, mocker, tag_response
+    ) -> None:
+        b, client = _connected(mocker)
+        client.list_queue_tags.side_effect = None
+        client.list_queue_tags.return_value = tag_response
+
+        with pytest.raises(QueueError) as exc_info:
+            b.push("queue1", b"payload")
+
+        assert exc_info.value.operation == "push"
+        assert b._queue_urls == {}
+        client.send_message.assert_not_called()
+
+    def test_unreadable_v2_queue_owner_fails_before_depth_or_clear(
+        self, mocker
+    ) -> None:
+        b, client = _connected(mocker)
+        client.list_queue_tags.side_effect = RuntimeError("access denied with secret")
+
+        for operation in ("pop", "queue_len", "clear_queue"):
+            with pytest.raises(QueueError) as exc_info:
+                getattr(b, operation)("queue1")
+            assert exc_info.value.operation == operation
+            assert "secret" not in str(exc_info.value)
+
+        assert b._queue_urls == {}
+        client.receive_message.assert_not_called()
+        client.get_queue_attributes.assert_not_called()
+        client.purge_queue.assert_not_called()
 
     def test_push_maps_colon_logical_name_to_stable_aws_name(self, mocker) -> None:
         first, first_client = _connected(mocker)
@@ -905,15 +1018,15 @@ class TestSqsPushPop:
     def test_legacy_drain_preserves_already_valid_80_character_name(
         self, mocker
     ) -> None:
-        with pytest.warns(FutureWarning, match="legacy_v1"):
-            b = _make_backend(
-                queue_name_prefix="",
-                queue_name_generation=SqsQueueNameGeneration.LEGACY_V1,
-            )
+        b = _make_backend(
+            queue_name_prefix="",
+            queue_name_generation=SqsQueueNameGeneration.LEGACY_V1,
+        )
         client = mocker.MagicMock()
         client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
         _patch_client(mocker, return_value=client)
-        b.connect()
+        with pytest.warns(FutureWarning, match="legacy_v1"):
+            b.connect()
         valid_name = "q" * 80
 
         b.push(valid_name, b"payload")

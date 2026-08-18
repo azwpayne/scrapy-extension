@@ -7,7 +7,7 @@ import re
 from hypothesis import given
 from hypothesis import strategies as st
 
-from scrapy_extension.backends.sqs import _physical_queue_name
+from scrapy_extension.backends.sqs import _physical_queue_name, _v2_queue_owner
 from scrapy_extension.settings import SqsQueueNameGeneration, SqsSettings
 
 _V2_NAME_PATTERN = re.compile(r"^scrapyext-v2-[0-9a-f]{40}$")
@@ -44,6 +44,22 @@ def test_v2_separates_known_legacy_prefix_boundary_collision() -> None:
     assert _physical_queue_name("a", "bc", SqsQueueNameGeneration.V2) != (
         _physical_queue_name("ab", "c", SqsQueueNameGeneration.V2)
     )
+
+
+def test_v2_owner_is_stable_and_bound_to_complete_tuple() -> None:
+    assert _v2_queue_owner("scrapy-", "queue1") == (
+        "scrapy-extension:sqs:v2:84c957fda86e68c72442ea2433d04183a0dd34b0"
+    )
+    assert _v2_queue_owner("a", "bc") != _v2_queue_owner("ab", "c")
+
+
+def test_v2_owner_distinguishes_a_legacy_direct_alias() -> None:
+    v2_name = _physical_queue_name("a", "bc", SqsQueueNameGeneration.V2)
+
+    assert _physical_queue_name(
+        "", v2_name, SqsQueueNameGeneration.LEGACY_V1
+    ) == v2_name
+    assert _v2_queue_owner("a", "bc") != _v2_queue_owner("", v2_name)
 
 
 def test_v2_separates_known_legacy_direct_vs_hash_namespace_collision() -> None:
@@ -85,3 +101,13 @@ def test_settings_select_v2_by_default_and_explicit_legacy_drain_mode() -> None:
         SqsSettings(queue_name_generation="legacy_v1").queue_name_generation
         is SqsQueueNameGeneration.LEGACY_V1
     )
+
+
+def test_queue_name_generation_loads_from_sqs_environment(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPY_SQS_QUEUE_NAME_GENERATION", "legacy_v1")
+    assert (
+        SqsSettings().queue_name_generation is SqsQueueNameGeneration.LEGACY_V1
+    )
+
+    monkeypatch.setenv("SCRAPY_SQS_QUEUE_NAME_GENERATION", "v2")
+    assert SqsSettings().queue_name_generation is SqsQueueNameGeneration.V2
