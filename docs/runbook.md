@@ -529,12 +529,13 @@ entire paginated clear are serialized because boto3 Resources are not
 thread-safe. Disconnect waits for an admitted call or table creation before
 closing the botocore client, so the shutdown budget must cover SDK retries and a
 full clear. This linearizes clear against writes made through the same backend instance.
-Every package `store()` also writes a fresh opaque `_scrapy_revision`, and clear
-conditions each deletion on the exact observed revision. A same-key replacement
-from another process therefore survives a stale clear, which raises a typed
-partial-result error instead of false success. DynamoDB Scan still does not
-provide cross-page snapshot isolation, so newly inserted, unobserved rows can
-remain.
+Every package `store()` generates `_scrapy_revision` with `uuid.uuid4().hex`;
+the required stored grammar is exactly 32 lowercase hexadecimal characters.
+Clear conditions each deletion on the exact observed revision. A same-key
+replacement from another process therefore survives a stale clear, which raises
+a typed partial-result error instead of false success. DynamoDB Scan still does
+not provide cross-page snapshot isolation, so newly inserted, unobserved rows
+can remain.
 
 Custom DynamoDB endpoints must be set through the backend's validated endpoint
 setting. Botocore environment variables (`AWS_ENDPOINT_URL` and
@@ -555,10 +556,12 @@ attempting rollback. Never call `disconnect()` re-entrantly from a synchronous
 logging hook or signal handler; schedule teardown on another thread.
 
 The stored schema reserves `_scrapy_revision` alongside `pk`, `value`, and the
-optional `expire_at`. Direct writers must replace it with a fresh opaque value,
-never preserve an old row's revision. Normal revision-fenced rows are safe from
-stale same-key clear deletion. Revisionless legacy rows fail closed and remain
-present because identical-value ABA is indistinguishable. In a stopped-writer
+optional `expire_at`. Direct writers must set `_scrapy_revision` to a freshly
+generated `uuid.uuid4().hex` on every replacement: exactly 32 lowercase
+hexadecimal characters. They must never preserve an old row's revision. Normal
+revision-fenced rows are safe from stale same-key clear deletion. Revisionless
+legacy rows fail closed and remain present because identical-value ABA is
+indistinguishable. In a stopped-writer
 maintenance window, either rewrite them through the current package or connect
 one generation with
 `SCRAPY_DYNAMODB_ALLOW_UNFENCED_LEGACY_CLEAR=True`. The high-risk override

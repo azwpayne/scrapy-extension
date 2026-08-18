@@ -737,9 +737,11 @@ boto3 Session. Shared backend instances serialize all Resource operations,
 including health checks and the complete paginated clear; budget for one
 in-flight operation per generation. Disconnect drains that call and closes the
 underlying botocore client. Local clear/store ordering is now linearized.
-Package stores also carry an opaque per-write revision so cross-process
-same-key replacements are fenced from stale clear deletes; DynamoDB Scan still
-has no cross-page snapshot isolation for newly inserted keys.
+Package stores generate `_scrapy_revision` with `uuid.uuid4().hex`; the required
+stored grammar is exactly 32 lowercase hexadecimal characters. This per-write
+revision fences cross-process same-key replacements from stale clear deletes;
+DynamoDB Scan still has no cross-page snapshot isolation for newly inserted
+keys.
 
 DynamoDB custom endpoints must now be configured with
 `SCRAPY_DYNAMODB_ENDPOINT_URL`. The backend intentionally ignores
@@ -748,11 +750,12 @@ endpoints so an ambient URL cannot bypass cloud-mode transport validation.
 Ambient credentials continue to work; only endpoint routing is isolated.
 
 DynamoDB package writes now include the reserved `_scrapy_revision` string
-attribute. Its 32-byte opaque value and attribute name count toward the 400 KiB
-item limit, so payloads that sat exactly at the previous maximum must shrink by
-48 bytes. Revision-fenced rows need no migration and normal clear safely fences
-each observed revision. A legacy row without the attribute is different:
-default clear preserves it and raises
+attribute generated with `uuid.uuid4().hex`. Its value is exactly 32 lowercase
+hexadecimal characters (32 bytes), and its value and attribute name count toward
+the 400 KiB item limit, so payloads that sat exactly at the previous maximum
+must shrink by 48 bytes. Revision-fenced rows need no migration and normal clear
+safely fences each observed revision. A legacy row without the attribute is
+different: default clear preserves it and raises
 `StorageError(operation="clear_storage", key=None)` because identical-value ABA
 cannot be detected from its attributes.
 
@@ -766,8 +769,9 @@ all writers remain stopped, then disable the setting and reconnect before
 resuming work. This high-risk override conditionally deletes the observed legacy
 attributes directly, so it does not add bytes, but identical-value ABA remains
 indistinguishable and is safe only because writers are quiesced. Applications
-writing directly to the table must generate a fresh opaque revision on every
-replacement; preserving a prior revision defeats replacement detection.
+writing directly to the table must set `_scrapy_revision` to a freshly generated
+`uuid.uuid4().hex` on every replacement—exactly 32 lowercase hexadecimal
+characters; preserving a prior revision defeats replacement detection.
 
 Clear now uses one conditional `DeleteItem(ALL_OLD)` per observed row and
 validates the returned old-item identity. The old key-only BatchWrite path and

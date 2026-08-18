@@ -510,10 +510,11 @@ their issuing table generation.
 
 The item schema is a string partition key `pk`, binary `value`, optional numeric
 `expire_at`, and package-reserved string `_scrapy_revision`. Every `store()`
-creates a fresh opaque 32-character revision, included in the 400 KiB size
-check. Direct table writers that replace package rows must write a fresh opaque
-revision (or remove the old one); copying a stale revision defeats replacement
-detection.
+generates `_scrapy_revision` with `uuid.uuid4().hex`; its required stored grammar
+is exactly 32 lowercase hexadecimal characters, and it is included in the 400
+KiB size check. Direct table writers that replace package rows must set
+`_scrapy_revision` to a freshly generated `uuid.uuid4().hex` on every
+replacement; copying a stale revision defeats replacement detection.
 
 Region and custom endpoint URLs are authoritative backend settings. Ambient
 `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_DYNAMODB`, and shared-config custom
