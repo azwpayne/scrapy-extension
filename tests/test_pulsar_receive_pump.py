@@ -349,6 +349,106 @@ def test_failed_consumer_close_fences_concurrent_replacement_across_disconnect(
     assert backend._consumer_retirements == {}
 
 
+@pytest.mark.parametrize("consumer_type", ["Exclusive", "Failover"])
+def test_disconnect_retires_unobserved_terminal_consumer_across_reconnect(
+    mocker: Any, consumer_type: str
+) -> None:
+    """Teardown fences a failed consumer even before a poll observes failure."""
+    close_started = Event()
+    release_close = Event()
+    failed_consumer = MagicMock(name="unobserved-failed-consumer")
+    recovered_consumer = _ControllableConsumer()
+    failed_consumer.receive.side_effect = RuntimeError("unobserved receive failure")
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    failed_consumer.close.side_effect = blocked_close
+    old_client = MagicMock(name="unobserved-old-client")
+    old_client.subscribe.return_value = failed_consumer
+    new_client = MagicMock(name="unobserved-new-client")
+    new_client.subscribe.return_value = recovered_consumer
+    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
+    backend = PulsarBackend(PulsarSettings(consumer_type=consumer_type))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    topic = "scrapy-unobserved-retirement"
+
+    assert backend.pop("unobserved-retirement", timeout=0) is None
+    failed_pump = backend._receive_pumps[topic]
+    assert failed_pump.stopped.wait(timeout=0.5)
+
+    backend.disconnect()
+    assert close_started.is_set()
+    assert list(backend._consumer_retirements) == [topic]
+    backend.connect()
+    assert backend.pop("unobserved-retirement", timeout=0) is None
+    assert new_client.subscribe.call_count == 0
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("unobserved-retirement", timeout=0) is None
+    assert recovered_consumer.receive_started.wait(timeout=0.5)
+    assert failed_consumer.close.call_count == 1
+    assert new_client.subscribe.call_count == 1
+
+
+@pytest.mark.parametrize("consumer_type", ["Exclusive", "Failover"])
+def test_disconnect_fences_stale_blocked_bootstrap_return_across_reconnect(
+    mocker: Any, consumer_type: str
+) -> None:
+    """A subscribe result returning after teardown closes before replacement."""
+    subscribe_started = Event()
+    release_subscribe = Event()
+    close_started = Event()
+    release_close = Event()
+    stale_consumer = MagicMock(name="stale-bootstrap-consumer")
+    recovered_consumer = _ControllableConsumer()
+
+    def blocked_subscribe(*_args: Any, **_kwargs: Any) -> Any:
+        subscribe_started.set()
+        release_subscribe.wait(timeout=2.0)
+        return stale_consumer
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    stale_consumer.close.side_effect = blocked_close
+    old_client = MagicMock(name="bootstrap-old-client")
+    old_client.subscribe.side_effect = blocked_subscribe
+    new_client = MagicMock(name="bootstrap-new-client")
+    new_client.subscribe.return_value = recovered_consumer
+    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
+    backend = PulsarBackend(PulsarSettings(consumer_type=consumer_type))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    topic = "scrapy-stale-bootstrap"
+
+    assert backend.pop("stale-bootstrap", timeout=0) is None
+    assert subscribe_started.wait(timeout=0.5)
+    backend.disconnect()
+    assert list(backend._consumer_retirements) == [topic]
+    backend.connect()
+    assert backend.pop("stale-bootstrap", timeout=0) is None
+    assert new_client.subscribe.call_count == 0
+
+    release_subscribe.set()
+    assert close_started.wait(timeout=0.5)
+    assert backend.pop("stale-bootstrap", timeout=0) is None
+    assert new_client.subscribe.call_count == 0
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("stale-bootstrap", timeout=0) is None
+    assert recovered_consumer.receive_started.wait(timeout=0.5)
+    stale_consumer.close.assert_called_once_with()
+    assert new_client.subscribe.call_count == 1
+
+
 def test_receive_worker_name_does_not_expose_private_topic(mocker: Any) -> None:
     private_marker = "private-thread-topic-marker"
     consumer = _ControllableConsumer()

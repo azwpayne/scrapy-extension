@@ -239,12 +239,12 @@ class _PulsarCloseTask:
 
 @dataclass
 class _PulsarConsumerRetirement:
-    """Failed consumer close that fences replacement subscription publication."""
+    """Consumer close that fences replacement subscription publication."""
 
     topic: str
     client: Any
     generation: int
-    consumer: Any
+    consumer: Any = None
     completed: Event = field(default_factory=Event)
     worker: Thread | None = None
 
@@ -268,6 +268,7 @@ class _PulsarReceivePump:
     buffered: Event = field(default_factory=Event)
     stopped: Event = field(default_factory=Event)
     worker: Thread | None = None
+    retirement: _PulsarConsumerRetirement | None = None
 
     def stop_admission(self) -> None:
         """Fence this pump and wake local waiters before its consumer closes."""
@@ -720,10 +721,25 @@ class PulsarBackend(Backend, QueueBackend):
                 id(producer): producer for producer in self._producers.values()
             }
             pumps = list(self._receive_pumps.values())
+            disconnect_retirements: list[_PulsarConsumerRetirement] = []
             # Admission is stopped at the lifecycle linearization point. A receive
             # that completes after this fence cannot publish into its old buffer.
+            # Every possibly live topic consumer receives a retirement tombstone
+            # before reconnect can publish a replacement subscription. This includes
+            # workers still blocked in subscribe(), whose stale candidate is attached
+            # to the tombstone when bootstrap eventually returns.
             for pump in pumps:
                 pump.stop_admission()
+                if pump.consumer is not None:
+                    consumers.pop(id(pump.consumer), None)
+                    retirement = self._start_consumer_retirement_locked(
+                        pump, pump.consumer
+                    )
+                    disconnect_retirements.append(retirement)
+                elif not pump.stopped.is_set():
+                    retirement = self._new_consumer_retirement_locked(pump)
+                    pump.retirement = retirement
+                    disconnect_retirements.append(retirement)
             client = self._client
             self._lifecycle_generation += 1
             self._receive_pumps.clear()
@@ -747,6 +763,10 @@ class PulsarBackend(Backend, QueueBackend):
             self._close_detached_handles(*handles)
         except BaseException as error:
             close_error = error
+
+        for retirement in disconnect_retirements:
+            if not retirement.completed.wait(max(0.0, self._receive_shutdown_timeout)):
+                self._log_close_shutdown_timeout()
 
         join_error: BaseException | None = None
         for pump in pumps:
@@ -1235,16 +1255,25 @@ class PulsarBackend(Backend, QueueBackend):
                 # preserved process-control exception crossing the worker boundary.
                 raise terminal_error
 
-    def _start_consumer_retirement_locked(
-        self, pump: _PulsarReceivePump, consumer: Any
+    def _new_consumer_retirement_locked(
+        self, pump: _PulsarReceivePump, consumer: Any = None
     ) -> _PulsarConsumerRetirement:
-        """Publish and start one failed-consumer retirement under lifecycle lock."""
+        """Publish one topic tombstone before an old consumer can be replaced."""
         retirement = _PulsarConsumerRetirement(
             topic=pump.topic,
             client=pump.client,
             generation=pump.generation,
             consumer=consumer,
         )
+        pump.retirement = retirement
+        self._consumer_retirements[pump.topic] = retirement
+        return retirement
+
+    def _start_consumer_retirement_locked(
+        self, pump: _PulsarReceivePump, consumer: Any
+    ) -> _PulsarConsumerRetirement:
+        """Publish and start one consumer retirement under the lifecycle lock."""
+        retirement = self._new_consumer_retirement_locked(pump, consumer)
         worker = Thread(
             target=self._run_consumer_retirement,
             args=(retirement,),
@@ -1261,8 +1290,22 @@ class PulsarBackend(Backend, QueueBackend):
             raise
         return retirement
 
+    def _finish_consumer_retirement(
+        self, retirement: _PulsarConsumerRetirement
+    ) -> None:
+        """Release a topic fence only after its consumer can no longer be live."""
+        retirement.completed.set()
+        try:
+            with self._lifecycle_lock:
+                if self._consumer_retirements.get(retirement.topic) is retirement:
+                    self._consumer_retirements.pop(retirement.topic, None)
+        except BaseException:
+            # The completed Event is authoritative. A later poll prunes a
+            # tombstone even if an injected lifecycle-lock fault hit cleanup.
+            pass
+
     def _run_consumer_retirement(self, retirement: _PulsarConsumerRetirement) -> None:
-        """Close one failed consumer and release its replacement fence."""
+        """Close one consumer and release its replacement fence after close exits."""
         try:
             retirement.consumer.close()
         except BaseException:
@@ -1270,15 +1313,19 @@ class PulsarBackend(Backend, QueueBackend):
             # the failed receive/subscribe error selected by the public poll.
             pass
         finally:
-            retirement.completed.set()
-            try:
-                with self._lifecycle_lock:
-                    if self._consumer_retirements.get(retirement.topic) is retirement:
-                        self._consumer_retirements.pop(retirement.topic, None)
-            except BaseException:
-                # The completed Event is authoritative. A later poll prunes a
-                # tombstone even if an injected lifecycle-lock fault hit cleanup.
-                pass
+            self._finish_consumer_retirement(retirement)
+
+    def _close_stale_pump_candidate(
+        self, pump: _PulsarReceivePump, candidate: Any
+    ) -> None:
+        """Close a late bootstrap result without dropping its reconnect fence."""
+        retirement = pump.retirement
+        if retirement is None:
+            self._close_aborted_handle(candidate)
+            return
+        retirement.consumer = candidate
+        retirement.worker = current_thread()
+        self._run_consumer_retirement(retirement)
 
     def _ensure_receive_pump(
         self, topic: str, deadline: float | None
@@ -1420,7 +1467,7 @@ class PulsarBackend(Backend, QueueBackend):
                         pump.condition.notify_all()
                 return
             if candidate is not None:
-                self._close_aborted_handle(candidate)
+                self._close_stale_pump_candidate(pump, candidate)
                 candidate = None
                 return
 
@@ -1492,7 +1539,12 @@ class PulsarBackend(Backend, QueueBackend):
                         pump.condition.notify_all()
         finally:
             if candidate is not None:
-                self._close_aborted_handle(candidate)
+                self._close_stale_pump_candidate(pump, candidate)
+            retirement = pump.retirement
+            if retirement is not None and retirement.consumer is None:
+                # Bootstrap exited without producing a handle. No old subscription
+                # can survive, so the disconnect-created tombstone can now retire.
+                self._finish_consumer_retirement(retirement)
             pump.stopped.set()
 
     @queue_operation_error_boundary(
