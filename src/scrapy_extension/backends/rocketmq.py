@@ -525,8 +525,16 @@ class RocketMQBackend(Backend, QueueBackend):
         worker_stopped = self._finish_receive_pump_shutdown(worker)
         return cleanup_failed or not worker_stopped
 
+    @backend_connection_error_boundary(
+        _ROCKETMQ_DISCONNECT_ERROR,
+        "rocketmq",
+    )
     def disconnect(self) -> None:
         """Fence receives, close clients, and join the bounded receive pump."""
+        self._disconnect()
+
+    def _disconnect(self) -> None:
+        """Tear down one generation behind the terminal public error boundary."""
         with self._connection_lock:
             # Detach first so no public pop can enter this generation while its
             # blocking receive is being interrupted and joined.

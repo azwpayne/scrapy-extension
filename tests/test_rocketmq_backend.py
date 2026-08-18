@@ -96,6 +96,16 @@ def _assert_capability_error_is_redacted(error: BaseException, marker: str) -> N
         trace = trace.tb_next
 
 
+class _FailingShutdownClient:
+    """Keep nested private state while reporting a fixed shutdown failure."""
+
+    def __init__(self, private_state: object) -> None:
+        self.state = {"nested": [private_state]}
+
+    def shutdown(self) -> None:
+        raise RuntimeError("fixed shutdown failure")
+
+
 def _patch_rocketmq(mocker):
     """Install a stub of the apache 5.1.1 top-level client surface.
 
@@ -877,6 +887,37 @@ def test_disconnect_reports_typed_shutdown_failure_after_closing_peers(mocker) -
     mock_producer.shutdown.assert_called_once()
     mock_consumer.shutdown.assert_called_once()
     assert backend._producer is None
+
+
+@pytest.mark.parametrize("private_location", ("producer", "consumer", "config"))
+def test_disconnect_failure_traceback_recursively_redacts_teardown_state(
+    private_location: str,
+) -> None:
+    """The terminal error omits nested client and retained configuration state."""
+    marker = f"rocketmq-disconnect-{private_location}-private-marker"
+    settings = RocketMQSettings(
+        namesrv_address=(
+            f"{marker}.example:8081"
+            if private_location == "config"
+            else "localhost:8081"
+        ),
+        allow_remote_plaintext=True,
+    )
+    backend = RocketMQBackend(settings)
+    backend._producer = _FailingShutdownClient(
+        marker if private_location == "producer" else "public producer state"
+    )
+    backend._consumer = _FailingShutdownClient(
+        marker if private_location == "consumer" else "public consumer state"
+    )
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+        backend.disconnect()
+
+    error = exc_info.value
+    assert str(error) == "Failed to disconnect from RocketMQ."
+    assert error.backend_type == "rocketmq"
+    _assert_capability_error_is_redacted(error, marker)
 
 
 @pytest.mark.parametrize(
