@@ -14,7 +14,6 @@ from scrapy_extension.queue.queue import (
     _STRATEGY_CLEANUP_FAILED,
     _STRATEGY_CLEANUP_INDETERMINATE,
     _STRATEGY_CLEANUP_NOT_STARTED,
-    _STRATEGY_CLEANUP_STARTED,
     BackendQueue,
 )
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -213,484 +212,73 @@ def test_failed_close_waiter_is_not_overtaken_by_successful_retry() -> None:
     strategy.close.assert_called_once_with()
 
 
-class _InterruptingWaiterSet(set[object]):
-    def __init__(self, operation: str, exception: BaseException) -> None:
-        super().__init__()
-        self._operation = operation
-        self._exception = exception
-        self._raised = False
-
-    def add(self, element: object) -> None:
-        super().add(element)
-        if self._operation == "add" and not self._raised:
-            self._raised = True
-            raise self._exception
-
-    def discard(self, element: object) -> None:
-        super().discard(element)
-        if self._operation == "discard" and not self._raised:
-            self._raised = True
-            raise self._exception
-
-
-class _InterruptingWaiterMap(dict[int, set[object]]):
-    def __init__(self, operation: str, exception: BaseException) -> None:
-        super().__init__()
-        self._waiters = _InterruptingWaiterSet(operation, exception)
-        self.registration_attempted = threading.Event()
-
-    def setdefault(self, key: int, default: set[object] | None = None) -> set[object]:
-        self.registration_attempted.set()
-        return super().setdefault(key, self._waiters)
-
-
-@pytest.mark.timeout(10)
-@pytest.mark.parametrize(
-    ("operation", "interruption"),
-    [
-        ("add", KeyboardInterrupt("waiter registration interrupted")),
-        ("discard", SystemExit("waiter cleanup interrupted")),
-    ],
-)
-def test_interrupted_waiter_registration_and_cleanup_are_reclaimed(
-    operation: str, interruption: BaseException
-) -> None:
-    storage = MagicMock()
-    storage.retrieve.return_value = None
-    store_entered = threading.Event()
-    release_store = threading.Event()
-
-    def fail_store(_key: str, _value: bytes) -> None:
-        store_entered.set()
-        assert release_store.wait(timeout=2.0)
-        raise RuntimeError("secret backend failure")
-
-    storage.store.side_effect = fail_store
-    strategy = MagicMock()
-    strategy.snapshot.return_value = b"state"
-    queue = _queue_with_storage(strategy, storage)
-    waiter_map = _InterruptingWaiterMap(operation, interruption)
-    queue._close_attempt_waiters = waiter_map
-    outcomes: dict[str, BaseException | None] = {}
-
-    def close_queue(caller: str) -> None:
-        try:
-            queue.close()
-        except BaseException as exc:
-            outcomes[caller] = exc
-        else:
-            outcomes[caller] = None
-
-    owner = threading.Thread(
-        target=close_queue, args=("owner",), name="close-owner", daemon=True
-    )
-    waiter = threading.Thread(
-        target=close_queue, args=("waiter",), name="close-waiter", daemon=True
-    )
-    owner.start()
-    assert store_entered.wait(timeout=2.0)
-    waiter.start()
-    assert waiter_map.registration_attempted.wait(timeout=2.0)
-    if operation == "add":
-        waiter.join(timeout=2.0)
-        assert not waiter.is_alive()
-    release_store.set()
-    owner.join(timeout=2.0)
-    waiter.join(timeout=2.0)
-    assert not owner.is_alive()
-    assert not waiter.is_alive()
-
-    assert isinstance(outcomes["owner"], QueueError)
-    assert isinstance(outcomes["waiter"], type(interruption))
-    assert queue._close_in_progress is False
-    assert queue._close_attempt_waiters == {}
-    assert queue._close_attempt_outcomes == {}
-
-    storage.store.side_effect = None
-    queue.close()
-    assert queue._close_in_progress is False
-    assert queue._close_attempt_waiters == {}
-    assert queue._close_attempt_outcomes == {}
-    strategy.close.assert_called_once_with()
-
-
-@pytest.mark.timeout(10)
-def test_interrupted_owner_publication_repairs_waiters_and_allows_retry() -> None:
-    waiter_is_waiting = threading.Event()
-    publication_is_armed = threading.Event()
-
-    class _InterruptPublicationCondition(threading.Condition):
-        def __init__(self) -> None:
-            super().__init__()
-            self.interrupted = False
-
-        def __enter__(self) -> threading.Condition:
-            if publication_is_armed.is_set() and not self.interrupted:
-                self.interrupted = True
-                raise KeyboardInterrupt("owner publication interrupted")
-            return super().__enter__()
-
-        def wait(self, timeout: float | None = None) -> bool:
-            if threading.current_thread().name == "close-waiter":
-                waiter_is_waiting.set()
-            return super().wait(timeout)
-
-    storage = MagicMock()
-    storage.retrieve.return_value = None
-
-    def fail_store(_key: str, _value: bytes) -> None:
-        assert waiter_is_waiting.wait(timeout=2.0)
-        publication_is_armed.set()
-        raise RuntimeError("secret backend failure")
-
-    storage.store.side_effect = fail_store
-    strategy = MagicMock()
-    strategy.snapshot.return_value = b"state"
-    queue = _queue_with_storage(strategy, storage)
-    queue._operation_gate = _InterruptPublicationCondition()
-    outcomes: dict[str, BaseException | None] = {}
-
-    def close_queue(caller: str) -> None:
-        try:
-            queue.close()
-        except BaseException as exc:
-            outcomes[caller] = exc
-        else:
-            outcomes[caller] = None
-
-    owner = threading.Thread(
-        target=close_queue, args=("owner",), name="close-owner", daemon=True
-    )
-    waiter = threading.Thread(
-        target=close_queue, args=("waiter",), name="close-waiter", daemon=True
-    )
-    owner.start()
-    waiter.start()
-    owner.join(timeout=2.0)
-    waiter.join(timeout=2.0)
-    assert not owner.is_alive()
-    assert not waiter.is_alive()
-
-    assert isinstance(outcomes["owner"], KeyboardInterrupt)
-    assert isinstance(outcomes["waiter"], QueueError)
-    assert str(outcomes["waiter"]) == "Queue close failed; checkpoint can be retried."
-    assert queue._close_in_progress is False
-    assert queue._close_attempt_waiters == {}
-    assert queue._close_attempt_outcomes == {}
-
-    storage.store.side_effect = None
-    queue.close()
-    assert queue._close_in_progress is False
-    assert queue._close_attempt_waiters == {}
-    assert queue._close_attempt_outcomes == {}
-    strategy.close.assert_called_once_with()
-
-
 class _PublicationBoundaryInterruption(BaseException):
     pass
 
 
-class _MutationBoundaryQueue(BackendQueue):
-    """Inject once immediately after a publication-state mutation."""
-
-    _TRACKED_ATTRIBUTES = {
-        "_close_complete": "close-complete",
-        "_close_in_progress": "close-in-progress",
-        "_close_owner_token": "owner-token",
-        "_strategy_cleanup_state": "cleanup-state",
-    }
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        object.__setattr__(self, "_boundary_tracking", False)
-        object.__setattr__(self, "_boundary_target", None)
-        object.__setattr__(self, "_boundary_interruption", None)
-        object.__setattr__(self, "_boundary_raised", False)
-        object.__setattr__(self, "_boundary_observed", [])
-        super().__init__(*args, **kwargs)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        object.__setattr__(self, name, value)
-        label = self._TRACKED_ATTRIBUTES.get(name)
-        if label is not None and getattr(self, "_boundary_tracking", False):
-            self._after_mutation(label)
-
-    def _after_mutation(self, label: str) -> None:
-        self._boundary_observed.append(label)
-        if self._boundary_target == label and not self._boundary_raised:
-            object.__setattr__(self, "_boundary_raised", True)
-            interruption = self._boundary_interruption
-            assert interruption is not None
-            raise interruption
-
-    def arm_boundary(self, label: str, interruption: BaseException) -> None:
-        object.__setattr__(self, "_boundary_target", label)
-        object.__setattr__(self, "_boundary_interruption", interruption)
-        object.__setattr__(self, "_boundary_raised", False)
-        self._boundary_observed.clear()
-        object.__setattr__(self, "_boundary_tracking", True)
-
-
-class _MutationBoundaryMap(dict[int, object]):
-    def __init__(
-        self,
-        queue: _MutationBoundaryQueue,
-        *,
-        set_label: str,
-        pop_label: str,
-        initial: dict[int, object],
-    ) -> None:
-        super().__init__(initial)
-        self._queue = queue
-        self._set_label = set_label
-        self._pop_label = pop_label
-
-    def __setitem__(self, key: int, value: object) -> None:
-        super().__setitem__(key, value)
-        self._queue._after_mutation(self._set_label)
-
-    def pop(self, key: int, default: object = None) -> object:
-        value = super().pop(key, default)
-        self._queue._after_mutation(self._pop_label)
-        return value
-
-
-class _MutationBoundaryCondition(threading.Condition):
-    def __init__(self, queue: _MutationBoundaryQueue) -> None:
-        super().__init__()
-        self._queue = queue
-
-    def notify_all(self) -> None:
-        super().notify_all()
-        self._queue._after_mutation("notify-all")
-
-
-_PUBLICATION_MODELS = {
-    (True, True): [
-        "close-complete",
-        "outcome-set",
-        "notify-all",
-        "close-in-progress",
-        "owner-token",
-    ],
-    (True, False): [
-        "close-complete",
-        "waiters-pop",
-        "outcomes-pop",
-        "notify-all",
-        "close-in-progress",
-        "owner-token",
-    ],
-    (False, True): [
-        "outcome-set",
-        "notify-all",
-        "close-in-progress",
-        "owner-token",
-    ],
-    (False, False): [
-        "waiters-pop",
-        "outcomes-pop",
-        "notify-all",
-        "close-in-progress",
-        "owner-token",
-    ],
-}
-
-
-@pytest.mark.parametrize(
-    ("succeeded", "has_waiter", "boundary"),
-    [
-        (succeeded, has_waiter, boundary)
-        for (succeeded, has_waiter), boundaries in _PUBLICATION_MODELS.items()
-        for boundary in boundaries
-    ],
-)
-def test_every_close_publication_mutation_boundary_repairs_to_terminal_state(
-    succeeded: bool, has_waiter: bool, boundary: str
-) -> None:
-    storage = MagicMock()
-    storage.retrieve.return_value = None
-    strategy = MagicMock()
-    queue = _MutationBoundaryQueue(
-        MagicMock(
-            get_storage_backend=MagicMock(return_value=storage),
-            get_queue_backend=MagicMock(return_value=MagicMock()),
-        ),
-        "q",
-        queue_strategy=strategy,
-    )
-    attempt = 1
-    owner_token = object()
-    waiter_token = object()
-    queue._close_owner_token = owner_token
-    queue._close_in_progress = True
-    queue._close_complete = False
-    waiter_values: dict[int, object] = {
-        attempt: {waiter_token} if has_waiter else set()
-    }
-    outcome_values: dict[int, object] = {attempt: not succeeded}
-    queue._close_attempt_waiters = _MutationBoundaryMap(
-        queue,
-        set_label="waiters-set",
-        pop_label="waiters-pop",
-        initial=waiter_values,
-    )  # type: ignore[assignment]
-    queue._close_attempt_outcomes = _MutationBoundaryMap(
-        queue,
-        set_label="outcome-set",
-        pop_label="outcomes-pop",
-        initial=outcome_values,
-    )  # type: ignore[assignment]
-    queue._operation_gate = _MutationBoundaryCondition(queue)
-    interruption = _PublicationBoundaryInterruption(boundary)
-    queue.arm_boundary(boundary, interruption)
-
-    publication_failure = queue._publish_close_attempt(
-        attempt, owner_token, succeeded=succeeded
-    )
-
-    assert publication_failure is interruption
-    expected_order = _PUBLICATION_MODELS[succeeded, has_waiter]
-    assert list(dict.fromkeys(queue._boundary_observed)) == expected_order
-    assert queue._close_complete is succeeded
-    assert queue._close_in_progress is False
-    assert queue._close_owner_token is None
-    if has_waiter:
-        assert queue._close_attempt_outcomes == {attempt: succeeded}
-        with queue._operation_gate:
-            assert queue._cleanup_close_waiter_locked(attempt, waiter_token) is None
-    assert queue._close_attempt_waiters == {}
-    assert queue._close_attempt_outcomes == {}
-
-
 @pytest.mark.timeout(10)
-def test_opcode_interruption_at_former_owner_clear_boundary_is_terminal() -> None:
+def test_interrupted_close_publication_is_bounded_and_retryable() -> None:
     storage = MagicMock()
     storage.retrieve.return_value = None
     strategy = MagicMock()
     strategy.snapshot.return_value = b"state"
     queue = _queue_with_storage(strategy, storage)
-    interruption = _PublicationBoundaryInterruption(
-        "interrupted immediately after owner-token clearing"
-    )
-    target_offset = _instruction_after_in(
-        BackendQueue._publish_close_attempt, "STORE_ATTR", "_close_owner_token"
-    )
+    original = queue._publish_close_attempt
+    interruption = _PublicationBoundaryInterruption("publish")
+    calls = 0
 
-    def inject(frame: object, event: str, _arg: object) -> object:
-        if (
-            getattr(frame, "f_code", None)
-            is BackendQueue._publish_close_attempt.__code__
-        ):
-            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
-            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
-                raise interruption
-        return inject
+    def interrupt_once(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise interruption
+        original(*args, **kwargs)  # type: ignore[arg-type]
 
-    sys.settrace(inject)
-    try:
-        with pytest.raises(_PublicationBoundaryInterruption) as exc_info:
-            queue.close()
-    finally:
-        sys.settrace(None)
+    queue._publish_close_attempt = interrupt_once  # type: ignore[method-assign]
+
+    with pytest.raises(_PublicationBoundaryInterruption) as exc_info:
+        queue.close()
 
     assert exc_info.value is interruption
+    assert queue._close_in_progress is True
+    queue.close()
     assert queue._close_complete is True
     assert queue._close_in_progress is False
     assert queue._close_owner_token is None
-    assert queue._close_attempt_waiters == {}
-    assert queue._close_attempt_outcomes == {}
-
-    queue.close()
-
     strategy.close.assert_called_once_with()
-    assert queue._close_owner_token is None
 
 
 @pytest.mark.timeout(10)
-def test_every_executed_finalization_opcode_repairs_owned_attempt() -> None:
-    """Stress every opcode on the started-cleanup/waiter publication path."""
+def test_interrupted_cleanup_publication_is_terminal_without_replay() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = _queue_with_storage(strategy, storage)
+    original = queue._publish_strategy_cleanup_outcome
+    interruption = _PublicationBoundaryInterruption("cleanup publication")
+    calls = 0
 
-    def prepared_queue() -> tuple[BackendQueue, object, object]:
-        queue = _queue_with_storage(MagicMock(), MagicMock())
-        owner_token = object()
-        waiter_token = object()
-        queue._close_attempt = 1
-        queue._close_owner_token = owner_token
-        queue._close_in_progress = True
-        queue._strategy_cleanup_state = _STRATEGY_CLEANUP_STARTED
-        queue._close_attempt_waiters = {1: {waiter_token}}
-        return queue, owner_token, waiter_token
+    def interrupt_once(outcome: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise interruption
+        original(outcome)
 
-    observed_offsets: list[int] = []
-    baseline, baseline_owner, _ = prepared_queue()
+    queue._publish_strategy_cleanup_outcome = interrupt_once  # type: ignore[method-assign]
 
-    def observe(frame: object, event: str, _arg: object) -> object:
-        if (
-            getattr(frame, "f_code", None)
-            is BackendQueue._repair_close_finalization.__code__
-        ):
-            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
-            if event == "opcode":
-                observed_offsets.append(frame.f_lasti)  # type: ignore[attr-defined]
-        return observe
+    with pytest.raises(_PublicationBoundaryInterruption):
+        queue.close()
 
-    sys.settrace(observe)
-    try:
-        assert baseline._repair_close_finalization(
-            1, baseline_owner, succeeded=False
-        ) == (None, None, None)
-    finally:
-        sys.settrace(None)
+    queue.close()
+    assert queue._close_complete is True
+    strategy.close.assert_called_once_with()
 
-    for target_offset in dict.fromkeys(observed_offsets):
-        queue, owner_token, waiter_token = prepared_queue()
-        interruption = _PublicationBoundaryInterruption(
-            f"finalization opcode {target_offset}"
-        )
-        escaped: BaseException | None = None
-        result: tuple[BaseException | None, BaseException | None, BaseException | None]
 
-        def inject(
-            frame: object,
-            event: str,
-            _arg: object,
-            *,
-            target_offset: int = target_offset,
-            interruption: BaseException = interruption,
-        ) -> object:
-            if (
-                getattr(frame, "f_code", None)
-                is BackendQueue._repair_close_finalization.__code__
-            ):
-                frame.f_trace_opcodes = True  # type: ignore[attr-defined]
-                if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
-                    raise interruption
-            return inject
-
-        sys.settrace(inject)
-        try:
-            try:
-                result = queue._repair_close_finalization(
-                    1, owner_token, succeeded=False
-                )
-            except BaseException as exc:
-                escaped = exc
-                result = queue._repair_close_finalization(
-                    1, owner_token, succeeded=False
-                )
-        finally:
-            sys.settrace(None)
-
-        assert escaped is interruption or interruption in result
-        assert queue._strategy_cleanup_state == _STRATEGY_CLEANUP_INDETERMINATE
-        assert queue._close_complete is True
-        assert queue._close_in_progress is False
-        assert queue._close_owner_token is None
-        assert queue._close_attempt_outcomes == {1: False}
-        with queue._operation_gate:
-            assert queue._cleanup_close_waiter_locked(1, waiter_token) is None
-        assert queue._close_attempt_waiters == {}
-        assert queue._close_attempt_outcomes == {}
+def test_close_finalization_has_no_unbounded_retry_loop() -> None:
+    instructions = list(dis.get_instructions(BackendQueue._repair_close_finalization))
+    assert all(instruction.opname != "JUMP_BACKWARD" for instruction in instructions)
 
 
 @pytest.mark.parametrize(
@@ -835,37 +423,6 @@ def test_trace_interruption_after_ownership_always_publishes_and_allows_retry(
     assert queue._close_owner_token is None
     assert queue._close_attempt_waiters == {}
     assert queue._close_attempt_outcomes == {}
-
-
-def test_interruption_after_cleanup_started_is_terminal_without_invocation() -> None:
-    storage = MagicMock()
-    storage.retrieve.return_value = None
-    strategy = MagicMock()
-    strategy.snapshot.return_value = b"state"
-    queue = _MutationBoundaryQueue(
-        MagicMock(
-            get_storage_backend=MagicMock(return_value=storage),
-            get_queue_backend=MagicMock(return_value=MagicMock()),
-        ),
-        "q",
-        queue_strategy=strategy,
-        snapshot_max_bytes=64,
-        snapshot_chunk_bytes=4,
-    )
-    interruption = _PublicationBoundaryInterruption("before cleanup invocation")
-    queue.arm_boundary("cleanup-state", interruption)
-
-    with pytest.raises(_PublicationBoundaryInterruption) as exc_info:
-        queue.close()
-
-    assert exc_info.value is interruption
-    assert queue._strategy_cleanup_state == _STRATEGY_CLEANUP_INDETERMINATE
-    assert queue._close_complete is True
-    strategy.close.assert_not_called()
-
-    queue.close()
-    queue.close(lossy=True)
-    strategy.close.assert_not_called()
 
 
 @pytest.mark.parametrize(

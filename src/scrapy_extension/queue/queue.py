@@ -10,6 +10,7 @@ import binascii
 import inspect
 import logging
 import math
+import sys
 import threading
 import time
 import warnings
@@ -102,6 +103,30 @@ _REQUEST_CLASSES: dict[str, type[Request]] = {
     f"{request_cls.__module__}.{request_cls.__name__}": request_cls
     for request_cls in (Request, FormRequest, JsonRequest, XmlRpcRequest)
 }
+
+
+class _CloseOwnerToken:
+    """Invocation-scoped close ownership reclaimable after its frame unwinds."""
+
+    __slots__ = ("thread_id",)
+
+    def __init__(self) -> None:
+        self.thread_id = threading.get_ident()
+
+    @property
+    def active(self) -> bool:
+        try:
+            frame = sys._current_frames().get(self.thread_id)  # noqa: SLF001
+        except Exception:  # noqa: BLE001 - stale close ownership is retryable
+            return False
+        while frame is not None:
+            try:
+                if frame.f_locals.get("owner_token") is self:
+                    return True
+            except Exception:  # noqa: BLE001 - fail toward bounded reclamation
+                return False
+            frame = frame.f_back
+        return False
 
 
 def _invalid_routing_value_description(value: object) -> str:
@@ -256,7 +281,7 @@ class BackendQueue:
         self._close_complete = False
         self._close_in_progress = False
         self._close_attempt = 0
-        self._close_owner_token: object | None = None
+        self._close_owner_token: _CloseOwnerToken | None = None
         # Retain an attempt outcome until every caller that observed that exact
         # attempt has consumed it. Per-caller tokens make registration and
         # idempotent cleanup safe when process-control exceptions interrupt either.
@@ -1297,51 +1322,43 @@ class BackendQueue:
             return ScrapyStatsMonitor(stats)
         return NullMonitor()
 
-    def _cleanup_close_waiter_locked(
-        self, attempt: int, waiter_token: object
-    ) -> BaseException | None:
-        """Idempotently reclaim one waiter and its consumed outcome.
-
-        This runs with ``_operation_gate`` held. If an asynchronous exception lands
-        during one of the map operations, repeat the whole cleanup before allowing
-        that exception to propagate.
-        """
-        interrupted: BaseException | None = None
-        while True:
-            try:
-                waiters = self._close_attempt_waiters.get(attempt)
-                if waiters is not None:
-                    waiters.discard(waiter_token)
-                if not waiters:
-                    self._close_attempt_waiters.pop(attempt, None)
-                    self._close_attempt_outcomes.pop(attempt, None)
-                    self._close_attempt_terminal.pop(attempt, None)
-                return interrupted
-            except BaseException as exc:
-                if interrupted is None:
-                    interrupted = exc
+    def _cleanup_close_waiter_locked(self, attempt: int, waiter_token: object) -> None:
+        """Idempotently reclaim one waiter and its consumed outcome."""
+        waiters = self._close_attempt_waiters.get(attempt)
+        if waiters is not None:
+            waiters.discard(waiter_token)
+        if not waiters:
+            self._close_attempt_waiters.pop(attempt, None)
+            self._close_attempt_outcomes.pop(attempt, None)
+            self._close_attempt_terminal.pop(attempt, None)
 
     def _wait_for_close_attempt_locked(self, attempt: int) -> None:
         """Register, await, and reclaim one close-attempt observation."""
         waiter_token = object()
         failure: BaseException | None = None
-        cleanup_failure: BaseException | None = None
         observed_success = False
         observed_terminal = False
         try:
             self._close_attempt_waiters.setdefault(attempt, set()).add(waiter_token)
             while attempt not in self._close_attempt_outcomes:
-                self._operation_gate.wait()
-            observed_success = self._close_attempt_outcomes[attempt]
-            observed_terminal = self._close_attempt_terminal.get(attempt, False)
+                owner = self._close_owner_token
+                if owner is None or not owner.active:
+                    observed_terminal = (
+                        self._strategy_cleanup_state != _STRATEGY_CLEANUP_NOT_STARTED
+                    )
+                    break
+                # Periodically re-check liveness so an interrupted owner cannot
+                # strand peers without a notification publication.
+                self._operation_gate.wait(timeout=0.05)
+            else:
+                observed_success = self._close_attempt_outcomes[attempt]
+                observed_terminal = self._close_attempt_terminal.get(attempt, False)
         except BaseException as exc:
             failure = exc
         finally:
-            cleanup_failure = self._cleanup_close_waiter_locked(attempt, waiter_token)
+            self._cleanup_close_waiter_locked(attempt, waiter_token)
         if failure is not None:
             raise failure
-        if cleanup_failure is not None:
-            raise cleanup_failure
         if not observed_success:
             if observed_terminal:
                 raise QueueError(
@@ -1349,124 +1366,55 @@ class BackendQueue:
                 )
             raise QueueError("Queue close failed; checkpoint can be retried.")
 
-    def _publish_strategy_cleanup_outcome(self, outcome: str) -> BaseException | None:
-        """Replace ``started`` with one terminal outcome despite interruption."""
-        interrupted: BaseException | None = None
-        while self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
-            try:
-                self._strategy_cleanup_state = outcome
-            except BaseException as exc:
-                if interrupted is None:
-                    interrupted = exc
-        return interrupted
+    def _publish_strategy_cleanup_outcome(self, outcome: str) -> None:
+        """Replace ``started`` with one terminal, idempotent outcome."""
+        if self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
+            self._strategy_cleanup_state = outcome
 
     def _publish_close_attempt(
         self,
         attempt: int,
-        owner_token: object,
+        owner_token: _CloseOwnerToken,
         *,
         succeeded: bool,
-    ) -> BaseException | None:
-        """Publish a terminal attempt outcome despite gate interruptions.
-
-        Publication is idempotent. Any ``BaseException`` raised while acquiring,
-        mutating, notifying, or releasing the gate is deferred until a complete
-        pass repairs lifecycle state and wakes registered waiters.
-        """
-        interrupted: BaseException | None = None
-        while True:
-            try:
-                with self._operation_gate:
-                    owns_attempt = self._close_owner_token is owner_token
-                    cleanup_started = (
-                        self._strategy_cleanup_state != _STRATEGY_CLEANUP_NOT_STARTED
-                    )
-                    if owns_attempt and (succeeded or cleanup_started):
-                        # Cleanup cannot safely be replayed once invocation may have
-                        # mutated strategy state. Failure and indeterminate outcomes
-                        # therefore close this queue lifecycle just like success.
-                        self._close_complete = True
-                    waiters = self._close_attempt_waiters.get(attempt)
-                    if waiters:
-                        self._close_attempt_outcomes[attempt] = succeeded
-                        self._close_attempt_terminal[attempt] = cleanup_started
-                    else:
-                        self._close_attempt_waiters.pop(attempt, None)
-                        self._close_attempt_outcomes.pop(attempt, None)
-                        self._close_attempt_terminal.pop(attempt, None)
-                    self._operation_gate.notify_all()
-                    if owns_attempt:
-                        self._close_in_progress = False
-                        # Keep ownership recognizable until every terminal state
-                        # mutation is complete. An interruption before this final
-                        # write therefore retries publication; one after it can
-                        # only observe the already-terminal attempt.
-                        self._close_owner_token = None
-                return interrupted
-            except BaseException as exc:
-                if interrupted is None:
-                    interrupted = exc
+    ) -> None:
+        """Publish one idempotent terminal attempt outcome in a bounded pass."""
+        with self._operation_gate:
+            owns_attempt = self._close_owner_token is owner_token
+            cleanup_started = (
+                self._strategy_cleanup_state != _STRATEGY_CLEANUP_NOT_STARTED
+            )
+            if owns_attempt and (succeeded or cleanup_started):
+                self._close_complete = True
+            waiters = self._close_attempt_waiters.get(attempt)
+            if waiters:
+                self._close_attempt_outcomes[attempt] = succeeded
+                self._close_attempt_terminal[attempt] = cleanup_started
+            else:
+                self._close_attempt_waiters.pop(attempt, None)
+                self._close_attempt_outcomes.pop(attempt, None)
+                self._close_attempt_terminal.pop(attempt, None)
+            self._operation_gate.notify_all()
+            if owns_attempt:
+                self._close_in_progress = False
+                self._close_owner_token = None
 
     def _repair_close_finalization(
         self,
         attempt: int,
-        owner_token: object,
+        owner_token: _CloseOwnerToken,
         *,
         succeeded: bool,
-    ) -> tuple[BaseException | None, BaseException | None, BaseException | None]:
-        """Repair every owned-attempt terminal invariant before returning.
+    ) -> None:
+        """Make one bounded idempotent finalization pass.
 
-        The loop deliberately includes state evaluation as well as both publication
-        calls in its exception boundary.  An asynchronous exception may therefore
-        land at any opcode in finalization without leaving ownership, an in-progress
-        marker, or a waiter stranded.  The first such interruption is deferred until
-        publication has made the attempt terminal.
+        An interruption may leave package state retryable. A later close reclaims
+        inactive ownership and never replays destructive strategy cleanup.
         """
-        cleanup_publication_failure: BaseException | None = None
-        publication_failure: BaseException | None = None
-        interrupted: BaseException | None = None
-        cleanup_publication_complete = False
-        close_publication_complete = False
-        while True:
-            try:
-                if (
-                    not cleanup_publication_complete
-                    and self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED
-                ):
-                    candidate = self._publish_strategy_cleanup_outcome(
-                        _STRATEGY_CLEANUP_INDETERMINATE
-                    )
-                    if cleanup_publication_failure is None:
-                        cleanup_publication_failure = candidate
-                    cleanup_publication_complete = True
-                if (
-                    not close_publication_complete
-                    and self._close_owner_token is owner_token
-                ):
-                    candidate = self._publish_close_attempt(
-                        attempt, owner_token, succeeded=succeeded
-                    )
-                    if publication_failure is None:
-                        publication_failure = candidate
-                    close_publication_complete = True
-                # Re-evaluate inside the guarded region.  ``_publish_close_attempt``
-                # clears ownership last, after completion/outcome notification and
-                # the in-progress marker, so loss of ownership is the commit proof.
-                if (
-                    cleanup_publication_complete
-                    or self._strategy_cleanup_state != _STRATEGY_CLEANUP_STARTED
-                ) and (
-                    close_publication_complete
-                    or self._close_owner_token is not owner_token
-                ):
-                    return (
-                        cleanup_publication_failure,
-                        publication_failure,
-                        interrupted,
-                    )
-            except BaseException as exc:
-                if interrupted is None:
-                    interrupted = exc
+        if self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
+            self._publish_strategy_cleanup_outcome(_STRATEGY_CLEANUP_INDETERMINATE)
+        if self._close_owner_token is owner_token:
+            self._publish_close_attempt(attempt, owner_token, succeeded=succeeded)
 
     def close(self, *, lossy: bool = False) -> None:
         """Transactionally checkpoint and close the strategy.
@@ -1477,7 +1425,7 @@ class BackendQueue:
         abort path for discarding nonempty state when no durable checkpoint can be
         made.
         """
-        owner_token = object()
+        owner_token = _CloseOwnerToken()
         attempt = 0
         failure: BaseException | None = None
         publication_failure: BaseException | None = None
@@ -1490,8 +1438,26 @@ class BackendQueue:
                     if self._close_complete:
                         return
                     if self._close_in_progress:
-                        self._wait_for_close_attempt_locked(self._close_attempt)
-                        return
+                        current_owner = self._close_owner_token
+                        if current_owner is not None and current_owner.active:
+                            if current_owner.thread_id == owner_token.thread_id:
+                                raise QueueError("Queue close is already in progress.")
+                            self._wait_for_close_attempt_locked(self._close_attempt)
+                            return
+                        # The prior frame unwound before publication. Reclaim only
+                        # package ownership; opaque cleanup is never replayed.
+                        self._close_in_progress = False
+                        self._close_owner_token = None
+                        cleanup_state = self._strategy_cleanup_state
+                        if cleanup_state != _STRATEGY_CLEANUP_NOT_STARTED:
+                            self._close_complete = True
+                            self._operation_gate.notify_all()
+                            if cleanup_state == _STRATEGY_CLEANUP_SUCCEEDED:
+                                return
+                            raise QueueError(
+                                "Queue strategy cleanup failed or was interrupted; "
+                                "close is terminal."
+                            )
                     self._close_attempt += 1
                     attempt = self._close_attempt
                     self._close_owner_token = owner_token
@@ -1526,9 +1492,10 @@ class BackendQueue:
                 else:
                     cleanup_outcome = _STRATEGY_CLEANUP_SUCCEEDED
                 finally:
-                    cleanup_publication_failure = (
+                    try:
                         self._publish_strategy_cleanup_outcome(cleanup_outcome)
-                    )
+                    except BaseException as exc:
+                        cleanup_publication_failure = exc
                 if cleanup_failure is not None:
                     raise cleanup_failure
                 if cleanup_publication_failure is not None:
@@ -1537,26 +1504,14 @@ class BackendQueue:
             except BaseException as exc:
                 failure = exc
         finally:
-            # The call itself is also inside a retrying exception boundary: opcode
-            # tracing can interrupt argument loading or dispatch before the helper
-            # frame starts.  Once attempt ownership exists, do not leave this loop
-            # until cleanup state and close-attempt publication are terminal.
-            while True:
-                try:
-                    (
-                        cleanup_publication_failure,
-                        publication_failure,
-                        repair_interruption,
-                    ) = self._repair_close_finalization(
-                        attempt, owner_token, succeeded=succeeded
-                    )
-                except BaseException as exc:
-                    if finalization_interruption is None:
-                        finalization_interruption = exc
-                else:
-                    if finalization_interruption is None:
-                        finalization_interruption = repair_interruption
-                    break
+            # One bounded package-state pass. If it is interrupted, the invocation
+            # token becomes inactive on unwind and a later close can reclaim it.
+            try:
+                self._repair_close_finalization(
+                    attempt, owner_token, succeeded=succeeded
+                )
+            except BaseException as exc:
+                finalization_interruption = exc
 
         # Preserve the originating control-flow exception ahead of errors raised
         # while repairing it.  Otherwise a control-flow interruption encountered by
