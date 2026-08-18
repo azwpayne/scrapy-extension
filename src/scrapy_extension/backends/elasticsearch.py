@@ -109,6 +109,127 @@ _ELASTICSEARCH_STORAGE_TTL_ERROR = "ElasticSearch storage TTL read failed."
 _ELASTICSEARCH_STORAGE_CLEAR_ERROR = "ElasticSearch storage clear failed."
 
 
+class _ElasticSearchResponseError(Exception):
+    """An Elasticsearch response could not prove the requested outcome."""
+
+
+def _api_error_has_type(error: ApiError, expected_type: str) -> bool:
+    """Match an Elasticsearch error by structured type fields only."""
+    body = getattr(error, "body", None)
+    if not isinstance(body, Mapping):
+        return False
+    detail = body.get("error")
+    if not isinstance(detail, Mapping):
+        return False
+    if detail.get("type") == expected_type:
+        return True
+    root_cause = detail.get("root_cause")
+    return isinstance(root_cause, list) and any(
+        isinstance(cause, Mapping) and cause.get("type") == expected_type
+        for cause in root_cause
+    )
+
+
+def _response_mapping(response: object) -> Mapping[str, Any]:
+    """Unwrap elastic-transport API responses to a response mapping."""
+    if isinstance(response, Mapping):
+        return cast("Mapping[str, Any]", response)
+    body = getattr(response, "body", None)
+    if isinstance(body, Mapping):
+        return cast("Mapping[str, Any]", body)
+    raise _ElasticSearchResponseError
+
+
+def _exact_nonnegative_int(value: object) -> int:
+    """Return an exact nonnegative integer or reject the response."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _ElasticSearchResponseError
+    return value
+
+
+def _validate_shards(response: object, *, require_success: bool) -> None:
+    """Reject missing, malformed, partial, or failed shard acknowledgements."""
+    response_body = _response_mapping(response)
+    shards = response_body.get("_shards")
+    if not isinstance(shards, Mapping):
+        raise _ElasticSearchResponseError
+    total = _exact_nonnegative_int(shards.get("total"))
+    successful = _exact_nonnegative_int(shards.get("successful"))
+    failed = _exact_nonnegative_int(shards.get("failed"))
+    skipped = _exact_nonnegative_int(shards.get("skipped", 0))
+    if failed != 0 or successful + failed != total or skipped > successful:
+        raise _ElasticSearchResponseError
+    if require_success and successful == 0:
+        raise _ElasticSearchResponseError
+    failures = shards.get("failures", [])
+    if not isinstance(failures, list) or failures:
+        raise _ElasticSearchResponseError
+
+
+def _validate_index_response(response: object, allowed_results: frozenset[str]) -> None:
+    """Require a successful shard acknowledgement and expected write result."""
+    _validate_shards(response, require_success=True)
+    response_body = _response_mapping(response)
+    if response_body.get("result") not in allowed_results:
+        raise _ElasticSearchResponseError
+
+
+def _validate_delete_response(response: object) -> bool:
+    """Return a server-confirmed delete result, rejecting ambiguous shapes."""
+    _validate_shards(response, require_success=True)
+    response_body = _response_mapping(response)
+    result = response_body.get("result")
+    if result == "deleted":
+        return True
+    if result == "not_found":
+        return False
+    raise _ElasticSearchResponseError
+
+
+def _validate_search_response(response: object) -> list[object]:
+    """Return validated exact search hits with no timeout or shard failure."""
+    response_body = _response_mapping(response)
+    if response_body.get("timed_out") is not False:
+        raise _ElasticSearchResponseError
+    _validate_shards(response_body, require_success=False)
+    hits_block = response_body.get("hits")
+    if not isinstance(hits_block, Mapping):
+        raise _ElasticSearchResponseError
+    total = hits_block.get("total")
+    if not isinstance(total, Mapping) or total.get("relation") != "eq":
+        raise _ElasticSearchResponseError
+    total_value = _exact_nonnegative_int(total.get("value"))
+    hits = hits_block.get("hits")
+    if not isinstance(hits, list) or len(hits) > 1:
+        raise _ElasticSearchResponseError
+    if (total_value == 0) != (len(hits) == 0):
+        raise _ElasticSearchResponseError
+    return cast("list[object]", hits)
+
+
+def _validate_count_response(response: object) -> int:
+    """Return an exact nonnegative count from a complete shard response."""
+    _validate_shards(response, require_success=False)
+    response_body = _response_mapping(response)
+    return _exact_nonnegative_int(response_body.get("count"))
+
+
+def _validate_delete_by_query_response(response: object) -> None:
+    """Require a complete, failure-free delete-by-query response."""
+    response_body = _response_mapping(response)
+    if response_body.get("timed_out") is not False:
+        raise _ElasticSearchResponseError
+    _validate_shards(response_body, require_success=False)
+    failures = response_body.get("failures")
+    if not isinstance(failures, list) or failures:
+        raise _ElasticSearchResponseError
+    total = _exact_nonnegative_int(response_body.get("total"))
+    deleted = _exact_nonnegative_int(response_body.get("deleted"))
+    conflicts = _exact_nonnegative_int(response_body.get("version_conflicts"))
+    if deleted != total or conflicts != 0:
+        raise _ElasticSearchResponseError
+
+
 def _validate_queue_name_argument(
     _backend: object,
     queue_name: str,
@@ -681,8 +802,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             except RequestError as e:
                 # HTTP 400 resource_already_exists_exception = idempotent success
                 # (index created by a prior connect or a peer worker). Anything else
-                # is a real config error — re-raise so it surfaces.
-                if "resource_already_exists" not in str(e).lower():
+                # is a real config error — re-raise so it surfaces. Never inspect
+                # diagnostic text: only the structured server error type is trusted.
+                if not _api_error_has_type(e, "resource_already_exists_exception"):
                     raise
 
     @contextlib.contextmanager
@@ -930,12 +1052,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # ``wait_for`` across consecutive pushes, so each one pays the full
             # refresh-interval wait.
             with self._lease_generation("push") as generation:
-                generation.mutation_client.index(
+                response = generation.mutation_client.index(
                     index=generation.snapshot.queue_index,
                     id=document_id,
                     document=doc,
                 )
-        except TransportError:
+                _validate_index_response(response, frozenset({"created"}))
+        except (TransportError, _ElasticSearchResponseError):
             raise QueueOutcomeIndeterminateError(
                 _ELASTICSEARCH_QUEUE_PUSH_ERROR, operation="push"
             ) from None
@@ -1002,8 +1125,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                         # requires both, so request them explicitly — without this the pop
                         # raises ``KeyError: '_seq_no'`` on every call under ES 8.x.
                         seq_no_primary_term=True,
+                        track_total_hits=True,
                     )
-                    hits = resp.get("hits", {}).get("hits", [])
+                    hits = _validate_search_response(resp)
                     if not hits:
                         return None
                     document_id, sequence_number, primary_term, item = (
@@ -1012,22 +1136,33 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     try:
                         # No ``refresh`` on delete — the NEXT pop's pre-search refresh
                         # (above) flushes this delete, so the search won't re-find the doc.
-                        generation.mutation_client.delete(
+                        delete_response = generation.mutation_client.delete(
                             index=generation.snapshot.queue_index,
                             id=document_id,
                             if_seq_no=sequence_number,
                             if_primary_term=primary_term,
                         )
+                        if not _validate_delete_response(delete_response):
+                            raise _ElasticSearchResponseError
                     except ConflictError:
                         # Lost the race to another worker — retry to find the next item.
                         continue
-                    except TransportError:
+                    except NotFoundError:
+                        # A DELETE 404 is a race, not proof that the queue was empty.
+                        raise QueueError(
+                            _ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop"
+                        ) from None
+                    except (TransportError, _ElasticSearchResponseError):
                         raise QueueOutcomeIndeterminateError(
                             _ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop"
                         ) from None
                     return item
                 except NotFoundError:
                     return None
+                except _ElasticSearchResponseError:
+                    raise QueueError(
+                        _ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop"
+                    ) from None
                 except (ApiError, TransportError) as e:
                     # R19-A: catch the broad ApiError (auth/permission/server/query faults),
                     # not just TransportError — every sibling ES hot-path does. A non-NotFound,
@@ -1087,6 +1222,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     "queue_name",
                     queue_name,
                 )
+        except _ElasticSearchResponseError:
+            raise QueueError(
+                _ELASTICSEARCH_QUEUE_LENGTH_ERROR, operation="queue_len"
+            ) from None
         except (ApiError, TransportError) as e:
             raise QueueError(
                 str(e), queue_name=queue_name, operation="queue_len"
@@ -1121,7 +1260,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     "queue_name",
                     queue_name,
                 )
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise QueueOutcomeIndeterminateError(
                 _ELASTICSEARCH_QUEUE_CLEAR_ERROR, operation="clear_queue"
             ) from None
@@ -1181,16 +1320,17 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # consistent); ``set_len`` refreshes in ``_count``. Same amortized
             # read-refresh rationale as push.
             with self._lease_generation("add") as generation:
-                generation.mutation_client.index(
+                response = generation.mutation_client.index(
                     index=generation.snapshot.set_index,
                     id=doc_id,
                     document=doc,
                     op_type="create",
                 )
+                _validate_index_response(response, frozenset({"created"}))
         except ConflictError:
             return False
         except RequestError as e:
-            if "version_conflict" in str(e).lower():
+            if _api_error_has_type(e, "version_conflict_engine_exception"):
                 return False
             raise ConfigurationError(
                 _ELASTICSEARCH_SET_REQUEST_ERROR,
@@ -1201,7 +1341,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 _ELASTICSEARCH_SET_REQUEST_ERROR,
                 setting_name="operation",
             ) from e
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise SetOutcomeIndeterminateError(
                 _ELASTICSEARCH_SET_ADD_ERROR, backend_type="elasticsearch"
             ) from None
@@ -1240,7 +1380,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     generation.snapshot.set_index,
                     self._set_doc_id(set_name, item),
                 )
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise SetOutcomeIndeterminateError(
                 _ELASTICSEARCH_SET_REMOVE_ERROR, backend_type="elasticsearch"
             ) from None
@@ -1324,11 +1464,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 return self._count(
                     generation, generation.snapshot.set_index, "set_name", set_name
                 )
-        except TransportError as e:
+        except (TransportError, _ElasticSearchResponseError):
             raise BackendConnectionError(
-                f"ElasticSearch set length failed for {set_name!r}: {e}",
+                _ELASTICSEARCH_SET_LENGTH_ERROR,
                 backend_type="elasticsearch",
-            ) from e
+            ) from None
         except ApiError as e:
             raise ConfigurationError(
                 _ELASTICSEARCH_SET_REQUEST_ERROR,
@@ -1363,7 +1503,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 self._delete_by_term(
                     generation, generation.snapshot.set_index, "set_name", set_name
                 )
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise SetOutcomeIndeterminateError(
                 _ELASTICSEARCH_SET_CLEAR_ERROR, backend_type="elasticsearch"
             ) from None
@@ -1402,10 +1542,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ).isoformat()
         try:
             with self._lease_generation("store") as generation:
-                generation.mutation_client.index(
+                response = generation.mutation_client.index(
                     index=generation.snapshot.storage_index, id=key, document=doc
                 )
-        except TransportError:
+                _validate_index_response(response, frozenset({"created", "updated"}))
+        except (TransportError, _ElasticSearchResponseError):
             raise StorageOutcomeIndeterminateError(
                 _ELASTICSEARCH_STORAGE_STORE_ERROR, operation="store"
             ) from None
@@ -1416,15 +1557,23 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     @staticmethod
     def _storage_source(response: Any, key: str, operation: str) -> dict[str, Any]:
         """Return a validated storage document source."""
-        source = response.get("_source")
-        if not isinstance(source, dict):
+        try:
+            response_body = _response_mapping(response)
+        except _ElasticSearchResponseError:
+            raise StorageError(
+                _ELASTICSEARCH_STORAGE_RETRIEVE_ERROR,
+                operation=operation,
+                key=key,
+            ) from None
+        source = response_body.get("_source")
+        if not isinstance(source, Mapping):
             raise StorageError(
                 f"Corrupt ElasticSearch storage document for key {key!r}: "
                 "missing object _source",
                 operation=operation,
                 key=key,
             )
-        return cast("dict[str, Any]", source)
+        return dict(source)
 
     @staticmethod
     def _storage_expiry(
@@ -1480,57 +1629,44 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     ) -> bool:
         """R-esttl: lazy-reap an expired storage doc; return True if expired.
 
-        Best-effort delete so the index does not accumulate dead docs (ES has no
-        native TTL reaper; only ``clear_storage`` wipes wholesale). Mirrors
-        DynamoDB's reap contract.
+        The conditional delete prevents stale documents from accumulating (ES
+        has no native TTL reaper). Cleanup failures surface instead of reporting
+        an absent success with unknown physical state.
         """
         source = self._storage_source(response, key, operation)
         expiry = self._storage_expiry(source, key, operation)
         if expiry is None or expiry > datetime.now(tz=timezone.utc):
             return False
-        seq_no = response.get("_seq_no")
-        primary_term = response.get("_primary_term")
-        if seq_no is None or primary_term is None:
-            # The value is still logically absent, but an unconditional delete could
-            # remove a fresh concurrent replacement. ES normally returns both fields;
-            # fail open on physical cleanup if a proxy/client omitted either one.
-            # Expiry has already made this value logically absent.  The missing
-            # metadata only disables the physical best-effort cleanup, so a logging
-            # handler must not turn the determined absent result into a failure.
-            try:
-                logger.warning(
-                    "Skipping unsafe reap of expired ES storage document: response omitted "
-                    "_seq_no/_primary_term"
-                )
-            except BaseException:
-                pass
-            return True
-        reap_failed = False
         try:
-            generation.mutation_client.delete(
+            response_body = _response_mapping(response)
+            seq_no = _exact_nonnegative_int(response_body.get("_seq_no"))
+            primary_term = _exact_nonnegative_int(response_body.get("_primary_term"))
+        except _ElasticSearchResponseError:
+            raise StorageError(
+                _ELASTICSEARCH_STORAGE_DELETE_ERROR,
+                operation=operation,
+                key=key,
+            ) from None
+        try:
+            delete_response = generation.mutation_client.delete(
                 index=generation.snapshot.storage_index,
                 id=key,
                 if_seq_no=seq_no,
                 if_primary_term=primary_term,
             )
+            _validate_delete_response(delete_response)
         except (ConflictError, NotFoundError):
             pass
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise StorageOutcomeIndeterminateError(
                 _ELASTICSEARCH_STORAGE_DELETE_ERROR, operation=operation
             ) from None
         except ApiError:
-            reap_failed = True
-
-        if reap_failed:
-            # Only the already-caught ordinary cleanup error is best-effort.  A
-            # direct control exception from ``delete`` still propagates normally.
-            # Logging happens after the handler so custom handlers cannot observe
-            # the raw SDK failure through ``sys.exc_info()``.
-            try:
-                logger.warning("Failed to reap expired ES storage key")
-            except BaseException:
-                pass
+            raise StorageError(
+                _ELASTICSEARCH_STORAGE_DELETE_ERROR,
+                operation=operation,
+                key=key,
+            ) from None
         return True
 
     @storage_operation_error_boundary(
@@ -1599,7 +1735,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 return self._delete_by_id_on_generation(
                     generation, generation.snapshot.storage_index, key
                 )
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise StorageOutcomeIndeterminateError(
                 _ELASTICSEARCH_STORAGE_DELETE_ERROR, operation="delete"
             ) from None
@@ -1720,7 +1856,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 self._delete_by_query_on_generation(
                     generation, generation.snapshot.storage_index, query
                 )
-        except TransportError:
+        except (TransportError, _ElasticSearchResponseError):
             raise StorageOutcomeIndeterminateError(
                 _ELASTICSEARCH_STORAGE_CLEAR_ERROR, operation="clear_storage"
             ) from None
@@ -1763,7 +1899,7 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         resp = generation.client.count(
             index=index, query={"term": {f"{field}.keyword": value}}
         )
-        return cast(int, resp.get("count", 0))
+        return _validate_count_response(resp)
 
     def _delete_by_id(self, index: str, doc_id: str) -> bool:
         """Compatibility helper that leases one generation for a direct call."""
@@ -1776,10 +1912,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     ) -> bool:
         """Delete a document by ID using only the supplied generation."""
         try:
-            generation.mutation_client.delete(index=index, id=doc_id)
+            response = generation.mutation_client.delete(index=index, id=doc_id)
         except NotFoundError:
             return False
-        return True
+        return _validate_delete_response(response)
 
     def _delete_by_term(
         self,
@@ -1812,4 +1948,5 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         query: dict[str, Any],
     ) -> None:
         """Delete matching documents using only the supplied generation."""
-        generation.mutation_client.delete_by_query(index=index, query=query)
+        response = generation.mutation_client.delete_by_query(index=index, query=query)
+        _validate_delete_by_query_response(response)

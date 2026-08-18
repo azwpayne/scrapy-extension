@@ -8,13 +8,14 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 import pytest
-from elastic_transport import ApiResponseMeta, BaseNode, HttpHeaders
+from elastic_transport import ApiResponseMeta, BaseNode, HttpHeaders, NodeConfig
 from elastic_transport import ConnectionError as ElasticConnectionError
 from elastic_transport._node import NodeApiResponse
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, RequestError
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import (
+    QueueError,
     QueueOutcomeIndeterminateError,
     SetOutcomeIndeterminateError,
     StorageOutcomeIndeterminateError,
@@ -85,6 +86,7 @@ class _RetryProbeNode(BaseNode):
                 "timed_out": False,
                 "total": 1,
                 "deleted": 1,
+                "version_conflicts": 0,
                 "failures": [],
                 "_shards": {"total": 1, "successful": 1, "failed": 0},
             }
@@ -192,3 +194,228 @@ def test_mutation_view_has_fixed_no_replay_options_and_shares_root_transport() -
             assert generation.mutation_client._retry_on_status == ()
     finally:
         backend.disconnect()
+
+
+_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+
+
+def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    client = mocker.MagicMock()
+    client.index.return_value = {"result": "created", "_shards": _SHARDS}
+    client.delete.return_value = {"result": "deleted", "_shards": _SHARDS}
+    client.delete_by_query.return_value = {
+        "timed_out": False,
+        "total": 1,
+        "deleted": 1,
+        "version_conflicts": 0,
+        "failures": [],
+        "_shards": _SHARDS,
+    }
+    backend._client = client
+    backend._connection_snapshot = backend._capture_connection_snapshot()
+    return backend, client
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        {},
+        {
+            "timed_out": True,
+            "_shards": _SHARDS,
+            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+        },
+        {
+            "timed_out": False,
+            "_shards": {"total": 1, "successful": 0, "failed": 1},
+            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+        },
+        {
+            "timed_out": False,
+            "_shards": _SHARDS,
+            "hits": {"total": {"value": 10_000, "relation": "gte"}, "hits": []},
+        },
+        {
+            "timed_out": False,
+            "_shards": _SHARDS,
+            "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
+        },
+    ),
+)
+def test_search_partial_or_malformed_response_fails_closed(
+    mocker: Any, response: object
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.search.return_value = response
+
+    with pytest.raises(QueueError, match="queue pop failed"):
+        backend.pop("jobs")
+
+    client.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("count", (None, -1, True, 1.5))
+def test_count_requires_exact_nonnegative_integer(mocker: Any, count: object) -> None:
+    backend, client = _mock_backend(mocker)
+    client.count.return_value = {"count": count, "_shards": _SHARDS}
+
+    with pytest.raises(QueueError, match="queue length read failed"):
+        backend.queue_len("jobs")
+
+
+@pytest.mark.parametrize(
+    "shards",
+    (
+        None,
+        {"total": 1, "successful": 0, "failed": 1},
+        {"total": 2, "successful": 1, "failed": 0},
+        {"total": 1, "successful": 1, "failed": 0, "failures": [{}]},
+    ),
+)
+def test_count_rejects_missing_failed_or_partial_shards(
+    mocker: Any, shards: object
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.count.return_value = {"count": 1, "_shards": shards}
+
+    with pytest.raises(QueueError, match="queue length read failed"):
+        backend.queue_len("jobs")
+
+
+@pytest.mark.parametrize(
+    ("operation", "response", "expected_error"),
+    (
+        (
+            "push",
+            {"result": "updated", "_shards": _SHARDS},
+            QueueOutcomeIndeterminateError,
+        ),
+        (
+            "set",
+            {"result": "updated", "_shards": _SHARDS},
+            SetOutcomeIndeterminateError,
+        ),
+        (
+            "store",
+            {"result": "noop", "_shards": _SHARDS},
+            StorageOutcomeIndeterminateError,
+        ),
+        (
+            "delete",
+            {
+                "result": "deleted",
+                "_shards": {"total": 1, "successful": 0, "failed": 1},
+            },
+            StorageOutcomeIndeterminateError,
+        ),
+        (
+            "clear",
+            {
+                "timed_out": True,
+                "total": 1,
+                "deleted": 1,
+                "version_conflicts": 0,
+                "failures": [],
+                "_shards": _SHARDS,
+            },
+            StorageOutcomeIndeterminateError,
+        ),
+        (
+            "clear",
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 0,
+                "version_conflicts": 0,
+                "failures": [{"cause": "redacted"}],
+                "_shards": _SHARDS,
+            },
+            StorageOutcomeIndeterminateError,
+        ),
+        (
+            "clear",
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 0,
+                "version_conflicts": 0,
+                "failures": [],
+                "_shards": _SHARDS,
+            },
+            StorageOutcomeIndeterminateError,
+        ),
+        (
+            "clear",
+            {
+                "timed_out": False,
+                "total": 1,
+                "deleted": 1,
+                "failures": [],
+                "_shards": _SHARDS,
+            },
+            StorageOutcomeIndeterminateError,
+        ),
+    ),
+)
+def test_mutation_requires_complete_acknowledgement(
+    mocker: Any,
+    operation: str,
+    response: object,
+    expected_error: type[Exception],
+) -> None:
+    backend, client = _mock_backend(mocker)
+    call: Callable[[], object]
+    if operation == "push":
+        client.index.return_value = response
+        call = lambda: backend.push("jobs", b"item")
+    elif operation == "set":
+        client.index.return_value = response
+        call = lambda: backend.add("seen", b"item")
+    elif operation == "store":
+        client.index.return_value = response
+        call = lambda: backend.store("key", b"item")
+    elif operation == "delete":
+        client.delete.return_value = response
+        call = lambda: backend.delete("key")
+    else:
+        client.delete_by_query.return_value = response
+        call = lambda: backend.clear_storage()
+
+    with pytest.raises(expected_error):
+        call()
+
+
+def _request_error(body: object) -> RequestError:
+    meta = ApiResponseMeta(
+        status=400,
+        http_version="1.1",
+        headers=HttpHeaders(),
+        duration=0.0,
+        node=NodeConfig("http", "localhost", 9200),
+    )
+    return RequestError("static test", meta, body)
+
+
+def test_index_setup_accepts_only_structured_resource_already_exists(
+    mocker: Any,
+) -> None:
+    backend, client = _mock_backend(mocker)
+    structured = _request_error(
+        {"error": {"type": "resource_already_exists_exception"}}
+    )
+    client.indices.create.side_effect = [structured, None, None]
+
+    backend._ensure_indices(client=client)
+
+
+def test_index_setup_rejects_resource_exists_text_without_structured_type(
+    mocker: Any,
+) -> None:
+    backend, client = _mock_backend(mocker)
+    client.indices.create.side_effect = _request_error(
+        {"error": {"reason": "resource_already_exists_exception"}}
+    )
+
+    with pytest.raises(RequestError):
+        backend._ensure_indices(client=client)

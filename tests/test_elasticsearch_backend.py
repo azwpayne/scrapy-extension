@@ -14,6 +14,7 @@ from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
+    StorageError,
     StorageOutcomeIndeterminateError,
 )
 from scrapy_extension.settings.elasticsearch import (
@@ -35,10 +36,41 @@ def _assert_package_traceback_locals_are_redacted(
         trace = trace.tb_next
 
 
+_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+_INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
+_DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
+_DELETE_BY_QUERY_RESPONSE = {
+    "timed_out": False,
+    "total": 1,
+    "deleted": 1,
+    "version_conflicts": 0,
+    "failures": [],
+    "_shards": _SHARDS,
+}
+
+
+def _search_response(hits):
+    return {
+        "timed_out": False,
+        "_shards": _SHARDS,
+        "hits": {
+            "total": {"value": len(hits), "relation": "eq"},
+            "hits": hits,
+        },
+    }
+
+
+def _count_response(count):
+    return {"count": count, "_shards": _SHARDS}
+
+
 def _mock_backend(mocker, **settings_kwargs):
     config = ElasticSearchSettings(**settings_kwargs)
     backend = ElasticSearchBackend(config)
     backend._client = mocker.MagicMock()
+    backend._client.index.return_value = _INDEX_RESPONSE
+    backend._client.delete.return_value = _DELETE_RESPONSE
+    backend._client.delete_by_query.return_value = _DELETE_BY_QUERY_RESPONSE
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend
 
@@ -297,6 +329,7 @@ class TestConnection:
     def test_live_client_keeps_original_capability_indices_after_mutation(self, mocker):
         """Live operations use the client generation's immutable index snapshot."""
         client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+        client.index.return_value = _INDEX_RESPONSE
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch", return_value=client
         )
@@ -357,18 +390,16 @@ class TestQueue:
 
     def test_pop_with_items(self, mocker):
         b = _mock_backend(mocker)
-        b._client.search.return_value = {
-            "hits": {
-                "hits": [
-                    {
-                        "_id": "1",
-                        "_seq_no": 42,
-                        "_primary_term": 1,
-                        "_source": {"item": "aXRlbQ=="},
-                    }
-                ]
-            }
-        }
+        b._client.search.return_value = _search_response(
+            [
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": "aXRlbQ=="},
+                }
+            ]
+        )
 
         assert b.pop("q") == b"item"
         # delete no longer passes refresh= — read-your-writes moved to a pre-search
@@ -478,7 +509,7 @@ class TestQueue:
     )
     def test_pop_rejects_malformed_hit_before_delete(self, mocker, hit):
         b = _mock_backend(mocker)
-        b._client.search.return_value = {"hits": {"hits": [hit]}}
+        b._client.search.return_value = _search_response([hit])
 
         with pytest.raises(QueueError) as exc_info:
             b.pop("q")
@@ -492,18 +523,16 @@ class TestQueue:
 
     def test_pop_preserves_valid_empty_bytes(self, mocker):
         b = _mock_backend(mocker)
-        b._client.search.return_value = {
-            "hits": {
-                "hits": [
-                    {
-                        "_id": "1",
-                        "_seq_no": 42,
-                        "_primary_term": 1,
-                        "_source": {"item": ""},
-                    }
-                ]
-            }
-        }
+        b._client.search.return_value = _search_response(
+            [
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": ""},
+                }
+            ]
+        )
 
         assert b.pop("q") == b""
         b._client.delete.assert_called_once_with(
@@ -525,34 +554,30 @@ class TestQueue:
         b = _mock_backend(mocker)
         # First search returns a doc that loses the race; second returns a winner.
         b._client.search.side_effect = [
-            {
-                "hits": {
-                    "hits": [
-                        {
-                            "_id": "1",
-                            "_seq_no": 10,
-                            "_primary_term": 1,
-                            "_source": {"item": "bG9zdA=="},
-                        }
-                    ]
-                }
-            },
-            {
-                "hits": {
-                    "hits": [
-                        {
-                            "_id": "2",
-                            "_seq_no": 20,
-                            "_primary_term": 1,
-                            "_source": {"item": "d29u"},
-                        }
-                    ]
-                }
-            },
+            _search_response(
+                [
+                    {
+                        "_id": "1",
+                        "_seq_no": 10,
+                        "_primary_term": 1,
+                        "_source": {"item": "bG9zdA=="},
+                    }
+                ]
+            ),
+            _search_response(
+                [
+                    {
+                        "_id": "2",
+                        "_seq_no": 20,
+                        "_primary_term": 1,
+                        "_source": {"item": "d29u"},
+                    }
+                ]
+            ),
         ]
         b._client.delete.side_effect = [
             ConflictError("conflict", 409, body={}),
-            None,
+            _DELETE_RESPONSE,
         ]
 
         assert b.pop("q") == b"won"
@@ -570,34 +595,49 @@ class TestQueue:
 
         b = _mock_backend(mocker)
         # Every search finds a doc; every delete loses the race (conflict).
-        b._client.search.return_value = {
-            "hits": {
-                "hits": [
-                    {
-                        "_id": "1",
-                        "_seq_no": 10,
-                        "_primary_term": 1,
-                        "_source": {"item": "bG9zdA=="},
-                    }
-                ]
-            }
-        }
+        b._client.search.return_value = _search_response(
+            [
+                {
+                    "_id": "1",
+                    "_seq_no": 10,
+                    "_primary_term": 1,
+                    "_source": {"item": "bG9zdA=="},
+                }
+            ]
+        )
         b._client.delete.side_effect = ConflictError("conflict", 409, body={})
 
         assert b.pop("q") is None
         # All 3 attempts tried (max_attempts); each searched then lost the race.
         assert b._client.search.call_count == 3
 
+    def test_pop_delete_not_found_is_not_empty_success(self, mocker):
+        b = _mock_backend(mocker)
+        b._client.search.return_value = _search_response(
+            [
+                {
+                    "_id": "1",
+                    "_seq_no": 10,
+                    "_primary_term": 1,
+                    "_source": {"item": "aXRlbQ=="},
+                }
+            ]
+        )
+        b._client.delete.side_effect = _make_not_found_error()
+
+        with pytest.raises(QueueError, match="queue pop failed"):
+            b.pop("q")
+
     def test_pop_empty(self, mocker):
         b = _mock_backend(mocker)
-        b._client.search.return_value = {"hits": {"hits": []}}
+        b._client.search.return_value = _search_response([])
 
         assert b.pop("q") is None
         b._client.delete.assert_not_called()
 
     def test_queue_len(self, mocker):
         b = _mock_backend(mocker)
-        b._client.count.return_value = {"count": 5}
+        b._client.count.return_value = _count_response(5)
         assert b.queue_len("q") == 5
 
     def test_queue_len_error(self, mocker):
@@ -656,7 +696,9 @@ class TestSetCore:
     def test_add_duplicate(self, mocker):
         b = _mock_backend(mocker)
         err = RequestError(
-            "409", mocker.MagicMock(), {"error": "version_conflict_engine_exception"}
+            "409",
+            mocker.MagicMock(),
+            {"error": {"type": "version_conflict_engine_exception"}},
         )
         b._client.index.side_effect = err
         assert b.add("s", b"item") is False
@@ -713,7 +755,7 @@ class TestSetCore:
 
     def test_set_len(self, mocker):
         b = _mock_backend(mocker)
-        b._client.count.return_value = {"count": 3}
+        b._client.count.return_value = _count_response(3)
         assert b.set_len("s") == 3
 
     def test_clear_set(self, mocker):
@@ -793,13 +835,14 @@ class TestStorage:
             if_primary_term=3,
         )
 
-    def test_retrieve_expired_without_version_metadata_skips_unsafe_reap(self, mocker):
-        """Never fall back to deleting a key without optimistic concurrency data."""
+    def test_retrieve_expired_without_version_metadata_fails_closed(self, mocker):
+        """Missing concurrency metadata is a malformed response, not absence."""
         b = _mock_backend(mocker)
         past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
         b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
 
-        assert b.retrieve("k") is None
+        with pytest.raises(StorageError):
+            b.retrieve("k")
         b._client.delete.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -810,10 +853,10 @@ class TestStorage:
             SystemExit("warning handler exited"),
         ],
     )
-    def test_expired_reap_missing_version_keeps_absent_result_when_warning_fails(
+    def test_expired_reap_missing_version_fails_closed_without_warning(
         self, mocker, diagnostic_error
     ):
-        """A metadata-cleanup warning cannot revive an already expired value."""
+        """Malformed version metadata fails closed before cleanup diagnostics."""
         b = _mock_backend(mocker)
         past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
         b._client.get.return_value = {"_source": {"data": "ZGF0YQ==", "expireAt": past}}
@@ -822,10 +865,11 @@ class TestStorage:
             side_effect=diagnostic_error,
         )
 
-        assert b.retrieve("k") is None
+        with pytest.raises(StorageError):
+            b.retrieve("k")
 
         b._client.delete.assert_not_called()
-        warning.assert_called_once()
+        warning.assert_not_called()
 
     @pytest.mark.parametrize(
         "diagnostic_error",
@@ -967,13 +1011,14 @@ class TestStorage:
             index="scrapy_storage", id="k", if_seq_no=4, if_primary_term=2
         )
 
-    def test_ttl_expired_without_version_metadata_skips_unsafe_reap(self, mocker):
-        """Logical expiry must not trigger an unconditional concurrent-write race."""
+    def test_ttl_expired_without_version_metadata_fails_closed(self, mocker):
+        """Logical expiry with malformed metadata is not an absent success."""
         b = _mock_backend(mocker)
         past = (datetime.now(tz=timezone.utc) - timedelta(seconds=3600)).isoformat()
         b._client.get.return_value = {"_source": {"expireAt": past}}
 
-        assert b.ttl("k") is None
+        with pytest.raises(StorageError):
+            b.ttl("k")
         b._client.delete.assert_not_called()
 
     def test_ttl_malformed_expiry_is_storage_error(self, mocker):
@@ -1145,7 +1190,9 @@ class TestSet:
     def test_add_duplicate(self, mocker):
         b = _mock_backend(mocker)
         err = RequestError(
-            "409", mocker.MagicMock(), {"error": "version_conflict_engine_exception"}
+            "409",
+            mocker.MagicMock(),
+            {"error": {"type": "version_conflict_engine_exception"}},
         )
         b._client.index.side_effect = err
         assert b.add("s", b"item") is False
@@ -1167,7 +1214,7 @@ class TestSet:
 
     def test_set_len(self, mocker):
         b = _mock_backend(mocker)
-        b._client.count.return_value = {"count": 3}
+        b._client.count.return_value = _count_response(3)
         assert b.set_len("s") == 3
 
     def test_clear_set(self, mocker):

@@ -336,7 +336,8 @@ expect one in-flight operation per connected backend generation.
 
 | Surface | Ack / state boundary | Crash behavior | Operator action |
 |---|---|---|---|
-| Redis / MongoDB / ElasticSearch queue pop | Atomic pop removes the item from the backend queue. Redis never automatically replays a transport-failed pop. | A worker crash after pop can lose the request unless the spider re-enqueues or the backend implementation provides its own recovery. A lost Redis response may hide one already-consumed item even though the SDK does not consume a second. | Use idempotent callbacks and durable item storage for critical crawls. Reconcile an ambiguous Redis failure before issuing another pop. |
+| Redis / MongoDB queue pop | Atomic pop removes the item from the backend queue. Redis never automatically replays a transport-failed pop. | A worker crash after pop can lose the request unless the spider re-enqueues or the backend implementation provides its own recovery. A lost Redis response may hide one already-consumed item even though the SDK does not consume a second. | Use idempotent callbacks and durable item storage for critical crawls. Reconcile an ambiguous Redis failure before issuing another pop. |
+| ElasticSearch queue pop | Search plus optimistic-concurrency delete; explicit HTTP 409 races retry up to three searches. Every data mutation uses a no-replay client view. | A committed delete whose response is lost raises `QueueOutcomeIndeterminateError`; no SDK replay occurs, but the item may already be gone. This is not exactly-once delivery. | Reconcile the stable queue document/domain state before retrying. Treat malformed, timed-out, or partial search/delete responses as failures, never as an empty queue. |
 | Kafka / RabbitMQ / Pulsar queue pop | `pop_with_ack()` returns a per-message token; scheduler acks on Scrapy `response_received`. Kafka binds tokens to generation/assignment/attempt; Pulsar permits one successful terminal action and keeps client failures retryable. | Crash before ack redelivers. Kafka nacks/rebalances retire the old attempt so its late completion cannot commit the replacement. Crash after response but before callback/pipeline completion can lose downstream work. | Treat ack as downloader-level, not end-to-end completion. Retry the same Pulsar token after a reported client failure. RabbitMQ push waits for a publisher confirm and raises on unroutable/nacked delivery. |
 | SQS queue pop | Receipt-handle token plus `SCRAPY_SQS_VISIBILITY_TIMEOUT` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the visibility lease. | No automatic renewal. Size the lease above worst-case download time. Explicit nack sets visibility to 0 for immediate redelivery. |
 | RocketMQ queue pop | Single-outcome message token plus `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the invisibility lease. | No automatic renewal. Token-aware pop never fills the legacy ack slot; ack/nack on one token serialize and a failure remains locally retryable. Explicit nack shortens the lease to RocketMQ's 10-second minimum. Pair set/storage through per-component backends. |
@@ -472,6 +473,20 @@ the three destinations: its queue, set-uniqueness, storage-key, and TTL indexes
 remain attached. Back it up, create three empty collections, let the backend
 create each domain's indexes, import only that domain's documents, and verify
 the resulting indexes before opening writers.
+
+Elasticsearch safe reads and index setup retain
+`SCRAPY_ELASTICSEARCH_MAX_RETRIES` / retry-on-timeout configuration. Queue,
+set, storage, TTL-reap, and delete-by-query mutations instead use one
+shared-transport no-replay view (`max_retries=0`, `retry_on_timeout=False`, and
+no retry statuses). A normal return requires a complete, well-formed response:
+no search/delete-by-query timeout, no failed/partial shards or failure entries,
+an exact nonnegative count, and the expected mutation result. A typed
+`*OutcomeIndeterminateError` means the server may have committed before the
+response was lost or proved malformed. No automatic replay is not exactly-once;
+stop blind retry loops and reconcile through the queue document ID, set member
+hash, storage key, or domain state first. The localhost response-drop harness is
+opt-in with `SCRAPY_TEST_ES_OUTCOME_SAFETY=1` and a single local HTTP
+`SCRAPY_TEST_ES_HOSTS` endpoint.
 
 If the error is in a backend's `from_settings` / `from_crawler` factory,
 check `backends/connectors.py:resolve_backend_config` — it resolves

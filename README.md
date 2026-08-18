@@ -341,6 +341,17 @@ SCRAPY_BACKEND_TYPE = "elasticsearch"
 SCRAPY_ELASTICSEARCH_HOSTS = ["http://localhost:9200"]
 ```
 
+Each connected generation uses the configured retry policy for safe reads and
+control-plane setup, but a shared-transport `client.options(...)` view disables
+all automatic retries for queue, set, and storage mutations. This prevents an
+SDK replay from silently applying a committed mutation twice; it does **not**
+provide exactly-once semantics. If a mutation response is lost or malformed,
+the backend raises a typed `QueueOutcomeIndeterminateError`,
+`SetOutcomeIndeterminateError`, or `StorageOutcomeIndeterminateError`. Callers
+must reconcile by stable document/domain identity before deciding whether to
+retry. Search, count, delete, and delete-by-query responses also fail closed on
+timeouts, shard failures, partial results, or malformed acknowledgements.
+
 ### RocketMQ (standalone, cluster, cloud)
 
 ```python

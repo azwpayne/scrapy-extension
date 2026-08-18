@@ -16,6 +16,7 @@ from scrapy_extension.exceptions import (
     ConfigurationError,
     QueueError,
     StorageError,
+    StorageOutcomeIndeterminateError,
 )
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
@@ -89,6 +90,17 @@ def _backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     )
     backend = ElasticSearchBackend(config)
     client = mocker.MagicMock()
+    shards = {"total": 1, "successful": 1, "failed": 0}
+    client.index.return_value = {"result": "created", "_shards": shards}
+    client.delete.return_value = {"result": "deleted", "_shards": shards}
+    client.delete_by_query.return_value = {
+        "timed_out": False,
+        "total": 1,
+        "deleted": 1,
+        "version_conflicts": 0,
+        "failures": [],
+        "_shards": shards,
+    }
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend, client
@@ -332,7 +344,9 @@ def test_elasticsearch_set_duplicate_conflict_still_returns_false(
         failure = ConflictError(_MARKER, mocker.MagicMock(), {})
     else:
         failure = RequestError(
-            "409", mocker.MagicMock(), {"error": "version_conflict_engine_exception"}
+            "409",
+            mocker.MagicMock(),
+            {"error": {"type": "version_conflict_engine_exception"}},
         )
     client.index.side_effect = failure
 
@@ -478,7 +492,30 @@ def test_elasticsearch_store_accepts_keyword_data_argument(mocker: Any) -> None:
     assert client.index.call_args.kwargs["document"]["data"] == "cGF5bG9hZA=="
 
 
-def test_elasticsearch_expired_document_warning_omits_storage_key(mocker: Any) -> None:
+def test_malformed_mutation_response_raises_static_redacted_typed_error(
+    mocker: Any,
+) -> None:
+    backend, client = _backend(mocker)
+    client.delete.return_value = {
+        "result": "deleted",
+        "_shards": {
+            "total": 1,
+            "successful": 0,
+            "failed": 1,
+            "failures": [{"reason": _MARKER}],
+        },
+    }
+
+    with pytest.raises(StorageOutcomeIndeterminateError) as exc_info:
+        backend.delete("safe-key")
+
+    assert str(exc_info.value) == "ElasticSearch storage delete failed."
+    _assert_terminal_error_is_redacted(exc_info.value, _MARKER)
+
+
+def test_elasticsearch_expired_document_missing_version_fails_redacted(
+    mocker: Any,
+) -> None:
     backend, client = _backend(mocker)
     client.get.return_value = {
         "_source": {
@@ -488,12 +525,8 @@ def test_elasticsearch_expired_document_warning_omits_storage_key(mocker: Any) -
             ).isoformat(),
         }
     }
-    warning = mocker.patch("scrapy_extension.backends.elasticsearch.logger.warning")
 
-    assert backend.retrieve(_MARKER) is None
+    with pytest.raises(StorageError) as exc_info:
+        backend.retrieve(_MARKER)
 
-    warning.assert_called_once_with(
-        "Skipping unsafe reap of expired ES storage document: response omitted "
-        "_seq_no/_primary_term"
-    )
-    assert _MARKER not in repr(warning.call_args)
+    _assert_terminal_error_is_redacted(exc_info.value, _MARKER)

@@ -12,10 +12,23 @@ from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
+_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+_INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
+_DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
+
+
+def _successful_client(mocker: Any) -> Any:
+    client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    client.index.return_value = _INDEX_RESPONSE
+    client.delete.return_value = _DELETE_RESPONSE
+    return client
+
 
 def _injected_backend(mocker: Any, **settings: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(ElasticSearchSettings(**settings))
     client = mocker.MagicMock()
+    client.index.return_value = _INDEX_RESPONSE
+    client.delete.return_value = _DELETE_RESPONSE
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend, client
@@ -40,9 +53,10 @@ def test_push_lease_keeps_client_open_until_sdk_call_finishes(mocker: Any) -> No
     release = threading.Event()
     disconnected = threading.Event()
 
-    def index(**_kwargs: Any) -> None:
+    def index(**_kwargs: Any) -> dict[str, Any]:
         entered.set()
         assert release.wait(timeout=2)
+        return _INDEX_RESPONSE
 
     client.index.side_effect = index
     pushing = _thread(lambda: backend.push("jobs", b"payload"))
@@ -72,7 +86,10 @@ def test_pop_search_delete_uses_one_generation_lease(mocker: Any) -> None:
         search_entered.set()
         assert release_search.wait(timeout=2)
         return {
+            "timed_out": False,
+            "_shards": _SHARDS,
             "hits": {
+                "total": {"value": 1, "relation": "eq"},
                 "hits": [
                     {
                         "_id": "doc-1",
@@ -80,12 +97,17 @@ def test_pop_search_delete_uses_one_generation_lease(mocker: Any) -> None:
                         "_primary_term": 2,
                         "_source": {"item": "cGF5bG9hZA=="},
                     }
-                ]
-            }
+                ],
+            },
         }
 
     client.search.side_effect = search
-    client.delete.side_effect = lambda **_kwargs: calls.append("delete")
+
+    def delete(**_kwargs: Any) -> dict[str, Any]:
+        calls.append("delete")
+        return _DELETE_RESPONSE
+
+    client.delete.side_effect = delete
     client.close.side_effect = lambda: calls.append("close")
 
     result: list[bytes | None] = []
@@ -115,9 +137,10 @@ def test_expired_storage_reap_uses_get_generation_for_delete(mocker: Any) -> Non
         "_primary_term": 4,
     }
 
-    def delete(**_kwargs: Any) -> None:
+    def delete(**_kwargs: Any) -> dict[str, Any]:
         reap_entered.set()
         assert release_reap.wait(timeout=2)
+        return _DELETE_RESPONSE
 
     client.delete.side_effect = delete
     result: list[bytes | None] = []
@@ -143,9 +166,10 @@ def test_disconnect_drains_all_peer_operation_leases(mocker: Any) -> None:
     release = threading.Event()
     disconnected = threading.Event()
 
-    def index(**_kwargs: Any) -> None:
+    def index(**_kwargs: Any) -> dict[str, Any]:
         both_entered.wait(timeout=2)
         assert release.wait(timeout=2)
+        return _INDEX_RESPONSE
 
     client.index.side_effect = index
     first = _thread(lambda: backend.push("jobs", b"one"))
@@ -166,8 +190,8 @@ def test_disconnect_drains_all_peer_operation_leases(mocker: Any) -> None:
 
 
 def test_reconnect_fences_retired_client_and_snapshot(mocker: Any) -> None:
-    first = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
-    second = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    first = _successful_client(mocker)
+    second = _successful_client(mocker)
     factory = mocker.patch(
         "scrapy_extension.backends.elasticsearch.Elasticsearch",
         side_effect=[first, second],
@@ -178,9 +202,10 @@ def test_reconnect_fences_retired_client_and_snapshot(mocker: Any) -> None:
     entered = threading.Event()
     release = threading.Event()
 
-    def old_index(**_kwargs: Any) -> None:
+    def old_index(**_kwargs: Any) -> dict[str, Any]:
         entered.set()
         assert release.wait(timeout=2)
+        return _INDEX_RESPONSE
 
     first.index.side_effect = old_index
     pushing = _thread(lambda: backend.push("jobs", b"old"))
@@ -206,8 +231,8 @@ def test_reconnect_fences_retired_client_and_snapshot(mocker: Any) -> None:
 def test_connect_during_drain_rejects_lease_owner_and_replaces_for_peer(
     mocker: Any,
 ) -> None:
-    first = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
-    second = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    first = _successful_client(mocker)
+    second = _successful_client(mocker)
     factory = mocker.patch(
         "scrapy_extension.backends.elasticsearch.Elasticsearch",
         side_effect=[first, second],
@@ -224,7 +249,7 @@ def test_connect_during_drain_rejects_lease_owner_and_replaces_for_peer(
     peer_errors: list[BaseException] = []
     peer_connected = threading.Event()
 
-    def hold_lease(**_kwargs: Any) -> None:
+    def hold_lease(**_kwargs: Any) -> dict[str, Any]:
         operation_entered.wait(timeout=2)
         assert try_nested_connect.wait(timeout=2)
         try:
@@ -234,6 +259,7 @@ def test_connect_during_drain_rejects_lease_owner_and_replaces_for_peer(
         finally:
             nested_connect_done.set()
         assert release_operation.wait(timeout=2)
+        return _INDEX_RESPONSE
 
     def push() -> None:
         try:
@@ -295,7 +321,7 @@ def test_connect_during_drain_rejects_lease_owner_and_replaces_for_peer(
 def test_post_publication_interrupt_preserves_leasable_generation(
     mocker: Any,
 ) -> None:
-    candidate = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))
+    candidate = _successful_client(mocker)
     factory = mocker.patch(
         "scrapy_extension.backends.elasticsearch.Elasticsearch",
         return_value=candidate,
@@ -332,9 +358,10 @@ def test_post_publication_interrupt_preserves_leasable_generation(
         except BaseException as error:
             connect_errors.append(error)
 
-    def hold_lease(**_kwargs: Any) -> None:
+    def hold_lease(**_kwargs: Any) -> dict[str, Any]:
         operation_entered.wait(timeout=2)
         assert release_operation.wait(timeout=2)
+        return _INDEX_RESPONSE
 
     def push() -> None:
         try:
@@ -401,10 +428,11 @@ def test_reentrant_disconnect_is_rejected_without_deadlock(mocker: Any) -> None:
     backend, client = _injected_backend(mocker)
     rejection: list[BackendConnectionError] = []
 
-    def index(**_kwargs: Any) -> None:
+    def index(**_kwargs: Any) -> dict[str, Any]:
         with pytest.raises(BackendConnectionError) as exc_info:
             backend.disconnect()
         rejection.append(exc_info.value)
+        return _INDEX_RESPONSE
 
     client.index.side_effect = index
     backend.push("jobs", b"payload")
