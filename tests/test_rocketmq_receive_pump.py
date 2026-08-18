@@ -26,6 +26,49 @@ def _connected_backend() -> tuple[RocketMQBackend, MagicMock, MagicMock]:
     return backend, producer, consumer
 
 
+def test_start_failure_is_redacted_and_allows_clean_disconnect_then_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, producer, consumer = _connected_backend()
+    original_start = threading.Thread.start
+    receive_start_attempts = 0
+
+    def fail_first_receive_start(worker: threading.Thread) -> None:
+        nonlocal receive_start_attempts
+        if worker.name.startswith("rocketmq-receive-"):
+            receive_start_attempts += 1
+            if receive_start_attempts == 1:
+                raise RuntimeError("private thread startup detail")
+        original_start(worker)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_receive_start)
+
+    with pytest.raises(QueueError) as exc_info:
+        backend.pop("jobs", timeout=1)
+
+    assert str(exc_info.value) == "Failed to pop RocketMQ message."
+    assert exc_info.value.__cause__ is None
+    assert "private thread startup detail" not in str(exc_info.value)
+    assert backend._receive_worker is None
+
+    started = time.monotonic()
+    backend.disconnect()
+    assert time.monotonic() - started < 1
+    producer.shutdown.assert_called_once_with()
+    consumer.shutdown.assert_called_once_with()
+
+    message = MagicMock(body=b"recovered")
+    second_consumer = MagicMock(is_running=True)
+    second_consumer.receive.return_value = [message]
+    backend._producer = MagicMock(is_running=True)
+    backend._consumer = second_consumer
+    backend._consumer_generation += 1
+
+    assert backend.pop("replacement", timeout=1) == b"recovered"
+    assert receive_start_attempts == 2
+    backend.disconnect()
+
+
 def test_zero_timeout_never_waits_for_blocked_broker_receive() -> None:
     backend, _, consumer = _connected_backend()
     receive_entered = threading.Event()

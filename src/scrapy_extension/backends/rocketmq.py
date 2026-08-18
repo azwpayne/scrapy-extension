@@ -484,7 +484,11 @@ class RocketMQBackend(Backend, QueueBackend):
 
     def _finish_receive_pump_shutdown(self, worker: threading.Thread | None) -> bool:
         """Bound the detached-worker join and report whether it really stopped."""
-        if worker is not None and worker is not threading.current_thread():
+        if (
+            worker is not None
+            and worker is not threading.current_thread()
+            and worker.ident is not None
+        ):
             worker.join(timeout=_RECEIVE_PUMP_JOIN_TIMEOUT_S)
         worker_stopped = (
             worker is None
@@ -737,7 +741,16 @@ class RocketMQBackend(Backend, QueueBackend):
             daemon=True,
         )
         self._receive_worker = worker
-        worker.start()
+        try:
+            worker.start()
+        except BaseException:
+            # ``Thread.start`` may fail before assigning an identity. Roll back
+            # only our candidate so disconnect never tries to join an unstarted
+            # worker and a later operation may retry this still-current generation.
+            if self._receive_worker is worker:
+                self._receive_worker = None
+            self._receive_condition.notify_all()
+            raise
 
     def _pump_is_current_locked(
         self, consumer: Any, generation: int, stop: threading.Event
