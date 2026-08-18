@@ -276,6 +276,48 @@ def test_failed_wheel_drain_keeps_due_item_for_retry():
     assert qb.push.call_count == 2
 
 
+@pytest.mark.parametrize(
+    "failure_type",
+    [RuntimeError, KeyboardInterrupt],
+    ids=["exception", "base-exception"],
+)
+def test_partial_wheel_drain_failure_refreshes_remaining_slot_minimum(failure_type):
+    """A successful prefix cannot leave the failed later deadline cached stale."""
+    s, qb, clock = _strategy(wheel_size=4, clock_value=0.0)
+    s.push("q", b"earliest", delay=1.0)  # ready_at=1, physical slot 1
+    clock[0] = 1.0
+    s.push("q", b"later", delay=4.0)  # ready_at=5, same slot next rotation
+    clock[0] = 5.0
+    failure = failure_type("publish interrupted")
+    failed_once = False
+    accepted: list[bytes] = []
+
+    def publish(_queue_name: str, item: bytes, _priority: float) -> None:
+        nonlocal failed_once
+        if item == b"later" and not failed_once:
+            failed_once = True
+            raise failure
+        accepted.append(item)
+
+    qb.push.side_effect = publish
+
+    with pytest.raises(failure_type) as raised:
+        s.pop("q")
+
+    assert raised.value is failure
+    assert accepted == [b"earliest"]
+    assert list(s._wheel[1]) == [(5.0, b"later", 0.0)]
+    assert s._slot_min_deadlines[1] == 5.0
+    assert s._next_release_at() == 5.0
+
+    s.pop("q")
+
+    assert accepted == [b"earliest", b"later"]
+    assert not s._wheel[1]
+    assert s._slot_min_deadlines[1] is None
+    assert s._next_release_at() is None
+
+
 def test_process_control_wheel_drain_keeps_failing_item_and_tail_in_order():
     """A process-control signal must remove only the successfully pushed prefix."""
 
