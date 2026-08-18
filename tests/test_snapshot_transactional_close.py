@@ -194,8 +194,10 @@ class _InterruptingWaiterMap(dict[int, set[object]]):
     def __init__(self, operation: str, exception: BaseException) -> None:
         super().__init__()
         self._waiters = _InterruptingWaiterSet(operation, exception)
+        self.registration_attempted = threading.Event()
 
     def setdefault(self, key: int, default: set[object] | None = None) -> set[object]:
+        self.registration_attempted.set()
         return super().setdefault(key, self._waiters)
 
 
@@ -224,7 +226,8 @@ def test_interrupted_waiter_registration_and_cleanup_are_reclaimed(
     strategy = MagicMock()
     strategy.snapshot.return_value = b"state"
     queue = _queue_with_storage(strategy, storage)
-    queue._close_attempt_waiters = _InterruptingWaiterMap(operation, interruption)
+    waiter_map = _InterruptingWaiterMap(operation, interruption)
+    queue._close_attempt_waiters = waiter_map
     outcomes: dict[str, BaseException | None] = {}
 
     def close_queue(caller: str) -> None:
@@ -244,11 +247,15 @@ def test_interrupted_waiter_registration_and_cleanup_are_reclaimed(
     owner.start()
     assert store_entered.wait(timeout=2.0)
     waiter.start()
-    waiter.join(timeout=2.0)
-    assert not waiter.is_alive()
+    assert waiter_map.registration_attempted.wait(timeout=2.0)
+    if operation == "add":
+        waiter.join(timeout=2.0)
+        assert not waiter.is_alive()
     release_store.set()
     owner.join(timeout=2.0)
+    waiter.join(timeout=2.0)
     assert not owner.is_alive()
+    assert not waiter.is_alive()
 
     assert isinstance(outcomes["owner"], QueueError)
     assert isinstance(outcomes["waiter"], type(interruption))

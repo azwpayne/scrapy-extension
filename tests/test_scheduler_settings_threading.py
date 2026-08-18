@@ -44,6 +44,8 @@ def _make_settings(
     queue_strategy: str = "passthrough",
     ring_buffer_full_policy: str | None = None,
     snapshot_owner: str | None = None,
+    snapshot_max_bytes: int | None = None,
+    snapshot_chunk_bytes: int | None = None,
 ) -> Mock:
     """Build a Scrapy-Settings-like Mock resolving the R14-C SCRAPY_* keys.
 
@@ -73,6 +75,10 @@ def _make_settings(
         overrides["SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY"] = ring_buffer_full_policy
     if snapshot_owner is not None:
         overrides["SCRAPY_QUEUE_SNAPSHOT_OWNER"] = snapshot_owner
+    if snapshot_max_bytes is not None:
+        overrides["SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES"] = snapshot_max_bytes
+    if snapshot_chunk_bytes is not None:
+        overrides["SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES"] = snapshot_chunk_bytes
 
     def get(key: str, default: Any = None) -> Any:
         return overrides.get(key, default)
@@ -194,6 +200,22 @@ def _open_scheduler(scheduler: BackendScheduler) -> BackendQueue:
     scheduler.open(_FakeSpider())
     assert scheduler._queue is not None
     return scheduler._queue
+
+
+def test_custom_snapshot_limits_are_threaded_to_backend_queue(mocker) -> None:
+    mocker.patch(
+        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
+        return_value=mocker.Mock(),
+    )
+    settings = _make_settings(
+        snapshot_max_bytes=4096,
+        snapshot_chunk_bytes=1024,
+    )
+
+    queue = _open_scheduler(BackendScheduler.from_settings(settings))
+
+    assert queue._snapshot_max_bytes == 4096
+    assert queue._snapshot_chunk_bytes == 1024
 
 
 class TestR14CDepthSampleEveryThreading:

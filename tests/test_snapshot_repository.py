@@ -153,6 +153,60 @@ def test_legacy_raw_value_remains_readable() -> None:
     assert result.state == b"legacy-v3-or-v2-payload"
 
 
+class _CopyBombBytearray(bytearray):
+    def __init__(self, value: bytes) -> None:
+        super().__init__(value)
+        self.copy_attempted = False
+
+    def __bytes__(self) -> bytes:
+        self.copy_attempted = True
+        raise AssertionError("oversized backend value must not be copied")
+
+
+@pytest.mark.parametrize("use_memoryview", [False, True])
+def test_oversized_bytes_like_manifest_is_rejected_before_copy(
+    use_memoryview: bool,
+) -> None:
+    hostile = _CopyBombBytearray(b"x" * (65 * 1024))
+    backend_value = memoryview(hostile) if use_memoryview else hostile
+    storage = MagicMock()
+    storage.retrieve.return_value = backend_value
+    repository = SnapshotRepository(storage, max_bytes=4, chunk_bytes=2)
+
+    with pytest.raises(SnapshotRepositoryError, match="size limit"):
+        repository.read(_KEY)
+
+    assert hostile.copy_attempted is False
+
+
+@pytest.mark.parametrize("use_memoryview", [False, True])
+def test_oversized_bytes_like_chunk_is_rejected_before_copy(
+    use_memoryview: bool,
+) -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=8, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+    manifest = json.loads(values[_KEY])
+    first_chunk = repository._chunk_key(_KEY, manifest["generation"], 0)
+    hostile = _CopyBombBytearray(b"x" * 5)
+    values[first_chunk] = memoryview(hostile) if use_memoryview else hostile
+
+    with pytest.raises(SnapshotRepositoryError, match="chunk length"):
+        repository.read(_KEY)
+
+    assert hostile.copy_attempted is False
+
+
+def test_bounded_memoryview_manifest_and_chunks_round_trip() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=16, chunk_bytes=4)
+    repository.commit(_KEY, b"bounded-state")
+    for key, value in tuple(values.items()):
+        values[key] = memoryview(value)
+
+    assert repository.read(_KEY).state == b"bounded-state"
+
+
 def _logical_key(
     queue_name: str, *, owner: str | None = None, spider: str | None = None
 ) -> str:

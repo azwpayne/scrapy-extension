@@ -206,8 +206,13 @@ class SnapshotRepository:
         value = self._retrieve(key, "Snapshot manifest retrieval failed.")
         if value is None:
             return SnapshotRead(False, None, False)
-        if not isinstance(value, (bytes, bytearray)):
+        if not isinstance(value, (bytes, bytearray, memoryview)):
             raise SnapshotRepositoryError("Snapshot manifest has an invalid type.")
+        raw_length = len(value)
+        if isinstance(value, memoryview):
+            raw_length = value.nbytes
+        if raw_length > max(self._max_bytes, _MAX_MANIFEST_BYTES):
+            raise SnapshotRepositoryError("Snapshot exceeds the configured size limit.")
         raw = bytes(value)
         manifest = self._decode_manifest(raw)
         if manifest is None:
@@ -231,18 +236,20 @@ class SnapshotRepository:
                 self._chunk_key(key, manifest.generation, index),
                 "Snapshot chunk retrieval failed.",
             )
-            if not isinstance(chunk, (bytes, bytearray)):
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
                 raise SnapshotRepositoryError("Snapshot chunk is missing or invalid.")
-            chunk_value = bytes(chunk)
             expected = min(
                 manifest.chunk_bytes,
                 manifest.length - (index * manifest.chunk_bytes),
             )
-            if len(chunk_value) != expected:
+            chunk_length = len(chunk)
+            if isinstance(chunk, memoryview):
+                chunk_length = chunk.nbytes
+            if chunk_length != expected:
                 raise SnapshotRepositoryError(
                     "Snapshot chunk length validation failed."
                 )
-            assembled.extend(chunk_value)
+            assembled.extend(bytes(chunk))
         state = bytes(assembled)
         if len(state) != manifest.length:
             raise SnapshotRepositoryError("Snapshot length validation failed.")
