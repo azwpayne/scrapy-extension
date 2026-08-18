@@ -133,6 +133,8 @@ _MONGODB_SAFE_CONNECT_MESSAGES: frozenset[str] = frozenset(
 _MONGODB_QUEUE_PUSH_ERROR = "MongoDB queue push failed."
 _MONGODB_QUEUE_POP_ERROR = "MongoDB queue pop failed."
 _MONGODB_QUEUE_LENGTH_ERROR = "MongoDB queue length read failed."
+_BSON_INT64_MIN = -(2**63)
+_BSON_INT64_MAX = 2**63 - 1
 # MongoDB's ``number`` query alias excludes booleans. Decimal128 bounds retain
 # every finite BSON numeric value while excluding NaN and both infinities.
 _MONGODB_MAX_FINITE_PRIORITY = Decimal128("9.999999999999999999999999999999999E+6144")
@@ -167,16 +169,15 @@ def _validate_queue_push_arguments(
     _item: bytes,
     priority: float = 0.0,
 ) -> None:
-    """Reject priorities that a durable write would immediately quarantine."""
+    """Reject priorities whose negated stored form is not a finite BSON number."""
     _validate_key_name(queue_name, "queue_name")
-    try:
-        valid_priority = (
-            not isinstance(priority, bool)
-            and isinstance(priority, (int, float))
-            and math.isfinite(priority)
-        )
-    except OverflowError:
-        valid_priority = False
+    valid_priority = False
+    if not isinstance(priority, bool):
+        if isinstance(priority, int):
+            stored_priority = -priority
+            valid_priority = _BSON_INT64_MIN <= stored_priority <= _BSON_INT64_MAX
+        elif isinstance(priority, float):
+            valid_priority = math.isfinite(-priority)
     if not valid_priority:
         raise ValueError("priority must be a finite non-boolean number")
 
@@ -1147,9 +1148,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         }
         try:
             queue_collection.insert_one(doc)
-        except PyMongoError as e:
-            msg = f"Failed to push to queue {queue_name}: {e}"
-            raise QueueError(msg, queue_name=queue_name, operation="push") from e
+        except (PyMongoError, BSONError, OverflowError) as e:
+            # The public boundary rebuilds this after the document and encoder
+            # traceback have unwound, retaining only its static operation metadata.
+            raise QueueError(_MONGODB_QUEUE_PUSH_ERROR, operation="push") from e
 
     @queue_operation_error_boundary(
         "pop",

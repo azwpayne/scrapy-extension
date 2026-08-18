@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from bson.binary import Binary
+from bson.errors import BSONError
 
 from scrapy_extension.backends.mongodb import (
     MongoDBBackend,
@@ -237,7 +238,7 @@ def test_concurrent_contention_uses_one_atomic_command_per_pop(
 
 @pytest.mark.parametrize(
     "priority",
-    [True, False, "1", float("nan"), float("inf"), float("-inf"), 10**10000],
+    [True, False, "1", float("nan"), float("inf"), float("-inf"), 10**100],
     ids=[
         "true",
         "false",
@@ -260,6 +261,83 @@ def test_push_rejects_undeliverable_priority_before_insert(
         backend.push(_QUEUE, b"payload", priority=priority)  # type: ignore[arg-type]
 
     collection.insert_one.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("priority", "stored_priority"),
+    [
+        (-(2**63) + 1, 2**63 - 1),
+        (2**63 - 1, -(2**63) + 1),
+        (2**63, -(2**63)),
+    ],
+    ids=["negative-adjacent", "positive-adjacent", "positive-boundary"],
+)
+def test_push_accepts_exact_negated_bson_int64_boundaries(
+    mocker: Any, priority: int, stored_priority: int
+) -> None:
+    collection = mocker.MagicMock()
+    backend = _backend(mocker, collection)
+
+    backend.push(_QUEUE, b"payload", priority=priority)
+
+    document = collection.insert_one.call_args.args[0]
+    assert document["priority"] == stored_priority
+
+
+@pytest.mark.parametrize(
+    "priority",
+    [-(2**63) - 1, -(2**63), 2**63 + 1, 10**100],
+    ids=[
+        "below-negative-boundary",
+        "negative-boundary",
+        "above-positive-boundary",
+        "large-finite-int",
+    ],
+)
+def test_push_rejects_priorities_outside_negated_bson_int64_bounds(
+    mocker: Any, priority: int
+) -> None:
+    collection = mocker.MagicMock()
+    backend = _backend(mocker, collection)
+
+    with pytest.raises(
+        ValueError, match="priority must be a finite non-boolean number"
+    ):
+        backend.push(_QUEUE, b"payload", priority=priority)  # type: ignore[arg-type]
+
+    collection.insert_one.assert_not_called()
+
+
+@pytest.mark.parametrize("encoding_error", [OverflowError, BSONError])
+def test_push_rebuilds_bson_encoding_failures_without_document_graph(
+    mocker: Any, encoding_error: type[Exception]
+) -> None:
+    marker = "mongodb-private-encoding-marker"
+    collection = mocker.MagicMock()
+
+    def fail_encoding(document: dict[str, Any]) -> None:
+        assert document["item"] == marker.encode()
+        raise encoding_error(marker)
+
+    collection.insert_one.side_effect = fail_encoding
+    backend = _backend(mocker, collection)
+
+    with pytest.raises(QueueError) as exc_info:
+        backend.push(_QUEUE, marker.encode(), priority=1.0)
+
+    error = exc_info.value
+    assert str(error) == "MongoDB queue push failed."
+    assert error.operation == "push"
+    assert error.queue_name is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    trace = error.__traceback__
+    while trace is not None:
+        if "/src/scrapy_extension/" in trace.tb_frame.f_code.co_filename:
+            assert marker not in repr(trace.tb_frame.f_locals)
+        trace = trace.tb_next
 
 
 def test_pop_query_is_strict_and_accepts_bson_binary_result(mocker: Any) -> None:

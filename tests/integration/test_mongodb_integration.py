@@ -206,15 +206,18 @@ def test_poison_records_are_durable_and_excluded_from_active_length(
             "created_at": "not-a-date",
         },
     ]
-    collection.insert_many(poison_documents)
-    mongo_backend.push(queue, b"deliverable", priority=1.0)
+    try:
+        collection.insert_many(poison_documents)
+        mongo_backend.push(queue, b"deliverable", priority=1.0)
 
-    assert mongo_backend.queue_len(queue) == 1
-    assert mongo_backend.pop(queue) == b"deliverable"
-    assert mongo_backend.queue_len(queue) == 0
-    assert collection.count_documents({"queue_name": queue}) == len(poison_documents)
-
-    mongo_backend.clear_queue(queue)
+        assert mongo_backend.queue_len(queue) == 1
+        assert mongo_backend.pop(queue) == b"deliverable"
+        assert mongo_backend.queue_len(queue) == 0
+        assert collection.count_documents({"queue_name": queue}) == len(
+            poison_documents
+        )
+    finally:
+        mongo_backend.clear_queue(queue)
     assert collection.count_documents({"queue_name": queue}) == 0
 
 
