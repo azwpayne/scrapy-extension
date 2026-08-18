@@ -2,19 +2,34 @@
 
 from __future__ import annotations
 
+import base64
 import inspect
+import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
+from pydantic import ValidationError
 
+from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
+from scrapy_extension.settings import Settings
+from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
 from scrapy_extension.storage.strategies.factory import create_storage_strategy
+from tests.integration import bench_es_push_refresh
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _README = (_REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
@@ -22,10 +37,6 @@ _RUNBOOK = (_REPOSITORY_ROOT / "docs" / "runbook.md").read_text(encoding="utf-8"
 _STABILITY = (_REPOSITORY_ROOT / ".github" / "STABILITY.md").read_text(encoding="utf-8")
 _SECURITY = (_REPOSITORY_ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8")
 _CHANGELOG = (_REPOSITORY_ROOT / ".github" / "CHANGELOG.md").read_text(encoding="utf-8")
-_PLAYBOOK = (_REPOSITORY_ROOT / "docs" / "playbook.md").read_text(encoding="utf-8")
-_ES_PUSH_BENCHMARK = (
-    _REPOSITORY_ROOT / "tests" / "integration" / "bench_es_push_refresh.py"
-).read_text(encoding="utf-8")
 
 
 def test_component_factory_documentation_matches_runtime_api() -> None:
@@ -83,26 +94,201 @@ def test_pre_release_support_and_symbol_tiers_are_explicit() -> None:
     assert "Public surface is determined by the owning namespace" in _STABILITY
 
 
-def test_operational_evidence_describes_current_runtime_contracts() -> None:
-    assert "may skip persistence only when" in _CHANGELOG
-    assert "strategy snapshot state is empty" in _CHANGELOG
-    assert "nonempty state fails close" in _CHANGELOG
-    assert "lossy abort (`lossy=True`)" in _CHANGELOG
-
-    assert "Coverage.py intentionally has `fail_under = 0`" in _PLAYBOOK
-    assert "**95% statement coverage** and **91% branch coverage**" in _PLAYBOOK
-    assert "direct construction may raise a redacted Pydantic `ValidationError`" in (
-        _PLAYBOOK
+def _coverage_gate_script() -> str:
+    workflow = yaml.safe_load(
+        (_REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
     )
-    assert "At the runtime/connect boundary, `ConnectionManager`" in _PLAYBOOK
-    assert "and exposes `ConfigurationError`" in _PLAYBOOK
+    runs = [
+        step.get("run")
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", ())
+        if isinstance(step, dict)
+    ]
+    coverage_runs = [
+        run
+        for run in runs
+        if isinstance(run, str) and "--cov-report=json:coverage.json" in run
+    ]
+    assert len(coverage_runs) == 1
+    heredoc = re.search(
+        r"<<'PY'\n(?P<script>.*?)\n\s*PY(?:\n|$)",
+        coverage_runs[0],
+        flags=re.DOTALL,
+    )
+    assert heredoc is not None
+    return heredoc.group("script")
 
-    assert "ElasticSearchBackend.push" in _ES_PUSH_BENCHMARK
-    assert "backend.push(" in _ES_PUSH_BENCHMARK
-    assert "client.index(" not in _ES_PUSH_BENCHMARK
-    assert "SCRAPY_TEST_INTEGRATION" in _ES_PUSH_BENCHMARK
-    assert "SCRAPY_TEST_ES_HOSTS" in _ES_PUSH_BENCHMARK
-    assert "does not isolate refresh behavior" in _ES_PUSH_BENCHMARK
+
+def _execute_coverage_gate(
+    script: str,
+    totals: dict[str, int],
+    temporary_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (temporary_directory / "coverage.json").write_text(
+        json.dumps({"totals": totals}), encoding="utf-8"
+    )
+    monkeypatch.chdir(temporary_directory)
+    exec(compile(script, "<ci-coverage-gate>", "exec"), {})
+
+
+def test_coverage_configuration_and_ci_floors_are_enforced_semantically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with (_REPOSITORY_ROOT / "pyproject.toml").open("rb") as stream:
+        pyproject = tomllib.load(stream)
+    coverage = pyproject["tool"]["coverage"]
+    assert coverage["run"]["branch"] is True
+    assert coverage["report"]["fail_under"] == 0
+
+    script = _coverage_gate_script()
+    exact_floors = {
+        "covered_lines": 95,
+        "num_statements": 100,
+        "covered_branches": 91,
+        "num_branches": 100,
+    }
+    _execute_coverage_gate(script, exact_floors, tmp_path, monkeypatch)
+
+    below_statement_floor = {
+        **exact_floors,
+        "covered_lines": 9499,
+        "num_statements": 10000,
+    }
+    with pytest.raises(AssertionError):
+        _execute_coverage_gate(script, below_statement_floor, tmp_path, monkeypatch)
+
+    below_branch_floor = {
+        **exact_floors,
+        "covered_branches": 9099,
+        "num_branches": 10000,
+    }
+    with pytest.raises(AssertionError):
+        _execute_coverage_gate(script, below_branch_floor, tmp_path, monkeypatch)
+
+
+def test_configuration_error_families_match_runtime_boundaries() -> None:
+    with pytest.raises(ValidationError) as direct_error:
+        Settings(retry_attempts=-1)
+    assert direct_error.value.errors()[0]["loc"] == ("retry_attempts",)
+    assert direct_error.value.errors()[0]["input"] is None
+
+    manager = ConnectionManager(
+        "elasticsearch", {"request_timeout": "not-a-valid-timeout"}
+    )
+    with pytest.raises(ConfigurationError) as manager_error:
+        manager._create_backend()
+    assert manager_error.value.setting_name == "backend_settings"
+    assert manager_error.value.setting_value is None
+
+
+class _FakeElasticSearchClient:
+    def __init__(self) -> None:
+        self.transport = object()
+        self.options_calls: list[dict[str, Any]] = []
+        self.index_calls: list[dict[str, Any]] = []
+        self.delete_by_query_calls: list[dict[str, Any]] = []
+        self.closed = False
+
+    def options(self, **kwargs: Any) -> _FakeElasticSearchClient:
+        self.options_calls.append(kwargs)
+        return self
+
+    def index(self, **kwargs: Any) -> dict[str, Any]:
+        self.index_calls.append(kwargs)
+        return {
+            "_index": kwargs["index"],
+            "_id": kwargs["id"],
+            "result": "created",
+            "_shards": {"total": 1, "successful": 1, "failed": 0},
+        }
+
+    def delete_by_query(self, **kwargs: Any) -> dict[str, Any]:
+        self.delete_by_query_calls.append(kwargs)
+        return {
+            "timed_out": False,
+            "failures": [],
+            "total": 0,
+            "deleted": 0,
+            "version_conflicts": 0,
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_es_push_benchmark_requires_explicit_environment_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SCRAPY_TEST_INTEGRATION", raising=False)
+    monkeypatch.delenv("SCRAPY_TEST_ES_HOSTS", raising=False)
+
+    constructed = False
+
+    def fail_if_constructed(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("backend construction crossed the opt-in gate")
+
+    monkeypatch.setattr(
+        bench_es_push_refresh, "ElasticSearchBackend", fail_if_constructed
+    )
+    with pytest.raises(SystemExit):
+        bench_es_push_refresh.main()
+    assert constructed is False
+
+    environment = {
+        "SCRAPY_TEST_INTEGRATION": "1",
+        "SCRAPY_TEST_ES_HOSTS": " http://127.0.0.1:9200, http://localhost:9200 ",
+    }
+    assert bench_es_push_refresh.configured_hosts(environment) == [
+        "http://127.0.0.1:9200",
+        "http://localhost:9200",
+    ]
+
+
+def test_es_push_benchmark_uses_production_backend_and_cleans_up_without_network() -> (
+    None
+):
+    client = _FakeElasticSearchClient()
+    backend = ElasticSearchBackend(
+        ElasticSearchSettings(hosts=["http://127.0.0.1:9200"])
+    )
+    backend._client = client  # type: ignore[assignment]
+    moments = iter((0.0, 0.1, 1.0, 1.3))
+
+    result = bench_es_push_refresh.run_benchmark(
+        backend,
+        "benchmark-contract",
+        sample_count=2,
+        clock=lambda: next(moments),
+    )
+
+    assert result.total == pytest.approx(0.4)
+    assert result.mean == pytest.approx(0.2)
+    assert result.p95 == pytest.approx(0.3)
+    assert result.maximum == pytest.approx(0.3)
+    assert client.options_calls == [
+        {"max_retries": 0, "retry_on_timeout": False, "retry_on_status": ()}
+    ]
+    assert len(client.index_calls) == 2
+    assert [
+        base64.b64decode(call["document"]["item"]) for call in client.index_calls
+    ] == [b"item-000", b"item-001"]
+    assert all(
+        call["document"]["queue_name"] == "benchmark-contract"
+        for call in client.index_calls
+    )
+    assert client.delete_by_query_calls == [
+        {
+            "index": backend.config.queue_index,
+            "query": {"term": {"queue_name.keyword": "benchmark-contract"}},
+        }
+    ]
+    assert client.closed is True
+    assert backend.is_connected() is False
 
 
 def test_active_documentation_local_links_resolve() -> None:

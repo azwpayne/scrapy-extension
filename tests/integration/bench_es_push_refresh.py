@@ -21,6 +21,8 @@ import os
 import statistics
 import time
 import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
@@ -28,12 +30,23 @@ from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 N = 50
 
 
-def _configured_hosts() -> list[str]:
+@dataclass(frozen=True)
+class BenchmarkResult:
+    """Summary of one sequential production-backend push run."""
+
+    total: float
+    mean: float
+    p95: float
+    maximum: float
+
+
+def configured_hosts(environment: Mapping[str, str] | None = None) -> list[str]:
     """Return explicitly opted-in broker hosts or stop without broker I/O."""
-    if os.environ.get("SCRAPY_TEST_INTEGRATION") != "1":
+    environment = os.environ if environment is None else environment
+    if environment.get("SCRAPY_TEST_INTEGRATION") != "1":
         raise SystemExit("Set SCRAPY_TEST_INTEGRATION=1 to enable live-broker I/O.")
 
-    configured = os.environ.get("SCRAPY_TEST_ES_HOSTS")
+    configured = environment.get("SCRAPY_TEST_ES_HOSTS")
     if not configured:
         raise SystemExit(
             "Set SCRAPY_TEST_ES_HOSTS (for example, http://localhost:9200)."
@@ -44,46 +57,71 @@ def _configured_hosts() -> list[str]:
     return hosts
 
 
-def _bench_push(
-    backend: ElasticSearchBackend, queue_name: str
+def bench_push(
+    backend: ElasticSearchBackend,
+    queue_name: str,
+    *,
+    sample_count: int = N,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[float, list[float]]:
-    """Push N queue items through the production backend surface."""
+    """Push queue items through the production backend surface."""
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive")
+
     per_push: list[float] = []
-    for index in range(N):
-        started = time.monotonic()
+    for index in range(sample_count):
+        started = clock()
         backend.push(queue_name, f"item-{index:03d}".encode(), priority=1.0)
-        per_push.append(time.monotonic() - started)
+        per_push.append(clock() - started)
     return sum(per_push), per_push
 
 
-def main() -> None:
-    hosts = _configured_hosts()
-    backend = ElasticSearchBackend(
-        ElasticSearchSettings(hosts=hosts, request_timeout=10.0, max_retries=1)
-    )
-    queue_name = f"bench-push-{uuid.uuid4().hex}"
+def run_benchmark(
+    backend: ElasticSearchBackend,
+    queue_name: str,
+    *,
+    sample_count: int = N,
+    clock: Callable[[], float] = time.monotonic,
+) -> BenchmarkResult:
+    """Connect, measure production pushes, and always clear and disconnect."""
     backend.connect()
     try:
-        total, per_push = _bench_push(backend, queue_name)
+        total, per_push = bench_push(
+            backend,
+            queue_name,
+            sample_count=sample_count,
+            clock=clock,
+        )
         ordered = sorted(per_push)
-        p95 = ordered[math.ceil(0.95 * len(ordered)) - 1]
-        mean = statistics.mean(per_push)
-        maximum = max(per_push)
-
-        print(f"ElasticSearchBackend.push benchmark: N={N}, broker={hosts[0]}")
-        print(f"total: {total:.2f}s")
-        print(f"mean: {mean * 1000:.1f}ms")
-        print(f"p95: {p95 * 1000:.1f}ms")
-        print(f"max: {maximum * 1000:.1f}ms")
-        print(
-            "Scope: sequential end-to-end backend.push calls; this measurement "
-            "does not isolate refresh behavior or compare raw client modes."
+        return BenchmarkResult(
+            total=total,
+            mean=statistics.mean(per_push),
+            p95=ordered[math.ceil(0.95 * len(ordered)) - 1],
+            maximum=max(per_push),
         )
     finally:
         try:
             backend.clear_queue(queue_name)
         finally:
             backend.disconnect()
+
+
+def main() -> None:
+    hosts = configured_hosts()
+    backend = ElasticSearchBackend(
+        ElasticSearchSettings(hosts=hosts, request_timeout=10.0, max_retries=1)
+    )
+    result = run_benchmark(backend, f"bench-push-{uuid.uuid4().hex}")
+
+    print(f"ElasticSearchBackend.push benchmark: N={N}, broker={hosts[0]}")
+    print(f"total: {result.total:.2f}s")
+    print(f"mean: {result.mean * 1000:.1f}ms")
+    print(f"p95: {result.p95 * 1000:.1f}ms")
+    print(f"max: {result.maximum * 1000:.1f}ms")
+    print(
+        "Scope: sequential end-to-end backend.push calls; this measurement "
+        "does not isolate refresh behavior or compare raw client modes."
+    )
 
 
 if __name__ == "__main__":
