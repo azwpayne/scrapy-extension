@@ -27,8 +27,9 @@ the broker must run with ``--enable-proxy`` (see tests/integration/docker-compos
 from __future__ import annotations
 
 import logging
-import math
 import threading
+import time
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -86,6 +87,10 @@ _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR = (
 _ROCKETMQ_CLEAR_QUEUE_UNSUPPORTED_MESSAGE = (
     "clear_queue is not supported by the RocketMQ client"
 )
+_ROCKETMQ_TOPIC_ALREADY_SELECTED_ERROR = (
+    "RocketMQ consumer generation already selected a different queue."
+)
+_ROCKETMQ_RECEIVE_PUMP_ERROR = "RocketMQ receive pump failed."
 _ROCKETMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
     {
         "Not connected to RocketMQ",
@@ -93,6 +98,7 @@ _ROCKETMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
         "RocketMQBackend not connected: consumer is None",
         _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR,
         _ROCKETMQ_CLEAR_QUEUE_UNSUPPORTED_MESSAGE,
+        _ROCKETMQ_TOPIC_ALREADY_SELECTED_ERROR,
     }
 )
 _ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE = (
@@ -211,10 +217,22 @@ class RocketMQBackend(Backend, QueueBackend):
         self._connection_lock = threading.RLock()
         self._consumer_generation = 0
         self._subscribed_topics: set[str] = set()
-        # ``SimpleConsumer.await_duration`` is mutable global state on the client.
-        # Serialize receive calls so concurrent callers cannot overwrite one
-        # another's requested long-poll window before the RPC reads it.
-        self._receive_lock = threading.Lock()
+        # RocketMQ Proxy mandates a blocking long poll. Keep that RPC off scheduler
+        # threads and publish at most one exact generation-scoped delivery locally.
+        self._receive_condition = threading.Condition()
+        self._receive_buffer: deque[tuple[Any, Any, int]] = deque()
+        self._receive_worker: threading.Thread | None = None
+        self._receive_stop: threading.Event | None = None
+        self._receive_consumer: Any = None
+        self._receive_generation = 0
+        self._selected_topic: str | None = None
+        self._receive_error: QueueError | None = None
+        self._receive_control_error: BaseException | None = None
+        # Private live-test hook: observe a driver failure synchronously in the
+        # pump thread without retaining its graph on the backend.
+        self._receive_error_observer: Callable[[BaseException], None] | None = None
+        self._receive_cycle = 0
+        self._receive_demand = 0
         # Legacy single-slot for the ``ack(token=None)`` fallback path. Set by
         # ``pop`` / ``pop_with_ack``; cleared when ``ack`` acks the tracked message.
         # The token path (preferred under ``CONCURRENT_REQUESTS > 1``) does not
@@ -409,6 +427,34 @@ class RocketMQBackend(Backend, QueueBackend):
         except BaseException:
             pass
 
+    def _fence_receive_pump_unlocked(self) -> threading.Thread | None:
+        """Fence pump admission and discard, but never settle, local deliveries."""
+        with self._receive_condition:
+            worker = self._receive_worker
+            if self._receive_stop is not None:
+                self._receive_stop.set()
+            self._receive_buffer.clear()
+            self._receive_error = None
+            self._receive_control_error = None
+            self._receive_consumer = None
+            self._receive_generation = 0
+            self._selected_topic = None
+            self._receive_demand = 0
+            self._receive_condition.notify_all()
+            return worker
+
+    def _finish_receive_pump_shutdown(
+        self, worker: threading.Thread | None
+    ) -> None:
+        """Join the detached worker after consumer shutdown interrupts receive."""
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+        with self._receive_condition:
+            if self._receive_worker is worker:
+                self._receive_worker = None
+            self._receive_stop = None
+            self._receive_condition.notify_all()
+
     def _abort_partial_connect(self) -> bool:
         """Detach and best-effort stop clients created by a failed connect."""
         producer = self._producer
@@ -419,17 +465,20 @@ class RocketMQBackend(Backend, QueueBackend):
         self._subscribed_topics.clear()
         self._last_msg = None
         self._last_delivery = None
-        return self._shutdown_detached_clients(
+        worker = self._fence_receive_pump_unlocked()
+        cleanup_failed = self._shutdown_detached_clients(
             (consumer, "consumer"),
             (producer, "producer"),
             suppress_control_errors=True,
         )
+        self._finish_receive_pump_shutdown(worker)
+        return cleanup_failed
 
     def disconnect(self) -> None:
-        """Close RocketMQ connections (shutdown producer + consumer)."""
+        """Fence receives, close clients, and join the bounded receive pump."""
         with self._connection_lock:
-            # apache Producer/Consumer shutdown is best-effort — guard each so a
-            # failure in one doesn't skip the other.
+            # Detach first so no public pop can enter this generation while its
+            # blocking receive is being interrupted and joined.
             producer = self._producer
             consumer = self._consumer
             self._producer = None
@@ -438,9 +487,13 @@ class RocketMQBackend(Backend, QueueBackend):
             self._subscribed_topics.clear()
             self._last_msg = None
             self._last_delivery = None
-            cleanup_failed = self._shutdown_detached_clients(
-                (producer, "producer"), (consumer, "consumer")
-            )
+            worker = self._fence_receive_pump_unlocked()
+            try:
+                cleanup_failed = self._shutdown_detached_clients(
+                    (consumer, "consumer"), (producer, "producer")
+                )
+            finally:
+                self._finish_receive_pump_shutdown(worker)
             if cleanup_failed:
                 self._log_cleanup_diagnostic()
             # This diagnostic follows the completed disconnect state transition. A
@@ -517,45 +570,6 @@ class RocketMQBackend(Backend, QueueBackend):
         _validate_key_name(queue_name, "queue_name")
         return f"{self.config.topic_prefix}_{queue_name}"
 
-    def _ensure_subscribed(
-        self, topic_name: str, queue_name: str, consumer: Any
-    ) -> None:
-        """Ensure the consumer is subscribed to ``topic_name``.
-
-        The apache SimpleConsumer only receives messages from topics it has
-        subscribed to. Subscriptions are tracked in-session to avoid re-subscribing
-        on every pop.
-
-        Args:
-          topic_name: Full topic name to subscribe to.
-        """
-        if topic_name in self._subscribed_topics:
-            return
-        try:
-            consumer.subscribe(topic_name)
-        except Exception as e:
-            raise QueueError(
-                f"Failed to subscribe to RocketMQ queue {queue_name}: {e}",
-                queue_name=queue_name,
-                operation="pop",
-            ) from e
-        # disconnect()/_abort_partial_connect() clear _subscribed_topics and
-        # replace the consumer under _connection_lock; a subscribe that was in
-        # flight during that teardown must not record into the new generation's
-        # set — that would permanently skip subscribe on the live consumer.
-        with self._connection_lock:
-            if self._consumer is not consumer:
-                reconnected = True
-            else:
-                reconnected = False
-                self._subscribed_topics.add(topic_name)
-        if reconnected:
-            raise QueueError(
-                f"RocketMQ reconnected while subscribing to queue {queue_name}; retry pop",
-                queue_name=queue_name,
-                operation="pop",
-            )
-
     @queue_operation_error_boundary(
         "push",
         "Failed to push RocketMQ message.",
@@ -607,55 +621,182 @@ class RocketMQBackend(Backend, QueueBackend):
             err = f"Failed to push to queue: {e}"
             raise QueueError(err, queue_name=queue_name, operation="push") from e
 
+    def _start_receive_worker_locked(self) -> None:
+        """Start the selected generation's pump while its condition is held."""
+        worker = self._receive_worker
+        if worker is not None and worker.is_alive():
+            return
+        consumer = self._receive_consumer
+        topic_name = self._selected_topic
+        stop = self._receive_stop
+        generation = self._receive_generation
+        if consumer is None or topic_name is None or stop is None:
+            return
+        worker = threading.Thread(
+            target=self._receive_pump,
+            args=(consumer, generation, topic_name, stop),
+            name=f"rocketmq-receive-{generation}",
+            daemon=True,
+        )
+        self._receive_worker = worker
+        worker.start()
+
+    def _pump_is_current_locked(
+        self, consumer: Any, generation: int, stop: threading.Event
+    ) -> bool:
+        """Return whether a pump still owns receive admission."""
+        return (
+            not stop.is_set()
+            and self._receive_consumer is consumer
+            and self._receive_generation == generation
+            and self._receive_stop is stop
+        )
+
+    def _receive_pump(
+        self,
+        consumer: Any,
+        generation: int,
+        topic_name: str,
+        stop: threading.Event,
+    ) -> None:
+        """Run bounded broker long polls and publish one local delivery at a time."""
+        try:
+            consumer.subscribe(topic_name)
+            with self._receive_condition:
+                if not self._pump_is_current_locked(consumer, generation, stop):
+                    return
+                self._subscribed_topics.add(topic_name)
+                self._receive_condition.notify_all()
+            consumer.await_duration = _MIN_LONG_POLL_DURATION
+            while True:
+                with self._receive_condition:
+                    while (
+                        self._pump_is_current_locked(consumer, generation, stop)
+                        and (
+                            self._receive_buffer or self._receive_demand == 0
+                        )
+                    ):
+                        self._receive_condition.wait()
+                    if not self._pump_is_current_locked(consumer, generation, stop):
+                        return
+                    self._receive_demand -= 1
+                messages = consumer.receive(1, self.config.invisible_duration)
+                with self._receive_condition:
+                    if not self._pump_is_current_locked(consumer, generation, stop):
+                        return
+                    self._receive_cycle += 1
+                    if messages:
+                        self._receive_buffer.append(
+                            (messages[0], consumer, generation)
+                        )
+                    self._receive_condition.notify_all()
+        except Exception as error:
+            # Never retain a driver exception (and its potentially sensitive graph)
+            # across the worker boundary. Public operations expose only fixed text.
+            observer = self._receive_error_observer
+            if observer is not None:
+                try:
+                    observer(error)
+                except BaseException:
+                    pass
+            with self._receive_condition:
+                if self._pump_is_current_locked(consumer, generation, stop):
+                    self._receive_error = QueueError(
+                        _ROCKETMQ_RECEIVE_PUMP_ERROR,
+                        operation="pop",
+                    )
+                    self._receive_cycle += 1
+                    self._receive_condition.notify_all()
+        except BaseException as error:
+            with self._receive_condition:
+                if self._pump_is_current_locked(consumer, generation, stop):
+                    self._receive_control_error = error
+                    self._receive_cycle += 1
+                    self._receive_condition.notify_all()
+        finally:
+            with self._receive_condition:
+                if self._receive_worker is threading.current_thread():
+                    self._receive_worker = None
+                self._receive_condition.notify_all()
+
     def _receive_delivery(
         self, queue_name: str, timeout: float
     ) -> tuple[Any | None, Any, int]:
-        """Receive one message together with its consumer generation."""
+        """Take one exact delivery from the generation-scoped local buffer."""
         _validate_key_name(queue_name, "queue_name")
-        if not self.is_connected():
-            msg = "Not connected to RocketMQ"
-            raise QueueError(msg, queue_name=queue_name, operation="pop")
-
-        try:
-            topic_name = self._get_topic_name(queue_name)
+        topic_name = self._get_topic_name(queue_name)
+        with self._connection_lock:
+            if not self.is_connected():
+                msg = "Not connected to RocketMQ"
+                raise QueueError(msg, queue_name=queue_name, operation="pop")
             consumer = self._consumer
             generation = self._consumer_generation
             if consumer is None:
                 error = "RocketMQBackend not connected: consumer is None"
                 raise QueueError(error, queue_name=queue_name, operation="pop")
-            self._ensure_subscribed(topic_name, queue_name, consumer)
-            await_duration = max(
-                _MIN_LONG_POLL_DURATION,
-                math.ceil(timeout) if timeout > 0 else 0,
-            )
-            with self._receive_lock:
-                consumer.await_duration = await_duration
-                messages = consumer.receive(1, self.config.invisible_duration)
-            if not messages:
-                return (None, consumer, generation)
-            return (messages[0], consumer, generation)
-        except QueueError:
-            raise
-        except Exception as e:
-            msg = f"Failed to pop from queue: {e}"
-            raise QueueError(msg, queue_name=queue_name, operation="pop") from e
+            with self._receive_condition:
+                if self._selected_topic not in (None, topic_name):
+                    raise QueueError(
+                        _ROCKETMQ_TOPIC_ALREADY_SELECTED_ERROR,
+                        operation="pop",
+                    )
+                if self._selected_topic is None:
+                    self._selected_topic = topic_name
+                    self._receive_consumer = consumer
+                    self._receive_generation = generation
+                    self._receive_stop = threading.Event()
+                    self._receive_error = None
+                    self._receive_control_error = None
+                    self._receive_demand = 0
+                elif (
+                    self._receive_consumer is not consumer
+                    or self._receive_generation != generation
+                ):
+                    msg = "Not connected to RocketMQ"
+                    raise QueueError(msg, queue_name=queue_name, operation="pop")
+                # Coalesce scheduler polls into one bounded broker demand; the
+                # one-slot delivery buffer and one pump thread cannot grow with
+                # repeated timeout=0 calls.
+                self._receive_demand = 1
+                observed_cycle = self._receive_cycle
+                if (
+                    self._receive_error is None
+                    and self._receive_control_error is None
+                ):
+                    self._start_receive_worker_locked()
+
+        wait_timeout = max(0.0, timeout)
+        deadline = time.monotonic() + wait_timeout
+        with self._receive_condition:
+            while True:
+                if (
+                    self._receive_consumer is not consumer
+                    or self._receive_generation != generation
+                ):
+                    msg = "Not connected to RocketMQ"
+                    raise QueueError(msg, queue_name=queue_name, operation="pop")
+                if self._receive_buffer:
+                    delivery = self._receive_buffer.popleft()
+                    self._receive_condition.notify_all()
+                    return delivery
+                if self._receive_control_error is not None:
+                    control_error = self._receive_control_error
+                    self._receive_control_error = None
+                    raise control_error
+                if self._receive_error is not None:
+                    pump_error = self._receive_error
+                    self._receive_error = None
+                    self._start_receive_worker_locked()
+                    raise pump_error
+                if wait_timeout == 0 or self._receive_cycle != observed_cycle:
+                    return (None, consumer, generation)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return (None, consumer, generation)
+                self._receive_condition.wait(timeout=remaining)
 
     def _receive_message(self, queue_name: str, timeout: float) -> Any | None:
-        """Receive a single message from ``queue_name`` WITHOUT acking.
-
-        Args:
-          queue_name: Name of the queue.
-          timeout: Seconds to wait for a message. The SDK exposes this as the
-            consumer's ``await_duration`` property, separate from the processing
-            lease passed to ``receive``. RocketMQ Proxy applies a five-second
-            minimum even when the interface requests a shorter wait.
-
-        Returns:
-          The received message object, or None if no message was available.
-
-        Raises:
-          QueueError: If not connected or the receive fails.
-        """
+        """Take a locally pumped message without acknowledging it."""
         message, _consumer, _generation = self._receive_delivery(queue_name, timeout)
         return message
 
@@ -679,8 +820,9 @@ class RocketMQBackend(Backend, QueueBackend):
 
         Args:
           queue_name: Name of the queue.
-          timeout: Requested seconds to wait. RocketMQ Proxy enforces a five-second
-            minimum long-poll window.
+          timeout: Maximum seconds to wait on the local delivery condition. A
+            zero value only inspects the local buffer; the pump independently
+            owns RocketMQ Proxy's bounded long poll.
 
         Returns:
           Popped item, or None if queue is empty.
@@ -710,8 +852,9 @@ class RocketMQBackend(Backend, QueueBackend):
 
         Args:
           queue_name: Name of the queue.
-          timeout: Requested seconds to wait. RocketMQ Proxy enforces a five-second
-            minimum long-poll window.
+          timeout: Maximum seconds to wait on the local delivery condition. A
+            zero value only inspects the local buffer; the pump independently
+            owns RocketMQ Proxy's bounded long poll.
 
         Returns:
           ``(body_bytes, msg_token)`` or ``(None, None)`` when empty.

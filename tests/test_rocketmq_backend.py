@@ -912,14 +912,15 @@ def test_disconnect_continues_when_shutdown_warning_is_interrupted(mocker) -> No
 
 def test_disconnect_closes_all_clients_after_baseexception(mocker) -> None:
     backend, producer, consumer, _ = _make_connected_backend(mocker)
-    first = KeyboardInterrupt()
-    producer.shutdown.side_effect = first
-    consumer.shutdown.side_effect = SystemExit(2)
+    producer_error = KeyboardInterrupt()
+    consumer_error = SystemExit(2)
+    producer.shutdown.side_effect = producer_error
+    consumer.shutdown.side_effect = consumer_error
 
-    with pytest.raises(KeyboardInterrupt) as raised:
+    with pytest.raises(SystemExit) as raised:
         backend.disconnect()
 
-    assert raised.value is first
+    assert raised.value is consumer_error
     producer.shutdown.assert_called_once_with()
     consumer.shutdown.assert_called_once_with()
     assert backend._producer is None
@@ -1049,33 +1050,30 @@ def test_pop_not_connected() -> None:
 
 
 def test_pop_returns_message(mocker) -> None:
-    """pop returns message body when available (no inline ack — initiative #4)."""
+    """A positive wait takes a pumped message without acknowledging inline."""
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-    mock_msg = mocker.MagicMock()
-    mock_msg.body = b"hello-world"
+    mock_msg = mocker.MagicMock(body=b"hello-world")
     mock_consumer.receive.return_value = [mock_msg]
 
-    result = backend.pop("my_queue")
+    result = backend.pop("my_queue", timeout=1)
 
     assert result == b"hello-world"
-    # Waiting and processing lease are independent. RocketMQ Proxy enforces a
-    # five-second long-poll floor while the processing lease remains 300 seconds.
     assert mock_consumer.await_duration == 5
     mock_consumer.receive.assert_called_once_with(1, 300)
-    mock_consumer.ack.assert_not_called()  # deferred-ack: no inline ack
-
-
-def test_pop_returns_none_when_empty(mocker) -> None:
-    """pop returns None when no messages available."""
-    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-    mock_consumer.receive.return_value = []
-
-    assert backend.pop("my_queue") is None
     mock_consumer.ack.assert_not_called()
 
 
-def test_pop_timeout_controls_await_duration_not_processing_lease(mocker) -> None:
-    """Queue ``timeout`` is a receive wait, never a processing lease."""
+def test_pop_returns_none_when_empty(mocker) -> None:
+    """A completed empty pump cycle wakes a positive waiter."""
+    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
+    mock_consumer.receive.return_value = []
+
+    assert backend.pop("my_queue", timeout=1) is None
+    mock_consumer.ack.assert_not_called()
+
+
+def test_pop_timeout_does_not_change_bounded_broker_poll(mocker) -> None:
+    """Public wait duration is local; the broker poll remains bounded."""
     backend, _, mock_consumer, _ = _make_connected_backend(
         mocker, invisible_duration=90
     )
@@ -1083,12 +1081,11 @@ def test_pop_timeout_controls_await_duration_not_processing_lease(mocker) -> Non
 
     backend.pop("my_queue", timeout=20.0)
 
-    assert mock_consumer.await_duration == 20
+    assert mock_consumer.await_duration == 5
     mock_consumer.receive.assert_called_once_with(1, 90)
 
 
-def test_pop_fractional_timeout_clamps_to_proxy_floor(mocker) -> None:
-    """The SDK wait honors RocketMQ Proxy's five-second polling floor."""
+def test_pop_fractional_timeout_uses_bounded_broker_poll(mocker) -> None:
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.return_value = []
 
@@ -1098,126 +1095,68 @@ def test_pop_fractional_timeout_clamps_to_proxy_floor(mocker) -> None:
     mock_consumer.receive.assert_called_once_with(1, 300)
 
 
-def test_pop_zero_timeout_uses_proxy_floor_with_default_processing_lease(
-    mocker,
-) -> None:
-    """Scheduler ``timeout=0`` uses the proxy floor, not the SDK's 20s default."""
+def test_pop_zero_timeout_starts_bounded_pump(mocker) -> None:
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-    mock_consumer.receive.return_value = []
+    receive_called = threading.Event()
 
-    backend.pop("my_queue", timeout=0.0)
-
-    assert mock_consumer.await_duration == 5
-    mock_consumer.receive.assert_called_once_with(1, 300)
-
-
-def test_concurrent_pop_cannot_overwrite_another_calls_await_duration(mocker) -> None:
-    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-    first_entered = threading.Event()
-    release_first = threading.Event()
-    observed: list[tuple[str, int]] = []
-
-    def receive(_max_messages: int, _lease: int) -> list[object]:
-        name = threading.current_thread().name
-        if name == "short-wait":
-            first_entered.set()
-            assert release_first.wait(timeout=2)
-        observed.append((name, mock_consumer.await_duration))
+    def receive(_maximum: int, _lease: int) -> list[object]:
+        receive_called.set()
         return []
 
     mock_consumer.receive.side_effect = receive
-    short = threading.Thread(
-        target=backend.pop,
-        args=("my_queue", 1.0),
-        name="short-wait",
-    )
-    long = threading.Thread(
-        target=backend.pop,
-        args=("my_queue", 7.0),
-        name="long-wait",
-    )
-
-    short.start()
-    assert first_entered.wait(timeout=2)
-    long.start()
-    release_first.set()
-    short.join(timeout=2)
-    long.join(timeout=2)
-
-    assert not short.is_alive()
-    assert not long.is_alive()
-    assert observed == [("short-wait", 5), ("long-wait", 7)]
+    assert backend.pop("my_queue", timeout=0.0) is None
+    assert receive_called.wait(timeout=1)
+    assert mock_consumer.await_duration == 5
 
 
-def test_pop_receive_failure(mocker) -> None:
-    """pop wraps a receive failure in QueueError."""
+def test_pop_receive_failure_is_reported_without_driver_graph(mocker) -> None:
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.side_effect = OSError("Network error")
 
     with pytest.raises(QueueError) as exc_info:
-        backend.pop("my_queue")
+        backend.pop("my_queue", timeout=1)
     assert str(exc_info.value) == "Failed to pop RocketMQ message."
+    assert exc_info.value.__cause__ is None
 
 
 def test_pop_unexpected_error(mocker) -> None:
-    """pop wraps any unexpected receive error in QueueError."""
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.side_effect = RuntimeError("unexpected")
 
     with pytest.raises(QueueError) as exc_info:
-        backend.pop("my_queue")
+        backend.pop("my_queue", timeout=1)
     assert str(exc_info.value) == "Failed to pop RocketMQ message."
 
 
-def test_raw_pop_implementation_retains_driver_cause_for_integration_retry(
-    mocker,
-) -> None:
-    """Only live tests bypass the public redaction to identify a Proxy race."""
-    backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-    driver_error = RuntimeError("NullPointerException from receive startup")
-    mock_consumer.receive.side_effect = driver_error
-
-    with pytest.raises(QueueError) as exc_info:
-        backend.pop.__wrapped__(backend, "my_queue")
-
-    assert exc_info.value.__cause__ is driver_error
-    assert "NullPointerException" in str(exc_info.value.__cause__)
-
-
 def test_pop_subscribes_to_topic_before_receive(mocker) -> None:
-    """pop subscribes the consumer to the queue's topic before receiving."""
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
-    mock_msg = mocker.MagicMock()
-    mock_msg.body = b"data"
-    mock_consumer.receive.return_value = [mock_msg]
+    mock_consumer.receive.return_value = []
 
-    backend.pop("my_queue")
+    backend.pop("my_queue", timeout=1)
 
     mock_consumer.subscribe.assert_called_once_with("scrapy-queue_my_queue")
 
 
-def test_pop_subscribes_only_once_per_topic(mocker) -> None:
-    """Repeated pop calls for the same queue subscribe exactly once."""
+def test_pop_subscribes_only_once_per_generation(mocker) -> None:
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.return_value = []
 
-    backend.pop("my_queue")
-    backend.pop("my_queue")
-    backend.pop("my_queue")
+    backend.pop("my_queue", timeout=1)
+    backend.pop("my_queue", timeout=1)
+    backend.pop("my_queue", timeout=1)
 
     assert mock_consumer.subscribe.call_count == 1
 
 
-def test_pop_subscribes_distinct_topics_for_distinct_queues(mocker) -> None:
-    """Different queue names subscribe to different topics."""
+def test_pop_rejects_distinct_topic_on_same_generation(mocker) -> None:
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.return_value = []
 
-    backend.pop("queue_a")
-    backend.pop("queue_b")
+    backend.pop("queue_a", timeout=1)
+    with pytest.raises(QueueError, match="different queue"):
+        backend.pop("queue_b", timeout=0)
 
-    subscribed = {call.args[0] for call in mock_consumer.subscribe.call_args_list}
-    assert subscribed == {"scrapy-queue_queue_a", "scrapy-queue_queue_b"}
+    mock_consumer.subscribe.assert_called_once_with("scrapy-queue_queue_a")
 
 
 def test_connect_starts_consumer(mocker) -> None:
@@ -1230,7 +1169,7 @@ def test_disconnect_clears_subscribed_topics(mocker) -> None:
     """disconnect() clears the subscription cache so reconnect re-subscribes."""
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.return_value = []
-    backend.pop("my_queue")
+    backend.pop("my_queue", timeout=1)
     assert "scrapy-queue_my_queue" in backend._subscribed_topics
 
     backend.disconnect()
@@ -1256,7 +1195,7 @@ def test_pop_no_longer_inline_acks(mocker) -> None:
     mock_consumer.receive.return_value = [mock_msg]
     mock_consumer.ack.side_effect = OSError("broker down")  # sabotage the OLD path
 
-    result = backend.pop("my_queue")
+    result = backend.pop("my_queue", timeout=1)
 
     assert result == b"payload"  # body delivered
     mock_consumer.ack.assert_not_called()  # no inline ack attempted
@@ -1272,7 +1211,7 @@ def test_pop_with_ack_returns_body_and_token_no_ack(mocker) -> None:
     mock_msg.body = b"hello"
     mock_consumer.receive.return_value = [mock_msg]
 
-    body, token = backend.pop_with_ack("my_queue")
+    body, token = backend.pop_with_ack("my_queue", timeout=1)
 
     assert body == b"hello"
     assert isinstance(token, _RocketMQAckToken)
@@ -1286,7 +1225,7 @@ def test_token_pop_cannot_be_settled_through_legacy_slot(mocker) -> None:
     message = mocker.MagicMock(body=b"x")
     consumer.receive.return_value = [message]
 
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
     backend.ack("q", token=None)
     backend.nack("q", token=token)
 
@@ -1301,7 +1240,7 @@ def test_pop_with_ack_empty_returns_none_none(mocker) -> None:
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.receive.return_value = []
 
-    body, token = backend.pop_with_ack("my_queue")
+    body, token = backend.pop_with_ack("my_queue", timeout=1)
 
     assert body is None
     assert token is None
@@ -1313,7 +1252,7 @@ def test_ack_with_token_acks_specific_message(mocker) -> None:
     msg_b = mocker.MagicMock(name="b")
     msg_b.body = b"b"
     mock_consumer.receive.return_value = [msg_b]
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
 
     backend.ack("q", token=token)
 
@@ -1326,7 +1265,7 @@ def test_ack_token_none_acks_last_msg_then_clears(mocker) -> None:
     mock_msg = mocker.MagicMock()
     mock_msg.body = b"x"
     mock_consumer.receive.return_value = [mock_msg]
-    backend.pop("my_queue")
+    backend.pop("my_queue", timeout=1)
     assert backend._last_msg is mock_msg
 
     backend.ack("my_queue", token=None)
@@ -1348,7 +1287,7 @@ def test_ack_token_is_idempotent(mocker) -> None:
     backend, _, consumer, _ = _make_connected_backend(mocker)
     message = mocker.MagicMock(body=b"x")
     consumer.receive.return_value = [message]
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
 
     backend.ack("q", token=token)
     backend.ack("q", token=token)
@@ -1362,7 +1301,7 @@ def test_ack_and_nack_for_same_token_are_serialized(mocker) -> None:
     backend, _, consumer, _ = _make_connected_backend(mocker)
     message = mocker.MagicMock(body=b"x")
     consumer.receive.return_value = [message]
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
     ack_entered = threading.Event()
     release_ack = threading.Event()
     nack_started = threading.Event()
@@ -1406,7 +1345,7 @@ def test_failed_token_settlement_remains_retryable(mocker) -> None:
     message = mocker.MagicMock(body=b"x")
     consumer.receive.return_value = [message]
     consumer.ack.side_effect = [RuntimeError("ack failed"), None]
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
 
     with pytest.raises(QueueError):
         backend.ack("q", token=token)
@@ -1421,7 +1360,7 @@ def test_stale_token_does_not_ack_replacement_consumer(mocker) -> None:
     backend, _, old_consumer, _ = _make_connected_backend(mocker)
     message = mocker.MagicMock(body=b"x")
     old_consumer.receive.return_value = [message]
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
     backend.disconnect()
     new_consumer = mocker.MagicMock(is_running=True)
     backend._producer = mocker.MagicMock(is_running=True)
@@ -1440,7 +1379,7 @@ def test_legacy_ack_failure_keeps_delivery_for_retry(mocker) -> None:
     message = mocker.MagicMock(body=b"x")
     consumer.receive.return_value = [message]
     consumer.ack.side_effect = [RuntimeError("ack failed"), None]
-    backend.pop("q")
+    backend.pop("q", timeout=1)
 
     with pytest.raises(QueueError):
         backend.ack("q")
@@ -1458,7 +1397,7 @@ def test_nack_shortens_processing_lease_to_broker_floor(mocker) -> None:
     msg = mocker.MagicMock()
     msg.body = b"x"
     mock_consumer.receive.return_value = [msg]
-    _body, token = backend.pop_with_ack("my_queue")
+    _body, token = backend.pop_with_ack("my_queue", timeout=1)
 
     backend.nack("my_queue", token=token)
 
@@ -1471,7 +1410,7 @@ def test_legacy_nack_shortens_lease_and_clears_last_message(mocker) -> None:
     msg = mocker.MagicMock()
     msg.body = b"payload"
     mock_consumer.receive.return_value = [msg]
-    backend.pop("my_queue")
+    backend.pop("my_queue", timeout=1)
 
     backend.nack("my_queue")
 
@@ -1484,7 +1423,7 @@ def test_legacy_nack_failure_keeps_delivery_for_retry(mocker) -> None:
     message = mocker.MagicMock(body=b"x")
     consumer.receive.return_value = [message]
     consumer.change_invisible_duration.side_effect = [RuntimeError("nack failed"), None]
-    backend.pop("q")
+    backend.pop("q", timeout=1)
 
     with pytest.raises(QueueError):
         backend.nack("q")
@@ -1501,7 +1440,7 @@ def test_nack_failure_raises_queue_error(mocker) -> None:
     msg = mocker.MagicMock()
     msg.body = b"x"
     mock_consumer.receive.return_value = [msg]
-    _body, token = backend.pop_with_ack("my_queue")
+    _body, token = backend.pop_with_ack("my_queue", timeout=1)
     mock_consumer.change_invisible_duration.side_effect = RuntimeError("renew failed")
 
     with pytest.raises(QueueError) as exc_info:
@@ -1551,7 +1490,7 @@ def test_extract_body_str_encodes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# is_connected / _ensure_subscribed — defensive exception branches
+# is_connected / pump subscription — defensive exception branches
 # ---------------------------------------------------------------------------
 
 
@@ -1578,14 +1517,14 @@ def test_is_connected_false_when_is_running_raises(mocker) -> None:
     assert backend.is_connected() is False
 
 
-def test_ensure_subscribed_surfaces_subscribe_failure(mocker) -> None:
-    """A subscription failure must not masquerade as an empty queue."""
+def test_receive_pump_surfaces_subscribe_failure(mocker) -> None:
+    """A pump subscription failure must not masquerade as an empty queue."""
     backend, _, mock_consumer, _ = _make_connected_backend(mocker)
     mock_consumer.subscribe.side_effect = RuntimeError("transient")
     mock_consumer.receive.return_value = []
 
     with pytest.raises(QueueError) as exc_info:
-        backend.pop("flaky_queue")
+        backend.pop("flaky_queue", timeout=1)
 
     assert exc_info.value.queue_name is None
     assert exc_info.value.operation == "pop"
@@ -1598,7 +1537,7 @@ def test_ack_failure_raises_queue_error(mocker) -> None:
     msg = mocker.MagicMock()
     msg.body = b"x"
     mock_consumer.receive.return_value = [msg]
-    _body, token = backend.pop_with_ack("q")
+    _body, token = backend.pop_with_ack("q", timeout=1)
     mock_consumer.ack.side_effect = OSError("broker gone")
 
     with pytest.raises(QueueError, match="Failed to ack RocketMQ message") as exc_info:

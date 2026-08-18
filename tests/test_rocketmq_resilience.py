@@ -19,8 +19,7 @@ load-bearing guard:
   before use (concurrent disconnect under ``CONCURRENT_REQUESTS > 1``). The
   guard raises a clean ``QueueError`` rather than ``AttributeError`` on
   ``None.send()`` / ``None.receive()``.
-- ``_ensure_subscribed`` is a no-op when the consumer is ``None`` — defensive
-  against being called outside the ``is_connected`` gate.
+- Receive admission rejects a detached consumer before the pump starts.
 """
 
 from __future__ import annotations
@@ -108,9 +107,7 @@ def test_push_raises_when_producer_becomes_none_after_connect_check(mocker) -> N
 
 def test_receive_raises_when_consumer_becomes_none_after_connect_check(mocker) -> None:
     """``is_connected()`` passed, but the consumer became ``None`` before
-    ``receive()``. ``_receive_message`` must raise a clean ``QueueError``. Also
-    covers the ``_ensure_subscribed`` no-op-when-consumer-None branch (called
-    just before the consumer-None guard)."""
+    pump admission. ``_receive_message`` must raise a clean ``QueueError``."""
     backend = _connected_backend(mocker)
     backend._consumer = None
     mocker.patch.object(backend, "is_connected", return_value=True)
@@ -134,8 +131,8 @@ def test_subscribe_in_flight_reconnect_does_not_poison_subscribed_topics(
         return None
 
     consumer.subscribe.side_effect = _subscribe_then_disconnect
-    with pytest.raises(QueueError, match="reconnected"):
-        backend._receive_message("q", 0.0)
+    with pytest.raises(QueueError, match="Not connected"):
+        backend._receive_message("q", 1.0)
     assert backend._subscribed_topics == set()
 
 
@@ -144,6 +141,6 @@ def test_subscribe_records_topic_when_generation_stable(mocker) -> None:
     in ``_subscribed_topics`` and the receive proceeds without error."""
     backend = _connected_backend(mocker)
     backend._consumer.receive.return_value = []
-    backend._receive_message("q", 0.0)
+    backend._receive_message("q", 1.0)
     assert backend._get_topic_name("q") in backend._subscribed_topics
     backend._consumer.subscribe.assert_called_once_with(backend._get_topic_name("q"))

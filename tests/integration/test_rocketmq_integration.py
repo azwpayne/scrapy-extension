@@ -14,8 +14,8 @@ apache rocketmq-python-client 5.1.1 gRPC):
   body WITHOUT acking; the caller acks via ``ack(token=msg)``. A crash before
   ack → the broker's invisible-duration window redelivers (at-least-once).
   ``_drain`` acks each message as it arrives.
-- ``pop(timeout=t)`` controls the receive wait independently from the message
-  processing lease. RocketMQ Proxy enforces a five-second long-poll floor.
+- A background pump owns RocketMQ Proxy's mandatory five-second long poll;
+  ``pop(timeout=t)`` waits only on the local delivery condition.
 - ``queue_len`` raises ``NotImplementedError`` (no broker-side depth RPC) so
   unknown depth cannot be mistaken for an empty queue.
 - Topic name is ``{topic_prefix}_{queue_name}``. **RocketMQ topic names
@@ -136,14 +136,22 @@ _ROCKETMQ_PROXY_NO_TOPIC_SIGNATURE = "no topic to receive message"
 
 
 def _pop_with_ack_preserving_proxy_error(backend, queue_name: str, timeout: float):  # type: ignore[no-untyped-def]
-    """Call the integration-only raw implementation to inspect a Proxy race.
+    """Use the pump's private live-test observer to classify Proxy startup races.
 
-    Public ``pop_with_ack`` intentionally strips driver details at its error
-    boundary.  This live-broker suite needs to recognize only two documented,
-    deadline-bounded Apache Proxy startup races; keeping that detail inside the
-    test avoids weakening the production error contract.
+    Production never retains a driver's exception graph across the pump thread.
+    This enabled-only suite observes it synchronously, then attaches it solely to
+    the test-local sanitized error for the existing classifier.
     """
-    return backend.pop_with_ack.__wrapped__(backend, queue_name, timeout)
+    driver_errors: list[BaseException] = []
+    backend._receive_error_observer = driver_errors.append
+    try:
+        return backend.pop_with_ack(queue_name, timeout)
+    except QueueError as error:
+        if driver_errors:
+            error.__cause__ = driver_errors[-1]
+        raise
+    finally:
+        backend._receive_error_observer = None
 
 
 def _proxy_receive_transient_state(error: QueueError) -> str | None:
@@ -226,11 +234,11 @@ def _rocketmq_sdk_loopback_identity():  # type: ignore[no-untyped-def]
         setattr(Misc, _ROCKETMQ_SDK_LOCAL_IP_CACHE_ATTRIBUTE, previous)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def rocketmq_backend(_rocketmq_sdk_loopback_identity):  # type: ignore[no-untyped-def]
-    """Connect a RocketMQBackend once per module; disconnect on teardown.
+    """Connect one generation per test so each may select its own logical topic.
 
-    Unique consumer/producer groups per run avoid cross-talk with any real
+    Unique consumer/producer groups avoid cross-talk with any real
     ``scrapy-extension-*`` groups or prior runs.
     """
     from scrapy_extension.backends.rocketmq import RocketMQBackend

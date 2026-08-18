@@ -108,8 +108,8 @@ def _failing_operation(mocker: Any, method_name: str) -> Callable[[], object]:
         consumer.receive.side_effect = RuntimeError(_MARKER)
         backend._consumer = consumer
         if method_name == "pop":
-            return lambda: backend.pop(_MARKER)
-        return lambda: backend.pop_with_ack(_MARKER)
+            return lambda: backend.pop(_MARKER, timeout=1)
+        return lambda: backend.pop_with_ack(_MARKER, timeout=1)
 
     if method_name in {"ack", "nack"}:
         consumer = mocker.MagicMock()
@@ -226,6 +226,6 @@ def test_rocketmq_queue_boundary_preserves_control_flow_exception(mocker: Any) -
     backend._consumer = consumer
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
-        backend.pop(_MARKER)
+        backend.pop(_MARKER, timeout=1)
 
     assert exc_info.value is interrupt
