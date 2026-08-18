@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import sys
 import traceback
+import weakref
 from collections import defaultdict, deque
 from types import ModuleType
 from typing import Any
@@ -109,6 +111,10 @@ class _CoroutineSettlementPlugin(_DeferredPlugin):
 class _CustomAwaitable:
     def __await__(self) -> Any:
         yield
+
+
+class _IdentityToken:
+    pass
 
 
 async def _unstarted_settlement_coroutine() -> None:
@@ -353,6 +359,65 @@ def test_awaitable_settlement_is_redacted_and_keeps_token_retryable(
     assert not [
         warning for warning in recwarn if "never awaited" in str(warning.message)
     ]
+
+
+def test_non_value_tokens_are_owned_and_settled_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    monkeypatch.setattr(
+        "scrapy_extension.backends.connectors._ack_token_key",
+        lambda token: ("identity", 1),
+    )
+    issued = _IdentityToken()
+    issued_ref = weakref.ref(issued)
+    backend.pop_results["q"].append((b"item", issued))
+    item, returned = contract.pop_with_ack("q")
+    assert item == b"item"
+    assert returned is issued
+
+    del issued
+    del returned
+    gc.collect()
+    owned = issued_ref()
+    assert owned is not None
+
+    forged = _IdentityToken()
+    with pytest.raises(QueueError, match="unknown"):
+        contract.ack("q", token=forged)
+    assert backend.ack_calls == []
+
+    contract.ack("q", token=owned)
+    backend.ack_calls.clear()
+    del owned
+    gc.collect()
+    assert issued_ref() is None
+
+
+def test_non_value_token_reference_is_released_on_adapter_teardown() -> None:
+    backend = _DeferredPlugin()
+    contract = _DeferredAckPluginQueueBackend(
+        backend,
+        supports_concurrent_ack=True,
+    )
+    issued = _IdentityToken()
+    issued_ref = weakref.ref(issued)
+    backend.pop_results["q"].append((b"item", issued))
+    _item, returned = contract.pop_with_ack("q")
+    assert returned is issued
+
+    del issued
+    del returned
+    gc.collect()
+    assert issued_ref() is not None
+
+    del contract
+    gc.collect()
+    assert issued_ref() is None
 
 
 def test_deferred_plugin_rejects_empty_and_missing_tokens() -> None:

@@ -646,7 +646,12 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         self._delegate = backend
         self.supports_concurrent_ack = supports_concurrent_ack
         self._ack_contract_lock = threading.Lock()
-        self._active_ack_tokens: dict[str, set[tuple[object, ...]]] = {}
+        # Values retain the exact issued object. Identity-keyed tokens therefore
+        # cannot be collected and have their id reused while they remain active.
+        self._active_ack_tokens: dict[
+            str,
+            dict[tuple[object, ...], object],
+        ] = {}
 
     def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
         self._delegate.push(queue_name, item, priority)
@@ -687,13 +692,13 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
             )
         key = _ack_token_key(token)
         with self._ack_contract_lock:
-            active = self._active_ack_tokens.setdefault(queue_name, set())
+            active = self._active_ack_tokens.setdefault(queue_name, {})
             if key in active:
                 raise QueueError(
                     "Deferred-ack backend reused an active acknowledgement token",
                     operation="pop",
                 )
-            active.add(key)
+            active[key] = token
         return (item, token)
 
     @_deferred_ack_queue_error_boundary("ack")
@@ -713,11 +718,15 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         key = _ack_token_key(token)
         with self._ack_contract_lock:
             active = self._active_ack_tokens.get(queue_name)
-            if active is None or key not in active:
+            issued_token = active.get(key) if active is not None else None
+            if issued_token is None or (
+                key[0] == "identity" and issued_token is not token
+            ):
                 raise QueueError(
                     "Deferred-ack settlement rejected an unknown acknowledgement token",
                     operation=operation,
                 )
+            assert active is not None
             try:
                 settle_hook = cast(
                     "Callable[..., Any]",
@@ -737,7 +746,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
             except BaseException:
                 raise
             else:
-                active.remove(key)
+                active.pop(key)
                 if not active:
                     self._active_ack_tokens.pop(queue_name, None)
 
