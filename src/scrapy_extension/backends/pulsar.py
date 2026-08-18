@@ -756,13 +756,16 @@ class PulsarBackend(Backend, QueueBackend):
                 pump.stop_admission()
                 if pump.consumer is not None:
                     consumers.pop(id(pump.consumer), None)
-                    retirement = self._start_consumer_retirement_locked(
-                        pump, pump.consumer
-                    )
+                    retirement = pump.retirement
+                    if retirement is None:
+                        retirement = self._start_consumer_retirement_locked(
+                            pump, pump.consumer
+                        )
                     disconnect_retirements.append(retirement)
                 elif not pump.stopped.is_set():
-                    retirement = self._new_consumer_retirement_locked(pump)
-                    pump.retirement = retirement
+                    retirement = pump.retirement
+                    if retirement is None:
+                        retirement = self._new_consumer_retirement_locked(pump)
                     disconnect_retirements.append(retirement)
             client = self._client
             self._lifecycle_generation += 1

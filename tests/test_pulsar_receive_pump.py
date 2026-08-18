@@ -702,6 +702,69 @@ def test_publication_failure_fences_blocked_candidate_close_across_reconnect(
     )
 
 
+def test_disconnect_reuses_unobserved_publication_retirement(mocker: Any) -> None:
+    """Disconnect keeps the exact in-progress candidate-close tombstone."""
+
+    class _FailingPublicationMap(dict[str, Any]):
+        def __setitem__(self, key: str, value: Any) -> None:
+            del key, value
+            raise KeyboardInterrupt("unobserved publication marker")
+
+    close_started = Event()
+    release_close = Event()
+    stale_consumer = MagicMock(name="unobserved-publication-consumer")
+    replacement_consumer = _ControllableConsumer()
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    stale_consumer.close.side_effect = blocked_close
+    old_client = MagicMock(name="unobserved-publication-old-client")
+    old_client.subscribe.return_value = stale_consumer
+    new_client = MagicMock(name="unobserved-publication-new-client")
+    new_client.subscribe.return_value = replacement_consumer
+    mocker.patch.object(pulsar, "Client", side_effect=[old_client, new_client])
+    backend = PulsarBackend(PulsarSettings(consumer_type="Exclusive"))
+    backend._receive_shutdown_timeout = 0.05
+    backend.connect()
+    _CONNECTED_BACKENDS.append(backend)
+    backend._consumers = _FailingPublicationMap()
+    topic = "scrapy-unobserved-publication"
+
+    assert backend.pop("unobserved-publication", timeout=0) is None
+    assert close_started.wait(timeout=0.5)
+    pump = backend._receive_pumps[topic]
+    retirement = pump.retirement
+    assert retirement is not None
+
+    # The publication error has not been transferred through a public poll yet.
+    # Disconnect must claim the close already running on the receive worker rather
+    # than replacing its topic tombstone or starting a second consumer close.
+    backend.disconnect()
+    assert pump.retirement is retirement
+    assert backend._consumer_retirements == {topic: retirement}
+    stale_consumer.close.assert_called_once_with()
+
+    backend._consumers = {}
+    backend.connect()
+    assert backend.pop("unobserved-publication", timeout=0) is None
+    new_client.subscribe.assert_not_called()
+
+    release_close.set()
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert backend.pop("unobserved-publication", timeout=0) is None
+    assert replacement_consumer.receive_started.wait(timeout=0.5)
+    stale_consumer.close.assert_called_once_with()
+    new_client.subscribe.assert_called_once_with(
+        topic,
+        "scrapy-extension",
+        consumer_type=pulsar.ConsumerType.Exclusive,
+        initial_position=pulsar.InitialPosition.Earliest,
+        negative_ack_redelivery_delay_ms=60_000,
+    )
+
+
 def test_receive_worker_name_does_not_expose_private_topic(mocker: Any) -> None:
     private_marker = "private-thread-topic-marker"
     consumer = _ControllableConsumer()
