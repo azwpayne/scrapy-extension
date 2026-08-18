@@ -13,6 +13,7 @@ from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.queue import (
     _STRATEGY_CLEANUP_FAILED,
     _STRATEGY_CLEANUP_INDETERMINATE,
+    _STRATEGY_CLEANUP_NOT_STARTED,
     BackendQueue,
 )
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -943,6 +944,67 @@ def test_scheduler_retries_real_backend_queue_only_after_checkpoint_failure() ->
     assert queue._checkpoint_complete is True
     strategy.close.assert_called_once_with()
     assert scheduler._queue is None
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("terminal_action", ["close", "abort"])
+def test_scheduler_retains_real_queue_interrupted_after_checkpoint(
+    terminal_action: str,
+) -> None:
+    storage = MagicMock(name="snapshot-storage")
+    storage.retrieve.return_value = None
+    strategy = MagicMock(name="strategy")
+    strategy.snapshot.return_value = b"state"
+    queue = _queue_with_storage(strategy, storage)
+    queue_manager = MagicMock(name="queue-manager")
+    snapshot_manager = MagicMock(name="snapshot-manager")
+    scheduler = BackendScheduler(
+        queue_manager,
+        snapshot_connection_manager=snapshot_manager,
+        owns_snapshot_connection_manager=True,
+    )
+    scheduler._queue = queue
+    interruption = _CustomControlFlow("interrupted after checkpoint commit")
+    target_offset = _instruction_after("STORE_ATTR", "_checkpoint_complete")
+
+    def inject(frame: object, event: str, _arg: object) -> object:
+        if getattr(frame, "f_code", None) is BackendQueue.close.__code__:
+            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                raise interruption
+        return inject
+
+    sys.settrace(inject)
+    try:
+        with pytest.raises(_CustomControlFlow) as exc_info:
+            scheduler.close("checkpoint-committed")
+    finally:
+        sys.settrace(None)
+
+    assert exc_info.value is interruption
+    assert queue._checkpoint_complete is True
+    assert queue._strategy_cleanup_state == _STRATEGY_CLEANUP_NOT_STARTED
+    assert queue._close_complete is False
+    assert scheduler._queue is queue
+    strategy.close.assert_not_called()
+    queue_manager.close.assert_not_called()
+    snapshot_manager.close.assert_not_called()
+
+    if terminal_action == "close":
+        scheduler.close("retry-close")
+    else:
+        scheduler.abort("explicit-abort")
+
+    assert queue._close_complete is True
+    strategy.close.assert_called_once_with()
+    assert scheduler._queue is None
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+
+    scheduler.close("duplicate-close")
+    scheduler.abort("duplicate-abort")
+    strategy.close.assert_called_once_with()
     queue_manager.close.assert_called_once_with()
     snapshot_manager.close.assert_called_once_with()
 

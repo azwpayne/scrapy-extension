@@ -1805,9 +1805,9 @@ class BackendScheduler:
         if self._lifecycle_state == _LIFECYCLE_CLOSED:
             return None
 
-        # The queue checkpoint is the teardown commit gate. Until it succeeds,
-        # retain the queue, signals, dupefilter, and both manager acquires so a
-        # later close call can retry against the same strategy state.
+        # A terminal queue close is the teardown commit gate. Until the queue
+        # publishes terminal completion, retain it, signals, dupefilter, and both
+        # manager acquires so a later close call can resume the same close attempt.
         queue_teardown_error: BaseException | None = None
         if self._queue is not None:
             queue_failure: BaseException | None = None
@@ -1822,23 +1822,25 @@ class BackendScheduler:
                 if lossy:
                     # An explicit abort is terminal even if begin_close() or
                     # strategy.close() fails before BackendQueue can publish its
-                    # checkpoint gate. Teardown must still release every acquire.
-                    checkpoint_incomplete = False
+                    # completion gate. Teardown must still release every acquire.
+                    queue_close_incomplete = False
                 elif isinstance(self._queue, BackendQueue):
-                    # BackendQueue publishes this gate immediately after the
-                    # durable snapshot commit and before strategy.close(). A
-                    # QueueError from the latter is an ordinary cleanup failure,
-                    # not a reason to retain both manager acquires indefinitely.
-                    checkpoint_incomplete = not self._queue._checkpoint_complete
+                    # A committed checkpoint is not terminal by itself: process
+                    # control can interrupt before destructive cleanup is marked
+                    # started. Retain every incomplete real queue so a later close
+                    # or explicit abort can finish cleanup exactly once. Once
+                    # BackendQueue publishes terminal completion, cleanup failures
+                    # follow the scheduler's ordinary terminal teardown policy.
+                    queue_close_incomplete = not self._queue._close_complete
                 else:
                     # Third-party queue implementations predate the explicit
-                    # checkpoint gate. Preserve their historical QueueError retry
+                    # completion gate. Preserve their historical QueueError retry
                     # signal because no stronger completion state is available.
-                    checkpoint_incomplete = isinstance(queue_failure, QueueError)
-                if checkpoint_incomplete:
+                    queue_close_incomplete = isinstance(queue_failure, QueueError)
+                if queue_close_incomplete:
                     try:
                         logger.error(
-                            "Queue checkpoint failed; scheduler close can be retried"
+                            "Queue close incomplete; scheduler close can be retried"
                         )
                     except BaseException:
                         pass
