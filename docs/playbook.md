@@ -99,8 +99,9 @@ green pytest is **not** a green CI:
    with, not identical to, the broader `source-exclude` list in
    `pyproject.toml`; keep both consistent) → fresh wheel install of `[all]`,
    asserting every `Backend/Mode/Settings` trio imports.
-6. `pytest -m "not integration" --cov` (3.10 lane): **coverage floor 95%,
-   branch mode** (`fail_under = 95`).
+6. `pytest -m "not integration" --cov` (3.10 lane) runs in branch mode.
+   Coverage.py intentionally has `fail_under = 0`; CI reads `coverage.json` and
+   separately enforces **95% statement coverage** and **91% branch coverage**.
 7. Unit matrix 3.10–3.14 (`fail-fast: false`); one 3.12 integration job with
    10 live containerized backends.
 
@@ -159,10 +160,14 @@ monitor_backpressure_threshold=1_000, monitor_pop_rate_window_s=60.0.
 
 **Per-backend models** (`settings/<name>.py`, each with
 `SCRAPY_<NAME>_` env prefix, `extra="forbid"`, `hide_input_in_errors=True`):
-fail at construction with `ConfigurationError` — never a raw pydantic
-`ValidationError`, never an opaque driver error. All subclass
-`RedactedBaseSettings`, which rebuilds validation failures so raw input and
-secrets never survive in tracebacks.
+direct construction may raise a redacted Pydantic `ValidationError` for
+field/type/range/enum constraints, and explicit policy validators may raise the
+project's `ConfigurationError`. All subclass `RedactedBaseSettings`, which
+rebuilds either failure so raw input and secrets do not survive in tracebacks.
+At the runtime/connect boundary, `ConnectionManager` catches settings
+`ValidationError` and validator `ConfigurationError` (plus construction
+`TypeError`) and exposes `ConfigurationError`; configuration failures are
+non-retryable rather than becoming opaque driver errors.
 
 **Per-component backend override** (multi-backend coexistence) is resolved by
 `resolve_backend_config(settings, type_key, settings_key,

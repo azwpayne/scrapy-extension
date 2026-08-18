@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the configured storage component.** `delay`, `round_robin`, `time_wheel`, and
   `ring_buffer` now use `SCRAPY_STORAGE_BACKEND_*` when their queue backend
   lacks storage. Full queue+storage backends keep their existing local snapshot
-  path; a legacy queue-only global configuration with no storage component
-  continues to skip snapshots best-effort.
+  path. Without snapshot storage, a clean close may skip persistence only when
+  the strategy snapshot state is empty; nonempty state fails close so it can be
+  retried, unless the caller explicitly chooses a lossy abort (`lossy=True`).
 
 ### Breaking
 

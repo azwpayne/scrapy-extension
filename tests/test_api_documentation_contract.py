@@ -22,6 +22,10 @@ _RUNBOOK = (_REPOSITORY_ROOT / "docs" / "runbook.md").read_text(encoding="utf-8"
 _STABILITY = (_REPOSITORY_ROOT / ".github" / "STABILITY.md").read_text(encoding="utf-8")
 _SECURITY = (_REPOSITORY_ROOT / ".github" / "SECURITY.md").read_text(encoding="utf-8")
 _CHANGELOG = (_REPOSITORY_ROOT / ".github" / "CHANGELOG.md").read_text(encoding="utf-8")
+_PLAYBOOK = (_REPOSITORY_ROOT / "docs" / "playbook.md").read_text(encoding="utf-8")
+_ES_PUSH_BENCHMARK = (
+    _REPOSITORY_ROOT / "tests" / "integration" / "bench_es_push_refresh.py"
+).read_text(encoding="utf-8")
 
 
 def test_component_factory_documentation_matches_runtime_api() -> None:
@@ -77,6 +81,28 @@ def test_pre_release_support_and_symbol_tiers_are_explicit() -> None:
         ".github/STABILITY.md)" in _README
     )
     assert "Public surface is determined by the owning namespace" in _STABILITY
+
+
+def test_operational_evidence_describes_current_runtime_contracts() -> None:
+    assert "may skip persistence only when" in _CHANGELOG
+    assert "strategy snapshot state is empty" in _CHANGELOG
+    assert "nonempty state fails close" in _CHANGELOG
+    assert "lossy abort (`lossy=True`)" in _CHANGELOG
+
+    assert "Coverage.py intentionally has `fail_under = 0`" in _PLAYBOOK
+    assert "**95% statement coverage** and **91% branch coverage**" in _PLAYBOOK
+    assert "direct construction may raise a redacted Pydantic `ValidationError`" in (
+        _PLAYBOOK
+    )
+    assert "At the runtime/connect boundary, `ConnectionManager`" in _PLAYBOOK
+    assert "and exposes `ConfigurationError`" in _PLAYBOOK
+
+    assert "ElasticSearchBackend.push" in _ES_PUSH_BENCHMARK
+    assert "backend.push(" in _ES_PUSH_BENCHMARK
+    assert "client.index(" not in _ES_PUSH_BENCHMARK
+    assert "SCRAPY_TEST_INTEGRATION" in _ES_PUSH_BENCHMARK
+    assert "SCRAPY_TEST_ES_HOSTS" in _ES_PUSH_BENCHMARK
+    assert "does not isolate refresh behavior" in _ES_PUSH_BENCHMARK
 
 
 def test_active_documentation_local_links_resolve() -> None:

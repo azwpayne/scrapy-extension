@@ -1,89 +1,89 @@
 #!/usr/bin/env python
-"""Benchmark: latency cost of ES push refresh="wait_for" (#40 tradeoff).
+"""Measure the production ElasticSearch queue push path.
 
-The ElasticSearchBackend.push/add/delete use ``refresh="wait_for"`` for
-read-your-writes consistency (push→pop correctness; see #40). The naive
-concern is "1s/push" (ES's default refresh interval). This script measures
-the real cost against a live ES — ES BATCHES refreshes, so consecutive
-pushes within one refresh window amortize the wait.
+This script calls :meth:`ElasticSearchBackend.push` end to end against a live
+broker. It reports sequential call latency, including backend validation and
+serialization, elasticsearch-py, network, and server indexing work. It does not
+isolate refresh cost, compare raw ``Elasticsearch.index`` modes, or prove why a
+latency change occurred; the integration regression gate owns the production
+per-push budget.
 
 Run (requires the compose ES broker up):
-    SCRAPY_TEST_ES_HOSTS=http://localhost:9200 uv run python \\
+    SCRAPY_TEST_INTEGRATION=1 \
+    SCRAPY_TEST_ES_HOSTS=http://localhost:9200 uv run python \
         tests/integration/bench_es_push_refresh.py
 """
 
 from __future__ import annotations
 
+import math
 import os
 import statistics
 import time
 import uuid
 
-from elasticsearch import Elasticsearch
+from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
-N = 50  # pushes per mode — matches test_push_pop_round_trip_optimistic_lock scale
+N = 50
 
 
-def _bench(
-    client: Elasticsearch, index: str, refresh: str | None
+def _configured_hosts() -> list[str]:
+    """Return explicitly opted-in broker hosts or stop without broker I/O."""
+    if os.environ.get("SCRAPY_TEST_INTEGRATION") != "1":
+        raise SystemExit("Set SCRAPY_TEST_INTEGRATION=1 to enable live-broker I/O.")
+
+    configured = os.environ.get("SCRAPY_TEST_ES_HOSTS")
+    if not configured:
+        raise SystemExit(
+            "Set SCRAPY_TEST_ES_HOSTS (for example, http://localhost:9200)."
+        )
+    hosts = [host.strip() for host in configured.split(",") if host.strip()]
+    if not hosts:
+        raise SystemExit("SCRAPY_TEST_ES_HOSTS must contain at least one host.")
+    return hosts
+
+
+def _bench_push(
+    backend: ElasticSearchBackend, queue_name: str
 ) -> tuple[float, list[float]]:
-    """Push N docs with the given refresh mode. Return (total_s, per_push_s_list)."""
+    """Push N queue items through the production backend surface."""
     per_push: list[float] = []
-    for _ in range(N):
-        doc = {
-            "queue_name": f"bench-{uuid.uuid4().hex}",
-            "item": "eA==",
-            "priority": -1.0,
-            "created_at": "2026-07-04T12:00:00Z",
-        }
-        kwargs: dict = {"index": index, "document": doc}
-        if refresh is not None:
-            kwargs["refresh"] = refresh
-        t0 = time.monotonic()
-        client.index(**kwargs)
-        per_push.append(time.monotonic() - t0)
+    for index in range(N):
+        started = time.monotonic()
+        backend.push(queue_name, f"item-{index:03d}".encode(), priority=1.0)
+        per_push.append(time.monotonic() - started)
     return sum(per_push), per_push
 
 
 def main() -> None:
-    hosts = [
-        h.strip()
-        for h in os.environ.get("SCRAPY_TEST_ES_HOSTS", "http://localhost:9200").split(
-            ","
-        )
-        if h.strip()
-    ]
-    client = Elasticsearch(hosts=hosts, request_timeout=10.0, retry_on_timeout=False)
-    assert client.ping(), "ES broker not reachable"
-
-    idx = f"bench-push-{uuid.uuid4().hex[:8]}"
-    client.indices.create(index=idx)
-
-    print(f"ES push benchmark: N={N} per mode, broker={hosts[0]}")
-    print(
-        f"{'mode':<22} {'total':>8} {'per-push mean':>15} {'per-push p95':>14} {'per-push max':>13}"
+    hosts = _configured_hosts()
+    backend = ElasticSearchBackend(
+        ElasticSearchSettings(hosts=hosts, request_timeout=10.0, max_retries=1)
     )
-    print("-" * 76)
-
-    for label, refresh in [
-        ("refresh='wait_for'", "wait_for"),
-        ("refresh=False", False),
-        ("no refresh arg", None),
-    ]:
-        total, per_push = _bench(client, idx, refresh)
-        per_push_sorted = sorted(per_push)
+    queue_name = f"bench-push-{uuid.uuid4().hex}"
+    backend.connect()
+    try:
+        total, per_push = _bench_push(backend, queue_name)
+        ordered = sorted(per_push)
+        p95 = ordered[math.ceil(0.95 * len(ordered)) - 1]
         mean = statistics.mean(per_push)
-        p95 = per_push_sorted[int(0.95 * len(per_push))]
-        mx = max(per_push)
-        print(
-            f"{label:<22} {total:>7.2f}s {mean * 1000:>13.1f}ms {p95 * 1000:>12.1f}ms {mx * 1000:>11.1f}ms"
-        )
+        maximum = max(per_push)
 
-    # Correctness check: with wait_for, a search immediately after push sees it.
-    client.indices.delete(index=idx)
-    print("\nInterpretation: refresh='wait_for' total >> refresh=False total means")
-    print("ES is NOT amortizing — every push pays the refresh wait. If the gap is")
-    print("small, ES batches refreshes and the per-push cost is sub-linear.")
+        print(f"ElasticSearchBackend.push benchmark: N={N}, broker={hosts[0]}")
+        print(f"total: {total:.2f}s")
+        print(f"mean: {mean * 1000:.1f}ms")
+        print(f"p95: {p95 * 1000:.1f}ms")
+        print(f"max: {maximum * 1000:.1f}ms")
+        print(
+            "Scope: sequential end-to-end backend.push calls; this measurement "
+            "does not isolate refresh behavior or compare raw client modes."
+        )
+    finally:
+        try:
+            backend.clear_queue(queue_name)
+        finally:
+            backend.disconnect()
 
 
 if __name__ == "__main__":
