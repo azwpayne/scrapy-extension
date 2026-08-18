@@ -1,0 +1,11 @@
+{
+  "logical_key": "queue:snapshot:v3:0::1:q",
+  "manifest": "{\"chunk_bytes\":4,\"chunks\":4,\"generation\":\"0123456789abcdef0123456789abcdef\",\"length\":13,\"schema\":\"scrapy-extension.queue-strategy-snapshot\",\"sha256\":\"bfd804b8d2352035570e7360093a9cff887a1ea5d732b8b4c467d76f2697981a\",\"version\":4}",
+  "chunks": {
+    "queue:snapshot:v3:0::1:q:generation:0123456789abcdef0123456789abcdef:chunk:0": "hist",
+    "queue:snapshot:v3:0::1:q:generation:0123456789abcdef0123456789abcdef:chunk:1": "oric",
+    "queue:snapshot:v3:0::1:q:generation:0123456789abcdef0123456789abcdef:chunk:2": "al-v",
+    "queue:snapshot:v3:0::1:q:generation:0123456789abcdef0123456789abcdef:chunk:3": "4"
+  },
+  "expected": "historical-v4"
+}

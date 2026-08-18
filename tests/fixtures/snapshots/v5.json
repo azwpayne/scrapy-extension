@@ -1,0 +1,10 @@
+{
+  "logical_key": "queue:snapshot:v3:0::1:q",
+  "manifest": "{\"chunk_bytes\":5,\"chunks\":3,\"generation\":\"0123456789abcdef0123456789abcdef\",\"length\":13,\"schema\":\"scrapy-extension.queue-strategy-snapshot\",\"sha256\":\"9e9b8626eece024f46b1400263413873335e1b344befbf8748cf3a7a2a1ba6b8\",\"version\":5}",
+  "chunks": {
+    "queue:snapshot-chunk:v1:ea43996161ff522ff7ead6ac0c03e8f1707dfd3e485ea60b2e3df3dda6674355": "histo",
+    "queue:snapshot-chunk:v1:0d0f3b8afc821da1e81e680f763bddd6b043b7eaa6981007f64dd82fd1469ed3": "rical",
+    "queue:snapshot-chunk:v1:1c0e9efda4b708631c77ab54e727b561c899d918a882201adc878ecd77c94de4": "-v5"
+  },
+  "expected": "historical-v5"
+}

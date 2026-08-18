@@ -33,6 +33,7 @@ from scrapy_extension.queue.snapshot import (
     DEFAULT_SNAPSHOT_CHUNK_BYTES,
     DEFAULT_SNAPSHOT_MAX_BYTES,
     MAX_SNAPSHOT_CHUNK_BYTES,
+    MAX_SNAPSHOT_CHUNKS,
     SnapshotRepository,
     SnapshotRepositoryError,
 )
@@ -219,13 +220,20 @@ class BackendQueue:
         )
         self._snapshot_max_bytes = resolved_snapshot_max_bytes
         self._snapshot_chunk_bytes = resolved_snapshot_chunk_bytes
+        minimum_snapshot_chunk_bytes = (
+            (resolved_snapshot_max_bytes + MAX_SNAPSHOT_CHUNKS - 1)
+            // MAX_SNAPSHOT_CHUNKS
+            if isinstance(resolved_snapshot_max_bytes, int)
+            and not isinstance(resolved_snapshot_max_bytes, bool)
+            else 1
+        )
         if (
             isinstance(resolved_snapshot_max_bytes, bool)
             or not isinstance(resolved_snapshot_max_bytes, int)
             or resolved_snapshot_max_bytes < 1
             or isinstance(resolved_snapshot_chunk_bytes, bool)
             or not isinstance(resolved_snapshot_chunk_bytes, int)
-            or resolved_snapshot_chunk_bytes < 1
+            or resolved_snapshot_chunk_bytes < minimum_snapshot_chunk_bytes
             or resolved_snapshot_chunk_bytes > resolved_snapshot_max_bytes
             or resolved_snapshot_chunk_bytes > MAX_SNAPSHOT_CHUNK_BYTES
         ):

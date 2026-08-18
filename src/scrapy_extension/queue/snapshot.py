@@ -13,6 +13,7 @@ from scrapy_extension.backends.base import BackendType, _validate_key_name
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024
+MAX_SNAPSHOT_CHUNKS = 4_096
 DEFAULT_SNAPSHOT_CHUNK_BYTES = MAX_SNAPSHOT_CHUNK_BYTES
 
 _MANIFEST_SCHEMA = "scrapy-extension.queue-strategy-snapshot"
@@ -77,13 +78,18 @@ class SnapshotRepository:
         max_bytes: int = DEFAULT_SNAPSHOT_MAX_BYTES,
         chunk_bytes: int = DEFAULT_SNAPSHOT_CHUNK_BYTES,
     ) -> None:
+        minimum_chunk_bytes = (
+            (max_bytes + MAX_SNAPSHOT_CHUNKS - 1) // MAX_SNAPSHOT_CHUNKS
+            if isinstance(max_bytes, int) and not isinstance(max_bytes, bool)
+            else 1
+        )
         if (
             isinstance(max_bytes, bool)
             or not isinstance(max_bytes, int)
             or max_bytes < 1
             or isinstance(chunk_bytes, bool)
             or not isinstance(chunk_bytes, int)
-            or chunk_bytes < 1
+            or chunk_bytes < minimum_chunk_bytes
             or chunk_bytes > max_bytes
             or chunk_bytes > MAX_SNAPSHOT_CHUNK_BYTES
         ):
@@ -171,16 +177,30 @@ class SnapshotRepository:
             key = ""
 
     def _store(self, key: str, value: bytes) -> bool:
-        """Store backend data and terminally collapse ordinary failures."""
+        """Store bytes, verifying an ordinary effect-then-raise result once."""
+        expected = value
+        observed: object = None
+        copied: bytes | None = None
         try:
             try:
                 self._storage.store(key, value)
             except Exception:
-                return False
+                # A backend may apply the write and then raise (for example, a
+                # response is lost). One exact readback can prove this immutable
+                # chunk or manifest committed; any ambiguity remains retryable.
+                observed, retrieve_failed = self._retrieve(key)
+                if retrieve_failed:
+                    return False
+                copied, copy_error = self._copy_buffer(observed, len(expected))
+                observed = None
+                return copy_error is None and copied == expected
             return True
         finally:
             key = ""
             value = b""
+            expected = b""
+            observed = None
+            copied = None
 
     @staticmethod
     def _copy_buffer(value: object, maximum: int) -> tuple[bytes | None, str | None]:
@@ -392,9 +412,14 @@ class SnapshotRepository:
                     return None, "Snapshot exceeds the configured size limit."
                 return SnapshotRead(True, raw, False), None
             raw = None
+            minimum_chunk_bytes = (
+                self._max_bytes + MAX_SNAPSHOT_CHUNKS - 1
+            ) // MAX_SNAPSHOT_CHUNKS
             if (
                 manifest.length > self._max_bytes
                 or manifest.chunk_bytes > self._chunk_bytes
+                or manifest.chunk_bytes < minimum_chunk_bytes
+                or manifest.chunks > MAX_SNAPSHOT_CHUNKS
             ):
                 return None, "Snapshot exceeds the configured size limit."
             if manifest.length == 0:

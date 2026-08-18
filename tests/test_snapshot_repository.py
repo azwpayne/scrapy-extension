@@ -6,6 +6,7 @@ import json
 import threading
 import traceback
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -81,6 +82,62 @@ def _storage(initial: dict[str, bytes] | None = None):
     storage.store.side_effect = lambda key, value: values.__setitem__(key, value)
     storage.delete.side_effect = lambda key: values.pop(key, None)
     return storage, values
+
+
+@pytest.mark.parametrize("failure_kind", ["chunk", "manifest"])
+def test_effect_then_raise_chunk_and_manifest_writes_are_verified(
+    failure_kind: str,
+) -> None:
+    storage, values = _storage()
+    failed = False
+
+    def store(key: str, value: bytes) -> None:
+        nonlocal failed
+        values[key] = value
+        is_chunk = key.startswith("queue:snapshot-chunk:v1:")
+        if not failed and (is_chunk == (failure_kind == "chunk")):
+            failed = True
+            raise RuntimeError("response lost after write")
+
+    storage.store.side_effect = store
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+
+    repository.commit(_KEY, b"effect-then-raise")
+
+    assert failed is True
+    assert repository.read(_KEY).state == b"effect-then-raise"
+
+
+def test_ambiguous_manifest_write_retry_establishes_new_authority() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old")
+    manifest_failed = False
+    verification_read = False
+
+    def store(key: str, value: bytes) -> None:
+        nonlocal manifest_failed
+        values[key] = value
+        if key == _KEY and not manifest_failed:
+            manifest_failed = True
+            raise RuntimeError("response lost after manifest write")
+
+    def retrieve(key: str) -> bytes | None:
+        nonlocal verification_read
+        if key == _KEY and manifest_failed and not verification_read:
+            verification_read = True
+            raise RuntimeError("readback unavailable")
+        return values.get(key)
+
+    storage.store.side_effect = store
+    storage.retrieve.side_effect = retrieve
+
+    with pytest.raises(SnapshotRepositoryError, match="manifest write"):
+        repository.commit(_KEY, b"ambiguous")
+
+    assert repository.read(_KEY).state == b"ambiguous"
+    repository.commit(_KEY, b"retry-authoritative")
+    assert repository.read(_KEY).state == b"retry-authoritative"
 
 
 def test_commit_writes_chunks_before_manifest_and_round_trips() -> None:
@@ -440,6 +497,53 @@ def test_logical_cap_is_symmetric_and_prewrite() -> None:
     values[_KEY] = b"oversize"
     with pytest.raises(SnapshotRepositoryError, match="size limit"):
         repository.read(_KEY)
+
+
+@pytest.mark.parametrize("version", [4, 5])
+def test_literal_historical_manifest_fixtures_remain_readable(version: int) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "snapshots" / f"v{version}.json"
+    fixture = json.loads(fixture_path.read_text())
+    values = {
+        fixture["logical_key"]: fixture["manifest"].encode(),
+        **{key: value.encode() for key, value in fixture["chunks"].items()},
+    }
+    storage, _ = _storage(values)
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=5)
+
+    result = repository.read(fixture["logical_key"])
+
+    assert result.state == fixture["expected"].encode()
+    assert result.manifest is True
+
+
+def test_literal_raw_empty_legacy_fixture_remains_present() -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "snapshots" / "raw-empty.bin"
+    storage, _ = _storage({_KEY: fixture_path.read_bytes()})
+
+    result = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4).read(_KEY)
+
+    assert result.found is True
+    assert result.state == b""
+    assert result.manifest is False
+
+
+def test_malicious_tiny_chunks_are_rejected_before_chunk_retrieval() -> None:
+    manifest = {
+        "schema": "scrapy-extension.queue-strategy-snapshot",
+        "version": 5,
+        "generation": "0" * 32,
+        "length": 4_097,
+        "chunk_bytes": 1,
+        "chunks": 4_097,
+        "sha256": "0" * 64,
+    }
+    storage, _ = _storage({_KEY: json.dumps(manifest).encode()})
+    repository = SnapshotRepository(storage, max_bytes=8_192, chunk_bytes=2)
+
+    with pytest.raises(SnapshotRepositoryError, match="size limit"):
+        repository.read(_KEY)
+
+    storage.retrieve.assert_called_once_with(_KEY)
 
 
 def test_legacy_raw_value_remains_readable() -> None:

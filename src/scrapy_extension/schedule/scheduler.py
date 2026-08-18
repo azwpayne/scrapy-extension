@@ -44,6 +44,7 @@ from scrapy_extension.queue.snapshot import (
     DEFAULT_SNAPSHOT_CHUNK_BYTES,
     DEFAULT_SNAPSHOT_MAX_BYTES,
     MAX_SNAPSHOT_CHUNK_BYTES,
+    MAX_SNAPSHOT_CHUNKS,
 )
 from scrapy_extension.queue.strategies.base import _QueueAckToken
 from scrapy_extension.utils._config import (
@@ -388,7 +389,11 @@ class _QueueComponentConfig:
                 "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES", DEFAULT_SNAPSHOT_CHUNK_BYTES
             ),
             "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES",
-            minimum=1,
+            minimum=max(
+                1,
+                (queue_snapshot_max_bytes + MAX_SNAPSHOT_CHUNKS - 1)
+                // MAX_SNAPSHOT_CHUNKS,
+            ),
             maximum=min(queue_snapshot_max_bytes, MAX_SNAPSHOT_CHUNK_BYTES),
         )
         snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
