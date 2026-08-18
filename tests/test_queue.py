@@ -17,9 +17,47 @@ from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.base import QueueStrategy, _PreparedQueuePush
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+from scrapy_extension.queue.strategies.priority import PriorityQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
 from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
+from scrapy_extension.queue.strategies.work_stealing import WorkStealingQueueStrategy
+
+
+class _TokenOnlyDeliveryBackend(QueueBackend):
+    """Concrete deferred-ack backend yielding a scripted delivery sequence."""
+
+    requires_ack = True
+
+    def __init__(self) -> None:
+        self.responses: list[tuple[bytes | None, object | None]] = []
+        self.pop_calls: list[tuple[str, float]] = []
+        self.ack_calls: list[tuple[str, object | None]] = []
+
+    def push(self, queue_name: str, item: bytes, priority: float = 0.0) -> None:
+        del queue_name, item, priority
+
+    def pop(self, queue_name: str, timeout: float = 0.0) -> bytes | None:
+        del queue_name, timeout
+        raise AssertionError("pop_with_ack override must be used")
+
+    def pop_with_ack(
+        self, queue_name: str, timeout: float = 0.0
+    ) -> tuple[bytes | None, object | None]:
+        self.pop_calls.append((queue_name, timeout))
+        if not self.responses:
+            return (None, None)
+        return self.responses.pop(0)
+
+    def ack(self, queue_name: str, *, token: object | None = None) -> None:
+        self.ack_calls.append((queue_name, token))
+
+    def queue_len(self, queue_name: str) -> int:
+        del queue_name
+        return 0
+
+    def clear_queue(self, queue_name: str) -> None:
+        del queue_name
 
 
 class _QueueTestSpider(Spider):
@@ -1755,6 +1793,89 @@ class TestBackendQueuePop:
         assert queue.pop() is None
 
         backend.ack.assert_called_once_with("test_queue", token=token)
+
+    @pytest.mark.parametrize(
+        ("strategy_name", "branch"),
+        [
+            ("priority", "bucket"),
+            ("priority", "blocking"),
+            ("priority", "rescan"),
+            ("work-stealing", "own"),
+            ("work-stealing", "peer"),
+            ("work-stealing", "blocking"),
+            ("work-stealing", "rescan-own"),
+            ("work-stealing", "rescan-peer"),
+        ],
+    )
+    def test_pop_settles_token_only_fanout_delivery_once(
+        self, mocker, strategy_name, branch
+    ):
+        """Every fan-out pop branch forwards token-only deliveries for settlement."""
+        backend = _TokenOnlyDeliveryBackend()
+        manager = mocker.MagicMock(name="ConnectionManager")
+        manager.backend_type = "redis"
+        manager.get_queue_backend.return_value = backend
+        token = object()
+
+        if strategy_name == "priority":
+            strategy = PriorityQueueStrategy(manager, levels=2)
+            if branch == "bucket":
+                backend.responses = [(None, None), (None, token)]
+                expected_queue = strategy._bucket_queue("test_queue", 1)
+            elif branch == "blocking":
+                backend.responses = [(None, None), (None, None), (None, token)]
+                expected_queue = strategy._bucket_queue("test_queue", 0)
+            else:
+                backend.responses = [
+                    (None, None),
+                    (None, None),
+                    (None, None),
+                    (None, None),
+                    (None, token),
+                ]
+                expected_queue = strategy._bucket_queue("test_queue", 1)
+        else:
+            strategy = WorkStealingQueueStrategy(
+                manager,
+                worker_id="w1",
+                peer_ids=("w2",),
+            )
+            if branch == "own":
+                backend.responses = [(None, token)]
+                expected_queue = strategy._own_queue("test_queue")
+            elif branch == "peer":
+                backend.responses = [(None, None), (None, token)]
+                expected_queue = strategy._worker_queue("test_queue", "w2")
+            elif branch == "blocking":
+                backend.responses = [(None, None), (None, None), (None, token)]
+                expected_queue = strategy._own_queue("test_queue")
+            elif branch == "rescan-own":
+                backend.responses = [
+                    (None, None),
+                    (None, None),
+                    (None, None),
+                    (None, token),
+                ]
+                expected_queue = strategy._own_queue("test_queue")
+            else:
+                backend.responses = [
+                    (None, None),
+                    (None, None),
+                    (None, None),
+                    (None, None),
+                    (None, token),
+                ]
+                expected_queue = strategy._worker_queue("test_queue", "w2")
+
+        queue = BackendQueue(
+            connection_manager=manager,
+            queue_name="test_queue",
+            queue_strategy=strategy,
+        )
+
+        assert queue.pop(timeout=2.5) is None
+        assert backend.responses == []
+        assert backend.ack_calls == [(expected_queue, token)]
 
     def test_pop_deserializes_and_returns_request(
         self, mock_connection_manager, mock_spider

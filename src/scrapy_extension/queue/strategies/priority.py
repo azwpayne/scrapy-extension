@@ -236,7 +236,7 @@ class PriorityQueueStrategy(QueueStrategy):
         for level in range(self._levels):
             physical_queue = self._bucket_queue(queue_name, level)
             data, token = self._pop_backend_instance_with_ack(qb, physical_queue, 0.0)
-            if data is not None:
+            if data is not None or token is not None:
                 return (data, token)
         if timeout > 0:
             data, token = self._pop_backend_instance_with_ack(
@@ -244,7 +244,7 @@ class PriorityQueueStrategy(QueueStrategy):
                 self._bucket_queue(queue_name, 0),
                 timeout,
             )
-            if data is not None:
+            if data is not None or token is not None:
                 return (data, token)
             # A lower-priority bucket may have received an item during the
             # blocking wait on p0; re-scan all levels non-blocking so the
@@ -253,7 +253,7 @@ class PriorityQueueStrategy(QueueStrategy):
                 pdata, ptoken = self._pop_backend_instance_with_ack(
                     qb, self._bucket_queue(queue_name, level), 0.0
                 )
-                if pdata is not None:
+                if pdata is not None or ptoken is not None:
                     return (pdata, ptoken)
         return (None, None)
 

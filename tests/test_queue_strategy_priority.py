@@ -121,6 +121,51 @@ def test_pop_with_ack_uses_one_blocking_fallback_after_empty_scan():
     )
 
 
+@pytest.mark.parametrize(
+    ("branch", "responses", "expected_level", "expected_timeout"),
+    [
+        (
+            "bucket-scan",
+            [(None, None), (None, "token-only")],
+            1,
+            0.0,
+        ),
+        (
+            "blocking-fallback",
+            [(None, None), (None, None), (None, "token-only")],
+            0,
+            2.5,
+        ),
+        (
+            "post-block-rescan",
+            [
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, "token-only"),
+            ],
+            1,
+            0.0,
+        ),
+    ],
+)
+def test_pop_with_ack_preserves_token_only_delivery_from_every_branch(
+    branch, responses, expected_level, expected_timeout
+):
+    """An empty broker payload is still a delivery when it carries a token."""
+    del branch
+    s, qb = _strategy(levels=2)
+    qb.pop_with_ack.side_effect = responses
+
+    assert s.pop_with_ack("q", timeout=2.5) == (None, "token-only")
+    assert qb.pop_with_ack.call_count == len(responses)
+    assert qb.pop_with_ack.call_args_list[-1].args == (
+        s._bucket_queue("q", expected_level),
+        expected_timeout,
+    )
+
+
 def test_pop_rechecks_lower_buckets_after_blocking_p0_timeout():
     """R75: after the blocking pop on p0 times out empty, pop must re-scan
     p0..p(N-1) non-blocking before returning None -- otherwise an item that

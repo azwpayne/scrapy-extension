@@ -276,7 +276,7 @@ class WorkStealingQueueStrategy(QueueStrategy):
         own = self._own_queue(queue_name)
         deadline = time.monotonic() + timeout if timeout > 0 else None
         data, token = self._pop_backend_instance_with_ack(qb, own, 0.0)
-        if data is not None:
+        if data is not None or token is not None:
             return (data, token)
         n_peers = len(self._peer_ids)
         if n_peers:
@@ -291,25 +291,25 @@ class WorkStealingQueueStrategy(QueueStrategy):
                         self._worker_queue(queue_name, peer),
                         peer_timeout,
                     )
-                    if data is not None:
+                    if data is not None or token is not None:
                         self._steal_idx = (idx + 1) % n_peers
                         return (data, token)
         remaining = self._remaining_timeout(deadline)
         if remaining > 0:
             data, token = self._pop_backend_instance_with_ack(qb, own, remaining)
-            if data is not None:
+            if data is not None or token is not None:
                 return (data, token)
             # A peer queue may have received an item during the blocking wait
             # on own; re-scan own + all peers non-blocking so the caller's
             # "next ready item or None if empty" contract holds (R84 sibling).
             data, token = self._pop_backend_instance_with_ack(qb, own, 0.0)
-            if data is not None:
+            if data is not None or token is not None:
                 return (data, token)
             for peer in self._peer_ids:
                 pdata, ptoken = self._pop_backend_instance_with_ack(
                     qb, self._worker_queue(queue_name, peer), 0.0
                 )
-                if pdata is not None:
+                if pdata is not None or ptoken is not None:
                     return (pdata, ptoken)
         return (None, None)
 

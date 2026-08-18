@@ -72,6 +72,58 @@ def test_pop_with_ack_threads_backend_token_from_own_queue():
     qb.pop_with_ack.assert_called_once_with(s._own_queue("q"), 0.0)
 
 
+@pytest.mark.parametrize(
+    ("branch", "responses", "expected_source", "expected_call_count"),
+    [
+        ("own", [(None, "token-only")], "own", 1),
+        ("peer", [(None, None), (None, "token-only")], "peer", 2),
+        (
+            "blocking-own",
+            [(None, None), (None, None), (None, "token-only")],
+            "own",
+            3,
+        ),
+        (
+            "rescan-own",
+            [
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, "token-only"),
+            ],
+            "own",
+            4,
+        ),
+        (
+            "rescan-peer",
+            [
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, "token-only"),
+            ],
+            "peer",
+            5,
+        ),
+    ],
+)
+def test_pop_with_ack_preserves_token_only_delivery_from_every_branch(
+    branch, responses, expected_source, expected_call_count
+):
+    """Own, peer, blocking, and re-scan paths must retain empty deliveries."""
+    del branch
+    s, qb = _strategy(worker_id="w1", peer_ids=("w2",))
+    qb.pop_with_ack.side_effect = responses
+
+    assert s.pop_with_ack("q", timeout=2.5) == (None, "token-only")
+    assert qb.pop_with_ack.call_count == expected_call_count
+    expected_queue = (
+        s._own_queue("q") if expected_source == "own" else s._worker_queue("q", "w2")
+    )
+    assert qb.pop_with_ack.call_args_list[-1].args[0] == expected_queue
+
+
 # ---------------------------------------------------------------------------
 # push — own queue only
 # ---------------------------------------------------------------------------
