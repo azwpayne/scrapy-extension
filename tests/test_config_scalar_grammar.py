@@ -228,10 +228,11 @@ def test_bundled_float_duration_fields_reject_coercion_and_nonfinite_values(
 def test_memcached_timeout_direct_text_is_rejected(
     field_name: str, raw_value: str
 ) -> None:
-    with pytest.raises(ValidationError) as exc_info:
+    with pytest.raises(ConfigurationError) as exc_info:
         MemcachedSettings(**{field_name: raw_value})
 
-    assert all(error["input"] is None for error in exc_info.value.errors())
+    assert exc_info.value.setting_name == field_name
+    assert exc_info.value.setting_value is None
 
 
 @pytest.mark.parametrize("field_name", ["connect_timeout", "socket_timeout"])

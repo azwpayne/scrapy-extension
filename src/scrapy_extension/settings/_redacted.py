@@ -359,6 +359,15 @@ def _raise_invalid_bundled_scalar(
     scalar_type: type[object],
 ) -> NoReturn:
     """Raise the established typed, redacted error for one invalid scalar."""
+    if (
+        settings_type.__module__ == "scrapy_extension.settings.memcached"
+        and settings_type.__qualname__ == "MemcachedSettings"
+        and field_name in {"connect_timeout", "socket_timeout"}
+    ):
+        raise ConfigurationError(
+            "Memcached timeout must be finite, greater than 0, and at most 86400 seconds.",
+            setting_name=field_name,
+        )
     if scalar_type is float or (
         scalar_type is int
         and settings_type.__module__ == "scrapy_extension.settings.base"
