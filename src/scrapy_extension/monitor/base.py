@@ -37,12 +37,12 @@ DEFAULT_BACKPRESSURE_THRESHOLD = 1_000
 
 #: Default rolling window (seconds) over which ``on_pop_rate`` reports rate.
 #:
-#: 60s matches the architect's "calls/sec over a 1m window" contract (U2):
-#: long enough to smooth per-second jitter, short enough that a stalled
-#: consumer surfaces as a falling-edge within a minute. ``BackendQueue``
-#: evicts timestamps older than this from its rolling counter on every pop;
-#: the value is also passed as ``window_s`` to ``on_pop_rate`` so a monitor
-#: can record it under a window-tagged stat key (``queue/pop_rate_1m``).
+#: 60s matches the architect's "calls/sec over a 1m window" contract (U2).
+#: The event-sampled gauge smooths per-second jitter but does not update when
+#: no pops occur, so it can freeze after a stall. ``queue/last_pop_epoch`` is
+#: the independent liveness primitive: observers derive age from wall time.
+#: ``BackendQueue`` evicts timestamps older than this rolling window on every
+#: pop and passes the value to ``on_pop_rate`` for a window-tagged stat key.
 DEFAULT_POP_RATE_WINDOW_S = 60.0
 
 
@@ -92,7 +92,11 @@ class Monitor:
     - ``on_filter_full()`` — membership filter at capacity; caller degrades.
     - ``on_pop_rate(window_s, rate)`` — rolling pop rate (U2 operability).
       Emitted by ``BackendQueue.pop`` on a sampling cadence (NOT every pop);
-      ``rate`` is pops per second over the trailing ``window_s`` window.
+      ``rate`` is pops per second over the trailing ``window_s`` window. It is
+      event-sampled and may freeze at its last value after a consumer stalls.
+    - ``on_last_pop_epoch(epoch)`` — wall-clock epoch of the latest pop attempt.
+      Emitted on every attempt so observers can derive liveness age without a
+      component-owned timer, even while the sampled pop-rate gauge is frozen.
     - ``on_filter_saturation(used, capacity)`` — membership-filter fill ratio
       (U2 operability). Emitted by ``BackendDupeFilter.request_seen`` after the
       deduplication decision when the underlying filter exposes saturation.
@@ -194,15 +198,22 @@ class Monitor:
         cheap). ``rate`` is pops per second over the trailing ``window_s``
         seconds. The default window is :data:`DEFAULT_POP_RATE_WINDOW_S` (60s).
 
-        Why a rate, not a counter: ``queue/pop_count`` already counts pops; the
-        operability question is "is the consumer alive *lately*?" — a rolling
-        rate answers that without forcing the operator to do wall-clock math
-        against a monotonic counter. A stalled crawler shows up as a falling-edge
-        to ~0 within one window.
+        The gauge is event-sampled: if pops stop entirely, no event recomputes it
+        and the last nonzero value may freeze. Use ``queue/last_pop_epoch`` and
+        derive ``current_epoch - last_pop_epoch`` for stall detection without a
+        background timer in the queue component.
 
         Args:
             window_s: The trailing window the rate was computed over (seconds).
             rate: Pops per second over that window.
+        """
+
+    def on_last_pop_epoch(self, epoch: float) -> None:
+        """Record the wall-clock epoch of the latest queue pop attempt.
+
+        Args:
+            epoch: Seconds since the Unix epoch from the queue's injected wall
+                clock. Observers derive age using their own current wall time.
         """
 
     def on_filter_saturation(self, used: int, capacity: int | None) -> None:

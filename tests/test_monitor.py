@@ -64,6 +64,7 @@ class TestNullMonitor:
             ("on_store", {"key": "k"}),
             ("on_filter_full", {}),
             ("on_pop_rate", {"window_s": DEFAULT_POP_RATE_WINDOW_S, "rate": 1.5}),
+            ("on_last_pop_epoch", {"epoch": 1_700_000_000.0}),
             ("on_filter_saturation", {"used": 100, "capacity": 200}),
             ("on_error", {"operation": "push", "error": RuntimeError("x")}),
             ("on_connect", {"backend_type": "redis"}),
@@ -89,6 +90,7 @@ class TestNullMonitor:
             "on_store",
             "on_filter_full",
             "on_pop_rate",
+            "on_last_pop_epoch",
             "on_filter_saturation",
             "on_error",
         ):
@@ -169,6 +171,13 @@ class TestScrapyStatsMonitor:
         assert stats.get_value("queue/pop_rate_30s") == 5.0
         # default-window key must NOT be touched when a different window is passed
         assert stats.get_value("queue/pop_rate_1m") is None
+
+    def test_on_last_pop_epoch_sets_gauge(self):
+        monitor, stats = self._monitor()
+        monitor.on_last_pop_epoch(1_700_000_000.25)
+        assert stats.get_value("queue/last_pop_epoch") == 1_700_000_000.25
+        monitor.on_last_pop_epoch(1_700_000_010.5)
+        assert stats.get_value("queue/last_pop_epoch") == 1_700_000_010.5
 
     def test_on_filter_saturation_sets_ratio_gauge(self):
         """on_filter_saturation stores used/capacity clamped to [0, 1]."""
@@ -496,6 +505,49 @@ class TestPopRateEmission:
         rate = monitor._stats.get_value("queue/pop_rate_1m")  # type: ignore[attr-defined]
         assert rate is not None
         assert rate > 0.0
+
+    def test_last_pop_epoch_supports_external_age_without_new_events(
+        self, mock_connection_manager
+    ) -> None:
+        wall_time = [1_700_000_000.0]
+        monitor = ScrapyStatsMonitor(_stats())
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="q",
+            monitor=monitor,
+            depth_sample_every=1,
+            wall_clock=lambda: wall_time[0],
+        )
+        mock_connection_manager.get_queue_backend().pop.return_value = None
+
+        queue.pop()
+        recorded_epoch = monitor._stats.get_value("queue/last_pop_epoch")  # type: ignore[attr-defined]
+        frozen_rate = monitor._stats.get_value("queue/pop_rate_1m")  # type: ignore[attr-defined]
+        assert recorded_epoch == wall_time[0]
+
+        # No pop, timer, or background task runs while the external clock moves.
+        wall_time[0] += 75.0
+        assert wall_time[0] - recorded_epoch == 75.0
+        assert monitor._stats.get_value("queue/last_pop_epoch") == recorded_epoch  # type: ignore[attr-defined]
+        assert monitor._stats.get_value("queue/pop_rate_1m") == frozen_rate  # type: ignore[attr-defined]
+
+    def test_last_pop_epoch_updates_on_every_empty_pop_attempt(
+        self, mock_connection_manager
+    ) -> None:
+        wall_time = iter([100.0, 101.5])
+        monitor = ScrapyStatsMonitor(_stats())
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="q",
+            monitor=monitor,
+            wall_clock=lambda: next(wall_time),
+        )
+        mock_connection_manager.get_queue_backend().pop.return_value = None
+
+        queue.pop()
+        assert monitor._stats.get_value("queue/last_pop_epoch") == 100.0  # type: ignore[attr-defined]
+        queue.pop()
+        assert monitor._stats.get_value("queue/last_pop_epoch") == 101.5  # type: ignore[attr-defined]
 
     def test_pop_rate_window_evicts_old_timestamps(
         self, mock_connection_manager, mocker
@@ -938,6 +990,7 @@ class TestScrapyStatsMonitorResilience:
             ("on_store", {"key": "k"}),
             ("on_filter_full", {}),
             ("on_pop_rate", {"window_s": DEFAULT_POP_RATE_WINDOW_S, "rate": 1.0}),
+            ("on_last_pop_epoch", {"epoch": 1_700_000_000.0}),
             ("on_filter_saturation", {"used": 1, "capacity": 10}),
             ("on_error", {"operation": "push", "error": RuntimeError("x")}),
             ("on_connect", {"backend_type": "redis"}),

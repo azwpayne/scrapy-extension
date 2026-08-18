@@ -710,16 +710,20 @@ Both are threaded by `BackendScheduler.from_settings` → the resolved
 `ScrapyStatsMonitor` (and `pop_rate_window_s` is also forwarded to
 `BackendQueue`, which computes the rolling rate).
 
-## Diagnose a stuck crawl (page on zero pop rate)
+## Diagnose a stuck crawl (page on last-pop age)
 
-The round-10 operability signals — `on_pop_rate` (the `queue/pop_rate_1m` gauge)
-and `on_filter_saturation` (the `dupefilter/filter_saturation` gauge) — ARE
-landed and wired via `BackendScheduler.from_settings` (see
-`SCRAPY_MONITOR_POP_RATE_WINDOW_S` above). Use them as the primary stuck-crawl
-diagnostics; the stats below add supporting depth:
+The rolling `queue/pop_rate_1m` gauge is event-sampled and can freeze at its
+last nonzero value when pops stop completely; it does not run a background
+heartbeat. Use `queue/last_pop_epoch` as the primary liveness signal and compute
+`current_epoch - last_pop_epoch` in the external monitoring system. The epoch is
+updated on every pop attempt, including empty polls, so its age continues to
+grow without any new queue event or component-owned timer. Pair it with
+`dupefilter/filter_saturation` and the supporting stats below:
 
 | Stat | What it tells you |
 |---|---|
+| `queue/last_pop_epoch` | Wall-clock Unix epoch of the latest pop attempt. Alert on externally computed age; unlike pop rate, this remains diagnostically useful when events stop. |
+| `queue/pop_rate_1m` | Event-sampled pop attempts/sec. Useful while events flow, but may freeze after a complete stall; do not use it alone for stall paging. |
 | `queue/depth` (sampled, U4) | Depth of a backend that supports `queue_len`. `0` = empty only when a sample was available; Pulsar/RocketMQ do not emit a broker depth. |
 | `dupefilter/hit_count` | Per-duplicate request count (monitor/stats.py). High + rising = dedup actively filtering. |
 | `dupefilter/miss_count` | Per-newly-seen request count (monitor/stats.py). Complement to `hit_count` — rising = novel URLs still arriving. |
@@ -736,11 +740,12 @@ diagnostics; the stats below add supporting depth:
 
 Differential diagnosis:
 
-- **Queue empty + zero pop rate** → backend drained; produce more requests
-  (or your scheduler is paused via backpressure — check
+- **Queue empty + fresh last-pop epoch** → backend drained; produce more
+  requests (or your scheduler is paused via backpressure — check
   `backpressure_pause_at`).
-- **Queue non-empty + zero pop rate** → backend-down (check `backend.ping()`
-  in your logs), throttle-strategy pinned, or `CONCURRENT_REQUESTS=0`.
+- **Queue non-empty + stale last-pop epoch** → backend-down (check
+  `backend.ping()` in your logs), throttle-strategy pinned, or
+  `CONCURRENT_REQUESTS=0`.
 - **Queue non-empty + pop rising + items not landing** → ack path broken
   (Kafka/RabbitMQ under `CONCURRENT_REQUESTS > 1` without
   `supports_concurrent_ack`); check for the `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS`

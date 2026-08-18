@@ -14,6 +14,7 @@ import threading
 import time
 import warnings
 from collections import deque
+from collections.abc import Callable
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -121,6 +122,7 @@ class BackendQueue:
         monitor: Monitor | None = None,
         depth_sample_every: int = DEFAULT_DEPTH_SAMPLE_EVERY,
         pop_rate_window_s: float = DEFAULT_POP_RATE_WINDOW_S,
+        wall_clock: Callable[[], float] = time.time,
         snapshot_owner: str | None = None,
         snapshot_connection_manager: ConnectionManager | None = None,
     ) -> None:
@@ -159,6 +161,10 @@ class BackendQueue:
                 (60.0). Round-14 R14-C: threaded via
                 ``BackendScheduler.from_settings`` so the window is tunable
                 without code changes (round-12 U2 left it stuck at the default).
+                This event-sampled gauge may freeze when no further pops occur;
+                use ``queue/last_pop_epoch`` to derive external liveness age.
+            wall_clock: Wall-clock epoch source for ``queue/last_pop_epoch``.
+                Injectable for deterministic tests; defaults to :func:`time.time`.
             snapshot_owner: Optional stable worker identity used to isolate
                 in-process strategy snapshots in multi-worker deployments. When
                 omitted, a delimiter-safe v3 spider+queue key is used. A missing
@@ -178,6 +184,7 @@ class BackendQueue:
         self.max_item_bytes = max_item_bytes
         self.depth_sample_every = max(1, int(depth_sample_every))
         self._pop_rate_window_s = pop_rate_window_s
+        self._wall_clock = wall_clock
         if snapshot_owner is not None:
             _validate_key_name(snapshot_owner, "snapshot_owner")
         self._snapshot_owner = snapshot_owner
@@ -643,6 +650,19 @@ class BackendQueue:
         if pop_monitor_failed:
             try:
                 logger.debug("monitor.on_pop raised; ignored")
+            except BaseException:
+                pass
+        # Additive wall-clock liveness primitive. Unlike the sampled pop-rate
+        # gauge this epoch remains useful after events stop: an external observer
+        # computes ``now - last_pop_epoch`` without a queue-owned timer thread.
+        last_pop_monitor_failed = False
+        try:
+            self._monitor.on_last_pop_epoch(self._wall_clock())
+        except Exception:  # noqa: BLE001 - telemetry cannot alter the pop result
+            last_pop_monitor_failed = True
+        if last_pop_monitor_failed:
+            try:
+                logger.debug("monitor.on_last_pop_epoch raised; ignored")
             except BaseException:
                 pass
         # U2 operability: record this pop into the rolling window, then emit the

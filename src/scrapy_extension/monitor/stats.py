@@ -95,7 +95,10 @@ class ScrapyStatsMonitor(Monitor):
       crossed" (the gauge follows depth, not threshold-crossing history).
     - ``queue/pop_rate_1m`` (gauge) — rolling pops/sec over the trailing 60s
       window (U2 operability). Sampled on the same cadence as the pop-path
-      depth probe; falling-edge to ~0 = stalled consumer.
+      depth probe; it may freeze at its last value when no further events occur.
+    - ``queue/last_pop_epoch`` (gauge) — wall-clock epoch of the latest pop
+      attempt. External observers subtract it from current wall time to detect a
+      stall without requiring a queue-owned heartbeat thread.
     - ``dupefilter/filter_saturation`` (gauge, 0.0-1.0) — filter fill ratio
       (U2 operability). Rises through 0.9 before ``dupefilter/filter_full``
       ever fires; leading indicator for raising filter capacity. ``0.0`` when
@@ -229,7 +232,9 @@ class ScrapyStatsMonitor(Monitor):
         ``SCRAPY_MONITOR_POP_RATE_WINDOW_S`` is overridden. ``BackendQueue``
         forwards its configured ``pop_rate_window_s`` here, so the key always
         reflects the window an operator is looking at on the stats dump. ``rate``
-        is pops per second over that trailing window.
+        is pops per second over that trailing window. Because emission is driven
+        by pop events, the gauge can freeze after a complete stall; use
+        ``queue/last_pop_epoch`` for an externally computed liveness age.
 
         Args:
             window_s: Trailing window the rate was computed over (seconds).
@@ -238,6 +243,11 @@ class ScrapyStatsMonitor(Monitor):
         """
         tag = "1m" if window_s == DEFAULT_POP_RATE_WINDOW_S else f"{window_s:g}s"
         self._stats.set_value(f"queue/pop_rate_{tag}", rate)
+
+    @_stats_safe
+    def on_last_pop_epoch(self, epoch: float) -> None:
+        """Set ``queue/last_pop_epoch`` to the latest pop-attempt wall time."""
+        self._stats.set_value("queue/last_pop_epoch", epoch)
 
     @_stats_safe
     def on_filter_saturation(self, used: int, capacity: int | None) -> None:
