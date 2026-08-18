@@ -128,6 +128,50 @@ def test_persistent_filter_failure_never_releases_manager() -> None:
     backend.disconnect.assert_not_called()
 
 
+def test_failed_open_reserves_cleanup_before_another_open() -> None:
+    manager = Mock()
+    membership_filter = Mock(spec=MembershipFilter)
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    open_error = RuntimeError("open failed")
+    membership_filter.open.side_effect = [open_error, None]
+
+    def blocking_close() -> None:
+        cleanup_entered.set()
+        assert allow_cleanup.wait(timeout=3)
+
+    membership_filter.close.side_effect = blocking_close
+    dupefilter = BackendDupeFilter(
+        connection_manager=manager,
+        membership_filter=membership_filter,
+    )
+    errors: list[BaseException] = []
+
+    def fail_open() -> None:
+        try:
+            dupefilter.open()
+        except BaseException as exc:
+            errors.append(exc)
+
+    opener = threading.Thread(target=fail_open, name="failed-dupefilter-open")
+    opener.start()
+    assert cleanup_entered.wait(timeout=3)
+    try:
+        with pytest.raises(RuntimeError, match="closing or closed"):
+            dupefilter.open()
+        assert membership_filter.open.call_count == 1
+        assert membership_filter.close.call_count == 1
+    finally:
+        allow_cleanup.set()
+    opener.join(timeout=3)
+
+    assert not opener.is_alive()
+    assert errors == [open_error]
+    assert dupefilter._closed is True
+    membership_filter.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+
+
 def test_concurrent_release_cannot_overtake_active_open() -> None:
     manager = Mock()
     membership_filter = Mock(spec=MembershipFilter)

@@ -758,13 +758,17 @@ class BackendDupeFilter:
             open_failure = exc
 
         if open_failure is not None:
-            with self._lifecycle_lock:
-                if self._open_owner_token is open_owner:
-                    self._opening = False
-                    self._open_owner_token = None
             cleanup_failed = False
+            reserved = False
             try:
-                self.release(self._direct_release_owner, "open-failed")
+                with self._lifecycle_lock:
+                    reserved = self._reserve_release_locked(
+                        self._direct_release_owner,
+                        get_ident(),
+                        opening_owner=open_owner,
+                    )
+                if reserved:
+                    self._run_reserved_release()
             except BaseException:
                 cleanup_failed = True
             if cleanup_failed:
@@ -811,38 +815,58 @@ class BackendDupeFilter:
     def release(self, owner_token: object, reason: str) -> None:
         """Retryably close for one exact owner without holding lifecycle locks."""
         del reason
-        thread_id = get_ident()
         with self._lifecycle_lock:
-            if self._closed:
-                return
-            if self._opening:
-                open_owner = self._open_owner_token
-                if open_owner is not None and open_owner.active:
-                    raise RuntimeError("dupefilter open is already in progress")
+            reserved = self._reserve_release_locked(owner_token, get_ident())
+        if reserved:
+            self._run_reserved_release()
+
+    def _reserve_release_locked(
+        self,
+        owner_token: object,
+        thread_id: int,
+        *,
+        opening_owner: _MonitorFenceToken | None = None,
+    ) -> bool:
+        """Atomically transfer lifecycle ownership into one close attempt."""
+        if self._closed:
+            return False
+        if self._opening:
+            open_owner = self._open_owner_token
+            if opening_owner is not None and open_owner is opening_owner:
+                # A failed opener transfers its still-live transition directly to
+                # cleanup. No peer can observe an idle lifecycle between them.
+                self._opening = False
+                self._open_owner_token = None
+            elif open_owner is not None and open_owner.active:
+                raise RuntimeError("dupefilter open is already in progress")
+            else:
                 # The opening frame has unwound without terminal publication.
                 # Reclaim package state for close without replaying filter.open().
                 self._opening = False
                 self._open_owner_token = None
-            if self._release_owner_token is None:
-                self._release_owner_token = owner_token
-            elif self._release_owner_token is not owner_token:
-                raise RuntimeError("dupefilter close is owned by another caller")
-            if self._release_in_progress:
-                if self._release_thread_id == thread_id:
-                    return
-                raise RuntimeError("dupefilter close is already in progress")
-            self._release_in_progress = True
-            self._release_thread_id = thread_id
-            self._closing = True
-            self._opening = False
-            self._open_owner_token = None
-            self._opened = False
-            self._opened_spider = None
-            # Receipts before queue commit own no marker and need no backend call.
-            for reservation in tuple(self._active_reservations.values()):
-                self._discard_reservation(reservation)
-            self._clear_retry_allowances()
+        if self._release_owner_token is None:
+            self._release_owner_token = owner_token
+        elif self._release_owner_token is not owner_token:
+            raise RuntimeError("dupefilter close is owned by another caller")
+        if self._release_in_progress:
+            if self._release_thread_id == thread_id:
+                return False
+            raise RuntimeError("dupefilter close is already in progress")
+        self._release_in_progress = True
+        self._release_thread_id = thread_id
+        self._closing = True
+        self._opening = False
+        self._open_owner_token = None
+        self._opened = False
+        self._opened_spider = None
+        # Receipts before queue commit own no marker and need no backend call.
+        for reservation in tuple(self._active_reservations.values()):
+            self._discard_reservation(reservation)
+        self._clear_retry_allowances()
+        return True
 
+    def _run_reserved_release(self) -> None:
+        """Execute a previously reserved close attempt outside the lifecycle lock."""
         try:
             self._close_locked()
         finally:
