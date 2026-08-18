@@ -1252,9 +1252,7 @@ class PulsarBackend(Backend, QueueBackend):
                 if retirement is not None:
                     shutdown_budget = max(0.0, self._receive_shutdown_timeout)
                     caller_remaining = (
-                        0.0
-                        if deadline is None
-                        else max(0.0, deadline - monotonic())
+                        0.0 if deadline is None else max(0.0, deadline - monotonic())
                     )
                     close_wait = min(shutdown_budget, caller_remaining)
                     if close_wait > 0 and not retirement.completed.wait(close_wait):
@@ -1314,11 +1312,7 @@ class PulsarBackend(Backend, QueueBackend):
         """Return true only when CPython's launch event proves no target ran."""
         try:
             started = getattr(worker, "_started", None)
-            return (
-                started is not None
-                and not started.is_set()
-                and worker.ident is None
-            )
+            return started is not None and not started.is_set() and worker.ident is None
         except BaseException:
             return False
 
