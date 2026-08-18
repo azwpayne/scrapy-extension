@@ -7,11 +7,10 @@ Round-5 R5-1: the four prior hand-synced registries (``_BACKEND_FACTORIES``
 + ``QUEUE_CAPABLE_BACKENDS`` / ``SET_CAPABLE_BACKENDS`` /
 ``STORAGE_CAPABLE_BACKENDS``) have been consolidated into the single
 :class:`~scrapy_extension.backends.registry.BackendDescriptor` table in
-``registry.py``. The capability sets below are THIN BACKWARD-COMPAT
-DELEGATIONS computed from the registry's single source of truth — they
-exist so existing imports (``from scrapy_extension.backends.connectors
-import QUEUE_CAPABLE_BACKENDS``) keep working, NOT as a parallel
-registry to maintain.
+``registry.py``. The capability sets below are backward-compatible,
+built-in-only immutable snapshots. They exist so importing this module never
+triggers third-party discovery; callers that need installed plugin capabilities
+must opt in through :func:`capable_backends` or the registry API.
 """
 
 from __future__ import annotations
@@ -58,6 +57,7 @@ from scrapy_extension.backends.circuit_breaker import (
     CircuitBreakerOpenError,
 )
 from scrapy_extension.backends.registry import (
+    _BUNDLED_DESCRIPTORS,
     BackendDescriptor,
     get_descriptor,
     get_registry,
@@ -446,25 +446,20 @@ def _validate_backend_contract(
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat capability sets (computed from the registry — single source
-# of truth). These are ``frozenset[str]`` so membership tests against both
+# Backward-compat built-in capability sets. These are ``frozenset[str]`` so
+# importing connectors never enumerates third-party entry points. Membership
+# tests against both
 # plain strings and ``BackendType`` members (which compare equal to their
 # string ``.value``) work unchanged.
 # ---------------------------------------------------------------------------
 # Kept as module-level constants so existing call sites and tests that import
 # them (e.g. ``tests/test_rocketmq_backend.py``) continue to compile. The
-# underlying data lives in ``registry._BUNDLED_DESCRIPTORS``; if a 3rd-party
-# plugin registers additional capabilities they are picked up here too
-# (the sets are rebuilt from the live registry).
+# underlying data lives in ``registry._BUNDLED_DESCRIPTORS``. Installed plugin
+# capabilities are intentionally available only through ``capable_backends``.
 
 
-def _capable_backends(capability: str) -> frozenset[str]:
-    """Return the set of backend-type strings declaring ``capability``.
-
-    Computed from the registry so the capability matrix has ONE source of
-    truth (round-5 R5-1). Returns a frozen copy so callers can't mutate the
-    cached registry.
-    """
+def capable_backends(capability: str) -> frozenset[str]:
+    """Explicitly discover and return backends declaring ``capability``."""
     return frozenset(
         name
         for name, descriptor in get_registry().items()
@@ -472,13 +467,22 @@ def _capable_backends(capability: str) -> frozenset[str]:
     )
 
 
-#: Backends implementing :class:`~scrapy_extension.backends.base.QueueBackend`.
-#: Computed from the registry; replaces the hand-synced module-level set.
-QUEUE_CAPABLE_BACKENDS: frozenset[str] = _capable_backends("queue")
-#: Backends implementing :class:`~scrapy_extension.backends.base.SetBackend`.
-SET_CAPABLE_BACKENDS: frozenset[str] = _capable_backends("set")
-#: Backends implementing :class:`~scrapy_extension.backends.base.StorageBackend`.
-STORAGE_CAPABLE_BACKENDS: frozenset[str] = _capable_backends("storage")
+def _bundled_capable_backends(capability: str) -> frozenset[str]:
+    """Return immutable built-in capability data without plugin discovery."""
+    return frozenset(
+        name
+        for name, descriptor in _BUNDLED_DESCRIPTORS.items()
+        if capability in descriptor.capabilities
+    )
+
+
+#: Built-in backends implementing :class:`~scrapy_extension.backends.base.QueueBackend`.
+#: Third-party capability discovery is available explicitly via :func:`capable_backends`.
+QUEUE_CAPABLE_BACKENDS: frozenset[str] = _bundled_capable_backends("queue")
+#: Built-in backends implementing :class:`~scrapy_extension.backends.base.SetBackend`.
+SET_CAPABLE_BACKENDS: frozenset[str] = _bundled_capable_backends("set")
+#: Built-in backends implementing :class:`~scrapy_extension.backends.base.StorageBackend`.
+STORAGE_CAPABLE_BACKENDS: frozenset[str] = _bundled_capable_backends("storage")
 
 
 def _load_object(dotted_path: str) -> Any:

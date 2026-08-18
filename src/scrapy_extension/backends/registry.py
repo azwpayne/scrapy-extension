@@ -36,6 +36,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -185,6 +186,7 @@ _BUNDLED_DESCRIPTORS: dict[str, BackendDescriptor] = {
 # ---------------------------------------------------------------------------
 
 _registry_cache: dict[str, BackendDescriptor] | None = None
+_registry_lock = threading.RLock()
 
 
 def _discover_entry_points() -> dict[str, BackendDescriptor]:
@@ -356,23 +358,24 @@ def get_registry() -> dict[str, BackendDescriptor]:
         A fresh dict mapping backend-type string → :class:`BackendDescriptor`.
     """
     global _registry_cache
-    if _registry_cache is None:
-        bundled = dict(_BUNDLED_DESCRIPTORS)
-        discovered = _discover_entry_points()
-        for name, descriptor in discovered.items():
-            if name in bundled:
-                # Bundled-wins precedence: the bundled descriptor stays; the
-                # 3rd-party shadow is dropped. Log so operators notice without making
-                # registry availability depend on their Python warning filters.
-                _log_diagnostic(
-                    logger.warning,
-                    "Third-party backend entry-point shadows a bundled backend; "
-                    "bundled backend wins.",
-                )
-                continue
-            bundled[name] = descriptor
-        _registry_cache = bundled
-    return dict(_registry_cache)
+    with _registry_lock:
+        if _registry_cache is None:
+            bundled = dict(_BUNDLED_DESCRIPTORS)
+            discovered = _discover_entry_points()
+            for name, descriptor in discovered.items():
+                if name in bundled:
+                    # Bundled-wins precedence: the bundled descriptor stays; the
+                    # 3rd-party shadow is dropped. Log so operators notice without making
+                    # registry availability depend on their Python warning filters.
+                    _log_diagnostic(
+                        logger.warning,
+                        "Third-party backend entry-point shadows a bundled backend; "
+                        "bundled backend wins.",
+                    )
+                    continue
+                bundled[name] = descriptor
+            _registry_cache = bundled
+        return dict(_registry_cache)
 
 
 def get_descriptor(backend_type: str) -> BackendDescriptor:
@@ -443,4 +446,5 @@ def _reset_registry_cache() -> None:
     via ``monkeypatch`` is re-discovered.
     """
     global _registry_cache
-    _registry_cache = None
+    with _registry_lock:
+        _registry_cache = None
