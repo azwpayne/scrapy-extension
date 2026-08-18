@@ -61,7 +61,7 @@ boundaries:
 
 | Mechanism | Masked display paths | Paths exposing the underlying secret |
 |---|---|---|
-| Pydantic `SecretStr` | Structured settings/model display and normal wrapper rendering. | Explicit `get_secret_value()` and code/serializers that call it, including this package's request/item JSON path. |
+| Pydantic `SecretStr` / `SecretBytes` | Structured settings/model display and normal wrapper rendering. `JSONSerializer` rejects the wrappers themselves. | Explicit `get_secret_value()` returns an ordinary string/bytes value that a caller may then pass to JSON persistence. This package never unwraps a wrapper on the request/item JSON path. |
 | `_RedactedStr` | `repr(value)`, an `!r` f-string, `%r`, and repr-based container/config display (currently `<redacted>`; the marker is not public API). | `str(value)`, a default/`!s` f-string, `%s`, `format`, concatenation/indexing, and JSON/string serialization. |
 | Sensitive `ConfigurationError.setting_value` | The exception domain field is replaced with the stable `***REDACTED***` marker. | Original inputs can still remain in caller traceback frame locals outside the exception's domain fields. |
 
@@ -123,13 +123,16 @@ the request / item path. Callers who supply a custom `Serializer`
 implementation are responsible for its safety.
 
 JSON serialization is not encryption and redaction wrappers are not a data
-classification boundary. Request metadata, callback arguments, items, queue
-snapshots, and custom settings may contain credentials or personal data; their
-underlying values can be serialized even when a configuration repr is masked.
-Use authenticated TLS to every remote backend, backend ACLs scoped to the
-smallest required key/topic/index namespace, and encryption at rest (or
-application-layer encryption where the backend cannot provide it). Restrict
-broker and snapshot access as if it granted access to the crawl's source data.
+classification boundary. `JSONSerializer` fails closed for Pydantic `SecretStr`
+and `SecretBytes`: it raises `TypeError` without unwrapping or including the
+secret in the exception graph. Only a caller-explicit unwrap to an ordinary
+serializable string or bytes value permits persistence. Request metadata,
+callback arguments, items, queue snapshots, and custom settings may still
+contain such caller-owned credentials or personal data. Use authenticated TLS
+to every remote backend, backend ACLs scoped to the smallest required
+key/topic/index namespace, and encryption at rest (or application-layer
+encryption where the backend cannot provide it). Restrict broker and snapshot
+access as if it granted access to the crawl's source data.
 
 ### Ack safety under concurrency
 

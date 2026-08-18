@@ -731,14 +731,16 @@ wire format. See [queued-request wire format](migration-guide.md#queued-request-
 
 ## Secret-bearing payloads
 
-The JSON codec prevents code execution; it does not encrypt data. Request meta,
-request bodies, and scraped items may contain credentials or personal data, and
-supported secret wrapper objects are serialized to their underlying value.
-Require TLS in transit, least-privilege queue/database ACLs, and encryption at
-rest. Where the backend does not provide adequate at-rest protection, encrypt
-the sensitive field in application code before enqueue/store. Avoid credentials
-inside plain MongoDB/other DSN strings because caller logging or settings reprs
-can expose them.
+The JSON codec prevents code execution; it does not encrypt data. It rejects
+Pydantic `SecretStr` and `SecretBytes` wrappers instead of unwrapping them. Only
+a caller that explicitly unwraps to an ordinary string or bytes value (or
+converts to another serializable value) can persist that data. Request meta,
+request bodies, and scraped items may still contain caller-owned credentials or
+personal data. Require TLS in transit, least-privilege queue/database ACLs, and
+encryption at rest. Where the backend does not provide adequate at-rest
+protection, encrypt the sensitive field in application code before
+enqueue/store. Avoid credentials inside plain MongoDB/other DSN strings because
+caller logging or settings reprs can expose them.
 
 For RocketMQ, set `SCRAPY_ROCKETMQ_TLS_ENABLED=True` whenever access/secret
 credentials are configured; cloud mode requires that combination. Anonymous

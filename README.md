@@ -670,7 +670,7 @@ are **per-process opt-in**. `priority` and correctly configured
 | Promise | Where enforced |
 |---|---|
 | **Fail-fast configuration.** Unknown nested fields and typoed flat `SCRAPY_<BACKEND>_*` names raise `ConfigurationError` with a suggestion. Project cross-field/capability checks also raise `ConfigurationError`; Pydantic type/range/enum validation raises `ValidationError`. `ConfigurationError.setting_name` / `.setting_value` are Stable attributes, and sensitive setting names are redacted. | `backends.connectors.resolve_backend_config`, backend settings models; see [STABILITY.md](https://github.com/azwpayne/scrapy-extension/blob/main/.github/STABILITY.md) |
-| **Structured credential redaction.** Password/token/API-key fields use `SecretStr`; selected SDK-bound values are additionally wrapped in a repr-redacting `str` subclass. `JSONSerializer` rejects `SecretStr` and `SecretBytes` so they cannot silently become queue/storage payloads. Plain strings and bytes remain caller-owned data: encrypt them before persistence when they carry credentials. | backend settings models, `backends._redaction`, `backends.base.JSONSerializer` |
+| **Structured credential redaction.** Password/token/API-key fields use `SecretStr`; selected SDK-bound values are additionally wrapped in a repr-redacting `str` subclass. `JSONSerializer` rejects `SecretStr` and `SecretBytes` so they cannot silently become queue/storage payloads. Persistence is possible only after the caller explicitly unwraps to an ordinary string or bytes value (or encrypts to another serializable value); that resulting data is caller-owned. | backend settings models, `backends._redaction`, `backends.base.JSONSerializer` |
 | **No code execution on the data path.** Serialization is JSON only — never `pickle`, never `eval`. Unknown types raise `TypeError` instead of being silently `str()`-ed. | `backends.base.JSONSerializer` |
 | **Input names are validated.** Queue / set / index / topic names match the documented safe subsets; injection-shaped inputs are rejected before use. | `backends.base._validate_key_name` and backend topic validators |
 | **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) carry a per-message ack token so the *specific* popped message is acked. Kafka additionally fences tokens by consumer generation, assignment epoch, and unique delivery attempt, preventing a late completion from committing a same-offset redelivery after nack/rebalance. Retry/redirect replacements transfer the token through their queue commit; user errbacks returning one or many requests use child tokens and settle the source only after every replacement is accepted. The scheduler's `from_settings` gate refuses a backend/plugin that declares single-slot ack unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py` (`QueueBackend` ack contract), `backends/kafka.py`, `schedule/scheduler.py` |
@@ -1060,14 +1060,16 @@ See the [examples guide](https://github.com/azwpayne/scrapy-extension/blob/main/
   addresses reject URI/userinfo and normalize bracketed IPv6 before SDK use
 - **No code execution**: JSON serialization only — never pickle or eval
 
-JSON safety is not confidentiality. Request metadata, request bodies, and
-scraped items are serialized as data and may include secret-bearing values;
-some supported types such as Pydantic secret wrappers are serialized to their
-underlying value. Use TLS for every backend connection, least-privilege broker
-and database ACLs, and encryption at rest. Do not place secrets in queued or
-stored payloads unless the application encrypts them before handing them to the
-extension. Credentials embedded in plain DSN/URI strings are caller-owned and
-must not be logged.
+JSON safety is not confidentiality. `JSONSerializer` rejects Pydantic
+`SecretStr` and `SecretBytes` wrappers; it never unwraps them implicitly. A
+caller can persist a secret only by explicitly calling `get_secret_value()` (or
+otherwise converting/encrypting it) and passing the resulting ordinary
+serializable value. Request metadata, request bodies, and scraped items may
+still contain caller-owned secret-bearing strings or bytes. Use TLS for every
+backend connection, least-privilege broker and database ACLs, and encryption at
+rest. Do not place secrets in queued or stored payloads unless the application
+encrypts them before handing them to the extension. Credentials embedded in
+plain DSN/URI strings are caller-owned and must not be logged.
 
 See the complete [security policy](https://github.com/azwpayne/scrapy-extension/blob/main/.github/SECURITY.md).
 

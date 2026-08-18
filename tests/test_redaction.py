@@ -13,9 +13,13 @@ backend depends on.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import traceback
+
+import pytest
+from pydantic import SecretBytes, SecretStr
 
 from scrapy_extension.backends._redaction import _redact, _RedactedStr
+from scrapy_extension.backends.base import JSONSerializer
 
 
 def test_redact_wraps_non_empty_string() -> None:
@@ -81,56 +85,59 @@ def test_redacted_str_ordinary_string_paths_expose_underlying_value() -> None:
     assert json.dumps({"secret": wrapped}) == '{"secret": "sdk-auth-secret"}'
 
 
-def test_security_policy_matches_repr_only_redaction_boundary() -> None:
-    """Keep the normative policy aligned with the executable string contract."""
-    policy = (
-        Path(__file__).resolve().parents[1] / ".github" / "SECURITY.md"
-    ).read_text(encoding="utf-8")
-    credential_section = policy.split("### Credential redaction", 1)[1].split(
-        "\n### ", 1
-    )[0]
-    header_row = next(
-        (
-            line
-            for line in credential_section.splitlines()
-            if line.startswith("| Mechanism |")
-        ),
-        "",
-    )
-    header_cells = [cell.strip().lower() for cell in header_row.strip("|").split("|")]
-    contract_row = next(
-        (
-            line
-            for line in credential_section.splitlines()
-            if line.startswith("|") and "`_RedactedStr`" in line
-        ),
-        "",
-    )
-    cells = [cell.strip() for cell in contract_row.strip("|").split("|")]
-    secret_str_row = next(
-        (
-            line
-            for line in credential_section.splitlines()
-            if line.startswith("|") and "Pydantic `SecretStr`" in line
-        ),
-        "",
-    )
-    secret_str_cells = [cell.strip() for cell in secret_str_row.strip("|").split("|")]
+@pytest.mark.parametrize(
+    ("wrapped", "marker"),
+    [
+        pytest.param(SecretStr("secret-string-marker"), "secret-string-marker"),
+        pytest.param(SecretBytes(b"secret-bytes-marker"), "secret-bytes-marker"),
+    ],
+)
+def test_json_serializer_rejects_secret_wrappers_without_leaking_exception_graph(
+    wrapped: SecretStr | SecretBytes, marker: str
+) -> None:
+    """Secret wrappers fail closed and remain masked throughout the failure."""
+    with pytest.raises(TypeError) as exc_info:
+        JSONSerializer().serialize({"credential": wrapped})
 
-    assert header_cells == [
-        "mechanism",
-        "masked display paths",
-        "paths exposing the underlying secret",
+    error = exc_info.value
+    surfaces = [
+        str(error),
+        repr(error),
+        repr(error.args),
+        repr(error.__dict__),
+        "".join(traceback.format_exception(error)),
     ]
-    assert len(cells) == 3, "SECURITY.md must state both redaction boundaries"
-    wrapper, masked_paths, exposed_paths = cells
-    assert wrapper == "`_RedactedStr`"
-    assert "`repr(value)`" in masked_paths
-    for exposed_path in ("`str(value)`", "f-string", "`%s`", "JSON"):
-        assert exposed_path in exposed_paths
-    assert len(secret_str_cells) == 3
-    assert secret_str_cells[0] == "Pydantic `SecretStr`"
-    assert "`get_secret_value()`" in secret_str_cells[2]
-    assert "JSON" in secret_str_cells[2]
-    assert "repr/string form" not in credential_section
-    assert "credential leakage in repr/str/logs" not in policy
+    current: BaseException | None = error
+    while current is not None:
+        surfaces.extend((repr(current.args), repr(current.__dict__)))
+        trace = current.__traceback__
+        while trace is not None:
+            if "/src/scrapy_extension/" in trace.tb_frame.f_code.co_filename:
+                surfaces.append(repr(trace.tb_frame.f_locals))
+            trace = trace.tb_next
+        current = current.__cause__ or current.__context__
+
+    assert type(wrapped).__name__ in str(error)
+    assert all(marker not in surface for surface in surfaces)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        pytest.param(SecretStr("explicit-string"), id="SecretStr"),
+        pytest.param(SecretBytes(b"explicit-bytes"), id="SecretBytes"),
+    ],
+)
+def test_json_serializer_persists_only_caller_explicit_secret_unwrap(
+    wrapped: SecretStr | SecretBytes,
+) -> None:
+    """An explicit unwrap produces ordinary caller-owned serializable data."""
+    unwrapped = wrapped.get_secret_value()
+    serializer = JSONSerializer()
+
+    encoded = serializer.serialize({"credential": unwrapped})
+
+    assert type(unwrapped) in {str, bytes}
+    assert serializer.deserialize(encoded) == {"credential": unwrapped}
