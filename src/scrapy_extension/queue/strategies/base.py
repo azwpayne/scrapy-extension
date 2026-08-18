@@ -74,7 +74,14 @@ class _BoundQueueAckToken(_QueueAckToken):
     strips it at the serialization boundary just like every raw ack token.
     """
 
-    __slots__ = ("_backend", "_queue_name", "_state", "_state_lock", "_token")
+    __slots__ = (
+        "_backend",
+        "_queue_name",
+        "_settlement_in_progress",
+        "_state",
+        "_state_lock",
+        "_token",
+    )
 
     def __init__(
         self,
@@ -86,6 +93,7 @@ class _BoundQueueAckToken(_QueueAckToken):
         self._queue_name = queue_name
         self._token = token
         self._state = "pending"
+        self._settlement_in_progress = False
         self._state_lock = threading.Lock()
 
     @property
@@ -120,18 +128,31 @@ class _BoundQueueAckToken(_QueueAckToken):
     def _settle(self, terminal_state: str) -> None:
         """Apply exactly one successful terminal transition.
 
-        The lock spans the backend call so concurrent response/error signals cannot
-        send conflicting terminal operations. A broker exception leaves the state
-        pending, allowing the same operation to be retried safely.
+        Reserve the pending transition under the state lock, then release it
+        before resolving and invoking the backend hook. Concurrent and reentrant
+        signals observe the reservation and return without duplicating broker
+        settlement. A callback failure clears the reservation so retry remains
+        possible.
         """
         with self._state_lock:
-            if self._state != "pending":
+            if self._state != "pending" or self._settlement_in_progress:
                 return
+            self._settlement_in_progress = True
+
+        try:
             if terminal_state == "acked":
-                self._backend.ack(self._queue_name, token=self._token)
+                settle = self._backend.ack
             else:
-                self._backend.nack(self._queue_name, token=self._token)
+                settle = self._backend.nack
+            settle(self._queue_name, token=self._token)
+        except BaseException:
+            with self._state_lock:
+                self._settlement_in_progress = False
+            raise
+
+        with self._state_lock:
             self._state = terminal_state
+            self._settlement_in_progress = False
 
     def __repr__(self) -> str:
         """Return diagnostics without exposing the raw token's representation."""
