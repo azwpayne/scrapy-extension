@@ -252,6 +252,14 @@ non-UTF-8 payloads consumed by atomic Lua pop. Public typed operation errors do
 not copy redis-py exception or response text; the original data-plane SDK
 exception remains available as `__cause__` for protected diagnostics.
 
+Authenticated plaintext is preserved only for direct, literal-loopback
+standalone Redis and MongoDB development connections. This narrow compatibility
+path excludes Redis Sentinel/Cluster and MongoDB replica-set/sharded/Atlas
+modes, even when a discovery seed is loopback. Remote authenticated Redis and
+MongoDB connections require verified TLS; `ALLOW_REMOTE_PLAINTEXT` authorizes
+only remote anonymous plaintext on an explicitly trusted network and never
+weakens credential transport requirements.
+
 ### MongoDB (standalone, replica_set, sharded_cluster, atlas)
 
 ```python

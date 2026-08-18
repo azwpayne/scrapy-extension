@@ -188,9 +188,7 @@ def test_ambiguous_plaintext_host_rejects_before_sdk_with_static_error(
     _assert_static_configuration_error(exc_info.value, host)
 
 
-@pytest.mark.parametrize(
-    "lookalike", ["true", 1, _RemotePlaintextEnumLike.TRUE_MARKER]
-)
+@pytest.mark.parametrize("lookalike", ["true", 1, _RemotePlaintextEnumLike.TRUE_MARKER])
 def test_elasticsearch_snapshot_rejects_mutated_plaintext_opt_in_before_sdk(
     lookalike: object, mocker
 ) -> None:
@@ -206,9 +204,7 @@ def test_elasticsearch_snapshot_rejects_mutated_plaintext_opt_in_before_sdk(
     _assert_mutated_opt_in_error_is_redacted(exc_info.value, lookalike)
 
 
-@pytest.mark.parametrize(
-    "lookalike", ["true", 1, _RemotePlaintextEnumLike.TRUE_MARKER]
-)
+@pytest.mark.parametrize("lookalike", ["true", 1, _RemotePlaintextEnumLike.TRUE_MARKER])
 def test_kafka_snapshot_rejects_mutated_plaintext_opt_in_before_sdk(
     lookalike: object, mocker
 ) -> None:

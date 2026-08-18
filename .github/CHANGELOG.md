@@ -29,8 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Elasticsearch, Kafka, Pulsar, and RocketMQ.** Non-loopback plaintext now
   requires the backend's exact `ALLOW_REMOTE_PLAINTEXT=True` trusted-network
   override; the former warning-only transition is over. Loopback development
-  remains available, and authenticated plaintext remains unconditionally
-  rejected.
+  remains available. Authenticated plaintext is preserved only for direct,
+  literal-loopback standalone Redis and MongoDB development connections. Remote
+  authenticated Redis and MongoDB connections require verified TLS; the remote
+  plaintext override never weakens credential transport requirements.
 - **Remote TLS verification can no longer be disabled anonymously.** Redis
   requires hostname checks, Elasticsearch requires certificate verification,
   and Pulsar requires certificate and hostname verification for non-loopback

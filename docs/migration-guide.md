@@ -117,11 +117,14 @@ when the network boundary is intentionally private and controlled:
 | RocketMQ | `SCRAPY_ROCKETMQ_ALLOW_REMOTE_PLAINTEXT` | `tls_enabled=False` with no access/secret key pair |
 
 These flags authorize only remote anonymous plaintext; they never weaken
-credential or TLS validation. For example, authenticated Redis or MongoDB
-connections still require their verified TLS settings, Elasticsearch credentials
-over `http://` still fail, Kafka `SASL_PLAINTEXT` still fails, Pulsar tokens
-still require `pulsar+ssl://`, and authenticated RocketMQ connections still
-require `tls_enabled=True`.
+credential or TLS validation. Authenticated plaintext is preserved only for
+direct, literal-loopback standalone Redis and MongoDB development connections.
+That exception cannot perform topology discovery: Redis Sentinel/Cluster and
+MongoDB replica-set/sharded/Atlas deployments are excluded even when their seed
+is loopback. Remote authenticated Redis and MongoDB connections require verified
+TLS; Elasticsearch credentials over `http://` still fail, Kafka
+`SASL_PLAINTEXT` still fails, Pulsar tokens still require `pulsar+ssl://`, and
+authenticated RocketMQ connections still require `tls_enabled=True`.
 
 Remote TLS now also requires identity verification without regard to whether
 credentials are configured: Redis requires hostname checking, Elasticsearch
