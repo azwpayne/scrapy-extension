@@ -26,6 +26,12 @@ _BACKEND_LOGICAL_KEY_LIMITS = {
     BackendType.ELASTICSEARCH: 512,
     BackendType.DYNAMODB: 2_048,
 }
+_BUFFER_TYPES = (bytes, bytearray, memoryview)
+_BUFFER_INVALID = "invalid"
+_BUFFER_NONCONTIGUOUS = "noncontiguous"
+_BUFFER_MUTABLE = "mutable"
+_BUFFER_CONVERSION_FAILED = "conversion-failed"
+_BUFFER_OVERSIZED = "oversized"
 
 
 class SnapshotRepositoryError(Exception):
@@ -140,6 +146,56 @@ class SnapshotRepository:
             raise SnapshotRepositoryError(failure_message)
 
     @staticmethod
+    def _copy_buffer(
+        value: object, maximum: int
+    ) -> tuple[bytes | None, str | None]:
+        """Copy one immutable contiguous byte buffer without calling its hooks."""
+        if not isinstance(value, _BUFFER_TYPES):
+            return None, _BUFFER_INVALID
+
+        view: memoryview | None = None
+        view_failed = False
+        try:
+            # Constructing the builtin view uses the buffer protocol directly. In
+            # particular, bytes/bytearray subclass ``__len__`` and ``__bytes__``
+            # overrides cannot influence either the bound or the copy below.
+            view = memoryview(value)
+        except Exception:
+            view_failed = True
+        value = None
+        if view_failed or view is None:
+            return None, _BUFFER_CONVERSION_FAILED
+
+        try:
+            size = view.nbytes
+            if size > maximum:
+                return None, _BUFFER_OVERSIZED
+            if not view.c_contiguous:
+                return None, _BUFFER_NONCONTIGUOUS
+            # A writable exporter can change bytes while a snapshot is being
+            # checksummed or parsed. Reject it rather than accepting a torn copy.
+            if not view.readonly:
+                return None, _BUFFER_MUTABLE
+
+            copied: bytes | None = None
+            copy_failed = False
+            try:
+                copied = view.tobytes()
+            except Exception:
+                copy_failed = True
+            if copy_failed or copied is None:
+                return None, _BUFFER_CONVERSION_FAILED
+            # Revalidate the builtin result before any parser, hash, or backend
+            # sees it. This also keeps an unexpected exporter conversion bounded.
+            if len(copied) != size:
+                return None, _BUFFER_CONVERSION_FAILED
+            if len(copied) > maximum:
+                return None, _BUFFER_OVERSIZED
+            return copied, None
+        finally:
+            view.release()
+
+    @staticmethod
     def _decode_manifest(value: bytes) -> _Manifest | None:
         if len(value) > _MAX_MANIFEST_BYTES:
             return None
@@ -206,14 +262,20 @@ class SnapshotRepository:
         value = self._retrieve(key, "Snapshot manifest retrieval failed.")
         if value is None:
             return SnapshotRead(False, None, False)
-        if not isinstance(value, (bytes, bytearray, memoryview)):
+        raw, buffer_error = self._copy_buffer(
+            value, max(self._max_bytes, _MAX_MANIFEST_BYTES)
+        )
+        value = None
+        if buffer_error == _BUFFER_INVALID:
             raise SnapshotRepositoryError("Snapshot manifest has an invalid type.")
-        raw_length = len(value)
-        if isinstance(value, memoryview):
-            raw_length = value.nbytes
-        if raw_length > max(self._max_bytes, _MAX_MANIFEST_BYTES):
+        if buffer_error == _BUFFER_NONCONTIGUOUS:
+            raise SnapshotRepositoryError("Snapshot manifest is not contiguous.")
+        if buffer_error == _BUFFER_MUTABLE:
+            raise SnapshotRepositoryError("Snapshot manifest is mutable.")
+        if buffer_error == _BUFFER_OVERSIZED:
             raise SnapshotRepositoryError("Snapshot exceeds the configured size limit.")
-        raw = bytes(value)
+        if buffer_error is not None or raw is None:
+            raise SnapshotRepositoryError("Snapshot manifest conversion failed.")
         manifest = self._decode_manifest(raw)
         if manifest is None:
             if len(raw) > self._max_bytes:
@@ -236,20 +298,29 @@ class SnapshotRepository:
                 self._chunk_key(key, manifest.generation, index),
                 "Snapshot chunk retrieval failed.",
             )
-            if not isinstance(chunk, (bytes, bytearray, memoryview)):
-                raise SnapshotRepositoryError("Snapshot chunk is missing or invalid.")
             expected = min(
                 manifest.chunk_bytes,
                 manifest.length - (index * manifest.chunk_bytes),
             )
-            chunk_length = len(chunk)
-            if isinstance(chunk, memoryview):
-                chunk_length = chunk.nbytes
-            if chunk_length != expected:
+            copied_chunk, buffer_error = self._copy_buffer(chunk, expected)
+            chunk = None
+            if buffer_error == _BUFFER_INVALID:
+                raise SnapshotRepositoryError("Snapshot chunk is missing or invalid.")
+            if buffer_error == _BUFFER_NONCONTIGUOUS:
+                raise SnapshotRepositoryError("Snapshot chunk is not contiguous.")
+            if buffer_error == _BUFFER_MUTABLE:
+                raise SnapshotRepositoryError("Snapshot chunk is mutable.")
+            if buffer_error == _BUFFER_OVERSIZED:
                 raise SnapshotRepositoryError(
                     "Snapshot chunk length validation failed."
                 )
-            assembled.extend(bytes(chunk))
+            if buffer_error is not None or copied_chunk is None:
+                raise SnapshotRepositoryError("Snapshot chunk conversion failed.")
+            if len(copied_chunk) != expected:
+                raise SnapshotRepositoryError(
+                    "Snapshot chunk length validation failed."
+                )
+            assembled.extend(copied_chunk)
         state = bytes(assembled)
         if len(state) != manifest.length:
             raise SnapshotRepositoryError("Snapshot length validation failed.")
@@ -260,13 +331,29 @@ class SnapshotRepository:
     def commit(self, key: str, state: bytes | None) -> None:
         """Commit ``state`` by writing all generation chunks before its manifest."""
         self._validate_logical_key(key)
-        if state is not None and not isinstance(state, bytes):
-            raise SnapshotRepositoryError("Strategy snapshot has an invalid type.")
-        length = 0 if state is None else len(state)
+        payload = b""
+        buffer_error: str | None = None
+        if state is not None:
+            if not isinstance(state, bytes):
+                state = None
+                raise SnapshotRepositoryError("Strategy snapshot has an invalid type.")
+            copied_payload, buffer_error = self._copy_buffer(state, self._max_bytes)
+            state = None
+            if buffer_error == _BUFFER_NONCONTIGUOUS:
+                raise SnapshotRepositoryError("Strategy snapshot is not contiguous.")
+            if buffer_error == _BUFFER_MUTABLE:
+                raise SnapshotRepositoryError("Strategy snapshot is mutable.")
+            if buffer_error == _BUFFER_OVERSIZED:
+                raise SnapshotRepositoryError(
+                    "Snapshot exceeds the configured size limit."
+                )
+            if buffer_error is not None or copied_payload is None:
+                raise SnapshotRepositoryError("Strategy snapshot conversion failed.")
+            payload = copied_payload
+        length = len(payload)
         if length > self._max_bytes:
             raise SnapshotRepositoryError("Snapshot exceeds the configured size limit.")
         generation = uuid.uuid4().hex
-        payload = b"" if state is None else state
         chunks = (length + self._chunk_bytes - 1) // self._chunk_bytes
         for index in range(chunks):
             start = index * self._chunk_bytes

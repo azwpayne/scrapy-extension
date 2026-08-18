@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import traceback
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,6 +17,19 @@ from scrapy_extension.queue.snapshot import (
 )
 
 _KEY = "queue:snapshot:v3:0::1:q"
+_SECRET_MARKER = "snapshot-buffer-private-marker"
+
+
+def _assert_static_repository_error(error: SnapshotRepositoryError) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert _SECRET_MARKER not in "".join(traceback.format_exception(error))
+    current = error.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        if "/src/scrapy_extension/" in frame.f_code.co_filename:
+            assert _SECRET_MARKER not in repr(frame.f_locals)
+        current = current.tb_next
 
 
 def _storage(initial: dict[str, bytes] | None = None):
@@ -163,6 +178,27 @@ class _CopyBombBytearray(bytearray):
         raise AssertionError("oversized backend value must not be copied")
 
 
+class _LengthLiarBytes(bytes):
+    def __len__(self) -> int:
+        return 10**9
+
+
+class _OversizedReturnBytes(bytes):
+    conversion_attempted = False
+
+    def __bytes__(self) -> bytes:
+        type(self).conversion_attempted = True
+        return _SECRET_MARKER.encode() * (1024 * 1024)
+
+
+class _RaisingConversionBytes(bytes):
+    conversion_attempted = False
+
+    def __bytes__(self) -> bytes:
+        type(self).conversion_attempted = True
+        raise RuntimeError(_SECRET_MARKER)
+
+
 @pytest.mark.parametrize("use_memoryview", [False, True])
 def test_oversized_bytes_like_manifest_is_rejected_before_copy(
     use_memoryview: bool,
@@ -205,6 +241,87 @@ def test_bounded_memoryview_manifest_and_chunks_round_trip() -> None:
         values[key] = memoryview(value)
 
     assert repository.read(_KEY).state == b"bounded-state"
+
+
+def test_length_liar_uses_buffer_nbytes_for_commit_and_read() -> None:
+    storage, values = _storage({_KEY: _LengthLiarBytes(b"legacy")})
+    repository = SnapshotRepository(storage, max_bytes=16, chunk_bytes=4)
+
+    assert repository.read(_KEY).state == b"legacy"
+    repository.commit(_KEY, _LengthLiarBytes(b"bounded"))
+
+    assert repository.read(_KEY).state == b"bounded"
+    assert all(type(value) is bytes for value in values.values())
+
+
+@pytest.mark.parametrize(
+    "hostile_type", [_OversizedReturnBytes, _RaisingConversionBytes]
+)
+def test_overridden_bytes_conversion_is_never_called(
+    hostile_type: type[bytes],
+) -> None:
+    hostile_type.conversion_attempted = False  # type: ignore[attr-defined]
+    storage, _ = _storage({_KEY: hostile_type(b"legacy")})
+    repository = SnapshotRepository(storage, max_bytes=16, chunk_bytes=4)
+
+    assert repository.read(_KEY).state == b"legacy"
+    repository.commit(_KEY, hostile_type(b"bounded"))
+
+    assert repository.read(_KEY).state == b"bounded"
+    assert hostile_type.conversion_attempted is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.timeout(10)
+def test_concurrently_mutable_manifest_is_rejected_without_a_secret_graph() -> None:
+    value = bytearray(_SECRET_MARKER.encode())
+    storage = MagicMock()
+    storage.retrieve.return_value = value
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+    started = threading.Event()
+    stop = threading.Event()
+
+    def mutate() -> None:
+        started.set()
+        replacement = ord("x")
+        while not stop.is_set():
+            value[0] = replacement
+            replacement = ord("y") if replacement == ord("x") else ord("x")
+
+    mutator = threading.Thread(target=mutate, daemon=True)
+    mutator.start()
+    assert started.wait(timeout=2.0)
+    try:
+        with pytest.raises(SnapshotRepositoryError, match="mutable") as exc_info:
+            repository.read(_KEY)
+    finally:
+        stop.set()
+        mutator.join(timeout=2.0)
+
+    assert not mutator.is_alive()
+    _assert_static_repository_error(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "backend_value, message",
+    [
+        (memoryview(b"noncontiguous")[::2], "not contiguous"),
+        (memoryview(b"released"), "conversion failed"),
+    ],
+    ids=["noncontiguous", "released"],
+)
+def test_invalid_buffer_conversion_is_static_and_context_free(
+    backend_value: memoryview, message: str
+) -> None:
+    if message == "conversion failed":
+        backend_value.release()
+    storage = MagicMock()
+    storage.retrieve.return_value = backend_value
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+
+    with pytest.raises(SnapshotRepositoryError, match=message) as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
 
 
 def _logical_key(
