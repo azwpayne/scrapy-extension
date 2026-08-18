@@ -47,8 +47,7 @@ def create_storage_strategy(name: str, **opts: Any) -> StorageStrategy:
     """Build the storage strategy for ``name``.
 
     Args:
-        name: Strategy name (``"passthrough"`` or ``"batched"``). Case-insensitive
-            via :class:`StorageStrategyType` lookup.
+        name: Case-sensitive strategy name (``"passthrough"`` or ``"batched"``).
         **opts: Strategy-specific options. ``BatchedStorageStrategy`` accepts
             ``threshold`` (int, default 100); passthrough accepts none.
 

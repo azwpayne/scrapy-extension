@@ -142,7 +142,8 @@ sets are far smaller.
 
 ## Switch storage strategy
 
-Select a `StorageStrategy` via `SCRAPY_STORAGE_STRATEGY` — no code change required.
+Select a `StorageStrategy` via `SCRAPY_STORAGE_STRATEGY` — no code change
+required. Names are case-sensitive: use lowercase `passthrough` or `batched`.
 
 | Strategy | When to use | Durability boundary |
 |---|---|---|

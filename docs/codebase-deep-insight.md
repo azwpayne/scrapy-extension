@@ -66,7 +66,7 @@ Five layers, each independently substitutable:
         Configuration (pydantic-settings) cuts vertically through all layers
 ```
 
-Each layer talks **only downward** through injected interfaces. Strategies receive a `ConnectionManager`; components receive strategies+backends via `from_settings()` / `from_crawler()` factories. No layer reaches up.
+Each layer talks **only downward** through injected interfaces. Strategies receive a `ConnectionManager`; factory-backed components receive strategies+backends through their supported `from_settings()` / `from_crawler()` entry points, while `BackendQueue` is constructed directly. No layer reaches up.
 
 ---
 
@@ -183,7 +183,9 @@ from the connected queue/message policy, not from publisher confirmation alone.
 
 ## 5. Scrapy Components (L5)
 
-All five follow Scrapy's `from_settings()` / `from_crawler()` factory pattern.
+Factory support is component-specific: scheduler, dupefilter, and pipeline expose
+both `from_settings()` and `from_crawler()`; `BackendSpiderMixin` exposes
+`from_crawler()`; `BackendQueue` is constructed directly.
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
@@ -191,7 +193,7 @@ All five follow Scrapy's `from_settings()` / `from_crawler()` factory pattern.
 | `BackendDupeFilter` | `dupefilter/dupefilter.py` (403 LOC) | Delegates to a `MembershipFilter`; handles `FilterFull` gracefully |
 | `BackendQueue` | `queue/queue.py` (725 LOC) | Request serialization/deserialization; delegates push/pop to a `QueueStrategy`; carries ack tokens in `request.meta`; depth-probe sampling (U4) |
 | `BackendPipeline` | `pipeline/pipeline.py` (351 LOC) | Item storage via a `StorageStrategy` + `StorageBackend`; C2 escalation (max consecutive errors) |
-| `BackendSpiderMixin` | `spider/spider_mixin.py` (395 LOC) | Spider mixin; `setup_backend()` in `__init__` |
+| `BackendSpiderMixin` | `spider/spider_mixin.py` (395 LOC) | Spider mixin; `from_crawler()` performs automatic setup, while direct construction requires explicit `setup_backend()` |
 
 `resolve_backend_config()` (in `connectors.py`) is the central config resolver used by all three component factories — enables **multi-backend coexistence**: queue in Redis, dedup in MongoDB, storage in ElasticSearch, each via independent connection managers keyed separately by `backend_type:settings_hash`.
 

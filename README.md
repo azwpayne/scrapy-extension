@@ -821,7 +821,9 @@ entries, but cannot lose the only copy of entries not yet processed.
 
 ### Storage strategy — `SCRAPY_STORAGE_STRATEGY`
 
-`BackendPipeline` delegates item writes to a `StorageStrategy`:
+Storage strategy names are case-sensitive and must use the documented lowercase
+values (`passthrough` or `batched`). `BackendPipeline` delegates item writes to a
+`StorageStrategy`:
 
 | Strategy | Behavior | Durability note |
 |----------|----------|-----------------|
@@ -973,7 +975,26 @@ use the same backend.
 | Queue        | `BackendQueue`       | Serializes/deserializes Scrapy requests           |
 | SpiderMixin  | `BackendSpiderMixin` | Convenient access to backend components           |
 
-All components follow Scrapy's `from_settings()` / `from_crawler()` factory pattern.
+Factory availability is component-specific:
+
+| Component | Supported construction entry points |
+|---|---|
+| `BackendScheduler` | `from_settings()` and `from_crawler()` |
+| `BackendDupeFilter` | `from_settings()` and `from_crawler()` |
+| `BackendPipeline` | `from_settings()` and `from_crawler()` |
+| `BackendQueue` | Direct constructor only; optional keyword-only `spider=None` |
+| `BackendSpiderMixin` | `from_crawler()` through Scrapy, or direct construction followed by explicit `setup_backend()` |
+
+### Public API tiers
+
+This concise symbol guide does not add or remove exports; the complete inventory
+and compatibility rules are in the [stability policy](https://github.com/azwpayne/scrapy-extension/blob/main/.github/STABILITY.md).
+
+| Tier | Representative symbols | Compatibility contract |
+|---|---|---|
+| Stable | Core components above; `Backend`, `QueueBackend`, `SetBackend`, `StorageBackend`; `ConnectionManager`; `BackendType`, `Serializer`, `JSONSerializer`; root-exported exceptions | No intentional patch-release break. Before 1.0, an unavoidable break requires a minor release, changelog entry, and migration guidance. |
+| Experimental | `BackendDescriptor` plugin registration; strategies, hooks, and settings explicitly marked Experimental in the stability policy | May change in a pre-1.0 minor release with notice. |
+| Private (Internal) | `_`-prefixed symbols and unlisted implementation helpers | No compatibility promise; do not import directly. |
 
 ### Scheduler
 

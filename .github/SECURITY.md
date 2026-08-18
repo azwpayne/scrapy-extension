@@ -2,13 +2,14 @@
 
 ## Supported versions
 
-`scrapy-extension` is pre-1.0 (`0.1.x`). Only the **latest release** receives
-security fixes.
+`scrapy-extension` is pre-1.0. Only the **latest published pre-1.0 release**
+receives security fixes; support does not continue on older `0.x` minor or patch
+releases.
 
 | Version | Supported |
 |---|---|
-| latest `0.1.x` | ✅ |
-| older `0.1.x` | ❌ |
+| latest published pre-1.0 release | ✅ |
+| older pre-1.0 releases | ❌ |
 
 ## Reporting a vulnerability
 
@@ -43,7 +44,7 @@ package are in scope.
 - **Fix or mitigation:** target 30 days for `High`/`Critical`, 90 days for
   `Medium`/`Low`. Coordinated disclosure timing is honored on request.
 
-A fix is released on the earliest affected minor or patch line; a public
+A fix is released on the currently supported pre-1.0 release line; a public
 advisory is published alongside the release.
 
 ## Built-in security controls

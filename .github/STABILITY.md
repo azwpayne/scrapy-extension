@@ -26,11 +26,11 @@ comes from this document; being exported does not automatically make it Stable.
 
 | Surface | Tier | Notes |
 |---|---|---|
-| `BackendScheduler` (`schedule/scheduler.py`) | Stable | `from_settings` / `from_crawler` factory; backpressure gates (round-4) are separately flagged Experimental below. |
-| `BackendDupeFilter` (`dupefilter/dupefilter.py`) | Stable | Strategy selection via `SCRAPY_DEDUP_STRATEGY` is Stable; per-strategy tiers in the next table. |
-| `BackendPipeline` (`pipeline/pipeline.py`) | Stable | |
-| `BackendQueue` (`queue/queue.py`) | Stable | `depth_sample_every` (round-9 U4) is Stable with a safe default. |
-| `BackendSpiderMixin` (`spider/spider_mixin.py`) | Stable | |
+| `BackendScheduler` (`schedule/scheduler.py`) | Stable | Provides `from_settings` and `from_crawler`; backpressure gates (round-4) are separately flagged Experimental below. |
+| `BackendDupeFilter` (`dupefilter/dupefilter.py`) | Stable | Provides `from_settings` and `from_crawler`. Strategy selection via `SCRAPY_DEDUP_STRATEGY` is Stable; per-strategy tiers in the next table. |
+| `BackendPipeline` (`pipeline/pipeline.py`) | Stable | Provides `from_settings` and `from_crawler`. |
+| `BackendQueue` (`queue/queue.py`) | Stable | Direct construction only; `spider` is optional and keyword-only. `depth_sample_every` (round-9 U4) is Stable with a safe default. |
+| `BackendSpiderMixin` (`spider/spider_mixin.py`) | Stable | Provides `from_crawler`; direct construction requires explicit `setup_backend()` before backend access. |
 | `Backend` / `QueueBackend` / `SetBackend` / `StorageBackend` ABCs | Stable | The abstract contract 3rd-party backends implement. `QueueBackend.push()` retains its stable signature/`None` return; the `_`-prefixed operation-bound durability receipt is Internal and existing plugins inherit a source-compatible volatile default. |
 | `ConnectionManager` (`backends/connectors.py`) | Stable | Lazy shared registry keyed by `backend_type:settings_digest`. Each `get_manager()` acquisition requires exactly one `close()` release. |
 | `scrapy_extension.backends.connectors.resolve_backend_config()` | Stable | Public fully qualified import used by all three component factories. |

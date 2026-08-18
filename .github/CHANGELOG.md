@@ -522,7 +522,8 @@ upgrading.
 - `ConnectionManager.close()` evicts the instance from the class-level
   registry.
 - `BackendSpiderMixin` now extends `Spider` directly (removes `cast`).
-- `BackendQueue.spider` is a required keyword-only argument.
+- `BackendQueue.spider` is accepted as an optional keyword-only argument for
+  callback/errback restoration.
 - `_validate_key_name` consolidated to single canonical implementation in
   `base.py` (was duplicated across ES and RabbitMQ with diverged patterns).
 - `BackendQueue._request_to_dict` body encoding changed from UTF-8/latin-1
