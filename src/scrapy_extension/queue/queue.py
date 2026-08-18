@@ -242,10 +242,12 @@ class BackendQueue:
         self._close_complete = False
         self._close_in_progress = False
         self._close_attempt = 0
+        self._close_owner_token: object | None = None
         # Retain an attempt outcome until every caller that observed that exact
-        # attempt has consumed it. A retry must not overtake those waiters.
+        # attempt has consumed it. Per-caller tokens make registration and
+        # idempotent cleanup safe when process-control exceptions interrupt either.
         self._close_attempt_outcomes: dict[int, bool] = {}
-        self._close_attempt_waiters: dict[int, int] = {}
+        self._close_attempt_waiters: dict[int, set[object]] = {}
         self._begin_close_complete = False
         self._checkpoint_complete = False
         self._monitor: Monitor = (
@@ -1276,6 +1278,85 @@ class BackendQueue:
             return ScrapyStatsMonitor(stats)
         return NullMonitor()
 
+    def _cleanup_close_waiter_locked(
+        self, attempt: int, waiter_token: object
+    ) -> BaseException | None:
+        """Idempotently reclaim one waiter and its consumed outcome.
+
+        This runs with ``_operation_gate`` held. If an asynchronous exception lands
+        during one of the map operations, repeat the whole cleanup before allowing
+        that exception to propagate.
+        """
+        interrupted: BaseException | None = None
+        while True:
+            try:
+                waiters = self._close_attempt_waiters.get(attempt)
+                if waiters is not None:
+                    waiters.discard(waiter_token)
+                if not waiters:
+                    self._close_attempt_waiters.pop(attempt, None)
+                    self._close_attempt_outcomes.pop(attempt, None)
+                return interrupted
+            except BaseException as exc:
+                if interrupted is None:
+                    interrupted = exc
+
+    def _wait_for_close_attempt_locked(self, attempt: int) -> None:
+        """Register, await, and reclaim one close-attempt observation."""
+        waiter_token = object()
+        failure: BaseException | None = None
+        cleanup_failure: BaseException | None = None
+        observed_success = False
+        try:
+            self._close_attempt_waiters.setdefault(attempt, set()).add(waiter_token)
+            while attempt not in self._close_attempt_outcomes:
+                self._operation_gate.wait()
+            observed_success = self._close_attempt_outcomes[attempt]
+        except BaseException as exc:
+            failure = exc
+        finally:
+            cleanup_failure = self._cleanup_close_waiter_locked(attempt, waiter_token)
+        if failure is not None:
+            raise failure
+        if cleanup_failure is not None:
+            raise cleanup_failure
+        if not observed_success:
+            raise QueueError("Queue close failed; checkpoint can be retried.")
+
+    def _publish_close_attempt(
+        self,
+        attempt: int,
+        owner_token: object,
+        *,
+        succeeded: bool,
+    ) -> BaseException | None:
+        """Publish a terminal attempt outcome despite gate interruptions.
+
+        Publication is idempotent. Any ``BaseException`` raised while acquiring,
+        mutating, notifying, or releasing the gate is deferred until a complete
+        pass repairs lifecycle state and wakes registered waiters.
+        """
+        interrupted: BaseException | None = None
+        while True:
+            try:
+                with self._operation_gate:
+                    if self._close_owner_token is owner_token:
+                        self._close_in_progress = False
+                        self._close_owner_token = None
+                        if succeeded:
+                            self._close_complete = True
+                    waiters = self._close_attempt_waiters.get(attempt)
+                    if waiters:
+                        self._close_attempt_outcomes[attempt] = succeeded
+                    else:
+                        self._close_attempt_waiters.pop(attempt, None)
+                        self._close_attempt_outcomes.pop(attempt, None)
+                    self._operation_gate.notify_all()
+                return interrupted
+            except BaseException as exc:
+                if interrupted is None:
+                    interrupted = exc
+
     def close(self, *, lossy: bool = False) -> None:
         """Transactionally checkpoint and close the strategy.
 
@@ -1285,36 +1366,30 @@ class BackendQueue:
         abort path for discarding nonempty state when no durable checkpoint can be
         made.
         """
-        with self._operation_gate:
-            if self._close_complete:
-                return
-            if self._close_in_progress:
-                observed_attempt = self._close_attempt
-                self._close_attempt_waiters[observed_attempt] = (
-                    self._close_attempt_waiters.get(observed_attempt, 0) + 1
-                )
-                try:
-                    while observed_attempt not in self._close_attempt_outcomes:
-                        self._operation_gate.wait()
-                    observed_success = self._close_attempt_outcomes[observed_attempt]
-                finally:
-                    remaining_waiters = (
-                        self._close_attempt_waiters[observed_attempt] - 1
-                    )
-                    if remaining_waiters == 0:
-                        del self._close_attempt_waiters[observed_attempt]
-                        self._close_attempt_outcomes.pop(observed_attempt, None)
-                    else:
-                        self._close_attempt_waiters[observed_attempt] = (
-                            remaining_waiters
-                        )
-                if observed_success:
+        owner_token = object()
+        attempt = 0
+        try:
+            with self._operation_gate:
+                if self._close_complete:
                     return
-                raise QueueError("Queue close failed; checkpoint can be retried.")
-            self._close_in_progress = True
-            self._close_attempt += 1
-            attempt = self._close_attempt
-            self._accepting_operations = False
+                if self._close_in_progress:
+                    self._wait_for_close_attempt_locked(self._close_attempt)
+                    return
+                self._close_attempt += 1
+                attempt = self._close_attempt
+                self._close_owner_token = owner_token
+                self._close_in_progress = True
+                self._accepting_operations = False
+        except BaseException as exc:
+            if self._close_owner_token is owner_token:
+                publication_failure = self._publish_close_attempt(
+                    attempt, owner_token, succeeded=False
+                )
+                if publication_failure is not None and not isinstance(
+                    exc, (KeyboardInterrupt, SystemExit)
+                ):
+                    raise publication_failure
+            raise
 
         failure: BaseException | None = None
         try:
@@ -1332,13 +1407,13 @@ class BackendQueue:
         except BaseException as exc:
             failure = exc
 
-        with self._operation_gate:
-            self._close_in_progress = False
-            if self._close_attempt_waiters.get(attempt, 0) > 0:
-                self._close_attempt_outcomes[attempt] = failure is None
-            if failure is None:
-                self._close_complete = True
-            self._operation_gate.notify_all()
+        publication_failure = self._publish_close_attempt(
+            attempt, owner_token, succeeded=failure is None
+        )
+        if publication_failure is not None and (
+            failure is None or not isinstance(failure, (KeyboardInterrupt, SystemExit))
+        ):
+            raise publication_failure
         if failure is not None:
             raise failure
 
