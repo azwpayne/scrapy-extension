@@ -106,6 +106,26 @@ class _FailingShutdownClient:
         raise RuntimeError("fixed shutdown failure")
 
 
+class _ShutdownControlSignal(BaseException):
+    """Custom process-control signal used to verify exact type preservation."""
+
+
+class _ControlShutdownClient:
+    """Expose nested client state from a shutdown control-exception frame."""
+
+    def __init__(
+        self, private_state: object, control_error: BaseException | None = None
+    ) -> None:
+        self.state = {"nested": [private_state]}
+        self.control_error = control_error
+        self.shutdown_calls = 0
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        if self.control_error is not None:
+            raise self.control_error
+
+
 def _patch_rocketmq(mocker):
     """Install a stub of the apache 5.1.1 top-level client surface.
 
@@ -973,6 +993,59 @@ def test_disconnect_closes_all_clients_after_baseexception(mocker) -> None:
     consumer.shutdown.assert_called_once_with()
     assert backend._producer is None
     assert backend._consumer is None
+
+
+@pytest.mark.parametrize("private_location", ("producer", "consumer", "config"))
+@pytest.mark.parametrize(
+    ("control_error_type", "control_args"),
+    (
+        (KeyboardInterrupt, ()),
+        (SystemExit, (17,)),
+        (_ShutdownControlSignal, ("stop",)),
+    ),
+    ids=("keyboard-interrupt", "system-exit", "custom-baseexception"),
+)
+def test_disconnect_control_exception_recursively_redacts_teardown_state(
+    private_location: str,
+    control_error_type: type[BaseException],
+    control_args: tuple[object, ...],
+) -> None:
+    """The exact shutdown signal escapes without old client/config frames."""
+    marker = f"rocketmq-control-{private_location}-private-marker"
+    settings = RocketMQSettings(
+        namesrv_address=(
+            f"{marker}.example:8081"
+            if private_location == "config"
+            else "localhost:8081"
+        ),
+        allow_remote_plaintext=True,
+    )
+    control_error = control_error_type(*control_args)
+    control_error.__cause__ = RuntimeError("obsolete shutdown cause")
+    control_error.__context__ = RuntimeError("obsolete shutdown context")
+    producer = _ControlShutdownClient(
+        marker if private_location == "producer" else "public producer state",
+        control_error if private_location != "consumer" else None,
+    )
+    consumer = _ControlShutdownClient(
+        marker if private_location == "consumer" else "public consumer state",
+        control_error if private_location == "consumer" else None,
+    )
+    backend = RocketMQBackend(settings)
+    backend._producer = producer
+    backend._consumer = consumer
+
+    with pytest.raises(BaseException) as exc_info:
+        backend.disconnect()
+
+    error = exc_info.value
+    assert error is control_error
+    assert type(error) is control_error_type
+    assert producer.shutdown_calls == 1
+    assert consumer.shutdown_calls == 1
+    assert backend._producer is None
+    assert backend._consumer is None
+    _assert_capability_error_is_redacted(error, marker)
 
 
 # ---------------------------------------------------------------------------

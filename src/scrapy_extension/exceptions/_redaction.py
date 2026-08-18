@@ -588,6 +588,44 @@ def configuration_error_boundary(
     return decorate
 
 
+def control_exception_traceback_boundary(
+    function: Callable[_P, _T],
+) -> Callable[_P, _T]:
+    """Preserve process-control identity without its protected traceback graph.
+
+    Cleanup paths may catch ``KeyboardInterrupt``, ``SystemExit``, or another
+    direct ``BaseException`` subclass long enough to finish peer cleanup.  Once
+    those implementation frames have unwound, clear the original exception
+    chain and traceback, release the wrapper arguments, and re-raise the exact
+    same object.  Ordinary exceptions retain their established behavior.
+    """
+
+    @wraps(function)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        caught_error: BaseException | None = None
+        try:
+            return function(*args, **kwargs)
+        except Exception:
+            del args
+            del kwargs
+            raise
+        except BaseException as error:
+            caught_error = error
+
+        assert caught_error is not None
+        caught_error.__traceback__ = None
+        caught_error.__cause__ = None
+        caught_error.__context__ = None
+        caught_error.__suppress_context__ = True
+        sanitized_error = caught_error
+        del args
+        del kwargs
+        del caught_error
+        raise sanitized_error
+
+    return wrapped
+
+
 def import_error_traceback_boundary(
     function: Callable[_P, _T],
 ) -> Callable[_P, _T]:

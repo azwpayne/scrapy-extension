@@ -49,6 +49,7 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.exceptions._redaction import (
     backend_connection_error_boundary,
     configuration_error_boundary,
+    control_exception_traceback_boundary,
     import_error_traceback_boundary,
     not_implemented_error_boundary,
     queue_operation_error_boundary,
@@ -525,6 +526,7 @@ class RocketMQBackend(Backend, QueueBackend):
         worker_stopped = self._finish_receive_pump_shutdown(worker)
         return cleanup_failed or not worker_stopped
 
+    @control_exception_traceback_boundary
     @backend_connection_error_boundary(
         _ROCKETMQ_DISCONNECT_ERROR,
         "rocketmq",
