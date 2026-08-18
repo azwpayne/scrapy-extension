@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.12.3,<0.13"]
+requires = ["uv_build==0.12.3"]
 build-backend = "uv_build"
 
 [project]
@@ -85,11 +85,13 @@ all = [
 [dependency-groups]
 dev = [
     "poethepoet",
-    "pytest-benchmark>=5.2.3",
     "ruff",
 ]
 test = [
     "pytest",
+    # Referenced by the root collection gate and warning policy, so the test
+    # group must be independently runnable from an extracted sdist.
+    "pytest-benchmark>=5.2.3",
     "pytest-xdist[psutil]",
     "pytest-randomly",
     "pytest-timeout",
@@ -129,9 +131,12 @@ source-include = [
     ".github/CONTRIBUTING.md",
     ".github/SECURITY.md",
     ".github/STABILITY.md",
+    ".github/workflows/**",
+    "conftest.py",
     "docs/**",
     "examples/**",
     "tests/**",
+    "uv.lock",
 ]
 source-exclude = [
     # uv-build's explicit source includes are broader than .gitignore. Keep
@@ -150,10 +155,37 @@ source-exclude = [
     "**/*.pfx",
     "**/*.jks",
     "**/*.keystore",
+    # Coverage, test, type-checker, and tool caches/reports.
+    "**/.coverage",
+    "**/.coverage.*",
+    "**/.benchmarks/**",
+    "**/.cache/**",
+    "**/.hypothesis/**",
+    "**/.mypy_cache/**",
+    "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
+    "**/__pycache__/**",
+    "**/coverage.json",
+    "**/coverage.xml",
+    "**/htmlcov/**",
+    "**/reports/**",
+    # Local runtime state and generated packaging canaries.
     "**/*.db",
+    "**/*.db-*",
+    "**/*.log",
+    "**/*.sqlite",
+    "**/*.sqlite-*",
+    "**/*.sqlite3",
+    "**/*.sqlite3-*",
+    "**/local-settings.*",
+    "**/local_settings.py",
+    "**/generated-canary*/**",
+    "**/.packaging-canary*/**",
     "**/.DS_Store",
-    # Historical working notes are useful in Git but are not user-facing
-    # package documentation.
+    # Historical working notes and archived audits are useful in Git but are
+    # not user-facing package documentation.
+    "docs/archive/**",
+    "docs/audits/**",
     "docs/insight/**",
     "docs/superpowers/**",
 ]

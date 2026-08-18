@@ -84,18 +84,37 @@ jobs:
           )
           assert all(result["stats"]["rounds"] > 0 for result in benchmarks)
           PY
-      - name: Build package artifacts
-        if: matrix.python-version == '3.10'
-        run: uv build --clear --python ${{ matrix.python-version }}
-      - name: Verify package artifact contents
+      - name: Build package artifacts from a clean tracked archive twice
         if: matrix.python-version == '3.10'
         shell: bash
         run: |
+          set -euo pipefail
+          build_root=$(mktemp -d)
+          git archive --format=tar HEAD | tar -xf - -C "$build_root"
+          for pass in 1 2; do
+            out="$GITHUB_WORKSPACE/.artifact-build-$pass"
+            (
+              cd "$build_root"
+              uv build --clear --python ${{ matrix.python-version }} --out-dir "$out"
+            )
+            (cd "$out" && sha256sum * | sort -k2) > ".artifact-hashes-$pass"
+          done
+          diff -u .artifact-hashes-1 .artifact-hashes-2
+          mkdir dist
+          cp .artifact-build-1/* dist/
+          cat .artifact-hashes-1
+      - name: Verify wheel and source artifact manifests
+        if: matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          set -euo pipefail
           shopt -s nullglob
-          artifacts=(dist/*.whl dist/*.tar.gz)
-          test "${#artifacts[@]}" -eq 2
-          forbidden='(^|/)(\.env[^/]*|\.secrets/|credentials/|secrets/)|\.(pem|key|crt|cer|p12|pfx|jks|keystore)$|(^|/)docs/insight/'
-          for artifact in "${artifacts[@]}"; do
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          forbidden='(^|/)(\.coverage($|\.)|\.benchmarks/|\.cache/|\.env[^/]*|\.hypothesis/|\.mypy_cache/|\.packaging-canary|\.pytest_cache/|\.ruff_cache/|\.secrets/|__pycache__/|credentials/|generated-canary|htmlcov/|reports/|secrets/)|\.(db|log|sqlite|sqlite3)(-|$)|\.(pem|key|crt|cer|p12|pfx|jks|keystore)$|(^|/)local[_-]settings\.|(^|/)docs/(archive|audits|insight|superpowers)/'
+          for artifact in "${wheels[0]}" "${sdists[0]}"; do
             if [[ "$artifact" == *.whl ]]; then
               contents=$(unzip -Z1 "$artifact")
             else
@@ -107,6 +126,37 @@ jobs:
               exit 1
             fi
           done
+          sdist_contents=$(tar -tzf "${sdists[0]}" | sed 's|^[^/]*/||')
+          for required in \
+            conftest.py \
+            uv.lock \
+            .github/workflows/ci.yml \
+            .github/workflows/codeql.yml \
+            tests/test_packaging_contract.py; do
+            grep -Fqx "$required" <<<"$sdist_contents"
+          done
+          wheel_contents=$(unzip -Z1 "${wheels[0]}")
+          grep -Fqx 'scrapy_extension/py.typed' <<<"$wheel_contents"
+          if grep -Eq '(^|/)(tests|examples|docs|conftest\.py|uv\.lock)(/|$)' <<<"$wheel_contents"; then
+            echo "Wheel contains source-only test or documentation files" >&2
+            exit 1
+          fi
+      - name: Test the extracted sdist in its own locked environment
+        if: matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_root=$(mktemp -d)
+          tar -xzf dist/*.tar.gz -C "$extract_root"
+          source_root=$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$source_root"
+          uv sync --project "$source_root" --python ${{ matrix.python-version }} \
+            --locked --no-default-groups --group test
+          (
+            cd "$source_root"
+            uv run --no-sync pytest \
+              tests/test_packaging_contract.py tests/test_collection_gates.py -q
+          )
       - name: Smoke-test package artifacts
         if: matrix.python-version == '3.10'
         shell: bash
