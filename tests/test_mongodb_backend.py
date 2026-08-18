@@ -6,7 +6,7 @@ from unittest.mock import PropertyMock
 
 import pytest
 
-from scrapy_extension.backends.mongodb import MongoDBBackend
+from scrapy_extension.backends.mongodb import MongoDBBackend, _active_queue_filter
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
@@ -1086,6 +1086,8 @@ def test_mongodb_backend_push_pop(mocker):
     mock_collection.find_one_and_delete.return_value = {
         "queue_name": "test_queue",
         "item": b"test_item",
+        "priority": -1.0,
+        "created_at": datetime.now(tz=timezone.utc),
     }
     result = backend.pop("test_queue")
     assert result == b"test_item"
@@ -1150,7 +1152,7 @@ def test_mongodb_backend_queue_len(mocker):
     result = backend.queue_len("test_queue")
     assert result == 5
     mock_collection.count_documents.assert_called_once_with(
-        {"queue_name": "test_queue"}, limit=100000
+        _active_queue_filter("test_queue"), limit=100000
     )
 
 

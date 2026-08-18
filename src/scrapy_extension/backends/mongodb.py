@@ -11,6 +11,7 @@ for distributed crawling, supporting multiple deployment modes:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
+    from bson.binary import Binary
+    from bson.decimal128 import Decimal128
+    from bson.errors import BSONError
     from pymongo import ASCENDING, MongoClient, ReadPreference
     from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
     from pymongo.read_concern import ReadConcern
@@ -117,6 +121,10 @@ _MONGODB_SAFE_CONNECT_MESSAGES: frozenset[str] = frozenset(
 _MONGODB_QUEUE_PUSH_ERROR = "MongoDB queue push failed."
 _MONGODB_QUEUE_POP_ERROR = "MongoDB queue pop failed."
 _MONGODB_QUEUE_LENGTH_ERROR = "MongoDB queue length read failed."
+# MongoDB's ``number`` query alias excludes booleans. Decimal128 bounds retain
+# every finite BSON numeric value while excluding NaN and both infinities.
+_MONGODB_MAX_FINITE_PRIORITY = Decimal128("9.999999999999999999999999999999999E+6144")
+_MONGODB_MIN_FINITE_PRIORITY = Decimal128("-9.999999999999999999999999999999999E+6144")
 _MONGODB_QUEUE_CLEAR_ERROR = "MongoDB queue clear failed."
 _MONGODB_SET_ADD_ERROR = "MongoDB set add failed."
 _MONGODB_SET_REMOVE_ERROR = "MongoDB set remove failed."
@@ -139,6 +147,51 @@ def _validate_queue_name_argument(
 ) -> None:
     """Validate a direct MongoDB queue name outside its terminal boundary."""
     _validate_key_name(queue_name, "queue_name")
+
+
+def _active_queue_filter(queue_name: str) -> dict[str, Any]:
+    """Select only deliverable records; malformed records stay quarantined in place.
+
+    The backend intentionally uses no destructive cleanup pass. Documents that do
+    not match this schema remain durable in the queue collection for inspection,
+    while valid records behind them remain eligible for the atomic pop. This same
+    active-record policy is used by :meth:`MongoDBBackend.queue_len`; clear_queue
+    deliberately remains broader so it removes active and quarantined documents.
+    """
+    return {
+        "queue_name": {"$eq": queue_name},
+        "item": {"$type": "binData"},
+        "priority": {
+            "$type": "number",
+            "$gte": _MONGODB_MIN_FINITE_PRIORITY,
+            "$lte": _MONGODB_MAX_FINITE_PRIORITY,
+        },
+        "created_at": {"$type": "date"},
+    }
+
+
+def _is_valid_queue_result(result: object, queue_name: str) -> bool:
+    """Defensively verify the driver's result obeys the server query schema."""
+    if not isinstance(result, Mapping):
+        return False
+    payload = result.get("item")
+    priority = result.get("priority")
+    created_at = result.get("created_at")
+    if (
+        result.get("queue_name") != queue_name
+        or not isinstance(payload, (bytes, Binary))
+        or isinstance(priority, bool)
+        or not isinstance(created_at, datetime)
+    ):
+        return False
+    if isinstance(priority, Decimal128):
+        return priority.to_decimal().is_finite()
+    if isinstance(priority, (int, float)):
+        try:
+            return math.isfinite(priority)
+        except OverflowError:
+            return False
+    return False
 
 
 def _validate_set_name_argument(
@@ -1093,18 +1146,28 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             msg = "MongoDBBackend not connected: queue collection is None"
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            # MongoDB doesn't support blocking pop, so we ignore timeout
+            # The strict predicate is evaluated by MongoDB before its atomic delete.
+            # Consequently poison documents are never selected or removed, valid
+            # records behind them remain live, and concurrent callers still have one
+            # server-side linearization point without client-side CAS retries.
             result = queue_collection.find_one_and_delete(
-                {"queue_name": queue_name},
+                _active_queue_filter(queue_name),
                 sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
             )
-        except PyMongoError as e:
-            msg = f"Failed to pop from queue {queue_name}: {e}"
-            raise QueueError(msg, queue_name=queue_name, operation="pop") from e
-        if result:
-            # find_one_and_delete returns Any; the queue doc stores ``item`` as bytes.
-            return cast(bytes, result["item"])
-        return None
+        except (PyMongoError, BSONError) as e:
+            msg = "MongoDB atomic queue pop failed."
+            raise QueueError(msg, operation="pop") from e
+        if result is None:
+            return None
+        if not _is_valid_queue_result(result, queue_name):
+            # A conforming server cannot return a non-matching document. Treat a
+            # driver/plugin contract violation as a static backend failure rather
+            # than indexing malformed data or exposing its diagnostics.
+            raise QueueError(
+                "MongoDB returned a malformed queue record.", operation="pop"
+            )
+        payload = result["item"]
+        return bytes(payload)
 
     @queue_operation_error_boundary(
         "pop",
@@ -1148,7 +1211,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             raise BackendConnectionError(msg, backend_type="mongodb")
         try:
             return queue_collection.count_documents(
-                {"queue_name": queue_name}, limit=100000
+                _active_queue_filter(queue_name), limit=100000
             )
         except PyMongoError as e:
             msg = f"Failed to get queue length for {queue_name}: {e}"

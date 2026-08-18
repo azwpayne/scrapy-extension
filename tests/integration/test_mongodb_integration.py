@@ -4,9 +4,9 @@ Companion to ``test_redis_integration.py``. MongoDB is the second fully-
 implemented backend (Queue + Set + Storage). These tests pin the contracts
 mocks cannot verify:
 
-- R1-P0-3 (withdrawn) — ``find_one_and_delete`` pop atomicity was *assumed*
-  correct and never verified against a real MongoDB. A real round-trip
-  confirms concurrent pops can't double-consume (50 in → 50 out, no loss).
+- ``find_one_and_delete`` pop atomicity and strict valid-record selection. Real
+  round-trips confirm concurrent pops cannot double-consume and malformed queue
+  documents remain durable without starving deliverable records.
 - Priority + same-priority FIFO ordering — pop sorts
   ``priority ASC, created_at ASC`` (priority negated on push, line 404/432).
 - R31 — ``add`` returns False on duplicate via the unique ``(set_name,
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -113,6 +114,58 @@ def test_same_priority_fifo(mongo_backend, unique_prefix):
 
     popped = [mongo_backend.pop(queue, timeout=0.0) for _ in items]
     assert popped == items
+
+
+def test_poison_records_are_durable_and_excluded_from_active_length(
+    mongo_backend, unique_prefix
+):
+    """A real server enforces the strict active schema before atomic deletion."""
+    queue = f"{unique_prefix}:poison"
+    collection = mongo_backend._queue_collection
+    assert collection is not None
+    now = datetime.now(tz=timezone.utc)
+    poison_documents = [
+        {
+            "queue_name": queue,
+            "item": "not-binary",
+            "priority": -100.0,
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"bool-priority",
+            "priority": False,
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"nan-priority",
+            "priority": float("nan"),
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"infinite-priority",
+            "priority": float("-inf"),
+            "created_at": now,
+        },
+        {
+            "queue_name": queue,
+            "item": b"bad-created-at",
+            "priority": -100.0,
+            "created_at": "not-a-date",
+        },
+    ]
+    collection.insert_many(poison_documents)
+    mongo_backend.push(queue, b"deliverable", priority=1.0)
+
+    assert mongo_backend.queue_len(queue) == 1
+    assert mongo_backend.pop(queue) == b"deliverable"
+    assert mongo_backend.queue_len(queue) == 0
+    assert collection.count_documents({"queue_name": queue}) == len(poison_documents)
+
+    mongo_backend.clear_queue(queue)
+    assert collection.count_documents({"queue_name": queue}) == 0
 
 
 def test_set_add_duplicate_contract(mongo_backend, unique_prefix):
