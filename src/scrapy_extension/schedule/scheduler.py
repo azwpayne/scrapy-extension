@@ -1953,7 +1953,9 @@ class BackendScheduler:
                 try:
                     self._connected_signals.disconnect(handler, signal=signal)
                 except Exception:
-                    pass
+                    # Compatibility-only registrations predate signal leases;
+                    # keyed disconnect is intentionally best-effort here.
+                    pass  # nosec B110
             self._connected_signals = None
             self._connected_ack_signal_handlers = None
             self._signals_connected = False
