@@ -398,6 +398,14 @@ usually unreachable from the host.
 > A delivery token has one terminal outcome: concurrent ack/nack calls are
 > serialized, token-aware pops cannot be settled through the legacy slot, and
 > only a failed broker RPC leaves the token locally retryable.
+>
+> **Direct receive API restriction:** one connected RocketMQ consumer generation
+> can select exactly one logical queue/topic. Calling `pop()` or `pop_with_ack()`
+> with a different queue on that generation raises `QueueError`. To migrate,
+> stop its waiters, call `disconnect()`, call `connect()`, and make the first pop
+> on the replacement queue; tokens from the retired generation must not be
+> reused. A receive-pump failure is likewise terminal and visible to every waiter
+> until this disconnect/reconnect migration creates a fresh generation.
 
 ### Pulsar (standalone, cluster)
 

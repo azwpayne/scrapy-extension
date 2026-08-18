@@ -21,6 +21,8 @@ from scrapy_extension.settings import RocketMQSettings
 
 _MARKER = "round44-rocketmq-private-marker"
 
+pytestmark = pytest.mark.usefixtures("cleanup_rocketmq_backends")
+
 
 def _assert_value_is_redacted(
     value: object, marker: str, seen: set[int] | None = None

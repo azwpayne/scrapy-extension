@@ -4,6 +4,29 @@ import pytest
 
 
 @pytest.fixture
+def cleanup_rocketmq_backends(monkeypatch):
+    """Disconnect every RocketMQ backend created by a pump-capable unit test."""
+    from scrapy_extension.backends.rocketmq import RocketMQBackend
+
+    backends: list[RocketMQBackend] = []
+    original_init = RocketMQBackend.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        backends.append(self)
+
+    monkeypatch.setattr(RocketMQBackend, "__init__", tracked_init)
+    yield
+    for backend in reversed(backends):
+        try:
+            backend.disconnect()
+        except BaseException:
+            # Individual teardown/error-propagation tests assert the public result.
+            # Fixture cleanup only guarantees no pump survives into another test.
+            pass
+
+
+@pytest.fixture
 def mock_redis_client(mocker):
     """Create a mock Redis client."""
     return mocker.Mock()

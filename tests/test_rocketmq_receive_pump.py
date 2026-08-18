@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from scrapy_extension.backends.rocketmq import RocketMQBackend, _RocketMQAckToken
-from scrapy_extension.exceptions import QueueError
+from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings import RocketMQSettings
+
+pytestmark = pytest.mark.usefixtures("cleanup_rocketmq_backends")
 
 
 def _connected_backend() -> tuple[RocketMQBackend, MagicMock, MagicMock]:
@@ -155,6 +158,157 @@ def test_disconnect_interrupts_and_joins_receive_worker() -> None:
     consumer.ack.assert_not_called()
     assert backend._receive_worker is None
     assert list(backend._receive_buffer) == []
+
+
+def test_pump_failure_is_sticky_for_every_concurrent_waiter() -> None:
+    backend, _, consumer = _connected_backend()
+    receive_entered = threading.Event()
+    release_receive = threading.Event()
+    all_waiters_blocked = threading.Event()
+    waiter_count = 4
+    blocked_waiters = 0
+    blocked_lock = threading.Lock()
+    original_wait = backend._receive_condition.wait
+
+    def tracked_wait(timeout: float | None = None) -> bool:
+        nonlocal blocked_waiters
+        if threading.current_thread().name.startswith("rocketmq-waiter-"):
+            with blocked_lock:
+                blocked_waiters += 1
+                if blocked_waiters == waiter_count:
+                    all_waiters_blocked.set()
+        return original_wait(timeout)
+
+    backend._receive_condition.wait = tracked_wait
+
+    def receive(_maximum: int, _lease: int) -> list[object]:
+        receive_entered.set()
+        assert release_receive.wait(timeout=2)
+        raise RuntimeError("private broker failure")
+
+    outcomes: list[str] = []
+
+    def pop() -> None:
+        try:
+            backend.pop("jobs", timeout=2)
+        except QueueError:
+            outcomes.append("error")
+        else:  # pragma: no cover - explicit false-empty regression signal
+            outcomes.append("empty")
+
+    consumer.receive.side_effect = receive
+    waiters = [
+        threading.Thread(target=pop, name=f"rocketmq-waiter-{index}")
+        for index in range(waiter_count)
+    ]
+    for waiter in waiters:
+        waiter.start()
+
+    assert receive_entered.wait(timeout=1)
+    assert all_waiters_blocked.wait(timeout=1)
+    release_receive.set()
+    for waiter in waiters:
+        waiter.join(timeout=2)
+
+    assert all(not waiter.is_alive() for waiter in waiters)
+    assert outcomes == ["error"] * waiter_count
+    with pytest.raises(QueueError):
+        backend.pop("jobs", timeout=0)
+    consumer.receive.assert_called_once_with(1, 300)
+    backend.disconnect()
+
+
+def test_reconnect_restarts_after_terminal_pump_failure() -> None:
+    backend, _, first_consumer = _connected_backend()
+    first_consumer.receive.side_effect = RuntimeError("first generation failed")
+
+    with pytest.raises(QueueError):
+        backend.pop("jobs", timeout=1)
+    with pytest.raises(QueueError):
+        backend.pop("jobs", timeout=0)
+    first_consumer.receive.assert_called_once_with(1, 300)
+    backend.disconnect()
+
+    message = MagicMock(body=b"replacement")
+    second_consumer = MagicMock(is_running=True)
+    second_consumer.receive.return_value = [message]
+    backend._producer = MagicMock(is_running=True)
+    backend._consumer = second_consumer
+    backend._consumer_generation += 1
+
+    assert backend.pop("replacement", timeout=1) == b"replacement"
+    second_consumer.subscribe.assert_called_once_with("scrapy-queue_replacement")
+    backend.disconnect()
+
+
+def test_disconnect_bounds_stuck_pump_and_fences_late_publication() -> None:
+    backend, _, consumer = _connected_backend()
+    receive_entered = threading.Event()
+    release_receive = threading.Event()
+    stale_message = MagicMock(body=b"stale")
+
+    def receive(_maximum: int, _lease: int) -> list[object]:
+        receive_entered.set()
+        release_receive.wait()
+        return [stale_message]
+
+    consumer.receive.side_effect = receive
+    consumer.shutdown.side_effect = RuntimeError("shutdown failed")
+    assert backend.pop("jobs", timeout=0) is None
+    assert receive_entered.wait(timeout=1)
+    stale_worker = backend._receive_worker
+    assert stale_worker is not None
+
+    started = time.monotonic()
+    with pytest.raises(BackendConnectionError, match="Failed to disconnect"):
+        backend.disconnect()
+    assert time.monotonic() - started < 2
+    assert stale_worker.is_alive()
+    assert backend._receive_worker is None
+
+    replacement = MagicMock(body=b"fresh")
+    second_consumer = MagicMock(is_running=True)
+    second_consumer.receive.return_value = [replacement]
+    backend._producer = MagicMock(is_running=True)
+    backend._consumer = second_consumer
+    backend._consumer_generation += 1
+    assert backend.pop("fresh", timeout=1) == b"fresh"
+
+    release_receive.set()
+    stale_worker.join(timeout=1)
+    assert not stale_worker.is_alive()
+    assert all(item[0] is not stale_message for item in backend._receive_buffer)
+    backend.disconnect()
+
+
+def test_disconnect_propagates_control_error_after_bounded_pump_join() -> None:
+    backend, producer, consumer = _connected_backend()
+    receive_entered = threading.Event()
+    release_receive = threading.Event()
+    interrupt = KeyboardInterrupt()
+
+    def receive(_maximum: int, _lease: int) -> list[object]:
+        receive_entered.set()
+        release_receive.wait()
+        return []
+
+    consumer.receive.side_effect = receive
+    consumer.shutdown.side_effect = interrupt
+    assert backend.pop("jobs", timeout=0) is None
+    assert receive_entered.wait(timeout=1)
+    worker = backend._receive_worker
+    assert worker is not None
+
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt) as raised:
+        backend.disconnect()
+    assert raised.value is interrupt
+    assert time.monotonic() - started < 2
+    producer.shutdown.assert_called_once_with()
+
+    release_receive.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
 
 
 def test_live_error_observer_sees_driver_error_without_public_retention() -> None:

@@ -38,6 +38,8 @@ from scrapy_extension.exceptions import (
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import RocketMQMode, RocketMQSettings
 
+pytestmark = pytest.mark.usefixtures("cleanup_rocketmq_backends")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -861,15 +863,19 @@ def test_disconnect_connected(mocker) -> None:
     assert backend._consumer is None
 
 
-def test_disconnect_best_effort_on_shutdown_failure(mocker) -> None:
-    """disconnect swallows a per-client shutdown failure so the other still runs."""
+def test_disconnect_reports_typed_shutdown_failure_after_closing_peers(mocker) -> None:
+    """disconnect reports a failed close after still attempting every client."""
     backend, mock_producer, mock_consumer, _ = _make_connected_backend(mocker)
     mock_producer.shutdown.side_effect = RuntimeError("boom")
 
-    backend.disconnect()  # must not raise
+    with pytest.raises(BackendConnectionError, match="Failed to disconnect") as raised:
+        backend.disconnect()
 
+    assert raised.value.backend_type == "rocketmq"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     mock_producer.shutdown.assert_called_once()
-    mock_consumer.shutdown.assert_called_once()  # still attempted
+    mock_consumer.shutdown.assert_called_once()
     assert backend._producer is None
 
 
@@ -895,16 +901,17 @@ def test_disconnect_preserves_completed_state_when_debug_is_interrupted(
     assert backend._consumer is None
 
 
-def test_disconnect_continues_when_shutdown_warning_is_interrupted(mocker) -> None:
-    """A cleanup warning must not stop sibling shutdown."""
+def test_disconnect_diagnostic_cannot_mask_typed_shutdown_failure(mocker) -> None:
+    """A cleanup diagnostic must not stop peers or mask the typed error."""
     backend, producer, consumer, _ = _make_connected_backend(mocker)
     producer.shutdown.side_effect = RuntimeError("boom")
     mocker.patch(
-        "scrapy_extension.backends.rocketmq.logger.warning",
+        "scrapy_extension.backends.rocketmq.logger.debug",
         side_effect=KeyboardInterrupt(),
     )
 
-    backend.disconnect()
+    with pytest.raises(BackendConnectionError, match="Failed to disconnect"):
+        backend.disconnect()
 
     producer.shutdown.assert_called_once_with()
     consumer.shutdown.assert_called_once_with()

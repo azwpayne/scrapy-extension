@@ -91,6 +91,7 @@ _ROCKETMQ_TOPIC_ALREADY_SELECTED_ERROR = (
     "RocketMQ consumer generation already selected a different queue."
 )
 _ROCKETMQ_RECEIVE_PUMP_ERROR = "RocketMQ receive pump failed."
+_ROCKETMQ_DISCONNECT_ERROR = "Failed to disconnect from RocketMQ."
 _ROCKETMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
     {
         "Not connected to RocketMQ",
@@ -134,6 +135,11 @@ _MIN_LONG_POLL_DURATION = 5
 # a stalled broker. Mirrors the R21 cap discipline
 # (``CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S`` / ``_MAX_BACKOFF_S``).
 _MAX_REQUEST_TIMEOUT_S = 300
+
+# Consumer shutdown should interrupt an in-flight receive promptly. Do not trust
+# that SDK guarantee during teardown: a broken transport or shutdown path must
+# not make ``disconnect`` wait forever for the daemon pump.
+_RECEIVE_PUMP_JOIN_TIMEOUT_S = 1.0
 
 
 def _validate_queue_name_argument(
@@ -190,6 +196,10 @@ class RocketMQBackend(Backend, QueueBackend):
     bypassed, instantiation fails fast via the dedicated guard classes
     ``RocketMQSetBackend`` / ``RocketMQStorageBackend`` (raise
     ``ConfigurationError`` in ``__init__``).
+
+    The direct receive API binds one logical queue/topic to each connected
+    consumer generation. To consume a different queue, callers must disconnect
+    and reconnect before the first pop for the replacement generation.
     """
 
     _push_is_durable = True
@@ -226,7 +236,10 @@ class RocketMQBackend(Backend, QueueBackend):
         self._receive_consumer: Any = None
         self._receive_generation = 0
         self._selected_topic: str | None = None
-        self._receive_error: QueueError | None = None
+        # Pump failures are terminal for this consumer generation. Retaining only
+        # a boolean for ordinary failures avoids keeping a sensitive driver graph
+        # and lets every waiter construct its own fixed-text QueueError.
+        self._receive_failed = False
         self._receive_control_error: BaseException | None = None
         # Private live-test hook: observe a driver failure synchronously in the
         # pump thread without retaining its graph on the backend.
@@ -434,7 +447,7 @@ class RocketMQBackend(Backend, QueueBackend):
             if self._receive_stop is not None:
                 self._receive_stop.set()
             self._receive_buffer.clear()
-            self._receive_error = None
+            self._receive_failed = False
             self._receive_control_error = None
             self._receive_consumer = None
             self._receive_generation = 0
@@ -445,15 +458,25 @@ class RocketMQBackend(Backend, QueueBackend):
 
     def _finish_receive_pump_shutdown(
         self, worker: threading.Thread | None
-    ) -> None:
-        """Join the detached worker after consumer shutdown interrupts receive."""
+    ) -> bool:
+        """Bound the detached-worker join and report whether it really stopped."""
         if worker is not None and worker is not threading.current_thread():
-            worker.join()
+            worker.join(timeout=_RECEIVE_PUMP_JOIN_TIMEOUT_S)
+        worker_stopped = (
+            worker is None
+            or worker is threading.current_thread()
+            or not worker.is_alive()
+        )
         with self._receive_condition:
+            # Clear admission even when the SDK left the old daemon blocked. Its
+            # captured stop event and generation identity fence all late results;
+            # a reconnect may therefore install a fresh pump without stale
+            # publication or the old worker clearing the replacement reference.
             if self._receive_worker is worker:
                 self._receive_worker = None
             self._receive_stop = None
             self._receive_condition.notify_all()
+        return worker_stopped
 
     def _abort_partial_connect(self) -> bool:
         """Detach and best-effort stop clients created by a failed connect."""
@@ -471,8 +494,8 @@ class RocketMQBackend(Backend, QueueBackend):
             (producer, "producer"),
             suppress_control_errors=True,
         )
-        self._finish_receive_pump_shutdown(worker)
-        return cleanup_failed
+        worker_stopped = self._finish_receive_pump_shutdown(worker)
+        return cleanup_failed or not worker_stopped
 
     def disconnect(self) -> None:
         """Fence receives, close clients, and join the bounded receive pump."""
@@ -488,14 +511,26 @@ class RocketMQBackend(Backend, QueueBackend):
             self._last_msg = None
             self._last_delivery = None
             worker = self._fence_receive_pump_unlocked()
+            cleanup_failed = False
+            control_error: BaseException | None = None
             try:
                 cleanup_failed = self._shutdown_detached_clients(
                     (consumer, "consumer"), (producer, "producer")
                 )
-            finally:
-                self._finish_receive_pump_shutdown(worker)
-            if cleanup_failed:
+            except BaseException as error:
+                # Finish the bounded pump join before restoring process-control
+                # flow. This preserves KeyboardInterrupt/SystemExit without an
+                # unbounded wait when receive ignored the failed shutdown.
+                control_error = error
+            worker_stopped = self._finish_receive_pump_shutdown(worker)
+            if control_error is not None:
+                raise control_error
+            if cleanup_failed or not worker_stopped:
                 self._log_cleanup_diagnostic()
+                raise BackendConnectionError(
+                    _ROCKETMQ_DISCONNECT_ERROR,
+                    backend_type="rocketmq",
+                )
             # This diagnostic follows the completed disconnect state transition. A
             # misbehaving logging handler must not report the completed operation as
             # failed or resurrect an already-detached client generation.
@@ -701,10 +736,7 @@ class RocketMQBackend(Backend, QueueBackend):
                     pass
             with self._receive_condition:
                 if self._pump_is_current_locked(consumer, generation, stop):
-                    self._receive_error = QueueError(
-                        _ROCKETMQ_RECEIVE_PUMP_ERROR,
-                        operation="pop",
-                    )
+                    self._receive_failed = True
                     self._receive_cycle += 1
                     self._receive_condition.notify_all()
         except BaseException as error:
@@ -745,7 +777,7 @@ class RocketMQBackend(Backend, QueueBackend):
                     self._receive_consumer = consumer
                     self._receive_generation = generation
                     self._receive_stop = threading.Event()
-                    self._receive_error = None
+                    self._receive_failed = False
                     self._receive_control_error = None
                     self._receive_demand = 0
                 elif (
@@ -759,10 +791,7 @@ class RocketMQBackend(Backend, QueueBackend):
                 # repeated timeout=0 calls.
                 self._receive_demand = 1
                 observed_cycle = self._receive_cycle
-                if (
-                    self._receive_error is None
-                    and self._receive_control_error is None
-                ):
+                if not self._receive_failed and self._receive_control_error is None:
                     self._start_receive_worker_locked()
 
         wait_timeout = max(0.0, timeout)
@@ -780,14 +809,12 @@ class RocketMQBackend(Backend, QueueBackend):
                     self._receive_condition.notify_all()
                     return delivery
                 if self._receive_control_error is not None:
-                    control_error = self._receive_control_error
-                    self._receive_control_error = None
-                    raise control_error
-                if self._receive_error is not None:
-                    pump_error = self._receive_error
-                    self._receive_error = None
-                    self._start_receive_worker_locked()
-                    raise pump_error
+                    raise self._receive_control_error
+                if self._receive_failed:
+                    raise QueueError(
+                        _ROCKETMQ_RECEIVE_PUMP_ERROR,
+                        operation="pop",
+                    )
                 if wait_timeout == 0 or self._receive_cycle != observed_cycle:
                     return (None, consumer, generation)
                 remaining = deadline - time.monotonic()

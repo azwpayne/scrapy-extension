@@ -34,6 +34,8 @@ from scrapy_extension.backends.rocketmq import RocketMQBackend
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings import RocketMQSettings
 
+pytestmark = pytest.mark.usefixtures("cleanup_rocketmq_backends")
+
 
 def _patch_rocketmq(mocker, *, producer=None, consumer=None) -> None:
     """Install a stub of the apache 5.1.1 top-level client surface.
