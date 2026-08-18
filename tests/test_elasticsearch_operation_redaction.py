@@ -140,6 +140,34 @@ def test_direct_elasticsearch_queue_operation_rebuilds_private_error_graph(
     _assert_terminal_error_is_redacted(error, _MARKER)
 
 
+def test_elasticsearch_malformed_queue_hit_is_retained_and_redacted(
+    mocker: Any,
+) -> None:
+    backend, client = _backend(mocker)
+    client.search.return_value = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "poison-record",
+                    "_seq_no": 1,
+                    "_primary_term": 1,
+                    "_source": {"item": f"{_MARKER}!"},
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(QueueError) as exc_info:
+        backend.pop(_MARKER)
+
+    error = exc_info.value
+    assert str(error) == "ElasticSearch queue pop failed."
+    assert error.operation == "pop"
+    assert error.queue_name is None
+    client.delete.assert_not_called()
+    _assert_terminal_error_is_redacted(error, _MARKER)
+
+
 def _failing_set_operation(mocker: Any, method_name: str) -> Callable[[], object]:
     backend, client = _backend(mocker)
     failure = TransportError(_MARKER)

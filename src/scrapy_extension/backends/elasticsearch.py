@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import logging
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
@@ -176,7 +177,37 @@ def _b64encode(data: bytes) -> str:
 
 
 def _b64decode(data: str) -> bytes:
-    return base64.b64decode(data.encode("ascii"))
+    return base64.b64decode(data.encode("ascii"), validate=True)
+
+
+def _decode_queue_hit(hit: object) -> tuple[str, int, int, bytes]:
+    """Validate and decode one queue hit without exposing corrupt fields."""
+    if not isinstance(hit, Mapping):
+        raise QueueError(_ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop")
+
+    document_id = hit.get("_id")
+    sequence_number = hit.get("_seq_no")
+    primary_term = hit.get("_primary_term")
+    source = hit.get("_source")
+    if (
+        not isinstance(document_id, str)
+        or not document_id
+        or not isinstance(sequence_number, int)
+        or isinstance(sequence_number, bool)
+        or not isinstance(primary_term, int)
+        or isinstance(primary_term, bool)
+        or not isinstance(source, Mapping)
+    ):
+        raise QueueError(_ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop")
+
+    item = source.get("item")
+    if not isinstance(item, str):
+        raise QueueError(_ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop")
+    try:
+        decoded_item = _b64decode(item)
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        raise QueueError(_ELASTICSEARCH_QUEUE_POP_ERROR, operation="pop") from None
+    return document_id, sequence_number, primary_term, decoded_item
 
 
 class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
@@ -627,20 +658,22 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 hits = resp.get("hits", {}).get("hits", [])
                 if not hits:
                     return None
-                doc = hits[0]
+                document_id, sequence_number, primary_term, item = _decode_queue_hit(
+                    hits[0]
+                )
                 try:
                     # No ``refresh`` on delete — the NEXT pop's pre-search refresh
                     # (above) flushes this delete, so the search won't re-find the doc.
                     self.client.delete(
                         index=self._active_snapshot().queue_index,
-                        id=doc["_id"],
-                        if_seq_no=doc["_seq_no"],
-                        if_primary_term=doc["_primary_term"],
+                        id=document_id,
+                        if_seq_no=sequence_number,
+                        if_primary_term=primary_term,
                     )
                 except ConflictError:
                     # Lost the race to another worker — retry to find the next item.
                     continue
-                return _b64decode(doc["_source"]["item"])
+                return item
             except NotFoundError:
                 return None
             except (ApiError, TransportError) as e:

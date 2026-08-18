@@ -10,7 +10,11 @@ from elasticsearch import ApiError, NotFoundError, RequestError, TransportError
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
-from scrapy_extension.exceptions import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
+)
 from scrapy_extension.settings.elasticsearch import (
     ElasticSearchMode,
     ElasticSearchSettings,
@@ -374,6 +378,138 @@ class TestQueue:
             if_primary_term=1,
         )
         b._client.indices.refresh.assert_called_once_with(index="scrapy_queue")
+
+    @pytest.mark.parametrize(
+        "hit",
+        [
+            pytest.param([], id="hit-not-mapping"),
+            pytest.param(
+                {
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": "aXRlbQ=="},
+                },
+                id="missing-id",
+            ),
+            pytest.param(
+                {
+                    "_id": "",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": "aXRlbQ=="},
+                },
+                id="empty-id",
+            ),
+            pytest.param(
+                {
+                    "_id": 1,
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": "aXRlbQ=="},
+                },
+                id="non-string-id",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": True,
+                    "_primary_term": 1,
+                    "_source": {"item": "aXRlbQ=="},
+                },
+                id="bool-sequence-number",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1.0,
+                    "_source": {"item": "aXRlbQ=="},
+                },
+                id="non-integer-primary-term",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": [],
+                },
+                id="source-not-mapping",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {},
+                },
+                id="missing-item",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": b"aXRlbQ=="},
+                },
+                id="item-not-string",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": "not base64!"},
+                },
+                id="invalid-base64",
+            ),
+            pytest.param(
+                {
+                    "_id": "1",
+                    "_seq_no": 42,
+                    "_primary_term": 1,
+                    "_source": {"item": "\N{SNOWMAN}"},
+                },
+                id="non-ascii-item",
+            ),
+        ],
+    )
+    def test_pop_rejects_malformed_hit_before_delete(self, mocker, hit):
+        b = _mock_backend(mocker)
+        b._client.search.return_value = {"hits": {"hits": [hit]}}
+
+        with pytest.raises(QueueError) as exc_info:
+            b.pop("q")
+
+        assert str(exc_info.value) == "ElasticSearch queue pop failed."
+        assert exc_info.value.operation == "pop"
+        assert exc_info.value.queue_name is None
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        b._client.delete.assert_not_called()
+
+    def test_pop_preserves_valid_empty_bytes(self, mocker):
+        b = _mock_backend(mocker)
+        b._client.search.return_value = {
+            "hits": {
+                "hits": [
+                    {
+                        "_id": "1",
+                        "_seq_no": 42,
+                        "_primary_term": 1,
+                        "_source": {"item": ""},
+                    }
+                ]
+            }
+        }
+
+        assert b.pop("q") == b""
+        b._client.delete.assert_called_once_with(
+            index="scrapy_queue",
+            id="1",
+            if_seq_no=42,
+            if_primary_term=1,
+        )
 
     def test_pop_retries_on_conflict(self, mocker):
         """R1-P1-13: pop must retry the search-delete cycle on ConflictError.
