@@ -18,6 +18,7 @@ API verified against the pulsar-client sync Python client:
 from __future__ import annotations
 
 import logging
+from _thread import start_new_thread
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -245,6 +246,7 @@ class _PulsarConsumerRetirement:
     client: Any
     generation: int
     consumer: Any = None
+    started: Event = field(default_factory=Event)
     completed: Event = field(default_factory=Event)
     worker: Thread | None = None
 
@@ -1292,10 +1294,33 @@ class PulsarBackend(Backend, QueueBackend):
         try:
             worker.start()
         except BaseException:
-            self._consumer_retirements.pop(pump.topic, None)
-            retirement.completed.set()
-            raise
+            # ``Thread.start`` is not transactional: an injected or alternate
+            # implementation may launch the target and then raise. Keep its
+            # tombstone whenever startup is ambiguous. Only a definitely unstarted
+            # worker receives a low-level daemon fallback, so close still begins
+            # without replacing the pump's already-selected terminal exception.
+            if self._thread_definitely_unstarted(worker):
+                retirement.worker = None
+                try:
+                    start_new_thread(self._run_consumer_retirement, (retirement,))
+                except BaseException:
+                    # With no worker available, conservatively retain the fence. A
+                    # replacement subscription is less safe than a stuck tombstone.
+                    pass
         return retirement
+
+    @staticmethod
+    def _thread_definitely_unstarted(worker: Thread) -> bool:
+        """Return true only when CPython's launch event proves no target ran."""
+        try:
+            started = getattr(worker, "_started", None)
+            return (
+                started is not None
+                and not started.is_set()
+                and worker.ident is None
+            )
+        except BaseException:
+            return False
 
     def _finish_consumer_retirement(
         self, retirement: _PulsarConsumerRetirement
@@ -1313,6 +1338,7 @@ class PulsarBackend(Backend, QueueBackend):
 
     def _run_consumer_retirement(self, retirement: _PulsarConsumerRetirement) -> None:
         """Close one consumer and release its replacement fence after close exits."""
+        retirement.started.set()
         try:
             retirement.consumer.close()
         except BaseException:

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, call
 import pulsar
 import pytest
 
+import scrapy_extension.backends.pulsar as pulsar_backend_module
 from scrapy_extension.backends.pulsar import PulsarBackend, _PulsarAckToken
 from scrapy_extension.exceptions import QueueError
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -287,6 +288,56 @@ def test_terminal_retirement_never_exceeds_caller_budget(
         else:
             assert elapsed >= 0.04
             assert elapsed < 0.2
+    finally:
+        release_close.set()
+
+
+def test_retirement_start_that_launches_then_raises_preserves_terminal_error(
+    mocker: Any,
+) -> None:
+    """An ambiguous Thread.start failure keeps its fence until close completes."""
+    close_started = Event()
+    release_close = Event()
+    pump_error = KeyboardInterrupt("pump control marker")
+    start_error = SystemExit("retirement start marker")
+    failed_consumer = MagicMock(name="ambiguous-start-consumer")
+    recovered_consumer = _ControllableConsumer()
+    failed_consumer.receive.side_effect = pump_error
+
+    def blocked_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+
+    failed_consumer.close.side_effect = blocked_close
+    backend = _connected_backend(mocker, [failed_consumer, recovered_consumer])
+    topic = "scrapy-ambiguous-start"
+    assert backend.pop("ambiguous-start", timeout=0) is None
+    failed_pump = backend._receive_pumps[topic]
+    assert failed_pump.stopped.wait(timeout=0.5)
+
+    real_start = Thread.start
+
+    def launch_then_raise(worker: Thread) -> None:
+        real_start(worker)
+        if worker.name == "pulsar-failed-consumer-retirement":
+            assert close_started.wait(timeout=0.5)
+            raise start_error
+
+    mocker.patch.object(pulsar_backend_module.Thread, "start", launch_then_raise)
+    try:
+        with pytest.raises(KeyboardInterrupt) as captured:
+            backend.pop("ambiguous-start", timeout=0)
+        assert captured.value is pump_error
+        assert list(backend._consumer_retirements) == [topic]
+        assert topic not in backend._receive_pumps
+        assert topic not in backend._consumers
+        assert failed_consumer.close.call_count == 1
+
+        release_close.set()
+        assert _wait_until(lambda: backend._consumer_retirements == {})
+        assert backend.pop("ambiguous-start", timeout=0) is None
+        assert recovered_consumer.receive_started.wait(timeout=0.5)
+        assert failed_consumer.close.call_count == 1
     finally:
         release_close.set()
 
