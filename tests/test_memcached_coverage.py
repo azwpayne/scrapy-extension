@@ -16,6 +16,7 @@ from scrapy_extension.settings import MemcachedSettings
 def _connected(mocker):
     b = MemcachedBackend(MemcachedSettings())
     client = mocker.MagicMock()
+    client.stats.return_value = {}
     client.set.return_value = True
     mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
     b.connect()
@@ -200,6 +201,7 @@ class TestMemcachedErrorPaths:
     def test_clear_raises_storage_error(self, mocker) -> None:
         b = MemcachedBackend(MemcachedSettings(allow_flush_all=True))
         client = mocker.MagicMock()
+        client.stats.return_value = {}
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         b.connect()
         client.flush_all.side_effect = RuntimeError("boom")

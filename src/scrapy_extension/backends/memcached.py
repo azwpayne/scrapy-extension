@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from threading import Lock
-from typing import Any, ParamSpec, TypeVar, cast
+from typing import Any, ParamSpec, TypeVar
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
@@ -95,6 +95,31 @@ _MEMCACHED_CLEAR_STORAGE_CAPABILITY_MESSAGES: frozenset[str] = frozenset(
         _MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE,
     }
 )
+
+
+def _validate_stats_response(response: object) -> Mapping[object, object]:
+    """Require the mapping contract published by ``pymemcache.stats``."""
+    if not isinstance(response, Mapping):
+        raise TypeError("Memcached stats returned a malformed response.")
+    return response
+
+
+def _validate_get_response(response: object) -> bytes | None:
+    """Normalize the documented byte-oriented ``pymemcache.get`` response."""
+    if response is None:
+        return None
+    if isinstance(response, bytes):
+        return response
+    if isinstance(response, bytearray):
+        return bytes(response)
+    raise TypeError("Memcached get returned a malformed response.")
+
+
+def _validate_delete_response(response: object) -> bool:
+    """Require an exact acknowledgement boolean from ``pymemcache.delete``."""
+    if type(response) is not bool:
+        raise TypeError("Memcached delete returned a malformed response.")
+    return response
 
 
 def _validate_storage_key_argument(
@@ -292,7 +317,7 @@ class MemcachedBackend(Backend, StorageBackend):
                     timeout=snapshot.socket_timeout,
                     default_noreply=False,
                 )
-                candidate.stats()
+                _validate_stats_response(candidate.stats())
             except Exception:
                 if candidate is not None:
                     _close_failed_candidate(candidate)
@@ -377,7 +402,7 @@ class MemcachedBackend(Backend, StorageBackend):
             if client is None:
                 return False
             try:
-                client.stats()
+                _validate_stats_response(client.stats())
                 return True
             except Exception:
                 return False
@@ -458,7 +483,7 @@ class MemcachedBackend(Backend, StorageBackend):
             with self._lifecycle_lock:
                 client = self._client
             try:
-                return cast("bytes | None", client.get(key))
+                return _validate_get_response(client.get(key))
             except Exception as e:
                 msg = f"Failed to retrieve key {key!r} from Memcached: {e}"
                 raise StorageError(msg, operation="retrieve", key=key) from e
@@ -488,7 +513,7 @@ class MemcachedBackend(Backend, StorageBackend):
             with self._lifecycle_lock:
                 client = self._client
             try:
-                return bool(client.delete(key))
+                return _validate_delete_response(client.delete(key))
             except Exception as e:
                 msg = f"Failed to delete key {key!r} in Memcached: {e}"
                 raise StorageError(msg, operation="delete", key=key) from e
@@ -518,7 +543,7 @@ class MemcachedBackend(Backend, StorageBackend):
             with self._lifecycle_lock:
                 client = self._client
             try:
-                return client.get(key) is not None
+                return _validate_get_response(client.get(key)) is not None
             except Exception as e:
                 msg = f"Failed to check existence of key {key!r} in Memcached: {e}"
                 raise StorageError(msg, operation="exists", key=key) from e

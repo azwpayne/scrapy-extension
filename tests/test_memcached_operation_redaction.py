@@ -84,6 +84,7 @@ def _backend(
         )
     )
     client = mocker.MagicMock()
+    client.stats.return_value = {}
     client.set.return_value = True
     client.flush_all.return_value = True
     mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
@@ -135,6 +136,28 @@ def test_direct_memcached_storage_operation_rebuilds_private_error_graph(
 
     error = exc_info.value
     assert str(error) == expected_message
+    assert error.operation == expected_operation
+    assert error.key is None
+    _assert_terminal_error_is_redacted(error, _MARKER)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_operation"),
+    (("retrieve", "retrieve"), ("delete", "delete"), ("exists", "exists")),
+)
+def test_malformed_memcached_response_is_redacted(
+    mocker: Any, method_name: str, expected_operation: str
+) -> None:
+    backend, client = _backend(mocker)
+    if method_name == "delete":
+        client.delete.return_value = _MARKER
+    else:
+        client.get.return_value = _MARKER
+
+    with pytest.raises(StorageError) as exc_info:
+        getattr(backend, method_name)(_MARKER)
+
+    error = exc_info.value
     assert error.operation == expected_operation
     assert error.key is None
     _assert_terminal_error_is_redacted(error, _MARKER)

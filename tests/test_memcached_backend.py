@@ -34,6 +34,7 @@ def _make_backend(**overrides) -> MemcachedBackend:
 def _connected(mocker):
     b = _make_backend()
     client = mocker.MagicMock()
+    client.stats.return_value = {}
     client.set.return_value = True
     # Patch the backend's captured MemcachedClient name (bound at import).
     mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
@@ -135,6 +136,7 @@ class TestMemcachedConnect:
         marker = "memcached-endpoint-log-marker"
         backend = _make_backend(host=f"{marker}.example", allow_remote_plaintext=True)
         client = mocker.MagicMock(name="client")
+        client.stats.return_value = {}
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         logger_warning = mocker.patch.object(memcached_mod.logger, "warning")
         logger_debug = mocker.patch.object(memcached_mod.logger, "debug")
@@ -155,6 +157,7 @@ class TestMemcachedConnect:
     ) -> None:
         backend = _make_backend(host="cache.internal", allow_remote_plaintext=True)
         client = mocker.MagicMock(name="client")
+        client.stats.return_value = {}
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         mocker.patch.object(
             memcached_mod.logger, "warning", side_effect=KeyboardInterrupt
@@ -171,6 +174,7 @@ class TestMemcachedConnect:
     ) -> None:
         backend = _make_backend()
         client = mocker.MagicMock(name="client")
+        client.stats.return_value = {}
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         mocker.patch.object(
             memcached_mod.logger, "debug", side_effect=KeyboardInterrupt
@@ -205,6 +209,7 @@ class TestMemcachedConnect:
         def blocking_stats():
             stats_entered.set()
             assert release_stats.wait(timeout=2.0)
+            return {}
 
         client.stats.side_effect = blocking_stats
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
@@ -305,6 +310,7 @@ class TestMemcachedConnect:
     def test_connect_retains_one_preconstruction_snapshot(self, mocker) -> None:
         settings = MemcachedSettings(host="cache.internal", allow_remote_plaintext=True)
         client = mocker.MagicMock(name="client")
+        client.stats.return_value = {}
 
         def mutate_after_construction(_endpoint, **_kwargs):
             settings.host = "attacker.internal"
@@ -390,6 +396,7 @@ class TestMemcachedConnect:
         def blocking_stats():
             stats_entered.set()
             assert release_stats.wait(timeout=2.0)
+            return {}
 
         client.stats.side_effect = blocking_stats
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
@@ -441,6 +448,33 @@ class TestMemcachedConnect:
         with pytest.raises(BackendConnectionError):
             b.connect()
         assert b.is_connected() is False
+
+    def test_malformed_stats_is_closed_and_a_later_generation_can_connect(
+        self, mocker
+    ) -> None:
+        marker = "malformed-stats-private-marker"
+        malformed = mocker.MagicMock(name="malformed")
+        malformed.stats.return_value = marker
+        healthy = mocker.MagicMock(name="healthy")
+        healthy.stats.return_value = {}
+        mocker.patch.object(
+            memcached_mod, "MemcachedClient", side_effect=[malformed, healthy]
+        )
+        backend = _make_backend()
+
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.connect()
+
+        rendered = "".join(traceback.format_exception(exc_info.value))
+        assert marker not in rendered
+        assert backend.is_connected() is False
+        malformed.close.assert_called_once_with()
+
+        backend.connect()
+
+        assert backend.is_connected() is True
+        assert backend._client is healthy
+        healthy.close.assert_not_called()
 
     def test_connect_stats_failure_nulls_client(self, mocker) -> None:
         """R-mcc: stats() failure must null the half-created client.
@@ -598,6 +632,21 @@ class TestMemcachedStorageOps:
         assert set_entered.is_set()
         assert errors == []
 
+    @pytest.mark.parametrize("stats_response", [None, b"stats", [], True])
+    def test_ping_rejects_malformed_stats_response(
+        self, mocker, stats_response: object
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.stats.return_value = stats_response
+
+        assert backend.ping() is False
+
+    def test_ping_accepts_mapping_stats_response(self, mocker) -> None:
+        backend, client = _connected(mocker)
+        client.stats.return_value = {b"version": b"1.6"}
+
+        assert backend.ping() is True
+
     def test_ping_does_not_overlap_storage_operation(self, mocker) -> None:
         backend, client = _connected(mocker)
         stats_entered = Event()
@@ -713,11 +762,43 @@ class TestMemcachedStorageOps:
         client.get.return_value = None
         assert b.retrieve("key1") is None
 
-    def test_delete_returns_bool(self, mocker) -> None:
-        b, client = _connected(mocker)
-        client.delete.return_value = True
-        assert b.delete("key1") is True
+    def test_retrieve_normalizes_bytearray(self, mocker) -> None:
+        backend, client = _connected(mocker)
+        client.get.return_value = bytearray(b"payload")
+
+        assert backend.retrieve("key1") == b"payload"
+
+    @pytest.mark.parametrize("response", [True, 1, "payload", [], memoryview(b"x")])
+    def test_retrieve_rejects_malformed_response(
+        self, mocker, response: object
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.get.return_value = response
+
+        with pytest.raises(StorageError) as exc_info:
+            backend.retrieve("key1")
+
+        assert exc_info.value.operation == "retrieve"
+
+    @pytest.mark.parametrize("response", [True, False])
+    def test_delete_returns_exact_bool(self, mocker, response: bool) -> None:
+        backend, client = _connected(mocker)
+        client.delete.return_value = response
+
+        assert backend.delete("key1") is response
         client.delete.assert_called_once_with("key1")
+
+    @pytest.mark.parametrize("response", [None, 0, 1, "deleted", [], b"deleted"])
+    def test_delete_rejects_non_boolean_response(
+        self, mocker, response: object
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.delete.return_value = response
+
+        with pytest.raises(StorageError) as exc_info:
+            backend.delete("key1")
+
+        assert exc_info.value.operation == "delete"
 
     def test_exists_uses_get(self, mocker) -> None:
         b, client = _connected(mocker)
@@ -730,6 +811,18 @@ class TestMemcachedStorageOps:
         client.get.return_value = None
         assert b.exists("key1") is False
 
+    @pytest.mark.parametrize("response", [True, 1, "payload", [], memoryview(b"x")])
+    def test_exists_reuses_get_response_validation(
+        self, mocker, response: object
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.get.return_value = response
+
+        with pytest.raises(StorageError) as exc_info:
+            backend.exists("key1")
+
+        assert exc_info.value.operation == "exists"
+
     def test_ttl_returns_none(self, mocker) -> None:
         b, _ = _connected(mocker)
         assert b.ttl("key1") is None
@@ -737,6 +830,7 @@ class TestMemcachedStorageOps:
     def test_clear_storage_flushes_all_when_explicitly_enabled(self, mocker) -> None:
         b = _make_backend(allow_flush_all=True)
         client = mocker.MagicMock()
+        client.stats.return_value = {}
         client.flush_all.return_value = True
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         b.connect()
@@ -747,6 +841,7 @@ class TestMemcachedStorageOps:
         settings = MemcachedSettings(allow_flush_all=True)
         backend = MemcachedBackend(settings)
         client = mocker.MagicMock()
+        client.stats.return_value = {}
         client.flush_all.return_value = True
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         backend.connect()
@@ -762,6 +857,7 @@ class TestMemcachedStorageOps:
         settings = MemcachedSettings()
         backend = MemcachedBackend(settings)
         client = mocker.MagicMock()
+        client.stats.return_value = {}
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         backend.connect()
         settings.allow_flush_all = "yes"  # type: ignore[assignment]
@@ -771,10 +867,14 @@ class TestMemcachedStorageOps:
 
         client.flush_all.assert_not_called()
 
-    def test_clear_storage_rejected_reply_raises_storage_error(self, mocker) -> None:
+    @pytest.mark.parametrize("response", [False, None, 1])
+    def test_clear_storage_rejected_reply_raises_storage_error(
+        self, mocker, response: object
+    ) -> None:
         backend = _make_backend(allow_flush_all=True)
         client = mocker.MagicMock()
-        client.flush_all.return_value = False
+        client.stats.return_value = {}
+        client.flush_all.return_value = response
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         backend.connect()
 
@@ -817,7 +917,7 @@ class TestMemcachedStorageOps:
 class TestMemcachedStorageErrorContract:
     """R14-A: each storage op raises StorageError on client-lib failure."""
 
-    @pytest.mark.parametrize("result", [False, None])
+    @pytest.mark.parametrize("result", [False, None, 1])
     def test_store_rejected_result_raises_storage_error(self, mocker, result) -> None:
         """A rejected write must not be reported as a successful store."""
         b, client = _connected(mocker)
@@ -865,6 +965,7 @@ class TestMemcachedStorageErrorContract:
     def test_clear_storage_failure_raises_storage_error(self, mocker) -> None:
         b = _make_backend(allow_flush_all=True)
         client = mocker.MagicMock()
+        client.stats.return_value = {}
         mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
         b.connect()
         client.flush_all.side_effect = RuntimeError("memcached unreachable")
