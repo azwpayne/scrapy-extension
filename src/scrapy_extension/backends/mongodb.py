@@ -372,6 +372,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         self._lease_local = threading.local()
         self._generation: _MongoDBGeneration | None = None
         self._active_leases = 0
+        self._connecting = False
+        self._connect_owner: int | None = None
         self._disconnecting = False
         self._disconnect_owner: int | None = None
 
@@ -398,30 +400,74 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         current_thread = threading.get_ident()
         with self._generation_condition:
-            while self._disconnecting:
-                if int(getattr(self._lease_local, "depth", 0)):
-                    raise BackendConnectionError(
-                        "Cannot connect to MongoDB during an active operation.",
-                        backend_type="mongodb",
-                    )
-                self._generation_condition.wait()
-            # A published client graph is complete: the client has been pinged, its
-            # collections initialized, capability domains claimed, and indexes
-            # created. Re-running setup would allocate an unowned replacement client.
-            if self._client is not None:
-                return
-            if self._disconnect_owner == current_thread:
-                raise BackendConnectionError(
-                    "Cannot connect to MongoDB re-entrantly during disconnect.",
-                    backend_type="mongodb",
-                )
-            self._refresh_connection_cache()
-            self._connect()
+            while True:
+                if self._disconnecting:
+                    # Check ownership before waiting: client.close() may invoke a
+                    # lifecycle callback on the disconnect owner itself.
+                    if self._disconnect_owner == current_thread:
+                        raise BackendConnectionError(
+                            "Cannot connect to MongoDB re-entrantly during disconnect.",
+                            backend_type="mongodb",
+                        )
+                    if int(getattr(self._lease_local, "depth", 0)):
+                        raise BackendConnectionError(
+                            "Cannot connect to MongoDB during an active operation.",
+                            backend_type="mongodb",
+                        )
+                    self._generation_condition.wait()
+                    continue
+                # A published client graph is complete: the client has been pinged,
+                # its collections initialized, capability domains claimed, and
+                # indexes created.
+                if self._client is not None:
+                    return
+                if self._connecting:
+                    if self._connect_owner == current_thread:
+                        raise BackendConnectionError(
+                            "Cannot connect to MongoDB re-entrantly during connect.",
+                            backend_type="mongodb",
+                        )
+                    self._generation_condition.wait()
+                    continue
+                self._connecting = True
+                self._connect_owner = current_thread
+                self._refresh_connection_cache()
+                break
+
+        try:
+            generation, snapshot, client_kwargs = self._connect()
+        except BaseException:
+            with self._generation_condition:
+                self._connecting = False
+                self._connect_owner = None
+                self._generation_condition.notify_all()
+            raise
+
+        with self._generation_condition:
+            self._generation = generation
+            self._client = generation.client
+            self._db = generation.database
+            self._queue_collection = generation.queue_collection
+            self._set_collection = generation.set_collection
+            self._storage_collection = generation.storage_collection
+            self._client_kwargs = client_kwargs.copy()
+            self._read_preference = snapshot.read_preference
+            self._connecting = False
+            self._connect_owner = None
+            self._generation_condition.notify_all()
+
+        # Diagnostics are callbacks too, so run them after publication and after
+        # releasing the lifecycle lock. They cannot roll back a complete graph.
+        try:
+            logger.debug("Connected to MongoDB in %s mode", snapshot.mode.value)
+        except BaseException:
+            pass
 
     def _refresh_connection_cache(self) -> None:
         """Rebuild configuration-derived caches for a fresh client generation."""
-        self._client_kwargs = None
-        self._read_preference = None
+        with self._connection_lock:
+            self._client_kwargs = None
+            self._read_preference = None
 
     @staticmethod
     def _validated_snapshot_int(value: object, setting_name: str, minimum: int) -> int:
@@ -607,37 +653,46 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ),
         )
 
-    def _connect(self) -> None:
-        """Connect one fresh client generation while ``_connection_lock`` is held."""
+    def _connect(
+        self,
+    ) -> tuple[_MongoDBGeneration, _MongoDBConnectionSnapshot, dict[str, Any]]:
+        """Build and validate one unpublished client graph without the state lock."""
         snapshot = self._capture_connection_snapshot()
-        self._read_preference = snapshot.read_preference
         marker_options = self._marker_collection_options(
             snapshot.mode,
             journal=snapshot.journal,
             w_timeout_ms=snapshot.w_timeout_ms,
         )
+        client_kwargs = self._build_client_kwargs(snapshot, cache=False)
+        if snapshot.mode == MongoDBMode.REPLICA_SET:
+            uri = (
+                f"mongodb://{','.join(snapshot.replica_set_members)}/"
+                if snapshot.replica_set_members
+                else snapshot.uri
+            )
+            if snapshot.replica_set_name:
+                client_kwargs["replicaSet"] = snapshot.replica_set_name
+        elif snapshot.mode == MongoDBMode.SHARDED_CLUSTER and snapshot.mongos_routers:
+            uri = f"mongodb://{','.join(snapshot.mongos_routers)}/"
+        else:
+            uri = snapshot.uri
+
+        client: MongoClient[dict[str, Any]] | None = None
+        generation: _MongoDBGeneration | None = None
         startup_error: BackendConnectionError | None = None
         cleanup_diagnostic_pending = False
         try:
-            if snapshot.mode == MongoDBMode.STANDALONE:
-                self._connect_standalone(snapshot, marker_options)
-            elif snapshot.mode == MongoDBMode.REPLICA_SET:
-                self._connect_replica_set(snapshot, marker_options)
-            elif snapshot.mode == MongoDBMode.SHARDED_CLUSTER:
-                self._connect_sharded_cluster(snapshot, marker_options)
-            else:
-                self._connect_atlas(snapshot, marker_options)
-        except ConnectionFailure:
-            cleanup_diagnostic_pending = self._discard_client(
-                suppress_process_control=True
+            client = MongoClient(uri, **client_kwargs)
+            client.admin.command("ping")
+            generation = self._initialize_candidate_generation(
+                client,
+                snapshot.database,
+                snapshot.collection_names,
+                marker_options,
             )
-            startup_error = BackendConnectionError(
-                f"Failed to connect to MongoDB ({snapshot.mode.value}).",
-                backend_type="mongodb",
-            )
-        except BackendConnectionError:
-            cleanup_diagnostic_pending = self._discard_client(
-                suppress_process_control=True
+        except (ConnectionFailure, BackendConnectionError):
+            cleanup_diagnostic_pending = self._close_client(
+                client, suppress_process_control=True
             )
             # Marker/setup helpers may retain a driver cause. The public startup
             # boundary must not re-expose that exception graph.
@@ -646,11 +701,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 backend_type="mongodb",
             )
         except ConfigurationError:
-            self._discard_client(suppress_process_control=True)
+            self._close_client(client, suppress_process_control=True)
             raise
         except Exception:
-            cleanup_diagnostic_pending = self._discard_client(
-                suppress_process_control=True
+            cleanup_diagnostic_pending = self._close_client(
+                client, suppress_process_control=True
             )
             # Unexpected driver/plugin errors are not safe public diagnostics.
             startup_error = BackendConnectionError(
@@ -658,30 +713,23 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 backend_type="mongodb",
             )
         except BaseException:
-            self._discard_client(suppress_process_control=True)
+            self._close_client(client, suppress_process_control=True)
             raise
 
         if cleanup_diagnostic_pending:
-            # The driver failure is no longer active.  Reporting the independent
+            # The driver failure is no longer active. Reporting the independent
             # close failure here prevents custom handlers from seeing it through
             # ``sys.exc_info()``.
             self._log_cleanup_diagnostic()
-
         if startup_error is not None:
             # Raise outside the driver exception handler so endpoint/credential text
             # cannot survive through ``__cause__`` or ``__context__``.
             raise startup_error
-
-        # Publish the complete graph as one leaseable identity before diagnostics.
-        # ``connect`` holds the generation condition throughout this method.
-        self._generation = self._generation_from_mirrors_locked()
-
-        # The complete client graph is now published. Success diagnostics must not
-        # turn that completed generation into a failed connection attempt.
-        try:
-            logger.debug("Connected to MongoDB in %s mode", snapshot.mode.value)
-        except BaseException:
-            pass
+        if generation is None:  # pragma: no cover - defensive invariant
+            raise BackendConnectionError(
+                "Failed to connect to MongoDB.", backend_type="mongodb"
+            )
+        return generation, snapshot, client_kwargs
 
     @staticmethod
     def _log_cleanup_diagnostic() -> None:
@@ -691,14 +739,27 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         except BaseException:
             pass
 
-    def _discard_client(self, *, suppress_process_control: bool = False) -> bool:
-        """Clear all handles and best-effort close the current client.
+    @staticmethod
+    def _close_client(
+        client: MongoClient[dict[str, Any]] | None,
+        *,
+        suppress_process_control: bool = False,
+    ) -> bool:
+        """Close one detached client and report whether an error was suppressed."""
+        if client is None:
+            return False
+        try:
+            client.close()
+        except Exception:
+            return True
+        except BaseException:
+            if not suppress_process_control:
+                raise
+            return True
+        return False
 
-        Returns whether a close failure was suppressed. Callers converting a
-        startup failure to a fixed public error emit the resulting diagnostic only
-        after their outer exception handler has completed.
-        """
-        close_failed = False
+    def _discard_client(self, *, suppress_process_control: bool = False) -> bool:
+        """Detach all published handles under lock, then close outside it."""
         with self._connection_lock:
             client = self._client
             self._generation = None
@@ -707,30 +768,28 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             self._queue_collection = None
             self._set_collection = None
             self._storage_collection = None
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    close_failed = True
-                except BaseException:
-                    if not suppress_process_control:
-                        raise
-                    close_failed = True
-        return close_failed
+        return self._close_client(
+            client, suppress_process_control=suppress_process_control
+        )
 
     def _build_client_kwargs(
-        self, snapshot: _MongoDBConnectionSnapshot | None = None
+        self,
+        snapshot: _MongoDBConnectionSnapshot | None = None,
+        *,
+        cache: bool = True,
     ) -> dict[str, Any]:
         """Build common MongoDB client kwargs.
 
         Returns:
             Dictionary of client configuration options.
         """
-        if snapshot is None and self._client_kwargs is not None:
-            return self._client_kwargs.copy()
+        if snapshot is None and cache:
+            with self._connection_lock:
+                cached_kwargs = self._client_kwargs
+            if cached_kwargs is not None:
+                return cached_kwargs.copy()
         if snapshot is None:
             snapshot = self._capture_connection_snapshot()
-        self._read_preference = snapshot.read_preference
 
         kwargs: dict[str, Any] = {
             "minPoolSize": snapshot.min_pool_size,
@@ -752,8 +811,10 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # Add read preference
         kwargs["readPreference"] = snapshot.read_preference
 
-        # Cache for future use
-        self._client_kwargs = kwargs.copy()
+        if cache:
+            with self._connection_lock:
+                self._read_preference = snapshot.read_preference
+                self._client_kwargs = kwargs.copy()
         return kwargs
 
     def _write_concern_kwargs(
@@ -831,7 +892,27 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Returns:
             Read preference string or None for default.
         """
-        return self._read_preference
+        with self._connection_lock:
+            return self._read_preference
+
+    def _initialize_candidate_generation(
+        self,
+        client: MongoClient[dict[str, Any]],
+        database_name: str,
+        collection_names: tuple[str, str, str],
+        marker_options: Mapping[str, Any],
+    ) -> _MongoDBGeneration:
+        """Build, claim, and index an unpublished graph without lifecycle state."""
+        database = client[database_name]
+        queue_name, set_name, storage_name = collection_names
+        collections = (
+            database[queue_name],
+            database[set_name],
+            database[storage_name],
+        )
+        self._claim_collection_domains(marker_options, collections)
+        self._create_indexes(collections)
+        return _MongoDBGeneration(client, database, *collections)
 
     def _initialize_collections(
         self,
@@ -839,17 +920,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         collection_names: tuple[str, str, str],
         marker_options: Mapping[str, Any] | None = None,
     ) -> None:
-        """Initialize database and create indexes."""
-        if self._client is None:
+        """Initialize mirrors through the same out-of-lock candidate path."""
+        with self._connection_lock:
+            client = self._client
+        if client is None:
             msg = "MongoDB client not initialized"
             raise BackendConnectionError(msg, backend_type="mongodb")
-        # Initialize database and collections
-        queue_collection, set_collection, storage_collection = collection_names
-        self._db = self._client[database]
-        self._queue_collection = self._db[queue_collection]
-        self._set_collection = self._db[set_collection]
-        self._storage_collection = self._db[storage_collection]
-
         if marker_options is None:
             _, w_timeout_ms = self._validated_write_concern()
             marker_options = self._marker_collection_options(
@@ -857,27 +933,49 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 journal=self.config.journal,
                 w_timeout_ms=w_timeout_ms,
             )
-        self._claim_collection_domains(marker_options)
-
-        # Create indexes
-        self._create_indexes()
+        generation = self._initialize_candidate_generation(
+            client, database, collection_names, marker_options
+        )
+        with self._connection_lock:
+            if self._client is not client:
+                raise BackendConnectionError(
+                    "MongoDB client changed during collection initialization.",
+                    backend_type="mongodb",
+                )
+            self._generation = generation
+            self._db = generation.database
+            self._queue_collection = generation.queue_collection
+            self._set_collection = generation.set_collection
+            self._storage_collection = generation.storage_collection
 
     def _claim_collection_domains(
         self,
         marker_options: Mapping[str, Any],
+        collections: tuple[
+            Collection[dict[str, Any]],
+            Collection[dict[str, Any]],
+            Collection[dict[str, Any]],
+        ]
+        | None = None,
     ) -> None:
         """Claim each physical collection for exactly one capability domain."""
-        if (
-            self._queue_collection is None
-            or self._set_collection is None
-            or self._storage_collection is None
-        ):
-            msg = "Collections not initialized: cannot claim capability domains"
-            raise BackendConnectionError(msg, backend_type="mongodb")
+        if collections is None:
+            with self._connection_lock:
+                queue_collection = self._queue_collection
+                set_collection = self._set_collection
+                storage_collection = self._storage_collection
+            if (
+                queue_collection is None
+                or set_collection is None
+                or storage_collection is None
+            ):
+                msg = "Collections not initialized: cannot claim capability domains"
+                raise BackendConnectionError(msg, backend_type="mongodb")
+            collections = (queue_collection, set_collection, storage_collection)
         claims = (
-            (self._queue_collection, "queue"),
-            (self._set_collection, "set"),
-            (self._storage_collection, "storage"),
+            (collections[0], "queue"),
+            (collections[1], "set"),
+            (collections[2], "storage"),
         )
         for collection, domain in claims:
             marker_collection = collection.with_options(**marker_options)
@@ -987,123 +1085,45 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             setting_name="collection_names",
         )
 
-    def _connect_standalone(
+    def _create_indexes(
         self,
-        snapshot: _MongoDBConnectionSnapshot,
-        marker_options: Mapping[str, Any],
+        collections: tuple[
+            Collection[dict[str, Any]],
+            Collection[dict[str, Any]],
+            Collection[dict[str, Any]],
+        ]
+        | None = None,
     ) -> None:
-        """Connect to standalone MongoDB instance."""
-        kwargs = self._build_client_kwargs(snapshot)
-        self._client = MongoClient(snapshot.uri, **kwargs)
-        self._client.admin.command("ping")
-        self._initialize_collections(
-            snapshot.database, snapshot.collection_names, marker_options
-        )
-
-    def _connect_replica_set(
-        self,
-        snapshot: _MongoDBConnectionSnapshot,
-        marker_options: Mapping[str, Any],
-    ) -> None:
-        """Connect to MongoDB replica set.
-
-        Uses replica_set_name if provided, otherwise uses URI.
-        """
-        kwargs = self._build_client_kwargs(snapshot)
-
-        # The seed list has already been parsed as host[:port] values. Keep the
-        # generated URI authority-only: database selection and replica topology
-        # are explicit client operations/kwargs, never string interpolation.
-        if snapshot.replica_set_members:
-            uri = f"mongodb://{','.join(snapshot.replica_set_members)}/"
-        else:
-            uri = snapshot.uri
-
-        if snapshot.replica_set_name:
-            kwargs["replicaSet"] = snapshot.replica_set_name
-
-        self._client = MongoClient(uri, **kwargs)
-        self._client.admin.command("ping")
-        self._initialize_collections(
-            snapshot.database, snapshot.collection_names, marker_options
-        )
-
-    def _connect_sharded_cluster(
-        self,
-        snapshot: _MongoDBConnectionSnapshot,
-        marker_options: Mapping[str, Any],
-    ) -> None:
-        """Connect to MongoDB sharded cluster.
-
-        Connects via mongos routers.
-        """
-        kwargs = self._build_client_kwargs(snapshot)
-
-        if snapshot.mongos_routers:
-            # Use validated mongos routers as connection points without a path/query.
-            routers = ",".join(snapshot.mongos_routers)
-            uri = f"mongodb://{routers}/"
-            self._client = MongoClient(uri, **kwargs)
-        else:
-            # Fall back to provided URI
-            self._client = MongoClient(snapshot.uri, **kwargs)
-
-        self._client.admin.command("ping")
-        self._initialize_collections(
-            snapshot.database, snapshot.collection_names, marker_options
-        )
-
-    def _connect_atlas(
-        self,
-        snapshot: _MongoDBConnectionSnapshot,
-        marker_options: Mapping[str, Any],
-    ) -> None:
-        """Connect to MongoDB Atlas.
-
-        Uses standard Atlas connection string with TLS enabled.
-        """
-        kwargs = self._build_client_kwargs(snapshot)
-
-        self._client = MongoClient(snapshot.uri, **kwargs)
-        self._client.admin.command("ping")
-        self._initialize_collections(
-            snapshot.database, snapshot.collection_names, marker_options
-        )
-
-    def _create_indexes(self) -> None:
-        """Create necessary indexes for collections.
-
-        Raises:
-            BackendConnectionError: If collections are not initialized.
-        """
-        if (
-            self._queue_collection is None
-            or self._set_collection is None
-            or self._storage_collection is None
-        ):
-            msg = "Collections not initialized: call _initialize_collections() first"
-            raise BackendConnectionError(msg, backend_type="mongodb")
-        # Queue indexes
-        self._queue_collection.create_index(
+        """Create necessary indexes without holding the lifecycle lock."""
+        if collections is None:
+            with self._connection_lock:
+                queue_collection = self._queue_collection
+                set_collection = self._set_collection
+                storage_collection = self._storage_collection
+            if (
+                queue_collection is None
+                or set_collection is None
+                or storage_collection is None
+            ):
+                msg = (
+                    "Collections not initialized: call _initialize_collections() first"
+                )
+                raise BackendConnectionError(msg, backend_type="mongodb")
+            collections = (queue_collection, set_collection, storage_collection)
+        queue_collection, set_collection, storage_collection = collections
+        queue_collection.create_index(
             [
                 ("queue_name", ASCENDING),
                 ("priority", ASCENDING),
                 ("created_at", ASCENDING),
             ]
         )
-
-        # Set indexes
-        self._set_collection.create_index(
+        set_collection.create_index(
             [("set_name", ASCENDING), ("item_hash", ASCENDING)],
             unique=True,
         )
-
-        # Storage indexes
-        self._storage_collection.create_index("key", unique=True)
-        self._storage_collection.create_index(
-            "expireAt",
-            expireAfterSeconds=0,
-        )
+        storage_collection.create_index("key", unique=True)
+        storage_collection.create_index("expireAt", expireAfterSeconds=0)
 
     def _generation_from_mirrors_locked(self) -> _MongoDBGeneration:
         """Build one immutable operation graph from the published mirrors."""
@@ -1207,10 +1227,15 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         close_failed = False
         pending_interrupt: BaseException | None = None
         with self._generation_condition:
-            while self._disconnecting:
+            while self._disconnecting or self._connecting:
                 if self._disconnect_owner == current_thread:
                     raise BackendConnectionError(
                         "Cannot disconnect MongoDB re-entrantly.",
+                        backend_type="mongodb",
+                    )
+                if self._connect_owner == current_thread:
+                    raise BackendConnectionError(
+                        "Cannot disconnect MongoDB re-entrantly during connect.",
                         backend_type="mongodb",
                     )
                 self._generation_condition.wait()

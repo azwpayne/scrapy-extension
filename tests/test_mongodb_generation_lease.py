@@ -40,6 +40,21 @@ def _wait_for_disconnect_entry(backend: MongoDBBackend) -> None:
         )
 
 
+def _assert_lifecycle_lock_free(backend: MongoDBBackend) -> None:
+    """Probe ownership locally and acquisition from a competing thread."""
+    assert not backend._connection_lock._is_owned()
+    acquired = threading.Event()
+
+    def acquire_lock() -> None:
+        with backend._connection_lock:
+            acquired.set()
+
+    contender = _thread(acquire_lock)
+    assert acquired.wait(timeout=2)
+    contender.join(timeout=2)
+    assert not contender.is_alive()
+
+
 def test_pop_delete_lease_keeps_pool_open_until_delete_finishes(mocker: Any) -> None:
     backend, client, queue_collection, _storage_collection = _injected_backend(mocker)
     delete_entered = threading.Event()
@@ -212,3 +227,93 @@ def test_reentrant_disconnect_from_operation_is_rejected_without_deadlock(
     assert len(rejection) == 1
     assert "re-entrantly" in str(rejection[0])
     client.close.assert_not_called()
+
+
+def test_disconnect_close_callback_connect_fails_immediately_without_deadlock(
+    mocker: Any,
+) -> None:
+    backend, client, _queue_collection, _storage_collection = _injected_backend(mocker)
+    rejection: list[BackendConnectionError] = []
+
+    def close() -> None:
+        with pytest.raises(BackendConnectionError) as exc_info:
+            backend.connect()
+        rejection.append(exc_info.value)
+
+    client.close.side_effect = close
+    disconnected = _thread(backend.disconnect)
+    disconnected.join(timeout=2)
+
+    assert not disconnected.is_alive()
+    assert len(rejection) == 1
+    assert rejection[0].backend_type == "mongodb"
+    client.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["construction", "ping", "domain", "index", "success-log", "failed-close"],
+)
+def test_connect_sdk_and_callbacks_run_with_lifecycle_lock_free(
+    mocker: Any,
+    phase: str,
+) -> None:
+    from pymongo.errors import ConnectionFailure
+
+    backend = MongoDBBackend(MongoDBSettings())
+    client = mocker.MagicMock()
+    database = mocker.MagicMock()
+    queue_collection = mocker.MagicMock()
+    set_collection = mocker.MagicMock()
+    storage_collection = mocker.MagicMock()
+    collections = {
+        "queues": queue_collection,
+        "sets": set_collection,
+        "storage": storage_collection,
+    }
+    client.__getitem__.return_value = database
+    database.__getitem__.side_effect = collections.__getitem__
+    for collection in collections.values():
+        collection.with_options.return_value = collection
+
+    probes: list[str] = []
+
+    def probe() -> None:
+        _assert_lifecycle_lock_free(backend)
+        probes.append(phase)
+
+    def construct(*_args: Any, **_kwargs: Any) -> Any:
+        probe()
+        return client
+
+    factory = mocker.patch(
+        "scrapy_extension.backends.mongodb.MongoClient",
+        side_effect=construct if phase == "construction" else None,
+        return_value=None if phase == "construction" else client,
+    )
+    if phase == "ping":
+        client.admin.command.side_effect = lambda _command: probe()
+    elif phase == "domain":
+        queue_collection.with_options.side_effect = lambda **_kwargs: (
+            probe(),
+            queue_collection,
+        )[1]
+    elif phase == "index":
+        queue_collection.create_index.side_effect = lambda *_args, **_kwargs: probe()
+    elif phase == "success-log":
+        mocker.patch(
+            "scrapy_extension.backends.mongodb.logger.debug",
+            side_effect=lambda *_args: probe(),
+        )
+    elif phase == "failed-close":
+        client.admin.command.side_effect = ConnectionFailure("startup failed")
+        client.close.side_effect = probe
+
+    if phase == "failed-close":
+        with pytest.raises(BackendConnectionError):
+            backend.connect()
+    else:
+        backend.connect()
+
+    assert probes == [phase]
+    factory.assert_called_once()
