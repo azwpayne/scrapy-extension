@@ -60,6 +60,12 @@ _QUEUE_POP_SERIALIZATION_FAILURE = "Failed to deserialize request."
 _QUEUE_PUSH_MONITOR_FAILURE = "Queue push serialization failed."
 _QUEUE_POP_MONITOR_FAILURE = "Queue pop deserialization failed."
 
+_STRATEGY_CLEANUP_NOT_STARTED = "not-started"
+_STRATEGY_CLEANUP_STARTED = "started"
+_STRATEGY_CLEANUP_SUCCEEDED = "succeeded"
+_STRATEGY_CLEANUP_FAILED = "failed"
+_STRATEGY_CLEANUP_INDETERMINATE = "indeterminate"
+
 #: R25-B/R26-A: ceiling (bytes) for a restored strategy snapshot. A corrupt or
 #: malicious multi-GB blob at the snapshot key would OOM-kill worker startup
 #: (``bytes(state)`` copy + ``json.loads`` full materialization) before the
@@ -247,9 +253,14 @@ class BackendQueue:
         # attempt has consumed it. Per-caller tokens make registration and
         # idempotent cleanup safe when process-control exceptions interrupt either.
         self._close_attempt_outcomes: dict[int, bool] = {}
+        self._close_attempt_terminal: dict[int, bool] = {}
         self._close_attempt_waiters: dict[int, set[object]] = {}
         self._begin_close_complete = False
         self._checkpoint_complete = False
+        # Destructive strategy cleanup is at-most-once. ``started`` is published
+        # before invoking extension code; every later state is terminal, including
+        # ``indeterminate`` when process control interrupts the call boundary.
+        self._strategy_cleanup_state = _STRATEGY_CLEANUP_NOT_STARTED
         self._monitor: Monitor = (
             monitor if monitor is not None else self._resolve_monitor(spider)
         )
@@ -1296,6 +1307,7 @@ class BackendQueue:
                 if not waiters:
                     self._close_attempt_waiters.pop(attempt, None)
                     self._close_attempt_outcomes.pop(attempt, None)
+                    self._close_attempt_terminal.pop(attempt, None)
                 return interrupted
             except BaseException as exc:
                 if interrupted is None:
@@ -1307,11 +1319,13 @@ class BackendQueue:
         failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         observed_success = False
+        observed_terminal = False
         try:
             self._close_attempt_waiters.setdefault(attempt, set()).add(waiter_token)
             while attempt not in self._close_attempt_outcomes:
                 self._operation_gate.wait()
             observed_success = self._close_attempt_outcomes[attempt]
+            observed_terminal = self._close_attempt_terminal.get(attempt, False)
         except BaseException as exc:
             failure = exc
         finally:
@@ -1321,7 +1335,24 @@ class BackendQueue:
         if cleanup_failure is not None:
             raise cleanup_failure
         if not observed_success:
+            if observed_terminal:
+                raise QueueError(
+                    "Queue strategy cleanup failed or was interrupted; close is terminal."
+                )
             raise QueueError("Queue close failed; checkpoint can be retried.")
+
+    def _publish_strategy_cleanup_outcome(
+        self, outcome: str
+    ) -> BaseException | None:
+        """Replace ``started`` with one terminal outcome despite interruption."""
+        interrupted: BaseException | None = None
+        while self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
+            try:
+                self._strategy_cleanup_state = outcome
+            except BaseException as exc:
+                if interrupted is None:
+                    interrupted = exc
+        return interrupted
 
     def _publish_close_attempt(
         self,
@@ -1341,14 +1372,23 @@ class BackendQueue:
             try:
                 with self._operation_gate:
                     owns_attempt = self._close_owner_token is owner_token
-                    if owns_attempt and succeeded:
+                    cleanup_started = (
+                        self._strategy_cleanup_state
+                        != _STRATEGY_CLEANUP_NOT_STARTED
+                    )
+                    if owns_attempt and (succeeded or cleanup_started):
+                        # Cleanup cannot safely be replayed once invocation may have
+                        # mutated strategy state. Failure and indeterminate outcomes
+                        # therefore close this queue lifecycle just like success.
                         self._close_complete = True
                     waiters = self._close_attempt_waiters.get(attempt)
                     if waiters:
                         self._close_attempt_outcomes[attempt] = succeeded
+                        self._close_attempt_terminal[attempt] = cleanup_started
                     else:
                         self._close_attempt_waiters.pop(attempt, None)
                         self._close_attempt_outcomes.pop(attempt, None)
+                        self._close_attempt_terminal.pop(attempt, None)
                     self._operation_gate.notify_all()
                     if owns_attempt:
                         self._close_in_progress = False
@@ -1375,6 +1415,7 @@ class BackendQueue:
         attempt = 0
         failure: BaseException | None = None
         publication_failure: BaseException | None = None
+        cleanup_publication_failure: BaseException | None = None
         succeeded = False
         try:
             try:
@@ -1400,11 +1441,44 @@ class BackendQueue:
                     if not lossy:
                         self._persist_snapshot()
                     self._checkpoint_complete = True
-                self._strategy.close()
+
+                # Mark destructive cleanup before invocation. After this write no
+                # close or lossy retry may call strategy.close() again: it may have
+                # raised after mutation, or process control may have landed after
+                # the call returned but before Python could observe that success.
+                self._strategy_cleanup_state = _STRATEGY_CLEANUP_STARTED
+                cleanup_outcome = _STRATEGY_CLEANUP_INDETERMINATE
+                cleanup_failure: BaseException | None = None
+                try:
+                    self._strategy.close()
+                except Exception as exc:
+                    cleanup_failure = exc
+                    cleanup_outcome = _STRATEGY_CLEANUP_FAILED
+                except BaseException as exc:
+                    cleanup_failure = exc
+                else:
+                    cleanup_outcome = _STRATEGY_CLEANUP_SUCCEEDED
+                finally:
+                    cleanup_publication_failure = (
+                        self._publish_strategy_cleanup_outcome(cleanup_outcome)
+                    )
+                if cleanup_failure is not None:
+                    raise cleanup_failure
+                if cleanup_publication_failure is not None:
+                    raise cleanup_publication_failure
                 succeeded = True
             except BaseException as exc:
                 failure = exc
         finally:
+            # An interruption can land after ``started`` but before the nested
+            # cleanup suite begins. Repair that gap to an explicit terminal state
+            # before publishing the close attempt.
+            if self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
+                cleanup_publication_failure = (
+                    self._publish_strategy_cleanup_outcome(
+                        _STRATEGY_CLEANUP_INDETERMINATE
+                    )
+                )
             # Once this call records ownership, every exit path must publish a
             # terminal result. In particular, tracing/profiling callbacks can
             # raise between handler bytecodes, before normal control reaches the
@@ -1416,6 +1490,8 @@ class BackendQueue:
 
         if failure is not None and not isinstance(failure, Exception):
             raise failure
+        if cleanup_publication_failure is not None:
+            raise cleanup_publication_failure
         if publication_failure is not None:
             raise publication_failure
         if failure is not None:

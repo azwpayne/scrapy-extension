@@ -10,7 +10,11 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from scrapy_extension.exceptions import QueueError
-from scrapy_extension.queue.queue import BackendQueue
+from scrapy_extension.queue.queue import (
+    _STRATEGY_CLEANUP_FAILED,
+    _STRATEGY_CLEANUP_INDETERMINATE,
+    BackendQueue,
+)
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
@@ -29,6 +33,21 @@ def _instruction_after_in(function: object, opname: str, argval: object) -> int:
 
 def _instruction_after(opname: str, argval: object) -> int:
     return _instruction_after_in(BackendQueue.close, opname, argval)
+
+
+def _instruction_after_strategy_close_call() -> int:
+    instructions = list(dis.get_instructions(BackendQueue.close))
+    for index, instruction in enumerate(instructions):
+        if instruction.opname in {"LOAD_METHOD", "LOAD_ATTR"} and instruction.argval == "close":
+            if not any(
+                candidate.opname == "LOAD_ATTR" and candidate.argval == "_strategy"
+                for candidate in instructions[max(0, index - 3) : index]
+            ):
+                continue
+            for call_index in range(index + 1, len(instructions) - 1):
+                if instructions[call_index].opname.startswith("CALL"):
+                    return instructions[call_index + 1].offset
+    raise AssertionError("Missing strategy.close() call in BackendQueue.close")
 
 
 def _queue_with_storage(strategy: MagicMock, storage: MagicMock) -> BackendQueue:
@@ -373,6 +392,7 @@ class _MutationBoundaryQueue(BackendQueue):
         "_close_complete": "close-complete",
         "_close_in_progress": "close-in-progress",
         "_close_owner_token": "owner-token",
+        "_strategy_cleanup_state": "cleanup-state",
     }
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -725,6 +745,103 @@ def test_trace_interruption_after_ownership_always_publishes_and_allows_retry(
     assert queue._close_attempt_outcomes == {}
 
 
+def test_interruption_after_cleanup_started_is_terminal_without_invocation() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = _MutationBoundaryQueue(
+        MagicMock(
+            get_storage_backend=MagicMock(return_value=storage),
+            get_queue_backend=MagicMock(return_value=MagicMock()),
+        ),
+        "q",
+        queue_strategy=strategy,
+        snapshot_max_bytes=64,
+        snapshot_chunk_bytes=4,
+    )
+    interruption = _PublicationBoundaryInterruption("before cleanup invocation")
+    queue.arm_boundary("cleanup-state", interruption)
+
+    with pytest.raises(_PublicationBoundaryInterruption) as exc_info:
+        queue.close()
+
+    assert exc_info.value is interruption
+    assert queue._strategy_cleanup_state == _STRATEGY_CLEANUP_INDETERMINATE
+    assert queue._close_complete is True
+    strategy.close.assert_not_called()
+
+    queue.close()
+    queue.close(lossy=True)
+    strategy.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("cleanup_error", "expected_state"),
+    [
+        (RuntimeError("ordinary cleanup failure"), _STRATEGY_CLEANUP_FAILED),
+        (
+            _CustomControlFlow("cleanup control interruption"),
+            _STRATEGY_CLEANUP_INDETERMINATE,
+        ),
+    ],
+)
+def test_cleanup_error_is_terminal_for_direct_and_lossy_retry(
+    cleanup_error: BaseException, expected_state: str
+) -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    strategy.close.side_effect = cleanup_error
+    queue = _queue_with_storage(strategy, storage)
+
+    with pytest.raises(type(cleanup_error)) as exc_info:
+        queue.close()
+
+    assert exc_info.value is cleanup_error
+    assert queue._strategy_cleanup_state == expected_state
+    assert queue._checkpoint_complete is True
+    assert queue._close_complete is True
+
+    queue.close()
+    queue.close(lossy=True)
+    strategy.close.assert_called_once_with()
+
+
+@pytest.mark.timeout(10)
+def test_opcode_interruption_immediately_after_cleanup_return_is_indeterminate() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = _queue_with_storage(strategy, storage)
+    interruption = _CustomControlFlow("interrupted after cleanup returned")
+    target_offset = _instruction_after_strategy_close_call()
+
+    def inject(frame: object, event: str, _arg: object) -> object:
+        if getattr(frame, "f_code", None) is BackendQueue.close.__code__:
+            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                raise interruption
+        return inject
+
+    sys.settrace(inject)
+    try:
+        with pytest.raises(_CustomControlFlow) as exc_info:
+            queue.close()
+    finally:
+        sys.settrace(None)
+
+    assert exc_info.value is interruption
+    assert queue._strategy_cleanup_state == _STRATEGY_CLEANUP_INDETERMINATE
+    assert queue._close_complete is True
+
+    queue.close()
+    queue.close(lossy=True)
+    strategy.close.assert_called_once_with()
+
+
 def test_nonempty_state_without_storage_requires_explicit_lossy_abort() -> None:
     manager = MagicMock()
     manager.get_storage_backend.side_effect = NotImplementedError("queue only")
@@ -856,6 +973,35 @@ def test_scheduler_cleans_up_after_real_strategy_close_queue_error() -> None:
     strategy.close.assert_called_once_with()
     queue_manager.close.assert_called_once_with()
     snapshot_manager.close.assert_called_once_with()
+
+
+def test_scheduler_abort_does_not_reenter_interrupted_real_queue_cleanup() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    interruption = _CustomControlFlow("lossy cleanup interrupted")
+    strategy.close.side_effect = interruption
+    queue = _queue_with_storage(strategy, storage)
+    queue_manager = MagicMock(name="queue-manager")
+    snapshot_manager = MagicMock(name="snapshot-manager")
+    scheduler = BackendScheduler(
+        queue_manager,
+        snapshot_connection_manager=snapshot_manager,
+        owns_snapshot_connection_manager=True,
+    )
+    scheduler._queue = queue
+
+    with pytest.raises(_CustomControlFlow) as exc_info:
+        scheduler.abort("first-lossy-abort")
+
+    assert exc_info.value is interruption
+    strategy.close.assert_called_once_with()
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+
+    scheduler.abort("duplicate-lossy-abort")
+    strategy.close.assert_called_once_with()
 
 
 def test_scheduler_abort_is_an_explicit_lossy_teardown() -> None:
