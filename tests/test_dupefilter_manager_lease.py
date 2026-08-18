@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -125,3 +126,48 @@ def test_persistent_filter_failure_never_releases_manager() -> None:
     assert lease.released is False
     assert dupefilter._closed is False
     backend.disconnect.assert_not_called()
+
+
+def test_concurrent_release_cannot_overtake_active_open() -> None:
+    manager = Mock()
+    membership_filter = Mock(spec=MembershipFilter)
+    entered = threading.Event()
+    continue_open = threading.Event()
+
+    def blocking_open() -> None:
+        entered.set()
+        assert continue_open.wait(timeout=3)
+
+    membership_filter.open.side_effect = blocking_open
+    dupefilter = BackendDupeFilter(
+        connection_manager=manager,
+        membership_filter=membership_filter,
+    )
+    errors: list[BaseException] = []
+
+    def run_open() -> None:
+        try:
+            dupefilter.open()
+        except BaseException as exc:
+            errors.append(exc)
+
+    opener = threading.Thread(target=run_open, name="dupefilter-open-owner")
+    opener.start()
+    assert entered.wait(timeout=3)
+    try:
+        with pytest.raises(RuntimeError, match="open is already in progress"):
+            dupefilter.close("concurrent")
+        assert dupefilter._closing is False
+        membership_filter.close.assert_not_called()
+    finally:
+        continue_open.set()
+    opener.join(timeout=3)
+
+    assert not opener.is_alive()
+    assert errors == []
+    assert dupefilter._opened is True
+    assert dupefilter._closed is False
+
+    dupefilter.close("finished")
+    membership_filter.close.assert_called_once_with()
+    manager.close.assert_called_once_with()

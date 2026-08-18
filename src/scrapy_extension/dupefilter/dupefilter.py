@@ -288,6 +288,7 @@ class BackendDupeFilter:
         self._opened = False
         self._opened_spider: Spider | None = None
         self._opening = False
+        self._open_owner_token: _MonitorFenceToken | None = None
         self._closed = False
         self._closing = False
         self._release_in_progress = False
@@ -725,16 +726,24 @@ class BackendDupeFilter:
 
     def open(self, spider: Spider | None = None) -> None:
         """Reserve, execute, and publish one filter open outside the lifecycle lock."""
+        open_owner = _MonitorFenceToken(get_ident(), "open_owner")
         with self._lifecycle_lock:
             if self._closed or self._closing:
                 raise RuntimeError("dupefilter is closing or closed")
             if self._opening:
-                raise RuntimeError("dupefilter open is already in progress")
+                current_owner = self._open_owner_token
+                if current_owner is not None and current_owner.active:
+                    raise RuntimeError("dupefilter open is already in progress")
+                # An interrupted open may have crossed an opaque filter boundary.
+                # Do not replay it. Its only safe recovery is the close path, which
+                # can reclaim this inactive package-owned transition below.
+                raise RuntimeError("dupefilter interrupted open requires close")
             if self._opened:
                 if spider is self._opened_spider:
                     return
                 raise RuntimeError("dupefilter is already open for a different spider")
             self._opening = True
+            self._open_owner_token = open_owner
 
         open_failure: BaseException | None = None
         try:
@@ -750,7 +759,9 @@ class BackendDupeFilter:
 
         if open_failure is not None:
             with self._lifecycle_lock:
-                self._opening = False
+                if self._open_owner_token is open_owner:
+                    self._opening = False
+                    self._open_owner_token = None
             cleanup_failed = False
             try:
                 self.release(self._direct_release_owner, "open-failed")
@@ -764,9 +775,12 @@ class BackendDupeFilter:
             raise open_failure
 
         with self._lifecycle_lock:
+            if self._open_owner_token is not open_owner:
+                raise RuntimeError("dupefilter open ownership changed")
             self._opened = True
             self._opened_spider = spider
             self._opening = False
+            self._open_owner_token = None
 
     def _resolve_spider_key(self, spider: Spider) -> None:
         """Substitute ``{spider}`` in :attr:`key` with ``spider.name``, propagating
@@ -799,14 +813,20 @@ class BackendDupeFilter:
         del reason
         thread_id = get_ident()
         with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._opening:
+                open_owner = self._open_owner_token
+                if open_owner is not None and open_owner.active:
+                    raise RuntimeError("dupefilter open is already in progress")
+                # The opening frame has unwound without terminal publication.
+                # Reclaim package state for close without replaying filter.open().
+                self._opening = False
+                self._open_owner_token = None
             if self._release_owner_token is None:
                 self._release_owner_token = owner_token
             elif self._release_owner_token is not owner_token:
-                if self._closed:
-                    return
                 raise RuntimeError("dupefilter close is owned by another caller")
-            if self._closed:
-                return
             if self._release_in_progress:
                 if self._release_thread_id == thread_id:
                     return
@@ -815,6 +835,7 @@ class BackendDupeFilter:
             self._release_thread_id = thread_id
             self._closing = True
             self._opening = False
+            self._open_owner_token = None
             self._opened = False
             self._opened_spider = None
             # Receipts before queue commit own no marker and need no backend call.
