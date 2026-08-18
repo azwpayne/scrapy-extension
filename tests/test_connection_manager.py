@@ -2349,9 +2349,9 @@ def test_retirement_interrupts_retry_backoff_before_second_backend(mocker, teard
         assert manager._users == 0
     else:
         ConnectionManager.clear_registry()
-        # Force teardown bypasses outstanding acquires rather than corrupting their
-        # accounting; a later holder close still owns this exact acquire.
-        assert manager._users == 1
+        # Force teardown invalidates every outstanding ownership token. A stale
+        # holder can still call close(), but it cannot affect a replacement.
+        assert manager._users == 0
 
     owner.join(timeout=1.0)
 

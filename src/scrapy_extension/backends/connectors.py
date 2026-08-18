@@ -1789,6 +1789,36 @@ def _normalize_registry_value(value: Any, active_ids: set[int]) -> Any:
         active_ids.remove(value_id)
 
 
+class ConnectionManagerLease:
+    """Acquire-specific, idempotently releasable manager ownership.
+
+    The legacy :meth:`ConnectionManager.get_manager` API cannot identify which
+    holder calls ``manager.close()``.  Components that must repair an interrupted
+    teardown use this additive lease API instead: retrying ``release()`` always
+    targets the same opaque acquire token and can never consume a peer's hold.
+    """
+
+    __slots__ = ("_manager", "_token")
+
+    def __init__(self, manager: ConnectionManager, token: object) -> None:
+        self._manager = manager
+        self._token = token
+
+    @property
+    def manager(self) -> ConnectionManager:
+        """Return the shared manager owned by this lease."""
+        return self._manager
+
+    @property
+    def released(self) -> bool:
+        """Whether this lease's ownership token is no longer active."""
+        return self._manager._is_acquire_released(self._token)
+
+    def release(self) -> None:
+        """Release this exact acquire; repeated calls are idempotent."""
+        self._manager._release_acquire(self._token)
+
+
 class ConnectionManager:
     """Lazy singleton connection manager for backends.
 
@@ -1944,13 +1974,24 @@ class ConnectionManager:
         # for the full delay.
         self._retired = False
         self._retirement_event = threading.Event()
-        # Refcount of outstanding ``get_manager()`` acquire calls sharing this
-        # instance (A1). The manager is only created via ``get_manager()``, so
-        # the constructor sets the initial count to 0; ``get_manager()`` then
-        # increments to 1 on first insertion. Each subsequent acquire bumps it;
-        # each ``close()`` (release) decrements; only the last holder actually
-        # disconnects + evicts the registry entry.
+        # Authoritative acquire ownership.  Every pooled acquisition has one
+        # opaque identity token; legacy ``get_manager()`` calls additionally place
+        # their token in ``_legacy_acquires`` so each ``manager.close()`` consumes
+        # one legacy hold.  ``_users`` is retained as an observational compatibility
+        # count only and is always synchronized from ``_active_acquires``.
+        self._active_acquires: set[object] = set()
+        self._legacy_acquires: list[object] = []
         self._users: int = 0
+        # Retirement is a repairable generation state.  Removing the final token
+        # and publishing ``_retired`` happen atomically under ``_registry_lock``;
+        # a retry with an already-absent token still completes this teardown.
+        self._retirement_complete = False
+        self._retiring_backend: Backend | None = None
+        self._retirement_disconnect_started = False
+        self._retiring_adapter: _DeferredAckPluginQueueBackend | None = None
+        self._retiring_adapter_source: tuple[Backend, CircuitBreaker | None] | None = (
+            None
+        )
         # Single-connect ownership flag (A2). The first thread to enter the slow
         # path takes ownership under ``_lock``; peers capture the same attempt and
         # wait for its result. A distinct result object per attempt is necessary:
@@ -2001,26 +2042,39 @@ class ConnectionManager:
         backend_type: str,
         settings: dict[str, Any] | None = None,
     ) -> ConnectionManager:
-        """Get or create a connection manager (acquire semantics).
+        """Get a shared manager and register one legacy ``close()`` acquire."""
+        manager, _ = cls._get_manager_with_token(
+            backend_type,
+            settings,
+            legacy=True,
+        )
+        return manager
 
-        Each call registers an acquire on the returned instance: the shared
-        manager's ``_users`` refcount is incremented under the registry lock.
-        Callers MUST pair every successful ``get_manager()`` with a ``close()``
-        (release). Only the LAST holder's ``close()`` disconnects the backend
-        and evicts the registry entry — earlier holders' closes are no-ops on
-        the backend, so co-located components (e.g. scheduler queue +
-        dupefilter sharing one Redis) don't tear each other's connection down
-        during shutdown.
+    @classmethod
+    def acquire_lease(
+        cls,
+        backend_type: str,
+        settings: dict[str, Any] | None = None,
+    ) -> ConnectionManagerLease:
+        """Get a shared manager with acquire-specific idempotent ownership."""
+        manager, token = cls._get_manager_with_token(
+            backend_type,
+            settings,
+            legacy=False,
+        )
+        return ConnectionManagerLease(manager, token)
 
-        Args:
-            backend_type: The backend-type registry string (or ``BackendType``
-                member, which is a ``str`` subclass).
-            settings: Backend-specific settings.
-
-        Returns:
-            A ConnectionManager instance for the given backend.
-        """
+    @classmethod
+    def _get_manager_with_token(
+        cls,
+        backend_type: str,
+        settings: dict[str, Any] | None,
+        *,
+        legacy: bool,
+    ) -> tuple[ConnectionManager, object]:
+        """Acquire one pooled manager and publish one opaque ownership token."""
         thread_id = threading.get_ident()
+        acquire_token = object()
         with cls._registry_lock:
             if thread_id in cls._manager_construction_owners:
                 raise ConfigurationError(
@@ -2101,7 +2155,11 @@ class ConnectionManager:
 
                 if manager is not None:
                     cls._managers.move_to_end(key)
-                    manager._users += 1
+                    cls._register_acquire_under_lock(
+                        manager,
+                        acquire_token,
+                        legacy=legacy,
+                    )
                 else:
                     attempt = cls._manager_constructions.get(key)
                     if attempt is None:
@@ -2119,7 +2177,7 @@ class ConnectionManager:
             for victim in victims:
                 cls._disconnect_backend_safely(victim)
             if manager is not None:
-                return manager
+                return manager, acquire_token
             assert attempt is not None
             if not construct:
                 attempt.event.wait()
@@ -2169,7 +2227,11 @@ class ConnectionManager:
                     candidate._registry_backend_type = candidate.backend_type
                     candidate._registry_settings = settings_snapshot
                     candidate._registry_token = key
-                    candidate._users = 1
+                    cls._register_acquire_under_lock(
+                        candidate,
+                        acquire_token,
+                        legacy=legacy,
+                    )
                     cls._managers[key] = candidate
                     selected = candidate
                     candidate = None
@@ -2177,7 +2239,11 @@ class ConnectionManager:
                     # Double-check publication: a post-clear generation may already
                     # have won. Reuse it and preserve one acquire per successful call.
                     cls._managers.move_to_end(key)
-                    existing._users += 1
+                    cls._register_acquire_under_lock(
+                        existing,
+                        acquire_token,
+                        legacy=legacy,
+                    )
                     selected = existing
 
                 # Publish/abort state is complete before peers wake and re-check.
@@ -2200,7 +2266,21 @@ class ConnectionManager:
                     cls.MAX_MANAGERS,
                 )
             if selected is not None:
-                return selected
+                return selected, acquire_token
+
+    @classmethod
+    def _register_acquire_under_lock(
+        cls,
+        manager: ConnectionManager,
+        token: object,
+        *,
+        legacy: bool,
+    ) -> None:
+        """Publish one active token while ``_registry_lock`` is held."""
+        manager._active_acquires.add(token)
+        if legacy:
+            manager._legacy_acquires.append(token)
+        manager._users = len(manager._active_acquires)
 
     @classmethod
     def _collect_orphans_under_lock(
@@ -2253,31 +2333,20 @@ class ConnectionManager:
 
     @staticmethod
     def _disconnect_backend_safely(manager: ConnectionManager) -> None:
-        """Disconnect ``manager._backend`` under its lock, suppressing errors.
-
-        Shared teardown primitive for evicted victims (:meth:`get_manager`) and
-        force-teardown (:meth:`clear_registry`). :meth:`close` does NOT use this
-        — it logs disconnect errors and emits ``on_disconnect`` / breaker-reset
-        hooks that ``suppress()`` would skip, so its teardown stays inline.
-        """
-        with manager._lock:
+        """Force one token generation terminal, suppressing teardown failures."""
+        cls = type(manager)
+        with cls._registry_lock:
+            manager._active_acquires.clear()
+            manager._legacy_acquires.clear()
+            manager._users = 0
             manager._retired = True
             manager._retirement_event.set()
-            backend = manager._backend
-            manager._backend = None
-            retired_adapter, retired_source = (
-                manager._detach_plugin_queue_backend_under_lock()
-            )
-        # An adapter can own hostile identity tokens whose destructors re-enter the
-        # manager. Release the complete cache generation only after ``_lock`` is free.
-        del retired_adapter, retired_source
-        if backend is not None:
-            try:
-                backend.disconnect()
-            except BaseException:
-                # Forced registry teardown is best-effort: one broken victim must not
-                # strand later victims or invalidate a newly returned manager acquire.
-                pass
+        try:
+            manager._finalize_retirement()
+        except BaseException:
+            # Forced registry teardown is best-effort: one broken victim must not
+            # strand later victims or invalidate a newly returned manager acquire.
+            pass
 
     @staticmethod
     def _registry_key(
@@ -2985,110 +3054,124 @@ class ConnectionManager:
         _MANAGER_CONFIGURATION_SETTING_NAMES,
     )
     def close(self) -> None:
-        """Release this holder's acquire on the shared manager (refcount).
-
-        Pairs with ``get_manager()`` (acquire). Decrements ``_users`` under the
-        registry lock; only when the count drops to zero (the LAST holder) does
-        this method actually disconnect the backend and evict the registry
-        entry. Earlier holders' closes are no-ops on the backend — so
-        co-located components (e.g. scheduler queue + dupefilter sharing one
-        Redis) don't tear each other's connection down during shutdown.
-
-        Disconnect-path error handling mirrors R25-A1's connect-path cleanup
-        (broad ``Exception`` catch): disconnecting a possibly-broken backend
-        can raise anything (OSError from the socket layer, a backend-specific
-        error). ``close()`` must still complete the registry eviction so the
-        next ``get_manager()`` creates a fresh manager — never propagate out of
-        the close chain.
-        """
+        """Release one legacy acquire, preserving the historical API."""
         cls = type(self)
-        token = self._registry_token
-        if token is None:
-            # Preserve direct-constructor validation behavior without allowing a
-            # bare manager to derive an eviction target from mutable public state.
+        if self._registry_token is None:
+            # Preserve direct-constructor validation and teardown behavior.
             cls._registry_key(self.backend_type, self.settings)
-        with cls._registry_lock:
-            # A ``close()`` without a matching ``get_manager()`` (e.g. a bare
-            # ``ConnectionManager(...)`` constructed in tests) has _users == 0;
-            # clamp at zero and fall through to the teardown path so such an
-            # instance still disconnects its backend.
-            if self._users > 0:
-                self._users -= 1
-            is_last_holder = self._users <= 0
-            if is_last_holder:
-                # Evict the saved acquire token by IDENTITY. A bare
-                # ``ConnectionManager(...)`` has no token and must not evict a
-                # registered peer with equivalent settings. A plain pop without the
-                # identity guard could remove a fresh replacement while it is held,
-                # creating a split-brain manager/connection leak. See
-                # test_close_bare_instance_does_not_evict_registered_peer.
-                if token is not None and cls._managers.get(token) is self:
-                    cls._managers.pop(token, None)
-
-        if not is_last_holder:
+            with cls._registry_lock:
+                if self._active_acquires:
+                    return
+                self._retired = True
+                self._retirement_event.set()
+            self._finalize_retirement()
             return
 
-        backend: Backend | None
+        with cls._registry_lock:
+            legacy_token = (
+                self._legacy_acquires.pop(0) if self._legacy_acquires else None
+            )
+        if legacy_token is not None:
+            self._release_acquire(legacy_token)
+        elif self._retired:
+            # Repair a prior final-release interruption without consuming a peer.
+            self._finalize_retirement()
+
+    def _is_acquire_released(self, acquire_token: object) -> bool:
+        """Return whether one opaque acquire token is no longer authoritative."""
+        with type(self)._registry_lock:
+            return acquire_token not in self._active_acquires
+
+    def _release_acquire(self, acquire_token: object) -> None:
+        """Release one exact token and repair final retirement when necessary."""
+        cls = type(self)
+        should_finalize = False
+        with cls._registry_lock:
+            self._active_acquires.discard(acquire_token)
+            # A token-aware release can race legacy cleanup only through misuse;
+            # keep the compatibility queue synchronized without relying on it.
+            try:
+                self._legacy_acquires.remove(acquire_token)
+            except ValueError:
+                pass
+            self._users = len(self._active_acquires)
+            if not self._active_acquires:
+                self._retired = True
+                self._retirement_event.set()
+                registry_token = self._registry_token
+                if (
+                    registry_token is not None
+                    and cls._managers.get(registry_token) is self
+                ):
+                    cls._managers.pop(registry_token, None)
+                should_finalize = not self._retirement_complete
+        if should_finalize:
+            self._finalize_retirement()
+
+    def _finalize_retirement(self) -> None:
+        """Complete one manager retirement without replaying opaque teardown."""
+        backend_to_disconnect: Backend | None = None
         with self._lock:
-            # Make the final release terminal before inspecting the backend. A
-            # connection attempt runs backend.connect() outside this lock; when it
-            # later tries to publish the successful handle, _attempt_connection()
-            # observes this marker and disposes that handle instead. Without this
-            # assignment, an in-flight connect can resurrect an evicted manager and
-            # leak an unowned connection.
             self._retired = True
             self._retirement_event.set()
-            backend = self._backend
-            self._backend = None
-            retired_adapter, retired_source = (
-                self._detach_plugin_queue_backend_under_lock()
-            )
-            # R14-E: reset the circuit breaker so a manager that reconnects after
-            # teardown (or an orphan-evicted manager re-created from the same
-            # settings) does not inherit a stale OPEN state from the prior
-            # incarnation's failure run. ``reset()`` is a no-op when the breaker
-            # was never constructed (disabled).
+            if self._retirement_complete:
+                return
+            if self._retiring_backend is None and self._backend is not None:
+                self._retiring_backend = self._backend
+                self._backend = None
+            if self._retiring_adapter is None:
+                (
+                    self._retiring_adapter,
+                    self._retiring_adapter_source,
+                ) = self._detach_plugin_queue_backend_under_lock()
+            if not self._retirement_disconnect_started:
+                self._retirement_disconnect_started = True
+                backend_to_disconnect = self._retiring_backend
             if self._breaker is not None:
                 self._breaker.reset()
 
-        # The adapter can release hostile identity tokens. Keep its source alive as
-        # part of the same retired generation until manager state is unlocked.
-        del retired_adapter, retired_source
-        if backend is None:
-            return
         disconnect_failed = False
-        try:
-            # Network teardown must not hold manager state while it blocks. The
-            # handle was already detached under ``_lock``, so no accessor can publish
-            # it as live during disconnect.
-            backend.disconnect()
-        except Exception:
-            # Broad catch — mirrors R25-A1's connect-path cleanup. Registry eviction
-            # and state detachment are already complete, so teardown errors remain
-            # observable without breaking the caller's close chain.
-            disconnect_failed = True
+        control_error: BaseException | None = None
+        if backend_to_disconnect is not None:
+            try:
+                backend_to_disconnect.disconnect()
+            except Exception:
+                disconnect_failed = True
+            except BaseException as error:
+                # Opaque disconnect effects cannot be replayed exactly. Publish the
+                # package-owned retirement state, then preserve control flow.
+                control_error = error
 
+        with self._lock:
+            self._retirement_complete = True
+            self._retiring_backend = None
+            retired_adapter = self._retiring_adapter
+            retired_source = self._retiring_adapter_source
+            self._retiring_adapter = None
+            self._retiring_adapter_source = None
+
+        # Hostile plugin token destruction and monitor callbacks run only after all
+        # registry/manager state is terminal and unlocked.
+        del retired_adapter, retired_source
         if disconnect_failed:
             _log_diagnostic(logger.warning, "Error during disconnect")
-        else:
+        elif backend_to_disconnect is not None:
             _log_diagnostic(
                 logger.debug,
                 "Disconnected from %s",
                 self._backend_type_for_operations(),
             )
-
-        # Lifecycle callbacks are user code. Dispatch after both registry and
-        # manager locks are released so re-entry observes the terminal state and
-        # receives a typed error instead of self-deadlocking. The outcome is a
-        # bounded boolean, never backend configuration or exception details.
-        self._notify_monitor(
-            "on_disconnect", str(self._backend_type_for_operations()), None
-        )
-        self._notify_monitor(
-            "on_disconnect_result",
-            str(self._backend_type_for_operations()),
-            not disconnect_failed,
-        )
+        if backend_to_disconnect is not None:
+            self._notify_monitor(
+                "on_disconnect", str(self._backend_type_for_operations()), None
+            )
+            self._notify_monitor(
+                "on_disconnect_result",
+                str(self._backend_type_for_operations()),
+                not disconnect_failed and control_error is None,
+            )
+        if control_error is not None:
+            raise control_error
 
     @classmethod
     def clear_registry(cls) -> None:
@@ -3105,6 +3188,12 @@ class ConnectionManager:
         with cls._registry_lock:
             managers = list(cls._managers.values())
             cls._managers.clear()
+            for manager in managers:
+                manager._active_acquires.clear()
+                manager._legacy_acquires.clear()
+                manager._users = 0
+                manager._retired = True
+                manager._retirement_event.set()
             # Invalidate candidates that began before this clear boundary and wake
             # every waiter so a fresh generation can elect its own constructor.
             cls._registry_epoch += 1
@@ -3119,11 +3208,10 @@ class ConnectionManager:
             # permanently suppressed after the first overflow across tests).
             cls._over_cap_warned = False
         for manager in managers:
-            cls._disconnect_backend_safely(manager)
-            # Reset any breaker state too (mirrors close()).
-            with manager._lock:
-                if manager._breaker is not None:
-                    manager._breaker.reset()
+            try:
+                manager._finalize_retirement()
+            except BaseException:
+                pass
 
     def set_monitor(self, monitor: Monitor) -> None:
         """Attach an observability monitor for connection-lifecycle hooks (R14-D).

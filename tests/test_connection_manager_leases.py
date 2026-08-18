@@ -1,0 +1,147 @@
+"""Acquire-specific ConnectionManager ownership regressions."""
+
+from __future__ import annotations
+
+import threading
+from unittest.mock import Mock
+
+import pytest
+
+from scrapy_extension.backends.base import BackendType
+from scrapy_extension.backends.connectors import ConnectionManager
+
+
+def test_leases_release_only_their_exact_acquire() -> None:
+    first = ConnectionManager.acquire_lease(BackendType.REDIS, {"host": "leases"})
+    second = ConnectionManager.acquire_lease(BackendType.REDIS, {"host": "leases"})
+    unrelated = ConnectionManager.acquire_lease(BackendType.REDIS, {"host": "leases"})
+    manager = first.manager
+    backend = Mock()
+    manager._backend = backend
+
+    assert second.manager is manager
+    assert unrelated.manager is manager
+    assert manager._users == 3
+
+    first.release()
+    first.release()
+    assert first.released is True
+    assert second.released is False
+    assert unrelated.released is False
+    assert manager._users == 2
+    backend.disconnect.assert_not_called()
+
+    second.release()
+    assert manager._users == 1
+    assert unrelated.released is False
+    backend.disconnect.assert_not_called()
+
+    unrelated.release()
+    unrelated.release()
+    assert manager._users == 0
+    assert manager._retirement_complete is True
+    backend.disconnect.assert_called_once_with()
+
+
+def test_legacy_close_never_consumes_an_acquire_specific_lease() -> None:
+    manager = ConnectionManager.get_manager(BackendType.REDIS, {"host": "mixed"})
+    lease = ConnectionManager.acquire_lease(BackendType.REDIS, {"host": "mixed"})
+    backend = Mock()
+    manager._backend = backend
+
+    manager.close()
+    manager.close()
+
+    assert manager._users == 1
+    assert lease.released is False
+    backend.disconnect.assert_not_called()
+
+    lease.release()
+    backend.disconnect.assert_called_once_with()
+
+
+@pytest.mark.parametrize("raise_after_effect", [False, True])
+def test_release_retry_repairs_interruption_around_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+    raise_after_effect: bool,
+) -> None:
+    lease = ConnectionManager.acquire_lease(
+        BackendType.REDIS, {"host": f"interrupt-{raise_after_effect}"}
+    )
+    manager = lease.manager
+    backend = Mock()
+    manager._backend = backend
+    original = manager._finalize_retirement
+    attempts = 0
+
+    def interrupted() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            if raise_after_effect:
+                original()
+            raise KeyboardInterrupt
+        original()
+
+    monkeypatch.setattr(manager, "_finalize_retirement", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        lease.release()
+
+    assert lease.released is True
+    lease.release()
+    assert manager._retirement_complete is True
+    assert manager._users == 0
+    backend.disconnect.assert_called_once_with()
+
+
+def test_single_flight_lease_callers_receive_unique_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_init = ConnectionManager.__init__
+    entered = threading.Event()
+    proceed = threading.Event()
+    construction_count = 0
+    count_lock = threading.Lock()
+
+    def blocking_init(self: ConnectionManager, *args: object, **kwargs: object) -> None:
+        nonlocal construction_count
+        with count_lock:
+            construction_count += 1
+        entered.set()
+        assert proceed.wait(timeout=3)
+        original_init(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ConnectionManager, "__init__", blocking_init)
+    leases = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def acquire() -> None:
+        try:
+            barrier.wait(timeout=3)
+            leases.append(
+                ConnectionManager.acquire_lease(
+                    BackendType.REDIS, {"host": "lease-single-flight"}
+                )
+            )
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    threads = [threading.Thread(target=acquire) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(timeout=3)
+    proceed.set()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert errors == []
+    assert construction_count == 1
+    assert len(leases) == 8
+    assert len({id(lease.manager) for lease in leases}) == 1
+    assert len({id(lease._token) for lease in leases}) == 8
+    assert leases[0].manager._users == 8
+
+    for lease in leases:
+        lease.release()
