@@ -1699,6 +1699,7 @@ class ConnectionManager:
             del settings
             raise input_error
         descriptor = get_descriptor(normalized_backend_type)
+        plugin_backend_cls: object | None = None
         deferred_ack_plugin = False
         plugin_supports_concurrent_ack = False
         plugin_class_load_failed = False
@@ -1727,6 +1728,10 @@ class ConnectionManager:
                         )
                         is True
                     )
+                    # The exact object whose static contract was accepted is the
+                    # only class this manager may later construct. Re-resolving an
+                    # untrusted module attribute would create a validation/use gap.
+                    plugin_backend_cls = backend_cls
                 except Exception:  # noqa: BLE001 - static plugin metadata is untrusted
                     ack_contract_failed = True
         if plugin_class_load_failed or ack_contract_failed:
@@ -1736,6 +1741,7 @@ class ConnectionManager:
             del normalized_backend_type
             del descriptor
             del backend_cls
+            del plugin_backend_cls
             del deferred_ack_plugin
             del plugin_supports_concurrent_ack
             del plugin_class_load_failed
@@ -1754,6 +1760,7 @@ class ConnectionManager:
             else normalized_backend_type
         )
         self.settings = settings if settings is not None else {}
+        self._plugin_backend_cls = plugin_backend_cls
         self._deferred_ack_plugin = deferred_ack_plugin
         self._plugin_supports_concurrent_ack = plugin_supports_concurrent_ack
         self._plugin_queue_backend_source: (
@@ -2091,6 +2098,27 @@ class ConnectionManager:
         settings_digest = hashlib.sha256(settings_key.encode("utf-8")).hexdigest()
         return f"{bt_key}:{settings_digest}"
 
+    def _static_ack_capabilities(self) -> tuple[bool, bool]:
+        """Return ACK flags from the exact backend class owned by this manager."""
+        backend_cls = self._plugin_backend_cls
+        if backend_cls is None:
+            backend_type = self._backend_type_for_operations()
+            descriptor = get_descriptor(
+                backend_type.value
+                if isinstance(backend_type, BackendType)
+                else backend_type
+            )
+            return _load_static_ack_capabilities(descriptor)
+        requires_ack = getattr_static(backend_cls, "requires_ack", False)
+        supports_concurrent = getattr_static(
+            backend_cls,
+            "supports_concurrent_ack",
+            False,
+        )
+        if type(requires_ack) is not bool or type(supports_concurrent) is not bool:
+            raise _invalid_plugin_ack_contract()
+        return requires_ack, supports_concurrent
+
     @_manager_terminal_error_boundary()
     @configuration_error_boundary(
         "Connection manager configuration is invalid.",
@@ -2122,7 +2150,12 @@ class ConnectionManager:
             if isinstance(backend_type, BackendType)
             else backend_type
         )
-        backend_cls = _load_descriptor_object(descriptor, descriptor.backend_cls_path)
+        backend_cls = self._plugin_backend_cls
+        if backend_cls is None:
+            backend_cls = _load_descriptor_object(
+                descriptor,
+                descriptor.backend_cls_path,
+            )
         settings_cls = _load_descriptor_object(descriptor, descriptor.settings_cls_path)
         if not callable(backend_cls) or not callable(settings_cls):
             msg = "Selected backend must provide callable backend and settings classes."

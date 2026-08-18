@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 import traceback
 from collections import defaultdict, deque
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -134,6 +136,24 @@ def _install_plugin(
     _reset_registry_cache()
 
 
+def _install_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor: BackendDescriptor,
+) -> None:
+    class _DescriptorEntryPoint:
+        name = descriptor.backend_type
+
+        @staticmethod
+        def load() -> Any:
+            return lambda: descriptor
+
+    monkeypatch.setattr(
+        "scrapy_extension.backends.registry.importlib.metadata.entry_points",
+        lambda *, group: [_DescriptorEntryPoint()],
+    )
+    _reset_registry_cache()
+
+
 @pytest.mark.parametrize(
     ("plugin_class", "accepted", "deferred"),
     [
@@ -164,6 +184,64 @@ def test_manager_conformance_matrix_fails_before_construction_or_broker_io(
     manager = ConnectionManager("ackplugin")
     assert manager._deferred_ack_plugin is deferred
     assert manager._backend is None
+
+
+def test_manager_constructs_the_exact_class_returned_by_dynamic_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "dynamic_ack_backend_for_test"
+    dynamic_module = ModuleType(module_name)
+    classes = iter((_DeferredPlugin, _QueuePlugin))
+    lookups: list[str] = []
+
+    def dynamic_getattr(name: str) -> object:
+        lookups.append(name)
+        return next(classes)
+
+    dynamic_module.__getattr__ = dynamic_getattr  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module_name, dynamic_module)
+    _install_descriptor(
+        monkeypatch,
+        BackendDescriptor(
+            backend_type="ackplugin",
+            backend_cls_path=f"{module_name}.Backend",
+            settings_cls_path=f"{__name__}._Settings",
+            capabilities=frozenset({"queue"}),
+        ),
+    )
+
+    manager = ConnectionManager("ackplugin")
+    backend = manager._create_backend()
+
+    assert type(backend) is _DeferredPlugin
+    assert manager._deferred_ack_plugin is True
+    assert manager._plugin_supports_concurrent_ack is True
+    assert manager._static_ack_capabilities() == (True, True)
+    assert lookups == ["Backend"]
+
+
+def test_manager_ignores_backend_module_mutation_after_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "mutable_ack_backend_for_test"
+    mutable_module = ModuleType(module_name)
+    mutable_module.Backend = _DeferredPlugin  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module_name, mutable_module)
+    _install_descriptor(
+        monkeypatch,
+        BackendDescriptor(
+            backend_type="ackplugin",
+            backend_cls_path=f"{module_name}.Backend",
+            settings_cls_path=f"{__name__}._Settings",
+            capabilities=frozenset({"queue"}),
+        ),
+    )
+
+    manager = ConnectionManager("ackplugin")
+    mutable_module.Backend = _QueuePlugin  # type: ignore[attr-defined]
+
+    assert type(manager._create_backend()) is _DeferredPlugin
+    assert manager._static_ack_capabilities() == (True, True)
 
 
 @pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])

@@ -1093,7 +1093,10 @@ class BackendScheduler:
             # backend sets supports_concurrent_ack=True, so this gate is unreachable
             # for bundled backends — it remains a defensive backstop for a
             # hypothetical 3rd-party single-slot backend.
-            BackendScheduler._enforce_ack_concurrency_gate(settings, backend_type)
+            ack_backend = (
+                manager if isinstance(manager, ConnectionManager) else backend_type
+            )
+            BackendScheduler._enforce_ack_concurrency_gate(settings, ack_backend)
 
             queue_config = queue_config.with_strategy_settings(settings)
             assert queue_config.strategy_type is not None
@@ -1153,7 +1156,10 @@ class BackendScheduler:
             # Strategy+MQ ack-bypass warning (2026-07-10 §B, refined 2026-07-11 #28):
             # fires only for strategies that do NOT override pop_with_ack (so they
             # lose the MQ per-message token) paired with a requires_ack backend.
-            BackendScheduler._warn_strategy_mq_ack_bypass(queue_strategy, backend_type)
+            BackendScheduler._warn_strategy_mq_ack_bypass(
+                queue_strategy,
+                ack_backend,
+            )
             if queue_config.strategy_type in {
                 QueueStrategyType.DELAY,
                 QueueStrategyType.ROUND_ROBIN,
@@ -1301,11 +1307,20 @@ class BackendScheduler:
                 concurrent ack, ``CONCURRENT_REQUESTS > 1``, and the opt-out
                 is not set.
         """
-        from scrapy_extension.backends.connectors import _load_static_ack_capabilities
-        from scrapy_extension.backends.registry import get_descriptor
+        if isinstance(backend_type, ConnectionManager):
+            manager = backend_type
+            backend_type = manager._backend_type_for_operations()
+            requires_ack, supports_concurrent = manager._static_ack_capabilities()
+        else:
+            from scrapy_extension.backends.connectors import (
+                _load_static_ack_capabilities,
+            )
+            from scrapy_extension.backends.registry import get_descriptor
 
-        descriptor = get_descriptor(str(backend_type))
-        requires_ack, supports_concurrent = _load_static_ack_capabilities(descriptor)
+            descriptor = get_descriptor(str(backend_type))
+            requires_ack, supports_concurrent = _load_static_ack_capabilities(
+                descriptor
+            )
         if not requires_ack or supports_concurrent:
             return
         concurrent = parse_int_setting(
@@ -1361,11 +1376,20 @@ class BackendScheduler:
         # Strategies that override pop_with_ack thread the MQ token — no warning.
         if "pop_with_ack" in type(queue_strategy).__dict__:
             return
-        from scrapy_extension.backends.connectors import _load_static_ack_capabilities
-        from scrapy_extension.backends.registry import get_descriptor
+        if isinstance(backend_type, ConnectionManager):
+            manager = backend_type
+            backend_type = manager._backend_type_for_operations()
+            requires_ack, _supports_concurrent = manager._static_ack_capabilities()
+        else:
+            from scrapy_extension.backends.connectors import (
+                _load_static_ack_capabilities,
+            )
+            from scrapy_extension.backends.registry import get_descriptor
 
-        descriptor = get_descriptor(str(backend_type))
-        requires_ack, _supports_concurrent = _load_static_ack_capabilities(descriptor)
+            descriptor = get_descriptor(str(backend_type))
+            requires_ack, _supports_concurrent = _load_static_ack_capabilities(
+                descriptor
+            )
         if not requires_ack:
             return
         bt_name = (
