@@ -661,13 +661,17 @@ class TestDescriptorBoundary:
     ):
         descriptor = self._runtime_descriptor()
         marker = "plugin-settings-loader-secret-marker"
+        load_calls: list[str] = []
         sleep_calls: list[float] = []
         monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
 
         def _load(path: str) -> object:
+            load_calls.append(path)
+            if path == descriptor.backend_cls_path:
+                return _StubBackend
             if path == descriptor.settings_cls_path:
                 raise ImportError(marker)
-            raise AssertionError("backend construction must not start")
+            raise AssertionError("unexpected descriptor path")
 
         monkeypatch.setattr(connectors, "_load_object", _load)
         monkeypatch.setattr(
@@ -675,12 +679,14 @@ class TestDescriptorBoundary:
             "_wait_for_retry_backoff",
             lambda _event, delay: sleep_calls.append(delay),
         )
+        manager = connectors.ConnectionManager(
+            "runtime_contract", {"retry_attempts": 3, "retry_delay": 1}
+        )
         with pytest.raises(ConfigurationError) as exc_info:
-            connectors.ConnectionManager(
-                "runtime_contract", {"retry_attempts": 3, "retry_delay": 1}
-            )
+            _ = manager.backend
 
         _assert_redacted_error(exc_info.value, marker)
+        assert load_calls.count(descriptor.settings_cls_path) == 1
         assert sleep_calls == []
 
     def test_plugin_settings_loader_failure_during_adaptation_is_static(
