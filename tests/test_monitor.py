@@ -545,7 +545,7 @@ class TestFilterSaturationEmission:
     """BackendDupeFilter emits supported filter saturation telemetry (U2)."""
 
     def test_cuckoo_saturation_property_rises_with_load(self):
-        """CuckooMembershipFilter.saturation = len / capacity, in [0, ~1]."""
+        """Cuckoo saturation uses the configured target, not rounded slots."""
         cuckoo = CuckooMembershipFilter(capacity=1_000, error_rate=0.01)
         assert cuckoo.saturation == 0.0
         # Add a batch of distinct items; saturation must rise monotonically.
@@ -569,8 +569,8 @@ class TestFilterSaturationEmission:
         )
         df.request_seen(Request(url="https://example.com/a"))
         sat = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]
-        assert sat is not None
-        assert sat > 0.0
+        assert sat == pytest.approx(1 / cuckoo.configured_capacity)
+        assert cuckoo.capacity == cuckoo.slot_capacity == 2_048
         # Saturation rises as more distinct items are added.
         df.request_seen(Request(url="https://example.com/b"))
         sat2 = monitor._stats.get_value("dupefilter/filter_saturation")  # type: ignore[attr-defined]

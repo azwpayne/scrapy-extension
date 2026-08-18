@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 
 import pytest
@@ -19,11 +20,42 @@ class TestCuckooMembershipFilterSizing:
         with pytest.raises(ValueError, match="capacity"):
             CuckooMembershipFilter(capacity=-5, error_rate=0.01)
 
-    def test_invalid_error_rate(self) -> None:
+    @pytest.mark.parametrize(
+        "error_rate",
+        [0.0, 1.0, float("nan"), float("inf"), float("-inf")],
+    )
+    def test_invalid_error_rate(self, error_rate: float) -> None:
         with pytest.raises(ValueError, match="error_rate"):
-            CuckooMembershipFilter(capacity=100, error_rate=0.0)
-        with pytest.raises(ValueError, match="error_rate"):
-            CuckooMembershipFilter(capacity=100, error_rate=1.0)
+            CuckooMembershipFilter(capacity=100, error_rate=error_rate)
+
+    def test_rejects_fingerprint_larger_than_sha256_digest(self) -> None:
+        with pytest.raises(ValueError, match="exceeds the 32-byte SHA-256 digest"):
+            CuckooMembershipFilter(
+                capacity=100,
+                error_rate=math.nextafter(math.ldexp(1.0, -253), 0.0),
+            )
+
+    def test_digest_limit_boundary_uses_all_32_bytes(self) -> None:
+        flt = CuckooMembershipFilter(
+            capacity=100,
+            error_rate=math.ldexp(1.0, -253),
+        )
+        assert flt.fp_len == 32
+
+    @pytest.mark.parametrize(
+        ("error_rate", "expected_bytes"),
+        [
+            (0.5, 1),  # ceil(4 bits) then ceil to one byte
+            (math.ldexp(1.0, -5), 1),  # exactly eight required bits
+            (math.ldexp(1.0, -6), 2),  # nine required bits rounds to two bytes
+            (0.01, 2),  # ceil(9.64 bits) then ceil to two bytes
+        ],
+    )
+    def test_fingerprint_bits_round_up_without_reciprocal_math(
+        self, error_rate: float, expected_bytes: int
+    ) -> None:
+        flt = CuckooMembershipFilter(capacity=100, error_rate=error_rate)
+        assert flt.fp_len == expected_bytes
 
     def test_sizing_positive(self) -> None:
         flt = CuckooMembershipFilter(capacity=1000, error_rate=0.01)
@@ -35,6 +67,18 @@ class TestCuckooMembershipFilterSizing:
         for cap in (10, 100, 1000, 5000):
             flt = CuckooMembershipFilter(capacity=cap, error_rate=0.01)
             assert (flt.num_buckets & (flt.num_buckets - 1)) == 0
+
+    def test_capacity_properties_distinguish_target_from_physical_slots(self) -> None:
+        flt = CuckooMembershipFilter(capacity=1_000, error_rate=1e-12)
+
+        assert flt.configured_capacity == 1_000
+        assert flt.slot_capacity == 2_048
+        assert flt.capacity == flt.slot_capacity  # backward-compatible meaning
+
+        for i in range(1_000):
+            assert flt.add(f"target-{i}".encode()) is True
+        assert len(flt) == 1_000
+        assert flt.saturation == 1.0
 
 
 class TestCuckooMembershipFilterOps:

@@ -501,6 +501,9 @@ class BackendDupeFilter:
         from scrapy_extension.dupefilter.filters.bloom_filter import (
             _BloomFilterAllocationError,
         )
+        from scrapy_extension.dupefilter.filters.cuckoo_filter import (
+            _CuckooFingerprintSizeError,
+        )
         from scrapy_extension.dupefilter.filters.factory import (
             DedupeStrategy,
             build_membership_filter,
@@ -623,6 +626,13 @@ class BackendDupeFilter:
                     and settings.getpriority(error_rate_setting) is not None
                     else capacity_setting
                 )
+                raise ConfigurationError(
+                    f"Invalid {constructor_setting}: {exc}",
+                    setting_name=constructor_setting,
+                    setting_value=settings.get(constructor_setting),
+                ) from exc
+            except _CuckooFingerprintSizeError as exc:
+                constructor_setting = "SCRAPY_DEDUP_CUCKOO_ERROR_RATE"
                 raise ConfigurationError(
                     f"Invalid {constructor_setting}: {exc}",
                     setting_name=constructor_setting,
@@ -1120,7 +1130,14 @@ class BackendDupeFilter:
         if not is_memory_filter or added:
             sat = getattr(self._filter, "saturation", None)
             if sat is not None:
-                cap = getattr(self._filter, "capacity", None)
+                # Cuckoo's long-public ``capacity`` is physical slot count. Its
+                # configured target is the actionable monitoring denominator;
+                # other filters continue to use their existing capacity property.
+                cap = getattr(
+                    self._filter,
+                    "configured_capacity",
+                    getattr(self._filter, "capacity", None),
+                )
                 saturation_event = (
                     "on_filter_saturation",
                     (len(self._filter), cap),

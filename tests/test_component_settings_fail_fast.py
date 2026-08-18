@@ -458,6 +458,25 @@ def test_dupefilter_numeric_settings_fail_fast_as_configuration_error(
     assert exc_info.value.setting_name == setting_name
 
 
+def test_cuckoo_digest_budget_error_is_attributed_to_error_rate(
+    component_manager: Any,
+) -> None:
+    settings = Settings(
+        {
+            "SCRAPY_BACKEND_TYPE": "redis",
+            "SCRAPY_DEDUP_STRATEGY": "cuckoo",
+            "SCRAPY_DEDUP_CUCKOO_ERROR_RATE": 5e-324,
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="32-byte SHA-256 digest") as exc_info:
+        BackendDupeFilter.from_settings(settings)
+
+    assert (
+        exc_info.value.setting_name == "SCRAPY_DEDUP_CUCKOO_ERROR_RATE"
+    )
+
+
 def test_dupefilter_accepts_numeric_environment_strings(
     component_manager: Any,
 ) -> None:

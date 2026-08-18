@@ -18,6 +18,16 @@ from typing import NoReturn
 
 from scrapy_extension.dupefilter.filters.base import FilterFull, MembershipFilter
 
+_SHA256_DIGEST_BYTES = hashlib.sha256().digest_size
+# With four slots per bucket the standard Cuckoo false-positive bound needs
+# ceil(-log2(error_rate) + log2(2 * bucket_size)) fingerprint bits. SHA-256 can
+# supply at most 256 non-repeated bits, so rates below 2**-253 are unsupported.
+_MIN_ERROR_RATE = math.ldexp(1.0, -(8 * _SHA256_DIGEST_BYTES - 3))
+
+
+class _CuckooFingerprintSizeError(ValueError):
+    """The requested false-positive rate exceeds the SHA-256 digest budget."""
+
 
 class CuckooMembershipFilter(MembershipFilter):
     """Pure-stdlib Cuckoo filter (Fan et al. 2014).
@@ -55,17 +65,34 @@ class CuckooMembershipFilter(MembershipFilter):
             error_rate: Target false-positive probability at ``capacity`` items.
 
         Raises:
-            ValueError: If capacity is not positive or error_rate is outside (0, 1).
+            ValueError: If capacity is not positive, error_rate is not finite and
+                inside (0, 1), or its fingerprint would exceed SHA-256's 32 bytes.
         """
         if capacity <= 0:
             raise ValueError(f"capacity must be a positive integer, got {capacity}")
-        if not 0.0 < error_rate < 1.0:
+        if not math.isfinite(error_rate) or not 0.0 < error_rate < 1.0:
             raise ValueError(
-                f"error_rate must be in the open interval (0, 1), got {error_rate}"
+                "error_rate must be finite and in the open interval (0, 1), "
+                f"got {error_rate}"
+            )
+        if error_rate < _MIN_ERROR_RATE:
+            raise _CuckooFingerprintSizeError(
+                "error_rate is too small: the required fingerprint exceeds the "
+                f"{_SHA256_DIGEST_BYTES}-byte SHA-256 digest"
             )
         b = self._BUCKET_SIZE
-        fp_bits = math.ceil(math.log2(1 / error_rate) + math.log2(2 * b))
+        # Avoid ``log2(1 / error_rate)``: the reciprocal overflows for valid,
+        # subnormal floats before the logarithm can size or reject them.
+        fp_bits = math.ceil(-math.log2(error_rate) + math.log2(2 * b))
+        if fp_bits > _SHA256_DIGEST_BYTES * 8:
+            # Defensive guard for future bucket-size/digest changes and floating
+            # boundary behavior; never silently truncate a requested fingerprint.
+            raise _CuckooFingerprintSizeError(
+                "error_rate is too small: the required fingerprint exceeds the "
+                f"{_SHA256_DIGEST_BYTES}-byte SHA-256 digest"
+            )
         self._fp_len = max(1, (fp_bits + 7) >> 3)
+        self._configured_capacity = capacity
         # Size buckets for ~85% load, rounded up to a power of two so the
         # two-index xor scheme can mask with (m - 1).
         ideal = math.ceil(capacity / b / self._TARGET_LOAD)
@@ -94,31 +121,35 @@ class CuckooMembershipFilter(MembershipFilter):
 
     @property
     def capacity(self) -> int:
-        """Hard capacity in items (``m * _BUCKET_SIZE``).
+        """Physical slot capacity, retained for backward compatibility.
 
-        The filter is sized for ~85% load (see :meth:`__init__`), so steady-state
-        saturation hovers near 0.85 and :meth:`add` raises
-        :class:`~scrapy_extension.dupefilter.filters.base.FilterFull` once kicks
-        exhaust ``_MAX_KICKS`` (effectively at/above capacity). Exposed so the
-        dupefilter can emit a leading saturation signal (U2 operability) as the
-        filter APPROACHES full — ``used / capacity`` rises through ~0.9 before
-        the overflow signal ever fires.
+        This public property historically exposed ``m * _BUCKET_SIZE``. It
+        remains a physical diagnostic rather than changing meaning on upgrade.
+        Prefer :attr:`configured_capacity` for the operator sizing target.
         """
+        return self.slot_capacity
+
+    @property
+    def configured_capacity(self) -> int:
+        """Configured item target used for sizing and saturation monitoring."""
+        return self._configured_capacity
+
+    @property
+    def slot_capacity(self) -> int:
+        """Physical bucket-slot count (``m * _BUCKET_SIZE``)."""
         return self._num_buckets * self._BUCKET_SIZE
 
     @property
     def saturation(self) -> float:
-        """Current fill ratio (``used / capacity``), in ``[0.0, ~1.0]``.
+        """Current target saturation (``used / configured_capacity``).
 
-        Used by :meth:`BackendDupeFilter.request_seen
-        <scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.request_seen>`
-        to emit ``on_filter_saturation`` after each add. ``used`` is the count of
-        inserted fingerprints still present (``len(self)``); ``capacity`` is the
-        hard bucket-slot count. The target load is 0.85 by design, so a healthy
-        filter reads ~0.85 at its configured capacity — operators should alert
-        on a rising edge past ~0.90, not on reaching 0.85.
+        The physical table is deliberately oversized and power-of-two rounded,
+        so dividing by :attr:`slot_capacity` can materially under-report progress
+        toward the configured target. Values may exceed 1.0 before ``FilterFull``;
+        the stats monitor clamps its public gauge while physical diagnostics stay
+        available through :attr:`capacity` and :attr:`slot_capacity`.
         """
-        return len(self) / self.capacity
+        return len(self) / self.configured_capacity
 
     def _fingerprint(self, item: bytes) -> tuple[bytes, int]:
         """Derive the fingerprint and primary index for ``item``.
