@@ -1368,48 +1368,47 @@ class BackendQueue:
         """
         owner_token = object()
         attempt = 0
+        failure: BaseException | None = None
+        publication_failure: BaseException | None = None
+        succeeded = False
         try:
-            with self._operation_gate:
-                if self._close_complete:
-                    return
-                if self._close_in_progress:
-                    self._wait_for_close_attempt_locked(self._close_attempt)
-                    return
-                self._close_attempt += 1
-                attempt = self._close_attempt
-                self._close_owner_token = owner_token
-                self._close_in_progress = True
-                self._accepting_operations = False
-        except BaseException as exc:
+            try:
+                with self._operation_gate:
+                    if self._close_complete:
+                        return
+                    if self._close_in_progress:
+                        self._wait_for_close_attempt_locked(self._close_attempt)
+                        return
+                    self._close_attempt += 1
+                    attempt = self._close_attempt
+                    self._close_owner_token = owner_token
+                    self._close_in_progress = True
+                    self._accepting_operations = False
+
+                if not self._begin_close_complete:
+                    self._strategy.begin_close()
+                    self._begin_close_complete = True
+                with self._operation_gate:
+                    while self._active_operations > 0:
+                        self._operation_gate.wait()
+                if not self._checkpoint_complete:
+                    if not lossy:
+                        self._persist_snapshot()
+                    self._checkpoint_complete = True
+                self._strategy.close()
+                succeeded = True
+            except BaseException as exc:
+                failure = exc
+        finally:
+            # Once this call records ownership, every exit path must publish a
+            # terminal result. In particular, tracing/profiling callbacks can
+            # raise between handler bytecodes, before normal control reaches the
+            # code following an ``except`` suite.
             if self._close_owner_token is owner_token:
                 publication_failure = self._publish_close_attempt(
-                    attempt, owner_token, succeeded=False
+                    attempt, owner_token, succeeded=succeeded
                 )
-                if publication_failure is not None:
-                    if not isinstance(exc, Exception):
-                        raise
-                    raise publication_failure
-            raise
 
-        failure: BaseException | None = None
-        try:
-            if not self._begin_close_complete:
-                self._strategy.begin_close()
-                self._begin_close_complete = True
-            with self._operation_gate:
-                while self._active_operations > 0:
-                    self._operation_gate.wait()
-            if not self._checkpoint_complete:
-                if not lossy:
-                    self._persist_snapshot()
-                self._checkpoint_complete = True
-            self._strategy.close()
-        except BaseException as exc:
-            failure = exc
-
-        publication_failure = self._publish_close_attempt(
-            attempt, owner_token, succeeded=failure is None
-        )
         if failure is not None and not isinstance(failure, Exception):
             raise failure
         if publication_failure is not None:

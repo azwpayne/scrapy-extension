@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dis
+import sys
 import threading
 from unittest.mock import MagicMock, call
 
@@ -14,6 +16,15 @@ from scrapy_extension.schedule.scheduler import BackendScheduler
 
 class _CustomControlFlow(BaseException):
     pass
+
+
+def _instruction_after(opname: str, argval: object) -> int:
+    instructions = list(dis.get_instructions(BackendQueue.close))
+    for index in range(len(instructions) - 2, -1, -1):
+        instruction = instructions[index]
+        if instruction.opname == opname and instruction.argval == argval:
+            return instructions[index + 1].offset
+    raise AssertionError(f"Missing {opname} {argval!r} in BackendQueue.close")
 
 
 def _queue_with_storage(strategy: MagicMock, storage: MagicMock) -> BackendQueue:
@@ -388,6 +399,107 @@ def test_initial_close_control_error_is_not_replaced_by_publication_failure() ->
         queue.close()
 
     assert exc_info.value is control_error
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    ("opname", "argval", "fail_snapshot"),
+    [
+        ("STORE_ATTR", "_close_owner_token", False),
+        ("STORE_FAST", "failure", True),
+    ],
+    ids=["after-owner-assignment", "after-failure-assignment"],
+)
+def test_trace_interruption_after_ownership_always_publishes_and_allows_retry(
+    opname: str, argval: str, fail_snapshot: bool
+) -> None:
+    snapshot_entered = threading.Event()
+    release_snapshot = threading.Event()
+    waiter_is_waiting = threading.Event()
+
+    class _ObservedWaitCondition(threading.Condition):
+        def wait(self, timeout: float | None = None) -> bool:
+            if threading.current_thread().name == "close-trace-waiter":
+                waiter_is_waiting.set()
+            return super().wait(timeout)
+
+    def snapshot() -> bytes:
+        if fail_snapshot:
+            snapshot_entered.set()
+            assert release_snapshot.wait(timeout=2.0)
+            raise RuntimeError("ordinary snapshot failure")
+        return b"state"
+
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.side_effect = snapshot
+    queue = _queue_with_storage(strategy, storage)
+    queue._operation_gate = _ObservedWaitCondition()
+    interruption = _CustomControlFlow("trace boundary interruption")
+    target_offset = _instruction_after(opname, argval)
+    outcomes: dict[str, BaseException | None] = {}
+
+    def close_owner() -> None:
+        def inject(frame: object, event: str, _arg: object) -> object:
+            if getattr(frame, "f_code", None) is BackendQueue.close.__code__:
+                frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+                if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                    raise interruption
+            return inject
+
+        sys.settrace(inject)
+        try:
+            queue.close()
+        except BaseException as exc:
+            outcomes["owner"] = exc
+        else:
+            outcomes["owner"] = None
+        finally:
+            sys.settrace(None)
+
+    def close_waiter() -> None:
+        try:
+            queue.close()
+        except BaseException as exc:
+            outcomes["waiter"] = exc
+        else:
+            outcomes["waiter"] = None
+
+    owner = threading.Thread(target=close_owner, name="close-trace-owner", daemon=True)
+    owner.start()
+    waiter: threading.Thread | None = None
+    if fail_snapshot:
+        assert snapshot_entered.wait(timeout=2.0)
+        waiter = threading.Thread(
+            target=close_waiter, name="close-trace-waiter", daemon=True
+        )
+        waiter.start()
+        assert waiter_is_waiting.wait(timeout=2.0)
+        release_snapshot.set()
+
+    owner.join(timeout=2.0)
+    assert not owner.is_alive()
+    if waiter is not None:
+        waiter.join(timeout=2.0)
+        assert not waiter.is_alive()
+        assert isinstance(outcomes["waiter"], QueueError)
+
+    assert outcomes["owner"] is interruption
+    assert queue._close_in_progress is False
+    assert queue._close_owner_token is None
+    assert queue._close_attempt_waiters == {}
+    assert queue._close_attempt_outcomes == {}
+
+    strategy.snapshot.side_effect = None
+    strategy.snapshot.return_value = b"state"
+    queue.close()
+
+    assert queue._close_complete is True
+    assert queue._close_in_progress is False
+    assert queue._close_owner_token is None
+    assert queue._close_attempt_waiters == {}
+    assert queue._close_attempt_outcomes == {}
 
 
 def test_nonempty_state_without_storage_requires_explicit_lossy_abort() -> None:
