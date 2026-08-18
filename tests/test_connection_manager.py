@@ -3,6 +3,8 @@
 import logging
 import sys
 import traceback
+from decimal import Decimal
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
@@ -781,6 +783,78 @@ def test_connect_rejects_invalid_retry_policy_before_backend_creation(
 
     assert exc_info.value.setting_name == setting_name
     create_backend.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "raw_attempts",
+    [
+        0.0,
+        1.0,
+        Decimal("1"),
+        Fraction(1, 1),
+        "",
+        "00",
+        "01",
+        "+1",
+        "-0",
+        " 1",
+        "1 ",
+        "1.0",
+        "1e0",
+        "\uff11",
+    ],
+)
+def test_connect_rejects_noncanonical_retry_attempts(mocker, raw_attempts):
+    """Retry counts never truncate or accept alternate integer spellings."""
+    manager = ConnectionManager(
+        BackendType.REDIS,
+        {"retry_attempts": raw_attempts},
+    )
+    create_backend = mocker.patch.object(manager, "_create_backend")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        manager.connect()
+
+    assert exc_info.value.setting_name == "retry_attempts"
+    create_backend.assert_not_called()
+
+
+def test_connect_rejects_custom_retry_attempt_integer_conversion(mocker):
+    """Arbitrary ``__int__`` hooks are not part of the retry-count wire format."""
+    conversions: list[str] = []
+
+    class _IntegerLike:
+        def __int__(self) -> int:
+            conversions.append("__int__")
+            return 1
+
+    manager = ConnectionManager(
+        BackendType.REDIS,
+        {"retry_attempts": _IntegerLike()},
+    )
+    create_backend = mocker.patch.object(manager, "_create_backend")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        manager.connect()
+
+    assert exc_info.value.setting_name == "retry_attempts"
+    assert conversions == []
+    create_backend.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw_attempts", "expected"),
+    [(0, 0), (20, 20), ("0", 0), ("20", 20)],
+)
+def test_retry_policy_accepts_canonical_retry_attempt_boundaries(
+    raw_attempts, expected
+):
+    manager = ConnectionManager(
+        BackendType.REDIS,
+        {"retry_attempts": raw_attempts},
+    )
+
+    assert manager._retry_policy()[0] == expected
 
 
 @pytest.mark.parametrize("field", ["retry_attempts", "retry_delay"])

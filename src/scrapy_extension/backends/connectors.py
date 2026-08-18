@@ -2187,23 +2187,29 @@ class ConnectionManager:
             ),
         )
         retry_attempts: int | None = None
-        invalid_attempts = False
-        try:
-            if isinstance(raw_attempts, bool):
-                raise ValueError
+        if type(raw_attempts) is int:
+            retry_attempts = raw_attempts
+        elif type(raw_attempts) is str and (
+            raw_attempts == "0"
+            or (
+                1 <= len(raw_attempts) <= 2
+                and "1" <= raw_attempts[0] <= "9"
+                and raw_attempts.isascii()
+                and raw_attempts.isdecimal()
+            )
+        ):
+            # ``raw_attempts`` is an exact ``str`` containing at most two ASCII
+            # digits, so conversion cannot invoke user code or hit Python's
+            # integer-string length limit. Alternate spellings (signs, whitespace,
+            # leading zeroes, decimal/exponent notation) are deliberately rejected.
             retry_attempts = int(raw_attempts)
-            if isinstance(raw_attempts, float) and not raw_attempts.is_integer():
-                raise ValueError
-        except Exception:  # noqa: BLE001 - custom numeric coercion is untrusted
-            invalid_attempts = True
-        if invalid_attempts:
+        if retry_attempts is None:
             policy_error = ConfigurationError(
                 "retry_attempts must be an integer between 0 and 20",
                 setting_name="retry_attempts",
             )
             del raw_attempts
             raise policy_error
-        assert retry_attempts is not None
         if not 0 <= retry_attempts <= 20:
             policy_error = ConfigurationError(
                 "retry_attempts must be between 0 and 20",
