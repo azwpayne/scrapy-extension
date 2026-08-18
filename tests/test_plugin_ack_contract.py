@@ -104,14 +104,6 @@ class _NonBooleanMetadata(_DeferredPlugin):
     requires_ack = 1  # type: ignore[assignment]
 
 
-class _CoroutineSettlementPlugin(_DeferredPlugin):
-    async def ack(self, queue_name: str, *, token: Any | None = None) -> None:
-        raise AssertionError("async ack body must not be invoked")
-
-    async def nack(self, queue_name: str, *, token: Any | None = None) -> None:
-        raise AssertionError("async nack body must not be invoked")
-
-
 class _CustomAwaitable:
     def __await__(self) -> Any:
         yield
@@ -283,28 +275,79 @@ def test_manager_ignores_backend_module_mutation_after_validation(
     assert manager._static_ack_capabilities() == (True, True)
 
 
-def test_manager_statically_rejects_coroutine_settlement_hooks(
+@pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
+def test_manager_statically_rejects_coroutine_delivery_hooks_without_io(
     monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    recwarn: pytest.WarningsRecorder,
 ) -> None:
-    _install_plugin(monkeypatch, _CoroutineSettlementPlugin)
+    constructed = False
+
+    async def asynchronous_hook(self: object, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+        raise AssertionError("async delivery hook body must not be invoked")
+
+    def reject_construction(self: object, settings: object | None = None) -> None:
+        del self, settings
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("plugin must not be constructed")
+
+    monkeypatch.setattr(_DeferredPlugin, method_name, asynchronous_hook)
+    monkeypatch.setattr(_DeferredPlugin, "__init__", reject_construction)
+    _install_plugin(monkeypatch, _DeferredPlugin)
 
     with pytest.raises(ConfigurationError, match="acknowledgement contract"):
         ConnectionManager("ackplugin")
 
+    gc.collect()
+    assert constructed is False
+    assert not [
+        warning for warning in recwarn if "never awaited" in str(warning.message)
+    ]
 
-@pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
+
+@pytest.mark.parametrize(
+    ("method_name", "signature_case"),
+    [
+        ("pop_with_ack", "missing_argument"),
+        ("pop_with_ack", "required_extra"),
+        ("ack", "missing_argument"),
+        ("ack", "positional_only_token"),
+        ("ack", "required_extra"),
+        ("nack", "missing_argument"),
+        ("nack", "positional_only_token"),
+        ("nack", "required_extra"),
+    ],
+)
 def test_manager_statically_rejects_signature_incompatible_overrides(
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
+    signature_case: str,
 ) -> None:
-    if method_name == "pop_with_ack":
+    if signature_case == "missing_argument":
 
         def incompatible(self: object, queue_name: str) -> None:
             raise AssertionError("incompatible hook must not be invoked")
 
+    elif signature_case == "positional_only_token":
+
+        def incompatible(  # type: ignore[misc]
+            self: object,
+            queue_name: str,
+            token: object,
+            /,
+        ) -> None:
+            raise AssertionError("incompatible hook must not be invoked")
+
     else:
 
-        def incompatible(self: object, queue_name: str) -> None:
+        def incompatible(  # type: ignore[misc]
+            self: object,
+            queue_name: str,
+            timeout_or_token: object,
+            required: object,
+        ) -> None:
             raise AssertionError("incompatible hook must not be invoked")
 
     monkeypatch.setattr(_DeferredPlugin, method_name, incompatible)

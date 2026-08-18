@@ -491,7 +491,7 @@ def _validate_plugin_ack_class(
             type(method) is not FunctionType
             or method is default_method
             or getattr_static(method, "__isabstractmethod__", False) is True
-            or (method_name in {"ack", "nack"} and iscoroutinefunction(method))
+            or iscoroutinefunction(method)
         ):
             raise _invalid_plugin_ack_contract()
         try:
