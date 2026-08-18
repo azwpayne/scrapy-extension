@@ -10,13 +10,14 @@ for distributed crawling, supporting multiple deployment modes:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import re
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
@@ -268,6 +269,17 @@ def _validate_storage_prefix_argument(
         _validate_key_name(prefix, "prefix")
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _MongoDBGeneration:
+    """One complete MongoDB client/database/collection graph."""
+
+    client: MongoClient[dict[str, Any]] | None
+    database: Database[dict[str, Any]] | None
+    queue_collection: Collection[dict[str, Any]]
+    set_collection: Collection[dict[str, Any]]
+    storage_collection: Collection[dict[str, Any]]
+
+
 @dataclass(frozen=True)
 class _MongoDBConnectionSnapshot:
     """One fully validated, repr-safe set of values for a connect attempt."""
@@ -353,9 +365,15 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # boundary and retain raw values in constructor traceback frames.
         self._read_preference: str | None = None
         # A backend can be used directly as well as through ConnectionManager.
-        # Serialize publication/retirement of its client graph so concurrent direct
-        # callers cannot create two clients and lose one without closing it.
-        self._connection_lock = RLock()
+        # The condition serializes lifecycle publication/retirement while allowing
+        # normal operations to run concurrently under short admission leases.
+        self._connection_lock = threading.RLock()
+        self._generation_condition = threading.Condition(self._connection_lock)
+        self._lease_local = threading.local()
+        self._generation: _MongoDBGeneration | None = None
+        self._active_leases = 0
+        self._disconnecting = False
+        self._disconnect_owner: int | None = None
 
     @backend_connection_error_boundary(
         "Failed to connect to MongoDB.",
@@ -378,12 +396,25 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             BackendConnectionError: If the connection cannot be established.
             ConfigurationError: If the configuration is invalid for the mode.
         """
-        with self._connection_lock:
+        current_thread = threading.get_ident()
+        with self._generation_condition:
+            while self._disconnecting:
+                if int(getattr(self._lease_local, "depth", 0)):
+                    raise BackendConnectionError(
+                        "Cannot connect to MongoDB during an active operation.",
+                        backend_type="mongodb",
+                    )
+                self._generation_condition.wait()
             # A published client graph is complete: the client has been pinged, its
             # collections initialized, capability domains claimed, and indexes
             # created. Re-running setup would allocate an unowned replacement client.
             if self._client is not None:
                 return
+            if self._disconnect_owner == current_thread:
+                raise BackendConnectionError(
+                    "Cannot connect to MongoDB re-entrantly during disconnect.",
+                    backend_type="mongodb",
+                )
             self._refresh_connection_cache()
             self._connect()
 
@@ -641,8 +672,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # cannot survive through ``__cause__`` or ``__context__``.
             raise startup_error
 
-        # The complete client graph is now published.  Success diagnostics must
-        # not turn that completed generation into a failed connection attempt.
+        # Publish the complete graph as one leaseable identity before diagnostics.
+        # ``connect`` holds the generation condition throughout this method.
+        self._generation = self._generation_from_mirrors_locked()
+
+        # The complete client graph is now published. Success diagnostics must not
+        # turn that completed generation into a failed connection attempt.
         try:
             logger.debug("Connected to MongoDB in %s mode", snapshot.mode.value)
         except BaseException:
@@ -666,6 +701,7 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         close_failed = False
         with self._connection_lock:
             client = self._client
+            self._generation = None
             self._client = None
             self._db = None
             self._queue_collection = None
@@ -1069,24 +1105,160 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             expireAfterSeconds=0,
         )
 
+    def _generation_from_mirrors_locked(self) -> _MongoDBGeneration:
+        """Build one immutable operation graph from the published mirrors."""
+        client = self._client
+        database = self._db
+        queue_collection = self._queue_collection
+        set_collection = self._set_collection
+        storage_collection = self._storage_collection
+        if (
+            queue_collection is None
+            or set_collection is None
+            or storage_collection is None
+        ):
+            raise BackendConnectionError(
+                "Not connected: call connect() first", backend_type="mongodb"
+            )
+        return _MongoDBGeneration(
+            client,
+            database,
+            queue_collection,
+            set_collection,
+            storage_collection,
+        )
+
+    def _assert_connected(self) -> None:
+        """Verify all operation collections are initialized."""
+        if (
+            self._queue_collection is None
+            or self._set_collection is None
+            or self._storage_collection is None
+        ):
+            raise BackendConnectionError(
+                "Not connected: call connect() first", backend_type="mongodb"
+            )
+
+    def _current_generation_locked(self) -> _MongoDBGeneration:
+        """Pin the current graph, including legacy private mirror injection."""
+        generation = self._generation_from_mirrors_locked()
+        self._generation = generation
+        return generation
+
+    @contextlib.contextmanager
+    def _lease_generation(self, operation: str) -> Iterator[_MongoDBGeneration]:
+        """Admit an operation to one pinned graph until its final SDK call exits."""
+        with self._generation_condition:
+            if self._disconnecting:
+                raise BackendConnectionError(
+                    f"Cannot {operation} while MongoDB is disconnecting.",
+                    backend_type="mongodb",
+                )
+            self._assert_connected()
+            generation = self._current_generation_locked()
+            self._active_leases += 1
+        previous_depth = int(getattr(self._lease_local, "depth", 0))
+        self._lease_local.depth = previous_depth + 1
+        try:
+            yield generation
+        finally:
+            try:
+                with self._generation_condition:
+                    self._active_leases -= 1
+                    if self._active_leases == 0:
+                        self._generation_condition.notify_all()
+            finally:
+                self._lease_local.depth = previous_depth
+
+    @contextlib.contextmanager
+    def _lease_existing_client(
+        self,
+    ) -> Iterator[MongoClient[dict[str, Any]] | None]:
+        """Lease the current client for a health check without connecting."""
+        with self._generation_condition:
+            client = None if self._disconnecting else self._client
+            if client is not None:
+                self._active_leases += 1
+        previous_depth = int(getattr(self._lease_local, "depth", 0))
+        if client is not None:
+            self._lease_local.depth = previous_depth + 1
+        try:
+            yield client
+        finally:
+            if client is not None:
+                try:
+                    with self._generation_condition:
+                        self._active_leases -= 1
+                        if self._active_leases == 0:
+                            self._generation_condition.notify_all()
+                finally:
+                    self._lease_local.depth = previous_depth
+
     def disconnect(self) -> None:
-        """Close MongoDB connection."""
-        if self._discard_client():
+        """Reject admission, drain operations, detach, then close the client."""
+        current_thread = threading.get_ident()
+        if int(getattr(self._lease_local, "depth", 0)):
+            raise BackendConnectionError(
+                "Cannot disconnect MongoDB re-entrantly from an active operation.",
+                backend_type="mongodb",
+            )
+
+        client: MongoClient[dict[str, Any]] | None = None
+        close_failed = False
+        pending_interrupt: BaseException | None = None
+        with self._generation_condition:
+            while self._disconnecting:
+                if self._disconnect_owner == current_thread:
+                    raise BackendConnectionError(
+                        "Cannot disconnect MongoDB re-entrantly.",
+                        backend_type="mongodb",
+                    )
+                self._generation_condition.wait()
+            self._disconnecting = True
+            self._disconnect_owner = current_thread
+            while self._active_leases:
+                try:
+                    self._generation_condition.wait()
+                except BaseException as error:
+                    if pending_interrupt is None:
+                        pending_interrupt = error
+            generation = self._generation
+            client = generation.client if generation is not None else self._client
+            self._generation = None
+            self._client = None
+            self._db = None
+            self._queue_collection = None
+            self._set_collection = None
+            self._storage_collection = None
+
+        try:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    close_failed = True
+                except BaseException as error:
+                    if pending_interrupt is None:
+                        pending_interrupt = error
+        finally:
+            with self._generation_condition:
+                self._disconnecting = False
+                self._disconnect_owner = None
+                self._generation_condition.notify_all()
+        if close_failed:
             self._log_cleanup_diagnostic()
+        if pending_interrupt is not None:
+            raise pending_interrupt
 
     def is_connected(self) -> bool:
-        """Check if MongoDB is connected.
-
-        Returns:
-            True if connected and responding to ping.
-        """
-        try:
-            if self._client is None:
+        """Check the pinned current generation without racing client close."""
+        with self._lease_existing_client() as client:
+            if client is None:
                 return False
-            self._client.admin.command("ping")
-        except Exception:
-            return False
-        else:
+            try:
+                client.admin.command("ping")
+            except Exception:
+                return False
             return True
 
     def ping(self) -> bool:
@@ -1105,20 +1277,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             BackendType.MONGODB
         """
         return BackendType.MONGODB
-
-    def _assert_connected(self) -> None:
-        """Verify all collections are initialized.
-
-        Raises:
-            BackendConnectionError: If not connected.
-        """
-        if (
-            self._queue_collection is None
-            or self._set_collection is None
-            or self._storage_collection is None
-        ):
-            msg = "Not connected: call connect() first"
-            raise BackendConnectionError(msg, backend_type="mongodb")
 
     # QueueBackend implementation
     @queue_operation_error_boundary(
@@ -1140,11 +1298,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ValueError: If queue_name contains invalid characters.
         """
         _validate_key_name(queue_name, "queue_name")
-        self._assert_connected()
-        queue_collection = self._queue_collection
-        if queue_collection is None:
-            msg = "MongoDBBackend not connected: queue collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         doc = {
             "queue_name": queue_name,
             "item": item,
@@ -1152,7 +1305,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             "created_at": datetime.now(tz=timezone.utc),
         }
         try:
-            queue_collection.insert_one(doc)
+            with self._lease_generation("push") as generation:
+                generation.queue_collection.insert_one(doc)
         except (PyMongoError, BSONError, OverflowError) as e:
             # The public boundary rebuilds this after the document and encoder
             # traceback have unwound, retaining only its static operation metadata.
@@ -1179,20 +1333,16 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ValueError: If queue_name contains invalid characters.
         """
         _validate_key_name(queue_name, "queue_name")
-        self._assert_connected()
-        queue_collection = self._queue_collection
-        if queue_collection is None:
-            msg = "MongoDBBackend not connected: queue collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
             # The strict predicate is evaluated by MongoDB before its atomic delete.
             # Consequently poison documents are never selected or removed, valid
             # records behind them remain live, and concurrent callers still have one
             # server-side linearization point without client-side CAS retries.
-            result = queue_collection.find_one_and_delete(
-                _active_queue_filter(queue_name),
-                sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
-            )
+            with self._lease_generation("pop") as generation:
+                result = generation.queue_collection.find_one_and_delete(
+                    _active_queue_filter(queue_name),
+                    sort=[("priority", ASCENDING), ("created_at", ASCENDING)],
+                )
         except (PyMongoError, BSONError) as e:
             msg = "MongoDB atomic queue pop failed."
             raise QueueError(msg, operation="pop") from e
@@ -1243,15 +1393,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             QueueError: If the count request fails.
         """
         _validate_key_name(queue_name, "queue_name")
-        self._assert_connected()
-        queue_collection = self._queue_collection
-        if queue_collection is None:
-            msg = "MongoDBBackend not connected: queue collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            return queue_collection.count_documents(
-                _active_queue_filter(queue_name), limit=100000
-            )
+            with self._lease_generation("read queue length") as generation:
+                return generation.queue_collection.count_documents(
+                    _active_queue_filter(queue_name), limit=100000
+                )
         except PyMongoError as e:
             msg = f"Failed to get queue length for {queue_name}: {e}"
             raise QueueError(msg, queue_name=queue_name, operation="queue_len") from e
@@ -1273,13 +1419,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             QueueError: If the delete request fails.
         """
         _validate_key_name(queue_name, "queue_name")
-        self._assert_connected()
-        queue_collection = self._queue_collection
-        if queue_collection is None:
-            msg = "MongoDBBackend not connected: queue collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            queue_collection.delete_many({"queue_name": queue_name})
+            with self._lease_generation("clear queue") as generation:
+                generation.queue_collection.delete_many({"queue_name": queue_name})
         except PyMongoError as e:
             msg = f"Failed to clear queue {queue_name}: {e}"
             raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
@@ -1304,11 +1446,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ValueError: If set_name contains invalid characters.
         """
         _validate_key_name(set_name, "set_name")
-        self._assert_connected()
-        set_collection = self._set_collection
-        if set_collection is None:
-            msg = "MongoDBBackend not connected: set collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         doc = {
             "set_name": set_name,
             "item_hash": _hash_item(item),
@@ -1316,7 +1453,8 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             "created_at": datetime.now(tz=timezone.utc),
         }
         try:
-            set_collection.insert_one(doc)
+            with self._lease_generation("add to set") as generation:
+                generation.set_collection.insert_one(doc)
         except DuplicateKeyError:
             return False
         except PyMongoError as e:
@@ -1349,18 +1487,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ValueError: If set_name contains invalid characters.
         """
         _validate_key_name(set_name, "set_name")
-        self._assert_connected()
-        set_collection = self._set_collection
-        if set_collection is None:
-            msg = "MongoDBBackend not connected: set collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = set_collection.delete_one(
-                {
-                    "set_name": set_name,
-                    "item_hash": _hash_item(item),
-                }
-            )
+            with self._lease_generation("remove from set") as generation:
+                result = generation.set_collection.delete_one(
+                    {
+                        "set_name": set_name,
+                        "item_hash": _hash_item(item),
+                    }
+                )
         except PyMongoError as e:
             raise BackendConnectionError(
                 f"MongoDB set remove failed for {set_name!r}: {e}",
@@ -1387,18 +1521,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             ValueError: If set_name contains invalid characters.
         """
         _validate_key_name(set_name, "set_name")
-        self._assert_connected()
-        set_collection = self._set_collection
-        if set_collection is None:
-            msg = "MongoDBBackend not connected: set collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = set_collection.find_one(
-                {
-                    "set_name": set_name,
-                    "item_hash": _hash_item(item),
-                }
-            )
+            with self._lease_generation("check set membership") as generation:
+                result = generation.set_collection.find_one(
+                    {
+                        "set_name": set_name,
+                        "item_hash": _hash_item(item),
+                    }
+                )
         except PyMongoError as e:
             raise BackendConnectionError(
                 f"MongoDB set contains failed for {set_name!r}: {e}",
@@ -1425,13 +1555,11 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             Number of items in the set (capped at 100000).
         """
         _validate_key_name(set_name, "set_name")
-        self._assert_connected()
-        set_collection = self._set_collection
-        if set_collection is None:
-            msg = "MongoDBBackend not connected: set collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            return set_collection.count_documents({"set_name": set_name}, limit=100000)
+            with self._lease_generation("read set length") as generation:
+                return generation.set_collection.count_documents(
+                    {"set_name": set_name}, limit=100000
+                )
         except PyMongoError as e:
             raise BackendConnectionError(
                 f"MongoDB set length failed for {set_name!r}: {e}",
@@ -1455,13 +1583,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 MongoDB layer (parity with add R-dupe-1 #38 + redis clear_set #71).
         """
         _validate_key_name(set_name, "set_name")
-        self._assert_connected()
-        set_collection = self._set_collection
-        if set_collection is None:
-            msg = "MongoDBBackend not connected: set collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            set_collection.delete_many({"set_name": set_name})
+            with self._lease_generation("clear set") as generation:
+                generation.set_collection.delete_many({"set_name": set_name})
         except PyMongoError as e:
             # R-rclears-mongo: wrap operational PyMongoError (parity with add
             # R-dupe-1 #38 + redis clear_set #71) so BackendDupeFilter's
@@ -1496,11 +1620,6 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         _validate_ttl(ttl)
-        self._assert_connected()
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         doc: dict[str, Any] = {
             "key": key,
             "data": data,
@@ -1509,11 +1628,12 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             doc["expireAt"] = datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
 
         try:
-            storage_collection.replace_one(
-                {"key": key},
-                doc,
-                upsert=True,
-            )
+            with self._lease_generation("store") as generation:
+                generation.storage_collection.replace_one(
+                    {"key": key},
+                    doc,
+                    upsert=True,
+                )
         except PyMongoError as e:
             msg = f"Failed to store key {key!r} in MongoDB: {e}"
             raise StorageError(msg, operation="store", key=key) from e
@@ -1532,16 +1652,17 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             expire_at = expire_at.replace(tzinfo=timezone.utc)
         return (expire_at - datetime.now(tz=timezone.utc)).total_seconds()
 
-    def _lazy_reap_expired_storage(self, document: dict[str, Any], key: str) -> bool:
-        """Conditionally reap an expired snapshot and report whether it expired."""
+    def _lazy_reap_expired_storage(
+        self,
+        storage_collection: Collection[dict[str, Any]],
+        document: dict[str, Any],
+        key: str,
+    ) -> bool:
+        """Conditionally reap an expired snapshot on its pinned collection."""
         remaining = self._remaining_storage_ttl(document)
         if remaining is None or remaining > 0:
             return False
 
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         reap_failed = False
         try:
             # The read snapshot may be stale: a concurrent store() can replace the
@@ -1585,15 +1706,14 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             StorageError: On PyMongoError (was previously unwrapped).
         """
         _validate_key_name(key, "key")
-        self._assert_connected()
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = storage_collection.find_one({"key": key})
-            if result and self._lazy_reap_expired_storage(result, key):
-                return None
+            with self._lease_generation("retrieve") as generation:
+                storage_collection = generation.storage_collection
+                result = storage_collection.find_one({"key": key})
+                if result and self._lazy_reap_expired_storage(
+                    storage_collection, result, key
+                ):
+                    return None
         except PyMongoError as e:
             msg = f"Failed to retrieve key {key!r} from MongoDB: {e}"
             raise StorageError(msg, operation="retrieve", key=key) from e
@@ -1622,13 +1742,9 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             StorageError: On PyMongoError (was previously unwrapped).
         """
         _validate_key_name(key, "key")
-        self._assert_connected()
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = storage_collection.delete_one({"key": key})
+            with self._lease_generation("delete") as generation:
+                result = generation.storage_collection.delete_one({"key": key})
         except PyMongoError as e:
             msg = f"Failed to delete key {key!r} in MongoDB: {e}"
             raise StorageError(msg, operation="delete", key=key) from e
@@ -1654,17 +1770,16 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             StorageError: On PyMongoError (was previously unwrapped).
         """
         _validate_key_name(key, "key")
-        self._assert_connected()
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = storage_collection.find_one(
-                {"key": key}, {"_id": 1, "expireAt": 1}
-            )
-            if result and self._lazy_reap_expired_storage(result, key):
-                return False
+            with self._lease_generation("check storage existence") as generation:
+                storage_collection = generation.storage_collection
+                result = storage_collection.find_one(
+                    {"key": key}, {"_id": 1, "expireAt": 1}
+                )
+                if result and self._lazy_reap_expired_storage(
+                    storage_collection, result, key
+                ):
+                    return False
         except PyMongoError as e:
             msg = f"Failed to check existence of key {key!r} in MongoDB: {e}"
             raise StorageError(msg, operation="exists", key=key) from e
@@ -1690,25 +1805,22 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             StorageError: On PyMongoError (was previously unwrapped).
         """
         _validate_key_name(key, "key")
-        self._assert_connected()
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
         try:
-            result = storage_collection.find_one({"key": key}, {"expireAt": 1})
+            with self._lease_generation("read storage TTL") as generation:
+                storage_collection = generation.storage_collection
+                result = storage_collection.find_one({"key": key}, {"expireAt": 1})
+                if result is None:
+                    return None
+                remaining = self._remaining_storage_ttl(result)
+                if remaining is None:
+                    return None
+                if remaining <= 0:
+                    self._lazy_reap_expired_storage(storage_collection, result, key)
+                    return None
+                return max(0, int(remaining))
         except PyMongoError as e:
             msg = f"Failed to read TTL of key {key!r} in MongoDB: {e}"
             raise StorageError(msg, operation="ttl", key=key) from e
-        if result is None:
-            return None
-        remaining = self._remaining_storage_ttl(result)
-        if remaining is None:
-            return None
-        if remaining <= 0:
-            self._lazy_reap_expired_storage(result, key)
-            return None
-        return max(0, int(remaining))
 
     @storage_operation_error_boundary(
         "clear_storage",
@@ -1729,23 +1841,19 @@ class MongoDBBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         if prefix is not None:
             _validate_key_name(prefix, "prefix")
-        self._assert_connected()
-        storage_collection = self._storage_collection
-        if storage_collection is None:
-            msg = "MongoDBBackend not connected: storage collection is None"
-            raise BackendConnectionError(msg, backend_type="mongodb")
-        if prefix:
-            pattern = re.escape(prefix)
-            try:
-                storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
-            except PyMongoError as e:
+        try:
+            with self._lease_generation("clear storage") as generation:
+                storage_collection = generation.storage_collection
+                if prefix:
+                    pattern = re.escape(prefix)
+                    storage_collection.delete_many({"key": {"$regex": f"^{pattern}"}})
+                else:
+                    storage_collection.delete_many(
+                        {"_id": {"$ne": _CAPABILITY_DOMAIN_MARKER_ID}}
+                    )
+        except PyMongoError as e:
+            if prefix:
                 msg = f"Failed to clear MongoDB storage (prefix={prefix!r}): {e}"
-                raise StorageError(msg, operation="clear_storage", key=None) from e
-        else:
-            try:
-                storage_collection.delete_many(
-                    {"_id": {"$ne": _CAPABILITY_DOMAIN_MARKER_ID}}
-                )
-            except PyMongoError as e:
+            else:
                 msg = f"Failed to clear MongoDB storage: {e}"
-                raise StorageError(msg, operation="clear_storage", key=None) from e
+            raise StorageError(msg, operation="clear_storage", key=None) from e
