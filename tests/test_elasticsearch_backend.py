@@ -71,7 +71,9 @@ class TestElasticSearchSettings:
         assert s.api_key is None
 
     def test_custom_hosts(self):
-        s = ElasticSearchSettings(hosts=["http://es1:9200"])
+        s = ElasticSearchSettings(
+            hosts=["http://es1:9200"], allow_remote_plaintext=True
+        )
         assert s.hosts == ["http://es1:9200"]
 
 
@@ -130,19 +132,18 @@ class TestConnection:
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__context__ is None
 
-    def test_network_failure_does_not_retain_mutated_endpoint_snapshot(self, mocker):
+    def test_mutated_remote_plaintext_fails_before_sdk_and_hides_endpoint(self, mocker):
         marker = "elasticsearch-mutable-endpoint-marker"
         config = ElasticSearchSettings()
         config.hosts = [f"http://{marker}:9200"]
-        client = mocker.MagicMock(ping=mocker.MagicMock(return_value=False))
-        mocker.patch(
-            "scrapy_extension.backends.elasticsearch.Elasticsearch",
-            return_value=client,
+        client_factory = mocker.patch(
+            "scrapy_extension.backends.elasticsearch.Elasticsearch"
         )
 
-        with pytest.raises(BackendConnectionError) as exc_info:
+        with pytest.raises(ConfigurationError) as exc_info:
             ElasticSearchBackend(config).connect()
 
+        client_factory.assert_not_called()
         error = exc_info.value
         assert marker not in str(error)
         assert marker not in repr(error.__dict__)

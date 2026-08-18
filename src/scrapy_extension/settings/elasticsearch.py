@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
@@ -17,8 +17,9 @@ from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
+    normalize_allow_remote_plaintext,
+    require_remote_plaintext_opt_in,
     validate_allow_remote_plaintext,
-    warn_remote_unauthenticated_plaintext,
 )
 
 _VALID_ES_SCHEMES: frozenset[str] = frozenset({"http", "https"})
@@ -146,6 +147,12 @@ class ElasticSearchSettings(RedactedBaseSettings):
         default="scrapy_storage",
         description="Index name for storage operations",
     )
+
+    @field_validator("allow_remote_plaintext", mode="before")
+    @classmethod
+    def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
+        """Accept canonical environment booleans but reject truthy lookalikes."""
+        return normalize_allow_remote_plaintext(value)
 
     @model_validator(mode="after")
     def _validate_hosts_scheme(self) -> Self:
@@ -362,8 +369,8 @@ class ElasticSearchSettings(RedactedBaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _warn_remote_unauthenticated_plaintext(self) -> Self:
-        """Keep remote unauthenticated HTTP compatible while making it explicit."""
+    def _require_remote_unauthenticated_plaintext_opt_in(self) -> Self:
+        """Require explicit acceptance before using remote anonymous HTTP."""
         allow_remote_plaintext = validate_allow_remote_plaintext(
             self.allow_remote_plaintext
         )
@@ -380,7 +387,7 @@ class ElasticSearchSettings(RedactedBaseSettings):
             and not has_credential
             and has_remote_plaintext_host
         ):
-            warn_remote_unauthenticated_plaintext(
+            require_remote_plaintext_opt_in(
                 "Elasticsearch", allow_remote_plaintext
             )
         return self

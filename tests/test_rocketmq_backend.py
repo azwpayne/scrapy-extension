@@ -449,7 +449,9 @@ def test_disconnect_waits_for_the_full_connect_generation(mocker) -> None:
 def test_connect_cluster_mode(mocker) -> None:
     """Cluster mode passes the configured proxy endpoints through."""
     config = RocketMQSettings(
-        mode=RocketMQMode.CLUSTER, namesrv_address="rocketmq-cluster:8081"
+        mode=RocketMQMode.CLUSTER,
+        namesrv_address="rocketmq-cluster:8081",
+        allow_remote_plaintext=True,
     )
     backend = RocketMQBackend(config)
     (_, _, _, mock_config_cls, _) = _patch_rocketmq(mocker)
@@ -1704,7 +1706,9 @@ def test_queue_len_reports_unsupported_risk1() -> None:
 def test_queue_len_rebuilds_static_capability_error_without_backend_graph() -> None:
     marker = "round44-rocketmq-depth-private-marker"
     backend = RocketMQBackend(
-        RocketMQSettings(namesrv_address=f"{marker}.example:8081")
+        RocketMQSettings(
+            namesrv_address=f"{marker}.example:8081", allow_remote_plaintext=True
+        )
     )
     _reset_queue_len_warned()
 
@@ -1720,7 +1724,9 @@ def test_queue_len_rebuilds_static_capability_error_without_backend_graph() -> N
 def test_queue_len_proxy_keeps_static_capability_error_and_breaker_neutral() -> None:
     marker = "round44-rocketmq-depth-proxy-marker"
     backend = RocketMQBackend(
-        RocketMQSettings(namesrv_address=f"{marker}.example:8081")
+        RocketMQSettings(
+            namesrv_address=f"{marker}.example:8081", allow_remote_plaintext=True
+        )
     )
     breaker = CircuitBreaker("rocketmq-capability-depth", failure_threshold=1)
     proxy = wrap_queue_backend(backend, breaker)
@@ -1909,6 +1915,7 @@ def test_rocketmq_mode_enum_values() -> None:
 def test_rocketmq_settings_env_prefix(monkeypatch) -> None:
     """Test RocketMQSettings respects env prefix."""
     monkeypatch.setenv("SCRAPY_ROCKETMQ_NAMESRV_ADDRESS", "env-rocketmq:9876")
+    monkeypatch.setenv("SCRAPY_ROCKETMQ_ALLOW_REMOTE_PLAINTEXT", "true")
     settings = RocketMQSettings()
     assert settings.namesrv_address == "env-rocketmq:9876"
 

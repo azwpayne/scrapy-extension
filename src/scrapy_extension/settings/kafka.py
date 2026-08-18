@@ -19,8 +19,9 @@ from scrapy_extension.settings._broker_endpoints import (
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
+    normalize_allow_remote_plaintext,
+    require_remote_plaintext_opt_in,
     validate_allow_remote_plaintext,
-    warn_remote_unauthenticated_plaintext,
 )
 
 
@@ -458,6 +459,12 @@ class KafkaSettings(RedactedBaseSettings):
         description="Minimum in-sync replicas for producer acks",
     )
 
+    @field_validator("allow_remote_plaintext", mode="before")
+    @classmethod
+    def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
+        """Accept canonical environment booleans but reject truthy lookalikes."""
+        return normalize_allow_remote_plaintext(value)
+
     @field_validator("bootstrap_servers", mode="after")
     @classmethod
     def _normalize_bootstrap_servers(cls, value: str) -> str:
@@ -526,8 +533,8 @@ class KafkaSettings(RedactedBaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _warn_remote_unauthenticated_plaintext(self) -> KafkaSettings:
-        """Keep no-auth remote PLAINTEXT compatible while making it explicit."""
+    def _require_remote_unauthenticated_plaintext_opt_in(self) -> KafkaSettings:
+        """Require explicit acceptance before using remote anonymous PLAINTEXT."""
         allow_remote_plaintext = validate_allow_remote_plaintext(
             self.allow_remote_plaintext
         )
@@ -552,7 +559,7 @@ class KafkaSettings(RedactedBaseSettings):
             and not has_authentication
             and not _kafka_broker_endpoints_are_loopback(endpoints)
         ):
-            warn_remote_unauthenticated_plaintext("Kafka", allow_remote_plaintext)
+            require_remote_plaintext_opt_in("Kafka", allow_remote_plaintext)
         return self
 
     @model_validator(mode="after")

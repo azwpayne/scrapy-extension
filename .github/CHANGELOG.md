@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- **Remote anonymous plaintext is fail-closed across Redis, MongoDB,
+  Elasticsearch, Kafka, Pulsar, and RocketMQ.** Non-loopback plaintext now
+  requires the backend's exact `ALLOW_REMOTE_PLAINTEXT=True` trusted-network
+  override; the former warning-only transition is over. Loopback development
+  remains available, and authenticated plaintext remains unconditionally
+  rejected.
 - **Cuckoo item-level deletion is now fail-safe unsupported.** Calling
   `CuckooMembershipFilter.remove()` now raises `NotImplementedError` without
   mutating the filter. The former behavior could delete a resident item when an

@@ -21,8 +21,9 @@ from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
+    normalize_allow_remote_plaintext,
+    require_remote_plaintext_opt_in,
     validate_allow_remote_plaintext,
-    warn_remote_unauthenticated_plaintext,
 )
 
 
@@ -535,6 +536,12 @@ class RedisSettings(RedactedBaseSettings):
         json_schema_extra={"deprecated": True},
     )
 
+    @field_validator("allow_remote_plaintext", mode="before")
+    @classmethod
+    def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
+        """Accept canonical environment booleans but reject truthy lookalikes."""
+        return normalize_allow_remote_plaintext(value)
+
     @model_validator(mode="before")
     @classmethod
     def _reject_ghost_masters_field(cls, values: Any) -> Any:
@@ -718,5 +725,5 @@ class RedisSettings(RedactedBaseSettings):
             and not has_authentication
             and not _redis_configured_endpoints_are_loopback(self)
         ):
-            warn_remote_unauthenticated_plaintext("Redis", allow_remote_plaintext)
+            require_remote_plaintext_opt_in("Redis", allow_remote_plaintext)
         return self

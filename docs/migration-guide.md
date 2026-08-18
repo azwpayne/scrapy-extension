@@ -90,21 +90,18 @@ SCRAPY_ROCKETMQ_SECRET_KEY = "..."
 
 The access and secret keys must be supplied together and neither may be empty
 or whitespace-only. Cloud mode refuses to start without this complete pair and
-TLS. Anonymous standalone/cluster connections remain compatible with the
-previous plaintext default, but should be limited to trusted local networks.
+TLS. Anonymous standalone/cluster connections are plaintext only on loopback by
+default. Remote plaintext requires the explicit trusted-network override below.
 The TLS flag targets the RocketMQ 5.x gRPC proxy and is propagated separately
 to both SDK client constructors; it is not a `ClientConfiguration` option.
 
-## Remote Plaintext Transition
+## Remote Plaintext Opt-in
 
-Unauthenticated connections to a non-loopback endpoint remain accepted in this
-release for backwards compatibility, but now emit a `FutureWarning` unless an
-operator makes the trusted-network exception explicit. Loopback defaults
-(`localhost` and literal loopback IP addresses) remain unchanged and do not
-warn. A future release will reject these remote plaintext configurations.
-
-Set the matching environment variable to `true` only when the network boundary
-is intentionally private and controlled:
+Unauthenticated connections to a non-loopback endpoint now fail at settings
+validation unless an operator explicitly accepts the trusted-network risk.
+Loopback defaults (`localhost` and literal loopback IP addresses) remain
+unchanged. Set the matching environment variable to exact boolean `true` only
+when the network boundary is intentionally private and controlled:
 
 | Backend | Explicit acknowledgement setting | Plaintext condition |
 |---|---|---|
@@ -115,7 +112,7 @@ is intentionally private and controlled:
 | Pulsar | `SCRAPY_PULSAR_ALLOW_REMOTE_PLAINTEXT` | unauthenticated `pulsar://` endpoint |
 | RocketMQ | `SCRAPY_ROCKETMQ_ALLOW_REMOTE_PLAINTEXT` | `tls_enabled=False` with no access/secret key pair |
 
-These flags suppress only the transition warning; they never weaken existing
+These flags authorize only remote anonymous plaintext; they never weaken
 credential or TLS validation. For example, authenticated Redis or MongoDB
 connections still require their verified TLS settings, Elasticsearch credentials
 over `http://` still fail, Kafka `SASL_PLAINTEXT` still fails, Pulsar tokens

@@ -1,8 +1,7 @@
-"""Small shared primitives for transition-period transport security warnings."""
+"""Small shared primitives for transport security policy enforcement."""
 
 from __future__ import annotations
 
-import warnings
 from ipaddress import ip_address
 
 from scrapy_extension.exceptions.base import ConfigurationError
@@ -27,8 +26,24 @@ def is_loopback_host(host: object) -> bool:
         return False
 
 
+def normalize_allow_remote_plaintext(value: object) -> bool:
+    """Parse canonical environment booleans without accepting truthy lookalikes."""
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ConfigurationError(
+        "allow_remote_plaintext must be a boolean.",
+        setting_name="allow_remote_plaintext",
+    )
+
+
 def validate_allow_remote_plaintext(value: object) -> bool:
-    """Require a boolean opt-in even when mutable settings bypass Pydantic."""
+    """Require an exact boolean even when mutable settings bypass Pydantic."""
     if type(value) is not bool:
         raise ConfigurationError(
             "allow_remote_plaintext must be a boolean.",
@@ -37,25 +52,16 @@ def validate_allow_remote_plaintext(value: object) -> bool:
     return value
 
 
-def warn_remote_unauthenticated_plaintext(
+def require_remote_plaintext_opt_in(
     backend_name: str, allow_remote_plaintext: object
-) -> bool:
-    """Warn about a remote plaintext transport until the opt-in is explicit.
-
-    The message intentionally includes no endpoint or credential values. The
-    warning source remains inside this module so Python never renders a caller
-    source line that may contain inline secrets.
-    """
-    allowed = validate_allow_remote_plaintext(allow_remote_plaintext)
-    if not allowed:
-        warnings.warn(
+) -> None:
+    """Reject remote anonymous plaintext unless its risk is explicitly accepted."""
+    if validate_allow_remote_plaintext(allow_remote_plaintext) is not True:
+        raise ConfigurationError(
             (
-                f"Remote unauthenticated plaintext {backend_name} connections are "
-                "deprecated and will be rejected in a future release. Enable TLS "
-                "or set allow_remote_plaintext=True only for a trusted private "
-                "network."
+                f"Remote unauthenticated plaintext {backend_name} connections "
+                "require allow_remote_plaintext=True. Enable TLS or use this "
+                "override only for a trusted private network."
             ),
-            FutureWarning,
-            stacklevel=1,
+            setting_name="allow_remote_plaintext",
         )
-    return allowed

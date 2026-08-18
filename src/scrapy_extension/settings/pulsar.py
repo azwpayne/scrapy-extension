@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
@@ -18,8 +18,9 @@ from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
+    normalize_allow_remote_plaintext,
+    require_remote_plaintext_opt_in,
     validate_allow_remote_plaintext,
-    warn_remote_unauthenticated_plaintext,
 )
 
 _VALID_PULSAR_SCHEMES: tuple[str, ...] = ("pulsar://", "pulsar+ssl://")
@@ -183,7 +184,7 @@ def validate_pulsar_connection(
     elif scheme == "pulsar://" and not all(
         is_loopback_host(host) for host in endpoint_hosts
     ):
-        warn_remote_unauthenticated_plaintext(
+        require_remote_plaintext_opt_in(
             "Pulsar", normalized_allow_remote_plaintext
         )
     return (
@@ -281,6 +282,12 @@ class PulsarSettings(RedactedBaseSettings):
             "for unauthenticated local compatibility"
         ),
     )
+
+    @field_validator("allow_remote_plaintext", mode="before")
+    @classmethod
+    def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
+        """Accept canonical environment booleans but reject truthy lookalikes."""
+        return normalize_allow_remote_plaintext(value)
 
     @model_validator(mode="after")
     def _validate_connection(self) -> Self:

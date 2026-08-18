@@ -15,8 +15,9 @@ from scrapy_extension.settings._broker_endpoints import (
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
+    normalize_allow_remote_plaintext,
+    require_remote_plaintext_opt_in,
     validate_allow_remote_plaintext,
-    warn_remote_unauthenticated_plaintext,
 )
 
 
@@ -111,7 +112,7 @@ def validate_rocketmq_connection(
         and not tls_enabled
         and not _rocketmq_namesrv_endpoints_are_loopback(namesrv_address)
     ):
-        warn_remote_unauthenticated_plaintext(
+        require_remote_plaintext_opt_in(
             "RocketMQ", normalized_allow_remote_plaintext
         )
     return mode, namesrv_address, key_text, secret_text, tls_enabled
@@ -188,6 +189,12 @@ class RocketMQSettings(RedactedBaseSettings):
     # set_topic_prefix / storage_topic_prefix settings — do NOT re-add them
     # (R25-H removed vestigial, unconsumed dead config).
     topic_prefix: str = Field(default="scrapy-queue")
+
+    @field_validator("allow_remote_plaintext", mode="before")
+    @classmethod
+    def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
+        """Accept canonical environment booleans but reject truthy lookalikes."""
+        return normalize_allow_remote_plaintext(value)
 
     @field_validator("consumer_group", mode="after")
     @classmethod

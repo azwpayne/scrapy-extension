@@ -1,8 +1,7 @@
-"""Compatibility warnings for unauthenticated remote plaintext transports."""
+"""Fail-closed policy for unauthenticated remote plaintext transports."""
 
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 import pytest
@@ -57,79 +56,78 @@ _REMOTE_PLAINTEXT_CASES: list[tuple[str, type[Any], dict[str, object], str]] = [
 ]
 
 
-def _future_warnings(
-    factory: type[Any], **kwargs: object
-) -> list[warnings.WarningMessage]:
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter("always", FutureWarning)
-        factory(**kwargs)
-    return [
-        warning for warning in captured if issubclass(warning.category, FutureWarning)
-    ]
-
-
 @pytest.mark.parametrize(
-    ("backend", "settings_type", "remote_kwargs", "_environment_name"),
+    ("_backend", "settings_type", "remote_kwargs", "_environment_name"),
     _REMOTE_PLAINTEXT_CASES,
 )
-def test_loopback_plaintext_defaults_do_not_emit_transition_warning(
-    backend: str,
+def test_loopback_plaintext_defaults_remain_available(
+    _backend: str,
     settings_type: type[Any],
     remote_kwargs: dict[str, object],
     _environment_name: str,
 ) -> None:
-    """The existing local defaults remain quiet and usable during migration."""
-    del backend, remote_kwargs
+    """The existing local defaults remain usable without a high-risk opt-in."""
+    del remote_kwargs
 
     settings = settings_type()
 
     assert settings.allow_remote_plaintext is False
-    assert not _future_warnings(settings_type)
 
 
 @pytest.mark.parametrize(
-    ("backend", "settings_type", "remote_kwargs", "_environment_name"),
+    ("_backend", "settings_type", "remote_kwargs", "_environment_name"),
     _REMOTE_PLAINTEXT_CASES,
 )
-def test_remote_unauthenticated_plaintext_emits_transition_warning(
-    backend: str,
+def test_remote_unauthenticated_plaintext_fails_closed(
+    _backend: str,
     settings_type: type[Any],
     remote_kwargs: dict[str, object],
     _environment_name: str,
 ) -> None:
-    """Remote plaintext stays compatible for now but becomes conspicuous."""
-    del _environment_name
+    """Remote anonymous plaintext is rejected before any backend can be built."""
+    with pytest.raises(ConfigurationError) as exc_info:
+        settings_type(**remote_kwargs)
 
-    with pytest.warns(
-        FutureWarning,
-        match=(
-            rf"(?i)Remote unauthenticated plaintext {backend} connections are deprecated"
-        ),
-    ):
-        settings = settings_type(**remote_kwargs)
-
-    assert settings.allow_remote_plaintext is False
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+    assert exc_info.value.__cause__ is None
 
 
 @pytest.mark.parametrize(
-    ("backend", "settings_type", "remote_kwargs", "environment_name"),
+    ("_backend", "settings_type", "remote_kwargs", "environment_name"),
     _REMOTE_PLAINTEXT_CASES,
 )
-def test_explicit_remote_plaintext_opt_in_suppresses_transition_warning(
-    backend: str,
+def test_environment_remote_plaintext_opt_in_is_explicit(
+    _backend: str,
     settings_type: type[Any],
     remote_kwargs: dict[str, object],
     environment_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The setting is an intentional, namespaced acknowledgement of the risk."""
-    del backend
+    """Canonical environment true explicitly acknowledges the trusted-network risk."""
     monkeypatch.setenv(environment_name, "true")
 
     settings = settings_type(**remote_kwargs)
 
     assert settings.allow_remote_plaintext is True
-    assert not _future_warnings(settings_type, **remote_kwargs)
+
+
+@pytest.mark.parametrize(
+    ("_backend", "settings_type", "remote_kwargs", "_environment_name"),
+    _REMOTE_PLAINTEXT_CASES,
+)
+@pytest.mark.parametrize("lookalike", [1, 0, "yes", object()])
+def test_remote_plaintext_opt_in_rejects_non_boolean_lookalikes(
+    _backend: str,
+    settings_type: type[Any],
+    remote_kwargs: dict[str, object],
+    _environment_name: str,
+    lookalike: object,
+) -> None:
+    """Truthy/coercible values never grant the high-risk compatibility override."""
+    with pytest.raises(ConfigurationError) as exc_info:
+        settings_type(**remote_kwargs, allow_remote_plaintext=lookalike)
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
 
 
 @pytest.mark.parametrize(
@@ -261,8 +259,8 @@ def test_authenticated_plaintext_still_fails_fast(
         ),
     ],
 )
-def test_authenticated_tls_paths_do_not_emit_transition_warning(
+def test_authenticated_tls_paths_remain_available(
     settings_type: type[Any], secure_kwargs: dict[str, object]
 ) -> None:
-    """Verified transports remain the migration destination without warning noise."""
-    assert not _future_warnings(settings_type, **secure_kwargs)
+    """Verified transports remain the migration destination."""
+    settings_type(**secure_kwargs)

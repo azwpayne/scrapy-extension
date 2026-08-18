@@ -175,7 +175,10 @@ class TestPulsarConnect:
 
     def test_connect_diagnostic_hides_service_url(self, mocker) -> None:
         marker = "pulsar-service-url-log-marker"
-        b = _make_backend(service_url=f"pulsar://{marker}.example:6650")
+        b = _make_backend(
+            service_url=f"pulsar://{marker}.example:6650",
+            allow_remote_plaintext=True,
+        )
         client = mocker.MagicMock()
         mocker.patch.object(pulsar, "Client", return_value=client)
         logger_debug = mocker.patch("scrapy_extension.backends.pulsar.logger.debug")
@@ -1459,7 +1462,10 @@ class TestPulsarLenClear:
         self,
     ) -> None:
         marker = "round44-pulsar-depth-private-marker"
-        backend = _make_backend(service_url=f"pulsar://{marker}.example:6650")
+        backend = _make_backend(
+            service_url=f"pulsar://{marker}.example:6650",
+            allow_remote_plaintext=True,
+        )
 
         with pytest.raises(NotImplementedError) as exc_info:
             backend.queue_len(marker)
@@ -1475,7 +1481,10 @@ class TestPulsarLenClear:
         self,
     ) -> None:
         marker = "round44-pulsar-depth-proxy-marker"
-        backend = _make_backend(service_url=f"pulsar://{marker}.example:6650")
+        backend = _make_backend(
+            service_url=f"pulsar://{marker}.example:6650",
+            allow_remote_plaintext=True,
+        )
         breaker = CircuitBreaker("pulsar-capability-depth", failure_threshold=1)
         proxy = wrap_queue_backend(backend, breaker)
 
@@ -1628,6 +1637,7 @@ class TestPulsarTlsDecouple:
         """pulsar:// (plaintext) doesn't pass either TLS field."""
         b = _make_backend(
             service_url="pulsar://broker:6650",
+            allow_remote_plaintext=True,
             allow_insecure_connection=True,  # ignored — not an ssl url
             tls_trust_certs_file="/tmp/plaintext-ignored.pem",
             tls_validate_hostname=False,
