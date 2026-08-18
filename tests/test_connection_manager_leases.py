@@ -43,6 +43,38 @@ def test_leases_release_only_their_exact_acquire() -> None:
     backend.disconnect.assert_called_once_with()
 
 
+def test_concurrent_legacy_close_claims_distinct_tokens_atomically() -> None:
+    manager = ConnectionManager.get_manager(BackendType.REDIS, {"host": "legacy-race"})
+    for _ in range(15):
+        assert (
+            ConnectionManager.get_manager(BackendType.REDIS, {"host": "legacy-race"})
+            is manager
+        )
+    backend = Mock()
+    manager._backend = backend
+    barrier = threading.Barrier(16)
+    errors: list[BaseException] = []
+
+    def release() -> None:
+        try:
+            barrier.wait(timeout=3)
+            manager.close()
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    threads = [threading.Thread(target=release) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert errors == []
+    assert manager._users == 0
+    assert manager._legacy_acquires == []
+    assert manager._retirement_complete is True
+    backend.disconnect.assert_called_once_with()
+
+
 def test_legacy_close_never_consumes_an_acquire_specific_lease() -> None:
     manager = ConnectionManager.get_manager(BackendType.REDIS, {"host": "mixed"})
     lease = ConnectionManager.acquire_lease(BackendType.REDIS, {"host": "mixed"})
@@ -92,6 +124,46 @@ def test_release_retry_repairs_interruption_around_retirement(
     lease.release()
     assert manager._retirement_complete is True
     assert manager._users == 0
+    backend.disconnect.assert_called_once_with()
+
+
+def test_one_interrupted_retirement_publication_repairs_event_and_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = ConnectionManager.acquire_lease(
+        BackendType.REDIS, {"host": "publication-interruption"}
+    )
+    manager = lease.manager
+    backend = Mock()
+    manager._backend = backend
+    original = manager._publish_retirement_complete
+    interruption = KeyboardInterrupt("publish")
+    calls = 0
+
+    def interrupted_publication() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # Model interruption after one package-state assignment. The bounded
+            # repair pass must finish the event and finalizer ownership fields.
+            with manager._lock:
+                manager._retirement_complete = True
+            raise interruption
+        original()
+
+    monkeypatch.setattr(
+        manager, "_publish_retirement_complete", interrupted_publication
+    )
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        lease.release()
+
+    assert exc_info.value is interruption
+    assert manager._retirement_complete is True
+    assert manager._retirement_finalizing is False
+    assert manager._retirement_finalizer_token is None
+    assert manager._retirement_finalization_event.is_set()
+    lease.release()
     backend.disconnect.assert_called_once_with()
 
 

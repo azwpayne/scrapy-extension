@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import sys
 import threading
 from abc import ABC
 from collections import OrderedDict
@@ -1789,6 +1790,31 @@ def _normalize_registry_value(value: Any, active_ids: set[int]) -> Any:
         active_ids.remove(value_id)
 
 
+class _RetirementFinalizerToken:
+    """Invocation-scoped retirement ownership that can be reclaimed after unwind."""
+
+    __slots__ = ("thread_id",)
+
+    def __init__(self) -> None:
+        self.thread_id = threading.get_ident()
+
+    @property
+    def active(self) -> bool:
+        """Whether a live frame still owns this exact token."""
+        try:
+            frame = sys._current_frames().get(self.thread_id)  # noqa: SLF001
+        except Exception:  # noqa: BLE001 - stale ownership must be reclaimable
+            return False
+        while frame is not None:
+            try:
+                if frame.f_locals.get("finalizer_token") is self:
+                    return True
+            except Exception:  # noqa: BLE001 - fail closed to reclaimable ownership
+                return False
+            frame = frame.f_back
+        return False
+
+
 class ConnectionManagerLease:
     """Acquire-specific, idempotently releasable manager ownership.
 
@@ -1988,6 +2014,7 @@ class ConnectionManager:
         self._retirement_complete = False
         self._retirement_finalizing = False
         self._retirement_finalizer_thread_id: int | None = None
+        self._retirement_finalizer_token: _RetirementFinalizerToken | None = None
         self._retirement_finalization_event = threading.Event()
         self._retiring_backend: Backend | None = None
         self._retirement_disconnect_started = False
@@ -3070,12 +3097,18 @@ class ConnectionManager:
             self._finalize_retirement()
             return
 
+        should_finalize = False
         with cls._registry_lock:
+            # Claim and consume the exact legacy token in one registry transaction.
+            # Two concurrent close() calls therefore cannot both select the same
+            # token and accidentally leave a distinct legacy acquire active.
             legacy_token = self._legacy_acquires[0] if self._legacy_acquires else None
-        if legacy_token is not None:
-            self._release_acquire(legacy_token)
-        elif self._retired:
-            # Repair a prior final-release interruption without consuming a peer.
+            if legacy_token is not None:
+                should_finalize = self._release_acquire_under_lock(legacy_token)
+            elif self._retired:
+                # Repair a prior final-release interruption without consuming a peer.
+                should_finalize = not self._retirement_complete
+        if should_finalize:
             self._finalize_retirement()
 
     def _is_acquire_released(self, acquire_token: object) -> bool:
@@ -3083,51 +3116,84 @@ class ConnectionManager:
         with type(self)._registry_lock:
             return acquire_token not in self._active_acquires
 
+    def _release_acquire_under_lock(self, acquire_token: object) -> bool:
+        """Consume one exact token; called only while the registry lock is held."""
+        cls = type(self)
+        self._active_acquires.discard(acquire_token)
+        # A token-aware release can race legacy cleanup only through misuse;
+        # keep the compatibility queue synchronized without relying on it.
+        try:
+            self._legacy_acquires.remove(acquire_token)
+        except ValueError:
+            pass
+        self._users = len(self._active_acquires)
+        if self._active_acquires:
+            return False
+        self._retired = True
+        self._retirement_event.set()
+        registry_token = self._registry_token
+        if registry_token is not None and cls._managers.get(registry_token) is self:
+            cls._managers.pop(registry_token, None)
+        return not self._retirement_complete
+
     def _release_acquire(self, acquire_token: object) -> None:
         """Release one exact token and repair final retirement when necessary."""
         cls = type(self)
-        should_finalize = False
         with cls._registry_lock:
-            self._active_acquires.discard(acquire_token)
-            # A token-aware release can race legacy cleanup only through misuse;
-            # keep the compatibility queue synchronized without relying on it.
-            try:
-                self._legacy_acquires.remove(acquire_token)
-            except ValueError:
-                pass
-            self._users = len(self._active_acquires)
-            if not self._active_acquires:
-                self._retired = True
-                self._retirement_event.set()
-                registry_token = self._registry_token
-                if (
-                    registry_token is not None
-                    and cls._managers.get(registry_token) is self
-                ):
-                    cls._managers.pop(registry_token, None)
-                should_finalize = not self._retirement_complete
+            should_finalize = self._release_acquire_under_lock(acquire_token)
         if should_finalize:
             self._finalize_retirement()
+
+    def _publish_retirement_complete(self) -> None:
+        """Publish package-owned retirement state in one retryable lock pass."""
+        with self._lock:
+            self._retirement_complete = True
+            self._retirement_finalizing = False
+            self._retirement_finalizer_thread_id = None
+            self._retirement_finalizer_token = None
+            self._retirement_finalization_event.set()
+            self._retiring_backend = None
+            retired_adapter = self._retiring_adapter
+            retired_source = self._retiring_adapter_source
+            self._retiring_adapter = None
+            self._retiring_adapter_source = None
+        # Plugin token destruction must remain outside the manager lock.
+        del retired_adapter, retired_source
 
     def _finalize_retirement(self) -> None:
         """Complete one manager retirement without replaying opaque teardown."""
         backend_to_disconnect: Backend | None = None
         wait_for_finalizer: threading.Event | None = None
-        thread_id = threading.get_ident()
+        finalizer_token = _RetirementFinalizerToken()
         with self._lock:
             self._retired = True
             self._retirement_event.set()
             if self._retirement_complete:
+                # A prior publication may have been interrupted after its first
+                # assignment. Repair every waiter/ownership field before returning.
+                self._retirement_finalizing = False
+                self._retirement_finalizer_thread_id = None
+                self._retirement_finalizer_token = None
+                self._retirement_finalization_event.set()
                 return
-            if self._retirement_finalizing:
-                if self._retirement_finalizer_thread_id == thread_id:
+            current_owner = self._retirement_finalizer_token
+            if (
+                self._retirement_finalizing
+                and current_owner is not None
+                and current_owner.active
+            ):
+                if current_owner.thread_id == finalizer_token.thread_id:
                     # Opaque teardown re-entry observes retirement in progress; the
                     # outer owner will publish completion before returning.
                     return
                 wait_for_finalizer = self._retirement_finalization_event
             else:
+                # No live owner remains (for example, package-state publication was
+                # interrupted). Reclaim the existing event rather than replacing it,
+                # so already-waiting peers are never stranded.
                 self._retirement_finalizing = True
-                self._retirement_finalizer_thread_id = thread_id
+                self._retirement_finalizer_thread_id = finalizer_token.thread_id
+                self._retirement_finalizer_token = finalizer_token
             if wait_for_finalizer is None:
                 if self._retiring_backend is None and self._backend is not None:
                     self._retiring_backend = self._backend
@@ -3159,20 +3225,17 @@ class ConnectionManager:
                 # package-owned retirement state, then preserve control flow.
                 control_error = error
 
-        with self._lock:
-            self._retirement_complete = True
-            self._retirement_finalizing = False
-            self._retirement_finalizer_thread_id = None
-            self._retirement_finalization_event.set()
-            self._retiring_backend = None
-            retired_adapter = self._retiring_adapter
-            retired_source = self._retiring_adapter_source
-            self._retiring_adapter = None
-            self._retiring_adapter_source = None
+        publication_error: BaseException | None = None
+        try:
+            self._publish_retirement_complete()
+        except BaseException as error:
+            publication_error = error
+            # The bounded guarantee permits one interruption of package-owned
+            # publication. One repair pass completes event/finalizer ownership;
+            # a second interruption remains retryable by a later release.
+            self._publish_retirement_complete()
 
-        # Hostile plugin token destruction and monitor callbacks run only after all
-        # registry/manager state is terminal and unlocked.
-        del retired_adapter, retired_source
+        # Hostile monitor callbacks run only after all manager state is terminal.
         if disconnect_failed:
             _log_diagnostic(logger.warning, "Error during disconnect")
         elif backend_to_disconnect is not None:
@@ -3192,6 +3255,8 @@ class ConnectionManager:
             )
         if control_error is not None:
             raise control_error
+        if publication_error is not None:
+            raise publication_error
 
     @classmethod
     def clear_registry(cls) -> None:

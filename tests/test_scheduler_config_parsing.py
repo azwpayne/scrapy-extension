@@ -15,6 +15,12 @@ from scrapy_extension.schedule.scheduler import BackendScheduler
 pytestmark = pytest.mark.unit
 
 
+def _lease(mocker: MockerFixture, manager: object) -> object:
+    lease = mocker.Mock()
+    lease.manager = manager
+    return lease
+
+
 def test_queue_component_config_parses_queue_values_immutably() -> None:
     """The staged snapshot retains every value passed to the queue seam."""
     from scrapy_extension.schedule.scheduler import _QueueComponentConfig
@@ -112,8 +118,8 @@ def test_strategy_is_read_once_before_ring_buffer_safety_gate(
     manager = mocker.Mock()
     mocker.patch.object(
         ConnectionManager,
-        "get_manager",
-        return_value=manager,
+        "acquire_lease",
+        return_value=_lease(mocker, manager),
     )
     build_strategy = mocker.patch(
         "scrapy_extension.queue.strategies.factory.build_queue_strategy",
@@ -139,7 +145,9 @@ def test_queue_peer_ids_accept_string_list_and_tuple(
     expected: tuple[str, ...],
 ) -> None:
     manager = mocker.Mock()
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+    mocker.patch.object(
+        ConnectionManager, "acquire_lease", return_value=_lease(mocker, manager)
+    )
     build_strategy = mocker.patch(
         "scrapy_extension.queue.strategies.factory.build_queue_strategy",
         return_value=mocker.Mock(),
@@ -224,7 +232,9 @@ def test_ack_bypass_warning_interruption_preserves_valid_configuration(
 ) -> None:
     """A pure compatibility warning cannot abort scheduler construction."""
     manager = mocker.Mock(name="ConnectionManager")
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+    mocker.patch.object(
+        ConnectionManager, "acquire_lease", return_value=_lease(mocker, manager)
+    )
     mocker.patch(
         "scrapy_extension.schedule.scheduler.logger.warning",
         side_effect=diagnostic_error,
@@ -294,7 +304,9 @@ def test_workstealing_key_unsafe_worker_id_names_worker_id(
     the unrelated SCRAPY_QUEUE_PEER_IDS. Unfixed sibling of the snapshot_owner attribution
     fix (R80 / fe72f30) -- R80's Directive demands source-setting attribution, which the
     work_stealing constructor catch block violated."""
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    mocker.patch.object(
+        ConnectionManager, "acquire_lease", return_value=_lease(mocker, mocker.Mock())
+    )
     settings = ScrapySettings(
         {
             "SCRAPY_BACKEND_TYPE": "redis",
@@ -315,7 +327,9 @@ def test_workstealing_key_unsafe_peer_id_still_names_peer_ids(
     """R88 hardening: when a key-unsafe PEER_ID (not worker_id) is the offender under
     work_stealing, attribution must stay on SCRAPY_QUEUE_PEER_IDS -- the worker_id
     re-check must not over-redirect when worker_id itself is valid."""
-    mocker.patch.object(ConnectionManager, "get_manager", return_value=mocker.Mock())
+    mocker.patch.object(
+        ConnectionManager, "acquire_lease", return_value=_lease(mocker, mocker.Mock())
+    )
     settings = ScrapySettings(
         {
             "SCRAPY_BACKEND_TYPE": "redis",

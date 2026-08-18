@@ -34,6 +34,12 @@ from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
 
+def _lease(mocker: MockerFixture, manager: Mock) -> Mock:
+    lease = mocker.Mock()
+    lease.manager = manager
+    return lease
+
+
 def _make_settings(
     *,
     depth_sample_every: int | None = None,
@@ -97,8 +103,8 @@ class TestRingBufferBlockingPolicyGate:
         )
         settings.getint.side_effect = lambda _key, default=0: default
         get_manager = mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
 
         with pytest.raises(ConfigurationError) as exc_info:
@@ -204,8 +210,8 @@ def _open_scheduler(scheduler: BackendScheduler) -> BackendQueue:
 
 def test_custom_snapshot_limits_are_threaded_to_backend_queue(mocker) -> None:
     mocker.patch(
-        "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-        return_value=mocker.Mock(),
+        "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+        return_value=_lease(mocker, mocker.Mock()),
     )
     settings = _make_settings(
         snapshot_max_bytes=4096,
@@ -224,8 +230,8 @@ class TestR14CDepthSampleEveryThreading:
     def test_custom_value_threaded(self, mocker) -> None:
         """Set ``=5`` → constructed ``BackendQueue.depth_sample_every == 5``."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings(depth_sample_every=5)
         scheduler = BackendScheduler.from_settings(settings)
@@ -235,8 +241,8 @@ class TestR14CDepthSampleEveryThreading:
     def test_default_when_unset(self, mocker) -> None:
         """Unset → constructor default (100) preserved."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings()
         scheduler = BackendScheduler.from_settings(settings)
@@ -250,8 +256,8 @@ class TestR14CMaxItemBytesThreading:
     def test_custom_value_threaded(self, mocker) -> None:
         """Set ``=2048`` → constructed ``BackendQueue.max_item_bytes == 2048``."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings(max_item_bytes=2048)
         scheduler = BackendScheduler.from_settings(settings)
@@ -279,8 +285,8 @@ class TestR14CDelayMaxHeldThreading:
             )
         )
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         scheduler = BackendScheduler.from_settings(settings)
         _open_scheduler(scheduler)
@@ -301,8 +307,8 @@ class TestR14CBackpressureThresholdThreading:
     def test_custom_value_carried_on_scheduler(self, mocker) -> None:
         """Set ``=2500`` → ``scheduler._monitor_backpressure_threshold == 2500``."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings(monitor_backpressure_threshold=2500)
         scheduler = BackendScheduler.from_settings(settings)
@@ -311,8 +317,8 @@ class TestR14CBackpressureThresholdThreading:
     def test_default_carried_when_unset(self, mocker) -> None:
         """Unset → default (1000) carried on the scheduler."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings()
         scheduler = BackendScheduler.from_settings(settings)
@@ -325,8 +331,8 @@ class TestR14CPopRateWindowThreading:
     def test_custom_value_threaded_to_queue(self, mocker) -> None:
         """Set ``=30.0`` → constructed ``BackendQueue._pop_rate_window_s == 30.0``."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings(monitor_pop_rate_window_s=30.0)
         scheduler = BackendScheduler.from_settings(settings)
@@ -336,8 +342,8 @@ class TestR14CPopRateWindowThreading:
     def test_custom_value_carried_on_scheduler(self, mocker) -> None:
         """Set ``=30.0`` → ``scheduler._monitor_pop_rate_window_s == 30.0``."""
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings(monitor_pop_rate_window_s=30.0)
         scheduler = BackendScheduler.from_settings(settings)
@@ -347,8 +353,8 @@ class TestR14CPopRateWindowThreading:
 class TestSnapshotOwnerThreading:
     def test_explicit_snapshot_owner_reaches_backend_queue(self, mocker) -> None:
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings(snapshot_owner="worker-a")
 
@@ -361,8 +367,8 @@ class TestSnapshotOwnerThreading:
 
     def test_worker_id_is_snapshot_owner_fallback(self, mocker) -> None:
         mocker.patch(
-            "scrapy_extension.schedule.scheduler.ConnectionManager.get_manager",
-            return_value=mocker.Mock(),
+            "scrapy_extension.schedule.scheduler.ConnectionManager.acquire_lease",
+            return_value=_lease(mocker, mocker.Mock()),
         )
         settings = _make_settings()
         original_get = settings.get.side_effect
