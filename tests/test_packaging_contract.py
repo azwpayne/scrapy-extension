@@ -18,6 +18,7 @@ _REQUIRED_SOURCE_ENTRIES = {
 }
 _REQUIRED_EXCLUDES = {
     "**/.coverage.*",
+    "./.cache/**",
     "**/.pytest_cache/**",
     "**/*.log",
     "**/*.sqlite3",

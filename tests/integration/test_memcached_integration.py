@@ -16,7 +16,8 @@ Skipped by default. To run, point at a memcached you don't mind throwaway
 ``inttest:*`` keys landing in::
 
     SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_MEMCACHED_HOST=localhost \
-      uv run pytest tests/integration/test_memcached_integration.py -q --force-enable-socket
+      uv run --no-sync pytest tests/integration/test_memcached_integration.py -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 For a non-loopback test server, also set
 ``SCRAPY_TEST_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=1`` to acknowledge that the

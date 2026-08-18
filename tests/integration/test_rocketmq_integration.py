@@ -39,7 +39,8 @@ with ``--enable-proxy``, which serves gRPC on 8081). The apache
 legacy remoting port (10911)::
 
     SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_ROCKETMQ_NAMESRV=localhost:8081 \
-      uv run pytest tests/integration -q --force-enable-socket
+      uv run --no-sync pytest tests/integration -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 Each test uses a UUID-suffixed topic so concurrent runs and leftover data
 can't interfere. Consumer/producer groups are unique per module run.

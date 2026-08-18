@@ -65,6 +65,17 @@ pip install scrapy-extension[all]             # All backends
 
 Backends are loaded lazily via PEP 562 — the core package works without any backend deps installed. Backend-specific dependencies are only loaded when a backend class is first accessed.
 
+### Distribution artifact contents
+
+The wheel is the minimal runtime artifact: it contains the importable
+`scrapy_extension` package, `py.typed`, and distribution metadata/license
+files. The source distribution is intentionally self-contained for downstream
+verification: in addition to the runtime sources it carries the root README and
+license, user docs, examples, tests, root `conftest.py`, `uv.lock`, and the CI
+workflows those tests inspect. CI installs both artifacts and runs a locked test
+subset from an extracted sdist; docs, examples, and tests are not copied into
+the wheel.
+
 ## Quick Start
 
 This example uses Redis for scheduling, duplicate filtering, and item storage.
@@ -457,7 +468,7 @@ HTTPS validation. Botocore FIPS/dual-stack endpoint selection remains
 available when the SQS endpoint is unset. A custom
 `boto3.setup_default_session(...)` or event hook attached only to that global
 Session is intentionally not inherited; see the
-[migration guide](docs/migration-guide.md#sqs-private-boto3-sessions).
+[migration guide](https://github.com/azwpayne/scrapy-extension/blob/main/docs/migration-guide.md#sqs-private-boto3-sessions).
 
 ### Memcached (standalone, NoSQL KV)
 
@@ -1061,7 +1072,7 @@ uv run pytest --cov=scrapy_extension --cov-report=term-missing \
 uv run poe test
 ```
 
-Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov, pytest-timeout, and pytest-socket (the default suite runs with sockets disabled). CI emits `coverage.json` and independently requires at least 95% statement coverage and 91% branch coverage; it does not report a misleading blended floor. Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and `--force-enable-socket`.
+Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov, pytest-timeout, and pytest-socket (the default suite runs with sockets disabled). CI emits `coverage.json` and independently requires at least 95% statement coverage and 91% branch coverage; it does not report a misleading blended floor. Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and an explicit loopback boundary, for example `uv run --no-sync pytest tests/integration -m integration --allow-hosts=localhost,127.0.0.1,::1`.
 
 ## License
 

@@ -16,7 +16,8 @@ Running
 Skipped by default. Point at a Pulsar broker via service_url::
 
     SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_PULSAR_URL=pulsar://localhost:6650 \
-      uv run pytest tests/integration/test_pulsar_integration.py -q --force-enable-socket
+      uv run --no-sync pytest tests/integration/test_pulsar_integration.py -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 The test uses a UUID-prefixed topic so concurrent runs don't interfere.
 """

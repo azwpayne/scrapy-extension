@@ -16,7 +16,8 @@ Running
 Skipped by default. Point at LocalStack (or real AWS) via endpoint_url::
 
     SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_SQS_ENDPOINT=http://localhost:4566 \
-      uv run pytest tests/integration/test_sqs_integration.py -q --force-enable-socket
+      uv run --no-sync pytest tests/integration/test_sqs_integration.py -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 The test uses a UUID-prefixed queue name so concurrent runs don't interfere.
 """

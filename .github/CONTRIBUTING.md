@@ -26,7 +26,7 @@ uv run pytest tests/test_backends.py            # one file
 uv run pytest tests/test_backends.py::TestRedisBackend::test_connect_success -v  # one test
 ```
 
-The unit suite is mock-based (no live backends needed). Pytest runs with `--disable-socket` by default so unit tests cannot accidentally open real network connections; integration tests must opt back in with `--force-enable-socket`.
+The unit suite is mock-based (no live backends needed). Pytest runs with `--disable-socket` by default so unit tests cannot accidentally open real network connections. Integration runs must keep that boundary and explicitly allow only the loopback brokers with `--allow-hosts=localhost,127.0.0.1,::1`, as shown below.
 
 ### Integration tests (require live backends)
 

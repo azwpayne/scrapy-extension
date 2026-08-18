@@ -41,7 +41,8 @@ Skipped by default. Point at a Kafka broker you don't mind ``scrapy-inttest-*``
 topics landing in::
 
     SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_KAFKA_BOOTSTRAP=localhost:9092 \
-      uv run pytest tests/integration -q --force-enable-socket
+      uv run --no-sync pytest tests/integration -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 Each test uses a UUID-prefixed topic name (Kafka topics are
 ``scrapy-{queue_name}``) so concurrent runs and leftover data can't interfere.

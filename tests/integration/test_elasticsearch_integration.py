@@ -31,7 +31,8 @@ Skipped by default. Point at an ES you don't mind ``inttest:*`` docs landing
 in::
 
     SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_ES_HOSTS=http://localhost:9200 \
-      uv run pytest tests/integration -q --force-enable-socket
+      uv run --no-sync pytest tests/integration -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 Each test uses a UUID-prefixed logical-name namespace (queue_name / set_name
 / key) so concurrent runs and leftover data can't interfere.

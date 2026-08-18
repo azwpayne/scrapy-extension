@@ -55,6 +55,37 @@ jobs:
         # limits impact to Scrapy <=2.15.2. The lock uses 2.17.0; keep this
         # exception exact so every other present or future advisory fails CI.
         run: uv audit --locked --ignore PYSEC-2017-83
+      - name: Discover and import examples without starting a crawl
+        if: matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          set -euo pipefail
+          spiders=$(cd examples && uv run --no-sync scrapy list)
+          diff -u \
+            <(printf '%s\n' quotes quotes_connection_manager quotes_crawl \
+              quotes_elasticsearch quotes_kafka quotes_mongodb quotes_multi_mode \
+              quotes_programmatic quotes_rabbitmq quotes_redis) \
+            <(printf '%s\n' "$spiders")
+          uv run --no-sync python - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("examples").resolve()))
+          import examples
+
+          modules = sorted(
+              module.name
+              for module in pkgutil.walk_packages(
+                  examples.__path__, examples.__name__ + "."
+              )
+          )
+          assert modules
+          for module in modules:
+              importlib.import_module(module)
+          print(f"imported {len(modules)} example modules without broker I/O")
+          PY
       - name: Pytest xdist/benchmark compatibility canary
         if: matrix.python-version == '3.10'
         run: >-
@@ -132,11 +163,15 @@ jobs:
             uv.lock \
             .github/workflows/ci.yml \
             .github/workflows/codeql.yml \
+            examples/README.md \
+            examples/scrapy.cfg \
             tests/test_packaging_contract.py; do
             grep -Fqx "$required" <<<"$sdist_contents"
           done
           wheel_contents=$(unzip -Z1 "${wheels[0]}")
           grep -Fqx 'scrapy_extension/py.typed' <<<"$wheel_contents"
+          grep -Eq '^scrapy_extension-[^/]+\.dist-info/METADATA$' <<<"$wheel_contents"
+          grep -Eq '^scrapy_extension-[^/]+\.dist-info/licenses/LICENSE$' <<<"$wheel_contents"
           if grep -Eq '(^|/)(tests|examples|docs|conftest\.py|uv\.lock)(/|$)' <<<"$wheel_contents"; then
             echo "Wheel contains source-only test or documentation files" >&2
             exit 1

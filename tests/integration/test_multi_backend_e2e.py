@@ -27,7 +27,8 @@ mind a few throwaway ``inttest:*`` keys landing in::
     SCRAPY_TEST_REDIS_URL=redis://localhost:6379/0 \
     SCRAPY_TEST_MONGODB_URI=mongodb://localhost:27017 \
     SCRAPY_TEST_ES_HOSTS=http://localhost:9200 \
-      uv run pytest tests/integration/test_multi_backend_e2e.py -q --force-enable-socket
+      uv run --no-sync pytest tests/integration/test_multi_backend_e2e.py -q \\
+        --allow-hosts=localhost,127.0.0.1,::1
 
 Env var names mirror the per-backend integration suites
 (``test_redis_integration.py`` / ``test_mongodb_integration.py`` /

@@ -159,7 +159,9 @@ source-exclude = [
     "**/.coverage",
     "**/.coverage.*",
     "**/.benchmarks/**",
-    "**/.cache/**",
+    # Keep this project-rooted: isolated uv_build extracts the sdist below its
+    # own ~/.cache path, so **/.cache/** would exclude the wheel payload itself.
+    "./.cache/**",
     "**/.hypothesis/**",
     "**/.mypy_cache/**",
     "**/.pytest_cache/**",

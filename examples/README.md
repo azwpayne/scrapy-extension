@@ -19,8 +19,8 @@ uv sync
 docker run -d --name scrapy-redis -p 127.0.0.1:6379:6379 redis:7-alpine
 
 cd examples
-scrapy list
-scrapy crawl quotes_redis
+uv run --no-sync scrapy list
+uv run --no-sync scrapy crawl quotes_redis
 ```
 
 > **Local development only:** The Docker commands in this guide bind services
@@ -102,7 +102,7 @@ backend, but it does not deduplicate across workers.
 ## Redis (`quotes_redis`)
 
 ```bash
-scrapy crawl quotes_redis
+uv run --no-sync scrapy crawl quotes_redis
 ```
 
 Common settings:
@@ -166,7 +166,7 @@ class QuotesRedisSpider(QuotesParsingMixin, BackendSpiderMixin, scrapy.Spider):
 
 ```bash
 docker run -d --name scrapy-mongo -p 127.0.0.1:27017:27017 mongo:7
-scrapy crawl quotes_mongodb
+uv run --no-sync scrapy crawl quotes_mongodb
 ```
 
 The spider's `custom_settings` sets `SCRAPY_BACKEND_TYPE=mongodb`, so Queue,
@@ -202,7 +202,7 @@ Kafka is queue-only. The example selects Kafka only for the queue and uses
 Redis for Set and Storage:
 
 ```bash
-scrapy crawl quotes_kafka
+uv run --no-sync scrapy crawl quotes_kafka
 ```
 
 ```python
@@ -232,7 +232,7 @@ RabbitMQ is queue-only. The example uses its queue with Redis Set/Storage:
 
 ```bash
 docker run -d --name scrapy-rabbit -p 127.0.0.1:5672:5672 -p 127.0.0.1:15672:15672 rabbitmq:3-management
-scrapy crawl quotes_rabbitmq
+uv run --no-sync scrapy crawl quotes_rabbitmq
 ```
 
 Use a credential-free URL plus the required username/password fields:
@@ -288,7 +288,7 @@ docker run -d --name scrapy-elastic -p 127.0.0.1:9200:9200 \
   -e discovery.type=single-node \
   -e xpack.security.enabled=false \
   docker.elastic.co/elasticsearch/elasticsearch:9.4.1
-scrapy crawl quotes_elasticsearch
+uv run --no-sync scrapy crawl quotes_elasticsearch
 ```
 
 ```python
@@ -353,8 +353,8 @@ portable isolation for Cluster deployments.
 The example selects Sentinel by default and Cluster when requested:
 
 ```bash
-SCRAPY_EXAMPLE_REDIS_MODE=sentinel scrapy crawl quotes_multi_mode
-SCRAPY_EXAMPLE_REDIS_MODE=cluster scrapy crawl quotes_multi_mode
+SCRAPY_EXAMPLE_REDIS_MODE=sentinel uv run --no-sync scrapy crawl quotes_multi_mode
+SCRAPY_EXAMPLE_REDIS_MODE=cluster uv run --no-sync scrapy crawl quotes_multi_mode
 ```
 
 Its selected dictionary is applied both to the mixin and to
@@ -394,8 +394,8 @@ again.
 `quotes` and `quotes_crawl` override the example project's global components:
 
 ```bash
-scrapy crawl quotes -O quotes.json
-scrapy crawl quotes_crawl -O quotes-crawl.json
+uv run --no-sync scrapy crawl quotes -O quotes.json
+uv run --no-sync scrapy crawl quotes_crawl -O quotes-crawl.json
 ```
 
 They use Scrapy's standard scheduler and `RFPDupeFilter` and disable the
@@ -411,7 +411,8 @@ Scrapy values have higher precedence. Override them with Scrapy's command-line
 priority, for example:
 
 ```bash
-scrapy crawl quotes_redis -s SCRAPY_REDIS_NAMESPACE=one-off-test
+uv run --no-sync scrapy crawl quotes_redis \
+  -s SCRAPY_REDIS_NAMESPACE=one-off-test
 ```
 
 **Queue-only backend fails capability validation**
@@ -439,5 +440,5 @@ Run commands from the example Scrapy project:
 
 ```bash
 cd examples
-scrapy list
+uv run --no-sync scrapy list
 ```

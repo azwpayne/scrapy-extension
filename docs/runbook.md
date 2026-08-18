@@ -764,10 +764,11 @@ exist; this is the canonical procedure until it lands):
 2. **Sync lockfile:** `uv lock` (verify `uv lock --check` passes).
 3. **Update CHANGELOG:** move the [`Unreleased`](../.github/CHANGELOG.md) entries
    into a new `## [X.Y.Z] — YYYY-MM-DD` section.
-4. **Verify source and artifacts before publication:** run `uv run ruff check`,
-   `uv run pytest -m "not integration"`, and
-   `uv run pytest --cov=scrapy_extension --cov-report=term-missing` (fails below
-   95%), then run `uv build --clear`. In the release shell, select exactly one
+4. **Verify source and artifacts before publication:** run `uv run --no-sync ruff check`,
+   `uv run --no-sync pytest -m "not integration"`, and
+   `uv run --no-sync pytest --cov=scrapy_extension --cov-report=term-missing
+   --cov-report=json:coverage.json`, then independently verify the 95% statement
+   and 91% branch floors before running `uv build --clear`. In the release shell, select exactly one
    wheel and sdist and record their hashes; retain these variables through
    publication:
 
@@ -781,12 +782,16 @@ exist; this is the canonical procedure until it lands):
 
    In fresh virtual environments, install those exact `$wheel` and `$sdist`
    artifacts and import the package + one backend. Confirm `__version__` is
-   `X.Y.Z`; inspect each artifact for `py.typed`, public docs, and examples, and
-   confirm `.omc`, local `*.db`, ignored scratch plans, credentials, and editor
-   state are absent. Render the wheel `METADATA` description and verify every
+   `X.Y.Z`. The wheel must contain only the runtime package (including
+   `py.typed`) and distribution metadata/license; the sdist must additionally
+   contain the root README/license, public docs, examples, tests, root
+   `conftest.py`, `uv.lock`, and workflow files. Confirm `.omc`, local databases,
+   coverage/cache output, archived audits, credentials, and editor state are
+   absent from both. Render the wheel `METADATA` description and verify every
    non-anchor README link is an absolute web URL. For live backends, set
-   `SCRAPY_TEST_INTEGRATION=1`, the relevant `SCRAPY_TEST_*` variables, and pass
-   `--force-enable-socket`.
+   `SCRAPY_TEST_INTEGRATION=1`, the relevant `SCRAPY_TEST_*` variables, and keep
+   socket access loopback-only with
+   `--allow-hosts=localhost,127.0.0.1,::1`.
 5. **Tag:** `git tag vX.Y.Z` and push the tag after all verification succeeds.
 6. **Publish the verified artifacts:** immediately re-check the recorded hashes
    and publish only the recorded paths: `shasum -a 256 -c dist/SHA256SUMS && uv
