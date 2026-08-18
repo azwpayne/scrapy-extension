@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from urllib.parse import unquote
 from collections.abc import Callable
 from typing import Any, ClassVar
+from urllib.parse import unquote
 
 import pytest
 from elastic_transport import ApiResponseMeta, BaseNode, HttpHeaders, NodeConfig
 from elastic_transport import ConnectionError as ElasticConnectionError
 from elastic_transport._node import NodeApiResponse
 from elasticsearch import Elasticsearch, RequestError
+from hypothesis import example, given, seed, settings
+from hypothesis import strategies as st
 
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import (
@@ -30,12 +32,14 @@ class _RetryProbeNode(BaseNode):
 
     calls: ClassVar[Counter[str]] = Counter()
     failures_remaining: ClassVar[Counter[str]] = Counter()
+    malformed_remaining: ClassVar[Counter[str]] = Counter()
     close_calls: ClassVar[int] = 0
 
     @classmethod
     def reset(cls, **failures: int) -> None:
         cls.calls = Counter()
         cls.failures_remaining = Counter(failures)
+        cls.malformed_remaining = Counter()
         cls.close_calls = 0
 
     def close(self) -> None:
@@ -120,6 +124,10 @@ class _RetryProbeNode(BaseNode):
             status = 200
         else:  # pragma: no cover - an unexpected SDK path should be obvious
             raise AssertionError(f"unexpected transport request: {operation}")
+
+        if type(self).malformed_remaining[operation] > 0:
+            type(self).malformed_remaining[operation] -= 1
+            response["_id"] = "ack-for-another-document"
 
         meta = ApiResponseMeta(
             status=status,
@@ -210,6 +218,51 @@ def test_mutation_view_has_fixed_no_replay_options_and_shares_root_transport() -
             assert generation.mutation_client._max_retries == 0
             assert generation.mutation_client._retry_on_timeout is False
             assert generation.mutation_client._retry_on_status == ()
+    finally:
+        backend.disconnect()
+
+
+@seed(0xE5A11C)
+@settings(max_examples=40, deadline=None)
+@example(["success", "response-loss", "turnover", "malformed-ack"])
+@given(
+    st.lists(
+        st.sampled_from(("success", "response-loss", "malformed-ack", "turnover")),
+        min_size=1,
+        max_size=24,
+    )
+)
+def test_seeded_mutation_outcome_model_preserves_single_transport_attempt(
+    actions: list[str],
+) -> None:
+    """Randomized generation and outcome sequences never replay a mutation."""
+    _RetryProbeNode.reset()
+    backend, _root = _transport_backend()
+    mutation_number = 0
+    try:
+        for action in actions:
+            if action == "turnover":
+                backend.disconnect()
+                backend, _root = _transport_backend()
+                continue
+
+            before = _RetryProbeNode.calls["index"]
+            if action == "response-loss":
+                _RetryProbeNode.failures_remaining["index"] += 1
+            elif action == "malformed-ack":
+                _RetryProbeNode.malformed_remaining["index"] += 1
+
+            call = lambda backend=backend, mutation_number=mutation_number: (
+                backend.store(f"model-key-{mutation_number}", b"payload")
+            )
+            if action in {"response-loss", "malformed-ack"}:
+                with pytest.raises(StorageOutcomeIndeterminateError):
+                    call()
+            else:
+                call()
+
+            assert _RetryProbeNode.calls["index"] - before == 1
+            mutation_number += 1
     finally:
         backend.disconnect()
 
