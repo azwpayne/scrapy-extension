@@ -951,6 +951,45 @@ def test_disconnect_preserves_pump_close_control_after_bookkeeping(
     consumer.close.assert_called_once_with()
 
 
+def test_disconnect_fences_retirement_control_outcome_after_deadline(
+    mocker: Any,
+) -> None:
+    """A close outcome published after the shared deadline is never selected."""
+    close_started = Event()
+    release_close = Event()
+    control_error = KeyboardInterrupt("late retirement control marker")
+    consumer = MagicMock(name="late-retirement-control-consumer")
+    consumer.receive.side_effect = pulsar.Timeout("empty")
+
+    def late_control_close() -> None:
+        close_started.set()
+        release_close.wait(timeout=2.0)
+        raise control_error
+
+    consumer.close.side_effect = late_control_close
+    backend = _connected_backend(mocker, [consumer])
+    backend._receive_shutdown_timeout = 0.05
+
+    assert backend.pop("late-retirement-control", timeout=0) is None
+    pump = backend._receive_pumps["scrapy-late-retirement-control"]
+    assert pump.receive_started.wait(timeout=0.5)
+
+    # Teardown reaches its shared deadline while close is still blocked. The
+    # retirement result fence is closed before disconnect returns.
+    backend.disconnect()
+    retirement = pump.retirement
+    assert retirement is not None
+    assert close_started.is_set()
+    assert retirement.accepting_outcome is False
+    assert retirement.outcome_completed is False
+
+    release_close.set()
+    assert retirement.completed.wait(timeout=0.5)
+    assert retirement.control_error is None
+    assert retirement.outcome_completed is False
+    consumer.close.assert_called_once_with()
+
+
 def test_disconnect_is_bounded_when_close_does_not_interrupt_receive(
     mocker: Any,
 ) -> None:

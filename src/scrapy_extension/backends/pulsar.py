@@ -249,7 +249,16 @@ class _PulsarConsumerRetirement:
     started: Event = field(default_factory=Event)
     completed: Event = field(default_factory=Event)
     worker: Thread | None = None
+    outcome_lock: Lock = field(default_factory=Lock)
+    accepting_outcome: bool = True
+    outcome_completed: bool = False
     control_error: BaseException | None = None
+
+    def fence_and_collect(self) -> tuple[bool, BaseException | None]:
+        """Stop late result publication and return the admitted close outcome."""
+        with self.outcome_lock:
+            self.accepting_outcome = False
+            return self.outcome_completed, self.control_error
 
 
 @dataclass
@@ -716,7 +725,9 @@ class PulsarBackend(Backend, QueueBackend):
         # handled. The normal failure path logs after this helper returns.
         cleanup_failure_count = len(close_errors) + close_timeout_count
         for retirement in abort_retirements:
-            if not retirement.completed.wait(max(0.0, teardown_deadline - monotonic())):
+            retirement.completed.wait(max(0.0, teardown_deadline - monotonic()))
+            completed, _control_error = retirement.fence_and_collect()
+            if not completed:
                 cleanup_failure_count += 1
                 self._log_close_shutdown_timeout()
         for pump in pumps:
@@ -795,9 +806,14 @@ class PulsarBackend(Backend, QueueBackend):
         except BaseException as error:
             close_error = error
 
+        retirement_errors: list[BaseException] = []
         for retirement in disconnect_retirements:
-            if not retirement.completed.wait(max(0.0, teardown_deadline - monotonic())):
+            retirement.completed.wait(max(0.0, teardown_deadline - monotonic()))
+            completed, outcome_error = retirement.fence_and_collect()
+            if not completed:
                 self._log_close_shutdown_timeout()
+            elif outcome_error is not None:
+                retirement_errors.append(outcome_error)
 
         join_error: BaseException | None = None
         for pump in pumps:
@@ -813,14 +829,7 @@ class PulsarBackend(Backend, QueueBackend):
             # These records were received but never returned. Dropping only the
             # local references (without ACK/NACK) leaves them for broker redelivery.
             pump.discard_buffered()
-        retirement_error = next(
-            (
-                retirement.control_error
-                for retirement in disconnect_retirements
-                if retirement.control_error is not None
-            ),
-            None,
-        )
+        retirement_error = retirement_errors[0] if retirement_errors else None
         terminal_error = close_error or retirement_error or join_error
         if terminal_error is not None:
             # Raise only after every pump buffer and detached handle has completed
@@ -1364,9 +1373,15 @@ class PulsarBackend(Backend, QueueBackend):
             return False
 
     def _finish_consumer_retirement(
-        self, retirement: _PulsarConsumerRetirement
+        self,
+        retirement: _PulsarConsumerRetirement,
+        control_error: BaseException | None = None,
     ) -> None:
-        """Release a topic fence only after its consumer can no longer be live."""
+        """Publish an admitted outcome, then release a no-longer-live topic fence."""
+        with retirement.outcome_lock:
+            if retirement.accepting_outcome:
+                retirement.control_error = control_error
+                retirement.outcome_completed = True
         retirement.completed.set()
         try:
             with self._lifecycle_lock:
@@ -1381,6 +1396,7 @@ class PulsarBackend(Backend, QueueBackend):
         """Close one consumer and release its replacement fence after close exits."""
         retirement.started.set()
         ordinary_failure = False
+        control_error: BaseException | None = None
         try:
             retirement.consumer.close()
         except Exception:
@@ -1390,11 +1406,11 @@ class PulsarBackend(Backend, QueueBackend):
             # Disconnect preserves process control after all sibling teardown.
             # Failed-connect abort and terminal receive paths retain their existing
             # primary errors and intentionally do not consume this stored outcome.
-            retirement.control_error = error
+            control_error = error
         finally:
             if ordinary_failure:
                 _log_suppressed_cleanup_error()
-            self._finish_consumer_retirement(retirement)
+            self._finish_consumer_retirement(retirement, control_error)
 
     def _close_stale_pump_candidate(
         self, pump: _PulsarReceivePump, candidate: Any
