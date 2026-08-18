@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import logging
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
@@ -172,6 +173,14 @@ class _ElasticSearchConnectionSnapshot:
     storage_index: str
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _ElasticSearchGeneration:
+    """One atomically published Elasticsearch client and immutable snapshot."""
+
+    client: Elasticsearch
+    snapshot: _ElasticSearchConnectionSnapshot
+
+
 def _b64encode(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -222,12 +231,18 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             config: Configuration for ElasticSearch connection.
         """
         self.config = config
+        self._lifecycle_lock = threading.RLock()
+        self._generation_condition = threading.Condition()
+        self._lease_local = threading.local()
+        self._lifecycle_epoch = 0
+        self._disconnecting = False
+        self._disconnect_owner: int | None = None
+        self._generation: _ElasticSearchGeneration | None = None
+        self._active_leases = 0
+        # Compatibility mirrors for diagnostics and older private test injection.
+        # Internal operations use only the authoritative leased generation.
         self._client: Elasticsearch | None = None
         self._connection_snapshot: _ElasticSearchConnectionSnapshot | None = None
-        # A client generation is published only after its health check and index
-        # setup complete.  Serializing connect/disconnect prevents a second caller
-        # from replacing (or closing) an in-flight candidate.
-        self._lifecycle_lock = threading.RLock()
 
     @configuration_error_boundary(
         "Elasticsearch configuration is invalid.",
@@ -288,14 +303,18 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         )
 
     def _active_snapshot(self) -> _ElasticSearchConnectionSnapshot:
-        """Return the immutable configuration belonging to the live client."""
-        snapshot = self._connection_snapshot
+        """Return the current snapshot for compatibility diagnostics only."""
+        with self._generation_condition:
+            if self._generation is not None:
+                return self._generation.snapshot
+            snapshot = self._connection_snapshot
         if snapshot is None:
-            # Preserve compatibility for integrations that supplied a test/dummy
-            # client through the formerly public private attribute.  A real
-            # ``connect`` always publishes the snapshot before the client.
             snapshot = self._capture_connection_snapshot()
-            self._connection_snapshot = snapshot
+            with self._generation_condition:
+                if self._connection_snapshot is None:
+                    self._connection_snapshot = snapshot
+                else:
+                    snapshot = self._connection_snapshot
         return snapshot
 
     def _build_kwargs(
@@ -333,16 +352,46 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         catch_unexpected=False,
     )
     def connect(self) -> None:
-        """Establish connection to ElasticSearch.
+        """Privately build and atomically publish one client generation."""
+        current_thread = threading.get_ident()
+        with self._generation_condition:
+            if self._disconnect_owner == current_thread:
+                raise BackendConnectionError(
+                    "Cannot connect to Elasticsearch re-entrantly during disconnect.",
+                    backend_type="elasticsearch",
+                )
+            while self._disconnecting:
+                if int(getattr(self._lease_local, "depth", 0)):
+                    raise BackendConnectionError(
+                        "Cannot connect to Elasticsearch during an active operation.",
+                        backend_type="elasticsearch",
+                    )
+                self._generation_condition.wait()
+            if self._generation is not None:
+                return
 
-        Raises:
-            BackendConnectionError: If the connection cannot be established.
-        """
         with self._lifecycle_lock:
-            # The live generation's snapshot is deliberately fixed until callers
-            # explicitly disconnect.  Repeated connects are therefore no-ops rather
-            # than a competing replacement generation.
-            if self._client is not None:
+            with self._generation_condition:
+                if self._generation is not None:
+                    return
+                if self._disconnecting:
+                    raise BackendConnectionError(
+                        "Cannot connect while Elasticsearch is disconnecting.",
+                        backend_type="elasticsearch",
+                    )
+                injected_client = self._client
+                injected_snapshot = self._connection_snapshot
+
+            # Preserve narrowly scoped compatibility for code that populated the
+            # historical private mirrors. Adopt both into one atomic generation.
+            if injected_client is not None:
+                snapshot = injected_snapshot or self._capture_connection_snapshot()
+                generation = _ElasticSearchGeneration(injected_client, snapshot)
+                with self._generation_condition:
+                    self._generation = generation
+                    self._client = generation.client
+                    self._connection_snapshot = generation.snapshot
+                    self._generation_condition.notify_all()
                 return
 
             snapshot = self._capture_connection_snapshot()
@@ -368,14 +417,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                         backend_type="elasticsearch",
                     )
                 self._ensure_indices(snapshot, client=candidate)
-                # Only a fully initialized candidate becomes observable to other
-                # callers.  A failed candidate is never allowed to disturb a live
-                # generation.
-                self._connection_snapshot = snapshot
-                self._client = candidate
-                # The generation is now live.  Success diagnostics are extension code,
-                # so a handler failure must not make ``connect`` roll back and close a
-                # healthy, published client.
+                generation = _ElasticSearchGeneration(candidate, snapshot)
+                with self._generation_condition:
+                    self._generation = generation
+                    self._client = generation.client
+                    self._connection_snapshot = generation.snapshot
+                    self._generation_condition.notify_all()
                 try:
                     logger.debug(
                         "Connected to ElasticSearch in %s mode", snapshot.mode.value
@@ -389,28 +436,18 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     backend_type="elasticsearch",
                 )
             except Exception:
-                # Unexpected error (e.g. a RuntimeError from a custom transport/SSL plugin)
-                # must roll back a post-publication candidate as well as close it.
                 cleanup_diagnostic_pending = self._abort_failed_connect(candidate)
                 startup_error = BackendConnectionError(
                     f"Connection failed to ElasticSearch ({snapshot.mode.value}).",
                     backend_type="elasticsearch",
                 )
             except BaseException:
-                # Ctrl-C / SystemExit during connect: still close the candidate, then
-                # re-signal. Mirrors mongodb.connect() (BaseException arm).
                 self._abort_failed_connect(candidate)
                 raise
 
             if cleanup_diagnostic_pending:
-                # The driver failure and nested candidate-close interruption have
-                # unwound. Keep the fixed diagnostic outside their exception suites so
-                # a user handler cannot recover either raw exception via ``sys.exc_info``.
                 self._log_failed_connect_cleanup_diagnostic()
-
             if startup_error is not None:
-                # Raise outside the driver exception handler so endpoint/credential
-                # text cannot survive through ``__cause__`` or ``__context__``.
                 raise startup_error
 
     @staticmethod
@@ -433,9 +470,14 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         if candidate is None:
             return False
 
-        if self._client is candidate:
-            self._client = None
-            self._connection_snapshot = None
+        with self._generation_condition:
+            if self._generation is not None and self._generation.client is candidate:
+                self._generation = None
+                self._client = None
+                self._connection_snapshot = None
+            elif self._client is candidate:
+                self._client = None
+                self._connection_snapshot = None
 
         try:
             candidate.close()
@@ -468,10 +510,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                     pass
 
     def _discard_client(self) -> None:
-        """Clear and best-effort close a failed or retired client."""
-        client = self._client
-        self._client = None
-        self._connection_snapshot = None
+        """Detach and best-effort close a compatibility-injected client."""
+        with self._generation_condition:
+            generation = self._generation
+            client = generation.client if generation is not None else self._client
+            self._generation = None
+            self._client = None
+            self._connection_snapshot = None
         self._discard_candidate(client)
 
     def _ensure_indices(
@@ -512,28 +557,165 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 if "resource_already_exists" not in str(e).lower():
                     raise
 
+    @contextlib.contextmanager
+    def _lease_generation(self, operation: str) -> Iterator[_ElasticSearchGeneration]:
+        """Lease one complete generation, lazily connecting in the same epoch."""
+        with self._generation_condition:
+            if self._disconnecting:
+                raise BackendConnectionError(
+                    f"Cannot {operation} while Elasticsearch is disconnecting.",
+                    backend_type="elasticsearch",
+                )
+            generation = self._generation
+            request_epoch = self._lifecycle_epoch
+            if generation is not None:
+                self._active_leases += 1
+                leased = True
+            else:
+                leased = False
+
+        if not leased:
+            # Serialize the epoch check with lifecycle changes. Without this guard,
+            # a pre-disconnect operation could wait behind disconnect, reconnect a
+            # replacement generation after teardown, and then fail its stale check.
+            with self._lifecycle_lock:
+                with self._generation_condition:
+                    if request_epoch != self._lifecycle_epoch or self._disconnecting:
+                        raise BackendConnectionError(
+                            f"Elasticsearch connection changed while starting {operation}.",
+                            backend_type="elasticsearch",
+                        )
+                self.connect()
+            with self._generation_condition:
+                generation = self._generation
+                if (
+                    request_epoch != self._lifecycle_epoch
+                    or self._disconnecting
+                    or generation is None
+                ):
+                    raise BackendConnectionError(
+                        f"Elasticsearch connection changed while starting {operation}.",
+                        backend_type="elasticsearch",
+                    )
+                self._active_leases += 1
+
+        assert generation is not None
+        previous_depth = int(getattr(self._lease_local, "depth", 0))
+        self._lease_local.depth = previous_depth + 1
+        try:
+            yield generation
+        finally:
+            try:
+                with self._generation_condition:
+                    self._active_leases -= 1
+                    if self._active_leases == 0:
+                        self._generation_condition.notify_all()
+            finally:
+                self._lease_local.depth = previous_depth
+
+    @contextlib.contextmanager
+    def _lease_existing_generation(
+        self,
+    ) -> Iterator[_ElasticSearchGeneration | None]:
+        """Lease the current generation for a non-connecting health operation."""
+        with self._generation_condition:
+            generation = None if self._disconnecting else self._generation
+            if (
+                generation is None
+                and not self._disconnecting
+                and self._client is not None
+            ):
+                snapshot = (
+                    self._connection_snapshot or self._capture_connection_snapshot()
+                )
+                generation = _ElasticSearchGeneration(self._client, snapshot)
+                self._generation = generation
+                self._connection_snapshot = snapshot
+            if generation is not None:
+                self._active_leases += 1
+        previous_depth = int(getattr(self._lease_local, "depth", 0))
+        if generation is not None:
+            self._lease_local.depth = previous_depth + 1
+        try:
+            yield generation
+        finally:
+            if generation is not None:
+                try:
+                    with self._generation_condition:
+                        self._active_leases -= 1
+                        if self._active_leases == 0:
+                            self._generation_condition.notify_all()
+                finally:
+                    self._lease_local.depth = previous_depth
+
     def disconnect(self) -> None:
-        """Close ElasticSearch connection."""
+        """Stop admission, drain leases, detach, then close the root client."""
+        if int(getattr(self._lease_local, "depth", 0)):
+            raise BackendConnectionError(
+                "Cannot disconnect Elasticsearch re-entrantly from an active operation.",
+                backend_type="elasticsearch",
+            )
+
+        current_thread = threading.get_ident()
+        pending_interrupt: BaseException | None = None
+        owns_barrier = False
+        generation: _ElasticSearchGeneration | None = None
+        legacy_client: Elasticsearch | None = None
         with self._lifecycle_lock:
-            self._discard_client()
+            try:
+                with self._generation_condition:
+                    if self._disconnect_owner == current_thread:
+                        raise BackendConnectionError(
+                            "Cannot disconnect Elasticsearch re-entrantly.",
+                            backend_type="elasticsearch",
+                        )
+                    owns_barrier = True
+                    self._disconnect_owner = current_thread
+                    self._disconnecting = True
+                    self._lifecycle_epoch += 1
+                    generation = self._generation
+                    legacy_client = self._client
+                    while self._active_leases:
+                        try:
+                            self._generation_condition.wait()
+                        except BaseException as error:
+                            if pending_interrupt is None:
+                                pending_interrupt = error
+                    self._generation = None
+                    self._client = None
+                    self._connection_snapshot = None
+
+                # Closing a driver may execute user/transport callbacks. It must never
+                # happen under the generation state lock.
+                try:
+                    self._discard_candidate(
+                        generation.client if generation is not None else legacy_client
+                    )
+                except BaseException as error:
+                    if pending_interrupt is None:
+                        pending_interrupt = error
+            finally:
+                if owns_barrier:
+                    with self._generation_condition:
+                        self._disconnecting = False
+                        self._disconnect_owner = None
+                        self._generation_condition.notify_all()
+
+        if pending_interrupt is not None:
+            raise pending_interrupt
 
     def is_connected(self) -> bool:
-        """Check if ElasticSearch is connected.
-
-        Returns:
-            True if connected and responding to ping.
-        """
-        try:
-            return bool(self._client.ping()) if self._client is not None else False
-        except Exception:
-            return False
+        """Check the leased current generation without implicitly connecting."""
+        with self._lease_existing_generation() as generation:
+            if generation is None:
+                return False
+            try:
+                return bool(generation.client.ping())
+            except Exception:
+                return False
 
     def ping(self) -> bool:
-        """Check ElasticSearch health.
-
-        Returns:
-            True if ElasticSearch responds to ping.
-        """
+        """Check ElasticSearch health through one operation lease."""
         return self.is_connected()
 
     @property
@@ -555,12 +737,17 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         Raises:
             BackendConnectionError: If the client cannot be initialized.
         """
-        if self._client is None:
-            self.connect()
-        if self._client is None:
+        self.connect()
+        with self._generation_condition:
+            generation = self._generation
+            if generation is not None:
+                return generation.client
+            # Preserve the historical guard for patched/no-op ``connect`` methods.
+            client = self._client
+        if client is None:
             msg = "ElasticSearchBackend not connected: client is None after connect()"
             raise BackendConnectionError(msg, backend_type="elasticsearch")
-        return self._client
+        return client
 
     # ---- Queue ----
 
@@ -597,7 +784,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # 4ms without — see bench_es_push_refresh.py); ES does not batch
             # ``wait_for`` across consecutive pushes, so each one pays the full
             # refresh-interval wait.
-            self.client.index(index=self._active_snapshot().queue_index, document=doc)
+            with self._lease_generation("push") as generation:
+                generation.client.index(
+                    index=generation.snapshot.queue_index, document=doc
+                )
         except (ApiError, TransportError) as e:
             raise QueueError(str(e), queue_name=queue_name, operation="push") from e
 
@@ -631,58 +821,63 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         max_attempts = 3
-        for _attempt in range(max_attempts):
-            try:
-                # Force one refresh before searching so recent pushes AND deletes
-                # from prior pops are visible. Forced ``indices.refresh`` is ms-scale
-                # (just flushes the indexing buffer to a segment) — far cheaper than
-                # the per-push ``refresh="wait_for"`` it replaces (which blocked ~1s
-                # per push). Amortized: N fast pushes + 1 refresh per read.
-                self.client.indices.refresh(index=self._active_snapshot().queue_index)
-                resp = self.client.search(
-                    index=self._active_snapshot().queue_index,
-                    # ``.keyword`` subfield for exact match: the dynamic mapping makes
-                    # ``queue_name`` a ``text`` field (standard analyzer), so a name
-                    # with colons (e.g. ``inttest:<uuid>:queue``) gets tokenized and a
-                    # ``term`` on the analyzed field never matches. Keyword subfield is
-                    # not analyzed → exact term match regardless of punctuation.
-                    query={"term": {"queue_name.keyword": queue_name}},
-                    sort=[{"priority": "asc"}, {"created_at": "asc"}],
-                    size=1,
-                    # ES 8.x omits ``_seq_no`` / ``_primary_term`` from search hits by
-                    # default (7.x included them). The optimistic-locking delete below
-                    # requires both, so request them explicitly — without this the pop
-                    # raises ``KeyError: '_seq_no'`` on every call under ES 8.x.
-                    seq_no_primary_term=True,
-                )
-                hits = resp.get("hits", {}).get("hits", [])
-                if not hits:
-                    return None
-                document_id, sequence_number, primary_term, item = _decode_queue_hit(
-                    hits[0]
-                )
+        with self._lease_generation("pop") as generation:
+            for _attempt in range(max_attempts):
                 try:
-                    # No ``refresh`` on delete — the NEXT pop's pre-search refresh
-                    # (above) flushes this delete, so the search won't re-find the doc.
-                    self.client.delete(
-                        index=self._active_snapshot().queue_index,
-                        id=document_id,
-                        if_seq_no=sequence_number,
-                        if_primary_term=primary_term,
+                    # Force one refresh before searching so recent pushes AND deletes
+                    # from prior pops are visible. Forced ``indices.refresh`` is ms-scale
+                    # (just flushes the indexing buffer to a segment) — far cheaper than
+                    # the per-push ``refresh="wait_for"`` it replaces (which blocked ~1s
+                    # per push). Amortized: N fast pushes + 1 refresh per read.
+                    generation.client.indices.refresh(
+                        index=generation.snapshot.queue_index
                     )
-                except ConflictError:
-                    # Lost the race to another worker — retry to find the next item.
-                    continue
-                return item
-            except NotFoundError:
-                return None
-            except (ApiError, TransportError) as e:
-                # R19-A: catch the broad ApiError (auth/permission/server/query faults),
-                # not just TransportError — every sibling ES hot-path does. A non-NotFound,
-                # non-Conflict ApiError subclass otherwise escapes raw past the QueueError
-                # contract this method's docstring promises. (NotFoundError -> None above;
-                # ConflictError is handled by the inner delete try's `continue`.)
-                raise QueueError(str(e), queue_name=queue_name, operation="pop") from e
+                    resp = generation.client.search(
+                        index=generation.snapshot.queue_index,
+                        # ``.keyword`` subfield for exact match: the dynamic mapping makes
+                        # ``queue_name`` a ``text`` field (standard analyzer), so a name
+                        # with colons (e.g. ``inttest:<uuid>:queue``) gets tokenized and a
+                        # ``term`` on the analyzed field never matches. Keyword subfield is
+                        # not analyzed → exact term match regardless of punctuation.
+                        query={"term": {"queue_name.keyword": queue_name}},
+                        sort=[{"priority": "asc"}, {"created_at": "asc"}],
+                        size=1,
+                        # ES 8.x omits ``_seq_no`` / ``_primary_term`` from search hits by
+                        # default (7.x included them). The optimistic-locking delete below
+                        # requires both, so request them explicitly — without this the pop
+                        # raises ``KeyError: '_seq_no'`` on every call under ES 8.x.
+                        seq_no_primary_term=True,
+                    )
+                    hits = resp.get("hits", {}).get("hits", [])
+                    if not hits:
+                        return None
+                    document_id, sequence_number, primary_term, item = (
+                        _decode_queue_hit(hits[0])
+                    )
+                    try:
+                        # No ``refresh`` on delete — the NEXT pop's pre-search refresh
+                        # (above) flushes this delete, so the search won't re-find the doc.
+                        generation.client.delete(
+                            index=generation.snapshot.queue_index,
+                            id=document_id,
+                            if_seq_no=sequence_number,
+                            if_primary_term=primary_term,
+                        )
+                    except ConflictError:
+                        # Lost the race to another worker — retry to find the next item.
+                        continue
+                    return item
+                except NotFoundError:
+                    return None
+                except (ApiError, TransportError) as e:
+                    # R19-A: catch the broad ApiError (auth/permission/server/query faults),
+                    # not just TransportError — every sibling ES hot-path does. A non-NotFound,
+                    # non-Conflict ApiError subclass otherwise escapes raw past the QueueError
+                    # contract this method's docstring promises. (NotFoundError -> None above;
+                    # ConflictError is handled by the inner delete try's `continue`.)
+                    raise QueueError(
+                        str(e), queue_name=queue_name, operation="pop"
+                    ) from e
         return None
 
     @queue_operation_error_boundary(
@@ -718,9 +913,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         try:
-            return self._count(
-                self._active_snapshot().queue_index, "queue_name", queue_name
-            )
+            with self._lease_generation("queue_len") as generation:
+                return self._count(
+                    generation,
+                    generation.snapshot.queue_index,
+                    "queue_name",
+                    queue_name,
+                )
         except (ApiError, TransportError) as e:
             raise QueueError(
                 str(e), queue_name=queue_name, operation="queue_len"
@@ -744,9 +943,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         try:
-            self._delete_by_term(
-                self._active_snapshot().queue_index, "queue_name", queue_name
-            )
+            with self._lease_generation("clear_queue") as generation:
+                self._delete_by_term(
+                    generation,
+                    generation.snapshot.queue_index,
+                    "queue_name",
+                    queue_name,
+                )
         except (ApiError, TransportError) as e:
             msg = f"Failed to clear ElasticSearch queue {queue_name!r}: {e}"
             raise QueueError(msg, queue_name=queue_name, operation="clear_queue") from e
@@ -802,12 +1005,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # No ``refresh`` on write — ``contains`` is by-id (immediately
             # consistent); ``set_len`` refreshes in ``_count``. Same amortized
             # read-refresh rationale as push.
-            self.client.index(
-                index=self._active_snapshot().set_index,
-                id=doc_id,
-                document=doc,
-                op_type="create",
-            )
+            with self._lease_generation("add") as generation:
+                generation.client.index(
+                    index=generation.snapshot.set_index,
+                    id=doc_id,
+                    document=doc,
+                    op_type="create",
+                )
         except ConflictError:
             return False
         except RequestError as e:
@@ -862,9 +1066,12 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         try:
-            return self._delete_by_id(
-                self._active_snapshot().set_index, self._set_doc_id(set_name, item)
-            )
+            with self._lease_generation("remove") as generation:
+                return self._delete_by_id_on_generation(
+                    generation,
+                    generation.snapshot.set_index,
+                    self._set_doc_id(set_name, item),
+                )
         except TransportError as e:
             raise BackendConnectionError(
                 f"ElasticSearch set remove failed for {set_name!r}: {e}",
@@ -903,10 +1110,11 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         try:
-            response = self.client.exists(
-                index=self._active_snapshot().set_index,
-                id=self._set_doc_id(set_name, item),
-            )
+            with self._lease_generation("contains") as generation:
+                response = generation.client.exists(
+                    index=generation.snapshot.set_index,
+                    id=self._set_doc_id(set_name, item),
+                )
         except TransportError as e:
             raise BackendConnectionError(
                 f"ElasticSearch set contains failed for {set_name!r}: {e}",
@@ -945,7 +1153,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         try:
-            return self._count(self._active_snapshot().set_index, "set_name", set_name)
+            with self._lease_generation("set_len") as generation:
+                return self._count(
+                    generation, generation.snapshot.set_index, "set_name", set_name
+                )
         except TransportError as e:
             raise BackendConnectionError(
                 f"ElasticSearch set length failed for {set_name!r}: {e}",
@@ -981,9 +1192,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(set_name, "set_name")
         try:
-            self._delete_by_term(
-                self._active_snapshot().set_index, "set_name", set_name
-            )
+            with self._lease_generation("clear_set") as generation:
+                self._delete_by_term(
+                    generation, generation.snapshot.set_index, "set_name", set_name
+                )
         except TransportError as e:
             raise BackendConnectionError(
                 f"ElasticSearch set clear failed for {set_name!r}: {e}",
@@ -1023,9 +1235,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 datetime.now(tz=timezone.utc) + timedelta(seconds=ttl)
             ).isoformat()
         try:
-            self.client.index(
-                index=self._active_snapshot().storage_index, id=key, document=doc
-            )
+            with self._lease_generation("store") as generation:
+                generation.client.index(
+                    index=generation.snapshot.storage_index, id=key, document=doc
+                )
         except (ApiError, TransportError) as e:
             msg = f"Failed to store key {key!r} in ElasticSearch: {e}"
             raise StorageError(msg, operation="store", key=key) from e
@@ -1088,7 +1301,13 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 key=key,
             ) from e
 
-    def _lazy_reap_if_expired(self, response: Any, key: str, operation: str) -> bool:
+    def _lazy_reap_if_expired(
+        self,
+        generation: _ElasticSearchGeneration,
+        response: Any,
+        key: str,
+        operation: str,
+    ) -> bool:
         """R-esttl: lazy-reap an expired storage doc; return True if expired.
 
         Best-effort delete so the index does not accumulate dead docs (ES has no
@@ -1118,8 +1337,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             return True
         reap_failed = False
         try:
-            self.client.delete(
-                index=self._active_snapshot().storage_index,
+            generation.client.delete(
+                index=generation.snapshot.storage_index,
                 id=key,
                 if_seq_no=seq_no,
                 if_primary_term=primary_term,
@@ -1166,16 +1385,20 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         try:
-            resp = self.client.get(index=self._active_snapshot().storage_index, id=key)
-        except NotFoundError:
-            return None
+            with self._lease_generation("retrieve") as generation:
+                try:
+                    resp = generation.client.get(
+                        index=generation.snapshot.storage_index, id=key
+                    )
+                except NotFoundError:
+                    return None
+                source = self._storage_source(resp, key, "retrieve")
+                if self._lazy_reap_if_expired(generation, resp, key, "retrieve"):
+                    return None
+                return self._storage_data(source, key)
         except (ApiError, TransportError) as e:
             msg = f"Failed to retrieve key {key!r} from ElasticSearch: {e}"
             raise StorageError(msg, operation="retrieve", key=key) from e
-        source = self._storage_source(resp, key, "retrieve")
-        if self._lazy_reap_if_expired(resp, key, "retrieve"):
-            return None
-        return self._storage_data(source, key)
 
     @storage_operation_error_boundary(
         "delete",
@@ -1198,7 +1421,10 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         try:
-            return self._delete_by_id(self._active_snapshot().storage_index, key)
+            with self._lease_generation("delete") as generation:
+                return self._delete_by_id_on_generation(
+                    generation, generation.snapshot.storage_index, key
+                )
         except (ApiError, TransportError) as e:
             msg = f"Failed to delete key {key!r} from ElasticSearch: {e}"
             raise StorageError(msg, operation="delete", key=key) from e
@@ -1230,15 +1456,19 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         try:
-            resp = self.client.get(index=self._active_snapshot().storage_index, id=key)
-        except NotFoundError:
-            return False
+            with self._lease_generation("exists") as generation:
+                try:
+                    resp = generation.client.get(
+                        index=generation.snapshot.storage_index, id=key
+                    )
+                except NotFoundError:
+                    return False
+                if self._lazy_reap_if_expired(generation, resp, key, "exists"):
+                    return False
+                return True
         except (ApiError, TransportError) as e:
             msg = f"Failed to check existence of key {key!r} in ElasticSearch: {e}"
             raise StorageError(msg, operation="exists", key=key) from e
-        if self._lazy_reap_if_expired(resp, key, "exists"):
-            return False
-        return True
 
     @storage_operation_error_boundary(
         "ttl",
@@ -1261,20 +1491,24 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         """
         _validate_key_name(key, "key")
         try:
-            resp = self.client.get(index=self._active_snapshot().storage_index, id=key)
-        except NotFoundError:
-            return None
+            with self._lease_generation("ttl") as generation:
+                try:
+                    resp = generation.client.get(
+                        index=generation.snapshot.storage_index, id=key
+                    )
+                except NotFoundError:
+                    return None
+                source = self._storage_source(resp, key, "ttl")
+                expiry = self._storage_expiry(source, key, "ttl")
+                if expiry is None:
+                    return None
+                if self._lazy_reap_if_expired(generation, resp, key, "ttl"):
+                    return None
+                remaining = (expiry - datetime.now(tz=timezone.utc)).total_seconds()
+                return max(0, int(remaining))
         except (ApiError, TransportError) as e:
             msg = f"Failed to read TTL of key {key!r} in ElasticSearch: {e}"
             raise StorageError(msg, operation="ttl", key=key) from e
-        source = self._storage_source(resp, key, "ttl")
-        expiry = self._storage_expiry(source, key, "ttl")
-        if expiry is None:
-            return None
-        if self._lazy_reap_if_expired(resp, key, "ttl"):
-            return None
-        remaining = (expiry - datetime.now(tz=timezone.utc)).total_seconds()
-        return max(0, int(remaining))
 
     @storage_operation_error_boundary(
         "clear_storage",
@@ -1304,14 +1538,19 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # scan_iter(match=prefix*) and dynamodb begins_with (#64).
         query = {"prefix": {"key.keyword": prefix}} if prefix else {"match_all": {}}
         try:
-            self._delete_by_query(self._active_snapshot().storage_index, query)
+            with self._lease_generation("clear_storage") as generation:
+                self._delete_by_query_on_generation(
+                    generation, generation.snapshot.storage_index, query
+                )
         except (ApiError, TransportError) as e:
             msg = f"Failed to clear ElasticSearch storage: {e}"
             raise StorageError(msg, operation="clear_storage", key=None) from e
 
     # ---- Shared helpers ----
 
-    def _count(self, index: str, field: str, value: str) -> int:
+    def _count(
+        self, generation: _ElasticSearchGeneration, index: str, field: str, value: str
+    ) -> int:
         """Count documents matching a term query.
 
         Args:
@@ -1335,32 +1574,38 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         # its own typed error contract.
         # Forced refresh so just-written docs (push/add don't refresh) are
         # searchable — same amortized-read-refresh rationale as pop.
-        self.client.indices.refresh(index=index)
+        generation.client.indices.refresh(index=index)
         # ``.keyword`` subfield — see pop's term-query note. ``queue_name`` /
         # ``set_name`` are dynamically mapped as ``text``; count must match the
         # exact (unanalyzed) value via the keyword subfield.
-        resp = self.client.count(
+        resp = generation.client.count(
             index=index, query={"term": {f"{field}.keyword": value}}
         )
         return cast(int, resp.get("count", 0))
 
     def _delete_by_id(self, index: str, doc_id: str) -> bool:
-        """Delete document by ID.
+        """Compatibility helper that leases one generation for a direct call."""
+        with self._lease_generation("delete_by_id") as generation:
+            return self._delete_by_id_on_generation(generation, index, doc_id)
 
-        Args:
-            index: Index name.
-            doc_id: Document ID.
-
-        Returns:
-            True if deleted, False if didn't exist.
-        """
+    @staticmethod
+    def _delete_by_id_on_generation(
+        generation: _ElasticSearchGeneration, index: str, doc_id: str
+    ) -> bool:
+        """Delete a document by ID using only the supplied generation."""
         try:
-            self.client.delete(index=index, id=doc_id)
+            generation.client.delete(index=index, id=doc_id)
         except NotFoundError:
             return False
         return True
 
-    def _delete_by_term(self, index: str, field: str, value: str) -> None:
+    def _delete_by_term(
+        self,
+        generation: _ElasticSearchGeneration,
+        index: str,
+        field: str,
+        value: str,
+    ) -> None:
         """Delete all documents matching a term query.
 
         Args:
@@ -1369,17 +1614,20 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             value: Value to match.
         """
         # ``.keyword`` subfield — same exact-match rationale as ``_count``.
-        self._delete_by_query(index, {"term": {f"{field}.keyword": value}})
+        self._delete_by_query_on_generation(
+            generation, index, {"term": {f"{field}.keyword": value}}
+        )
 
     def _delete_by_query(self, index: str, query: dict[str, Any]) -> None:
-        """Delete all documents matching a query.
+        """Compatibility helper that leases one generation for a direct call."""
+        with self._lease_generation("delete_by_query") as generation:
+            self._delete_by_query_on_generation(generation, index, query)
 
-        Args:
-            index: Index name.
-            query: Query dict.
-
-        Raises:
-            TransportError: If the delete request fails. Public callers map this
-                to the exception family for their interface.
-        """
-        self.client.delete_by_query(index=index, query=query)
+    @staticmethod
+    def _delete_by_query_on_generation(
+        generation: _ElasticSearchGeneration,
+        index: str,
+        query: dict[str, Any],
+    ) -> None:
+        """Delete matching documents using only the supplied generation."""
+        generation.client.delete_by_query(index=index, query=query)
