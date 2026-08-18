@@ -33,7 +33,14 @@ from decimal import Decimal
 from difflib import get_close_matches
 from enum import Enum
 from functools import wraps
-from inspect import getattr_static, isawaitable, iscoroutinefunction, signature
+from inspect import (
+    getattr_static,
+    isasyncgen,
+    isasyncgenfunction,
+    isawaitable,
+    iscoroutinefunction,
+    signature,
+)
 from json import JSONEncoder
 from pathlib import PurePath
 from types import CoroutineType, FunctionType, ModuleType
@@ -492,6 +499,7 @@ def _validate_plugin_ack_class(
             or method is default_method
             or getattr_static(method, "__isabstractmethod__", False) is True
             or iscoroutinefunction(method)
+            or isasyncgenfunction(method)
         ):
             raise _invalid_plugin_ack_contract()
         try:
@@ -563,6 +571,8 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
     "pop": frozenset(
         {
             "Deferred-ack backend returned an invalid delivery result",
+            "Deferred-ack backend returned an awaitable delivery result",
+            "Deferred-ack backend returned an asynchronous-generator delivery result",
             "Deferred-ack backend returned a delivery without an acknowledgement token",
             "Deferred-ack backend returned an empty acknowledgement token",
             "Deferred-ack backend reused an active acknowledgement token",
@@ -573,6 +583,7 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
             "Deferred-ack settlement requires an issued acknowledgement token",
             "Deferred-ack settlement rejected an unknown acknowledgement token",
             "Deferred-ack backend returned an awaitable settlement result",
+            "Deferred-ack backend returned an asynchronous-generator settlement result",
         }
     ),
     "nack": frozenset(
@@ -580,9 +591,31 @@ _DEFERRED_ACK_QUEUE_ERROR_MESSAGES: dict[str, frozenset[str]] = {
             "Deferred-ack settlement requires an issued acknowledgement token",
             "Deferred-ack settlement rejected an unknown acknowledgement token",
             "Deferred-ack backend returned an awaitable settlement result",
+            "Deferred-ack backend returned an asynchronous-generator settlement result",
         }
     ),
 }
+
+
+def _reject_asynchronous_delivery_result(result: object, operation: str) -> None:
+    """Reject async plugin results without advancing plugin-controlled code."""
+    if type(result) is CoroutineType:
+        # Closing an unstarted native coroutine only releases its frame; it does
+        # not execute the body and prevents a later ``never awaited`` warning.
+        CoroutineType.close(result)
+    if isawaitable(result):
+        result_kind = "awaitable"
+    elif isasyncgen(result):
+        # Do not call ``aclose``: that would manufacture another awaitable which
+        # synchronous callers cannot consume without leaking a warning.
+        result_kind = "asynchronous-generator"
+    else:
+        return
+    result_role = "delivery" if operation == "pop" else "settlement"
+    raise QueueError(
+        f"Deferred-ack backend returned an {result_kind} {result_role} result",
+        operation=operation,
+    )
 
 
 def _deferred_ack_queue_error_boundary(
@@ -672,6 +705,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
         timeout: float = 0.0,
     ) -> tuple[bytes | None, Any | None]:
         result = self._delegate.pop_with_ack(queue_name, timeout)
+        _reject_asynchronous_delivery_result(result, "pop")
         if type(result) is not tuple or len(result) != 2:
             raise QueueError(
                 "Deferred-ack backend returned an invalid delivery result",
@@ -733,16 +767,7 @@ class _DeferredAckPluginQueueBackend(QueueBackend):
                     self._delegate.ack if operation == "ack" else self._delegate.nack,
                 )
                 result = settle_hook(queue_name, token=token)
-                if isawaitable(result):
-                    # Native coroutine objects warn when garbage-collected without
-                    # being awaited. Close without advancing user code, then reject
-                    # the asynchronous contract while the token remains retryable.
-                    if type(result) is CoroutineType:
-                        CoroutineType.close(result)
-                    raise QueueError(
-                        "Deferred-ack backend returned an awaitable settlement result",
-                        operation=operation,
-                    )
+                _reject_asynchronous_delivery_result(result, operation)
             except BaseException:
                 raise
             else:

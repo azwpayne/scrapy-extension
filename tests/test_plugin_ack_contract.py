@@ -106,7 +106,12 @@ class _NonBooleanMetadata(_DeferredPlugin):
 
 
 class _CustomAwaitable:
+    def __init__(self, broker_events: list[str] | None = None) -> None:
+        self._broker_events = broker_events
+
     def __await__(self) -> Any:
+        if self._broker_events is not None:
+            self._broker_events.append("custom-awaitable-advanced")
         yield
 
 
@@ -114,20 +119,24 @@ class _IdentityToken:
     pass
 
 
-async def _unstarted_settlement_coroutine() -> None:
-    raise AssertionError("settlement coroutine body must not be invoked")
+async def _tracked_delivery_coroutine(broker_events: list[str]) -> None:
+    broker_events.append("coroutine-advanced")
 
 
-class _AwaitableSettlementPlugin(_DeferredPlugin):
-    settlement_result: object | None = None
+async def _tracked_delivery_async_generator(broker_events: list[str]) -> Any:
+    broker_events.append("async-generator-advanced")
+    yield None
 
-    def ack(self, queue_name: str, *, token: Any | None = None) -> None:
-        self.ack_calls.append((queue_name, token))
-        return self.settlement_result  # type: ignore[return-value]
 
-    def nack(self, queue_name: str, *, token: Any | None = None) -> None:
-        self.nack_calls.append((queue_name, token))
-        return self.settlement_result  # type: ignore[return-value]
+def _wrapped_asynchronous_result(
+    result_kind: str,
+    broker_events: list[str],
+) -> object:
+    if result_kind == "coroutine":
+        return _tracked_delivery_coroutine(broker_events)
+    if result_kind == "awaitable":
+        return _CustomAwaitable(broker_events)
+    return _tracked_delivery_async_generator(broker_events)
 
 
 class _HostileMethodDescriptor:
@@ -299,17 +308,37 @@ def test_manager_ignores_backend_module_mutation_after_validation(
     assert manager._static_ack_capabilities() == (True, True)
 
 
+@pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
-def test_manager_statically_rejects_coroutine_delivery_hooks_without_io(
+@pytest.mark.parametrize("function_kind", ["coroutine", "async-generator"])
+def test_manager_statically_rejects_asynchronous_delivery_hooks_without_io(
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
-    recwarn: pytest.WarningsRecorder,
+    function_kind: str,
 ) -> None:
     constructed = False
+    broker_events: list[str] = []
 
-    async def asynchronous_hook(self: object, *args: object, **kwargs: object) -> None:
-        del self, args, kwargs
-        raise AssertionError("async delivery hook body must not be invoked")
+    if function_kind == "coroutine":
+
+        async def asynchronous_hook(
+            self: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            del self, args, kwargs
+            broker_events.append("coroutine-advanced")
+
+    else:
+
+        async def asynchronous_hook(  # type: ignore[misc]
+            self: object,
+            *args: object,
+            **kwargs: object,
+        ) -> Any:
+            del self, args, kwargs
+            broker_events.append("async-generator-advanced")
+            yield None
 
     def reject_construction(self: object, settings: object | None = None) -> None:
         del self, settings
@@ -321,14 +350,18 @@ def test_manager_statically_rejects_coroutine_delivery_hooks_without_io(
     monkeypatch.setattr(_DeferredPlugin, "__init__", reject_construction)
     _install_plugin(monkeypatch, _DeferredPlugin)
 
-    with pytest.raises(ConfigurationError, match="acknowledgement contract"):
+    with pytest.raises(ConfigurationError) as exc_info:
         ConnectionManager("ackplugin")
 
     gc.collect()
+    assert str(exc_info.value) == (
+        "Selected third-party queue backend has an invalid acknowledgement contract."
+    )
+    assert exc_info.value.setting_name == "SCRAPY_BACKEND_TYPE"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert constructed is False
-    assert not [
-        warning for warning in recwarn if "never awaited" in str(warning.message)
-    ]
+    assert broker_events == []
 
 
 @pytest.mark.parametrize(
@@ -397,39 +430,62 @@ def test_manager_statically_rejects_noncallable_method_descriptors(
         ConnectionManager("ackplugin")
 
 
-@pytest.mark.parametrize("operation", ["ack", "nack"])
-@pytest.mark.parametrize("awaitable_kind", ["coroutine", "custom"])
-def test_awaitable_settlement_is_redacted_and_keeps_token_retryable(
-    operation: str,
-    awaitable_kind: str,
-    recwarn: pytest.WarningsRecorder,
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("method_name", ["pop_with_ack", "ack", "nack"])
+@pytest.mark.parametrize(
+    "result_kind",
+    ["coroutine", "awaitable", "async-generator"],
+)
+def test_wrapped_asynchronous_delivery_results_fail_without_broker_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    result_kind: str,
 ) -> None:
-    marker = f"awaitable-settlement-private-{operation}-{awaitable_kind}"
-    backend = _AwaitableSettlementPlugin()
+    marker = f"async-result-private-{method_name}-{result_kind}"
+    broker_events: list[str] = []
+    backend = _DeferredPlugin()
     contract = _DeferredAckPluginQueueBackend(
         backend,
         supports_concurrent_ack=True,
     )
-    backend.pop_results["q"].append((b"item", marker))
-    contract.pop_with_ack("q")
-    backend.settlement_result = (
-        _unstarted_settlement_coroutine()
-        if awaitable_kind == "coroutine"
-        else _CustomAwaitable()
-    )
+    original_hook = getattr(backend, method_name)
 
+    if method_name != "pop_with_ack":
+        backend.pop_results["q"].append((b"item", marker))
+        contract.pop_with_ack("q")
+
+    def wrapped_hook(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return _wrapped_asynchronous_result(result_kind, broker_events)
+
+    monkeypatch.setattr(backend, method_name, wrapped_hook)
     with pytest.raises(QueueError) as exc_info:
-        getattr(contract, operation)("q", token=marker)
+        if method_name == "pop_with_ack":
+            contract.pop_with_ack("q")
+        else:
+            getattr(contract, method_name)("q", token=marker)
 
+    gc.collect()
     _assert_terminal_queue_error_is_redacted(exc_info.value, marker)
-    assert "awaitable settlement result" in str(exc_info.value)
-    backend.settlement_result = None
-    getattr(contract, operation)("q", token=marker)
-    calls = backend.ack_calls if operation == "ack" else backend.nack_calls
-    assert calls == [("q", marker), ("q", marker)]
-    assert not [
-        warning for warning in recwarn if "never awaited" in str(warning.message)
-    ]
+    assert broker_events == []
+    assert backend.ack_calls == []
+    assert backend.nack_calls == []
+
+    monkeypatch.setattr(backend, method_name, original_hook)
+    if method_name == "pop_with_ack":
+        assert contract._active_ack_tokens == {}
+        backend.pop_results["q"].append((b"item", marker))
+        assert contract.pop_with_ack("q") == (b"item", marker)
+        contract.ack("q", token=marker)
+        assert backend.ack_calls == [("q", marker)]
+    else:
+        # The failed asynchronous settlement must leave ownership with the
+        # adapter so the same delivery can be synchronously retried.
+        getattr(contract, method_name)("q", token=marker)
+        expected = [("q", marker)]
+        assert backend.ack_calls == (expected if method_name == "ack" else [])
+        assert backend.nack_calls == (expected if method_name == "nack" else [])
+        assert contract._active_ack_tokens == {}
 
 
 def test_non_value_tokens_are_owned_and_settled_by_identity(
