@@ -638,7 +638,11 @@ class TestDescriptorBoundary:
             raise AssertionError("backend construction must not start")
 
         monkeypatch.setattr(connectors, "_load_object", _load)
-        monkeypatch.setattr(connectors.time, "sleep", sleep_calls.append)
+        monkeypatch.setattr(
+            connectors,
+            "_wait_for_retry_backoff",
+            lambda _event, delay: sleep_calls.append(delay),
+        )
         manager = connectors.ConnectionManager(
             "runtime_contract", {"retry_attempts": 3, "retry_delay": 1}
         )
@@ -774,7 +778,11 @@ class TestDescriptorBoundary:
         marker = f"bundled-{stage}-import-error-marker"
         sleeps: list[float] = []
         monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
-        monkeypatch.setattr(connectors.time, "sleep", sleeps.append)
+        monkeypatch.setattr(
+            connectors,
+            "_wait_for_retry_backoff",
+            lambda _event, delay: sleeps.append(delay),
+        )
 
         class _ImportErrorSettings:
             def __init__(self, **kwargs: object) -> None:

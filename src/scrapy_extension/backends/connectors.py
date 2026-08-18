@@ -24,7 +24,6 @@ import logging
 import math
 import os
 import threading
-import time
 from abc import ABC
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
@@ -83,6 +82,14 @@ logger = logging.getLogger(__name__)
 _MonitorEvent = tuple[str, tuple[Any, ...]]
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
+
+
+def _wait_for_retry_backoff(
+    retirement_event: threading.Event,
+    delay: float,
+) -> bool:
+    """Wait for retry delay, returning early when the manager is retired."""
+    return retirement_event.wait(delay)
 
 
 def _log_diagnostic(
@@ -1437,8 +1444,11 @@ class ConnectionManager:
         self._connect_lock = threading.Lock()
         # Terminal lifecycle marker. Once the final holder releases (or registry
         # teardown evicts this manager), a slow in-progress connect must not
-        # publish a backend into the now-unowned instance.
+        # publish a backend into the now-unowned instance. The event mirrors that
+        # terminal transition so a retry backoff wakes without polling or waiting
+        # for the full delay.
         self._retired = False
+        self._retirement_event = threading.Event()
         # Refcount of outstanding ``get_manager()`` acquire calls sharing this
         # instance (A1). The manager is only created via ``get_manager()``, so
         # the constructor sets the initial count to 0; ``get_manager()`` then
@@ -1668,6 +1678,7 @@ class ConnectionManager:
         """
         with manager._lock:
             manager._retired = True
+            manager._retirement_event.set()
             backend = manager._backend
             manager._backend = None
         if backend is not None:
@@ -2130,7 +2141,12 @@ class ConnectionManager:
                             (str(self._backend_type_for_operations()), attempt + 1),
                         )
                     )
-                    time.sleep(compute_full_jitter_backoff(attempt, retry_delay))
+                    interrupted = _wait_for_retry_backoff(
+                        self._retirement_event,
+                        compute_full_jitter_backoff(attempt, retry_delay),
+                    )
+                    if interrupted:
+                        break
                 continue
 
             _log_diagnostic(
@@ -2371,6 +2387,7 @@ class ConnectionManager:
             # assignment, an in-flight connect can resurrect an evicted manager and
             # leak an unowned connection.
             self._retired = True
+            self._retirement_event.set()
             backend = self._backend
             self._backend = None
             # R14-E: reset the circuit breaker so a manager that reconnects after
@@ -2520,8 +2537,8 @@ class ConnectionManager:
           resolves). They do NOT spin on ``_lock`` while the owner backs off. A
           failed attempt is fanned out to its waiter cohort; only a later,
           independent call starts a new attempt.
-        - The owner runs ``connect()`` (which performs ``time.sleep`` between
-          retry attempts) WITHOUT holding ``_lock``. This is the load-bearing
+        - The owner runs ``connect()`` (which performs an interruptible wait
+          between retry attempts) WITHOUT holding ``_lock``. This is the load-bearing
           fix: a slow-connecting backend no longer blocks every peer thread
           sharing the manager.
 
@@ -2581,8 +2598,8 @@ class ConnectionManager:
             if attempt.error is not None:
                 raise _rebuild_connect_attempt_error(attempt.error)
 
-        # Owner path: connect WITHOUT holding _lock so the retry-loop
-        # time.sleep backoff does not block peer threads (A2).
+        # Owner path: connect WITHOUT holding _lock so the retry loop's
+        # interruptible backoff does not block peer threads (A2).
         connect_error: BaseException | None = None
         self._lazy_connection_context.owner_attempt = attempt
         try:

@@ -780,7 +780,10 @@ class TestR14DObservability:
         mocker.patch.object(
             manager, "_attempt_connection", side_effect=RuntimeError("boom")
         )
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")  # skip backoff
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )  # skip backoff
         stats = _stats()
         manager.set_monitor(ScrapyStatsMonitor(stats))
         with pytest.raises(BackendConnectionError):
@@ -869,7 +872,10 @@ class TestR14DObservability:
             "_create_backend",
             side_effect=[failed_backend, recovered_backend],
         )
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
         monitor = mocker.MagicMock(name="monitor")
         monitor.on_retry.side_effect = RuntimeError("stats unavailable")
         manager.set_monitor(monitor)

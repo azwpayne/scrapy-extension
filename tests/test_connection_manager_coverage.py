@@ -137,17 +137,19 @@ def _clear_registry():
 
 @pytest.fixture
 def patch_sleep_random(monkeypatch):
-    """Deterministic time.sleep + random.uniform — records uniform(lo,hi) calls."""
+    """Deterministic retry wait + random.uniform — records uniform(lo,hi) calls."""
     calls: list[tuple[float, float]] = []
 
-    def fake_sleep(_d: float) -> None:
-        pass
+    def fake_wait(_retirement_event: threading.Event, _delay: float) -> bool:
+        return False
 
     def fake_uniform(lo: float, hi: float) -> float:
         calls.append((lo, hi))
         return (lo + hi) / 2  # midpoint — deterministic, strictly in-range
 
-    monkeypatch.setattr("scrapy_extension.backends.connectors.time.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff", fake_wait
+    )
     # Risk 6: random.uniform moved from connectors to the extracted _retry module.
     monkeypatch.setattr("scrapy_extension.backends._retry.random.uniform", fake_uniform)
     return calls

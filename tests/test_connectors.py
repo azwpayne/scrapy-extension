@@ -627,7 +627,10 @@ class TestConnectionManagerRetryLogic:
             "_create_backend",
             side_effect=ConnectionError("Connection failed"),
         )
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
 
         manager = ConnectionManager(
             BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.1}
@@ -646,7 +649,10 @@ class TestConnectionManagerRetryLogic:
             "_create_backend",
             side_effect=RuntimeError(f"driver dump included {marker}"),
         )
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
         manager = ConnectionManager(
             BackendType.REDIS, {"retry_attempts": 1, "retry_delay": 0}
         )
@@ -684,7 +690,10 @@ class TestConnectionManagerRetryLogic:
 
         # First call raises, second succeeds
         mock_create_backend.side_effect = [ConnectionError("Failed"), mock_backend]
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
 
         manager = ConnectionManager(
             BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.1}
@@ -699,7 +708,10 @@ class TestConnectionManagerRetryLogic:
         mocker.patch.object(
             ConnectionManager, "_create_backend", side_effect=KeyboardInterrupt
         )
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
 
         manager = ConnectionManager(BackendType.REDIS)
 
@@ -711,7 +723,10 @@ class TestConnectionManagerRetryLogic:
         mocker.patch.object(
             ConnectionManager, "_create_backend", side_effect=SystemExit
         )
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
 
         manager = ConnectionManager(BackendType.REDIS)
 
@@ -1004,7 +1019,10 @@ class TestConnectionManagerMonitorReentrancy:
         recovered = mocker.MagicMock(name="recovered")
         recovered.is_connected.return_value = True
         mocker.patch.object(manager, "_create_backend", side_effect=[failed, recovered])
-        mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+        mocker.patch(
+            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            return_value=False,
+        )
         lock_states: list[bool] = []
         reentries: list[object] = []
 

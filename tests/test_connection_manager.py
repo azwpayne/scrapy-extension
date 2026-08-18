@@ -698,63 +698,48 @@ def test_close_swallows_backend_disconnect_error_and_still_evicts(mocker):
     assert key not in ConnectionManager._managers
 
 
-def test_connect_retry_sleep_outside_backend_lock(mocker):
-    """A2: ``time.sleep`` during retry backoff must NOT be called while
-    ``_lock`` is held.
+def test_connect_retry_backoff_outside_backend_lock(mocker):
+    """A2: the interruptible retry wait must not hold ``_lock``.
 
-    The old ``backend`` property held ``self._lock`` across the entire
-    ``connect()`` call, and ``connect()`` calls ``time.sleep`` between retry
-    attempts. That blocks every peer thread sharing the manager — even ones
-    that would have found ``_backend`` already populated. The fix separates
-    the fast connected-check (lock-free read) from the slow connect path so
-    the lock is never held across ``time.sleep``.
-
-    This test is a behavioral guard: if the implementation regresses to
-    holding the lock across the retry sleep, the mock ``time.sleep`` will be
-    observed to run while a separate ``_lock.acquire`` is pending in another
-    thread, surfacing the contention. The simpler structural assertion here:
-    ``connect()`` performs its retries WITHOUT owning ``_lock``.
+    A slow retry delay must not block peer threads sharing the manager. This
+    observes the wait seam and verifies the manager state lock remains available
+    throughout every backoff.
     """
 
     manager = ConnectionManager(
         BackendType.REDIS, {"retry_attempts": 3, "retry_delay": 0.01}
     )
 
-    # Force _create_backend to keep failing so all retry attempts fire and
-    # each calls time.sleep.
+    # Force _create_backend to keep failing so all retry waits fire.
     mocker.patch.object(
         ConnectionManager,
         "_create_backend",
         side_effect=ConnectionError("transient"),
     )
-    mock_sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    wait = mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
-    # Track whether _lock is held at the moment time.sleep is invoked.
-    lock_held_during_sleep: list[bool] = []
+    lock_held_during_wait: list[bool] = []
 
-    def sleep_observer(_delay):
-        # Try to acquire the lock non-blockingly. If it's held by the connect
-        # path (the bug), this returns False.
+    def wait_observer(_retirement_event, _delay):
         acquired = manager._lock.acquire(blocking=False)
-        lock_held_during_sleep.append(not acquired)
+        lock_held_during_wait.append(not acquired)
         if acquired:
             manager._lock.release()
+        return False
 
-    mock_sleep.side_effect = sleep_observer
+    wait.side_effect = wait_observer
 
-    # Call connect() directly (not via the backend property) — the fix is
-    # about connect() not holding the lock across sleep. connect() itself
-    # must be lock-free on the retry path.
     with pytest.raises(Exception, match="Failed to connect"):  # noqa: B017 - testing retry exhaustion
         manager.connect()
 
-    assert mock_sleep.call_count == 3  # 1 initial attempt + 3 retries
-    # The load-bearing assertion: _lock must NOT be held during any sleep.
-    assert lock_held_during_sleep, "time.sleep was never observed"
-    assert not any(lock_held_during_sleep), (
-        "_lock was held across time.sleep during retry backoff — this blocks "
-        "peer threads sharing the manager. connect() must run its retry loop "
-        "without holding _lock."
+    assert wait.call_count == 3  # 1 initial attempt + 3 retries
+    assert lock_held_during_wait, "retry wait was never observed"
+    assert not any(lock_held_during_wait), (
+        "_lock was held across retry backoff — this blocks peer threads sharing "
+        "the manager. connect() must run its retry loop without holding _lock."
     )
 
 
@@ -895,7 +880,10 @@ def test_connect_retry_policy_sanitizes_custom_numeric_coercion(
     value = _ExplosiveNumber()
     manager = ConnectionManager(BackendType.REDIS, {field: value})
     create_backend = mocker.patch.object(manager, "_create_backend")
-    sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    sleep = mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
         manager.connect()
@@ -960,7 +948,10 @@ def test_connect_does_not_retry_configuration_errors(mocker):
             setting_name="host",
         ),
     )
-    sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    sleep = mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     with pytest.raises(
         ConfigurationError,
@@ -1002,7 +993,10 @@ def test_connect_sanitizes_plugin_validation_errors_without_retry(mocker):
         "_attempt_connection",
         side_effect=validation_error,
     )
-    sleep = mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    sleep = mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     with pytest.raises(ConfigurationError) as exc_info:
         manager.connect()
@@ -1200,7 +1194,10 @@ def test_retry_diagnostic_interrupt_does_not_block_retry(mocker):
         "_attempt_connection",
         side_effect=[ConnectionError("first attempt failed"), None],
     )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
     mocker.patch(
         "scrapy_extension.backends.connectors.logger.warning",
         side_effect=KeyboardInterrupt("diagnostic interruption"),
@@ -1242,7 +1239,10 @@ def test_direct_connect_dispatches_retry_monitor_outside_terminal_error(mocker):
         "_attempt_connection",
         side_effect=RuntimeError(marker),
     )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     with pytest.raises(BackendConnectionError) as exc_info:
         manager.connect()
@@ -1287,7 +1287,10 @@ def test_direct_connect_preserves_base_exception_retry_monitor_dispatch(mocker):
         "_attempt_connection",
         side_effect=[RuntimeError("retryable failure"), interrupt],
     )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
         manager.connect()
@@ -1324,7 +1327,10 @@ def test_direct_connect_base_exception_monitor_callback_keeps_precedence(mocker)
         "_attempt_connection",
         side_effect=[RuntimeError("retryable failure"), backend_interrupt],
     )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         manager.connect()
@@ -1619,7 +1625,10 @@ def test_backend_property_concurrent_first_connect_single_connect(mocker):
     manager = ConnectionManager(BackendType.REDIS, {"retry_attempts": 1})
     mock_backend = mocker.MagicMock()
     mocker.patch.object(ConnectionManager, "_create_backend", return_value=mock_backend)
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
 
     n = 15
     barrier = threading.Barrier(n)
@@ -1663,7 +1672,10 @@ def test_lazy_owner_failure_publishes_before_retry_monitor_reentry(mocker):
     failed = mocker.MagicMock(name="failed-backend")
     failed.connect.side_effect = OSError("temporary failure")
     mocker.patch.object(manager, "_create_backend", return_value=failed)
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
     monitor_states: list[tuple[bool, bool]] = []
     reentrant_errors: list[BackendConnectionError] = []
 
@@ -1734,7 +1746,10 @@ def test_lazy_owner_publishes_sanitized_mutated_config_error_to_peer(mocker):
         )
 
     mocker.patch.object(manager, "_attempt_connection", side_effect=attempt_connection)
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
     outcomes: dict[str, BaseException] = {}
     monitor_states: list[tuple[bool, bool]] = []
     reentrant_errors: list[ConfigurationError] = []
@@ -1840,7 +1855,10 @@ def test_lazy_owner_retry_success_publishes_before_monitor_reentry(mocker):
         "_create_backend",
         side_effect=[failed, recovered],
     )
-    mocker.patch("scrapy_extension.backends.connectors.time.sleep")
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        return_value=False,
+    )
     monitor_states: list[tuple[str, bool, bool]] = []
     reentries: list[object] = []
     connect_reentries: list[str] = []
@@ -2277,6 +2295,73 @@ def test_last_close_during_connect_cannot_publish_orphan_backend(mocker):
     backend.disconnect.assert_called_once_with()
     key = ConnectionManager._registry_key(manager.backend_type, manager.settings)
     assert key not in ConnectionManager._managers
+
+
+@pytest.mark.parametrize("teardown", ["close", "clear_registry"])
+def test_retirement_interrupts_retry_backoff_before_second_backend(mocker, teardown):
+    """Final and forced teardown wake a retry owner before another factory call."""
+    import threading
+
+    manager = ConnectionManager.get_manager(
+        BackendType.REDIS,
+        {
+            "host": f"interrupt-backoff-{teardown}",
+            "retry_attempts": 3,
+            "retry_delay": 60,
+        },
+    )
+    backend = mocker.MagicMock(name="failed-backend")
+    backend.connect.side_effect = OSError("temporary failure")
+    create_backend = mocker.patch.object(
+        manager,
+        "_create_backend",
+        return_value=backend,
+    )
+    wait_entered = threading.Event()
+
+    def observed_wait(retirement_event, delay):
+        assert delay == 60
+        wait_entered.set()
+        return retirement_event.wait(delay)
+
+    mocker.patch(
+        "scrapy_extension.backends.connectors.compute_full_jitter_backoff",
+        return_value=60,
+    )
+    mocker.patch(
+        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        side_effect=observed_wait,
+    )
+    outcomes: list[BaseException] = []
+
+    def connect() -> None:
+        try:
+            manager.connect()
+        except BaseException as error:  # noqa: BLE001 - inspect owner outcome
+            outcomes.append(error)
+
+    owner = threading.Thread(target=connect, daemon=True)
+    owner.start()
+    assert wait_entered.wait(timeout=2.0), "connect owner did not enter backoff"
+
+    if teardown == "close":
+        manager.close()
+        assert manager._users == 0
+    else:
+        ConnectionManager.clear_registry()
+        # Force teardown bypasses outstanding acquires rather than corrupting their
+        # accounting; a later holder close still owns this exact acquire.
+        assert manager._users == 1
+
+    owner.join(timeout=1.0)
+
+    assert not owner.is_alive(), "retired manager waited for the full retry delay"
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], BackendConnectionError)
+    assert manager._retirement_event.is_set()
+    assert manager._retired is True
+    assert create_backend.call_count == 1
+    assert manager not in ConnectionManager._managers.values()
 
 
 def test_backend_property_rejects_released_manager(mocker):
