@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from inspect import getattr_static, isawaitable
 from typing import TYPE_CHECKING, Any
 
+from pydispatch.errors import DispatcherKeyError
 from scrapy import signals
 from scrapy.http import Request
 from scrapy.utils.misc import load_object
@@ -68,6 +69,27 @@ _LIFECYCLE_OPEN = "open"
 _LIFECYCLE_CLOSED = "closed"
 _MISSING_STATIC_ATTRIBUTE = object()
 _EnqueueDiagnostic = tuple[str, str, str | None]
+
+
+class _SignalReceiver:
+    """Invocation-unique, weak-referenceable signal receiver proxy."""
+
+    __slots__ = ("__weakref__", "handler")
+
+    def __init__(self, handler: Callable[..., Any]) -> None:
+        self.handler = handler
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.handler(*args, **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class _SignalLease:
+    """One exact Scrapy/PyDispatcher registration owned by the scheduler."""
+
+    manager: Any
+    signal: Any
+    receiver: _SignalReceiver
 
 
 @dataclass(frozen=True, slots=True)
@@ -990,6 +1012,7 @@ class BackendScheduler:
         # successfully registers a handler, the list becomes the authoritative
         # ownership record, including during a partial-registration rollback.
         self._connected_ack_signal_handlers: list[tuple[Any, Any]] | None = None
+        self._signal_leases: list[_SignalLease] = []
         self._manager_released: bool = False
         self._owns_connection_manager = owns_connection_manager
         # Backpressure gate config (round-4 BP-2). resume_at defaults to pause_at
@@ -1613,7 +1636,7 @@ class BackendScheduler:
         crawler reference at construction time. Idempotent: guarded by
         ``_signals_connected`` so re-open doesn't double-register.
         """
-        if self._signals_connected:
+        if self._signal_leases:
             return
         crawler = getattr(spider, "crawler", None)
         if crawler is None:
@@ -1634,42 +1657,40 @@ class BackendScheduler:
             (self._on_response_received, signals.response_received),
             (self._on_spider_error, signals.spider_error),
         )
-        connected: list[tuple[Any, Any]] = []
-        try:
-            for handler, signal in signal_handlers:
-                # A third-party signal manager can register and then raise. Record
-                # ownership first so either outcome is disconnected during rollback
-                # (and retried by terminal cleanup if that rollback is interrupted).
-                connected.append((handler, signal))
-                # Publish every attempted registration immediately. If registration
-                # or rollback is interrupted, ``open()`` can delegate retained
-                # handlers to ``_close_locked`` for another cleanup try.
-                self._connected_signals = sig
-                self._connected_ack_signal_handlers = connected
-                self._signals_connected = True
-                sig.connect(handler, signal=signal)
-        except BaseException:
-            for handler, signal in reversed(tuple(connected)):
-                try:
-                    sig.disconnect(handler, signal=signal)
-                except BaseException:
-                    # A failed rollback leaves this handler in ``connected`` so the
-                    # terminal open-failure cleanup retries it. Never let rollback (or
-                    # its logging) mask the original registration failure.
-                    try:
-                        logger.exception(
-                            "Failed to roll back %s after signal registration failure",
-                            signal,
-                        )
-                    except BaseException:
-                        pass
-                else:
-                    connected.remove((handler, signal))
-            if not connected:
-                self._connected_signals = None
-                self._connected_ack_signal_handlers = None
-                self._signals_connected = False
-            raise
+        for handler, signal in signal_handlers:
+            # Publish one unique receiver before connect(). A manager that registers
+            # and then raises is still repaired by keyed disconnect during close.
+            receiver = _SignalReceiver(handler)
+            lease = _SignalLease(sig, signal, receiver)
+            self._signal_leases.append(lease)
+            self._sync_signal_compatibility_views()
+            sig.connect(receiver, signal=signal)
+
+    def _sync_signal_compatibility_views(self) -> None:
+        """Maintain legacy signal fields as non-authoritative views."""
+        if not self._signal_leases:
+            self._connected_signals = None
+            self._connected_ack_signal_handlers = None
+            self._signals_connected = False
+            return
+        self._connected_signals = self._signal_leases[0].manager
+        self._connected_ack_signal_handlers = [
+            (lease.receiver, lease.signal) for lease in self._signal_leases
+        ]
+        self._signals_connected = True
+
+    def _disconnect_signal_leases(self) -> None:
+        """Release signal registrations one at a time, retaining failures."""
+        while self._signal_leases:
+            lease = self._signal_leases[0]
+            try:
+                lease.manager.disconnect(lease.receiver, signal=lease.signal)
+            except DispatcherKeyError:
+                # The unique registration is already absent: this is the successful
+                # retry result for an effect-then-raise disconnect.
+                pass
+            self._signal_leases.pop(0)
+            self._sync_signal_compatibility_views()
 
     def _on_response_received(
         self,
@@ -1881,33 +1902,28 @@ class BackendScheduler:
             else None
         )
         try:
-            if self._connected_signals is not None:
-                signal_handlers = self._connected_ack_signal_handlers
-                if signal_handlers is None:
-                    # Legacy/manual lifecycle state did not retain per-handler
-                    # ownership. Preserve the historical full-pair cleanup behavior.
-                    signal_handlers = [
-                        (self._on_response_received, signals.response_received),
-                        (self._on_spider_error, signals.spider_error),
-                    ]
+            if self._signal_leases:
+                try:
+                    self._disconnect_signal_leases()
+                except BaseException as exc:
+                    if primary_error is None:
+                        primary_error = exc
+            elif self._connected_signals is not None:
+                # Compatibility cleanup for manually constructed legacy state.
+                signal_handlers = self._connected_ack_signal_handlers or [
+                    (self._on_response_received, signals.response_received),
+                    (self._on_spider_error, signals.spider_error),
+                ]
                 for handler, signal in signal_handlers:
-                    disconnect_failed = False
                     try:
                         self._connected_signals.disconnect(handler, signal=signal)
                     except Exception:
-                        # Each stale/already-disconnected tuple is independent: one failure
-                        # must not leave the other handler registered or block later cleanup.
-                        disconnect_failed = True
-                    except BaseException as exc:
-                        if primary_error is None:
-                            primary_error = exc
-                    if disconnect_failed:
-                        # The ordinary disconnect failure has unwound before the logging
-                        # handler runs, so it cannot expose its traceback through
-                        # ``sys.exc_info()``.
                         _log_shutdown_exception(
                             "Failed to disconnect signal during shutdown"
                         )
+                    except BaseException as exc:
+                        if primary_error is None:
+                            primary_error = exc
             if (
                 self._owns_dupefilter
                 and self.dupefilter is not None
@@ -1935,9 +1951,10 @@ class BackendScheduler:
             # lifecycle_state guard before reaching here, so no double-reset risk.
             self._queue = None
             self._spider = None
-            self._connected_signals = None
-            self._connected_ack_signal_handlers = None
-            self._signals_connected = False
+            if not self._signal_leases:
+                self._connected_signals = None
+                self._connected_ack_signal_handlers = None
+                self._signals_connected = False
             self._backpressure_paused = False
             self._backpressure_probe_due = False
             if (
