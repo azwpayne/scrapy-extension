@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import threading
 import traceback
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,15 +22,51 @@ _KEY = "queue:snapshot:v3:0::1:q"
 _SECRET_MARKER = "snapshot-buffer-private-marker"
 
 
+def _assert_no_secret_object_graph(value: object, seen: set[int]) -> None:
+    identity = id(value)
+    if identity in seen:
+        return
+    seen.add(identity)
+    if isinstance(value, (str, bytes, bytearray)):
+        assert _SECRET_MARKER not in repr(value)
+        return
+    if isinstance(value, memoryview):
+        try:
+            assert _SECRET_MARKER.encode() not in value.tobytes()
+        except ValueError:
+            pass
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _assert_no_secret_object_graph(key, seen)
+            _assert_no_secret_object_graph(item, seen)
+        return
+    if isinstance(value, Sequence):
+        for item in value:
+            _assert_no_secret_object_graph(item, seen)
+        return
+    if isinstance(value, BaseException):
+        assert _SECRET_MARKER not in str(value)
+        _assert_no_secret_object_graph(value.__dict__, seen)
+        for linked in (value.__cause__, value.__context__):
+            if linked is not None:
+                _assert_no_secret_object_graph(linked, seen)
+
+
 def _assert_static_repository_error(error: SnapshotRepositoryError) -> None:
     assert error.__cause__ is None
     assert error.__context__ is None
     assert _SECRET_MARKER not in "".join(traceback.format_exception(error))
+    _assert_no_secret_object_graph(error, set())
     current = error.__traceback__
     while current is not None:
         frame = current.tb_frame
         if "/src/scrapy_extension/" in frame.f_code.co_filename:
-            assert _SECRET_MARKER not in repr(frame.f_locals)
+            for name, value in frame.f_locals.items():
+                # Repository ownership intentionally reaches backend state. The
+                # terminal boundary must instead remove secret operation locals.
+                if name != "self":
+                    _assert_no_secret_object_graph(value, set())
         current = current.tb_next
 
 
@@ -105,6 +143,17 @@ def test_manifest_failure_leaves_old_manifest_authoritative() -> None:
     assert repository.read(_KEY).state == b"old"
 
 
+def test_chunk_write_failure_has_no_recursive_secret_graph() -> None:
+    storage, _ = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    storage.store.side_effect = RuntimeError(_SECRET_MARKER)
+
+    with pytest.raises(SnapshotRepositoryError, match="chunk write") as exc_info:
+        repository.commit(_KEY, _SECRET_MARKER.encode())
+
+    _assert_static_repository_error(exc_info.value)
+
+
 def test_empty_state_is_a_committed_authoritative_manifest() -> None:
     storage, values = _storage({_KEY: b"legacy raw state"})
     repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
@@ -120,13 +169,74 @@ def test_empty_state_is_a_committed_authoritative_manifest() -> None:
 
 def test_checksum_corruption_is_rejected() -> None:
     storage, values = _storage()
-    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
-    repository.commit(_KEY, b"abcdefgh")
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    repository.commit(_KEY, _SECRET_MARKER.encode())
     manifest = json.loads(values[_KEY])
-    chunk_key = repository._chunk_key(_KEY, manifest["generation"], 1)
-    values[chunk_key] = b"WXYZ"
+    manifest["sha256"] = "0" * 64
+    values[_KEY] = json.dumps(manifest).encode()
 
-    with pytest.raises(SnapshotRepositoryError, match="checksum"):
+    with pytest.raises(SnapshotRepositoryError, match="checksum") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_chunk_length_failure_has_no_recursive_secret_graph() -> None:
+    storage, values = _storage()
+    payload = _SECRET_MARKER.encode() + b"x"
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    repository.commit(_KEY, payload)
+    manifest = json.loads(values[_KEY])
+    chunk_key = repository._chunk_key(_KEY, manifest["generation"], 0)
+    values[chunk_key] = _SECRET_MARKER.encode()
+
+    with pytest.raises(SnapshotRepositoryError, match="chunk length") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_manifest_schema_failure_has_no_recursive_secret_graph() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    repository.commit(_KEY, b"state")
+    manifest = json.loads(values[_KEY])
+    manifest[_SECRET_MARKER] = {_SECRET_MARKER: [_SECRET_MARKER]}
+    values[_KEY] = json.dumps(manifest).encode()
+
+    with pytest.raises(SnapshotRepositoryError, match="schema") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_parser_recursion_error_is_terminally_redacted(mocker: Any) -> None:
+    storage, _ = _storage({_KEY: _SECRET_MARKER.encode()})
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    mocker.patch(
+        "scrapy_extension.queue.snapshot.json.loads",
+        side_effect=RecursionError(_SECRET_MARKER),
+    )
+
+    with pytest.raises(SnapshotRepositoryError, match="parsing") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "control_error", [KeyboardInterrupt("stop"), SystemExit("stop")]
+)
+def test_parser_process_control_errors_propagate(
+    control_error: BaseException, mocker: Any
+) -> None:
+    storage, _ = _storage({_KEY: b"manifest"})
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=64)
+    mocker.patch(
+        "scrapy_extension.queue.snapshot.json.loads", side_effect=control_error
+    )
+
+    with pytest.raises(type(control_error), match="stop"):
         repository.read(_KEY)
 
 
@@ -272,6 +382,20 @@ def test_overridden_bytes_conversion_is_never_called(
 
 
 @pytest.mark.timeout(10)
+def test_readonly_alias_of_mutable_exporter_is_rejected_without_secret_graph() -> None:
+    exporter = bytearray(_SECRET_MARKER.encode())
+    readonly_alias = memoryview(exporter).toreadonly()
+    storage = MagicMock()
+    storage.retrieve.return_value = readonly_alias
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+
+    with pytest.raises(SnapshotRepositoryError, match="mutable") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+    assert readonly_alias.tobytes() == _SECRET_MARKER.encode()
+
+
 def test_concurrently_mutable_manifest_is_rejected_without_a_secret_graph() -> None:
     value = bytearray(_SECRET_MARKER.encode())
     storage = MagicMock()
