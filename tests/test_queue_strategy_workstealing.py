@@ -231,6 +231,28 @@ def test_pop_with_ack_rechecks_peers_after_blocking_own_timeout():
     assert qb.pop_with_ack.call_count == 6
 
 
+def test_pop_with_ack_returns_tombstone_token_from_blocking_own_wait():
+    """R133 mirror of the priority tombstone test: the blocking own-queue arm
+    must propagate a (None, token) broker tombstone for settlement instead of
+    gating on data-only (a swallowed token pins the Kafka commit watermark at
+    the tombstone offset forever)."""
+    s, qb = _strategy(worker_id="w1", peer_ids=("w2", "w3"))
+    qb.pop_with_ack.side_effect = [
+        (None, None),  # own empty
+        (None, None),  # steal w2 empty
+        (None, None),  # steal w3 empty
+        (None, "TOMB"),  # blocking own -> tombstone delivery
+        (None, None),  # (rescan arms only run if the tombstone were swallowed)
+        (None, None),
+        (None, None),
+    ]
+
+    data, token = s.pop_with_ack("q", timeout=2.5)
+
+    assert (data, token) == (None, "TOMB")
+    assert qb.pop_with_ack.call_count == 4
+
+
 def test_compatible_backend_keeps_published_worker_queue_name():
     """A rolling upgrade reads and writes the existing ``q:worker`` queue in place."""
     cm = MagicMock(name="ConnectionManager")

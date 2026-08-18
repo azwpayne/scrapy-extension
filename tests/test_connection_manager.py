@@ -603,6 +603,61 @@ def test_attempt_connection_close_wins_preserves_discard_error_when_warning_inte
     assert manager._backend is None
 
 
+def test_connect_with_retries_preserves_release_error_when_close_wins(mocker):
+    """The retry loop keeps the typed release error when close wins the race.
+
+    ``_connect_with_retries`` broad-catches every ordinary connection failure
+    and reports the generic attempt-count tail.  A concurrent ``close()`` that
+    retires the manager mid-attempt is not an ordinary failure: the typed
+    ``BackendConnectionError`` from ``_attempt_connection()`` explains the
+    actionable cause and must surface verbatim instead of being re-wrapped
+    (with a miscounted attempt number) by the generic tail.
+    """
+    import threading
+
+    manager = ConnectionManager(
+        BackendType.REDIS,
+        {"retry_attempts": 1, "retry_delay": 0},
+    )
+    connect_entered = threading.Event()
+    allow_connect_return = threading.Event()
+
+    def _connect() -> None:
+        connect_entered.set()
+        assert allow_connect_return.wait(timeout=5), "test did not release connect"
+
+    backend = mocker.MagicMock()
+    backend.connect.side_effect = _connect
+    mocker.patch.object(manager, "_create_backend", return_value=backend)
+
+    outcome: list[BaseException] = []
+
+    def _connect_with_retries() -> None:
+        try:
+            manager._connect_with_retries([])
+        except BaseException as exc:  # noqa: BLE001 - capture the thread outcome
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_connect_with_retries)
+    worker.start()
+    assert connect_entered.wait(timeout=5), "backend.connect() was not entered"
+
+    # ``close()`` retires the manager while ``backend.connect()`` is still in
+    # flight, so the retry loop deterministically observes a released manager
+    # when the attempt resolves with the typed discard error.
+    manager.close()
+    allow_connect_return.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "connection attempt did not finish"
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], BackendConnectionError)
+    assert "backend discarded" in str(outcome[0])
+    assert "Failed to connect after" not in str(outcome[0])
+    backend.disconnect.assert_called_once_with()
+    assert manager._backend is None
+
+
 def test_attempt_connection_close_wins_logs_after_disconnect_context_unwinds(
     mocker,
 ) -> None:
@@ -2656,3 +2711,128 @@ def test_durable_push_preserves_non_queue_exception_contracts(
         assert error is raised_error
     else:
         assert error is not raised_error
+
+
+def test_apply_scrapy_breaker_policy_keeps_registry_key_stable(monkeypatch):
+    """R137-F1: apply_scrapy_breaker_policy must never mutate manager.settings.
+
+    close() recomputes the registry key from self.settings at release time and
+    evicts by identity. A post-registration settings mutation changes the
+    recomputed key, the identity check fails, and the retired entry stays in
+    the registry — the next get_manager with the ORIGINAL settings returns the
+    retired manager, on which every backend access raises permanently.
+    """
+    for key in (
+        "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+        "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from scrapy.settings import Settings as ScrapySettings
+
+    settings = {"host": "r137-key-stability-host"}
+    manager = ConnectionManager.get_manager(BackendType.REDIS, settings)
+    try:
+        manager.apply_scrapy_breaker_policy(
+            ScrapySettings(
+                {
+                    "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                    "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 4,
+                    "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 9.0,
+                }
+            )
+        )
+        assert manager._get_breaker() is not None
+    finally:
+        manager.close()
+
+    # The retired entry must have been evicted: a fresh get_manager with the
+    # ORIGINAL (policy-less) settings returns a brand-new usable manager.
+    manager_after = ConnectionManager.get_manager(BackendType.REDIS, settings)
+    try:
+        assert manager_after is not manager
+        assert manager_after._retired is False
+    finally:
+        manager_after.close()
+
+
+def test_apply_scrapy_breaker_policy_overrides_env_fallback_resolution(
+    monkeypatch,
+):
+    """R137-F2: a pre-crawler first use caches the disabled env fallback
+    (_breaker_configured=True, _breaker=None). An explicit Scrapy policy
+    arriving afterwards must OVERRIDE that fallback — otherwise the breaker
+    the user configured silently never engages (the exact R136-F1 symptom
+    surviving through used-early, not just acquired-early)."""
+    for key in (
+        "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+        "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from scrapy.settings import Settings as ScrapySettings
+
+    manager = ConnectionManager.get_manager(
+        BackendType.REDIS, {"host": "r137-env-fallback-host"}
+    )
+    try:
+        assert manager._get_breaker() is None  # env fallback cached + latched
+
+        manager.apply_scrapy_breaker_policy(
+            ScrapySettings(
+                {
+                    "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                    "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 5,
+                    "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 30.0,
+                }
+            )
+        )
+
+        breaker = manager._get_breaker()
+        assert breaker is not None
+        assert breaker.failure_threshold == 5
+        assert breaker.reset_timeout == 30.0
+    finally:
+        manager.close()
+
+
+def test_apply_scrapy_breaker_policy_warns_on_dropped_differing_policy(
+    monkeypatch, caplog
+):
+    """R137-F3: two spiders sharing one early-acquired manager cannot both
+    own its single breaker. First explicit resolution wins; a later DIFFERING
+    explicit policy is dropped with a one-shot warning instead of silently
+    overwriting (last-write-wins) the first spider's configuration. Re-applying
+    the SAME policy never warns."""
+    from scrapy.settings import Settings as ScrapySettings
+
+    def _policy(threshold: int) -> ScrapySettings:
+        return ScrapySettings(
+            {
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": threshold,
+                "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 7.5,
+            }
+        )
+
+    manager = ConnectionManager.get_manager(
+        BackendType.REDIS, {"host": "r137-dropped-policy-host"}
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger=connectors_module.__name__):
+            manager.apply_scrapy_breaker_policy(_policy(3))
+            manager.apply_scrapy_breaker_policy(_policy(3))  # same → no warn
+            manager.apply_scrapy_breaker_policy(_policy(9))  # differing → warn
+            manager.apply_scrapy_breaker_policy(_policy(9))  # again → once only
+
+        warnings = [
+            r for r in caplog.records if "circuit breaker policy" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        breaker = manager._get_breaker()
+        assert breaker is not None
+        assert breaker.failure_threshold == 3  # first explicit policy wins
+    finally:
+        manager.close()

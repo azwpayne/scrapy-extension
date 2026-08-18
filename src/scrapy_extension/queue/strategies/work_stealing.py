@@ -276,6 +276,7 @@ class WorkStealingQueueStrategy(QueueStrategy):
         own = self._own_queue(queue_name)
         deadline = time.monotonic() + timeout if timeout > 0 else None
         data, token = self._pop_backend_instance_with_ack(qb, own, 0.0)
+        # Token-only broker tombstones still need BackendQueue._pop settlement.
         if data is not None or token is not None:
             return (data, token)
         n_peers = len(self._peer_ids)

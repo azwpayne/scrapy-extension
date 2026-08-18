@@ -8,9 +8,13 @@ from unittest.mock import Mock
 
 import pytest
 from scrapy import Spider, signals
+from scrapy.settings import Settings as ScrapySettings
 
 from scrapy_extension.backends.base import BackendType
-from scrapy_extension.backends.connectors import ConnectionManager
+from scrapy_extension.backends.connectors import (
+    ConnectionManager,
+    ConnectionManagerLease,
+)
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.spider import spider_mixin as spider_mixin_module
@@ -113,6 +117,7 @@ class TestBackendSpiderMixinFromCrawler:
             return_value=manager,
         )
         crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings()
 
         class TestSpider(BackendSpiderMixin, Spider):
             name = "test_spider"
@@ -235,6 +240,7 @@ class TestSetupBackend:
 
         spider = TestSpider()
         crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings()
         crawler.stats = mocker.MagicMock()
         spider.crawler = crawler
 
@@ -288,6 +294,121 @@ class TestSetupBackend:
         assert wired_calls, "set_monitor should have been called"
         last_wired = wired_calls[-1].args[0]
         assert isinstance(last_wired, ScrapyStatsMonitor)
+
+    def test_setup_backend_merges_scrapy_breaker_policy(
+        self, mocker, monkeypatch
+    ) -> None:
+        """R135-B: Scrapy-level SCRAPY_CIRCUIT_BREAKER_* must reach the mixin's
+        manager -- parity with the component-factory path, whose
+        resolve_backend_config folds the same policy into manager settings.
+        Pre-fix, the mixin built manager settings from backend_settings +
+        shortcut attrs only, so a breaker configured in Scrapy settings
+        silently never applied to the backends the mixin hands out."""
+        for key in (
+            "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+            "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+            backend_type = BackendType.REDIS
+
+        spider = TestSpider()
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 2,
+                "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 4.5,
+            }
+        )
+        spider.crawler = crawler
+
+        manager = spider.setup_backend()
+        try:
+            breaker = manager._get_breaker()
+
+            assert breaker is not None
+            assert breaker.failure_threshold == 2
+            assert breaker.reset_timeout == 4.5
+        finally:
+            spider.close_backend()
+
+    def test_setup_backend_without_breaker_source_is_unchanged(
+        self, mocker, monkeypatch
+    ) -> None:
+        """R135-B guard: with no breaker source anywhere (env cleared, crawler
+        settings empty) setup_backend behaves exactly as before -- the manager
+        builds and the default no-breaker policy applies."""
+        for key in (
+            "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+            "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+            backend_type = BackendType.REDIS
+
+        spider = TestSpider()
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings()
+        spider.crawler = crawler
+
+        manager = spider.setup_backend()
+        try:
+            assert manager is spider._connection_manager
+            assert manager._get_breaker() is None
+        finally:
+            spider.close_backend()
+
+    def test_from_crawler_applies_breaker_policy_after_early_setup(
+        self, mocker, monkeypatch
+    ) -> None:
+        """R136-F1: the documented early-setup pattern (setup_backend in
+        __init__, before Scrapy attaches the crawler) acquires the manager
+        with no breaker policy — the acquisition-time fold cannot see crawler
+        settings. from_crawler's idempotent second setup_backend call (crawler
+        attached) must re-apply the Scrapy breaker policy, or _get_breaker
+        caches the env-only fallback forever and a breaker configured in
+        Scrapy settings silently never engages."""
+        for key in (
+            "SCRAPY_CIRCUIT_BREAKER_ENABLED",
+            "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        class EarlySetupSpider(BackendSpiderMixin, Spider):
+            name = "early_setup_spider"
+            backend_type = BackendType.REDIS
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.setup_backend()  # before crawler -> policy-less manager
+
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 3,
+                "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 7.5,
+            }
+        )
+
+        spider = EarlySetupSpider.from_crawler(crawler)
+        try:
+            breaker = spider._connection_manager._get_breaker()
+
+            assert breaker is not None
+            assert breaker.failure_threshold == 3
+            assert breaker.reset_timeout == 7.5
+        finally:
+            spider.close_backend()
 
     def test_consumer_backend_scope_is_unique_per_spider_instance(self) -> None:
         class TestSpider(BackendSpiderMixin, Spider):
@@ -392,6 +513,7 @@ class TestSetupBackend:
         signal_manager = mocker.MagicMock()
         signal_manager.connect.side_effect = [None, RuntimeError("closed signal bus")]
         spider.crawler = mocker.MagicMock(signals=signal_manager)
+        spider.crawler.settings = ScrapySettings()
 
         with pytest.raises(RuntimeError, match="closed signal bus"):
             spider.setup_backend()
@@ -417,6 +539,7 @@ class TestSetupBackend:
         signal_manager = mocker.MagicMock()
         signal_manager.connect.side_effect = RuntimeError("signal bus unavailable")
         spider.crawler = mocker.MagicMock(signals=signal_manager)
+        spider.crawler.settings = ScrapySettings()
 
         with pytest.raises(RuntimeError, match="signal bus unavailable"):
             spider.setup_backend()
@@ -462,6 +585,7 @@ class TestSetupBackend:
         wiring_error = RuntimeError("signal wiring failed")
         signal_manager.connect.side_effect = wiring_error
         spider.crawler = mocker.MagicMock(signals=signal_manager)
+        spider.crawler.settings = ScrapySettings()
 
         with pytest.raises(RuntimeError) as captured:
             spider.setup_backend()
@@ -564,9 +688,11 @@ class TestSetupBackend:
         first_signals = mocker.MagicMock()
         second_signals = mocker.MagicMock()
         spider.crawler = mocker.MagicMock(signals=first_signals)
+        spider.crawler.settings = ScrapySettings()
         spider.setup_backend()
 
         spider.crawler = mocker.MagicMock(signals=second_signals)
+        spider.crawler.settings = ScrapySettings()
         assert spider.setup_backend() is manager
 
         acquire.assert_called_once_with(backend_type=BackendType.REDIS, settings={})
@@ -597,12 +723,14 @@ class TestSetupBackend:
         spider = TestSpider()
         first_signals = mocker.MagicMock()
         spider.crawler = mocker.MagicMock(signals=first_signals)
+        spider.crawler.settings = ScrapySettings()
         spider.setup_backend()  # success: manager acquired, wired to first_signals
 
         second_signals = mocker.MagicMock()
         # first connect (spider_opened) succeeds; second (spider_closed) raises
         second_signals.connect.side_effect = [None, RuntimeError("replacement bus")]
         spider.crawler = mocker.MagicMock(signals=second_signals)
+        spider.crawler.settings = ScrapySettings()
 
         with pytest.raises(RuntimeError, match="replacement bus"):
             spider.setup_backend()
@@ -1468,6 +1596,84 @@ class TestGetQueue:
 
         assert result1 is result2
 
+    def test_get_queue_threads_monitor_knobs_from_settings(self, mocker):
+        """R137-F4: the SCRAPY_MONITOR_* operator knobs must reach the
+        get_queue-direct BackendQueue (R14-C parity with the scheduler path,
+        whose comment documents exactly this gap for the mixin direct path):
+        backpressure_threshold and pop_rate_window_s come from crawler
+        settings instead of constructor defaults."""
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 7,
+                "SCRAPY_MONITOR_POP_RATE_WINDOW_S": 12.5,
+            }
+        )
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        spider.crawler = crawler
+
+        queue = spider.get_queue()
+
+        assert isinstance(queue._monitor, ScrapyStatsMonitor)
+        assert queue._monitor.backpressure_threshold == 7
+        assert queue._pop_rate_window_s == 12.5
+
+    def test_get_queue_upgrades_null_monitor_after_early_setup(self, mocker):
+        """R137-F5: get_queue() in the early-setup window (no crawler) bakes
+        NullMonitor into the cached queue. Once the crawler is attached, a
+        later get_queue() call must upgrade the NullMonitor to the resolved
+        stats monitor — without rebuilding the queue."""
+        from scrapy_extension.monitor import NullMonitor
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+        queue = spider.get_queue()
+        assert isinstance(queue._monitor, NullMonitor)
+
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings()
+        spider.crawler = crawler
+
+        queue2 = spider.get_queue()
+        assert queue2 is queue  # cached instance, not rebuilt
+        assert isinstance(queue._monitor, ScrapyStatsMonitor)
+
+    def test_get_queue_never_rewires_a_real_monitor(self, mocker):
+        """R137-F5 guard: once the queue carries a real (stats-backed)
+        monitor, a later get_queue() must NOT rewire it — protects externally
+        tuned wiring (e.g. a scheduler-typed monitor) from being replaced by a
+        later default resolution."""
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 7})
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        spider.crawler = crawler
+
+        queue = spider.get_queue()
+        wired_first = queue._monitor
+        assert wired_first.backpressure_threshold == 7
+
+        # A later call with DIFFERENT knob settings must keep the wired monitor.
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD": 9})
+        spider.get_queue()
+        assert queue._monitor is wired_first
+
 
 class TestGetDupefilter:
     """Test get_dupefilter method."""
@@ -2147,10 +2353,12 @@ class TestCloseBackend:
         second_signals = mocker.MagicMock()
         spider = TestSpider()
         spider.crawler = mocker.MagicMock(signals=first_signals)
+        spider.crawler.settings = ScrapySettings()
         spider.setup_backend()
         spider.close_backend()
 
         spider.crawler = mocker.MagicMock(signals=second_signals)
+        spider.crawler.settings = ScrapySettings()
         assert spider.setup_backend() is second_manager
 
         assert acquire.call_count == 2
@@ -2267,6 +2475,276 @@ class TestSpiderMixinHonorsSettings:
         )
 
         assert isinstance(df._filter, MemoryMembershipFilter)
+
+
+class TestSpiderMixinSnapshotPairing:
+    """R135-C: get_queue must pair a stateful strategy (delay/round_robin/
+    time_wheel/ring_buffer) on a queue-only backend with the configured
+    storage component's ConnectionManager — parity with
+    BackendScheduler.from_settings — so in-process held state survives
+    shutdown. Previously the mixin built those strategies without a snapshot
+    manager, losing held items on every shutdown even when
+    SCRAPY_STORAGE_BACKEND_TYPE was explicitly configured.
+    """
+
+    # resolve_backend_config falls back to env sources; clear them so each
+    # test's ScrapySettings is the only configuration in play.
+    _ENV_KEYS = (
+        "SCRAPY_STORAGE_BACKEND_TYPE",
+        "SCRAPY_STORAGE_BACKEND_SETTINGS",
+        "SCRAPY_BACKEND_TYPE",
+        "SCRAPY_BACKEND_SETTINGS",
+    )
+
+    def _clear_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for key in self._ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_stateful_strategy_on_queue_only_backend_pairs_snapshot_manager(
+        self, mocker, monkeypatch
+    ) -> None:
+        """Kafka queue + delay strategy + explicit redis storage override: the
+        mixin's BackendQueue must receive a distinct snapshot manager that
+        close_backend releases only after the queue closes."""
+        self._clear_env(monkeypatch)
+        queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
+        snapshot_manager = mocker.MagicMock(
+            name="snapshot-manager", spec=ConnectionManager
+        )
+        snapshot_lease = mocker.MagicMock(
+            name="snapshot-lease", spec=ConnectionManagerLease
+        )
+        snapshot_lease.manager = snapshot_manager
+        get_manager = mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=queue_manager
+        )
+        acquire_lease = mocker.patch.object(
+            ConnectionManager, "acquire_lease", return_value=snapshot_lease
+        )
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_QUEUE_STRATEGY": "delay",
+                "SCRAPY_STORAGE_BACKEND_TYPE": "redis",
+            }
+        )
+
+        class KafkaSpider(BackendSpiderMixin, Spider):
+            name = "kafka_spider"
+            backend_type = BackendType.KAFKA
+
+        spider = KafkaSpider()
+        spider.crawler = crawler
+        spider.setup_backend()
+        queue = spider.get_queue()
+
+        from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+
+        assert isinstance(queue._strategy, DelayQueueStrategy)
+        assert queue._snapshot_connection_manager is snapshot_manager
+        assert queue._snapshot_connection_manager is not queue_manager
+        get_manager.assert_called_once()
+        acquire_lease.assert_called_once()
+        assert acquire_lease.call_args.kwargs["backend_type"] == "redis"
+
+        # Teardown ordering mirrors the scheduler contract: the queue close
+        # (which persists the strategy snapshot) precedes the snapshot manager
+        # release, which precedes the queue manager release.
+        order: list[str] = []
+        mocker.patch.object(
+            queue, "close", side_effect=lambda: order.append("queue-close")
+        )
+        snapshot_lease.release.side_effect = lambda: order.append("snapshot-release")
+        queue_manager.close.side_effect = lambda: order.append("manager-release")
+
+        spider.close_backend()
+
+        assert order == ["queue-close", "snapshot-release", "manager-release"]
+        snapshot_lease.release.assert_called_once_with()
+        snapshot_manager.close.assert_not_called()
+
+    def test_snapshot_manager_receives_resolved_monitor(
+        self, mocker, monkeypatch
+    ) -> None:
+        """R136-F2: the snapshot ConnectionManager acquired by get_queue must
+        carry the resolved monitor (R55 parity with the scheduler factory
+        pairing) — otherwise its backend lifecycle stats
+        (backend/{connect,disconnect,retry}_count) stay dead on the
+        get_queue-direct path."""
+        self._clear_env(monkeypatch)
+        queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
+        snapshot_manager = mocker.MagicMock(
+            name="snapshot-manager", spec=ConnectionManager
+        )
+        snapshot_lease = mocker.MagicMock(
+            name="snapshot-lease", spec=ConnectionManagerLease
+        )
+        snapshot_lease.manager = snapshot_manager
+        mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=queue_manager
+        )
+        mocker.patch.object(
+            ConnectionManager, "acquire_lease", return_value=snapshot_lease
+        )
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_QUEUE_STRATEGY": "delay",
+                "SCRAPY_STORAGE_BACKEND_TYPE": "redis",
+            }
+        )
+
+        class KafkaSpider(BackendSpiderMixin, Spider):
+            name = "kafka_spider"
+            backend_type = BackendType.KAFKA
+
+        spider = KafkaSpider()
+        spider.crawler = crawler
+        spider.setup_backend()
+        spider.get_queue()
+
+        snapshot_manager.set_monitor.assert_called_once()
+        wired = snapshot_manager.set_monitor.call_args.args[0]
+        assert isinstance(wired, ScrapyStatsMonitor)
+        spider.close_backend()
+
+    def test_stateful_strategy_without_storage_config_skips_snapshot_pairing(
+        self, mocker, monkeypatch
+    ) -> None:
+        """Guard: a queue-only global backend with no explicit storage override
+        keeps the legacy best-effort no-snapshot behavior — get_queue still
+        works, no crash, exactly one manager acquire."""
+        self._clear_env(monkeypatch)
+        queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
+        get_manager = mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=queue_manager
+        )
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_BACKEND_TYPE": "kafka",
+                "SCRAPY_QUEUE_STRATEGY": "delay",
+            }
+        )
+
+        class KafkaSpider(BackendSpiderMixin, Spider):
+            name = "kafka_spider"
+            backend_type = BackendType.KAFKA
+
+        spider = KafkaSpider()
+        spider.crawler = crawler
+        spider.setup_backend()
+        queue = spider.get_queue()
+
+        from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
+
+        assert isinstance(queue._strategy, DelayQueueStrategy)
+        assert queue._snapshot_connection_manager is None
+        assert get_manager.call_count == 1
+        spider.close_backend()
+        queue_manager.close.assert_called_once_with()
+
+    def test_explicit_storage_override_without_storage_capability_stays_fail_fast(
+        self, mocker, monkeypatch
+    ) -> None:
+        """An explicit but invalid storage override is never silently
+        downgraded — parity with the scheduler factory contract. The failed
+        get_queue must not tear down the mixin's own manager (ownership stays
+        with setup_backend / close_backend)."""
+        self._clear_env(monkeypatch)
+        queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
+        mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=queue_manager
+        )
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_QUEUE_STRATEGY": "delay",
+                "SCRAPY_STORAGE_BACKEND_TYPE": "kafka",
+            }
+        )
+
+        class KafkaSpider(BackendSpiderMixin, Spider):
+            name = "kafka_spider"
+            backend_type = BackendType.KAFKA
+
+        spider = KafkaSpider()
+        spider.crawler = crawler
+        spider.setup_backend()
+
+        with pytest.raises(ConfigurationError, match="does not support the storage"):
+            spider.get_queue()
+
+        queue_manager.close.assert_not_called()
+        spider.close_backend()
+        queue_manager.close.assert_called_once_with()
+
+    def test_storage_capable_queue_backend_keeps_single_manager(
+        self, mocker, monkeypatch
+    ) -> None:
+        """Guard: a storage-capable queue backend (redis) snapshots through its
+        own manager; no second acquire even with a storage override set."""
+        self._clear_env(monkeypatch)
+        queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
+        get_manager = mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=queue_manager
+        )
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_QUEUE_STRATEGY": "delay",
+                "SCRAPY_STORAGE_BACKEND_TYPE": "mongodb",
+            }
+        )
+
+        class RedisSpider(BackendSpiderMixin, Spider):
+            name = "redis_spider"
+            backend_type = BackendType.REDIS
+
+        spider = RedisSpider()
+        spider.crawler = crawler
+        spider.setup_backend()
+        queue = spider.get_queue()
+
+        assert queue._snapshot_connection_manager is None
+        assert get_manager.call_count == 1
+
+    def test_get_scheduler_snapshot_pairing_remains_factory_path_only(
+        self, mocker, monkeypatch
+    ) -> None:
+        """R135-C verification (SPEC): the mixin's get_scheduler builds
+        BackendScheduler directly rather than through the settings-driven
+        factory, so its scheduler carries no snapshot pairing — operators
+        pairing a stateful strategy with a queue-only backend through the
+        scheduler must use the SCHEDULER wiring (from_crawler ->
+        from_settings), which owns the pairing contract pinned in
+        test_scheduler_snapshot_storage_pairing.py. This test documents the
+        boundary; only get_queue pairs through the mixin."""
+        self._clear_env(monkeypatch)
+        queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
+        get_manager = mocker.patch.object(
+            ConnectionManager, "get_manager", return_value=queue_manager
+        )
+        crawler = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_QUEUE_STRATEGY": "delay",
+                "SCRAPY_STORAGE_BACKEND_TYPE": "redis",
+            }
+        )
+
+        class KafkaSpider(BackendSpiderMixin, Spider):
+            name = "kafka_spider"
+            backend_type = BackendType.KAFKA
+
+        spider = KafkaSpider()
+        spider.crawler = crawler
+        spider.setup_backend()
+        scheduler = spider.get_scheduler()
+
+        assert scheduler._snapshot_connection_manager is None
+        assert get_manager.call_count == 1
 
 
 class TestIntegration:

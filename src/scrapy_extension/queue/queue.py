@@ -235,6 +235,9 @@ class BackendQueue:
             _validate_key_name(snapshot_owner, "snapshot_owner")
         self._snapshot_owner = snapshot_owner
         self._snapshot_connection_manager = snapshot_connection_manager
+        # Set when startup could not read an eligible legacy checkpoint. Until a
+        # successful replacement commit, close must keep that legacy state reachable.
+        self._defer_legacy_retirement = False
         resolved_snapshot_max_bytes = (
             _MAX_SNAPSHOT_BYTES if snapshot_max_bytes is None else snapshot_max_bytes
         )
@@ -335,6 +338,13 @@ class BackendQueue:
         # clean rather than crash startup.
         self._strategy.open()
         self._restore_snapshot()
+
+    def set_monitor(self, monitor: Monitor) -> None:
+        """Replace the queue monitor and forward it to monitor-aware strategies."""
+        self._monitor = monitor
+        strategy_set_monitor = getattr(self._strategy, "set_monitor", None)
+        if callable(strategy_set_monitor):
+            strategy_set_monitor(monitor)
 
     @cached_property
     def _serializer(self) -> JSONSerializer:
@@ -1673,10 +1683,43 @@ class BackendQueue:
 
             storage = self._snapshot_storage(strict=True)
             if storage is None:
-                if state is None:
+                if state is None and not self._defer_legacy_retirement:
                     return
-                raise QueueError("Nonempty strategy state requires snapshot storage.")
+                if state is not None:
+                    raise QueueError(
+                        "Nonempty strategy state requires snapshot storage."
+                    )
+                raise QueueError("Strategy snapshot storage is unavailable.")
             repository = self._snapshot_repository(storage)
+            legacy_key = self._legacy_snapshot_key()
+
+            # If startup could not read a legacy checkpoint and this lifecycle has
+            # no replacement state, publishing an empty current manifest would make
+            # the preserved legacy value unreachable forever. Keep the current key
+            # absent and remove the old empty-state tombstone so a later restart can
+            # retry the legacy read. Failure is retryable and prevents destructive
+            # strategy cleanup.
+            if self._defer_legacy_retirement and state is None:
+                cleanup_failed = False
+                try:
+                    tombstone_key = self._empty_snapshot_tombstone_key()
+                    storage.delete(tombstone_key)
+                    tombstone_key = ""
+                except Exception:
+                    cleanup_failed = True
+                if cleanup_failed:
+                    try:
+                        logger.error(
+                            "Failed to preserve unread legacy strategy snapshot"
+                        )
+                    except BaseException:
+                        pass
+                    raise QueueError(
+                        "Unread legacy strategy snapshot cannot be preserved."
+                    ) from None
+                self._defer_legacy_retirement = False
+                return
+
             commit_failed = False
             try:
                 snapshot_key = self._snapshot_key()
@@ -1693,7 +1736,7 @@ class BackendQueue:
 
             # A committed manifest, including an empty manifest, is authoritative.
             # Legacy cleanup therefore happens only after the manifest-last commit.
-            legacy_key = self._legacy_snapshot_key()
+            self._defer_legacy_retirement = False
             if legacy_key is None:
                 return
             cleanup_failed = False
@@ -1758,12 +1801,11 @@ class BackendQueue:
                         try:
                             logger.error(
                                 "Failed to retrieve empty strategy snapshot tombstone; "
-                                "starting clean"
+                                "checking legacy checkpoint"
                             )
                         except BaseException:
                             pass
-                        return
-                    if tombstone is not None:
+                    elif tombstone is not None:
                         return
                     legacy_read_failed = False
                     try:
@@ -1771,6 +1813,7 @@ class BackendQueue:
                     except SnapshotRepositoryError:
                         legacy_read_failed = True
                     if legacy_read_failed:
+                        self._defer_legacy_retirement = True
                         try:
                             logger.error(
                                 "Failed to read legacy strategy snapshot; starting clean"

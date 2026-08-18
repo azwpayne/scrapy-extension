@@ -597,8 +597,8 @@ def test_backends_queue_distinguishes_clean_checkpoint_from_empty_bytes(
         strategy.restore.assert_called_once_with(b"")
 
 
-def test_backends_queue_marker_retrieval_failure_skips_legacy_fallback():
-    """A marker read error must not resurrect the legacy checkpoint."""
+def test_backends_queue_marker_retrieval_failure_falls_back_to_legacy():
+    """A tombstone read error errs toward duplicate-tolerant legacy replay."""
     storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
 
     def retrieve(key: str):
@@ -607,21 +607,90 @@ def test_backends_queue_marker_retrieval_failure_skips_legacy_fallback():
         return state.get(key)
 
     storage.retrieve.side_effect = retrieve
-    cm = _wired_cm(storage=storage)
     strategy = _delay(clock_value=100.0)
 
     BackendQueue(
-        connection_manager=cm,
+        connection_manager=_wired_cm(storage=storage),
         queue_name="q",
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
 
-    assert strategy._holding == []
+    assert strategy._holding[0][2] == b"legacy-recovered"
     assert storage.retrieve.call_args_list == [
         call(_SNAPSHOT_KEY),
         call(_SNAPSHOT_TOMBSTONE_KEY),
+        call(_LEGACY_SNAPSHOT_KEY),
     ]
+
+
+def test_unread_legacy_empty_close_remains_reachable_on_next_restart():
+    """An empty close cannot shadow a transiently unread legacy checkpoint."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+    fail_legacy_once = True
+
+    def retrieve(key: str):
+        nonlocal fail_legacy_once
+        if key == _LEGACY_SNAPSHOT_KEY and fail_legacy_once:
+            fail_legacy_once = False
+            raise RuntimeError("legacy storage unavailable")
+        return state.get(key)
+
+    storage.retrieve.side_effect = retrieve
+    first_strategy = _delay(clock_value=100.0)
+    first = BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=first_strategy,
+        monitor=MagicMock(),
+    )
+    assert first_strategy._holding == []
+
+    first.close()
+
+    assert _SNAPSHOT_KEY not in state
+    assert _LEGACY_SNAPSHOT_KEY in state
+    second_strategy = _delay(clock_value=100.0)
+    BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=second_strategy,
+        monitor=MagicMock(),
+    )
+    assert second_strategy._holding[0][2] == b"legacy-recovered"
+
+
+def test_unread_legacy_close_is_retryable_when_fallback_cannot_be_reopened():
+    """Tombstone cleanup failure keeps checkpoint close non-destructive."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+
+    def retrieve(key: str):
+        if key == _LEGACY_SNAPSHOT_KEY:
+            raise RuntimeError("legacy storage unavailable")
+        return state.get(key)
+
+    def delete(key: str):
+        if key == _SNAPSHOT_TOMBSTONE_KEY:
+            raise RuntimeError("tombstone storage unavailable")
+        state.pop(key, None)
+
+    storage.retrieve.side_effect = retrieve
+    storage.delete.side_effect = delete
+    strategy = _delay(clock_value=100.0)
+    queue = BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    with pytest.raises(QueueError, match="cannot be preserved"):
+        queue.close()
+
+    assert queue._checkpoint_complete is False
+    assert queue._strategy_cleanup_state == "not-started"
+    assert _LEGACY_SNAPSHOT_KEY in state
+    assert _SNAPSHOT_KEY not in state
 
 
 def test_backends_queue_restores_legacy_snapshot_when_v3_is_missing():

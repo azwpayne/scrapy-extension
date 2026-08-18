@@ -512,7 +512,7 @@ def test_restore_log_has_no_strategy_exception_context() -> None:
     [
         (
             "queue:snapshot-tombstone:v3:0::1:q",
-            "Failed to retrieve empty strategy snapshot tombstone; starting clean",
+            "Failed to retrieve empty strategy snapshot tombstone; checking legacy checkpoint",
         ),
         ("queue:snapshot:q", "Failed to read legacy strategy snapshot; starting clean"),
     ],

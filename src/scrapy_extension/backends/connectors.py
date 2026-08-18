@@ -1210,13 +1210,13 @@ def _merge_connection_manager_settings(
                 _CONNECTION_MANAGER_DEFAULTS[public_name],
             )
 
-    manager_settings.update(_resolve_circuit_breaker_policy(settings))
+    manager_settings.update(resolve_circuit_breaker_policy(settings))
     merged_backend_settings.update(merged_nested_settings)
     merged_backend_settings.update(manager_settings)
     return merged_backend_settings
 
 
-def _resolve_circuit_breaker_policy(
+def resolve_circuit_breaker_policy(
     settings: Any,
 ) -> dict[str, bool | int | float]:
     """Resolve explicit Scrapy breaker values before their environment fallback.
@@ -1259,6 +1259,10 @@ def _resolve_circuit_breaker_policy(
             reset_timeout
         ),
     }
+
+
+# Backward-compatible alias for callers of the former private name.
+_resolve_circuit_breaker_policy = resolve_circuit_breaker_policy
 
 
 def _parse_circuit_breaker_policy(
@@ -2043,6 +2047,9 @@ class ConnectionManager:
         # returns the raw backend with zero overhead and byte-identical behavior.
         self._breaker: CircuitBreaker | None = None
         self._breaker_configured: bool = False
+        self._breaker_resolved_from_env_fallback: bool = False
+        self._breaker_policy_values: tuple[bool, int, float] | None = None
+        self._dropped_breaker_policy_warned: bool = False
         # R14-D: observability monitor for connection-lifecycle hooks
         # (on_connect / on_disconnect / on_retry). Defaults to NullMonitor so the
         # hooks are no-ops unless a caller (scheduler / dupefilter factory) threads
@@ -2861,6 +2868,12 @@ class ConnectionManager:
                 # nothing caught by ``except Exception`` can be an instance of either.)
                 failed_attempt = True
                 attempt_failed = True
+                with self._lock:
+                    retired = self._retired
+                if retired:
+                    # A concurrent release won the race. Preserve the active typed
+                    # release error instead of replacing it with retry exhaustion.
+                    raise
 
             if attempt_failed:
                 # The driver exception is no longer active here.  Keep continuation
@@ -2870,10 +2883,6 @@ class ConnectionManager:
                     logger.warning,
                     "Connection attempt failed.",
                 )
-                with self._lock:
-                    retired = self._retired
-                if retired:
-                    break
                 if attempt < retry_attempts:
                     # Record each retry while its transaction is serialized. User
                     # callbacks are dispatched only after ``_connect_lock`` is released;
@@ -3560,6 +3569,7 @@ class ConnectionManager:
                 operational_settings[policy_keys["failure_threshold"]],
                 operational_settings[policy_keys["reset_timeout"]],
             )
+            from_env_fallback = False
         else:
             # Read the breaker config OUTSIDE self._lock (#15). Imported lazily
             # to avoid a settings-module import cycle at module load time and to
@@ -3570,26 +3580,83 @@ class ConnectionManager:
             enabled = settings.circuit_breaker_enabled
             failure_threshold = settings.circuit_breaker_failure_threshold
             reset_timeout = settings.circuit_breaker_reset_timeout
+            from_env_fallback = True
         with self._lock:
             if self._breaker_configured:
                 return self._breaker
-            backend_type = self._backend_type_for_operations()
-            bt_key = (
-                backend_type.value
-                if isinstance(backend_type, BackendType)
-                else backend_type
+            self._install_breaker_locked(
+                enabled,
+                failure_threshold,
+                reset_timeout,
+                from_env_fallback=from_env_fallback,
             )
-            if enabled:
-                self._breaker = CircuitBreaker(
-                    name=f"{bt_key}-backend",
-                    failure_threshold=failure_threshold,
-                    reset_timeout=reset_timeout,
-                    failure_exceptions=(BackendError,),
-                )
-            else:
-                self._breaker = None
-            self._breaker_configured = True
             return self._breaker
+
+    def _install_breaker_locked(
+        self,
+        enabled: bool,
+        failure_threshold: int,
+        reset_timeout: float,
+        *,
+        from_env_fallback: bool,
+    ) -> None:
+        """Install one breaker policy while the manager lock is held."""
+        backend_type = self._backend_type_for_operations()
+        bt_key = (
+            backend_type.value
+            if isinstance(backend_type, BackendType)
+            else backend_type
+        )
+        if enabled:
+            self._breaker = CircuitBreaker(
+                name=f"{bt_key}-backend",
+                failure_threshold=failure_threshold,
+                reset_timeout=reset_timeout,
+                failure_exceptions=(BackendError,),
+            )
+        else:
+            self._breaker = None
+        self._breaker_configured = True
+        self._breaker_resolved_from_env_fallback = from_env_fallback
+        self._breaker_policy_values = (enabled, failure_threshold, reset_timeout)
+
+    def apply_scrapy_breaker_policy(self, settings: Any) -> None:
+        """Apply an explicit Scrapy breaker policy without changing pool identity."""
+        policy = resolve_circuit_breaker_policy(settings)
+        if not policy:
+            return
+        policy_keys = _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS
+        enabled, failure_threshold, reset_timeout = _parse_circuit_breaker_policy(
+            policy[policy_keys["enabled"]],
+            policy[policy_keys["failure_threshold"]],
+            policy[policy_keys["reset_timeout"]],
+        )
+        policy_values = (enabled, failure_threshold, reset_timeout)
+        warn_differing_policy = False
+        with self._lock:
+            if self._breaker_configured and not (
+                self._breaker_resolved_from_env_fallback
+            ):
+                if (
+                    self._breaker_policy_values != policy_values
+                    and not self._dropped_breaker_policy_warned
+                ):
+                    self._dropped_breaker_policy_warned = True
+                    warn_differing_policy = True
+            else:
+                self._install_breaker_locked(
+                    enabled,
+                    failure_threshold,
+                    reset_timeout,
+                    from_env_fallback=False,
+                )
+        if warn_differing_policy:
+            _log_diagnostic(
+                logger.warning,
+                "Dropping a differing circuit breaker policy applied to an "
+                "already-resolved shared connection manager; the first explicit "
+                "policy remains in effect.",
+            )
 
     @_manager_terminal_error_boundary()
     @configuration_error_boundary(

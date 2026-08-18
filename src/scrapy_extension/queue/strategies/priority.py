@@ -236,6 +236,7 @@ class PriorityQueueStrategy(QueueStrategy):
         for level in range(self._levels):
             physical_queue = self._bucket_queue(queue_name, level)
             data, token = self._pop_backend_instance_with_ack(qb, physical_queue, 0.0)
+            # Token-only broker tombstones still need BackendQueue._pop settlement.
             if data is not None or token is not None:
                 return (data, token)
         if timeout > 0:

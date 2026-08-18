@@ -6,6 +6,7 @@ import threading
 from unittest.mock import Mock
 
 import pytest
+from scrapy.settings import Settings as ScrapySettings
 
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
@@ -41,6 +42,36 @@ def test_leases_release_only_their_exact_acquire() -> None:
     assert manager._users == 0
     assert manager._retirement_complete is True
     backend.disconnect.assert_called_once_with()
+
+
+def test_breaker_policy_preserves_shared_acquire_specific_leases() -> None:
+    """Post-acquire policy application cannot mutate identity or consume a peer."""
+    settings = {"host": "lease-breaker-policy"}
+    first = ConnectionManager.acquire_lease(BackendType.REDIS, settings)
+    second = ConnectionManager.acquire_lease(BackendType.REDIS, settings)
+    manager = first.manager
+    original_settings = dict(manager.settings)
+    original_token = manager._registry_token
+    try:
+        manager.apply_scrapy_breaker_policy(
+            ScrapySettings(
+                {
+                    "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                    "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 7,
+                    "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 12.0,
+                }
+            )
+        )
+
+        assert manager.settings == original_settings
+        assert manager._registry_token is original_token
+        assert manager._users == 2
+        first.release()
+        assert second.released is False
+        assert manager._users == 1
+    finally:
+        first.release()
+        second.release()
 
 
 def test_concurrent_legacy_close_claims_distinct_tokens_atomically() -> None:
