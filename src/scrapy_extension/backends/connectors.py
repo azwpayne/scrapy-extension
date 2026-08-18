@@ -1277,6 +1277,16 @@ class _ConnectionAttempt:
         self.error: BaseException | None = None
 
 
+class _ManagerConstructionAttempt:
+    """Owner gate for one pooled-manager construction generation."""
+
+    def __init__(self, owner: int, epoch: int) -> None:
+        self.owner = owner
+        self.epoch = epoch
+        self.event = threading.Event()
+        self.waiters = 0
+
+
 class _LazyConnectionContext(threading.local):
     """Per-thread lazy-owner state used while lifecycle hooks are dispatched.
 
@@ -1714,14 +1724,11 @@ class ConnectionManager:
         _backend: The backend instance (None until connected).
         _lock: Threading lock for thread safety.
 
-    Lock-order invariant (Risk 6 documentation): when a code path needs BOTH
-    locks, acquire ``_registry_lock`` (class-level) BEFORE the instance ``_lock``.
-    Reversing the order risks deadlock — ``get_manager`` takes ``_registry_lock``
-    and then (via ``connect``) may take ``_lock``, while peer code holding
-    ``_lock`` must never reach back for ``_registry_lock``. The A2 owner-gate
-    runs ``connect`` + backoff OUTSIDE ``_lock`` so a slow backend cannot block
-    peer threads sharing the manager. Do not narrow without verifying these
-    two orderings hold.
+    Registry mutation and instance mutation are kept in separate critical
+    sections. In particular, pooled construction, plugin discovery and class
+    validation, lifecycle callbacks, and manager teardown all run without
+    ``_registry_lock`` held. The A2 owner-gate likewise runs ``connect`` and
+    backoff outside ``_lock`` so a slow backend cannot block peer threads.
     """
 
     # Class-level registry of managers. R14-E: this is an LRU-bounded
@@ -1732,6 +1739,12 @@ class ConnectionManager:
     # actively-used managers (``_users > 0``) are never evicted.
     _managers: ClassVar[OrderedDict[str, ConnectionManager]] = OrderedDict()
     _registry_lock: ClassVar[threading.Lock] = threading.Lock()
+    # Per-key construction gates keep expensive and potentially untrusted plugin
+    # discovery outside the registry lock while preserving singleton publication.
+    # The epoch fences candidates started before ``clear_registry()``.
+    _manager_constructions: ClassVar[dict[str, _ManagerConstructionAttempt]] = {}
+    _manager_construction_owners: ClassVar[set[int]] = set()
+    _registry_epoch: ClassVar[int] = 0
     # One-shot guard for the "registry over cap with all entries live" warning
     # so we don't spam logs on every get_manager() once the cap is saturated.
     _over_cap_warned: ClassVar[bool] = False
@@ -1927,6 +1940,14 @@ class ConnectionManager:
         Returns:
             A ConnectionManager instance for the given backend.
         """
+        thread_id = threading.get_ident()
+        with cls._registry_lock:
+            if thread_id in cls._manager_construction_owners:
+                raise ConfigurationError(
+                    "Recursive pooled connection manager construction is not supported.",
+                    setting_name="backend_settings",
+                )
+
         # Hash and retain one operational deep snapshot, with a separate public
         # copy. Otherwise a caller can mutate a nested value after hashing and make
         # the old registry key point at new connection settings. Do not invoke
@@ -1972,53 +1993,139 @@ class ConnectionManager:
         assert public_settings_snapshot is not None
         assert key is not None
 
-        victims: list[ConnectionManager] = []
-        with cls._registry_lock:
-            manager = cls._managers.get(key)
-            if manager is not None and manager._retired:
-                # A teardown race or externally restored stale registry entry must
-                # never become live again. Remove by key *and identity* before
-                # creating the replacement, then dispose it outside the lock.
-                if cls._managers.get(key) is manager:
-                    cls._managers.pop(key)
-                    victims.append(manager)
-                manager = None
-            if manager is None:
-                # R14-E: before inserting a brand-new entry, evict from the FRONT
-                # of the LRU until we're under the cap. Only genuinely-orphaned
-                # entries (``_users <= 0``) are evicted — an actively-held manager
-                # is skipped (it will be evicted later when its last holder
-                # releases). If every entry is actively held we stop evicting and
-                # log a one-shot warning rather than tear down a live connection
-                # (a real leak, but not one ``get_manager`` should fix by force).
-                #
-                # Victims are collected (popped) UNDER the lock but disconnected
-                # AFTER release (see the loop below) so a slow victim disconnect
-                # does not serialize peer get_manager() calls.
-                victims.extend(cls._collect_orphans_under_lock())
-                manager = cls(backend_type, public_settings_snapshot)
-                manager._registry_backend_type = manager.backend_type
-                manager._registry_settings = settings_snapshot
-                manager._registry_token = key
-                cls._managers[key] = manager
-            else:
-                # LRU touch — recently-used entries move to the back (newest).
-                cls._managers.move_to_end(key)
-            manager._users += 1
+        while True:
+            victims: list[ConnectionManager] = []
+            attempt: _ManagerConstructionAttempt | None = None
+            construct = False
+            manager: ConnectionManager | None = None
 
-        # Disconnect evicted victims OUTSIDE _registry_lock via the shared
-        # teardown primitive. Victims are already popped (peers can't see them).
-        # Ordinary LRU victims have no outstanding acquire; a stale retired entry
-        # may retain an old refcount, but is terminal and cannot be reacquired.
-        # Disconnecting here rather than under the lock avoids serializing every
-        # get_manager() on the slowest backend disconnect during overflow.
-        for victim in victims:
-            cls._disconnect_backend_safely(victim)
+            with cls._registry_lock:
+                # Constructor-time plugin callbacks may not recursively acquire
+                # any pooled manager, even one that was already published. Allowing
+                # that special case would make recursion depend on registry history
+                # and could expose an instance while its caller is half-constructed.
+                if thread_id in cls._manager_construction_owners:
+                    raise ConfigurationError(
+                        "Recursive pooled connection manager construction is not supported.",
+                        setting_name="backend_settings",
+                    )
 
-        return manager
+                manager = cls._managers.get(key)
+                if manager is not None and manager._retired:
+                    # A stale terminal entry must not be reacquired. Detach it by
+                    # identity now and tear it down after releasing the lock.
+                    if cls._managers.get(key) is manager:
+                        cls._managers.pop(key)
+                        victims.append(manager)
+                    manager = None
+
+                if manager is not None:
+                    cls._managers.move_to_end(key)
+                    manager._users += 1
+                else:
+                    attempt = cls._manager_constructions.get(key)
+                    if attempt is None:
+                        attempt = _ManagerConstructionAttempt(
+                            thread_id, cls._registry_epoch
+                        )
+                        cls._manager_constructions[key] = attempt
+                        cls._manager_construction_owners.add(thread_id)
+                        construct = True
+                    else:
+                        attempt.waiters += 1
+
+            # Neither stale-manager teardown nor waiting on another constructor may
+            # hold the registry lock. A teardown backend is application/plugin code.
+            for victim in victims:
+                cls._disconnect_backend_safely(victim)
+            if manager is not None:
+                return manager
+            assert attempt is not None
+            if not construct:
+                attempt.event.wait()
+                continue
+
+            candidate: ConnectionManager | None = None
+            try:
+                # This is deliberately outside ``_registry_lock``: construction can
+                # discover entry points, load plugin classes, and validate arbitrary
+                # class attributes.
+                candidate = cls(backend_type, public_settings_snapshot)
+            except BaseException:
+                # KeyboardInterrupt and other control-flow exceptions must release
+                # the single-flight gate just like ordinary constructor failures.
+                with cls._registry_lock:
+                    if cls._manager_constructions.get(key) is attempt:
+                        cls._manager_constructions.pop(key)
+                    cls._manager_construction_owners.discard(thread_id)
+                    attempt.event.set()
+                raise
+
+            publish_victims: list[ConnectionManager] = []
+            selected: ConnectionManager | None = None
+            warn_over_cap = False
+            with cls._registry_lock:
+                gate_is_current = (
+                    cls._manager_constructions.get(key) is attempt
+                    and cls._registry_epoch == attempt.epoch
+                )
+                if cls._manager_constructions.get(key) is attempt:
+                    cls._manager_constructions.pop(key)
+                cls._manager_construction_owners.discard(thread_id)
+
+                existing = cls._managers.get(key)
+                if existing is not None and existing._retired:
+                    if cls._managers.get(key) is existing:
+                        cls._managers.pop(key)
+                        publish_victims.append(existing)
+                    existing = None
+
+                if gate_is_current and existing is None:
+                    # LRU enforcement belongs to publication, not construction: a
+                    # concurrent clear or publisher may have changed registry size
+                    # while this candidate was being built.
+                    collected, warn_over_cap = cls._collect_orphans_under_lock()
+                    publish_victims.extend(collected)
+                    candidate._registry_backend_type = candidate.backend_type
+                    candidate._registry_settings = settings_snapshot
+                    candidate._registry_token = key
+                    candidate._users = 1
+                    cls._managers[key] = candidate
+                    selected = candidate
+                    candidate = None
+                elif existing is not None:
+                    # Double-check publication: a post-clear generation may already
+                    # have won. Reuse it and preserve one acquire per successful call.
+                    cls._managers.move_to_end(key)
+                    existing._users += 1
+                    selected = existing
+
+                # Publish/abort state is complete before peers wake and re-check.
+                attempt.event.set()
+
+            # A candidate invalidated by clear_registry(), or one that lost the
+            # publication double-check, is terminally disposed outside every
+            # registry critical section. Then retry if no current manager existed.
+            if candidate is not None:
+                cls._disconnect_backend_safely(candidate)
+            for victim in publish_victims:
+                cls._disconnect_backend_safely(victim)
+            if warn_over_cap:
+                _log_diagnostic(
+                    logger.warning,
+                    "ConnectionManager registry at cap (%d) with all entries "
+                    "actively held; not force-evicting live managers. This "
+                    "indicates genuine unbounded backend coexistence — investigate "
+                    "the source of distinct backend settings.",
+                    cls.MAX_MANAGERS,
+                )
+            if selected is not None:
+                return selected
 
     @classmethod
-    def _collect_orphans_under_lock(cls) -> list[ConnectionManager]:
+    def _collect_orphans_under_lock(
+        cls,
+    ) -> tuple[list[ConnectionManager], bool]:
         """Pop orphaned managers from the front of the LRU until under cap.
 
         R14-E evolution: victims are collected (popped) here under
@@ -2040,9 +2147,11 @@ class ConnectionManager:
         reads ``_users`` without per-instance locking.
 
         Returns:
-            Victims the caller MUST disconnect outside the registry lock.
+            Victims the caller MUST disconnect outside the registry lock, plus
+            whether the caller must emit the one-shot saturation warning there.
         """
         victims: list[ConnectionManager] = []
+        warn_over_cap = False
         while len(cls._managers) >= cls.MAX_MANAGERS:
             # Find the front-most orphan. Can't ``popitem(last=False)`` blindly
             # because the oldest entry may be actively held (``_users > 0``) and
@@ -2057,17 +2166,10 @@ class ConnectionManager:
                 # Warn once per process; do not force-evict a live manager.
                 if not cls._over_cap_warned:
                     cls._over_cap_warned = True
-                    _log_diagnostic(
-                        logger.warning,
-                        "ConnectionManager registry at cap (%d) with all entries "
-                        "actively held; not force-evicting live managers. This "
-                        "indicates genuine unbounded backend coexistence — investigate "
-                        "the source of distinct backend settings.",
-                        cls.MAX_MANAGERS,
-                    )
-                return victims
+                    warn_over_cap = True
+                return victims, warn_over_cap
             victims.append(cls._managers.pop(orphan_key))
-        return victims
+        return victims, warn_over_cap
 
     @staticmethod
     def _disconnect_backend_safely(manager: ConnectionManager) -> None:
@@ -2895,6 +2997,15 @@ class ConnectionManager:
         with cls._registry_lock:
             managers = list(cls._managers.values())
             cls._managers.clear()
+            # Invalidate candidates that began before this clear boundary and wake
+            # every waiter so a fresh generation can elect its own constructor.
+            cls._registry_epoch += 1
+            construction_attempts = list(cls._manager_constructions.values())
+            cls._manager_constructions.clear()
+            for attempt in construction_attempts:
+                attempt.event.set()
+            # Owner thread ids intentionally remain marked until their old
+            # constructors return; constructor callbacks must still fail re-entry.
             # Reset the one-shot over-cap warning so a fresh test suite run
             # re-warns if it overflows the cap (otherwise the warning is
             # permanently suppressed after the first overflow across tests).
