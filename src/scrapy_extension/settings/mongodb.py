@@ -20,6 +20,7 @@ from scrapy_extension.exceptions._redaction import configuration_error_boundary
 from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
+    is_loopback_host,
     normalize_allow_remote_plaintext,
     require_remote_plaintext_opt_in,
     validate_allow_remote_plaintext,
@@ -655,18 +656,12 @@ def validate_mongodb_authentication(
 
 
 def _mongodb_endpoint_is_loopback(endpoint: object) -> bool:
-    """Classify a single host[:port] conservatively; unknown means remote."""
+    """Classify a single host[:port] with the shared exact loopback policy."""
     try:
         _uri_seed, host = _parse_mongodb_seed_endpoint(endpoint, "replica_set_members")
     except ConfigurationError:
         return False
-    normalized = host.lower().rstrip(".")
-    if normalized == "localhost":
-        return True
-    try:
-        return ip_address(normalized).is_loopback
-    except ValueError:
-        return False
+    return is_loopback_host(host)
 
 
 def is_mongodb_direct_loopback_uri(uri: str) -> bool:
