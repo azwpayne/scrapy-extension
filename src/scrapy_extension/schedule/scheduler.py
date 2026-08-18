@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import uuid
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
@@ -73,6 +74,31 @@ _LIFECYCLE_CLOSING = "closing"
 _LIFECYCLE_CLOSED = "closed"
 _MISSING_STATIC_ATTRIBUTE = object()
 _EnqueueDiagnostic = tuple[str, str, str | None]
+
+
+class _SchedulerAttemptToken:
+    """Frame-scoped lifecycle ownership reclaimable after its call unwinds."""
+
+    __slots__ = ("thread_id",)
+
+    def __init__(self) -> None:
+        self.thread_id = threading.get_ident()
+
+    @property
+    def active(self) -> bool:
+        """Whether the owning ``_close_attempt`` frame still holds this token."""
+        try:
+            frame = sys._current_frames().get(self.thread_id)  # noqa: SLF001
+        except Exception:  # noqa: BLE001 - stale ownership must be reclaimable
+            return False
+        while frame is not None:
+            try:
+                if frame.f_locals.get("owner_token") is self:
+                    return True
+            except Exception:  # noqa: BLE001 - fail toward bounded reclamation
+                return False
+            frame = frame.f_back
+        return False
 
 
 class _SignalReceiver:
@@ -1073,7 +1099,7 @@ class BackendScheduler:
         # through construction.
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_state = _LIFECYCLE_NEW
-        self._close_attempt_owner: object | None = None
+        self._close_attempt_owner: _SchedulerAttemptToken | None = None
         self._close_attempt_thread_id: int | None = None
 
     @classmethod
@@ -1823,23 +1849,26 @@ class BackendScheduler:
         allow_opening: bool = False,
     ) -> None:
         """Reserve one bounded close pass, run callbacks unlocked, then publish."""
-        owner_token = object()
-        thread_id = threading.get_ident()
+        owner_token = _SchedulerAttemptToken()
         with self._lifecycle_lock:
             if self._lifecycle_state == _LIFECYCLE_CLOSED:
                 return
             if self._lifecycle_state == _LIFECYCLE_OPENING and not allow_opening:
                 raise RuntimeError("Scheduler open is already in progress")
             if self._lifecycle_state == _LIFECYCLE_CLOSING:
-                if self._close_attempt_owner is not None:
-                    if self._close_attempt_thread_id == thread_id:
+                current_owner = self._close_attempt_owner
+                if current_owner is not None and current_owner.active:
+                    if current_owner.thread_id == owner_token.thread_id:
                         # Re-entrant close from an untrusted callback is bounded and
                         # leaves the outer attempt authoritative.
                         return
                     raise RuntimeError("Scheduler close is already in progress")
+                # The prior attempt unwound before it could clear package ownership.
+                # Reclaim the stale token; provider handles remain authoritative and
+                # make the resumed teardown idempotent.
             self._lifecycle_state = _LIFECYCLE_CLOSING
             self._close_attempt_owner = owner_token
-            self._close_attempt_thread_id = thread_id
+            self._close_attempt_thread_id = owner_token.thread_id
         try:
             self._close_locked(reason, lossy=lossy)
         finally:

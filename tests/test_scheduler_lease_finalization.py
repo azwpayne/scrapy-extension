@@ -224,3 +224,39 @@ def test_interruption_before_closed_publication_retries_without_releases() -> No
     scheduler.close("retry")
     manager.close.assert_called_once_with()
     assert scheduler._lifecycle_state == "closed"
+
+
+class _InterruptCloseFinalizerScheduler(BackendScheduler):
+    lock_reads = 0
+    interrupt_finalizer = False
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "_lifecycle_lock":
+            reads = object.__getattribute__(self, "lock_reads") + 1
+            object.__setattr__(self, "lock_reads", reads)
+            if reads == 2 and object.__getattribute__(self, "interrupt_finalizer"):
+                object.__setattr__(self, "interrupt_finalizer", False)
+                raise KeyboardInterrupt("close finalization")
+        return super().__getattribute__(name)
+
+
+def test_interrupted_close_owner_finalization_is_reclaimed_on_retry() -> None:
+    manager = Mock()
+    scheduler = _InterruptCloseFinalizerScheduler(manager)
+    queue = _real_queue(failure=QueueError("checkpoint failed"))
+    scheduler._queue = queue
+    scheduler.interrupt_finalizer = True
+
+    with pytest.raises(KeyboardInterrupt, match="close finalization"):
+        scheduler.close("first")
+
+    assert scheduler._lifecycle_state == "closing"
+    assert scheduler._close_attempt_owner is not None
+
+    queue._close_complete = True
+    queue.close.side_effect = None  # type: ignore[attr-defined]
+    scheduler.close("retry")
+
+    assert queue.close.call_count == 2
+    assert scheduler._lifecycle_state == "closed"
+    manager.close.assert_called_once_with()
