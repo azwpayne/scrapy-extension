@@ -1593,19 +1593,21 @@ class BackendQueue:
 
     def _persist_snapshot(self) -> None:
         """Commit a chunked strategy snapshot or raise a redacted retryable error."""
-        snapshot_failed = False
+        state: bytes | None = None
         try:
-            state = self._strategy.snapshot()
-        except Exception:
-            snapshot_failed = True
-            state = None
-        if snapshot_failed:
+            snapshot_failed = False
             try:
-                logger.error("Strategy snapshot creation failed")
-            except BaseException:
-                pass
-            raise QueueError("Strategy snapshot creation failed.") from None
-        try:
+                state = self._strategy.snapshot()
+            except Exception:
+                snapshot_failed = True
+                state = None
+            if snapshot_failed:
+                try:
+                    logger.error("Strategy snapshot creation failed")
+                except BaseException:
+                    pass
+                raise QueueError("Strategy snapshot creation failed.") from None
+
             storage = self._snapshot_storage(strict=True)
             if storage is None:
                 if state is None:

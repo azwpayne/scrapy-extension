@@ -138,6 +138,17 @@ def _instruction_after_result_assignment(function: object) -> int:
     return instructions[stores[1] + 1].offset
 
 
+def _instruction_after_snapshot_state_assignment() -> int:
+    instructions = list(dis.get_instructions(BackendQueue._persist_snapshot))
+    stores = [
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "STORE_FAST" and instruction.argval == "state"
+    ]
+    assert len(stores) >= 2
+    return instructions[stores[1] + 1].offset
+
+
 class _SnapshotControlFlow(BaseException):
     pass
 
@@ -237,6 +248,33 @@ def test_snapshot_result_assignment_interruption_clears_owned_payload(
 
     assert exc_info.value is interruption
     _assert_package_frame_payloads_cleared(interruption)
+
+
+def test_snapshot_acquisition_assignment_interruption_clears_owned_payload() -> None:
+    strategy = MagicMock(name="QueueStrategy")
+    strategy.snapshot.return_value = _MARKER.encode()
+    queue = _queue(_Storage(), strategy)
+    interruption = _SnapshotControlFlow("snapshot assignment interrupted")
+    target_offset = _instruction_after_snapshot_state_assignment()
+
+    def inject(frame: object, event: str, _arg: object) -> object:
+        if getattr(frame, "f_code", None) is BackendQueue._persist_snapshot.__code__:
+            frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+                raise interruption
+        return inject
+
+    sys.settrace(inject)
+    try:
+        with pytest.raises(_SnapshotControlFlow) as exc_info:
+            queue.close()
+    finally:
+        sys.settrace(None)
+
+    assert exc_info.value is interruption
+    _assert_package_frame_payloads_cleared(interruption)
+    queue.close()
+    strategy.close.assert_called_once_with()
 
 
 def test_restore_control_error_clears_state_without_mutating_exception() -> None:
